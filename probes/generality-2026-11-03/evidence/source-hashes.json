@@ -1,0 +1,22 @@
+{
+  "SourceTranslation.kt": {
+    "sha256": "2f97d794d53dcb5896c499330aaf6432b291ec3ad709f1ba72390a2d851140a9",
+    "lines": 14058
+  },
+  "MacroRulesExpander.kt": {
+    "sha256": "0f8a1e4490e087ce5bf512bc09b50940312233eb49fe9586a7e78c5467de9552",
+    "lines": 1846
+  },
+  "CrateTokenAbiScanner.kt": {
+    "sha256": "6b55dcb02fa00b45bfa8d7f20f3f4887d226f270cf61094d7e0450cae8a44311",
+    "lines": 2320
+  },
+  "Int128Synthesis.kt": {
+    "sha256": "80f3e27c46794f1edabe7123f27c519c0f1868b579823ff1e01dccab000e91f9",
+    "lines": 479
+  },
+  "CliRunner.kt": {
+    "sha256": "c42d07a93c3cc0e244f3a4b17f20678fb6d3abbf61fafee8c5c1ead0fb53a814",
+    "lines": 1244
+  }
+}

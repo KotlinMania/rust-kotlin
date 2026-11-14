@@ -1,0 +1,6 @@
+probes/generality-2026-11-03/runs/baseline/generated/cfg_powerpc64_big/plain/Config.kt:4:12: error: return type mismatch: expected 'UInt', actual 'Int'.
+    return 64
+           ^^
+probes/generality-2026-11-03/runs/baseline/generated/cfg_powerpc64_big/windows/Config.kt:4:12: error: return type mismatch: expected 'UInt', actual 'Int'.
+    return 64
+           ^^

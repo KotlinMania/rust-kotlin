@@ -1,0 +1,74 @@
+[versions]
+kotlin = "2.4.21"
+coroutines = "1.11.0"
+serialization = "1.11.0"
+datetime = "0.8.0"
+collectionsImmutable = "0.5.2"
+androidKmp = "9.4.1"
+detekt = "2.0.0-alpha.6"
+ktlint = "14.2.0"
+ktlintEngine = "1.8.0"
+kotlinxBenchmark = "0.5.0"
+androidxTestRunner = "1.7.0"
+changelog = "2.5.0"
+intellijPlatform = "2.19.0"
+junit = "4.13.2"
+kmIo = "0.4.0"
+libcKotlin = "0.1.13"
+randKotlin = "0.2.0"
+rustLangKotlin = "0.2.0"
+windowsSysKotlin = "0.1.2"
+serdeJsonKotlin = "0.2.0"
+procMacro2Kotlin = "0.1.8"
+quoteKotlin = "0.3.1"
+synKotlin = "0.5.0"
+anyhowKotlin = "0.2.0"
+numBigintKotlin = "0.1.2"
+serdeDerive = "0.1.12"
+
+[plugins]
+android-kotlin-multiplatform-library = { id = "com.android.kotlin.multiplatform.library", version.ref = "androidKmp" }
+android-kmp = { id = "com.android.kotlin.multiplatform.library", version.ref = "androidKmp" }
+kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+kotlinx-benchmark = { id = "org.jetbrains.kotlinx.benchmark", version.ref = "kotlinxBenchmark" }
+kotlin-allopen = { id = "org.jetbrains.kotlin.plugin.allopen", version.ref = "kotlin" }
+detekt = { id = "dev.detekt", version.ref = "detekt" }
+ktlint = { id = "org.jlleitschuh.gradle.ktlint", version.ref = "ktlint" }
+intellij-changelog = { id = "org.jetbrains.changelog", version.ref = "changelog" }
+intellij-platform = { id = "org.jetbrains.intellij.platform", version.ref = "intellijPlatform" }
+
+[libraries]
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+kotlinx-serialization-core = { module = "org.jetbrains.kotlinx:kotlinx-serialization-core", version.ref = "serialization" }
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
+kotlinx-datetime = { module = "org.jetbrains.kotlinx:kotlinx-datetime", version.ref = "datetime" }
+collections-immutable = { module = "org.jetbrains.kotlinx:kotlinx-collections-immutable", version.ref = "collectionsImmutable" }
+kotlinx-benchmark-runtime = { module = "org.jetbrains.kotlinx:kotlinx-benchmark-runtime", version.ref = "kotlinxBenchmark" }
+androidx-test-runner = { module = "androidx.test:runner", version.ref = "androidxTestRunner" }
+junit = { module = "junit:junit", version.ref = "junit" }
+km-io = { module = "io.github.kotlinmania:km-io", version.ref = "kmIo" }
+libc-kotlin = { module = "io.github.kotlinmania:libc-kotlin", version.ref = "libcKotlin" }
+rand-kotlin = { module = "io.github.kotlinmania:rand-kotlin", version.ref = "randKotlin" }
+rust-lang-kotlin = { module = "io.github.kotlinmania:rust-lang-kotlin", version.ref = "rustLangKotlin" }
+windows-sys-kotlin = { module = "io.github.kotlinmania:windows-sys-kotlin", version.ref = "windowsSysKotlin" }
+serde-json-kotlin = { module = "io.github.kotlinmania:serde-json-kotlin", version.ref = "serdeJsonKotlin" }
+proc-macro2-kotlin = { module = "io.github.kotlinmania:proc-macro2-kotlin", version.ref = "procMacro2Kotlin" }
+quote-kotlin = { module = "io.github.kotlinmania:quote-kotlin", version.ref = "quoteKotlin" }
+syn-kotlin = { module = "io.github.kotlinmania:syn-kotlin", version.ref = "synKotlin" }
+anyhow-kotlin = { module = "io.github.kotlinmania:anyhow-kotlin", version.ref = "anyhowKotlin" }
+num-bigint-kotlin = { module = "io.github.kotlinmania:num-bigint-kotlin", version.ref = "numBigintKotlin" }
+serde-derive = { module = "io.github.kotlinmania:serde-derive", version.ref = "serdeDerive" }
+
+[bundles]
+rust-kotlin-commonMain = [
+  "km-io",
+  "serde-json-kotlin",
+  "proc-macro2-kotlin",
+  "quote-kotlin",
+  "syn-kotlin",
+  "anyhow-kotlin",
+  "num-bigint-kotlin",
+  "serde-derive",
+]

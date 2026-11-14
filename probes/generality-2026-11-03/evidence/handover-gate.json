@@ -1,0 +1,13 @@
+{
+  "observed_utc": "2026-11-03T21:25:25.556414+00:00",
+  "head": "81b949dd74933c0161c5645636249c802a55f8c0",
+  "branch": "automation/rust-kotlin-transpiler-fixes",
+  "status": "",
+  "staged": "",
+  "cli": "$WORKSPACE/rust-kotlin/build/bin/macosArm64/releaseExecutable/rust-kotlin.kexe",
+  "bytes": 7578832,
+  "sha256": "c52134a64b7e691fde00ea7124d1bcc21f70334fb9a96f42ef543f8f4a86f046",
+  "mtime_utc": "2026-11-03T20:07:07.367869+00:00",
+  "probe_folder_exists": false,
+  "owner_release": "Full Antigravity conversation: task-7813 exit0, manage_task zero running tasks, explicit safe window NOW OPEN, all production writes/builds/downstream regeneration held until probe hands back."
+}

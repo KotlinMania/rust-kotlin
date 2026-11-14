@@ -1,0 +1,6 @@
+probes/generality-2026-11-03/runs/baseline/generated/cfg_windows32_msvc/plain/Config.kt:4:12: error: return type mismatch: expected 'UInt', actual 'Int'.
+    return 32
+           ^^
+probes/generality-2026-11-03/runs/baseline/generated/cfg_windows32_msvc/windows/Config.kt:4:12: error: return type mismatch: expected 'UInt', actual 'Int'.
+    return 32
+           ^^

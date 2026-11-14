@@ -1,0 +1,3 @@
+probes/generality-2026-11-03/runs/baseline/generated/alias_renamed/Generated.kt:10:12: error: operator '==' cannot be applied to 'Short' and 'Int'.
+    return negative() == -7
+           ^^^^^^^^^^^^^^^^

@@ -1,0 +1,3 @@
+probes/generality-2026-11-03/runs/baseline/generated/guid_sentinel/Generated.kt:404:12: error: operator '==' cannot be applied to 'UInt' and 'Int'.
+    return Guid.fromU128(number).marker == 73
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,13 @@
+{
+  "source": "cmp.rs",
+  "sha256": "953a01ad14ea229734b5307ef670169277b4c6e02dc4f0b3948c11282f1c2922",
+  "declaration_lines": [
+    417,
+    426
+  ],
+  "enum_trait_reference_files": {
+    "marker.rs": "4ee78584c05376c32368d7d3e83d737671e68d57d63e3850d0ef124812a65d4f",
+    "clone.rs": "4cde4977ec1f6fb758d745e156451328dbf2431c252c6dd4f5abf1fbf317cf36",
+    "cmp.rs": "953a01ad14ea229734b5307ef670169277b4c6e02dc4f0b3948c11282f1c2922"
+  }
+}

@@ -1,0 +1,6 @@
+probes/generality-2026-11-03/runs/baseline/generated/cfg_host/plain/Config.kt:4:12: error: return type mismatch: expected 'UInt', actual 'Int'.
+    return 64
+           ^^
+probes/generality-2026-11-03/runs/baseline/generated/cfg_host/windows/Config.kt:4:12: error: return type mismatch: expected 'UInt', actual 'Int'.
+    return 64
+           ^^

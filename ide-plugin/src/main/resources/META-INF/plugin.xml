@@ -1,0 +1,46 @@
+<!-- Plugin Configuration File. Read more: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
+<idea-plugin>
+    <!-- Unique identifier of the plugin. It should be FQN. It cannot be changed between the plugin versions. -->
+    <id>io.github.kotlinmania.rust-transpiler</id>
+
+    <!-- Public plugin name should be written in Title Case.
+     Guidelines: https://plugins.jetbrains.com/docs/marketplace/best-practices-for-listing.html#plugin-name -->
+    <name>Rust-transpiler</name>
+
+    <!-- A displayed Vendor name or Organization ID displayed on the Plugins Page. -->
+    <vendor url="https://github.com/KotlinMania">KotlinMania</vendor>
+
+    <!-- Description of the plugin displayed on the Plugin Page and IDE Plugin Manager.
+         Guidelines: https://plugins.jetbrains.com/docs/marketplace/best-practices-for-listing.html#plugin-description -->
+    <description><![CDATA[
+        Deterministic, language-level Rust-to-Kotlin mechanical transpiler modeled on IntelliJ's J2K.<br>
+        Powered by KotlinMania's <em>proc-macro2-kotlin</em> and <em>syn-kotlin</em> parsers.
+        ]]></description>
+
+    <!-- Product and plugin compatibility requirements.
+         Read more: https://plugins.jetbrains.com/docs/intellij/plugin-compatibility.html -->
+    <depends>com.intellij.modules.platform</depends>
+
+    <resource-bundle>messages.MyMessageBundle</resource-bundle>
+
+    <!-- Extensions defined by the plugin.
+         Read more: https://plugins.jetbrains.com/docs/intellij/plugin-extension-points.html -->
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="MyToolWindow" factoryClass="io.github.kotlinmania.rustkotlin.MyToolWindowFactory"
+                    icon="AllIcons.Toolwindows.ToolWindowPalette"/>
+    </extensions>
+
+    <!-- Actions defined by the plugin.
+         Read more: https://plugins.jetbrains.com/docs/intellij/action-system.html -->
+    <actions resource-bundle="messages.MyMessageBundle">
+        <action id="io.github.kotlinmania.rust-transpiler.ConvertRustToKotlin"
+                class="io.github.kotlinmania.rustkotlin.ConvertRustToKotlinAction"
+                icon="AllIcons.Actions.Compile">
+            <add-to-group group-id="CodeMenu" anchor="last"/>
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <synonym key="action.io.github.kotlinmania.rust-transpiler.ConvertRustToKotlin.synonym"/>
+            <abbreviation value="r2k"/>
+        </action>
+    </actions>
+</idea-plugin>

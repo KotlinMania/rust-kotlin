@@ -1,0 +1,15 @@
+probes/generality-2026-11-03/runs/baseline/generated/guid_layout/Generated.kt:410:12: error: operator '==' cannot be applied to 'UInt' and 'Int'.
+    return id.data1 == 0x11223344 && id.data2 == 0x5566 && id.data3 == 0x7788 && id.data4[0] == 0x99 && id.data4[7] == 0x00
+           ^^^^^^^^^^^^^^^^^^^^^^
+probes/generality-2026-11-03/runs/baseline/generated/guid_layout/Generated.kt:410:38: error: operator '==' cannot be applied to 'UShort' and 'Int'.
+    return id.data1 == 0x11223344 && id.data2 == 0x5566 && id.data3 == 0x7788 && id.data4[0] == 0x99 && id.data4[7] == 0x00
+                                     ^^^^^^^^^^^^^^^^^^
+probes/generality-2026-11-03/runs/baseline/generated/guid_layout/Generated.kt:410:60: error: operator '==' cannot be applied to 'UShort' and 'Int'.
+    return id.data1 == 0x11223344 && id.data2 == 0x5566 && id.data3 == 0x7788 && id.data4[0] == 0x99 && id.data4[7] == 0x00
+                                                           ^^^^^^^^^^^^^^^^^^
+probes/generality-2026-11-03/runs/baseline/generated/guid_layout/Generated.kt:410:82: error: operator '==' cannot be applied to 'UByte' and 'Int'.
+    return id.data1 == 0x11223344 && id.data2 == 0x5566 && id.data3 == 0x7788 && id.data4[0] == 0x99 && id.data4[7] == 0x00
+                                                                                 ^^^^^^^^^^^^^^^^^^^
+probes/generality-2026-11-03/runs/baseline/generated/guid_layout/Generated.kt:410:105: error: operator '==' cannot be applied to 'UByte' and 'Int'.
+    return id.data1 == 0x11223344 && id.data2 == 0x5566 && id.data3 == 0x7788 && id.data4[0] == 0x99 && id.data4[7] == 0x00
+                                                                                                        ^^^^^^^^^^^^^^^^^^^

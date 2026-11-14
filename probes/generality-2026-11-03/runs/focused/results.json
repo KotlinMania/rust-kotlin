@@ -1,0 +1,461 @@
+[
+  {
+    "case": "guid_sentinel_values",
+    "input": "inputs/guid_sentinel_values.rs",
+    "package": "probe.guid_sentinel_values",
+    "generation_exit": 0,
+    "generated": "runs/focused/generated/guid_sentinel_values/Generated.kt",
+    "kotlin_compile_exit": 0,
+    "kotlin_runtime_exit": 0,
+    "rust_compile_exit": 0,
+    "rust_runtime_exit": 0,
+    "rust_runtime_stdout": "true",
+    "rust_reference_matches": true,
+    "kotlin_runtime_stdout": "true",
+    "kotlin_runtime_matches": true,
+    "rust_reference_target": "aarch64-apple-darwin",
+    "rust_reference_scope": "host execution only; target-env alias profiles are not cross-target Rust runs"
+  },
+  {
+    "case": "guid_owner_renamed_values",
+    "input": "inputs/guid_owner_renamed_values.rs",
+    "package": "probe.guid_owner_renamed_values",
+    "generation_exit": 0,
+    "generated": "runs/focused/generated/guid_owner_renamed_values/Generated.kt",
+    "kotlin_compile_exit": 0,
+    "kotlin_runtime_exit": 0,
+    "rust_compile_exit": 0,
+    "rust_runtime_exit": 0,
+    "rust_runtime_stdout": "true",
+    "rust_reference_matches": true,
+    "kotlin_runtime_stdout": "true",
+    "kotlin_runtime_matches": true,
+    "rust_reference_target": "aarch64-apple-darwin",
+    "rust_reference_scope": "host execution only; target-env alias profiles are not cross-target Rust runs"
+  },
+  {
+    "case": "guid_method_renamed_values",
+    "input": "inputs/guid_method_renamed_values.rs",
+    "package": "probe.guid_method_renamed_values",
+    "generation_exit": 0,
+    "generated": "runs/focused/generated/guid_method_renamed_values/Generated.kt",
+    "kotlin_compile_exit": 0,
+    "kotlin_runtime_exit": 0,
+    "rust_compile_exit": 0,
+    "rust_runtime_exit": 0,
+    "rust_runtime_stdout": "true",
+    "rust_reference_matches": true,
+    "kotlin_runtime_stdout": "true",
+    "kotlin_runtime_matches": true,
+    "rust_reference_target": "aarch64-apple-darwin",
+    "rust_reference_scope": "host execution only; target-env alias profiles are not cross-target Rust runs"
+  },
+  {
+    "case": "guid_layout_values",
+    "input": "inputs/guid_layout_values.rs",
+    "package": "probe.guid_layout_values",
+    "generation_exit": 0,
+    "generated": "runs/focused/generated/guid_layout_values/Generated.kt",
+    "kotlin_compile_exit": 0,
+    "kotlin_runtime_exit": 0,
+    "rust_compile_exit": 0,
+    "rust_runtime_exit": 0,
+    "rust_runtime_stdout": "true",
+    "rust_reference_matches": true,
+    "kotlin_runtime_stdout": "true",
+    "kotlin_runtime_matches": true,
+    "rust_reference_target": "aarch64-apple-darwin",
+    "rust_reference_scope": "host execution only; target-env alias profiles are not cross-target Rust runs"
+  },
+  {
+    "case": "alias_named_values",
+    "input": "inputs/alias_named_values.rs",
+    "package": "probe.alias_named_values",
+    "generation_exit": 0,
+    "generated": "runs/focused/generated/alias_named_values/Generated.kt",
+    "kotlin_compile_exit": 0,
+    "kotlin_runtime_exit": 0,
+    "rust_compile_exit": 0,
+    "rust_runtime_exit": 0,
+    "alias_rhs_short": true,
+    "rust_runtime_stdout": "true",
+    "rust_reference_matches": true,
+    "kotlin_runtime_stdout": "true",
+    "kotlin_runtime_matches": true,
+    "rust_reference_target": "aarch64-apple-darwin",
+    "rust_reference_scope": "host execution only; target-env alias profiles are not cross-target Rust runs"
+  },
+  {
+    "case": "alias_renamed_values",
+    "input": "inputs/alias_renamed_values.rs",
+    "package": "probe.alias_renamed_values",
+    "generation_exit": 0,
+    "generated": "runs/focused/generated/alias_renamed_values/Generated.kt",
+    "kotlin_compile_exit": 0,
+    "kotlin_runtime_exit": 0,
+    "rust_compile_exit": 0,
+    "rust_runtime_exit": 0,
+    "alias_rhs_short": true,
+    "rust_runtime_stdout": "true",
+    "rust_reference_matches": true,
+    "kotlin_runtime_stdout": "true",
+    "kotlin_runtime_matches": true,
+    "rust_reference_target": "aarch64-apple-darwin",
+    "rust_reference_scope": "host execution only; target-env alias profiles are not cross-target Rust runs"
+  },
+  {
+    "case": "cfg_host",
+    "rust_target": "aarch64-apple-darwin",
+    "rust_target_metadata_exit": 0,
+    "generation_exit": 0,
+    "kotlin_compile_exit": 0,
+    "kotlin_runtime_exit": 1,
+    "rust_compile_exit": 0,
+    "rust_runtime_exit": 0,
+    "cross_target_rust_compile_run": "host reference follows",
+    "expected_runtime": "64,true,false,false,false,false,true,true,false,true,true,true",
+    "generated": [
+      "runs/focused/generated/cfg_host/plain/Config.kt",
+      "runs/focused/generated/cfg_host/windows/Config.kt"
+    ],
+    "directory_outputs_equal_except_package": true,
+    "closed_world_omits_unknown_attribute": true,
+    "packages": [
+      "probe.cfg_host.plain",
+      "probe.cfg_host.windows"
+    ],
+    "open_world_generation_exit": 0,
+    "open_world_preserves_unknown_attribute": true,
+    "open_world_compile_run": "not run; generation/policy check only",
+    "rust_runtime_stdout": "64,true,false,false,false,false,true,true,false,true,true,true",
+    "rust_reference_matches": true,
+    "kotlin_runtime_stdout": "actual:probe.cfg_host.plain=64,true,false,false,false,false,false,true,false,true,true,false",
+    "kotlin_runtime_matches": false,
+    "rust_reference_target": "aarch64-apple-darwin",
+    "rust_reference_scope": "host execution only; target-env alias profiles are not cross-target Rust runs",
+    "cfg_component_comparison": {
+      "width": {
+        "expected": "64",
+        "observed": "64",
+        "matches": true
+      },
+      "little": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "wasm": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "msvc": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "pc": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "windows": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "configured": {
+        "expected": "true",
+        "observed": "false",
+        "matches": false
+      },
+      "tautology": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "unknown": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "featureonly": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "flagonly": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "keyonly": {
+        "expected": "true",
+        "observed": "false",
+        "matches": false
+      }
+    },
+    "runtime_coverage_note": "plain package vector evaluated before failing assertion; windows package compiled and generated body matched, but runtime was not reached"
+  },
+  {
+    "case": "cfg_wasm32_wasi",
+    "rust_target": "wasm32-wasip1",
+    "rust_target_metadata_exit": 0,
+    "generation_exit": 0,
+    "kotlin_compile_exit": 0,
+    "kotlin_runtime_exit": 1,
+    "rust_compile_exit": null,
+    "rust_runtime_exit": null,
+    "cross_target_rust_compile_run": "not run; metadata reference only",
+    "expected_runtime": "32,true,true,false,false,false,true,true,false,true,true,true",
+    "generated": [
+      "runs/focused/generated/cfg_wasm32_wasi/plain/Config.kt",
+      "runs/focused/generated/cfg_wasm32_wasi/windows/Config.kt"
+    ],
+    "directory_outputs_equal_except_package": true,
+    "closed_world_omits_unknown_attribute": true,
+    "packages": [
+      "probe.cfg_wasm32_wasi.plain",
+      "probe.cfg_wasm32_wasi.windows"
+    ],
+    "kotlin_runtime_stdout": "actual:probe.cfg_wasm32_wasi.plain=32,true,true,false,false,false,false,true,false,true,true,false",
+    "kotlin_runtime_matches": false,
+    "cfg_component_comparison": {
+      "width": {
+        "expected": "32",
+        "observed": "32",
+        "matches": true
+      },
+      "little": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "wasm": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "msvc": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "pc": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "windows": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "configured": {
+        "expected": "true",
+        "observed": "false",
+        "matches": false
+      },
+      "tautology": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "unknown": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "featureonly": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "flagonly": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "keyonly": {
+        "expected": "true",
+        "observed": "false",
+        "matches": false
+      }
+    },
+    "runtime_coverage_note": "plain package vector evaluated before failing assertion; windows package compiled and generated body matched, but runtime was not reached"
+  },
+  {
+    "case": "cfg_windows32_msvc",
+    "rust_target": "i686-pc-windows-msvc",
+    "rust_target_metadata_exit": 0,
+    "generation_exit": 0,
+    "kotlin_compile_exit": 0,
+    "kotlin_runtime_exit": 1,
+    "rust_compile_exit": null,
+    "rust_runtime_exit": null,
+    "cross_target_rust_compile_run": "not run; metadata reference only",
+    "expected_runtime": "32,true,false,true,true,true,true,true,false,true,true,true",
+    "generated": [
+      "runs/focused/generated/cfg_windows32_msvc/plain/Config.kt",
+      "runs/focused/generated/cfg_windows32_msvc/windows/Config.kt"
+    ],
+    "directory_outputs_equal_except_package": true,
+    "closed_world_omits_unknown_attribute": true,
+    "packages": [
+      "probe.cfg_windows32_msvc.plain",
+      "probe.cfg_windows32_msvc.windows"
+    ],
+    "kotlin_runtime_stdout": "actual:probe.cfg_windows32_msvc.plain=32,true,false,true,true,true,false,true,false,true,true,false",
+    "kotlin_runtime_matches": false,
+    "cfg_component_comparison": {
+      "width": {
+        "expected": "32",
+        "observed": "32",
+        "matches": true
+      },
+      "little": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "wasm": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "msvc": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "pc": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "windows": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "configured": {
+        "expected": "true",
+        "observed": "false",
+        "matches": false
+      },
+      "tautology": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "unknown": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "featureonly": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "flagonly": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "keyonly": {
+        "expected": "true",
+        "observed": "false",
+        "matches": false
+      }
+    },
+    "runtime_coverage_note": "plain package vector evaluated before failing assertion; windows package compiled and generated body matched, but runtime was not reached"
+  },
+  {
+    "case": "cfg_powerpc64_big",
+    "rust_target": "powerpc64-unknown-linux-gnu",
+    "rust_target_metadata_exit": 0,
+    "generation_exit": 0,
+    "kotlin_compile_exit": 0,
+    "kotlin_runtime_exit": 1,
+    "rust_compile_exit": null,
+    "rust_runtime_exit": null,
+    "cross_target_rust_compile_run": "not run; metadata reference only",
+    "expected_runtime": "64,false,false,false,false,false,true,true,false,true,true,true",
+    "generated": [
+      "runs/focused/generated/cfg_powerpc64_big/plain/Config.kt",
+      "runs/focused/generated/cfg_powerpc64_big/windows/Config.kt"
+    ],
+    "directory_outputs_equal_except_package": true,
+    "closed_world_omits_unknown_attribute": true,
+    "packages": [
+      "probe.cfg_powerpc64_big.plain",
+      "probe.cfg_powerpc64_big.windows"
+    ],
+    "kotlin_runtime_stdout": "actual:probe.cfg_powerpc64_big.plain=64,false,false,false,false,false,false,true,false,true,true,false",
+    "kotlin_runtime_matches": false,
+    "cfg_component_comparison": {
+      "width": {
+        "expected": "64",
+        "observed": "64",
+        "matches": true
+      },
+      "little": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "wasm": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "msvc": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "pc": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "windows": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "configured": {
+        "expected": "true",
+        "observed": "false",
+        "matches": false
+      },
+      "tautology": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "unknown": {
+        "expected": "false",
+        "observed": "false",
+        "matches": true
+      },
+      "featureonly": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "flagonly": {
+        "expected": "true",
+        "observed": "true",
+        "matches": true
+      },
+      "keyonly": {
+        "expected": "true",
+        "observed": "false",
+        "matches": false
+      }
+    },
+    "runtime_coverage_note": "plain package vector evaluated before failing assertion; windows package compiled and generated body matched, but runtime was not reached"
+  }
+]

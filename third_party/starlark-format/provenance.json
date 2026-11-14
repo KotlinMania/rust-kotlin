@@ -1,0 +1,12 @@
+{
+  "source": "DotFormatParser.kt",
+  "source_sha256": "aa6f6858eb895a1cdaca3f6e2e2908c7fc15c101f0a09b84a90a772a091ebfe2",
+  "adapted_path": "src/nativeMain/kotlin/io/github/kotlinmania/rustkotlin/reused/starlark/DotFormatParser.kt",
+  "adapted_sha256": "53462dca93581a03267bd0810983c1ac909ef91e2a5b6ec6ec2aa8cf1a875671",
+  "modifications": [
+    "package relocation",
+    "provenance comments"
+  ],
+  "purpose": "existing format-literal parsing for explicitly shared Rust/Starlark empty-capture and escaped-brace subset; not Rust source lexical recognition",
+  "upstream_source": "starlark_syntax/src/dot_format_parser.rs"
+}

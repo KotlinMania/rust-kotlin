@@ -1,0 +1,1 @@
+actual:probe.cfg_powerpc64_big.plain=64,false,false,false,false,false,false,true,false,true,true,false

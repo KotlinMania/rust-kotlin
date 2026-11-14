@@ -1,0 +1,5 @@
+fun main() {
+    check(listOf(probe.cfg_host.plain.width().toString(), probe.cfg_host.plain.little().toString(), probe.cfg_host.plain.wasm().toString(), probe.cfg_host.plain.msvc().toString(), probe.cfg_host.plain.pc().toString(), probe.cfg_host.plain.windows().toString(), probe.cfg_host.plain.configured().toString(), probe.cfg_host.plain.tautology().toString(), probe.cfg_host.plain.unknown().toString()).joinToString(",") == "64,true,false,false,false,false,true,true,false")
+    check(listOf(probe.cfg_host.windows.width().toString(), probe.cfg_host.windows.little().toString(), probe.cfg_host.windows.wasm().toString(), probe.cfg_host.windows.msvc().toString(), probe.cfg_host.windows.pc().toString(), probe.cfg_host.windows.windows().toString(), probe.cfg_host.windows.configured().toString(), probe.cfg_host.windows.tautology().toString(), probe.cfg_host.windows.unknown().toString()).joinToString(",") == "64,true,false,false,false,false,true,true,false")
+    println("64,true,false,false,false,false,true,true,false")
+}

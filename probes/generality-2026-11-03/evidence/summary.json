@@ -1,0 +1,36 @@
+{
+  "baseline": {
+    "cases": 15,
+    "generation_attempts": 16,
+    "generation_passed": 16,
+    "kotlin_compile_attempts": 15,
+    "kotlin_compile_passed": 5,
+    "kotlin_execution_attempts": 5,
+    "kotlin_execution_passed": 5,
+    "rust_compile_attempts": 12,
+    "rust_compile_passed": 12,
+    "rust_execution_attempts": 12,
+    "rust_execution_passed": 12,
+    "production_integrity": {
+      "production_sources_head_and_cli_unchanged": true,
+      "index_empty": true
+    }
+  },
+  "focused": {
+    "cases": 10,
+    "generation_attempts": 11,
+    "generation_passed": 11,
+    "kotlin_compile_attempts": 10,
+    "kotlin_compile_passed": 10,
+    "kotlin_execution_attempts": 10,
+    "kotlin_execution_passed": 6,
+    "rust_compile_attempts": 7,
+    "rust_compile_passed": 7,
+    "rust_execution_attempts": 7,
+    "rust_execution_passed": 7,
+    "production_integrity": {
+      "production_sources_head_and_cli_unchanged": true,
+      "index_empty": true
+    }
+  }
+}

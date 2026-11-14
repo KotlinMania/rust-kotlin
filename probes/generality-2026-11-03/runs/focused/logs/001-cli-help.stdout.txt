@@ -1,0 +1,42 @@
+rust-kotlin: deterministic Rust-to-Kotlin translator (1 .rs file -> 1 .kt file)
+Usage:
+  rust-kotlin inspect [options] <input.rs | dir...>
+  rust-kotlin translate [options] <input.rs> <output.kt>
+  rust-kotlin [translate] [options] <input.rs | dir...>
+  rust-kotlin --help | --version
+
+Options:
+  -r, --recursive                  Recursively translate/inspect .rs files in directories (skips lib.rs and mod.rs)
+  -o, --output <file.kt|dir>       Target .kt file (single input) or output root directory (batch/single)
+      --in-place                   Write sibling <PascalCase>.kt next to each input .rs file
+      --stdout                     Print translated Kotlin source to stdout without writing disk files
+      --dry-run                    Print planned <input.rs> -> <output.kt> actions without writing files
+  -f, --force, --overwrite         Overwrite existing target .kt files (default refuses existing files)
+      --skip-existing              Skip target .kt files that already exist
+  -g, --gradle-properties <file>   Explicit gradle.properties file for group/namespace inference
+      --package-properties <file>  Explicit package.properties file for package/crate overrides
+  -p, --package <pkg>              Explicit Kotlin package name (appends relative subpackages in recursive mode)
+  -n, --namespace <ns>             Explicit crate root Kotlin namespace (e.g. io.github.kotlinmania.serdejson)
+      --group <group>              Explicit project group (e.g. io.github.kotlinmania)
+  -c, --crate-namespace <k>=<ns>   Map external crate <k> to Kotlin namespace <ns> (repeatable)
+      --source-root <dir>          Base directory for computing relative // port-lint paths
+      --port-lint <mode>           Port-lint header directive: source (default), tests, or none
+      --raw-abi                    Preserve raw C/Win32 ABI struct/constant/function identifiers
+      --final-structs              Emit final classes (non-open) for structs/unions
+      --split-module-roots         Split implementation mod.rs/lib.rs into focused files and place leaf modules in subpackages
+      --win32-dynamic-ffi          Emit multi-target Win32DynamicFfi runtime scaffold and route windows_link::link! calls through it
+      --c-dynamic-ffi              Emit multi-target LibcDynamicFfi runtime scaffold and route extern "C" calls/statics through it
+      --target-pointer-width <n>   Target pointer width in bits: 16, 32, or 64 (default: 64)
+      --target-endian <endian>     Target byte order: little or big (default: little)
+      --target-arch <arch>         Target CPU architecture for cfg predicates (e.g. x86_64, aarch64, wasm32)
+      --target-os <os>             Target OS for cfg predicates (e.g. macos, linux, windows, ios, wasi)
+      --target-env <env>           Target ABI/environment for cfg predicates (e.g. gnu, msvc, musl)
+      --target-vendor <vendor>     Target vendor for cfg predicates (e.g. apple, pc, unknown)
+      --target-family <family>     Target family for cfg predicates, repeatable (e.g. unix, windows, wasm)
+      --feature <name>             Enable Cargo feature <name> for cfg(feature = "...") (repeatable)
+      --cfg <spec>                 Enable custom cfg flag or key=value predicate (repeatable)
+      --cfg-closed-world           Treat unspecified cfg predicates/features as false instead of open-world
+      --timings                    Report lexer/parser/emitter stage timings
+  -q, --quiet                      Suppress progress summary lines
+  -v, --version                    Show version information
+  -h, --help                       Show this help message

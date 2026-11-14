@@ -1,0 +1,3 @@
+# Visible local executables/classes; text inputs, outputs and logs are tracked.
+artifacts/
+__pycache__/
