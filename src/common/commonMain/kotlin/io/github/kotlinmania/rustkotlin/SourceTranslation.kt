@@ -20,6 +20,7 @@ import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.TraitItem
 import io.github.kotlinmania.syn.TypeParamBound
+import io.github.kotlinmania.syn.UseTree
 import io.github.kotlinmania.syn.Visibility
 import io.github.kotlinmania.syn.WherePredicate
 import io.github.kotlinmania.syn.gen.Visit
@@ -272,9 +273,26 @@ private fun selectParentItemsExcludingSplitInlineMods(file: File, headerContext:
     return File(
         shebang = file.shebang,
         attrs = file.attrs,
-        items = file.items.filterNot { it in excludedSet },
+        items =
+            file.items.map { item ->
+                if (item in excludedSet && item is Item.Mod) item.copy(content = null) else item
+            },
     )
 }
+
+private fun useTreeStartsWithSuper(tree: UseTree): Boolean =
+    when (tree) {
+        is UseTree.Path -> tree.ident.toString().removePrefix("r#") == "super"
+        is UseTree.Group -> tree.items.toList().any(::useTreeStartsWithSuper)
+        else -> false
+    }
+
+private fun useTreeRootIdent(tree: UseTree): String? =
+    when (tree) {
+        is UseTree.Path -> tree.ident.toString().removePrefix("r#")
+        is UseTree.Name -> tree.ident.toString().removePrefix("r#")
+        else -> null
+    }
 
 private fun emitSplitInlineModCompanions(
     expandedFile: File,
@@ -288,6 +306,18 @@ private fun emitSplitInlineModCompanions(
     if (splitMods.isEmpty()) return emptyList()
     val basePkg = headerContext.packageName!!.trim().removeSuffix(".")
     val effectiveNs = headerContext.projectNamespace ?: basePkg
+    val parentLocalMods =
+        expandedFile.items
+            .filterIsInstance<Item.Mod>()
+            .mapTo(hashSetOf()) { it.ident.toString().removePrefix("r#") }
+    val parentUses =
+        expandedFile.items
+            .filterIsInstance<Item.Use>()
+            .filterNot(::itemHasDocOnlyCfg)
+            .filter { u ->
+                val root = useTreeRootIdent(u.tree)
+                root != null && root != "self" && root != "super" && root !in parentLocalMods
+            }.map { it.copy(vis = Visibility.Inherited) }
     val out = mutableListOf<CompanionInteropFile>()
     for (modItem in splitMods) {
         val rawMod = modItem.ident.toString().removePrefix("r#")
@@ -307,11 +337,17 @@ private fun emitSplitInlineModCompanions(
                 currentRelativeSourceDir = childRelDir,
                 isModuleRootSource = false,
             )
+        val inlineItems = (modItem.content as ModContent.Inline).items
+        val hasSuperImport =
+            inlineItems.any { child ->
+                child is Item.Use && !itemHasDocOnlyCfg(child) && useTreeStartsWithSuper(child.tree)
+            }
+        val childItems = if (hasSuperImport && parentUses.isNotEmpty()) parentUses + inlineItems else inlineItems
         val rawChildFile =
             File(
                 shebang = null,
                 attrs = modItem.attrs,
-                items = (modItem.content as ModContent.Inline).items,
+                items = childItems,
             )
         val prevLayout = TranslationSession.sourceLayoutFile
         val prevRelDir = TranslationSession.currentRelativeSourceDir
@@ -899,12 +935,25 @@ internal class KotlinJ2KEmitter(
         val standaloneItems = mutableListOf<Item>()
 
         currentOmittedTestIdents = computeTransitivelyOmittedQuickcheckOrRandIdents(file.items, emptySet())
+        val sharedModFile = TranslationSession.sharedModuleFile
+        if (sharedModFile != null) {
+            for (sharedItem in sharedModFile.items) {
+                if (itemHasDocOnlyCfg(sharedItem)) continue
+                if (sharedItem is Item.Use) {
+                    registerUseItemInScope(sharedItem)
+                }
+            }
+        }
         for (item in file.items) {
             if (itemHasDocOnlyCfg(item)) continue
             if (item is Item.Use) {
-                registerUseItemInScope(item)
-                continue
+                if (sharedModFile == null || sharedModFile.items.none { it === item }) {
+                    registerUseItemInScope(item)
+                }
             }
+        }
+        for (item in file.items) {
+            if (itemHasDocOnlyCfg(item) || item is Item.Use) continue
             if (item is Item.Impl && !shouldOmitItemForUnportedQuickcheckOrRand(item)) {
                 val ownerType = extractDirectOwnerTypeName(item.selfType, item.generics)
                 if (ownerType != null && ownerType in inspector.attachableTypeNames) {
@@ -2020,7 +2069,7 @@ internal class KotlinJ2KEmitter(
             is Item.Trait -> renderItemTrait(item, indent, scopeSignatures, isLocalItem = isLocalItem)
             is Item.TraitAlias -> renderItemTraitAlias(item, indent, scopeSignatures, isLocalItem = isLocalItem)
             is Item.Impl -> renderStandaloneItemImpl(item, indent, scopeSignatures, isLocalItem = isLocalItem)
-            is Item.Mod -> renderItemMod(item, indent, scopeSignatures)
+            is Item.Mod -> renderItemMod(item, indent, scopeSignatures, isLocalItem = isLocalItem)
             is Item.Macro -> renderItemMacro(item, indent, isLocalItem = isLocalItem)
             is Item.ForeignMod -> renderItemForeignMod(item, indent, isLocalItem = isLocalItem)
             is Item.ExternCrate -> ""
@@ -2513,8 +2562,10 @@ internal val PRIMITIVE_TYPE_NAMES =
         "i64",
         "i128",
         "isize",
+        "f16",
         "f32",
         "f64",
+        "f128",
         "bool",
         "str",
         "char",
@@ -2570,8 +2621,10 @@ internal val IGNORED_QUOTE_KEYWORDS =
         "i64",
         "i128",
         "isize",
+        "f16",
         "f32",
         "f64",
+        "f128",
         "bool",
         "str",
         "char",

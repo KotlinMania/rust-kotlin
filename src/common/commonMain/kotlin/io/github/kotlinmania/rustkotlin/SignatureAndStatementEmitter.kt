@@ -18,6 +18,7 @@ import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.Lit
 import io.github.kotlinmania.syn.Macro
 import io.github.kotlinmania.syn.Member
+import io.github.kotlinmania.syn.ModContent
 import io.github.kotlinmania.syn.Pat
 import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
@@ -1696,6 +1697,7 @@ internal fun KotlinJ2KEmitter.renderBlock(
     val blockEntryExpectedKind = currentExpectedNumericKind
     val blockEntryTailExpectsUnitResultOk = currentTailExpectsUnitResultOk
     val savedBlockLocalFnRawNames = hashSetOf<String>()
+    val savedBlockLocalInlineModNames = hashSetOf<String>()
     val prevBlockLocalFnReturnSynTypes = linkedMapOf<String, SynType?>()
     currentExpectedNumericKind = null
     currentTailExpectsUnitResultOk = false
@@ -1754,6 +1756,12 @@ internal fun KotlinJ2KEmitter.renderBlock(
             if (itemHasDocOnlyCfg(itemInStmt)) continue
             if (itemInStmt is Item.Use) {
                 registerUseItemInScope(itemInStmt)
+            } else if (itemInStmt is Item.Mod && itemInStmt.content is ModContent.Inline) {
+                val modRaw = itemInStmt.ident.toString().removePrefix("r#")
+                if (modRaw !in inspector.localInlineModuleNames) {
+                    savedBlockLocalInlineModNames += modRaw
+                    inspector.localInlineModuleNames += modRaw
+                }
             }
         }
         val hoistedItems = mutableListOf<Pair<String?, String>>()
@@ -1848,6 +1856,7 @@ internal fun KotlinJ2KEmitter.renderBlock(
         }
     } finally {
         inspector.declaredTopLevelFnRawNames.removeAll(savedBlockLocalFnRawNames)
+        inspector.localInlineModuleNames.removeAll(savedBlockLocalInlineModNames)
         for ((fnKey, prevSyn) in prevBlockLocalFnReturnSynTypes) {
             if (prevSyn == null) {
                 inspector.topLevelFnReturnSynTypes.remove(fnKey)

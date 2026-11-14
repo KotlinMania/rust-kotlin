@@ -1733,6 +1733,13 @@ private fun scanModuleTokenTrees(
             if ((trees.getOrNull(kwIdx) as? TokenTree.Group)?.value?.delimiter() == Delimiter.Parenthesis) {
                 kwIdx++
             }
+            var traitLookIdx = kwIdx
+            while ((trees.getOrNull(traitLookIdx) as? TokenTree.Ident)?.value?.toString() in setOf("const", "unsafe", "auto")) {
+                traitLookIdx++
+            }
+            if ((trees.getOrNull(traitLookIdx) as? TokenTree.Ident)?.value?.toString() == "trait") {
+                kwIdx = traitLookIdx
+            }
             val kw = (trees.getOrNull(kwIdx) as? TokenTree.Ident)?.value?.toString()
             when (kw) {
                 "mod" -> {
@@ -1919,7 +1926,7 @@ private fun scanModuleTokenTrees(
                                 registerFnSig(subpkg, ktFn, pLists, retTy, insideExternBlock)
                             }
                         }
-                    } else if (afterConstText != null && afterConstText != "_" && !skippedByCfg) {
+                    } else if (afterConstText != null && afterConstText != "_" && afterConstText !in SCANNER_ITEM_KEYWORDS && !skippedByCfg) {
                         val ktConst = KotlinNamingPolicy.Default.toConstIdentifier(afterConstText)
                         registerSymbol(ktConst, subpkg)
                         extractConstOrStaticTypeLeaf(trees, kwIdx + 1, endFnIdx)?.let { leaf ->
@@ -2011,6 +2018,50 @@ private fun scanModuleTokenTrees(
             pendingAttrs.clear()
             continue
         }
+        val nonPubTraitQualIdx =
+            generateSequence(i) { idx ->
+                val tok = (trees.getOrNull(idx) as? TokenTree.Ident)?.value?.toString()
+                if (tok in setOf("const", "unsafe", "auto")) idx + 1 else null
+            }.last()
+        if ((trees.getOrNull(nonPubTraitQualIdx) as? TokenTree.Ident)?.value?.toString() == "trait") {
+            val rawIdent = (trees.getOrNull(nonPubTraitQualIdx + 1) as? TokenTree.Ident)?.value?.toString()
+            if (rawIdent != null && !skippedByCfg) {
+                val ktTrait = KotlinNamingPolicy.Default.toTypeIdentifier(rawIdent, allowRawAbi = rawAbiMode)
+                registerSymbol(ktTrait, subpkg)
+                scanTraitTokenMetadata(
+                    trees = trees,
+                    startAfterIdent = nonPubTraitQualIdx + 2,
+                    subpkg = subpkg,
+                    ktTrait = ktTrait,
+                    traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
+                    traitResultMethods = traitResultMethods,
+                )
+            }
+            i = skipItemAfterHeader(trees, nonPubTraitQualIdx + 1)
+            pendingAttrs.clear()
+            continue
+        }
+        val nonPubImplQualIdx =
+            generateSequence(i) { idx ->
+                val tok = (trees.getOrNull(idx) as? TokenTree.Ident)?.value?.toString()
+                if (tok in setOf("const", "unsafe", "default")) idx + 1 else null
+            }.last()
+        if ((trees.getOrNull(nonPubImplQualIdx) as? TokenTree.Ident)?.value?.toString() == "impl") {
+            val endImplIdx = skipItemAfterHeader(trees, nonPubImplQualIdx + 1)
+            if (!skippedByCfg) {
+                scanInherentImplAssociatedFunctions(
+                    trees = trees,
+                    implKwIdx = nonPubImplQualIdx,
+                    endImplIdx = endImplIdx,
+                    subpkg = subpkg,
+                    rawAbiMode = rawAbiMode,
+                    registerFnSig = registerFnSig,
+                )
+            }
+            i = endImplIdx
+            pendingAttrs.clear()
+            continue
+        }
         if (nonPubKw == "struct" || nonPubKw == "union" || nonPubKw == "enum" || nonPubKw == "trait" || nonPubKw == "type") {
             val rawIdent = (trees.getOrNull(i + 1) as? TokenTree.Ident)?.value?.toString()
             if (rawIdent != null && !skippedByCfg) {
@@ -2043,7 +2094,7 @@ private fun scanModuleTokenTrees(
             if (nonPubKw == "static" && (trees.getOrNull(idIdx) as? TokenTree.Ident)?.value?.toString() == "mut") idIdx++
             val rawIdent = (trees.getOrNull(idIdx) as? TokenTree.Ident)?.value?.toString()
             val endConstIdx = skipItemAfterHeader(trees, idIdx, semicolonOnly = true)
-            if (rawIdent != null && rawIdent != "_" && !skippedByCfg) {
+            if (rawIdent != null && rawIdent != "_" && rawIdent !in SCANNER_ITEM_KEYWORDS && !skippedByCfg) {
                 val ktConst = KotlinNamingPolicy.Default.toConstIdentifier(rawIdent)
                 registerSymbol(ktConst, subpkg)
                 extractConstOrStaticTypeLeaf(trees, idIdx, endConstIdx)?.let { leaf ->
@@ -2051,24 +2102,6 @@ private fun scanModuleTokenTrees(
                 }
             }
             i = endConstIdx
-            pendingAttrs.clear()
-            continue
-        }
-
-        // Inherent `impl <Owner> { pub [const] fn ... }` associated function parameter scanning
-        if ((cur as? TokenTree.Ident)?.value?.toString() == "impl") {
-            val endImplIdx = skipItemAfterHeader(trees, i + 1)
-            if (!skippedByCfg) {
-                scanInherentImplAssociatedFunctions(
-                    trees = trees,
-                    implKwIdx = i,
-                    endImplIdx = endImplIdx,
-                    subpkg = subpkg,
-                    rawAbiMode = rawAbiMode,
-                    registerFnSig = registerFnSig,
-                )
-            }
-            i = endImplIdx
             pendingAttrs.clear()
             continue
         }
@@ -2135,7 +2168,7 @@ private fun matchPathMacroGroupIndex(trees: List<TokenTree>, startIdx: Int): Int
 }
 
 private val SCANNER_ITEM_KEYWORDS =
-    setOf("pub", "mod", "struct", "union", "enum", "trait", "type", "const", "static", "fn", "unsafe", "async", "extern", "use", "impl")
+    setOf("pub", "mod", "struct", "union", "enum", "trait", "type", "const", "static", "fn", "unsafe", "async", "auto", "extern", "use", "impl")
 
 private fun extractLinkMacroFnIdent(innerTrees: List<TokenTree>): String? {
     if (innerTrees.size < 4 || innerTrees[0] !is TokenTree.Literal) return null

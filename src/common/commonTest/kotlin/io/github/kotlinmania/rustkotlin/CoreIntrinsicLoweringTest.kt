@@ -525,4 +525,119 @@ class CoreIntrinsicLoweringTest {
         assertContains(stdKt, "AddressableLocal(")
         assertContains(stdKt, ".asMutPtr().rawAddress")
     }
+
+    @Test
+    fun stdlibFullBuildFixesCfgParamsConstImplLocalModAndNumericConstants() {
+        val coreNs = "io.github.kotlinmania.rustlang.core"
+        val stdNs = "io.github.kotlinmania.rustlang.std"
+
+        // 1. Parameter-level #[cfg(...)] deduplicates colliding parameter names (fseeko64 pattern)
+        val libcSource =
+            """
+            extern "C" {
+                pub fn fseeko64(
+                    stream: *mut u8,
+                    #[cfg(any(not(target_os = "l4re"), all(target_os = "l4re", not(target_pointer_width = "64"))))]
+                    offset: i64,
+                    #[cfg(all(target_os = "l4re", target_pointer_width = "64"))]
+                    offset: i32,
+                    whence: i32,
+                ) -> i32;
+            }
+            """.trimIndent()
+        val libcKt =
+            renderSingleKotlinFile(
+                libcSource,
+                FileHeaderContext(
+                    packageName = "io.github.kotlinmania.rustlang.libc",
+                    projectGroup = "io.github.kotlinmania",
+                    projectNamespace = "io.github.kotlinmania.rustlang.libc",
+                    isBatchCrateOutput = true,
+                ),
+            )
+        assertEquals(1, Regex("""offset\s*:""").findAll(libcKt.text).count(), "Duplicate cfg param should be pruned:\n${libcKt.text}")
+
+        // 2. CrateTokenAbiScanner survives `const impl` and `pub const trait` to index `OneSidedRangeBound`
+        val rangeSource =
+            """
+            pub const trait RangeBounds<T> {
+                fn start_bound(&self) -> usize;
+            }
+            const impl RangeBounds<usize> for usize {
+                fn start_bound(&self) -> usize { *self }
+            }
+            pub enum OneSidedRangeBound {
+                StartInclusive,
+                End,
+                EndInclusive,
+            }
+            """.trimIndent()
+        val coreMeta =
+            buildCrateRawAbiMetadataFromSources(
+                sources = listOf("ops/range.rs" to rangeSource),
+                splitModuleRoots = true,
+            )
+        assertContains(coreMeta.symbolSubpackages["OneSidedRangeBound"].orEmpty(), "ops.range")
+        assertContains(coreMeta.symbolSubpackages["RangeBounds"].orEmpty(), "ops.range")
+
+        // 3. Block-local inline mod `sigpipe` does not emit `public` or synthesize `io.github.kotlinmania.sigpipe`
+        val unixModSource =
+            """
+            unsafe fn reset_sigpipe(handler: u8) -> bool {
+                mod sigpipe {
+                    pub const DEFAULT: u8 = 0;
+                    pub const INHERIT: u8 = 1;
+                }
+                match handler {
+                    sigpipe::DEFAULT => true,
+                    sigpipe::INHERIT => false,
+                    _ => false,
+                }
+            }
+            """.trimIndent()
+        val unixKt =
+            renderSingleKotlinFile(
+                unixModSource,
+                FileHeaderContext(
+                    packageName = "$stdNs.sys.pal.unix",
+                    projectGroup = "io.github.kotlinmania",
+                    projectNamespace = stdNs,
+                    isBatchCrateOutput = true,
+                ),
+            ).text
+        assertFalse(unixKt.contains("io.github.kotlinmania.sigpipe"), "Local mod must not leak phantom crate import:\n$unixKt")
+        assertFalse(unixKt.contains("public val DEFAULT"), "Local mod const must not emit `public`:\n$unixKt")
+
+        // 4. C numeric typedef MAX/MIN and F16/F128 IEEE-754 constants/methods avoid phantom imports
+        val numConstSource =
+            """
+            pub fn max_vals(a: f16, b: f128) -> (usize, usize, u16, U128Bits) {
+                let _ = a;
+                let _ = b;
+                (c_int::MAX as usize, c_uint::MAX as usize, f16::SIGN_MASK, f16::from_bits(1) as u16)
+            }
+            pub fn f128_mask() -> u128 {
+                f128::SIGN_MASK
+            }
+            """.trimIndent()
+        val numConstKt =
+            renderSingleKotlinFile(
+                numConstSource,
+                FileHeaderContext(
+                    packageName = "io.github.kotlinmania.rustlang.libm.math",
+                    projectGroup = "io.github.kotlinmania",
+                    projectNamespace = "io.github.kotlinmania.rustlang.libm",
+                    crateNamespaces = mapOf("core" to coreNs),
+                    isBatchCrateOutput = true,
+                ),
+            ).text
+        assertFalse(numConstKt.contains("io.github.kotlinmania.cint"), numConstKt)
+        assertFalse(numConstKt.contains("io.github.kotlinmania.cuint"), numConstKt)
+        assertFalse(numConstKt.contains("io.github.kotlinmania.f16"), numConstKt)
+        assertFalse(numConstKt.contains("io.github.kotlinmania.f128"), numConstKt)
+        assertContains(numConstKt, "Int.MAX_VALUE")
+        assertContains(numConstKt, "UInt.MAX_VALUE")
+        assertContains(numConstKt, "F16.SIGN_MASK")
+        assertContains(numConstKt, "F128.SIGN_MASK")
+    }
 }

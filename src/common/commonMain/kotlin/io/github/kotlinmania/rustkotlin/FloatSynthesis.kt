@@ -95,8 +95,23 @@ internal val SYNTHESIZED_F16_DECLARATION: String =
             public val MIN_10_EXP: Int = -4
             public val MAX_10_EXP: Int = 4
             public val BITS: UInt = 16u
+            public val SIGN_MASK: UShort = 0x8000u.toUShort()
+            public val EXP_MASK: UShort = 0x7C00u.toUShort()
+            public val SIG_MASK: UShort = 0x03FFu.toUShort()
+            public val IMPLICIT_BIT: UShort = 0x0400u.toUShort()
+            public val SIG_TOP_BIT: UShort = 0x0200u.toUShort()
+            public val SIG_BITS: UInt = 10u
+            public val EXP_BITS: UInt = 5u
+            public val EXP_SAT: UInt = 31u
+            public val EXP_BIAS: UInt = 15u
+            public val EXP_MAX: Int = 15
+            public val EXP_MIN: Int = -14
+            public val EXP_MIN_SUBNORM: Int = -24
+            public val TINY_BITS: UShort = 1u.toUShort()
+            public val MIN_POSITIVE_SUBNORMAL: F16 = F16(1u.toUShort())
 
             public fun fromBits(bits: UShort): F16 = F16(bits)
+            public fun toBits(value: F16): UShort = value.toBits()
 
             public fun fromFloat(v: Float): F16 {
                 val fb = v.toRawBits()
@@ -271,9 +286,24 @@ internal val SYNTHESIZED_F128_DECLARATION: String =
             public val MIN_10_EXP: Int = -4931
             public val MAX_10_EXP: Int = 4932
             public val BITS: UInt = 128u
+            public val SIGN_MASK: U128 = U128(0x8000_0000_0000_0000uL, 0uL)
+            public val EXP_MASK: U128 = U128(0x7FFF_0000_0000_0000uL, 0uL)
+            public val SIG_MASK: U128 = U128(0x0000_FFFF_FFFF_FFFFuL, 0xFFFF_FFFF_FFFF_FFFFuL)
+            public val IMPLICIT_BIT: U128 = U128(0x0001_0000_0000_0000uL, 0uL)
+            public val SIG_TOP_BIT: U128 = U128(0x0000_8000_0000_0000uL, 0uL)
+            public val SIG_BITS: UInt = 112u
+            public val EXP_BITS: UInt = 15u
+            public val EXP_SAT: UInt = 32767u
+            public val EXP_BIAS: UInt = 16383u
+            public val EXP_MAX: Int = 16383
+            public val EXP_MIN: Int = -16382
+            public val EXP_MIN_SUBNORM: Int = -16494
+            public val TINY_BITS: U128 = U128.ONE
+            public val MIN_POSITIVE_SUBNORMAL: F128 = F128(0uL, 1uL)
 
             public fun fromBits(bits: U128): F128 = F128(bits.high, bits.low)
             public fun fromBits(high: ULong, low: ULong): F128 = F128(high, low)
+            public fun toBits(value: F128): U128 = value.toBits()
 
             public fun fromDouble(v: Double): F128 {
                 val db = v.toRawBits().toULong()

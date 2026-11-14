@@ -1845,7 +1845,14 @@ internal fun KotlinJ2KEmitter.renderPrimitiveAssociatedConst(
                 "MIN", "MAX", "MIN_POSITIVE", "EPSILON", "INFINITY", "NEG_INFINITY", "NAN",
                 "ZERO", "ONE", "NEG_ZERO", "RADIX", "MANTISSA_DIGITS", "DIGITS",
                 "MIN_EXP", "MAX_EXP", "MIN_10_EXP", "MAX_10_EXP", "BITS",
-                -> "$owner.$c"
+                "SIGN_MASK", "EXP_MASK", "SIG_MASK", "IMPLICIT_BIT", "SIG_TOP_BIT",
+                "SIG_BITS", "EXP_BITS", "EXP_SAT", "EXP_BIAS", "EXP_MAX", "EXP_MIN",
+                "EXP_MIN_SUBNORM", "TINY_BITS", "MIN_POSITIVE_SUBNORMAL",
+                -> {
+                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.$owner")
+                    "$owner.$c"
+                }
                 else -> null
             }
         }
@@ -1882,6 +1889,39 @@ internal fun KotlinJ2KEmitter.renderPrimitiveAssociatedConst(
                     }
                     else -> "${rustTypeIdentToKotlin(prim)}.${c}_VALUE"
                 }
+            }
+        }
+        if (prim.firstOrNull()?.isLowerCase() == true && (c == "MIN" || c == "MAX" || c == "BITS")) {
+            val kind = resolveNumericKind(rustTypeIdentToKotlin(prim))
+            val mapped =
+                when (kind) {
+                    NumericKind.I8 -> "Byte" to "8u"
+                    NumericKind.U8 -> "UByte" to "8u"
+                    NumericKind.I16 -> "Short" to "16u"
+                    NumericKind.U16 -> "UShort" to "16u"
+                    NumericKind.I32 -> "Int" to "32u"
+                    NumericKind.U32 -> "UInt" to "32u"
+                    NumericKind.I64 -> "Long" to "64u"
+                    NumericKind.U64 -> "ULong" to "64u"
+                    NumericKind.I128 -> {
+                        usesI128 = true
+                        "I128" to "128u"
+                    }
+                    NumericKind.U128 -> {
+                        usesU128 = true
+                        "U128" to "128u"
+                    }
+                    NumericKind.F32 -> "Float" to "32u"
+                    NumericKind.F64 -> "Double" to "64u"
+                    else -> null
+                }
+            if (mapped != null) {
+                val (ktOwner, bitsStr) = mapped
+                if (c == "BITS") return bitsStr
+                if (c == "MIN" && (kind == NumericKind.F32 || kind == NumericKind.F64)) {
+                    return "(-$ktOwner.MAX_VALUE)"
+                }
+                return "$ktOwner.${c}_VALUE"
             }
         }
     }
@@ -2105,6 +2145,8 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
         val cleanSecond = secondRaw.removePrefix("r#")
         val firstKtType = rustTypeIdentToKotlin(firstRaw)
         if (filtered[1].arguments is PathArguments.None &&
+            firstRaw != "f16" &&
+            firstRaw != "f128" &&
             (firstRaw in PRIMITIVE_TYPE_NAMES || resolveNumericKind(firstKtType) != null) &&
             (secondRaw == "MAX" || secondRaw == "MIN")
         ) {
@@ -2117,6 +2159,7 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
             return "$firstKtType.${secondRaw}_VALUE"
         }
         if (filtered[1].arguments is PathArguments.None && (firstRaw == "u128" || firstRaw == "i128" || firstRaw == "f16" || firstRaw == "f128")) {
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
             val ownerPrim =
                 when (firstRaw) {
                     "u128" -> {
@@ -2127,8 +2170,14 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
                         usesI128 = true
                         "I128"
                     }
-                    "f16" -> "F16"
-                    else -> "F128"
+                    "f16" -> {
+                        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.F16")
+                        "F16"
+                    }
+                    else -> {
+                        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.F128")
+                        "F128"
+                    }
                 }
             val bitsCount = if (firstRaw == "f16") "16u" else "128u"
             when (cleanSecond) {
@@ -2138,6 +2187,8 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
                     val fn = if (activeCfgProfile.targetEndian == "big") "fromBeBytes" else "fromLeBytes"
                     return if (asCallee) "$ownerPrim.$fn" else "$ownerPrim::$fn"
                 }
+                "from_bits" -> if (firstRaw == "f16" || firstRaw == "f128") return if (asCallee) "$ownerPrim.fromBits" else "$ownerPrim::fromBits"
+                "to_bits" -> if (firstRaw == "f16" || firstRaw == "f128") return if (asCallee) "$ownerPrim.toBits" else "$ownerPrim::toBits"
                 "ZERO" -> return "$ownerPrim.ZERO"
                 "BITS" -> return bitsCount
             }

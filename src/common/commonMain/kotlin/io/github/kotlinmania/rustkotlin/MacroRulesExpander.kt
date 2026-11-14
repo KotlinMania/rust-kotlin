@@ -14,11 +14,14 @@ import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.ExprParse
 import io.github.kotlinmania.syn.File
 import io.github.kotlinmania.syn.FileParse
+import io.github.kotlinmania.syn.FnArg
 import io.github.kotlinmania.syn.ImplItem
 import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.Macro
 import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.ModContent
+import io.github.kotlinmania.syn.Pat
+import io.github.kotlinmania.syn.Signature
 import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.gen.Fold
@@ -993,6 +996,102 @@ internal class MacroRulesFileExpander(
         activeDefinitions.clear()
         activeDefinitions.putAll(savedDefs)
         return block.copy(stmts = expandedStmts)
+    }
+
+    override fun foldSignature(sig: Signature): Signature {
+        val folded = super.foldSignature(sig)
+        val args = folded.inputs.toList()
+        if (args.isEmpty()) return folded
+        val keptSet = linkedSetOf<Int>()
+        for ((idx, arg) in args.withIndex()) {
+            if (!isDocOnlyCfgAttribute(fnArgAttrs(arg))) {
+                keptSet += idx
+            }
+        }
+        val byCleanIdent = linkedMapOf<String, MutableList<Int>>()
+        for (idx in keptSet) {
+            val cleanIdent = fnArgCleanIdent(args[idx]) ?: continue
+            if (cleanIdent == "_") continue
+            byCleanIdent.getOrPut(cleanIdent) { mutableListOf() } += idx
+        }
+        for ((_, group) in byCleanIdent) {
+            if (group.size <= 1) continue
+            val winnerIdx = group.maxByOrNull { cfgAttrPreferenceScore(fnArgAttrs(args[it])) }!!
+            for (idx in group) {
+                if (idx != winnerIdx) keptSet.remove(idx)
+            }
+        }
+        if (keptSet.size < args.size) {
+            var idx = 0
+            folded.inputs.retain {
+                val keep = idx in keptSet
+                idx++
+                keep
+            }
+        }
+        return folded
+    }
+
+    override fun foldTypeFnPtr(ty: SynType.FnPtr): SynType.FnPtr {
+        val folded = super.foldTypeFnPtr(ty)
+        val args = folded.inputs.toList()
+        if (args.isEmpty()) return folded
+        val keptSet = linkedSetOf<Int>()
+        for ((idx, arg) in args.withIndex()) {
+            if (!isDocOnlyCfgAttribute(arg.attrs)) {
+                keptSet += idx
+            }
+        }
+        val byCleanIdent = linkedMapOf<String, MutableList<Int>>()
+        for (idx in keptSet) {
+            val cleanIdent =
+                args[idx]
+                    .name
+                    ?.ident
+                    ?.toString()
+                    ?.removePrefix("r#") ?: continue
+            if (cleanIdent == "_") continue
+            byCleanIdent.getOrPut(cleanIdent) { mutableListOf() } += idx
+        }
+        for ((_, group) in byCleanIdent) {
+            if (group.size <= 1) continue
+            val winnerIdx = group.maxByOrNull { cfgAttrPreferenceScore(args[it].attrs) }!!
+            for (idx in group) {
+                if (idx != winnerIdx) keptSet.remove(idx)
+            }
+        }
+        if (keptSet.size < args.size) {
+            var idx = 0
+            folded.inputs.retain {
+                val keep = idx in keptSet
+                idx++
+                keep
+            }
+        }
+        return folded
+    }
+
+    private fun fnArgAttrs(arg: FnArg): List<Attribute> =
+        when (arg) {
+            is FnArg.Receiver -> arg.attrs
+            is FnArg.Typed -> arg.patType.attrs
+        }
+
+    private fun fnArgCleanIdent(arg: FnArg): String? =
+        (arg as? FnArg.Typed)?.let {
+            (it.patType.pat as? Pat.Ident)?.ident?.toString()?.removePrefix("r#")
+        }
+
+    private fun cfgAttrPreferenceScore(attrs: List<Attribute>): Int {
+        val cfgPredicates =
+            attrs.mapNotNull { attr ->
+                val meta = attr.meta
+                if (meta is Meta.List && meta.path.isIdent("cfg")) meta.tokens.clone().toList() else null
+            }
+        if (cfgPredicates.isEmpty()) return 1
+        if (cfgPredicates.all { evalCfgTriState(it, forRuntimeCfgMacro = false) == true }) return 3
+        if (cfgPredicates.all { evalCfgExpressionTokens(it) }) return 2
+        return 0
     }
 
     override fun foldType(t: SynType): SynType {
