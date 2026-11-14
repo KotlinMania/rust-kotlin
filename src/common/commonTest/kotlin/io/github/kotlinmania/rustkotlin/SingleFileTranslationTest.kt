@@ -1098,7 +1098,8 @@ class SingleFileTranslationTest {
             files.writes.getValue(
                 "/proj/src/native/nativeMain/kotlin/io/github/kotlinmania/libc/new/common/posix/StdlibNativeActuals.kt",
             )
-        assertContains(nativeKt, "@file:OptIn(kotlinx.cinterop.ExperimentalForeignApi::class")
+        assertContains(nativeKt, "@file:OptIn(ExperimentalForeignApi::class")
+        assertContains(nativeKt, "import kotlinx.cinterop.ExperimentalForeignApi")
         assertContains(nativeKt, "public actual fun realloc(p: MutPtr, size: ULong): MutPtr")
         assertContains(nativeKt, "public actual fun strchr(cs: ConstPtr, c: Int): MutPtr")
         assertContains(nativeKt, "MutPtr(libcStdlibRealloc(p.rawAddress.toCPointer<ByteVar>(), size)?.toLong() ?: 0L)")
@@ -4634,5 +4635,171 @@ class SingleFileTranslationTest {
         assertContains(kt, "import io.github.kotlinmania.rustlang.core.ffi.CStr")
         assertContains(kt, "import io.github.kotlinmania.rustlang.alloc.ffi.CString")
         assertContains(kt, "fun ffiRoundtrip(code: CInt, ch: CChar, s: CStr): CString")
+    }
+
+    @Test fun cfgSelectTargetHasAtomicAndNonCompilingRustdocFences() {
+        val source =
+            """
+            /// Example:
+            /// ```ignore
+            /// let skipped = ...;
+            /// ```
+            /// ```rust
+            /// let a = ...;
+            /// ```
+            pub fn pick_exit() -> i32 {
+                cfg_select! {
+                    target_os = "hermit" => { 10 }
+                    all(target_has_atomic = "64", target_os = "macos") => { 42 }
+                    _ => { 0 }
+                }
+            }
+            """.trimIndent()
+        val kt =
+            renderSingleKotlinFile(
+                source,
+                FileHeaderContext(
+                    packageName = "io.github.kotlinmania.rustlang.std.sys.exit",
+                    projectGroup = "io.github.kotlinmania",
+                    projectNamespace = "io.github.kotlinmania.rustlang.std",
+                    portLintDirective = "none",
+                    cfgTargetProfile =
+                        CfgTargetProfile(
+                            pointerWidth = 64,
+                            targetArch = "aarch64",
+                            targetOs = "macos",
+                            targetFamilies = setOf("unix"),
+                        ),
+                ),
+            ).text
+        assertContains(kt, "```ignore")
+        assertContains(kt, "let skipped = ...;")
+        assertContains(kt, "```kotlin")
+        assertContains(kt, "return 42")
+        assertFalse(kt.contains("cfgSelect("), "cfg_select! should expand statically:\n$kt")
+    }
+
+    @Test fun tupleStructDestructuringMutBorrowAndValueBinding() {
+        val source =
+            """
+            pub struct Buf(pub Vec<u8>);
+
+            impl Buf {
+                pub fn push_byte(&mut self, b: u8) {
+                    let Self(inner) = self;
+                    inner.push(b);
+                }
+
+                pub fn take_len(self) -> usize {
+                    let Buf(v) = self;
+                    v.len()
+                }
+            }
+            """.trimIndent()
+        val kt = renderSingleKotlinFile(source).text
+        assertContains(kt, "var inner by run {")
+        assertContains(kt, "kotlin.properties.ReadWriteProperty<Any?, V>")
+        assertContains(kt, "place({ this.value }, { this.value = it })")
+        assertContains(kt, "val v = this.value")
+        assertFalse(kt.contains("val (inner)"), "TupleStruct destructuring must not emit Kotlin component destructuring:\n$kt")
+    }
+
+    @Test fun hoistedLocalFnOptionInferenceEmptyListEnvAndTailUnsafeReturn() {
+        val source =
+            """
+            use core::slice::memchr;
+
+            pub struct Env(pub Vec<(String, String)>);
+            impl Env {
+                pub fn new(entries: Vec<(String, String)>) -> Self {
+                    Env(entries)
+                }
+            }
+
+            pub fn read_env(bytes: &[u8]) -> Env {
+                unsafe {
+                    let mut result = Vec::new();
+                    if let Some(entry) = parse(bytes) {
+                        result.push(entry);
+                    }
+                    return Env::new(result);
+                }
+
+                fn parse(input: &[u8]) -> Option<(String, String)> {
+                    if input.is_empty() {
+                        return None;
+                    }
+                    let pos = memchr::memchr(b'=', &input[1..]).map(|p| p + 1);
+                    pos.map(|p| {
+                        let head = input[..p].to_vec();
+                        let _ = head;
+                        (String::new(), String::new())
+                    })
+                }
+            }
+
+            pub fn opt_flatten(r: Result<Option<i32>, i32>) -> Option<i32> {
+                r.ok().flatten()
+            }
+            """.trimIndent()
+        val kt = renderSingleKotlinFile(source).text
+        assertContains(kt, "var result = mutableListOf<Pair<String, String>>()")
+        assertContains(kt, ".slice(1 until input.size)))?.let({")
+        assertContains(kt, "return pos?.let({")
+        assertContains(kt, "return Env.new(result)")
+        assertFalse(kt.contains("return run {"), "Tail unsafe ending in return should not emit unreachable outer return:\n$kt")
+        assertFalse(kt.contains(".toVec()"), "Byte slice .to_vec() should lower to .toMutableList():\n$kt")
+        assertFalse(kt.contains(".flatten()"), "Option .flatten() should erase in Kotlin:\n$kt")
+    }
+
+    @Test fun ioResultPoisonErrorIntoInnerDropMapAndTraitCompanion() {
+        val source =
+            """
+            use crate::io;
+
+            pub struct Holder(pub Vec<u8>);
+
+            pub trait HolderExt {
+                fn from_bytes_vec(vec: Vec<u8>) -> Self;
+            }
+
+            impl HolderExt for Holder {
+                fn from_bytes_vec(vec: Vec<u8>) -> Self {
+                    Holder(vec)
+                }
+            }
+
+            pub fn use_helpers(res: Result<(), i32>, r: io::Result<()>) -> Result<(), i32> {
+                let _ = HolderExt::from_bytes_vec(Vec::new());
+                let _ = r;
+                res.map(drop)
+            }
+
+            pub fn poison_mapper<T>(p: PoisonError<T>) -> T {
+                let f: fn(PoisonError<T>) -> T = PoisonError::into_inner;
+                f(p)
+            }
+
+            pub fn trait_ref_mapper() -> fn(Vec<u8>) -> Holder {
+                HolderExt::from_bytes_vec
+            }
+            """.trimIndent()
+        val kt =
+            renderSingleKotlinFile(
+                source,
+                FileHeaderContext(
+                    packageName = "io.github.kotlinmania.rustlang.std.sample",
+                    projectGroup = "io.github.kotlinmania",
+                    projectNamespace = "io.github.kotlinmania.rustlang.std",
+                    portLintDirective = "none",
+                ),
+            ).text
+        assertContains(kt, "import io.github.kotlinmania.rustlang.std.io.error.Error")
+        assertContains(kt, "r: Result<Unit, Error>")
+        assertContains(kt, "res.map({ Unit })")
+        assertContains(kt, "public companion object {")
+        assertContains(kt, "public fun fromBytesVec(vec: List<UByte>): Holder = Holder.fromBytesVec(vec)")
+        assertContains(kt, "{ it.intoInner() }")
+        assertContains(kt, "{ HolderExt.fromBytesVec(it) }")
     }
 }

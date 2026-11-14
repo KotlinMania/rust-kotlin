@@ -1166,11 +1166,11 @@ internal class FfiInteropCollector(
         cinteropPkg: String,
     ): String {
         val sb = StringBuilder()
-        sb.append("@file:OptIn(kotlinx.cinterop.ExperimentalForeignApi::class, kotlin.ExperimentalUnsignedTypes::class)\n\n")
+        sb.append("@file:OptIn(ExperimentalForeignApi::class, ExperimentalUnsignedTypes::class)\n\n")
         if (!pkgName.isNullOrBlank()) {
             sb.append("package ").append(pkgName).append("\n\n")
         }
-        val imports = linkedSetOf<String>()
+        val imports = linkedSetOf("kotlinx.cinterop.ExperimentalForeignApi")
 
         val actualBlocks = mutableListOf<String>()
         val emittedActuals = linkedSetOf<String>()
@@ -1386,7 +1386,7 @@ internal class FfiInteropCollector(
         }
         val rawIdents = extractIdentifierTokens(bodyText, includeBuiltins = true)
         importsOut.retainAll { existing ->
-            if (existing.endsWith(".*")) {
+            if (existing.endsWith(".*") || existing == "kotlinx.cinterop.ExperimentalForeignApi") {
                 true
             } else {
                 val aliasSep = existing.indexOf(" as ")
@@ -1540,7 +1540,7 @@ internal class FfiInteropCollector(
 
     private fun buildWasmWasiActualsKotlinContent(pkgName: String?): String {
         val sb = StringBuilder()
-        sb.append("@file:OptIn(kotlin.ExperimentalUnsignedTypes::class, kotlin.wasm.ExperimentalWasmInterop::class)\n\n")
+        sb.append("@file:OptIn(ExperimentalUnsignedTypes::class, ExperimentalWasmInterop::class)\n\n")
         if (!pkgName.isNullOrBlank()) {
             sb.append("package ").append(pkgName).append("\n\n")
         }
@@ -1736,7 +1736,7 @@ internal class FfiInteropCollector(
         ffiModName: String,
     ): String {
         val sb = StringBuilder()
-        sb.append("@file:OptIn(kotlin.ExperimentalUnsignedTypes::class, kotlin.js.ExperimentalWasmJsInterop::class)\n\n")
+        sb.append("@file:OptIn(ExperimentalUnsignedTypes::class, ExperimentalWasmJsInterop::class)\n\n")
         if (!pkgName.isNullOrBlank()) {
             sb.append("package ").append(pkgName).append("\n\n")
         }
@@ -2622,7 +2622,7 @@ internal class FfiInteropCollector(
         includeJarResourceLoader: Boolean = true,
     ): String {
         val sb = StringBuilder()
-        sb.append("@file:OptIn(kotlin.ExperimentalUnsignedTypes::class)\n\n")
+        sb.append("@file:OptIn(ExperimentalUnsignedTypes::class)\n\n")
         if (!pkgName.isNullOrBlank()) {
             sb.append("package ").append(pkgName).append("\n\n")
         }
@@ -2872,8 +2872,44 @@ internal class FfiInteropCollector(
     ): String {
         val sb = StringBuilder()
         sb.append("#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n")
-        sb.append("#include <jni.h>\n")
         sb.append("#include <stdbool.h>\n")
+        sb.append("#include <stdint.h>\n")
+        sb.append("#if defined(__has_include)\n")
+        sb.append("#  if __has_include(<jni.h>)\n")
+        sb.append("#    include <jni.h>\n")
+        sb.append("#    define KM_HAS_JNI_H 1\n")
+        sb.append("#  endif\n")
+        sb.append("#endif\n")
+        sb.append("#ifndef KM_HAS_JNI_H\n")
+        sb.append("typedef uint8_t jboolean;\n")
+        sb.append("typedef int8_t jbyte;\n")
+        sb.append("typedef uint16_t jchar;\n")
+        sb.append("typedef int16_t jshort;\n")
+        sb.append("typedef int32_t jint;\n")
+        sb.append("typedef int64_t jlong;\n")
+        sb.append("typedef float jfloat;\n")
+        sb.append("typedef double jdouble;\n")
+        sb.append("typedef jint jsize;\n")
+        sb.append("typedef void* jobject;\n")
+        sb.append("typedef jobject jclass;\n")
+        sb.append("typedef jobject jstring;\n")
+        sb.append("typedef jobject jthrowable;\n")
+        sb.append("typedef jobject jarray;\n")
+        sb.append("typedef jarray jbyteArray;\n")
+        sb.append("struct JNINativeInterface_;\n")
+        sb.append("typedef const struct JNINativeInterface_* JNIEnv;\n")
+        sb.append("struct JNINativeInterface_ {\n")
+        sb.append("    const char* (*GetStringUTFChars)(JNIEnv*, jstring, jboolean*);\n")
+        sb.append("    void (*ReleaseStringUTFChars)(JNIEnv*, jstring, const char*);\n")
+        sb.append("};\n")
+        sb.append("#ifdef _WIN32\n")
+        sb.append("#  define JNIEXPORT __declspec(dllexport)\n")
+        sb.append("#  define JNICALL __stdcall\n")
+        sb.append("#else\n")
+        sb.append("#  define JNIEXPORT __attribute__((visibility(\"default\")))\n")
+        sb.append("#  define JNICALL\n")
+        sb.append("#endif\n")
+        sb.append("#endif\n")
         sb.append("#include <stddef.h>\n")
         sb.append("#include <stdint.h>\n")
         sb.append("#include <stdlib.h>\n")
@@ -3333,7 +3369,7 @@ internal class FfiInteropCollector(
         ffiModName: String,
     ): String {
         val sb = StringBuilder()
-        sb.append("@file:OptIn(kotlin.ExperimentalUnsignedTypes::class)\n\n")
+        sb.append("@file:OptIn(ExperimentalUnsignedTypes::class)\n\n")
         if (!pkgName.isNullOrBlank()) {
             sb.append("package ").append(pkgName).append("\n\n")
         }

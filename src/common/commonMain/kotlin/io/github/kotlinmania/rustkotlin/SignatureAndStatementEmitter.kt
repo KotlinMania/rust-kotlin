@@ -9,6 +9,7 @@ import io.github.kotlinmania.syn.Arm
 import io.github.kotlinmania.syn.BinOp
 import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
+import io.github.kotlinmania.syn.FieldValue
 import io.github.kotlinmania.syn.FnArg
 import io.github.kotlinmania.syn.GenericArgument
 import io.github.kotlinmania.syn.GenericParam
@@ -16,6 +17,7 @@ import io.github.kotlinmania.syn.Generics
 import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.Lit
 import io.github.kotlinmania.syn.Macro
+import io.github.kotlinmania.syn.Member
 import io.github.kotlinmania.syn.Pat
 import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
@@ -1685,10 +1687,36 @@ internal fun KotlinJ2KEmitter.renderBlock(
     val prevFnParamNumericKinds = currentFunctionParamNumericKinds
     val blockEntryExpectedKind = currentExpectedNumericKind
     val blockEntryTailExpectsUnitResultOk = currentTailExpectsUnitResultOk
+    val savedBlockLocalFnRawNames = hashSetOf<String>()
+    val prevBlockLocalFnReturnSynTypes = linkedMapOf<String, SynType?>()
     currentExpectedNumericKind = null
     currentTailExpectsUnitResultOk = false
     scopeBuilder.enterCompr()
     try {
+        for (stmt in stmts) {
+            val fnItem = (stmt as? Stmt.ItemStmt)?.item as? Item.Fn ?: continue
+            if (itemHasDocOnlyCfg(fnItem)) continue
+            val cleanRaw =
+                fnItem.sig.ident
+                    .toString()
+                    .removePrefix("r#")
+            if (cleanRaw !in inspector.declaredTopLevelFnRawNames) {
+                savedBlockLocalFnRawNames += cleanRaw
+                inspector.declaredTopLevelFnRawNames += cleanRaw
+            }
+            val retOut = fnItem.sig.output as? ReturnType.TypeReturn
+            if (retOut != null) {
+                val ktFn = rustFunctionIdentToKotlin(fnItem.sig.ident.toString())
+                if (cleanRaw !in prevBlockLocalFnReturnSynTypes) {
+                    prevBlockLocalFnReturnSynTypes[cleanRaw] = inspector.topLevelFnReturnSynTypes[cleanRaw]
+                }
+                if (ktFn !in prevBlockLocalFnReturnSynTypes) {
+                    prevBlockLocalFnReturnSynTypes[ktFn] = inspector.topLevelFnReturnSynTypes[ktFn]
+                }
+                inspector.topLevelFnReturnSynTypes[cleanRaw] = retOut.ty
+                inspector.topLevelFnReturnSynTypes[ktFn] = retOut.ty
+            }
+        }
         val blockFnParamKinds = linkedMapOf<String, List<NumericKind?>?>()
         for (stmt in stmts) {
             val fnItem = (stmt as? Stmt.ItemStmt)?.item as? Item.Fn ?: continue
@@ -1811,6 +1839,14 @@ internal fun KotlinJ2KEmitter.renderBlock(
             sanitizeBatchBlockLocals(lines)
         }
     } finally {
+        inspector.declaredTopLevelFnRawNames.removeAll(savedBlockLocalFnRawNames)
+        for ((fnKey, prevSyn) in prevBlockLocalFnReturnSynTypes) {
+            if (prevSyn == null) {
+                inspector.topLevelFnReturnSynTypes.remove(fnKey)
+            } else {
+                inspector.topLevelFnReturnSynTypes[fnKey] = prevSyn
+            }
+        }
         currentExpectedNumericKind = blockEntryExpectedKind
         currentTailExpectsUnitResultOk = blockEntryTailExpectsUnitResultOk
         currentBorrowedPlaceLocals = prevBorrowedPlaceLocals
@@ -2489,7 +2525,27 @@ internal fun KotlinJ2KEmitter.renderTailReturnExpr(expr: Expr, indent: String, s
     if (headerContext.isBatchCrateOutput && rendered.trimStart().startsWith("error(")) {
         return "$indent$rendered"
     }
+    if (blockEndsWithUnconditionalDiverge(expr)) {
+        return "$indent$rendered"
+    }
     return "${indent}return $rendered"
+}
+
+private fun KotlinJ2KEmitter.blockEndsWithUnconditionalDiverge(expr: Expr): Boolean {
+    val u = unwrapParenOrGroupExpr(expr)
+    val block =
+        when (u) {
+            is Expr.BlockExpr -> u.block
+            is Expr.Unsafe -> u.block
+            else -> return false
+        }
+    val lastStmt = block.stmts.lastOrNull { it !is Stmt.ItemStmt } ?: return false
+    if (lastStmt !is Stmt.ExprStmt) return false
+    return when (val inner = unwrapParenOrGroupExpr(lastStmt.expr)) {
+        is Expr.Return, is Expr.Break, is Expr.Continue, is Expr.Loop -> true
+        is Expr.BlockExpr, is Expr.Unsafe -> blockEndsWithUnconditionalDiverge(inner)
+        else -> false
+    }
 }
 
 internal fun KotlinJ2KEmitter.recordLocalInferredType(
@@ -2739,6 +2795,9 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
     if (unwrappedPat is Pat.Struct && diverge == null) {
         return renderStructDestructuringLocal(unwrappedPat, rhs, local.span(), indent, selfTypeName)
     }
+    if (unwrappedPat is Pat.TupleStruct && diverge == null) {
+        renderTupleStructDestructuringLocal(unwrappedPat, initExpr, rhs, local.span(), indent, selfTypeName)?.let { return it }
+    }
     val divergeBody =
         if (diverge != null) {
             val divergeExpr = diverge.expr
@@ -2764,12 +2823,16 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
         )
     var typeAnnotation = rawTypeAnnotation
     if (rhs == "mutableListOf()" && typeAnnotation == null) {
-        val inferredElem = inferEmptyListElementTypeFromReturn(currentEnclosingReturnRenderedType)
+        val inferredElem =
+            inferEmptyListElementTypeFromReturn(currentEnclosingReturnRenderedType)
+                ?: inferEmptyListElementTypeFromRemainingStmts(pat, remainingStmts, selfTypeName)
         if (inferredElem != null) {
             rhs = "mutableListOf<$inferredElem>()"
         }
     } else if (rhs.startsWith("ArrayList(") && typeAnnotation == null) {
-        val inferredElem = inferEmptyListElementTypeFromReturn(currentEnclosingReturnRenderedType)
+        val inferredElem =
+            inferEmptyListElementTypeFromReturn(currentEnclosingReturnRenderedType)
+                ?: inferEmptyListElementTypeFromRemainingStmts(pat, remainingStmts, selfTypeName)
         if (inferredElem != null) {
             rhs = "ArrayList<$inferredElem>(${rhs.removePrefix("ArrayList(")}"
         }
@@ -2902,7 +2965,7 @@ internal fun KotlinJ2KEmitter.renderStructDestructuringLocal(
 internal fun KotlinJ2KEmitter.inferEmptyListElementTypeFromReturn(enclosingRet: String?): String? {
     if (enclosingRet == null) return null
     val unwrappedResult =
-        if (enclosingRet.startsWith("Result<") && enclosingRet.endsWith(">")) {
+        if (enclosingRet.substringBefore('<').substringAfterLast('.').trim() == "Result" && enclosingRet.endsWith(">")) {
             rustResultOkPayloadType(enclosingRet) ?: enclosingRet
         } else {
             enclosingRet
@@ -2912,10 +2975,207 @@ internal fun KotlinJ2KEmitter.inferEmptyListElementTypeFromReturn(enclosingRet: 
             unwrappedResult.removePrefix("List<").removeSuffix(">").trim()
         unwrappedResult.startsWith("MutableList<") && unwrappedResult.endsWith(">") ->
             unwrappedResult.removePrefix("MutableList<").removeSuffix(">").trim()
+        unwrappedResult.startsWith("ArrayList<") && unwrappedResult.endsWith(">") ->
+            unwrappedResult.removePrefix("ArrayList<").removeSuffix(">").trim()
+        unwrappedResult.startsWith("ArrayDeque<") && unwrappedResult.endsWith(">") ->
+            unwrappedResult.removePrefix("ArrayDeque<").removeSuffix(">").trim()
         unwrappedResult.startsWith("IntoIter<") && unwrappedResult.endsWith(">") ->
             unwrappedResult.removePrefix("IntoIter<").removeSuffix(">").trim()
         else -> null
     }
+}
+
+private fun KotlinJ2KEmitter.inferEmptyListElementTypeFromRemainingStmts(
+    pat: Pat,
+    remainingStmts: List<Stmt>,
+    selfTypeName: String?,
+): String? {
+    if (remainingStmts.isEmpty()) return null
+    val identPat = unwrapTransparentPat(pat) as? Pat.Ident ?: return null
+    if (identPat.subpat != null) return null
+    val rawLocalName = identPat.ident.toString().removePrefix("r#")
+    if (rawLocalName == "_") return null
+
+    fun isTargetLocalPath(e: Expr): Boolean {
+        val u = unwrapParenOrGroupExpr(e) as? Expr.Path ?: return false
+        return u.qself == null &&
+            u.path.segments.len() == 1 &&
+            u.path.segments
+                .first()
+                ?.ident
+                ?.toString()
+                ?.removePrefix("r#") == rawLocalName
+    }
+
+    fun isConcreteElemType(ty: String?): Boolean =
+        ty != null &&
+            ty.isNotBlank() &&
+            ty != "Any" &&
+            ty != "Any?" &&
+            ty != "Nothing" &&
+            ty != "Unit" &&
+            ty != "_" &&
+            !ty.contains("RustAny")
+
+    fun resolveStructFieldElem(typeName: String, fieldName: String? = null): String? {
+        val synMap = inspector.structFieldSynTypesByType[typeName]
+        val localRendered =
+            if (fieldName != null) {
+                synMap?.get(fieldName)?.let { renderType(it, selfTypeName) }
+            } else {
+                synMap?.values?.singleOrNull()?.let { renderType(it, selfTypeName) }
+            }
+        val rendered =
+            localRendered
+                ?: scopedAbiKeysForRenderedType(typeName).firstNotNullOfOrNull { key ->
+                    if (fieldName != null) {
+                        headerContext.crateStructFieldTypes["$key.$fieldName"]
+                    } else {
+                        headerContext.crateStructFieldTypes["$key.value"]
+                            ?: headerContext.crateStructFieldTypes.entries
+                                .singleOrNull { it.key.startsWith("$key.") }
+                                ?.value
+                    }
+                }
+                ?: if (fieldName != null) {
+                    headerContext.crateStructFieldTypes["$typeName.$fieldName"]
+                } else {
+                    headerContext.crateStructFieldTypes["$typeName.value"]
+                }
+        return rendered?.let(::inferEmptyListElementTypeFromReturn)?.takeIf(::isConcreteElemType)
+    }
+
+    val ifLetBoundTypes = linkedMapOf<String, String>()
+    var inferred: String? = null
+    val visitor =
+        object : Visit() {
+            override fun visitExprLet(e: Expr.Let) {
+                super.visitExprLet(e)
+                val tsPat = unwrapTransparentPat(e.pat) as? Pat.TupleStruct
+                val innerIdent =
+                    if (tsPat != null && isOptionSomeTupleStructPat(tsPat)) {
+                        (
+                            tsPat.elems
+                                .toList()
+                                .singleOrNull()
+                                ?.let(::unwrapTransparentPat) as? Pat.Ident
+                        )?.takeIf { it.subpat == null }
+                            ?.ident
+                            ?.toString()
+                            ?.removePrefix("r#")
+                    } else {
+                        null
+                    }
+                if (innerIdent != null) {
+                    val scrutineeTy = inferExprRenderedType(e.expr, selfTypeName)
+                    if (scrutineeTy != null && scrutineeTy.endsWith("?")) {
+                        val unwrapped = scrutineeTy.removeSuffix("?").trim()
+                        if (isConcreteElemType(unwrapped)) {
+                            ifLetBoundTypes[innerIdent] = unwrapped
+                        }
+                    }
+                }
+            }
+
+            override fun visitExprMethodCall(e: Expr.MethodCall) {
+                if (inferred == null &&
+                    e.method.toString().removePrefix("r#") == "push" &&
+                    e.args.size == 1 &&
+                    isTargetLocalPath(e.receiver)
+                ) {
+                    val arg = e.args[0]
+                    val argIdent =
+                        (unwrapParenOrGroupExpr(arg) as? Expr.Path)
+                            ?.takeIf { it.qself == null && it.path.segments.len() == 1 }
+                            ?.path
+                            ?.segments
+                            ?.first()
+                            ?.ident
+                            ?.toString()
+                            ?.removePrefix("r#")
+                    val candidate =
+                        argIdent?.let { ifLetBoundTypes[it] }
+                            ?: inferExprRenderedType(arg, selfTypeName)
+                    if (isConcreteElemType(candidate)) {
+                        inferred = candidate
+                    }
+                }
+                super.visitExprMethodCall(e)
+            }
+
+            override fun visitExprCall(e: Expr.Call) {
+                if (inferred == null && e.args.size == 1 && isTargetLocalPath(e.args[0])) {
+                    val callPath = (unwrapParenOrGroupExpr(e.func) as? Expr.Path)?.takeIf { it.qself == null }
+                    val segs =
+                        callPath
+                            ?.path
+                            ?.segments
+                            ?.toList()
+                            .orEmpty()
+                    val ownerRaw =
+                        when {
+                            segs.size == 1 && segs[0]
+                                .ident
+                                .toString()
+                                .firstOrNull()
+                                ?.isUpperCase() == true ->
+                                segs[0].ident.toString()
+                            segs.size >= 2 && segs[segs.lastIndex - 1]
+                                .ident
+                                .toString()
+                                .firstOrNull()
+                                ?.isUpperCase() == true ->
+                                segs[segs.lastIndex - 1].ident.toString()
+                            else -> null
+                        }
+                    val ownerKt =
+                        when (ownerRaw) {
+                            null -> null
+                            "Self" -> selfTypeName?.substringBefore('<')?.trim()
+                            else -> rustTypeIdentToKotlin(ownerRaw)
+                        }
+                    if (ownerKt != null) {
+                        inferred = resolveStructFieldElem(ownerKt)
+                    }
+                }
+                super.visitExprCall(e)
+            }
+
+            override fun visitExprStruct(e: Expr.Struct) {
+                if (inferred == null) {
+                    val rawCtor =
+                        e.path.segments
+                            .last()
+                            ?.ident
+                            ?.toString()
+                    val ownerKt =
+                        when (rawCtor) {
+                            null -> null
+                            "Self" -> selfTypeName?.substringBefore('<')?.trim()
+                            else -> rustTypeIdentToKotlin(rawCtor)
+                        }
+                    if (ownerKt != null) {
+                        val fieldCount = e.fields.len()
+                        for (fv: FieldValue in e.fields.toList()) {
+                            if (!isTargetLocalPath(fv.expr)) continue
+                            val fieldName =
+                                when (val m = fv.member) {
+                                    is Member.Named -> rustFieldIdentToKotlin(m.ident.toString())
+                                    is Member.Unnamed -> tupleFieldPropertyName(m.index.index.toInt(), fieldCount)
+                                }
+                            inferred = resolveStructFieldElem(ownerKt, fieldName)
+                            if (inferred != null) break
+                        }
+                    }
+                }
+                super.visitExprStruct(e)
+            }
+        }
+    for (stmt in remainingStmts) {
+        if (inferred != null) break
+        visitor.visitStmt(stmt)
+    }
+    return inferred
 }
 
 internal fun KotlinJ2KEmitter.isSideEffectFreeExpr(expr: Expr): Boolean =
@@ -3462,4 +3722,99 @@ private fun KotlinJ2KEmitter.renderAddressableLocal(
     CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.AddressableLocal")
     val storageDecl = "${indent}val $storage = AddressableLocal($rhs, $codec)"
     return if (boundVarUsed) "$storageDecl\n${indent}$boundKeyword $boundName by $storage" else storageDecl
+}
+
+private fun KotlinJ2KEmitter.renderTupleStructDestructuringLocal(
+    pat: Pat.TupleStruct,
+    initExpr: Expr?,
+    rhs: String,
+    span: Span,
+    indent: String,
+    selfTypeName: String?,
+): String? {
+    if (isOptionSomeTupleStructPat(pat) || coreResultVariantMatchInfo(pat) != null) return null
+    val elems = pat.elems.toList()
+    val bindings = mutableListOf<Triple<Int, Pat.Ident, Boolean>>()
+    for ((idx, elemPat) in elems.withIndex()) {
+        if (elemPat is Pat.Rest || elemPat is Pat.Wild) continue
+        val inner = unwrapTransparentPat(elemPat)
+        if (inner is Pat.Wild) continue
+        if (inner is Pat.Ident && inner.subpat == null) {
+            if (inner.ident.toString().removePrefix("r#") == "_") continue
+            bindings += Triple(idx, inner, isMutablePattern(elemPat))
+        } else {
+            return null
+        }
+    }
+    val rhsTrimmed = rhs.trim()
+    if (bindings.isEmpty()) {
+        return if (initExpr != null && !isSideEffectFreeExpr(initExpr)) "$indent$rhsTrimmed" else ""
+    }
+    val rawPathLast =
+        pat.path.segments
+            .last()
+            ?.ident
+            ?.toString()
+    val structTypeName =
+        if (pat.path.segments.size == 1 && rawPathLast == "Self" && selfTypeName != null) {
+            selfTypeName.substringBefore('<')
+        } else {
+            renderPathAsType(pat.path, selfTypeName).substringBefore('<')
+        }
+    val unwrappedInit = initExpr?.let { unwrapParenOrGroupExpr(it) }
+    val isMutBorrow =
+        when {
+            unwrappedInit is Expr.Reference && unwrappedInit.mutability != null -> true
+            unwrappedInit is Expr.Path &&
+                unwrappedInit.qself == null &&
+                unwrappedInit.path.isIdent("self") &&
+                currentReceiverIsMutBorrow -> true
+            else -> false
+        }
+    val lines = mutableListOf<String>()
+    val receiverVar =
+        if (rhsTrimmed == "this" || rhsTrimmed.matches(Regex("[A-Za-z_][A-Za-z0-9_]*"))) {
+            rhsTrimmed
+        } else {
+            val tmp = scopeBuilder.bindLocal("_tupleStruct", "tupleStructVal", span).kotlinName
+            lines += "${indent}val $tmp = $rhsTrimmed"
+            tmp
+        }
+    val arity = elems.size
+    for ((idx, identPat, isMutBinding) in bindings) {
+        val raw = identPat.ident.toString().removePrefix("r#")
+        val fieldProp = tupleFieldPropertyName(idx, arity)
+        val fieldTy =
+            inspector.structFieldSynTypesByType[structTypeName]?.get(fieldProp)?.let { renderType(it, selfTypeName) }
+                ?: scopedAbiKeysForRenderedType(structTypeName).firstNotNullOfOrNull {
+                    headerContext.crateStructFieldTypes["$it.$fieldProp"]
+                }
+                ?: headerContext.crateStructFieldTypes["$structTypeName.$fieldProp"]
+        val assignCount = if (isMutBorrow || isMutBinding) AssignCount.Any else AssignCount.AtMostOnce
+        val ktVar = scopeBuilder.bindLocal(raw, rustValueIdentToKotlin(raw), identPat.ident.span(), assignCount = assignCount).kotlinName
+        if (fieldTy != null) {
+            currentTypedLocals = currentTypedLocals + (ktVar to fieldTy)
+            val fieldHead = fieldTy.substringBefore('<')
+            if (fieldHead in setOf("MutableList", "ArrayList", "Vec", "List")) {
+                currentMutableListLocals = currentMutableListLocals + ktVar
+            } else if (fieldHead in setOf("VecDeque", "ArrayDeque")) {
+                currentDequeLocals = currentDequeLocals + ktVar
+            }
+        }
+        if (isMutBorrow) {
+            lines += "${indent}var $ktVar by run {"
+            lines += "$indent    fun <V> place(read: () -> V, write: (V) -> Unit): kotlin.properties.ReadWriteProperty<Any?, V> ="
+            lines += "$indent        object : kotlin.properties.ReadWriteProperty<Any?, V> {"
+            lines += "$indent            override fun getValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>): V = read()"
+            lines += "$indent            override fun setValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>, value: V) = write(value)"
+            lines += "$indent        }"
+            lines += "$indent    place({ $receiverVar.$fieldProp }, { $receiverVar.$fieldProp = it })"
+            lines += "$indent}"
+            currentBorrowedPlaceLocals = currentBorrowedPlaceLocals + ktVar
+        } else {
+            val kw = if (isMutBinding) "var" else "val"
+            lines += "$indent$kw $ktVar = $receiverVar.$fieldProp"
+        }
+    }
+    return lines.joinToString("\n")
 }

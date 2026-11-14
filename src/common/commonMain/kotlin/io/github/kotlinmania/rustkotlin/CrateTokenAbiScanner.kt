@@ -56,6 +56,7 @@ internal data class CrateRawAbiMetadata(
 internal data class ExternalCrateAbiMetadata(
     val symbolPackages: Map<String, Map<String, List<String>>> = emptyMap(),
     val twoFieldResultFns: Set<String> = emptySet(),
+    val nullableReturnFns: Set<String> = emptySet(),
 )
 
 private var diskCrateRawAbiMetadataCache: Map<String, CrateRawAbiMetadata> = emptyMap()
@@ -1083,12 +1084,19 @@ internal fun collectCfgDisabledChildModuleRelPrefixes(
                         continue
                     }
                 }
-                if ((cur is TokenTree.Ident && cur.value.toString() == "cfg_if") &&
+                val curIdent = (cur as? TokenTree.Ident)?.value?.toString()
+                val nextGrp = (trees.getOrNull(idx + 2) as? TokenTree.Group)?.value
+                if ((curIdent == "cfg_if" || curIdent == "cfg_select") &&
                     (trees.getOrNull(idx + 1) as? TokenTree.Punct)?.value?.asChar() == '!' &&
-                    (trees.getOrNull(idx + 2) as? TokenTree.Group)?.value?.delimiter() == Delimiter.Brace
+                    (nextGrp?.delimiter() == Delimiter.Brace || nextGrp?.delimiter() == Delimiter.Parenthesis)
                 ) {
-                    val innerTrees = (trees[idx + 2] as TokenTree.Group).value.stream().toList()
-                    val branchBodies = partitionCfgIfBranchBodies(innerTrees)
+                    val innerTrees = nextGrp.stream().toList()
+                    val branchBodies =
+                        if (curIdent == "cfg_select") {
+                            partitionCfgSelectBranchBodies(innerTrees)
+                        } else {
+                            partitionCfgIfBranchBodies(innerTrees)
+                        }
                     if (branchBodies != null) {
                         for ((bodyTokens, isActive) in branchBodies) {
                             scanTreesForExternalModDecls(
@@ -1403,8 +1411,8 @@ private fun scanModuleTokenTrees(
                     if (linkParams != null || linkRet != null) {
                         registerFnSig(subpkg, ktLinkFn, linkParams, linkRet, true)
                     }
-                } else if (grp.delimiter() == Delimiter.Brace) {
-                    val cfgIfBodies = selectActiveCfgIfBodies(innerTrees)
+                } else if (grp.delimiter() == Delimiter.Brace || grp.delimiter() == Delimiter.Parenthesis) {
+                    val cfgIfBodies = selectActiveCfgIfBodies(innerTrees) ?: selectActiveCfgSelectBodies(innerTrees)
                     if (cfgIfBodies != null) {
                         for (branchBody in cfgIfBodies) {
                             scanModuleTokenTrees(
@@ -3635,6 +3643,7 @@ internal fun discoverExternalCrateAbiFromDisk(
 
     val symbolPackages = linkedMapOf<String, Map<String, List<String>>>()
     val twoFieldResultFns = linkedSetOf<String>()
+    val nullableReturnFns = linkedSetOf<String>()
 
     for (matched in matchedCrates) {
         val crateKey = matched.crateKey
@@ -3645,6 +3654,7 @@ internal fun discoverExternalCrateAbiFromDisk(
                 sourceText = readScannerKmFileText(ktFile),
                 pkgMapBySym = pkgMapBySym,
                 twoFieldResultFns = twoFieldResultFns,
+                nullableReturnFns = nullableReturnFns,
             )
         }
         if (pkgMapBySym.isNotEmpty()) {
@@ -3666,6 +3676,7 @@ internal fun discoverExternalCrateAbiFromDisk(
         ExternalCrateAbiMetadata(
             symbolPackages = symbolPackages,
             twoFieldResultFns = twoFieldResultFns,
+            nullableReturnFns = nullableReturnFns,
         )
     if (symbolPackages.isNotEmpty()) {
         if (diskExternalCrateAbiCache.size >= 32) {
@@ -3681,6 +3692,7 @@ private fun scanExternalKotlinFileSymbols(
     sourceText: String,
     pkgMapBySym: MutableMap<String, LinkedHashSet<String>>,
     twoFieldResultFns: MutableSet<String>,
+    nullableReturnFns: MutableSet<String>,
 ) {
     val lines = sourceText.lines()
     var pkg: String? = null
@@ -3804,6 +3816,9 @@ private fun scanExternalKotlinFileSymbols(
             if (retSimple != null) {
                 candidateTwoFieldFns += fnName to retSimple
             }
+            if (afterParen != null && hasNullableExternalReturnType(afterParen)) {
+                nullableReturnFns += "$packageName.$fnName"
+            }
             continue
         }
 
@@ -3817,4 +3832,44 @@ private fun scanExternalKotlinFileSymbols(
             twoFieldResultFns += "$packageName.$fnName"
         }
     }
+}
+
+private fun hasNullableExternalReturnType(afterParen: String): Boolean {
+    var i = 0
+    while (i < afterParen.length && afterParen[i].isWhitespace()) i++
+    if (i >= afterParen.length || afterParen[i] != ':') return false
+    val start = i + 1
+    var angleDepth = 0
+    var parenDepth = 0
+    var bracketDepth = 0
+    var end = afterParen.length
+    var j = start
+    while (j < afterParen.length) {
+        val ch = afterParen[j]
+        val prev = if (j > 0) afterParen[j - 1] else '\u0000'
+        when (ch) {
+            '<' -> angleDepth++
+            '>' -> if (prev != '-' && angleDepth > 0) angleDepth--
+            '(' -> parenDepth++
+            ')' -> if (parenDepth > 0) parenDepth--
+            '[' -> bracketDepth++
+            ']' -> if (bracketDepth > 0) bracketDepth--
+            '=', '{' ->
+                if (angleDepth == 0 && parenDepth == 0 && bracketDepth == 0) {
+                    end = j
+                    break
+                }
+        }
+        if (angleDepth == 0 && parenDepth == 0 && bracketDepth == 0 &&
+            afterParen.startsWith("where", j) &&
+            (j == start || !afterParen[j - 1].isLetterOrDigit()) &&
+            (j + 5 >= afterParen.length || afterParen[j + 5].isWhitespace())
+        ) {
+            end = j
+            break
+        }
+        j++
+    }
+    val retSlice = afterParen.substring(start, end).trim()
+    return retSlice.endsWith("?") && (!retSlice.contains("->") || (retSlice.startsWith("(") && retSlice.endsWith(")?")))
 }

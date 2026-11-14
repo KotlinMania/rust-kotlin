@@ -434,18 +434,19 @@ internal fun KotlinJ2KEmitter.renderItemFn(
     val prevIntoSubstParams = currentIntoSubstitutedParams
     val prevWitnesses = currentTypeParamWitnessCalls
     val prevSharedBorrowRecv = currentReceiverIsSharedBorrow
+    val prevMutBorrowRecv = currentReceiverIsMutBorrow
     currentClosureLabel = null
     currentEnclosingFunctionName = rustFunctionIdentToKotlin(item.sig.ident.toString())
     currentEnclosingReturnRenderedType = null
     currentEnclosingReturnSynType = null
-    currentReceiverIsSharedBorrow =
+    val firstReceiverRef =
         (
-            (
-                item.sig.inputs
-                    .toList()
-                    .firstOrNull() as? FnArg.Receiver
-            )?.kind as? ReceiverKind.Reference
-        )?.let { it.mutability == null } == true
+            item.sig.inputs
+                .toList()
+                .firstOrNull() as? FnArg.Receiver
+        )?.kind as? ReceiverKind.Reference
+    currentReceiverIsSharedBorrow = firstReceiverRef?.let { it.mutability == null } == true
+    currentReceiverIsMutBorrow = firstReceiverRef?.let { it.mutability != null } == true
     currentMutableListLocals = emptySet()
     currentDequeLocals = emptySet()
     currentIterableLocals = emptySet()
@@ -525,6 +526,7 @@ internal fun KotlinJ2KEmitter.renderItemFn(
         currentIntoSubstitutedParams = prevIntoSubstParams
         currentTypeParamWitnessCalls = prevWitnesses
         currentReceiverIsSharedBorrow = prevSharedBorrowRecv
+        currentReceiverIsMutBorrow = prevMutBorrowRecv
     }
 }
 
@@ -1166,11 +1168,14 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
         if (iterableElem != null && superTraits.none { it.substringBefore('<').trim() == "Iterable" }) {
             superTraits += "Iterable<$iterableElem>"
             val mIndent = "$indent    "
+            val kotlinIteratorTy = stdlibIteratorTypeName()
             if (iterElemTy != null) {
                 val iterBody =
                     buildString {
                         append(mIndent)
-                        append("override fun iterator(): kotlin.collections.Iterator<")
+                        append("override fun iterator(): ")
+                        append(kotlinIteratorTy)
+                        append("<")
                         append(iterElemTy)
                         append("> = object : AbstractIterator<")
                         append(iterElemTy)
@@ -1186,7 +1191,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                 extraIterableMembers += iterBody
             } else if (intoIterElemTy != null) {
                 extraIterableMembers +=
-                    "${mIndent}override fun iterator(): kotlin.collections.Iterator<$intoIterElemTy> = this.intoIter().iterator()"
+                    "${mIndent}override fun iterator(): $kotlinIteratorTy<$intoIterElemTy> = this.intoIter().iterator()"
             }
         }
         when (val fields = item.fields) {
@@ -1345,6 +1350,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                     indent = "$indent    ",
                     emittedFieldTypesByName = fieldNameAndTypes.toMap(),
                     useBodyPropertiesCtor = useBodyPropertiesForLargeStruct,
+                    emitter = this,
                 )
         }
     }
@@ -1403,7 +1409,6 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
         extraIterableMembers.addAll(buildArrayAwareDataClassMethods(typeName, fieldNameAndTypes, "$indent    "))
     }
     if (!isDataClass &&
-        typeParamCount > 0 &&
         !useBodyPropertiesForLargeStruct &&
         !attachedImplDefinesInstanceMethod(effectiveAttachedImpls, "clone") &&
         item.attrs.any { attribute ->
@@ -3085,17 +3090,18 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
                     val prevTraitFnTypeParams = activeTypeParamNames
                     val prevWitnesses = currentTypeParamWitnessCalls
                     val prevSharedBorrowRecv = currentReceiverIsSharedBorrow
+                    val prevMutBorrowRecv = currentReceiverIsMutBorrow
                     currentClosureLabel = null
                     currentEnclosingReturnRenderedType = null
                     currentEnclosingReturnSynType = null
-                    currentReceiverIsSharedBorrow =
+                    val traitFirstReceiverRef =
                         (
-                            (
-                                tItem.sig.inputs
-                                    .toList()
-                                    .firstOrNull() as? FnArg.Receiver
-                            )?.kind as? ReceiverKind.Reference
-                        )?.let { it.mutability == null } == true
+                            tItem.sig.inputs
+                                .toList()
+                                .firstOrNull() as? FnArg.Receiver
+                        )?.kind as? ReceiverKind.Reference
+                    currentReceiverIsSharedBorrow = traitFirstReceiverRef?.let { it.mutability == null } == true
+                    currentReceiverIsMutBorrow = traitFirstReceiverRef?.let { it.mutability != null } == true
                     currentMutableListLocals = emptySet()
                     currentDequeLocals = emptySet()
                     currentIterableLocals = emptySet()
@@ -3188,6 +3194,7 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
                         activeTypeParamNames = prevTraitFnTypeParams
                         currentTypeParamWitnessCalls = prevWitnesses
                         currentReceiverIsSharedBorrow = prevSharedBorrowRecv
+                        currentReceiverIsMutBorrow = prevMutBorrowRecv
                     }
                 }
                 is TraitItem.AssocType -> {}
@@ -3222,6 +3229,120 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
             }
         }
 
+        if (!isLocalItem && item.generics.params.isEmpty() && assocTypeNames.isEmpty()) {
+            val receiverlessTraitFns =
+                item.items
+                    .filterIsInstance<TraitItem.Fn>()
+                    .filter { tFn ->
+                        !traitItemHasDocOnlyCfg(tFn) &&
+                            tFn.sig.inputs
+                                .toList()
+                                .firstOrNull() !is FnArg.Receiver
+                    }
+            if (receiverlessTraitFns.isNotEmpty()) {
+                val rawTraitIdent = item.ident.toString()
+                val moduleItems = (TranslationSession.sharedModuleFile?.items ?: file.items).toList()
+                val uniqueImpl =
+                    moduleItems
+                        .filterIsInstance<Item.Impl>()
+                        .singleOrNull { implItem ->
+                            !itemHasDocOnlyCfg(implItem) &&
+                                implItem.generics.params.isEmpty() &&
+                                implItem.traitPath
+                                    ?.path
+                                    ?.segments
+                                    ?.last()
+                                    ?.ident
+                                    ?.toString() == rawTraitIdent
+                        }
+                if (uniqueImpl != null) {
+                    val savedTraitAssoc = currentTraitAssocParamNames
+                    val savedActiveTypeParams = activeTypeParamNames
+                    val companionMethods =
+                        try {
+                            currentTraitAssocParamNames = prevTraitAssoc
+                            activeTypeParamNames = prevTraitTypeParams
+                            val concreteSelfType = renderType(uniqueImpl.selfType, selfTypeName = null)
+                            val directOwner = extractDirectOwnerTypeName(uniqueImpl.selfType, uniqueImpl.generics)
+                            val isLocalAttached =
+                                directOwner != null &&
+                                    directOwner in inspector.attachableTypeNames &&
+                                    TranslationSession.sharedModuleFile == null
+                            val implFnsByRawName =
+                                uniqueImpl.items
+                                    .filterIsInstance<ImplItem.Fn>()
+                                    .filter { !implItemHasDocOnlyCfg(it) }
+                                    .associateBy {
+                                        it.sig.ident
+                                            .toString()
+                                            .removePrefix("r#")
+                                    }
+                            val companionSigs = linkedMapOf<String, Int>()
+                            val implTraitPath = uniqueImpl.traitPath!!.path
+                            receiverlessTraitFns.mapNotNull { tFn ->
+                                val rawFnName =
+                                    tFn.sig.ident
+                                        .toString()
+                                        .removePrefix("r#")
+                                val implFn = implFnsByRawName[rawFnName] ?: return@mapNotNull null
+                                val prevCompTyped = currentTypedLocals
+                                val prevCompSourceParams = currentSourceParameterTypes
+                                val prevCompIntoParams = currentIntoSubstitutedParams
+                                val prevCompIterable = currentIterableLocals
+                                val prevCompNullable = currentNullableLocals
+                                val prevCompMutList = currentMutableListLocals
+                                val prevCompNumKinds = currentFunctionParamNumericKinds
+                                scopeBuilder.enterDef()
+                                val sigHeader =
+                                    try {
+                                        renderFunctionSignature(
+                                            sig = implFn.sig,
+                                            visPrefix = "public ",
+                                            openPrefix = "",
+                                            selfTypeName = concreteSelfType,
+                                            ownerGenerics = null,
+                                            scopeSignatures = companionSigs,
+                                            isInterfaceMethod = false,
+                                            isCompanionMember = true,
+                                            fnBlock = implFn.block,
+                                        )
+                                    } finally {
+                                        scopeBuilder.exitDef()
+                                        currentTypedLocals = prevCompTyped
+                                        currentSourceParameterTypes = prevCompSourceParams
+                                        currentIntoSubstitutedParams = prevCompIntoParams
+                                        currentIterableLocals = prevCompIterable
+                                        currentNullableLocals = prevCompNullable
+                                        currentMutableListLocals = prevCompMutList
+                                        currentFunctionParamNumericKinds = prevCompNumKinds
+                                    }
+                                        ?: return@mapNotNull null
+                                val ktFnName = rustFunctionIdentToKotlin(implFn.sig.ident.toString())
+                                val targetCall =
+                                    if (isLocalAttached) {
+                                        "$concreteSelfType.$ktFnName"
+                                    } else {
+                                        disambiguateReceiverlessTraitImplFnName(implTraitPath, ktFnName, uniqueImpl.selfType)
+                                    }
+                                val forwardArgs = extractSigHeaderForwardArgs(sigHeader)
+                                val docAttrs = implFn.attrs.ifEmpty { tFn.attrs }
+                                val doc = renderKDocFromAttributes(docAttrs, "$indent        ")
+                                "$doc$indent        $sigHeader = $targetCall(${forwardArgs.joinToString(", ")})"
+                            }
+                        } finally {
+                            currentTraitAssocParamNames = savedTraitAssoc
+                            activeTypeParamNames = savedActiveTypeParams
+                        }
+                    if (companionMethods.isNotEmpty()) {
+                        members +=
+                            "$indent    public companion object {\n" +
+                            companionMethods.joinToString("\n") +
+                            "\n$indent    }"
+                    }
+                }
+            }
+        }
+
         if (members.isNotEmpty()) {
             sb.append(" {\n")
             sb.append(members.joinToString("\n\n"))
@@ -3233,6 +3354,67 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
         currentTraitAssocParamNames = prevTraitAssoc
         activeTypeParamNames = prevTraitTypeParams
     }
+}
+
+private fun extractSigHeaderForwardArgs(sigHeader: String): List<String> {
+    val funIdx = sigHeader.indexOf("fun ")
+    if (funIdx < 0) return emptyList()
+    var i = funIdx + 4
+    var angleDepth = 0
+    while (i < sigHeader.length) {
+        val ch = sigHeader[i]
+        when {
+            ch == '<' -> angleDepth++
+            ch == '>' -> if (angleDepth > 0 && (i == 0 || sigHeader[i - 1] != '-')) angleDepth--
+            ch == '(' && angleDepth == 0 -> break
+        }
+        i++
+    }
+    if (i >= sigHeader.length || sigHeader[i] != '(') return emptyList()
+    val openIdx = i
+    var parenDepth = 0
+    var closeIdx = -1
+    while (i < sigHeader.length) {
+        when (sigHeader[i]) {
+            '(' -> parenDepth++
+            ')' -> {
+                parenDepth--
+                if (parenDepth == 0) {
+                    closeIdx = i
+                    break
+                }
+            }
+        }
+        i++
+    }
+    if (closeIdx <= openIdx) return emptyList()
+    val body = sigHeader.substring(openIdx + 1, closeIdx).trim()
+    if (body.isEmpty()) return emptyList()
+    return PhantomRawPointerTypeStripper
+        .splitTopLevelCommaList(body)
+        .mapNotNull { entry ->
+            entry
+                .substringBefore(':')
+                .trim()
+                .substringAfterLast(' ')
+                .takeIf { it.isNotEmpty() }
+        }
+}
+
+private fun KotlinJ2KEmitter.stdlibIteratorTypeName(): String {
+    val iteratorShadowed =
+        "Iterator" in inspector.declaredTypeNames ||
+            "Iterator" in headerContext.moduleDeclaredTypeNames ||
+            extraTypePathImports.any { it.endsWith(".Iterator") || it.endsWith(".Iterator as Iterator") } ||
+            inspector.allUseItems.any { useItem ->
+                val leaves = mutableListOf<UseLeaf>()
+                collectUseLeaves(useItem.tree, emptyList(), leaves)
+                leaves.any { leaf ->
+                    val name = leaf.alias ?: leaf.segments.lastOrNull()
+                    name?.removePrefix("r#") == "Iterator"
+                }
+            }
+    return if (iteratorShadowed) "kotlin.collections.Iterator" else "Iterator"
 }
 
 internal fun KotlinJ2KEmitter.renderItemTraitAlias(
@@ -3532,18 +3714,19 @@ internal fun KotlinJ2KEmitter.renderImplItemFn(
     val prevIntoSubstParams = currentIntoSubstitutedParams
     val prevWitnesses = currentTypeParamWitnessCalls
     val prevSharedBorrowRecv = currentReceiverIsSharedBorrow
+    val prevMutBorrowRecv = currentReceiverIsMutBorrow
     currentClosureLabel = null
     currentEnclosingFunctionName = rustFunctionIdentToKotlin(item.sig.ident.toString())
     currentEnclosingReturnRenderedType = null
     currentEnclosingReturnSynType = null
-    currentReceiverIsSharedBorrow =
+    val firstReceiverRef =
         (
-            (
-                item.sig.inputs
-                    .toList()
-                    .firstOrNull() as? FnArg.Receiver
-            )?.kind as? ReceiverKind.Reference
-        )?.let { it.mutability == null } == true
+            item.sig.inputs
+                .toList()
+                .firstOrNull() as? FnArg.Receiver
+        )?.kind as? ReceiverKind.Reference
+    currentReceiverIsSharedBorrow = firstReceiverRef?.let { it.mutability == null } == true
+    currentReceiverIsMutBorrow = firstReceiverRef?.let { it.mutability != null } == true
     currentMutableListLocals = emptySet()
     currentDequeLocals = emptySet()
     currentIterableLocals = emptySet()
@@ -3746,5 +3929,6 @@ internal fun KotlinJ2KEmitter.renderImplItemFn(
         currentIntoSubstitutedParams = prevIntoSubstParams
         currentTypeParamWitnessCalls = prevWitnesses
         currentReceiverIsSharedBorrow = prevSharedBorrowRecv
+        currentReceiverIsMutBorrow = prevMutBorrowRecv
     }
 }

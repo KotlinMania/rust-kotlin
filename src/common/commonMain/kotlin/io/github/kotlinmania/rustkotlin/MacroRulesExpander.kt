@@ -103,6 +103,299 @@ internal fun isDocOnlyCfgPredicateTokens(tokens: List<TokenTree>): Boolean =
 internal fun evalCfgExpressionTokens(tokens: List<TokenTree>): Boolean =
     evalCfgTriState(tokens, forRuntimeCfgMacro = true) ?: false
 
+private data class CfgSelectArm(
+    val predicateTokens: List<TokenTree>?,
+    val bodyTokens: List<TokenTree>,
+)
+
+private val UNSUPPORTED_RUST_TARGET_OS =
+    setOf(
+        "hermit",
+        "motor",
+        "solid_asp3",
+        "teeos",
+        "uefi",
+        "vexos",
+        "xous",
+        "zkvm",
+        "l4re",
+        "nuttx",
+        "psp",
+        "psx",
+        "trusty",
+        "vita",
+        "vxworks",
+        "espidf",
+        "horizon",
+        "hurd",
+        "cygwin",
+        "aix",
+        "haiku",
+        "illumos",
+        "netbsd",
+        "openbsd",
+        "dragonfly",
+        "freebsd",
+        "solaris",
+        "redox",
+        "fuchsia",
+        "nto",
+        "rtems",
+        "emscripten",
+        "wasi_p3",
+        "lynxos178",
+        "qurt",
+        "cuda",
+        "nvptx",
+        "amdgpu",
+    )
+
+private val UNSUPPORTED_RUST_TARGET_ENV =
+    setOf(
+        "sgx",
+        "relibc",
+        "ohos",
+        "uclibc",
+        "newlib",
+    )
+
+private val UNSUPPORTED_RUST_TARGET_VENDOR =
+    setOf(
+        "fortanix",
+        "kmc",
+        "nintendo",
+        "sony",
+        "uwp",
+        "win7",
+    )
+
+private fun parseCfgSelectArms(innerTrees: List<TokenTree>): List<CfgSelectArm>? {
+    if (innerTrees.isEmpty()) return emptyList()
+    val arms = mutableListOf<CfgSelectArm>()
+    var idx = 0
+    while (idx < innerTrees.size) {
+        var arrowIdx = -1
+        var scan = idx
+        while (scan + 1 < innerTrees.size) {
+            val eq = (innerTrees[scan] as? TokenTree.Punct)?.value
+            val gt = (innerTrees[scan + 1] as? TokenTree.Punct)?.value
+            if (eq?.asChar() == '=' && eq.spacing() == Spacing.Joint && gt?.asChar() == '>') {
+                arrowIdx = scan
+                break
+            }
+            scan++
+        }
+        if (arrowIdx <= idx) return null
+        val predSlice = innerTrees.subList(idx, arrowIdx)
+        val isWildcard =
+            predSlice.size == 1 && (predSlice[0] as? TokenTree.Ident)?.value?.toString() == "_"
+        val bodyStart = arrowIdx + 2
+        if (bodyStart > innerTrees.size) return null
+        val bodyTok = innerTrees.getOrNull(bodyStart)
+        val (bodyTokens, nextIdx) =
+            if (bodyTok is TokenTree.Group && bodyTok.value.delimiter() == Delimiter.Brace) {
+                val afterGrp = bodyStart + 1
+                val nextAfter =
+                    if (afterGrp < innerTrees.size &&
+                        (innerTrees[afterGrp] as? TokenTree.Punct)?.value?.asChar() == ','
+                    ) {
+                        afterGrp + 1
+                    } else {
+                        afterGrp
+                    }
+                bodyTok.value.stream().toList() to nextAfter
+            } else {
+                var commaIdx = bodyStart
+                while (commaIdx < innerTrees.size &&
+                    (innerTrees[commaIdx] as? TokenTree.Punct)?.value?.asChar() != ','
+                ) {
+                    commaIdx++
+                }
+                val slice = innerTrees.subList(bodyStart, commaIdx)
+                val nextAfter = if (commaIdx < innerTrees.size) commaIdx + 1 else commaIdx
+                slice to nextAfter
+            }
+        arms +=
+            CfgSelectArm(
+                predicateTokens = if (isWildcard) null else predSlice,
+                bodyTokens = bodyTokens,
+            )
+        idx = nextIdx
+    }
+    return arms
+}
+
+internal fun partitionCfgSelectBranchBodies(innerTrees: List<TokenTree>): List<Pair<List<TokenTree>, Boolean>>? {
+    val arms = parseCfgSelectArms(innerTrees) ?: return null
+    val result = mutableListOf<Pair<List<TokenTree>, Boolean>>()
+    var guaranteedWinner = false
+    for (arm in arms) {
+        if (guaranteedWinner) {
+            result += arm.bodyTokens to false
+            continue
+        }
+        val pred = arm.predicateTokens
+        if (pred == null) {
+            guaranteedWinner = true
+            result += arm.bodyTokens to true
+            continue
+        }
+        val tri = evalCfgTriState(pred, forRuntimeCfgMacro = false)
+        when (tri) {
+            true -> {
+                guaranteedWinner = true
+                result += arm.bodyTokens to true
+            }
+            false -> result += arm.bodyTokens to false
+            null -> result += arm.bodyTokens to true
+        }
+    }
+    return result
+}
+
+private fun chooseSingleActiveCfgSelectBody(innerTrees: List<TokenTree>): List<TokenTree>? {
+    val arms = parseCfgSelectArms(innerTrees) ?: return null
+    var firstNonFalse: CfgSelectArm? = null
+    for (arm in arms) {
+        val pred = arm.predicateTokens ?: return firstNonFalse?.bodyTokens ?: arm.bodyTokens
+        when (evalCfgTriState(pred, forRuntimeCfgMacro = false)) {
+            true -> return arm.bodyTokens
+            false -> Unit
+            null -> if (firstNonFalse == null) firstNonFalse = arm
+        }
+    }
+    return firstNonFalse?.bodyTokens
+}
+
+private fun itemDeclarationKey(item: Item): String? =
+    when (item) {
+        is Item.Fn -> "fn:${item.sig.ident}"
+        is Item.Struct -> "struct:${item.ident}"
+        is Item.Enum -> "enum:${item.ident}"
+        is Item.Union -> "union:${item.ident}"
+        is Item.Trait -> "trait:${item.ident}"
+        is Item.ItemType -> "type:${item.ident}"
+        is Item.Const -> "const:${item.ident}"
+        is Item.Static -> "static:${item.ident}"
+        is Item.Mod -> "mod:${item.ident}"
+        else -> null
+    }
+
+private fun implItemDeclarationKey(item: ImplItem): String? =
+    when (item) {
+        is ImplItem.Fn -> "fn:${item.sig.ident}"
+        is ImplItem.Const -> "const:${item.ident}"
+        is ImplItem.AssocType -> "type:${item.ident}"
+        else -> null
+    }
+
+internal fun selectActiveCfgSelectBodies(innerTrees: List<TokenTree>): List<List<TokenTree>>? {
+    val arms = parseCfgSelectArms(innerTrees) ?: return null
+    val candidates = mutableListOf<Pair<CfgSelectArm, Boolean>>()
+    for (arm in arms) {
+        val pred = arm.predicateTokens
+        if (pred == null) {
+            candidates += arm to true
+            break
+        }
+        when (evalCfgTriState(pred, forRuntimeCfgMacro = false)) {
+            true -> return listOf(arm.bodyTokens)
+            false -> Unit
+            null -> candidates += arm to false
+        }
+    }
+    if (candidates.isEmpty()) return emptyList()
+    val hasNonWildcard = candidates.any { !it.second }
+    val seenKeys = linkedSetOf<String>()
+    val keptBodies = mutableListOf<List<TokenTree>>()
+    for ((arm, isWildcard) in candidates) {
+        if (arm.bodyTokens.isEmpty()) continue
+        val parsed =
+            parse2(FileParse::parse, TokenStream.fromTokenTrees(arm.bodyTokens))
+                .getOrNull()
+                ?.let(RustNextAstNormalizer::foldFile)
+        if (parsed == null) {
+            if (!isWildcard || !hasNonWildcard) {
+                keptBodies += arm.bodyTokens
+            }
+            continue
+        }
+        val armKeys = parsed.items.mapNotNull(::itemDeclarationKey)
+        if (isWildcard && hasNonWildcard) {
+            val isUnsupportedFallbackMod =
+                "mod:unsupported" in armKeys &&
+                    seenKeys.any { it.startsWith("mod:") }
+            val allKeysAlreadySeen =
+                armKeys.isNotEmpty() && armKeys.all { it in seenKeys }
+            if (isUnsupportedFallbackMod || allKeysAlreadySeen) {
+                continue
+            }
+        }
+        if (armKeys.isNotEmpty() && armKeys.all { it in seenKeys }) {
+            continue
+        }
+        seenKeys += armKeys
+        keptBodies += arm.bodyTokens
+    }
+    return keptBodies
+}
+
+private fun selectActiveCfgSelectImplItems(innerTrees: List<TokenTree>): List<ImplItem>? {
+    val arms = parseCfgSelectArms(innerTrees) ?: return null
+    val candidates = mutableListOf<Pair<CfgSelectArm, Boolean>>()
+    for (arm in arms) {
+        val pred = arm.predicateTokens
+        if (pred == null) {
+            candidates += arm to true
+            break
+        }
+        when (evalCfgTriState(pred, forRuntimeCfgMacro = false)) {
+            true -> {
+                val wrapped = wrapImplDummyStream(TokenStream.fromTokenTrees(arm.bodyTokens))
+                val dummy =
+                    parse2(FileParse::parse, wrapped)
+                        .getOrNull()
+                        ?.let(RustNextAstNormalizer::foldFile)
+                        ?.items
+                        ?.singleOrNull() as? Item.Impl ?: return null
+                return dummy.items
+            }
+            false -> Unit
+            null -> candidates += arm to false
+        }
+    }
+    if (candidates.isEmpty()) return emptyList()
+    val hasNonWildcard = candidates.any { !it.second }
+    val seenKeys = linkedSetOf<String>()
+    val collected = mutableListOf<ImplItem>()
+    for ((arm, isWildcard) in candidates) {
+        if (arm.bodyTokens.isEmpty()) continue
+        val wrapped = wrapImplDummyStream(TokenStream.fromTokenTrees(arm.bodyTokens))
+        val dummy =
+            parse2(FileParse::parse, wrapped)
+                .getOrNull()
+                ?.let(RustNextAstNormalizer::foldFile)
+                ?.items
+                ?.singleOrNull() as? Item.Impl ?: return null
+        val armKeys = dummy.items.mapNotNull(::implItemDeclarationKey)
+        if (isWildcard && hasNonWildcard && armKeys.isNotEmpty() && armKeys.all { it in seenKeys }) {
+            continue
+        }
+        if (armKeys.isNotEmpty() && armKeys.all { it in seenKeys }) {
+            continue
+        }
+        seenKeys += armKeys
+        collected += dummy.items
+    }
+    return collected
+}
+
+private fun wrapImplDummyStream(inner: TokenStream): TokenStream {
+    val prefix = TokenStream.fromString("impl Dummy").getOrThrow().toList()
+    val group = TokenTree.Group(Group(Delimiter.Brace, inner))
+    return TokenStream.fromTokenTrees(prefix + group)
+}
+
 private val ARCHS_16_OR_32_BIT =
     setOf(
         "avr",
@@ -249,10 +542,20 @@ internal fun evalCfgTriState(tokens: List<TokenTree>, forRuntimeCfgMacro: Boolea
                         resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
                     }
                 }
+                "target_has_atomic", "target_has_atomic_load_store", "target_has_atomic_equal_alignment" -> {
+                    when {
+                        profile.pointerWidth >= 64 && litText in setOf("8", "16", "32", "64", "ptr") -> true
+                        profile.pointerWidth == 32 && litText in setOf("8", "16", "32", "ptr") -> true
+                        profile.pointerWidth == 16 && litText in setOf("8", "16", "ptr") -> true
+                        else -> resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
+                    }
+                }
                 "target_os" -> {
                     profile.targetOs?.let { litText == it }
                         ?: if (dirContainsSegment(relDir, litText)) {
                             true
+                        } else if (litText in UNSUPPORTED_RUST_TARGET_OS) {
+                            false
                         } else {
                             resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
                         }
@@ -261,6 +564,8 @@ internal fun evalCfgTriState(tokens: List<TokenTree>, forRuntimeCfgMacro: Boolea
                     profile.targetEnv?.let { litText == it }
                         ?: if (dirContainsSegment(relDir, litText)) {
                             true
+                        } else if (litText in UNSUPPORTED_RUST_TARGET_ENV) {
+                            false
                         } else {
                             resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
                         }
@@ -269,6 +574,8 @@ internal fun evalCfgTriState(tokens: List<TokenTree>, forRuntimeCfgMacro: Boolea
                     profile.targetVendor?.let { litText == it }
                         ?: if (dirContainsSegment(relDir, litText)) {
                             true
+                        } else if (litText in UNSUPPORTED_RUST_TARGET_VENDOR) {
+                            false
                         } else {
                             resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
                         }
@@ -664,10 +971,43 @@ internal class MacroRulesFileExpander(
     }
 
     override fun foldExpr(e: Expr): Expr {
-        if (e is Expr.Macro && activeDefinitions.isNotEmpty()) {
-            val expandedExpr = expandMacroExprRecursive(e, depth = 0)
-            if (expandedExpr != null) {
-                return super.foldExpr(expandedExpr)
+        if (e is Expr.Macro) {
+            val macName =
+                e.mac.path.segments
+                    .last()
+                    ?.ident
+                    ?.toString()
+                    ?.removePrefix("r#")
+            if (macName == "cfg_select") {
+                val selected =
+                    chooseSingleActiveCfgSelectBody(
+                        e.mac.tokens
+                            .clone()
+                            .toList(),
+                    )
+                if (selected != null) {
+                    val parsedExpr =
+                        if (selected.isEmpty()) {
+                            parse2(ExprParse::parse, TokenStream.fromString("{}").getOrThrow()).getOrNull()
+                        } else {
+                            parse2(ExprParse::parse, TokenStream.fromTokenTrees(selected)).getOrNull()
+                                ?: parse2(
+                                    ExprParse::parse,
+                                    TokenStream.fromTokenTrees(
+                                        listOf(TokenTree.Group(Group(Delimiter.Brace, TokenStream.fromTokenTrees(selected)))),
+                                    ),
+                                ).getOrNull()
+                        }
+                    if (parsedExpr != null) {
+                        return super.foldExpr(RustNextAstNormalizer.foldExpr(parsedExpr))
+                    }
+                }
+            }
+            if (activeDefinitions.isNotEmpty()) {
+                val expandedExpr = expandMacroExprRecursive(e, depth = 0)
+                if (expandedExpr != null) {
+                    return super.foldExpr(expandedExpr)
+                }
             }
         }
         return super.foldExpr(e)
@@ -729,13 +1069,17 @@ internal class MacroRulesFileExpander(
                         ?.ident
                         ?.toString()
                 val def = if (macName != null) activeDefinitions[macName] else null
-                if (def == null && macName == "cfg_if") {
+                if (def == null && (macName == "cfg_if" || macName == "cfg_select")) {
+                    val rawTokens =
+                        item.mac.tokens
+                            .clone()
+                            .toList()
                     val bodies =
-                        selectActiveCfgIfBodies(
-                            item.mac.tokens
-                                .clone()
-                                .toList(),
-                        )
+                        if (macName == "cfg_select") {
+                            selectActiveCfgSelectBodies(rawTokens)
+                        } else {
+                            selectActiveCfgIfBodies(rawTokens)
+                        }
                     if (bodies != null) {
                         val tokens = TokenStream.fromTokenTrees(bodies.flatten())
                         val parsed = parse2(FileParse::parse, tokens).getOrNull()
@@ -769,13 +1113,39 @@ internal class MacroRulesFileExpander(
         if (depth > MAX_MACRO_EXPANSION_DEPTH) return items.map(::foldImplItem)
         val result = mutableListOf<ImplItem>()
         for (item in items) {
-            if (item is ImplItem.Macro && activeDefinitions.isNotEmpty()) {
+            if (item is ImplItem.Macro) {
                 val macName =
                     item.mac.path.segments
                         .last()
                         ?.ident
                         ?.toString()
                 val def = if (macName != null) activeDefinitions[macName] else null
+                if (def == null && (macName == "cfg_if" || macName == "cfg_select")) {
+                    val rawTokens =
+                        item.mac.tokens
+                            .clone()
+                            .toList()
+                    val selectedItems =
+                        if (macName == "cfg_select") {
+                            selectActiveCfgSelectImplItems(rawTokens)
+                        } else {
+                            selectActiveCfgIfBodies(rawTokens)?.let { bodies ->
+                                val wrapped = wrapImplDummyStream(TokenStream.fromTokenTrees(bodies.flatten()))
+                                (
+                                    parse2(FileParse::parse, wrapped)
+                                        .getOrNull()
+                                        ?.let(RustNextAstNormalizer::foldFile)
+                                        ?.items
+                                        ?.singleOrNull() as? Item.Impl
+                                )?.items
+                            }
+                        }
+                    if (selectedItems != null) {
+                        val expanded = expandAndFoldImplItemList(selectedItems, depth + 1)
+                        result.addAll(propagateOuterAttrsToImplItems(item.attrs, expanded))
+                        continue
+                    }
+                }
                 if (def != null) {
                     val expanded = tryExpandMacroImplItem(def, item.mac, depth)
                     if (expanded != null) {
@@ -915,13 +1285,37 @@ internal class MacroRulesFileExpander(
                     continue
                 }
             }
-            if (stmt is Stmt.MacroStmt && activeDefinitions.isNotEmpty()) {
+            if (stmt is Stmt.MacroStmt) {
                 val macName =
                     stmt.mac.path.segments
                         .last()
                         ?.ident
                         ?.toString()
                 val def = if (macName != null) activeDefinitions[macName] else null
+                if (def == null && (macName == "cfg_if" || macName == "cfg_select")) {
+                    val rawTokens =
+                        stmt.mac.tokens
+                            .clone()
+                            .toList()
+                    val selectedBody =
+                        if (macName == "cfg_select") {
+                            chooseSingleActiveCfgSelectBody(rawTokens)
+                        } else {
+                            selectActiveCfgIfBodies(rawTokens)?.firstOrNull()
+                        }
+                    if (selectedBody != null) {
+                        if (selectedBody.isEmpty()) {
+                            continue
+                        }
+                        val wrapped = buildWrappedStream("fn dummy()", Delimiter.Brace, TokenStream.fromTokenTrees(selectedBody))
+                        val parsedFile = parse2(FileParse::parse, wrapped).getOrNull()?.let(RustNextAstNormalizer::foldFile)
+                        val dummyFn = parsedFile?.items?.singleOrNull() as? Item.Fn
+                        if (dummyFn != null) {
+                            result.addAll(expandAndFoldBlockStmts(dummyFn.block.stmts, depth + 1))
+                            continue
+                        }
+                    }
+                }
                 if (def != null) {
                     val expanded = tryExpandMacroStmts(def, stmt.mac, depth)
                     if (expanded != null) {

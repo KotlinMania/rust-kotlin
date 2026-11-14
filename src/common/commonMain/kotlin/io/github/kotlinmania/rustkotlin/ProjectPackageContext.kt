@@ -236,6 +236,7 @@ public data class FileHeaderContext(
     public val scalarChar: Boolean = false,
     public val externalCrateSymbolPackages: Map<String, Map<String, List<String>>> = emptyMap(),
     public val externalCrateTwoFieldResultFns: Set<String> = emptySet(),
+    public val externalCrateNullableReturnFns: Set<String> = emptySet(),
     public val testClassName: String? = null,
 ) {
     public constructor(
@@ -537,6 +538,7 @@ internal fun inferFileHeaderContextWithResolvers(
         crateFlatFileModules = crateFlatModules,
         externalCrateSymbolPackages = externalAbi.symbolPackages,
         externalCrateTwoFieldResultFns = externalAbi.twoFieldResultFns,
+        externalCrateNullableReturnFns = externalAbi.nullableReturnFns,
     )
 }
 
