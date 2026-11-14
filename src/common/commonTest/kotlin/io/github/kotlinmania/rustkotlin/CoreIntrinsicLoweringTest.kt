@@ -416,4 +416,113 @@ class CoreIntrinsicLoweringTest {
         assertFalse(libcFallbackKt.contains("import io.github.kotlinmania.libc"))
         assertFalse(libcFallbackKt.contains("import io.github.kotlinmania.rustlang.libc"))
     }
+
+    @Test
+    fun stdlibModuleAliasesExternalPathsTargetPruningAndZeroedIoctlLowerCleanly() {
+        val coreNs = "io.github.kotlinmania.rustlang.core"
+        val allocNs = "io.github.kotlinmania.rustlang.alloc"
+        val stdNs = "io.github.kotlinmania.rustlang.std"
+        val libcNs = "io.github.kotlinmania.rustlang.libc"
+        val backtraceNs = "io.github.kotlinmania.rustlang.backtrace"
+        val crateNamespaces =
+            mapOf(
+                "core" to coreNs,
+                "alloc" to allocNs,
+                "std" to stdNs,
+                "libc" to libcNs,
+                "backtrace" to backtraceNs,
+            )
+
+        // 1. Same-crate module alias & external crate submodule call (`memchr::memrchr`)
+        val stdMeta =
+            buildCrateRawAbiMetadataFromSources(
+                sources =
+                    listOf(
+                        "lib.rs" to
+                            """
+                            #[path = "../../backtrace/src/lib.rs"]
+                            mod backtrace_rs;
+                            pub mod sys {
+                                pub mod env {
+                                    pub fn environ() -> usize { 0 }
+                                }
+                            }
+                            """.trimIndent(),
+                        "sys/mod.rs" to "pub mod env;",
+                        "sys/env.rs" to "pub fn environ() -> usize { 0 }",
+                        "sys/pal/hermit/mod.rs" to "pub fn dead_hermit() {}",
+                        "os/wasip2/mod.rs" to "pub fn dead_wasip2() {}",
+                        "os/freebsd/mod.rs" to "pub fn dead_freebsd() {}",
+                        "sys/pal/unix/linux/mod.rs" to "pub fn live_linux() {}",
+                    ),
+                splitModuleRoots = true,
+            )
+        assertEquals("backtrace", stdMeta.rootExternalModuleReexports["backtrace_rs"])
+        assertFalse(
+            stdMeta.symbolSubpackages["deadHermit"]?.isNotEmpty() == true,
+            "Expected dead hermit file to be pruned from metadata: ${stdMeta.symbolSubpackages}",
+        )
+        assertTrue("liveLinux" in stdMeta.symbolSubpackages)
+        assertTrue(isUnsupportedTargetRustRelPath("sys/pal/hermit/mod.rs", CfgTargetProfile()))
+        assertTrue(isUnsupportedTargetRustRelPath("os/wasip2/mod.rs", CfgTargetProfile()))
+        assertFalse(isUnsupportedTargetRustRelPath("sys/pal/unix/linux/mod.rs", CfgTargetProfile()))
+        assertFalse(isUnsupportedTargetRustRelPath("sys/pal/wasi/mod.rs", CfgTargetProfile()))
+
+        val allocHeader =
+            FileHeaderContext(
+                packageName = "$allocNs.io.buffered",
+                projectGroup = "io.github.kotlinmania",
+                projectNamespace = allocNs,
+                crateNamespaces = crateNamespaces,
+                externalCrateSymbolPackages =
+                    mapOf(
+                        "core" to mapOf("memrchr" to listOf("$coreNs.slice.memchr")),
+                    ),
+                isBatchCrateOutput = true,
+            )
+        val allocSource =
+            """
+            use core::slice::memchr;
+            pub fn find_last(byte: u8, haystack: &[u8]) -> Option<usize> {
+                memchr::memrchr(byte, haystack)
+            }
+            """.trimIndent()
+        val allocKt = renderSingleKotlinFile(allocSource, allocHeader).text
+        assertContains(allocKt, "import $coreNs.slice.memchr.memrchr")
+        assertFalse(allocKt.contains("io.github.kotlinmania.memchr"))
+
+        // 2. Same-crate alias (`use crate::sys::env as env_imp`), external #[path] backtrace_rs, and zeroed + ioctl
+        val stdHeader =
+            FileHeaderContext(
+                packageName = "$stdNs.sys.process.unix",
+                projectGroup = "io.github.kotlinmania",
+                projectNamespace = stdNs,
+                crateNamespaces = crateNamespaces,
+                crateSubpackageRawLeafNames = stdMeta.subpackageRawLeafNames,
+                crateSymbolSubpackages = stdMeta.symbolSubpackages,
+                rootExternalModuleReexports = stdMeta.rootExternalModuleReexports,
+                isBatchCrateOutput = true,
+            )
+        val stdSource =
+            """
+            use crate::sys::env as env_imp;
+            pub fn probe(fd: i32, _bt: crate::backtrace_rs::Frame) -> usize {
+                let e = env_imp::environ();
+                let mut info: libc::pidfd_info = unsafe { core::mem::zeroed() };
+                let _ = unsafe { libc::ioctl(fd, libc::PIDFD_GET_INFO, &mut info) };
+                #[cfg(any(target_env = "p2", miri, doc))]
+                let _ = wasip2::dead();
+                e
+            }
+            """.trimIndent()
+        val stdKt = renderSingleKotlinFile(stdSource, stdHeader).text
+        assertContains(stdKt, "import $stdNs.sys.env.environ")
+        assertFalse(stdKt.contains("io.github.kotlinmania.envimp"))
+        assertContains(stdKt, "import $backtraceNs.Frame")
+        assertFalse(stdKt.contains("backtracers"))
+        assertFalse(stdKt.contains("wasip2"))
+        assertContains(stdKt, "PidfdInfo()")
+        assertContains(stdKt, "AddressableLocal(")
+        assertContains(stdKt, ".asMutPtr().rawAddress")
+    }
 }

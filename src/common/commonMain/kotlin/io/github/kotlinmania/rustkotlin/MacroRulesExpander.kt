@@ -157,6 +157,8 @@ private val UNSUPPORTED_RUST_TARGET_ENV =
         "ohos",
         "uclibc",
         "newlib",
+        "p2",
+        "p3",
     )
 
 private val UNSUPPORTED_RUST_TARGET_VENDOR =
@@ -168,6 +170,38 @@ private val UNSUPPORTED_RUST_TARGET_VENDOR =
         "uwp",
         "win7",
     )
+
+private val PRUNED_UNSUPPORTED_TARGET_PATH_SEGMENTS =
+    UNSUPPORTED_RUST_TARGET_OS +
+        UNSUPPORTED_RUST_TARGET_ENV +
+        UNSUPPORTED_RUST_TARGET_VENDOR +
+        setOf(
+            "fortanix_sgx",
+            "solid",
+            "itron",
+            "wasip2",
+            "wasip3",
+            "wali",
+            "miri",
+            "switch",
+        )
+
+internal fun isUnsupportedTargetRustRelPath(
+    relPath: String,
+    cfgProfile: CfgTargetProfile,
+): Boolean {
+    val norm = relPath.replace('\\', '/').trimStart('/').trimEnd('/')
+    if (norm.isEmpty()) return false
+    val withoutExt = norm.substringBeforeLast('.')
+    val segs = withoutExt.split('/').filter { it.isNotEmpty() }
+    return segs.any { rawSeg ->
+        val seg = rawSeg.lowercase()
+        seg in PRUNED_UNSUPPORTED_TARGET_PATH_SEGMENTS &&
+            seg != cfgProfile.targetOs?.lowercase() &&
+            seg != cfgProfile.targetEnv?.lowercase() &&
+            seg != cfgProfile.targetVendor?.lowercase()
+    }
+}
 
 private fun parseCfgSelectArms(innerTrees: List<TokenTree>): List<CfgSelectArm>? {
     if (innerTrees.isEmpty()) return emptyList()
@@ -552,30 +586,30 @@ internal fun evalCfgTriState(tokens: List<TokenTree>, forRuntimeCfgMacro: Boolea
                 }
                 "target_os" -> {
                     profile.targetOs?.let { litText == it }
-                        ?: if (dirContainsSegment(relDir, litText)) {
-                            true
-                        } else if (litText in UNSUPPORTED_RUST_TARGET_OS) {
+                        ?: if (litText in UNSUPPORTED_RUST_TARGET_OS) {
                             false
+                        } else if (dirContainsSegment(relDir, litText)) {
+                            true
                         } else {
                             resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
                         }
                 }
                 "target_env" -> {
                     profile.targetEnv?.let { litText == it }
-                        ?: if (dirContainsSegment(relDir, litText)) {
-                            true
-                        } else if (litText in UNSUPPORTED_RUST_TARGET_ENV) {
+                        ?: if (litText in UNSUPPORTED_RUST_TARGET_ENV) {
                             false
+                        } else if (dirContainsSegment(relDir, litText)) {
+                            true
                         } else {
                             resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
                         }
                 }
                 "target_vendor" -> {
                     profile.targetVendor?.let { litText == it }
-                        ?: if (dirContainsSegment(relDir, litText)) {
-                            true
-                        } else if (litText in UNSUPPORTED_RUST_TARGET_VENDOR) {
+                        ?: if (litText in UNSUPPORTED_RUST_TARGET_VENDOR) {
                             false
+                        } else if (dirContainsSegment(relDir, litText)) {
+                            true
                         } else {
                             resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
                         }
@@ -615,6 +649,7 @@ internal fun evalCfgTriState(tokens: List<TokenTree>, forRuntimeCfgMacro: Boolea
     if (ident == "false") return false
     if (ident in profile.enabledCfgFlags) return true
     if (ident in profile.disabledCfgFlags) return false
+    if (ident in setOf("miri", "doc", "rustdoc", "doctest", "bootstrap")) return false
     if (ident == "test") return if (forRuntimeCfgMacro) false else null
     if (ident == "unix" || ident == "windows" || ident == "wasm") {
         profile.targetFamilies?.let { return ident in it }

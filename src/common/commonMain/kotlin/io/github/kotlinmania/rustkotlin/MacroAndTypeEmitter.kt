@@ -898,6 +898,10 @@ internal fun KotlinJ2KEmitter.renderCastExpression(
         val recv = if (isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
         return convertNumericReceiver("$recv.rawAddress", canonicalNumericTarget, NumericKind.I64)
     }
+    if (canonicalNumericTarget != null && mutableReferencePointeeType(sourceInferredForNum) != null) {
+        val recv = if (isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
+        return convertNumericReceiver("$recv.pointer.rawAddress", canonicalNumericTarget, NumericKind.I64)
+    }
     if (canonicalNumericTarget != null && isKnownBooleanCastSource(sourceExpr)) {
         val cleanCond =
             if (hasOuterBalancedParens(inner)) {

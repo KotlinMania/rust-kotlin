@@ -728,7 +728,57 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                         val retT = currentEnclosingReturnRenderedType
                         if (retT != null) renderFallbackDefaultForRenderedType(retT) else "0L"
                     } else {
-                        "null"
+                        val targetType =
+                            (currentExpectedParseTargetType ?: currentEnclosingReturnRenderedType)
+                                ?.trim()
+                                ?.removeSuffix("?")
+                                ?.takeIf { it.isNotEmpty() && it != "Any" && it != "Unit" }
+                        if (targetType == null) {
+                            "null"
+                        } else {
+                            val fallback = renderFallbackDefaultForRenderedType(targetType)
+                            if (!fallback.startsWith("null as ") && fallback != "null" && !fallback.startsWith("error(")) {
+                                fallback
+                            } else {
+                                val baseSimple = targetType.substringBefore('<').substringAfterLast('.').trim()
+                                val impPkg = importedSimpleNameToPkg[baseSimple]
+                                val libcNs = FfiInteropCollector.resolveLibcNamespace(headerContext)
+                                val isExternalFfiStruct =
+                                    (libcNs != null && (targetType.startsWith("$libcNs.") || impPkg == libcNs || impPkg?.startsWith("$libcNs.") == true)) ||
+                                        impPkg?.contains(".libc") == true ||
+                                        impPkg?.contains(".wasip1") == true ||
+                                        impPkg?.contains(".windowssys") == true ||
+                                        (
+                                            targetType in inspector.declaredTypeNames ||
+                                                sameFileUniqueSimpleStruct(baseSimple)
+                                                    ?.let { StructLayoutComputer.computeStructLayout(it, this) }
+                                                    ?.requiredTypeLayoutParams
+                                                    ?.isNotEmpty() == false
+                                        )
+                                val structDecl = sameFileUniqueSimpleStruct(baseSimple)
+                                val computedLayout =
+                                    if (structDecl != null) {
+                                        StructLayoutComputer.computeStructLayout(structDecl, this)
+                                    } else {
+                                        null
+                                    }
+                                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+                                when {
+                                    computedLayout != null && computedLayout.requiredTypeLayoutParams.isEmpty() ->
+                                        CoreIntrinsicLowering.renderZeroedLayoutReadExpression(
+                                            "$baseSimple.typeLayout()",
+                                            "$coreNs.intrinsics",
+                                            this,
+                                        )
+                                    isExternalFfiStruct && '<' !in targetType -> "$targetType()"
+                                    else -> {
+                                        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.maybeuninit.MaybeUninit")
+                                        val layoutExpr = resolveRenderedTypeLayoutExpr(targetType)
+                                        "MaybeUninit.zeroed($layoutExpr).assumeInit()"
+                                    }
+                                }
+                            }
+                        }
                     }
                 (calleeBase == "Padding.uninit" || calleeBase.endsWith(".Padding.uninit")) && nonUnitArgs.isEmpty() ->
                     if (currentExpectedParseTargetType in PRIMITIVE_ARRAY_TYPES) {
@@ -1100,21 +1150,40 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                                 }
                                 val paramKind = calleeParamNumericKinds?.get(argIdx)
                                 val isIntLitArg = (unwrapParenOrGroupExpr(argExpr) as? Expr.Lit)?.lit is Lit.Int
+                                val unwrappedRefArg = unwrapParenOrGroupExpr(argExpr) as? Expr.Reference
+                                val refArgLocal =
+                                    (unwrappedRefArg?.expr?.let(::unwrapParenOrGroupExpr) as? Expr.Path)
+                                        ?.takeIf { it.qself == null && it.path.segments.size == 1 }
+                                        ?.path
+                                        ?.segments
+                                        ?.first()
+                                        ?.ident
+                                        ?.toString()
+                                        ?.let { scopeBuilder.resolveLocalKotlinName(it.removePrefix("r#")) ?: rustValueIdentToKotlin(it) }
+                                val refArgStorage = refArgLocal?.let { currentAddressableLocals[it] }
                                 if ((callee == "ioctl" || callee.endsWith(".ioctl")) && argIdx >= 2) {
-                                    if (isIntLitArg || inferExprNumericKind(argExpr, selfTypeName) != null) {
-                                        renderTypedNumericInitializer(argExpr, NumericKind.I64, indent, selfTypeName)
-                                    } else {
-                                        currentExpectedNumericKind = null
-                                        val r = renderExpr(argExpr, indent, selfTypeName)
-                                        renderCastExpression(r, "Long", argExpr, selfTypeName)
+                                    when {
+                                        refArgStorage != null ->
+                                            if (unwrappedRefArg.mutability != null) "$refArgStorage.asMutPtr().rawAddress" else "$refArgStorage.asConstPtr().rawAddress"
+                                        isIntLitArg || inferExprNumericKind(argExpr, selfTypeName) != null ->
+                                            renderTypedNumericInitializer(argExpr, NumericKind.I64, indent, selfTypeName)
+                                        else -> {
+                                            currentExpectedNumericKind = null
+                                            val r = renderExpr(argExpr, indent, selfTypeName)
+                                            renderCastExpression(r, "Long", argExpr, selfTypeName)
+                                        }
                                     }
                                 } else if (callee == "syscall" || callee.endsWith(".syscall")) {
-                                    if (argIdx == 0 || isIntLitArg || inferExprNumericKind(argExpr, selfTypeName) != null) {
-                                        renderTypedNumericInitializer(argExpr, NumericKind.I64, indent, selfTypeName)
-                                    } else {
-                                        currentExpectedNumericKind = null
-                                        val r = renderExpr(argExpr, indent, selfTypeName)
-                                        renderCastExpression(r, "Long", argExpr, selfTypeName)
+                                    when {
+                                        argIdx > 0 && refArgStorage != null ->
+                                            if (unwrappedRefArg.mutability != null) "$refArgStorage.asMutPtr().rawAddress" else "$refArgStorage.asConstPtr().rawAddress"
+                                        argIdx == 0 || isIntLitArg || inferExprNumericKind(argExpr, selfTypeName) != null ->
+                                            renderTypedNumericInitializer(argExpr, NumericKind.I64, indent, selfTypeName)
+                                        else -> {
+                                            currentExpectedNumericKind = null
+                                            val r = renderExpr(argExpr, indent, selfTypeName)
+                                            renderCastExpression(r, "Long", argExpr, selfTypeName)
+                                        }
                                     }
                                 } else if (paramKind != null) {
                                     currentExpectedParseTargetType = null

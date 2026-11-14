@@ -3593,6 +3593,38 @@ private fun KotlinJ2KEmitter.renderAddressableLocal(
                 }
                 super.visitExprMethodCall(e)
             }
+            override fun visitExprCall(e: Expr.Call) {
+                val calleeLeaf =
+                    (e.func as? Expr.Path)
+                        ?.path
+                        ?.segments
+                        ?.toList()
+                        ?.lastOrNull()
+                        ?.ident
+                        ?.toString()
+                        ?.removePrefix("r#")
+                val minVarargAddrIdx =
+                    when (calleeLeaf) {
+                        "ioctl", "fcntl" -> 2
+                        "syscall", "prctl" -> 1
+                        else -> Int.MAX_VALUE
+                    }
+                for ((argIdx, argExpr) in e.args.toList().withIndex()) {
+                    val reference = unwrapParenOrGroupExpr(argExpr) as? Expr.Reference
+                    if (reference != null && isSelfIdentPath(reference.expr)) {
+                        val isPtrParam =
+                            argIdx >= minVarargAddrIdx ||
+                                resolveCalleeExprParamSynType(e.func, argIdx, selfTypeName) is SynType.Ptr
+                        if (isPtrParam) {
+                            rawAddressTaken = true
+                            if (reference.mutability == null) {
+                                storageOnlyMentions++
+                            }
+                        }
+                    }
+                }
+                super.visitExprCall(e)
+            }
             override fun visitExprRawAddr(e: Expr.RawAddr) {
                 if (isSelfIdentPath(e.expr)) {
                     rawAddressTaken = true
@@ -3673,7 +3705,9 @@ private fun KotlinJ2KEmitter.renderAddressableLocal(
                 }
         }
     if (codec == null) {
-        if (!rawAddressTaken) {
+        val allowAddressBackedMutRef =
+            mutRefTaken && sourceType != null && shouldUseAddressBackedMutableReference(sourceType, selfTypeName)
+        if (!rawAddressTaken && !allowAddressBackedMutRef) {
             return null
         }
         val fallbackRendered =

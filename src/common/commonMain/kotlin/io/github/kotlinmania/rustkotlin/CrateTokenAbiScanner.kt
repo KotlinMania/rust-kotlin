@@ -122,17 +122,20 @@ internal fun discoverCrateRawAbiMetadataFromDisk(
     fun collectDir(dir: KmPath) {
         val entries = SystemFileSystem.list(dir).sortedBy { it.toString() }
         for (entry in entries) {
+            val normEntry = entry.toString().replace('\\', '/')
+            val relEntry =
+                if (normEntry.startsWith("$normResolvedRoot/")) {
+                    normEntry.removePrefix("$normResolvedRoot/")
+                } else {
+                    entry.name
+                }
+            if (isUnsupportedTargetRustRelPath(relEntry, TranslationSession.cfgTargetProfile)) {
+                continue
+            }
             if (isScannerKmDirectory(entry)) {
                 collectDir(entry)
             } else if (isScannerKmRegularFile(entry) && entry.name.endsWith(".rs", ignoreCase = true)) {
-                val normEntry = entry.toString().replace('\\', '/')
-                val relFile =
-                    if (normEntry.startsWith("$normResolvedRoot/")) {
-                        normEntry.removePrefix("$normResolvedRoot/")
-                    } else {
-                        entry.name
-                    }
-                collectedSources += relFile to readScannerKmFileText(entry)
+                collectedSources += relEntry to readScannerKmFileText(entry)
             }
         }
     }
@@ -262,9 +265,12 @@ private fun scanSourcesWithActiveSession(
     finalStructs: Boolean,
 ): CrateRawAbiMetadata {
     val rawNormalizedSources =
-        sources.map { (rel, txt) ->
-            rel.replace('\\', '/').trimStart('/') to txt
-        }
+        sources
+            .map { (rel, txt) ->
+                rel.replace('\\', '/').trimStart('/') to txt
+            }.filterNot { (rel, _) ->
+                isUnsupportedTargetRustRelPath(rel, TranslationSession.cfgTargetProfile)
+            }
     val rawByRelPath = rawNormalizedSources.toMap()
     val skipCfgTest =
         "test" in TranslationSession.cfgTargetProfile.disabledCfgFlags ||
@@ -1067,6 +1073,22 @@ private fun scanRootAliasesAndExternalReexports(
                     if (pathVal == "mod.rs") {
                         rootSelfDirModuleAliasesOut += modIdent
                         pointsToRootModRs = true
+                    } else if (
+                        pathVal != null &&
+                        pathVal.startsWith("../") &&
+                        (pathVal.endsWith("/src/lib.rs") || pathVal.endsWith("/src/mod.rs"))
+                    ) {
+                        val targetCrate =
+                            pathVal
+                                .removeSuffix("/src/lib.rs")
+                                .removeSuffix("/src/mod.rs")
+                                .substringAfterLast('/')
+                                .replace('-', '_')
+                                .removePrefix("r#")
+                        if (targetCrate.isNotEmpty() && !isLocalFileModule(modIdent)) {
+                            rootExternalModuleReexportsOut[modIdent] = targetCrate
+                            externalCrateNames += targetCrate
+                        }
                     }
                 }
             }

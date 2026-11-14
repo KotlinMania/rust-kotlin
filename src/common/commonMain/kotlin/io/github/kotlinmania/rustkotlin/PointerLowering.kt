@@ -131,6 +131,16 @@ internal fun KotlinJ2KEmitter.shouldUseAddressBackedMutableReference(
     if (primitive in setOf("isize", "usize", "i128", "u128", "f16", "f32", "f64", "f128", "char")) return true
     if (resolved is SynType.Ptr) return true
     if (runtimeCellField(resolved) != null) return true
+    val firstRawSeg =
+        (resolved as? SynType.Path)
+            ?.path
+            ?.segments
+            ?.toList()
+            ?.firstOrNull()
+            ?.ident
+            ?.toString()
+            ?.removePrefix("r#")
+    if (firstRawSeg in setOf("libc", "wasip1", "windows_sys", "wasi")) return true
     val rendered =
         (resolved as? SynType.Path)
             ?.path
@@ -139,6 +149,10 @@ internal fun KotlinJ2KEmitter.shouldUseAddressBackedMutableReference(
             ?.ident
             ?.toString()
             ?.let { if (it == "Self") selfTypeName else rustTypeIdentToKotlin(it) }
+    val renderedPkg = rendered?.let { importedSimpleNameToPkg[it] }
+    if (renderedPkg != null && (".libc" in renderedPkg || ".wasip1" in renderedPkg || ".windowssys" in renderedPkg)) {
+        return true
+    }
     val decl = transparentDeclaration(rendered)
     if (decl != null && sourceTransparentField(decl, rendered ?: decl.ident.toString()) != null) {
         return true

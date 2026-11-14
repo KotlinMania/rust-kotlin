@@ -857,10 +857,27 @@ private fun executeTranslate(
         } else {
             parsed.cfgTargetProfile
         }
-    val filteredDiscovered =
+    val supportedDiscovered =
         if (parsed.recursive && discovered.size > 1) {
+            discovered.filterNot { ent ->
+                val discRoot = ent.discoveryRoot
+                val normEnt = ent.inputPath.replace('\\', '/')
+                val relPath =
+                    if (discRoot != null && normEnt.startsWith("$discRoot/")) {
+                        normEnt.removePrefix("$discRoot/")
+                    } else {
+                        ent.relativeDir.takeIf { it.isNotEmpty() }?.let { "$it/${normEnt.substringAfterLast('/')}" }
+                            ?: normEnt.substringAfterLast('/')
+                    }
+                isUnsupportedTargetRustRelPath(relPath, effectiveCfgProfile)
+            }
+        } else {
+            discovered
+        }
+    val filteredDiscovered =
+        if (parsed.recursive && supportedDiscovered.size > 1) {
             val disabledByRoot = mutableMapOf<String, Set<String>>()
-            for ((discRoot, entriesInRoot) in discovered.groupBy { it.discoveryRoot }) {
+            for ((discRoot, entriesInRoot) in supportedDiscovered.groupBy { it.discoveryRoot }) {
                 if (discRoot == null) continue
                 val relTextMap = linkedMapOf<String, String>()
                 for (ent in entriesInRoot) {
@@ -880,7 +897,7 @@ private fun executeTranslate(
                         skipCfgTest = parsed.portLintDirective != "tests",
                     )
             }
-            discovered.filterNot { ent ->
+            supportedDiscovered.filterNot { ent ->
                 val discRoot = ent.discoveryRoot ?: return@filterNot false
                 val disabledSet = disabledByRoot[discRoot].orEmpty()
                 if (disabledSet.isEmpty()) return@filterNot false
@@ -894,7 +911,7 @@ private fun executeTranslate(
                 isRelPathUnderDisabledModulePrefix(relPath, disabledSet)
             }
         } else {
-            discovered
+            supportedDiscovered
         }
     var resolvedProjectNamespaceForScaffold: String? = parsed.namespaceOverride ?: explicitGradleProps?.projectNamespace
     val isBatchOutput =
