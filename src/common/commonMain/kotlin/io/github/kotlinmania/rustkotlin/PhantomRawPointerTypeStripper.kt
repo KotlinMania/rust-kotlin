@@ -317,7 +317,7 @@ internal object PhantomRawPointerTypeStripper {
         return prefixes.any { code.startsWith(it, index) }
     }
 
-    private fun splitTopLevelCommaList(segment: String): List<String> {
+    internal fun splitTopLevelCommaList(segment: String): List<String> {
         val parts = mutableListOf<String>()
         var start = 0
         var i = 0

@@ -42,6 +42,9 @@ private enum class DocFenceKind {
 private val VERBATIM_FENCE_LANGS =
     setOf("text", "console", "plain", "plaintext", "sh", "bash", "zsh", "toml", "json", "yaml", "c", "cpp", "diff")
 
+private val NON_COMPILING_RUSTDOC_FENCE_TAGS =
+    setOf("ignore", "compile_fail", "custom")
+
 private val COMPILER_ONLY_DOC_EXAMPLE_ATTRS =
     setOf(
         "doc",
@@ -83,14 +86,19 @@ internal fun sanitizeDocLines(
             if (fenceKind == DocFenceKind.None) {
                 val fenceIdx = lineWithoutLeadingSpace.indexOf("```")
                 fencePrefixIndent = if (fenceIdx > 0) lineWithoutLeadingSpace.substring(0, fenceIdx) else ""
-                val langToken =
+                val fenceInfoTokens =
                     trimmed
                         .removePrefix("```")
                         .trim()
-                        .substringBefore(',')
-                        .substringBefore(' ')
-                        .lowercase()
-                if (langToken in VERBATIM_FENCE_LANGS) {
+                        .split(',', ' ', '\t')
+                        .map { it.trim().lowercase() }
+                        .filter { it.isNotEmpty() }
+                val langToken = fenceInfoTokens.firstOrNull().orEmpty()
+                val hasNonCompilingTag =
+                    fenceInfoTokens.any { tok ->
+                        tok in NON_COMPILING_RUSTDOC_FENCE_TAGS || tok.startsWith("ignore-")
+                    }
+                if (langToken in VERBATIM_FENCE_LANGS || hasNonCompilingTag) {
                     fenceKind = DocFenceKind.VerbatimText
                     cleaned.add(lineWithoutLeadingSpace.trimEnd())
                 } else {
@@ -738,6 +746,27 @@ private fun collectDoctestPlaceholderReplacementsFromTrees(
                 val semiPos = next.value.span().startOffset()
                 if (semiPos >= 0) {
                     edits += SpanReplacement(semiPos, semiPos, "placeholderValue")
+                }
+            } else if (i + 3 < trees.size) {
+                val dot1 = trees[i + 1] as? TokenTree.Punct
+                val dot2 = trees[i + 2] as? TokenTree.Punct
+                val dot3 = trees[i + 3] as? TokenTree.Punct
+                val after = trees.getOrNull(i + 4)
+                val validTrailing =
+                    after == null ||
+                        (after is TokenTree.Punct && (after.value.asChar() == ';' || after.value.asChar() == ','))
+                if (validTrailing &&
+                    dot1?.value?.asChar() == '.' &&
+                    dot1.value.spacing() == Spacing.Joint &&
+                    dot2?.value?.asChar() == '.' &&
+                    dot2.value.spacing() == Spacing.Joint &&
+                    dot3?.value?.asChar() == '.'
+                ) {
+                    val startPos = dot1.value.span().startOffset()
+                    val endPos = dot3.value.span().endExclusiveOffset()
+                    if (startPos >= 0 && endPos > startPos) {
+                        edits += SpanReplacement(startPos, endPos, "placeholderValue")
+                    }
                 }
             }
         }

@@ -197,6 +197,32 @@ internal fun KotlinJ2KEmitter.resolveBestSubpackageForSymbol(ktSymbol: String): 
             .filter { it !in setOf("new", "sys", "unix", "bsd", "linuxlike", "freebsdlike", "netbsdlike", "solarish") }
             .toSet()
 
+    fun osAffinityBias(candSegs: List<String>): Int {
+        var bias = 0
+        when {
+            "windows" in curSegs -> {
+                if ("windows" in candSegs) bias += 5000
+                if (candSegs.any { it in setOf("unix", "wasi", "hermit", "solid", "uefi", "xous", "zkvm", "motor", "sgx", "teeos", "vexos") }) {
+                    bias -= 5000
+                }
+            }
+            "wasi" in curSegs -> {
+                if ("wasi" in candSegs) bias += 5000
+                if ("unix" in candSegs) bias += 3000
+                if (candSegs.any { it in setOf("windows", "hermit", "solid", "uefi", "xous", "zkvm", "motor", "sgx") }) {
+                    bias -= 5000
+                }
+            }
+            "unix" in curSegs -> {
+                if ("unix" in candSegs) bias += 5000
+                if (candSegs.any { it in setOf("windows", "wasi", "hermit", "solid", "uefi", "xous", "zkvm", "motor", "sgx") }) {
+                    bias -= 5000
+                }
+            }
+        }
+        return bias
+    }
+
     fun score(cand: String): Int {
         val candSegs = if (cand.isEmpty()) emptyList() else cand.split('.')
         val isAncestor = cand.isEmpty() || cur.startsWith("$cand.")
@@ -206,14 +232,14 @@ internal fun KotlinJ2KEmitter.resolveBestSubpackageForSymbol(ktSymbol: String): 
         val isDescendant = cur.isEmpty() || cand.startsWith("$cur.")
         if (isDescendant) {
             val depthDelta = candSegs.size - curSegs.size
-            return 10_000 - depthDelta * 40 + archAndOsBias(candSegs)
+            return 10_000 - depthDelta * 40 + archAndOsBias(candSegs) + osAffinityBias(candSegs)
         }
         var common = 0
         while (common < curSegs.size && common < candSegs.size && curSegs[common] == candSegs[common]) {
             common++
         }
         val sharedOsBonus = candSegs.count { it in curSignificantSegs } * 2000
-        return common * 300 + sharedOsBonus - candSegs.size * 15 + archAndOsBias(candSegs)
+        return common * 300 + sharedOsBonus - candSegs.size * 15 + archAndOsBias(candSegs) + osAffinityBias(candSegs)
     }
 
     return candidates.maxByOrNull(::score)
@@ -937,25 +963,37 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
             return null
         }
         if (afterRoot.size == 1 && mapped.last() != "*" && nsPrefix != null && headerContext.crateSymbolSubpackages.isNotEmpty()) {
-            val bestSub = resolveBestSubpackageForSymbol(mapped.last())
-            if (bestSub != null) {
-                return if (bestSub.isEmpty()) "$nsPrefix.${mapped.last()}" else "$nsPrefix.$bestSub.${mapped.last()}"
+            val rawLeaf = afterRoot[0].removePrefix("r#")
+            if (rawLeaf.firstOrNull()?.isLowerCase() != true || isKnownFunctionLeafIdent(afterRoot[0])) {
+                val bestSub = resolveBestSubpackageForSymbol(mapped.last())
+                if (bestSub != null) {
+                    return if (bestSub.isEmpty()) "$nsPrefix.${mapped.last()}" else "$nsPrefix.$bestSub.${mapped.last()}"
+                }
             }
         }
         // A module path names where the item is declared; the scanned crate metadata records the
         // subpackage that declaration is emitted into (with split module roots, `op.rs` -> `op`).
         if (afterRoot.size >= 2 && mapped.last() != "*" && nsPrefix != null) {
             val explicitModule = mapped.drop(1).dropLast(1).joinToString(".")
+            val normalizedExplicitModule =
+                if (explicitModule == "os.wasi.ffi" || explicitModule.startsWith("os.wasi.ffi.")) {
+                    explicitModule.replaceFirst("os.wasi.ffi", "os.unix.ffi")
+                } else {
+                    explicitModule
+                }
             val candidates = headerContext.crateSymbolSubpackages[mapped.last()]
             if (!candidates.isNullOrEmpty()) {
                 val sub =
                     when {
                         explicitModule in candidates -> explicitModule
+                        normalizedExplicitModule in candidates -> normalizedExplicitModule
                         else ->
                             candidates
                                 .filter { it.startsWith("$explicitModule.") }
                                 .minByOrNull { it.count { ch -> ch == '.' } }
-                                ?: resolveBestSubpackageForSymbol(mapped.last())
+                                ?: candidates
+                                    .filter { it.startsWith("$normalizedExplicitModule.") }
+                                    .minByOrNull { it.count { ch -> ch == '.' } }
                     }
                 if (sub != null) {
                     return if (sub.isEmpty()) "$nsPrefix.${mapped.last()}" else "$nsPrefix.$sub.${mapped.last()}"
@@ -980,6 +1018,12 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
                     }
                 if (matchedPkg != null) {
                     return "$matchedPkg.${mapped.last()}"
+                }
+            }
+            if (!candidates.isNullOrEmpty()) {
+                val best = resolveBestSubpackageForSymbol(mapped.last())
+                if (best != null) {
+                    return if (best.isEmpty()) "$nsPrefix.${mapped.last()}" else "$nsPrefix.$best.${mapped.last()}"
                 }
             }
         }
@@ -1164,16 +1208,58 @@ internal fun KotlinJ2KEmitter.renderItemUse(
 ): String {
     val leaves = mutableListOf<UseLeaf>()
     collectUseLeaves(item.tree, emptyList(), leaves)
-    val lines = mutableListOf<String>()
+    val effectiveLeaves = mutableListOf<UseLeaf>()
     for (leaf in leaves) {
+        val segs = leaf.segments
+        val root = segs.firstOrNull()
+        val isStdOrSelfStdCrate =
+            root in STDLIB_CRATE_ROOTS ||
+                (root == "crate" && headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true)
+        if (isStdOrSelfStdCrate && segs.size == 5 && segs[1] == "os" && segs[3] == "prelude" && segs[4] == "*") {
+            val stdRoot = if (root == "crate") "crate" else "std"
+            when (segs[2]) {
+                "windows" -> {
+                    for (sym in listOf("OsStrExt", "OsStringExt", "encode_wide")) {
+                        effectiveLeaves += UseLeaf(segments = listOf(stdRoot, "os", "windows", "ffi", sym), alias = null, isSelfImport = false)
+                    }
+                    continue
+                }
+                "unix", "wasi" -> {
+                    for (sym in listOf("OsStrExt", "OsStringExt", "as_bytes", "into_vec", "from_bytes", "from_vec")) {
+                        effectiveLeaves += UseLeaf(segments = listOf(stdRoot, "os", "unix", "ffi", sym), alias = null, isSelfImport = false)
+                    }
+                    continue
+                }
+            }
+        }
+        effectiveLeaves += leaf
+    }
+    val lines = mutableListOf<String>()
+    for (leaf in effectiveLeaves) {
         val root = leaf.segments.firstOrNull()
-        if (leaf.isSelfImport && root in STDLIB_CRATE_ROOTS) {
+        val isStdOrSelfStdCrate =
+            root in STDLIB_CRATE_ROOTS ||
+                (root == "crate" && headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true)
+        val isMappedOrSelfStdCrate =
+            (
+                root in STDLIB_CRATE_ROOTS &&
+                    (
+                        root in headerContext.crateNamespaces ||
+                            headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true
+                    )
+            ) ||
+                (root == "crate" && headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true)
+        if (leaf.isSelfImport && isStdOrSelfStdCrate) {
             continue
         }
-        if (root in STDLIB_CRATE_ROOTS && leaf.segments.size == 2 && leaf.segments[1].firstOrNull()?.isLowerCase() == true) {
+        if (isMappedOrSelfStdCrate &&
+            leaf.segments.size == 2 &&
+            leaf.segments[1].firstOrNull()?.isLowerCase() == true &&
+            !isKnownFunctionLeafIdent(leaf.segments[1])
+        ) {
             continue
         }
-        if (root in STDLIB_CRATE_ROOTS &&
+        if (isStdOrSelfStdCrate &&
             leaf.segments.getOrNull(1)?.removePrefix("r#") in setOf("f32", "f64", "consts")
         ) {
             continue

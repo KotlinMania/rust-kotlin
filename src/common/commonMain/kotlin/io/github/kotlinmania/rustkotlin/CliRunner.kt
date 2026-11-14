@@ -1086,6 +1086,7 @@ private fun executeTranslate(
                 scalarChar = parsed.scalarChar,
                 externalCrateSymbolPackages = externalCrateMeta.symbolPackages,
                 externalCrateTwoFieldResultFns = externalCrateMeta.twoFieldResultFns,
+                externalCrateNullableReturnFns = externalCrateMeta.nullableReturnFns,
                 cfgTargetProfile =
                     if (parsed.portLintDirective != "tests") {
                         parsed.cfgTargetProfile.copy(

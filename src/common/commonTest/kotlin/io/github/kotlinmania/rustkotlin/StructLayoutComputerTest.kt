@@ -75,7 +75,11 @@ class StructLayoutComputerTest {
         val kt = renderSingleKotlinFile(rustSource).text
         assertContains(
             kt,
-            "public fun <T> typeLayout(typeLayoutT: io.github.kotlinmania.rustlang.core.mem.TypeLayout<T>):",
+            "import io.github.kotlinmania.rustlang.core.mem.TypeLayout",
+        )
+        assertContains(
+            kt,
+            "public fun <T> typeLayout(typeLayoutT: TypeLayout<T>):",
         )
         assertContains(kt, "alignUpBytes(")
         assertContains(kt, "(typeLayoutT).readNative(")

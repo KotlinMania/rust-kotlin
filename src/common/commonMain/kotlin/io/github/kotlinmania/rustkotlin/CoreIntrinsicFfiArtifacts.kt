@@ -2477,10 +2477,11 @@ public fun kmInternWideStr(literal: String): ConstPtr {
 
     public fun renderKmCoreNativeActualsKotlin(coreNamespace: String, cinteropPackage: String): String =
         """
-@file:OptIn(kotlinx.cinterop.ExperimentalForeignApi::class)
+@file:OptIn(ExperimentalForeignApi::class)
 
 package $coreNamespace.intrinsics
 
+import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.UByteVar
 import kotlinx.cinterop.ULongVar
 import kotlinx.cinterop.alloc
@@ -3193,7 +3194,7 @@ public actual fun kmSimdDotF32(aAddr: Long, bAddr: Long, len: Long): Float =
     ): String {
         val resourcePrefix = projectNamespace.replace('.', '/')
         return """
-@file:OptIn(kotlin.ExperimentalUnsignedTypes::class)
+@file:OptIn(ExperimentalUnsignedTypes::class)
 
 package $coreNamespace.intrinsics
 
@@ -3260,7 +3261,7 @@ ${renderKmCoreSharedJvmBridgeMethods(jniObjectName)}
         jniObjectName: String = "KmCoreJniBridge",
     ): String =
         """
-@file:OptIn(kotlin.ExperimentalUnsignedTypes::class)
+@file:OptIn(ExperimentalUnsignedTypes::class)
 
 package $coreNamespace.intrinsics
 
@@ -4321,7 +4322,7 @@ NODE_API_MODULE(NODE_GYP_MODULE_NAME, KmNapiStandaloneInit)
     ): String {
         val loaderBody = renderNodeKmCoreLoaderJsBody(ffiModName)
         return """
-@file:OptIn(kotlin.ExperimentalUnsignedTypes::class)
+@file:OptIn(ExperimentalUnsignedTypes::class)
 
 package $coreNamespace.intrinsics
 
@@ -4687,7 +4688,7 @@ public actual fun kmSimdDotF32(aAddr: Long, bAddr: Long, len: Long): Float =
     ): String {
         val loaderBody = renderNodeKmCoreLoaderJsBody(ffiModName)
         return """
-@file:OptIn(kotlin.ExperimentalUnsignedTypes::class, kotlin.js.ExperimentalWasmJsInterop::class)
+@file:OptIn(ExperimentalUnsignedTypes::class, ExperimentalWasmJsInterop::class)
 
 package $coreNamespace.intrinsics
 

@@ -1739,9 +1739,27 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                     }
                 }
             }
+            val isThreadCurrentCall =
+                when (val recvCore = unwrapParenOrGroupExpr(expr.receiver)) {
+                    is Expr.Call -> {
+                        val fnPath = (unwrapParenOrGroupExpr(recvCore.func) as? Expr.Path)?.takeIf { it.qself == null }
+                        val segs =
+                            fnPath
+                                ?.path
+                                ?.segments
+                                ?.toList()
+                                ?.map { it.ident.toString().removePrefix("r#") }
+                        recvCore.args.isEmpty() && (
+                            segs == listOf("thread", "current") ||
+                                segs == listOf("std", "thread", "current") ||
+                                (segs == listOf("current") && scopeBuilder.resolveModuleBinding("current")?.importedPath == "std.thread.current")
+                        )
+                    }
+                    else -> false
+                }
             if (rawMethod == "id" &&
                 nonUnitArgs.isEmpty() &&
-                (receiver == "thread.current()" || receiver.endsWith(".thread.current()"))
+                (receiver == "thread.current()" || receiver.endsWith(".thread.current()") || isThreadCurrentCall)
             ) {
                 usesCurrentThreadToken = true
                 return "currentThreadBoundToken()"
@@ -2517,6 +2535,35 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                 return "$atomicRecv.mapNotNull($mappedArg)"
             }
             val inferredMethodRecvTy = inferExprRenderedType(expr.receiver, selfTypeName)?.removeSuffix("?")?.trim()
+            if (rawMethod == "to_vec" && renderedValueArgs.isEmpty() && typeArgs.isEmpty()) {
+                val unwrappedRecvExpr = unwrapTransparentCastExpr(expr.receiver)
+                val isRangeSliceExpr = unwrappedRecvExpr is Expr.Index && unwrappedRecvExpr.index is Expr.Range
+                val isListOrByteSlice =
+                    inferredMethodRecvTy?.startsWith("List<") == true ||
+                        inferredMethodRecvTy?.startsWith("MutableList<") == true ||
+                        inferredMethodRecvTy?.startsWith("ArrayList<") == true ||
+                        isRangeSliceExpr ||
+                        receiver.endsWith(".toBytes()") ||
+                        receiver.endsWith(".asBytes()") ||
+                        receiver.endsWith(".asSlice()")
+                if (isListOrByteSlice) {
+                    val atomicRecv = if (isAtomicPostfixReceiver(expr.receiver, receiver)) receiver else "($receiver)"
+                    return "$atomicRecv.toMutableList()"
+                }
+            }
+            if ((rawMethod == "as_slice" || rawMethod == "size_hint") &&
+                renderedValueArgs.isEmpty() &&
+                typeArgs.isEmpty() &&
+                (receiver in currentDequeLocals || isDequeIterReceiver || inferredMethodRecvTy?.startsWith("ArrayDeque<") == true)
+            ) {
+                val atomicRecv = if (isAtomicPostfixReceiver(expr.receiver, receiver)) receiver else "($receiver)"
+                if (rawMethod == "as_slice") {
+                    return "$atomicRecv.toList()"
+                }
+                if (rawMethod == "size_hint") {
+                    return "run { val n = $atomicRecv.size; Pair(n, n) }"
+                }
+            }
             if (inferredMethodRecvTy == "RustAny" && renderedValueArgs.isEmpty() && typeArgs.isNotEmpty()) {
                 val atomicRecv = if (isAtomicPostfixReceiver(expr.receiver, receiver)) receiver else "($receiver)"
                 when (rawMethod) {
@@ -2572,6 +2619,7 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                         }
                     }
                     rawMethod == "into_iter" && renderedValueArgs.isEmpty() -> return "ArrayDeque(listOfNotNull($receiver))"
+                    rawMethod == "flatten" && renderedValueArgs.isEmpty() -> return receiver
                     (rawMethod == "map" || rawMethod == "and_then") && renderedValueArgs.size == 1 ->
                         return "$atomicRecv?.let(${wrapMapCallbackArg(nonUnitArgs[0], renderedValueArgs[0])})"
                     rawMethod == "map_or" && renderedValueArgs.size == 2 ->
@@ -3276,10 +3324,58 @@ internal fun KotlinJ2KEmitter.isKnownNullableOptionExpr(expr: Expr, renderedRece
         ) {
             return true
         }
-        if ((m == "map" || m == "and_then" || m == "or" || m == "or_else" || m == "as_ref" || m == "as_mut" || m == "cloned" || m == "copied" || m == "filter") &&
+        if ((m == "map" || m == "and_then" || m == "flatten" || m == "or" || m == "or_else" || m == "as_ref" || m == "as_mut" || m == "cloned" || m == "copied" || m == "filter") &&
             isKnownNullableOptionExpr(core.receiver, "", selfTypeName)
         ) {
             return true
+        }
+    }
+    if (core is Expr.Call) {
+        val fnPath = (unwrapParenOrGroupExpr(core.func) as? Expr.Path)?.takeIf { it.qself == null }
+        val segs =
+            fnPath
+                ?.path
+                ?.segments
+                ?.toList()
+                .orEmpty()
+        val lastRaw =
+            segs
+                .lastOrNull()
+                ?.ident
+                ?.toString()
+                ?.removePrefix("r#")
+        if (lastRaw != null) {
+            if (lastRaw in setOf("memchr", "memrchr")) {
+                return true
+            }
+            val ktFn = rustFunctionIdentToKotlin(lastRaw)
+            val localRet =
+                inspector.topLevelFnReturnSynTypes[lastRaw]
+                    ?: inspector.topLevelFnReturnSynTypes[ktFn]
+            if (localRet != null) {
+                val uRet = unwrapSynType(localRet) as? SynType.Path
+                if (uRet
+                        ?.path
+                        ?.segments
+                        ?.last()
+                        ?.ident
+                        ?.toString() == "Option"
+                ) {
+                    return true
+                }
+            } else if (headerContext.externalCrateNullableReturnFns.isNotEmpty()) {
+                val importedPkg = importedSimpleNameToPkg[ktFn]
+                if (importedPkg != null && "$importedPkg.$ktFn" in headerContext.externalCrateNullableReturnFns) {
+                    return true
+                }
+                if (segs.size == 1 &&
+                    headerContext.externalCrateSymbolPackages.values.any { symMap ->
+                        symMap[ktFn].orEmpty().any { pkg -> "$pkg.$ktFn" in headerContext.externalCrateNullableReturnFns }
+                    }
+                ) {
+                    return true
+                }
+            }
         }
     }
     val inferred = inferExprRenderedType(expr, selfTypeName)?.trim()
@@ -3979,6 +4075,12 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
             if (lastCallIdent == "type_name") {
                 return "String"
             }
+            if (lastCallIdent in setOf("memchr", "memrchr") &&
+                lastCallIdent !in inspector.declaredTopLevelFnRawNames &&
+                "memchr" !in inspector.declaredTypeNames
+            ) {
+                return "Int?"
+            }
             fun renderTopLevelFnRet(ktFn: String, rawFn: String? = null): String? {
                 val synRet =
                     (rawFn?.let { inspector.topLevelFnReturnSynTypes[it] })
@@ -4138,13 +4240,34 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
             }
             if (!hasDeclaredOptionEnum() && expr.turbofish == null) {
                 val optRecvTy = lazyRecvType
-                if (optRecvTy != null && optRecvTy.endsWith("?")) {
+                val recvIsNullable = optRecvTy != null && optRecvTy.endsWith("?")
+                if (recvIsNullable) {
                     when {
                         rawMethod == "unwrap" && expr.args.isEmpty() -> return optRecvTy.removeSuffix("?")
                         (rawMethod == "expect" || rawMethod == "unwrap_or" || rawMethod == "unwrap_or_else") && expr.args.size == 1 ->
                             return optRecvTy.removeSuffix("?")
-                        (rawMethod == "or" || rawMethod == "or_else") && expr.args.size == 1 ->
-                            return optRecvTy
+                    }
+                }
+                if (recvIsNullable || isKnownNullableOptionExpr(expr.receiver, "", selfTypeName)) {
+                    when {
+                        (rawMethod == "or" || rawMethod == "or_else" || rawMethod == "filter") && expr.args.size == 1 ->
+                            return optRecvTy ?: "Any?"
+                        (rawMethod == "cloned" || rawMethod == "copied" || rawMethod == "as_ref" || rawMethod == "as_mut") && expr.args.isEmpty() ->
+                            return optRecvTy ?: "Any?"
+                        rawMethod == "flatten" && expr.args.isEmpty() ->
+                            return optRecvTy?.removeSuffix("?")?.let { inner ->
+                                if (inner.endsWith("?")) inner else "$inner?"
+                            } ?: "Any?"
+                        (rawMethod == "map" || rawMethod == "and_then") && expr.args.size == 1 -> {
+                            val cbTy =
+                                expr.args
+                                    .first()
+                                    ?.let { unwrapParenOrGroupExpr(it) as? Expr.Closure }
+                                    ?.body
+                                    ?.let { inferExprRenderedType(it, selfTypeName)?.removeSuffix("?") }
+                                    ?: "Any"
+                            return "$cbTy?"
+                        }
                     }
                 }
             }
@@ -6267,6 +6390,15 @@ internal fun KotlinJ2KEmitter.wrapMapCallbackArg(
     }
     val unwrapped = unwrapParenOrGroupExpr(argExpr) as? Expr.Path ?: return renderedArg
     if (unwrapped.qself != null || unwrapped.path.segments.isEmpty()) return renderedArg
+    val segNames =
+        unwrapped.path.segments
+            .toList()
+            .map { it.ident.toString().removePrefix("r#") }
+    if ((segNames == listOf("drop") || segNames == listOf("mem", "drop") || segNames == listOf("core", "mem", "drop") || segNames == listOf("std", "mem", "drop")) &&
+        scopeBuilder.resolveLocalKotlinName("drop") == null
+    ) {
+        return "{ Unit }"
+    }
     val rawLast =
         unwrapped.path.segments
             .last()

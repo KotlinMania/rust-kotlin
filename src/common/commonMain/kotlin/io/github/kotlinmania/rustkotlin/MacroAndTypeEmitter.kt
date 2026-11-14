@@ -1952,7 +1952,7 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
             idx == effectiveRawSegments.lastIndex ||
                 id.first().isUpperCase() ||
                 id in PRIMITIVE_TYPE_NAMES ||
-                scopeBuilder.isImportedModuleInScope(id) ||
+                (scopeBuilder.isImportedModuleInScope(id) && !isSuppressedStdlibModuleAlias(id)) ||
                 resolveImportedUppercaseTypeBinding(id) != null ||
                 idKtType in inspector.declaredTypeNames ||
                 scopedAbiKeysForRenderedType(idKtType).any { it in headerContext.crateSymbolSubpackages }
@@ -2097,7 +2097,12 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
                             lastRaw.first().isLowerCase() &&
                             !lastRaw.all { it.isUpperCase() || it.isDigit() || it == '_' }
                     if (isStaticFnRef) {
-                        return fullParts.dropLast(1).joinToString(".") + "::" + fullParts.last()
+                        return renderValuePositionStaticFnRef(
+                            prevRaw = prevRaw,
+                            ownerPath = fullParts.dropLast(1).joinToString("."),
+                            methodKt = fullParts.last(),
+                            selfTypeName = selfTypeName,
+                        )
                     }
                 }
                 return fullParts.joinToString(".")
@@ -2167,7 +2172,12 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
                 lastRaw.first().isLowerCase() &&
                 !lastRaw.all { it.isUpperCase() || it.isDigit() || it == '_' }
         if (isStaticFnRef) {
-            return parts.dropLast(1).joinToString(".") + "::" + parts.last()
+            return renderValuePositionStaticFnRef(
+                prevRaw = prevRaw,
+                ownerPath = parts.dropLast(1).joinToString("."),
+                methodKt = parts.last(),
+                selfTypeName = selfTypeName,
+            )
         }
     }
     return parts.joinToString(".")
@@ -2537,6 +2547,71 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
         }
     }
 
+    if (!headerContext.rawAbiMode &&
+        rawName == "Result" &&
+        "Result" !in inspector.declaredTypeNames &&
+        !hasDeclaredResultEnum() &&
+        lastSeg.arguments is PathArguments.AngleBracketed
+    ) {
+        val typeArgs =
+            (lastSeg.arguments as PathArguments.AngleBracketed)
+                .args
+                .toList()
+                .mapNotNull { renderGenericArgument(it, selfTypeName) }
+        if (typeArgs.size == 1) {
+            val rawSegNames = rawSegments.map { it.ident.toString().removePrefix("r#") }
+            val modHead = rawSegNames.getOrNull(rawSegNames.size - 2)
+            val resolvedModImp =
+                if (rawSegNames.size == 2 && modHead != null) {
+                    scopeBuilder.resolveModuleBinding(modHead)?.importedPath
+                } else {
+                    null
+                }
+            val matchesStdMod =
+                { expected: String ->
+                    modHead == expected &&
+                        (
+                            (rawSegNames.size == 3 && rawSegNames[0] in setOf("std", "crate")) ||
+                                (
+                                    rawSegNames.size == 2 &&
+                                        (
+                                            resolvedModImp == null ||
+                                                resolvedModImp.startsWith("std.") ||
+                                                resolvedModImp.startsWith("crate.") ||
+                                                headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.std") == true
+                                        )
+                                )
+                        )
+                }
+            val isTaggedOrRustLangStd =
+                usesTaggedCoreResult() ||
+                    headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true
+            if (matchesStdMod("io") && isTaggedOrRustLangStd) {
+                val stdNs =
+                    headerContext.crateNamespaces["std"]
+                        ?.trim()
+                        ?.removeSuffix(".")
+                        ?.takeIf { it.isNotEmpty() }
+                        ?: "io.github.kotlinmania.rustlang.std".takeIf {
+                            headerContext.packageName?.startsWith(it) == true
+                        }
+                val ioErr =
+                    if (stdNs != null) {
+                        bindOrQualifyResolvedCrossSymbol("$stdNs.io.error.Error")
+                    } else {
+                        "Error"
+                    }
+                val resName = if (usesTaggedCoreResult()) sourceResultName() else "Result"
+                return "$resName<${typeArgs[0]}, $ioErr>"
+            }
+            if (matchesStdMod("thread") && isTaggedOrRustLangStd) {
+                usesRustAny = true
+                val resName = if (usesTaggedCoreResult()) sourceResultName() else "Result"
+                return "$resName<${typeArgs[0]}, RustAny>"
+            }
+        }
+    }
+
     var externalQualifiedOverride: String? = null
     val crossTarget =
         if (rawSegments.size >= 2 && rawSegments.dropLast(1).all { it.arguments is PathArguments.None }) {
@@ -2564,7 +2639,7 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                         it !in IGNORED_PATH_PREFIXES &&
                             it !in STDLIB_PRELUDE_REEXPORT_MODULES &&
                             it !in inspector.localInlineModuleNames &&
-                            (it.first().isUpperCase() || scopeBuilder.isImportedModuleInScope(it))
+                            (it.first().isUpperCase() || (scopeBuilder.isImportedModuleInScope(it) && !isSuppressedStdlibModuleAlias(it)))
                     }.map {
                         if (it.first().isUpperCase()) {
                             rustTypeIdentToKotlin(it)
@@ -3747,4 +3822,84 @@ internal fun KotlinJ2KEmitter.isStdlibDynAnyTraitObject(ty: SynType.TraitObject)
         }
     }
     return sawStdlibAny
+}
+
+internal fun KotlinJ2KEmitter.isSuppressedStdlibModuleAlias(id: String): Boolean {
+    val imp = scopeBuilder.resolveModuleBinding(id)?.importedPath ?: return false
+    val segs = imp.split('.')
+    if (segs.size == 2) {
+        val isMappedOrSelfStdCrate =
+            (
+                segs[0] in STDLIB_CRATE_ROOTS &&
+                    (
+                        segs[0] in headerContext.crateNamespaces ||
+                            headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true
+                    )
+            ) ||
+                (segs[0] == "crate" && headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true)
+        if (isMappedOrSelfStdCrate && segs[1].firstOrNull()?.isLowerCase() == true && !isKnownFunctionLeafIdent(segs[1])) {
+            return true
+        }
+    }
+    if (segs.size == 6 &&
+        segs[0] == "io" &&
+        segs[1] == "github" &&
+        segs[2] == "kotlinmania" &&
+        segs[3] == "rustlang" &&
+        segs[5].firstOrNull()?.isLowerCase() == true &&
+        !isKnownFunctionLeafIdent(segs[5])
+    ) {
+        return true
+    }
+    return false
+}
+
+private fun KotlinJ2KEmitter.renderValuePositionStaticFnRef(
+    prevRaw: String,
+    ownerPath: String,
+    methodKt: String,
+    selfTypeName: String?,
+): String {
+    val cleanPrev = prevRaw.removePrefix("r#")
+    val ownerKt =
+        if (cleanPrev == "Self") {
+            selfTypeName?.substringBefore('<')?.trim().orEmpty()
+        } else {
+            rustTypeIdentToKotlin(cleanPrev)
+        }
+    val isTraitOwner =
+        ownerKt.isNotEmpty() &&
+            (
+                ownerKt in inspector.declaredTraitsByName ||
+                    ownerKt in headerContext.crateTraitSupertraits ||
+                    ownerKt.endsWith("Ext")
+            )
+    if (isTraitOwner) {
+        return "{ $ownerPath.$methodKt(it) }"
+    }
+    val isInstanceMethodRef =
+        (
+            methodKt in inspector.instanceMethodsByType[ownerKt].orEmpty() &&
+                methodKt !in inspector.companionMethodsByType[ownerKt].orEmpty()
+        ) ||
+            (ownerKt == "PoisonError" && methodKt == "intoInner") ||
+            (
+                methodKt in
+                    setOf(
+                        "intoInner",
+                        "asRef",
+                        "asMut",
+                        "asSlice",
+                        "asBytes",
+                        "intoVec",
+                        "intoBoxedSlice",
+                        "intoString",
+                        "toOwned",
+                    ) &&
+                    ownerKt !in inspector.declaredTypeNames
+            )
+    if (isInstanceMethodRef) {
+        return "{ it.$methodKt() }"
+    }
+    return "$ownerPath::$methodKt"
 }

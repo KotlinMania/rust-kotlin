@@ -147,6 +147,19 @@ public object StructLayoutComputer {
     public fun typeLayoutParamName(typeParamKotlinName: String): String =
         "typeLayout$typeParamKotlinName"
 
+    private fun qualOrImportMemSymbol(
+        symbol: String,
+        memPkg: String,
+        emitter: KotlinJ2KEmitter,
+    ): String {
+        val shadowed =
+            emitter.headerContext.packageName != memPkg &&
+                (symbol in emitter.inspector.declaredTypeNames || symbol in emitter.headerContext.moduleDeclaredTypeNames)
+        if (shadowed) return "$memPkg.$symbol"
+        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.$symbol")
+        return symbol
+    }
+
     internal fun computeStructLayout(
         item: Item.Struct,
         emitter: KotlinJ2KEmitter,
@@ -335,10 +348,11 @@ public object StructLayoutComputer {
                         runningSymbolicEndExpr = resolvedField.sizeExpr
                     } else {
                         val helperName = "off$fieldIndex"
+                        val alignUpRef = qualOrImportMemSymbol("alignUpBytes", memPkg, emitter)
                         helperOffsetDecls +=
                             HelperOffsetDecl(
                                 helperName = helperName,
-                                helperInitExpr = "$memPkg.alignUpBytes($runningSymbolicEndExpr, $effAlignExpr)",
+                                helperInitExpr = "$alignUpRef($runningSymbolicEndExpr, $effAlignExpr)",
                             )
                         fieldOffsetExpr = helperName
                         runningSymbolicEndExpr = "($helperName + ${resolvedField.sizeExpr})"
@@ -385,12 +399,13 @@ public object StructLayoutComputer {
             } else {
                 finalStaticSize = null
                 val alignRef = if (allAlignsStatic) "${maxEffAlign}L" else "alignBytes"
-                finalSizeExpr = "$memPkg.alignUpBytes($runningSymbolicEndExpr, $alignRef)"
+                finalSizeExpr = "${qualOrImportMemSymbol("alignUpBytes", memPkg, emitter)}($runningSymbolicEndExpr, $alignRef)"
             }
 
+            val typeLayoutRef = qualOrImportMemSymbol("TypeLayout", memPkg, emitter)
             val requiredParams =
                 usedTypeParams.map { paramKt ->
-                    TypeLayoutParamSpec(typeLayoutParamName(paramKt), "$memPkg.TypeLayout<$paramKt>")
+                    TypeLayoutParamSpec(typeLayoutParamName(paramKt), "$typeLayoutRef<$paramKt>")
                 }
 
             ComputedStructLayout(
@@ -435,18 +450,20 @@ public object StructLayoutComputer {
         val unwrappedRaw = emitter.unwrapPaddingSynType(rawType)
         val resolved = emitter.resolveLayoutType(unwrappedRaw, emptyMap())
         if (resolved is SynType.Tuple && resolved.elems.isEmpty() && cleanRenderedKt == "Unit") {
-            return FieldLayoutSpec(0L, 1L, "0L", "1L", "$memPkg.PrimitiveLayouts.UNIT")
+            val primitiveLayoutsRef = qualOrImportMemSymbol("PrimitiveLayouts", memPkg, emitter)
+            return FieldLayoutSpec(0L, 1L, "0L", "1L", "$primitiveLayoutsRef.UNIT")
         }
         if (resolved is SynType.Ptr) {
             val pointeeKt = emitter.renderType(resolved.elem, selfTypeName)
             val isMut = resolved.mutability is io.github.kotlinmania.syn.PointerMutability.Mut
             val factory = if (isMut) "mutPtrLayout" else "constPtrLayout"
+            val primitiveLayoutsRef = qualOrImportMemSymbol("PrimitiveLayouts", memPkg, emitter)
             return FieldLayoutSpec(
                 staticSize = ptrBytes,
                 staticAlign = ptrBytes,
                 sizeExpr = "${ptrBytes}L",
                 alignExpr = "${ptrBytes}L",
-                layoutExpr = "$memPkg.PrimitiveLayouts.$factory<$pointeeKt>(${ptrBytes * 8L})",
+                layoutExpr = "$primitiveLayoutsRef.$factory<$pointeeKt>(${ptrBytes * 8L})",
             )
         }
         if (resolved is SynType.Array) {
@@ -480,9 +497,11 @@ public object StructLayoutComputer {
                 )
             val layoutExpr =
                 if (primitiveFactory != null) {
-                    "$memPkg.PrimitiveArrayLayouts.$primitiveFactory($lenIntArg)"
+                    val primitiveArrayLayoutsRef = qualOrImportMemSymbol("PrimitiveArrayLayouts", memPkg, emitter)
+                    "$primitiveArrayLayoutsRef.$primitiveFactory($lenIntArg)"
                 } else {
-                    "$memPkg.fixedListTypeLayout(${elemSpec.layoutExpr}, $lenIntArg)"
+                    val fixedListRef = qualOrImportMemSymbol("fixedListTypeLayout", memPkg, emitter)
+                    "$fixedListRef(${elemSpec.layoutExpr}, $lenIntArg)"
                 }
             return FieldLayoutSpec(
                 staticSize = staticArrSize,
@@ -548,35 +567,36 @@ public object StructLayoutComputer {
         memPkg: String,
         emitter: KotlinJ2KEmitter,
     ): FieldLayoutSpec? {
+        val primitiveLayoutsRef = qualOrImportMemSymbol("PrimitiveLayouts", memPkg, emitter)
         if (renderedFieldKt == "Boolean") {
-            return FieldLayoutSpec(1L, 1L, "1L", "1L", "$memPkg.PrimitiveLayouts.BOOL")
+            return FieldLayoutSpec(1L, 1L, "1L", "1L", "$primitiveLayoutsRef.BOOL")
         }
         if (renderedFieldKt == "Char") {
-            return FieldLayoutSpec(4L, 4L, "4L", "4L", "$memPkg.PrimitiveLayouts.CHAR")
+            return FieldLayoutSpec(4L, 4L, "4L", "4L", "$primitiveLayoutsRef.CHAR")
         }
         if (renderedFieldKt == "F16") {
-            return FieldLayoutSpec(2L, 2L, "2L", "2L", "$memPkg.PrimitiveLayouts.F16_LAYOUT")
+            return FieldLayoutSpec(2L, 2L, "2L", "2L", "$primitiveLayoutsRef.F16_LAYOUT")
         }
         val numKind = emitter.resolveNumericKind(renderedFieldKt) ?: return null
         if (numKind == NumericKind.I32 && rustLeafIdent == "isize") {
             val layoutConst = if (ptrBytes == 8L) "ISIZE64" else "ISIZE32"
-            return FieldLayoutSpec(ptrBytes, ptrBytes, "${ptrBytes}L", "${ptrBytes}L", "$memPkg.PrimitiveLayouts.$layoutConst")
+            return FieldLayoutSpec(ptrBytes, ptrBytes, "${ptrBytes}L", "${ptrBytes}L", "$primitiveLayoutsRef.$layoutConst")
         }
         if (numKind == NumericKind.I32 && rustLeafIdent == "usize") {
             val layoutConst = if (ptrBytes == 8L) "USIZE64" else "USIZE32"
-            return FieldLayoutSpec(ptrBytes, ptrBytes, "${ptrBytes}L", "${ptrBytes}L", "$memPkg.PrimitiveLayouts.$layoutConst")
+            return FieldLayoutSpec(ptrBytes, ptrBytes, "${ptrBytes}L", "${ptrBytes}L", "$primitiveLayoutsRef.$layoutConst")
         }
         return when (numKind) {
-            NumericKind.I8 -> FieldLayoutSpec(1L, 1L, "1L", "1L", "$memPkg.PrimitiveLayouts.I8")
-            NumericKind.U8 -> FieldLayoutSpec(1L, 1L, "1L", "1L", "$memPkg.PrimitiveLayouts.U8")
-            NumericKind.I16 -> FieldLayoutSpec(2L, 2L, "2L", "2L", "$memPkg.PrimitiveLayouts.I16")
-            NumericKind.U16 -> FieldLayoutSpec(2L, 2L, "2L", "2L", "$memPkg.PrimitiveLayouts.U16")
-            NumericKind.I32 -> FieldLayoutSpec(4L, 4L, "4L", "4L", "$memPkg.PrimitiveLayouts.I32")
-            NumericKind.U32 -> FieldLayoutSpec(4L, 4L, "4L", "4L", "$memPkg.PrimitiveLayouts.U32")
-            NumericKind.F32 -> FieldLayoutSpec(4L, 4L, "4L", "4L", "$memPkg.PrimitiveLayouts.F32")
-            NumericKind.I64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$memPkg.PrimitiveLayouts.I64")
-            NumericKind.U64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$memPkg.PrimitiveLayouts.U64")
-            NumericKind.F64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$memPkg.PrimitiveLayouts.F64")
+            NumericKind.I8 -> FieldLayoutSpec(1L, 1L, "1L", "1L", "$primitiveLayoutsRef.I8")
+            NumericKind.U8 -> FieldLayoutSpec(1L, 1L, "1L", "1L", "$primitiveLayoutsRef.U8")
+            NumericKind.I16 -> FieldLayoutSpec(2L, 2L, "2L", "2L", "$primitiveLayoutsRef.I16")
+            NumericKind.U16 -> FieldLayoutSpec(2L, 2L, "2L", "2L", "$primitiveLayoutsRef.U16")
+            NumericKind.I32 -> FieldLayoutSpec(4L, 4L, "4L", "4L", "$primitiveLayoutsRef.I32")
+            NumericKind.U32 -> FieldLayoutSpec(4L, 4L, "4L", "4L", "$primitiveLayoutsRef.U32")
+            NumericKind.F32 -> FieldLayoutSpec(4L, 4L, "4L", "4L", "$primitiveLayoutsRef.F32")
+            NumericKind.I64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$primitiveLayoutsRef.I64")
+            NumericKind.U64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$primitiveLayoutsRef.U64")
+            NumericKind.F64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$primitiveLayoutsRef.F64")
             NumericKind.I128 -> {
                 emitter.usesI128 = true
                 FieldLayoutSpec(
@@ -584,7 +604,7 @@ public object StructLayoutComputer {
                     16L,
                     "16L",
                     "16L",
-                    "$memPkg.PrimitiveLayouts.i128Layout(::I128, { it.high }, { it.low })",
+                    "$primitiveLayoutsRef.i128Layout(::I128, { it.high }, { it.low })",
                 )
             }
             NumericKind.U128 -> {
@@ -594,7 +614,7 @@ public object StructLayoutComputer {
                     16L,
                     "16L",
                     "16L",
-                    "$memPkg.PrimitiveLayouts.u128Layout(::U128, { it.high }, { it.low })",
+                    "$primitiveLayoutsRef.u128Layout(::U128, { it.high }, { it.low })",
                 )
             }
         }
@@ -621,7 +641,7 @@ public object StructLayoutComputer {
         fieldLayoutExpr: String,
     ): String {
         val clean = ktFieldType.trim()
-        if (fieldLayoutExpr.contains(".PrimitiveArrayLayouts.")) {
+        if (fieldLayoutExpr.contains("PrimitiveArrayLayouts.")) {
             return if (clean.startsWith("MutableList<")) "$rawReadExpr.toMutableList()" else rawReadExpr
         }
         return when (clean) {
@@ -664,7 +684,7 @@ public object StructLayoutComputer {
         ktFieldType: String,
         fieldLayoutExpr: String,
     ): String {
-        if (fieldLayoutExpr.contains(".PrimitiveArrayLayouts.")) {
+        if (fieldLayoutExpr.contains("PrimitiveArrayLayouts.")) {
             return rawValueExpr
         }
         val clean = ktFieldType.trim()
@@ -703,13 +723,20 @@ public object StructLayoutComputer {
         indent: String,
         emittedFieldTypesByName: Map<String, String> = emptyMap(),
         useBodyPropertiesCtor: Boolean = layout.useBodyPropertiesCtor,
+        emitter: KotlinJ2KEmitter? = null,
     ): String {
         val memPkg = "$coreNamespace.mem"
+        val typeLayoutRef =
+            if (emitter != null) {
+                qualOrImportMemSymbol("TypeLayout", memPkg, emitter)
+            } else {
+                "$memPkg.TypeLayout"
+            }
         val paramsSig = layout.requiredTypeLayoutParams.joinToString(", ") { "${it.paramName}: ${it.paramType}" }
         val fnTypeParams = if (genericTypeParamsRendered.isNotEmpty()) "$genericTypeParamsRendered " else ""
         val sb = StringBuilder()
-        sb.append("$indent    public fun ${fnTypeParams}typeLayout($paramsSig): $memPkg.TypeLayout<$selfTypeWithGenerics> =\n")
-        sb.append("$indent        object : $memPkg.TypeLayout<$selfTypeWithGenerics> {\n")
+        sb.append("$indent    public fun ${fnTypeParams}typeLayout($paramsSig): $typeLayoutRef<$selfTypeWithGenerics> =\n")
+        sb.append("$indent        object : $typeLayoutRef<$selfTypeWithGenerics> {\n")
         sb.append("$indent            override val alignBytes: Long = ${layout.alignExpr}\n")
         for ((helperName, helperInit) in layout.helperOffsetDecls) {
             sb.append("$indent            private val $helperName: Long = $helperInit\n")

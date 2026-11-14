@@ -776,6 +776,7 @@ internal class KotlinJ2KEmitter(
     internal var usesQuoteUnderlyingSpan: Boolean = false
     internal val aliasedUnderlyingSelfCalls: MutableMap<String, String> = linkedMapOf()
     internal var currentReceiverIsSharedBorrow: Boolean = false
+    internal var currentReceiverIsMutBorrow: Boolean = false
     internal var usesDebugStruct: Boolean = false
     internal var usesDebugTuple: Boolean = false
     internal var usesU128: Boolean = false
