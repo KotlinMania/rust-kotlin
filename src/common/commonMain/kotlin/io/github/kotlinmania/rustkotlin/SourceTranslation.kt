@@ -69,16 +69,17 @@ internal fun translateRustSourceToKotlinArtifacts(
         validateSupportedRustSemantics(recognized.file, allowStdlibDestructors = allowStdlibDestructors)
         val trivia = SourceTrivia.collect(recognized.source, recognized.tokens)
         val macroExpansion = expandFileMacroRules(recognized.file, headerContext.crateMacroSources)
+        val flattenedFile = flattenPrivateDefinitionInlineMods(macroExpansion.file)
         if (headerContext.isDocExample) {
-            TranslationSession.sourceLayoutFile = macroExpansion.file
+            TranslationSession.sourceLayoutFile = flattenedFile
         } else if (TranslationSession.sourceLayoutFile == null) {
-            TranslationSession.sourceLayoutFile = macroExpansion.file
+            TranslationSession.sourceLayoutFile = flattenedFile
         }
         val emitter =
             KotlinJ2KEmitter(
                 source = recognized.source,
                 originalFile = recognized.file,
-                file = selectParentItemsExcludingSplitInlineMods(macroExpansion.file, headerContext),
+                file = selectParentItemsExcludingSplitInlineMods(flattenedFile, headerContext),
                 trivia = trivia,
                 macroDefs = macroExpansion.definitions,
                 macroWrapperSpansByTargetOffset = macroExpansion.macroWrapperSpansByTargetOffset,
@@ -87,7 +88,7 @@ internal fun translateRustSourceToKotlinArtifacts(
         val parentText = emitter.emitFile()
         val splitModCompanions =
             emitSplitInlineModCompanions(
-                expandedFile = macroExpansion.file,
+                expandedFile = flattenedFile,
                 source = recognized.source,
                 trivia = trivia,
                 macroDefs = macroExpansion.definitions,
@@ -175,6 +176,93 @@ private fun selectSplitCandidateInlineMods(file: File, headerContext: FileHeader
         if (hasCollision) break
     }
     return if (hasCollision) candidates else emptyList()
+}
+
+private fun flattenPrivateDefinitionInlineMods(file: File): File {
+    val defModsByRaw = linkedMapOf<String, Item.Mod>()
+    for (item in file.items) {
+        if (itemHasDocOnlyCfg(item)) continue
+        if (item is Item.Mod && item.vis !is Visibility.Public && item.content is ModContent.Inline) {
+            val modRaw = item.ident.toString().removePrefix("r#")
+            if (modRaw.endsWith("_definition")) {
+                defModsByRaw[modRaw] = item
+            }
+        }
+    }
+    if (defModsByRaw.isEmpty()) return file
+
+    val innerTypesByModAndName = linkedMapOf<Pair<String, String>, MutableList<Item.ItemType>>()
+    for ((modRaw, modItem) in defModsByRaw) {
+        val content = modItem.content as ModContent.Inline
+        for (inner in content.items) {
+            if (itemHasDocOnlyCfg(inner)) continue
+            if (inner is Item.ItemType) {
+                val innerRaw = inner.ident.toString().removePrefix("r#")
+                innerTypesByModAndName.getOrPut(modRaw to innerRaw) { mutableListOf() }.add(inner)
+            }
+        }
+    }
+
+    val replacementByIdx = linkedMapOf<Int, List<Item.ItemType>>()
+    val matchedPairsByMod = linkedMapOf<String, MutableSet<String>>()
+    file.items.forEachIndexed { idx, item ->
+        if (itemHasDocOnlyCfg(item)) return@forEachIndexed
+        if (item is Item.ItemType && item.generics.params.isEmpty()) {
+            val rhs = unwrapSynType(item.ty) as? SynType.Path ?: return@forEachIndexed
+            if (rhs.qself != null) return@forEachIndexed
+            val segs = rhs.path.segments.toList()
+            if (segs.size != 2 || segs[1].arguments !is PathArguments.None) return@forEachIndexed
+            val modSeg = segs[0].ident.toString().removePrefix("r#")
+            val innerSeg = segs[1].ident.toString().removePrefix("r#")
+            val outerRaw = item.ident.toString().removePrefix("r#")
+            if (outerRaw != innerSeg) return@forEachIndexed
+            val hoisted = innerTypesByModAndName[modSeg to innerSeg] ?: return@forEachIndexed
+            replacementByIdx[idx] =
+                hoisted.map { inner ->
+                    inner.copy(
+                        attrs = item.attrs + inner.attrs,
+                        vis = item.vis,
+                    )
+                }
+            matchedPairsByMod.getOrPut(modSeg) { hashSetOf() }.add(innerSeg)
+        }
+    }
+    if (replacementByIdx.isEmpty()) return file
+
+    val consumedModNames = hashSetOf<String>()
+    for ((modRaw, modItem) in defModsByRaw) {
+        val matchedNames = matchedPairsByMod[modRaw] ?: continue
+        val content = modItem.content as ModContent.Inline
+        val allNonDocMatched =
+            content.items.all { inner ->
+                itemHasDocOnlyCfg(inner) ||
+                    (inner is Item.ItemType && inner.ident.toString().removePrefix("r#") in matchedNames)
+            }
+        if (allNonDocMatched) {
+            consumedModNames += modRaw
+        }
+    }
+
+    val rewritten = mutableListOf<Item>()
+    file.items.forEachIndexed { idx, item ->
+        val replacement = replacementByIdx[idx]
+        when {
+            replacement != null -> rewritten.addAll(replacement)
+            item is Item.Mod &&
+                item.vis !is Visibility.Public &&
+                item.content is ModContent.Inline &&
+                item.ident.toString().removePrefix("r#") in consumedModNames -> {
+                // Hoisted into outer alias position.
+            }
+            else -> rewritten += item
+        }
+    }
+    return File(
+        shebang = file.shebang,
+        frontmatter = file.frontmatter,
+        attrs = file.attrs,
+        items = rewritten,
+    )
 }
 
 private fun selectParentItemsExcludingSplitInlineMods(file: File, headerContext: FileHeaderContext): File {
@@ -385,8 +473,8 @@ internal fun translateModuleRootIntoFocusedChunks(
         validateSupportedRustSemantics(recognized.file, allowStdlibDestructors = allowStdlibDestructors)
         val trivia = SourceTrivia.collect(recognized.source, recognized.tokens)
         val macroExpansion = expandFileMacroRules(recognized.file, headerContext.crateMacroSources)
-        if (TranslationSession.sourceLayoutFile == null) TranslationSession.sourceLayoutFile = macroExpansion.file
-        val expandedFile = macroExpansion.file
+        val expandedFile = flattenPrivateDefinitionInlineMods(macroExpansion.file)
+        if (TranslationSession.sourceLayoutFile == null) TranslationSession.sourceLayoutFile = expandedFile
 
         val substantiveItems =
             expandedFile.items.filter { item ->
@@ -1353,10 +1441,20 @@ internal class KotlinJ2KEmitter(
         }
         extraImports.addAll(
             combinedExtraTypeImports.filter { imp ->
-                val rawSimple = imp.removePrefix("import ").substringBefore(" as ").substringAfterLast('.')
-                val targetPkg = imp.removePrefix("import ").substringBefore(" as ").substringBeforeLast('.', missingDelimiterValue = "")
+                val impPath = imp.removePrefix("import ").substringBefore(" as ").trim()
+                val rawSimple = impPath.substringAfterLast('.')
+                val targetPkg = impPath.substringBeforeLast('.', missingDelimiterValue = "")
+                val isSingleUpperTypeParam = rawSimple.length == 1 && rawSimple[0] in 'A'..'Z'
+                val isEnumVariantShadowed =
+                    (rawSimple in inspector.enumVariantSimpleNames || rawSimple in inspector.importedEnumVariantSimpleNames) &&
+                        !impPath.endsWith(".Result.$rawSimple") &&
+                        impPath != "Result.$rawSimple" &&
+                        !impPath.endsWith(".Option.$rawSimple") &&
+                        impPath != "Option.$rawSimple"
                 targetPkg != headerContext.packageName &&
                     rawSimple !in inspector.declaredTypeNames &&
+                    !isSingleUpperTypeParam &&
+                    !isEnumVariantShadowed &&
                     containsWholeIdentifier(bodyTextForImports, rawSimple)
             },
         )

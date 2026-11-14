@@ -105,8 +105,10 @@ internal enum class NumericKind {
     U32,
     U64,
     U128,
+    F16,
     F32,
     F64,
+    F128,
 }
 
 internal fun unwrapSynType(ty: SynType): SynType =
@@ -119,6 +121,7 @@ internal fun unwrapSynType(ty: SynType): SynType =
 internal fun isExternalIdentityTypeReexportAlias(
     i: Item.ItemType,
     selfCrateAliases: Set<String>,
+    localInlineModNames: Set<String> = emptySet(),
 ): Boolean {
     val genericParams = i.generics.params.toList()
     if (genericParams.isNotEmpty()) return false
@@ -130,7 +133,12 @@ internal fun isExternalIdentityTypeReexportAlias(
     if (lastSeg.arguments !is PathArguments.None) return false
     val firstIdent = segs.first().ident.toString()
     val firstRaw = firstIdent.removePrefix("r#")
-    if (firstRaw == "crate" || firstRaw == "super" || firstRaw == "self" || firstRaw in selfCrateAliases) {
+    if (firstRaw == "crate" ||
+        firstRaw == "super" ||
+        firstRaw == "self" ||
+        firstRaw in selfCrateAliases ||
+        firstRaw in localInlineModNames
+    ) {
         return false
     }
     val lhsKt = rustTypeIdentToKotlin(i.ident.toString())
@@ -249,6 +257,23 @@ internal class CrateSymbolInspector(
             }
         }
         super.visitExprPath(e)
+    }
+
+    override fun visitFile(f: File) {
+        if (blockDepth == 0) {
+            for (item in f.items) {
+                if (itemHasDocOnlyCfg(item)) continue
+                if (item is Item.Mod) {
+                    val modRaw = item.ident.toString().removePrefix("r#")
+                    if (item.content is ModContent.Inline) {
+                        localInlineModuleNames += modRaw
+                    } else if (item.content == null) {
+                        localExternalModuleNames += modRaw
+                    }
+                }
+            }
+        }
+        super.visitFile(f)
     }
 
     override fun visitItem(i: Item) {
@@ -667,7 +692,7 @@ internal class CrateSymbolInspector(
             if (name !in associatedTypeDecls) {
                 associatedTypeDecls[name] = AssocTypeDecl(i.ty, i.generics)
             }
-        } else if (!isExternalIdentityTypeReexportAlias(i, selfCrateAliases)) {
+        } else if (!isExternalIdentityTypeReexportAlias(i, selfCrateAliases, localInlineModuleNames)) {
             declaredTypeNames += name
             if (name !in typeAliasTargets) {
                 typeAliasTargets[name] = i.ty

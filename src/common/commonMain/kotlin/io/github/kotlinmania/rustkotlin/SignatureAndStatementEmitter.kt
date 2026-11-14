@@ -21,6 +21,7 @@ import io.github.kotlinmania.syn.Member
 import io.github.kotlinmania.syn.Pat
 import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
+import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.ReturnType
 import io.github.kotlinmania.syn.Signature
 import io.github.kotlinmania.syn.Stmt
@@ -607,6 +608,10 @@ internal fun KotlinJ2KEmitter.describeSynTypeForDisambiguation(ty: SynType?): St
     if (ty == null) return ""
     return when (val u = unwrapSynType(ty)) {
         is SynType.Reference -> describeSynTypeForDisambiguation(u.elem)
+        is SynType.Ptr -> {
+            val mutPrefix = if (u.mutability is PointerMutability.Mut) "MutPtr" else "ConstPtr"
+            "$mutPrefix${describeSynTypeForDisambiguation(u.elem)}"
+        }
         is SynType.Array -> {
             val elemDesc = describeSynTypeForDisambiguation(u.elem)
             val lenDesc = renderExpr(u.len, "", null).filter { it.isLetterOrDigit() }
@@ -680,12 +685,14 @@ internal fun KotlinJ2KEmitter.disambiguateReceiverTraitImplFnName(
             ?.mapNotNull { (it as? GenericArgument.TypeArg)?.type?.let(this::describeSynTypeForDisambiguation) }
             ?.joinToString("")
             .orEmpty()
-    val unwrappedSelf = selfSynType?.let(::unwrapSynType) as? SynType.Array
+    val unwrappedSelf = selfSynType?.let(::unwrapSynType)
     val selfArrSuffix =
-        if (unwrappedSelf != null) {
-            "From${describeSynTypeForDisambiguation(unwrappedSelf)}"
-        } else {
-            ""
+        when {
+            unwrappedSelf is SynType.Array -> "From${describeSynTypeForDisambiguation(unwrappedSelf)}"
+            traitArgSuffix.isEmpty() &&
+                (unwrappedSelf is SynType.Ptr || unwrappedSelf is SynType.Tuple || unwrappedSelf is SynType.Slice) ->
+                "From${describeSynTypeForDisambiguation(unwrappedSelf)}"
+            else -> ""
         }
     return "$fnName$traitArgSuffix$selfArrSuffix"
 }
@@ -1467,6 +1474,7 @@ internal fun KotlinJ2KEmitter.computeReceiverSignatureKey(receiverPrefix: String
 internal fun KotlinJ2KEmitter.eraseTypeForSignatureKey(renderedType: String): String {
     val nonNull = renderedType.removeSuffix("?")
     val base = nonNull.substringBefore('<').trim()
+    if (base in activeTypeParamNames) return "*"
     val keepNullability = base in KOTLIN_JVM_VALUE_TYPES
     return if (keepNullability && renderedType.endsWith("?")) "$base?" else base
 }

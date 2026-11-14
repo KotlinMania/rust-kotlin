@@ -128,7 +128,7 @@ internal fun KotlinJ2KEmitter.shouldUseAddressBackedMutableReference(
             ?.last()
             ?.ident
             ?.toString()
-    if (primitive in setOf("isize", "usize", "i128", "u128", "f32", "f64", "char")) return true
+    if (primitive in setOf("isize", "usize", "i128", "u128", "f16", "f32", "f64", "f128", "char")) return true
     if (resolved is SynType.Ptr) return true
     if (runtimeCellField(resolved) != null) return true
     val rendered =
@@ -854,6 +854,10 @@ internal fun KotlinJ2KEmitter.sourcePointerLayout(
             CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
             return "PrimitiveLayouts.F64"
         }
+        "f128", "F128" -> {
+            CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
+            return "PrimitiveLayouts.F128_LAYOUT"
+        }
         "char" -> {
             CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
             return "PrimitiveLayouts.CHAR"
@@ -899,7 +903,7 @@ internal fun KotlinJ2KEmitter.sourcePointerLayout(
                 ?.last()
                 ?.ident
                 ?.toString()
-        if (fixedScalarPointerCodec(referent) != null || scalarName in setOf("isize", "usize", "i128", "u128", "f32", "f64", "char")) {
+        if (fixedScalarPointerCodec(referent) != null || scalarName in setOf("isize", "usize", "i128", "u128", "f16", "f32", "f64", "f128", "char")) {
             val innerLayout = sourcePointerLayout(referent, selfType, available, substitutions, visiting + rendered) ?: return null
             CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
             return "PrimitiveLayouts.mutableReferenceLayout<${renderType(referent, selfType)}>($innerLayout, ${activeCfgProfile.pointerWidth}L)"
@@ -1431,7 +1435,7 @@ internal fun KotlinJ2KEmitter.primitiveArrayLayoutFactory(
         NumericKind.U64 -> "uLongArray"
         NumericKind.F32 -> "floatArray"
         NumericKind.F64 -> "doubleArray"
-        NumericKind.I128, NumericKind.U128, null -> null
+        NumericKind.I128, NumericKind.U128, NumericKind.F16, NumericKind.F128, null -> null
     }
 }
 

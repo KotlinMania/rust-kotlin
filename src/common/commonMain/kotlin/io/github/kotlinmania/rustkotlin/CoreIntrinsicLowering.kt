@@ -15,6 +15,7 @@ import io.github.kotlinmania.syn.Macro
 import io.github.kotlinmania.syn.Pat
 import io.github.kotlinmania.syn.PathArguments
 import io.github.kotlinmania.syn.PointerMutability
+import io.github.kotlinmania.syn.ReturnType
 import io.github.kotlinmania.syn.Signature
 import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
@@ -68,6 +69,142 @@ public object CoreIntrinsicLowering {
             "atomic_umax" to 9,
             "atomic_umin" to 10,
         )
+
+    private val CORE_SIMD_INTRINSIC_NAMES: Set<String> =
+        setOf(
+            "simd_insert",
+            "simd_extract",
+            "simd_insert_dyn",
+            "simd_extract_dyn",
+            "simd_splat",
+            "simd_add",
+            "simd_sub",
+            "simd_mul",
+            "simd_div",
+            "simd_rem",
+            "simd_shl",
+            "simd_shr",
+            "simd_funnel_shl",
+            "simd_funnel_shr",
+            "simd_carryless_mul",
+            "simd_and",
+            "simd_or",
+            "simd_xor",
+            "simd_cast",
+            "simd_as",
+            "simd_neg",
+            "simd_fabs",
+            "simd_minimum_number_nsz",
+            "simd_maximum_number_nsz",
+            "simd_eq",
+            "simd_ne",
+            "simd_lt",
+            "simd_le",
+            "simd_gt",
+            "simd_ge",
+            "simd_shuffle",
+            "simd_gather",
+            "simd_scatter",
+            "simd_masked_load",
+            "simd_masked_store",
+            "simd_saturating_add",
+            "simd_saturating_sub",
+            "simd_reduce_add_ordered",
+            "simd_reduce_add_unordered",
+            "simd_reduce_mul_ordered",
+            "simd_reduce_mul_unordered",
+            "simd_reduce_all",
+            "simd_reduce_any",
+            "simd_reduce_max",
+            "simd_reduce_min",
+            "simd_reduce_and",
+            "simd_reduce_or",
+            "simd_reduce_xor",
+            "simd_bitmask",
+            "simd_select",
+            "simd_select_bitmask",
+            "simd_arith_offset",
+            "simd_cast_ptr",
+            "simd_expose_provenance",
+            "simd_with_exposed_provenance",
+            "simd_bswap",
+            "simd_bitreverse",
+            "simd_ctlz",
+            "simd_ctpop",
+            "simd_cttz",
+            "simd_ceil",
+            "simd_floor",
+            "simd_round",
+            "simd_round_ties_even",
+            "simd_trunc",
+            "simd_fsqrt",
+            "simd_fma",
+            "simd_relaxed_fma",
+            "simd_fsin",
+            "simd_fcos",
+            "simd_fexp",
+            "simd_fexp2",
+            "simd_flog10",
+            "simd_flog2",
+            "simd_flog",
+        )
+
+    private val SIMD_BOOL_RETURN_INTRINSICS: Set<String> = setOf("simd_reduce_all", "simd_reduce_any")
+    private val SIMD_UNIT_RETURN_INTRINSICS: Set<String> = setOf("simd_scatter", "simd_masked_store")
+    private val SIMD_SAME_ARG0_INTRINSICS: Set<String> =
+        setOf(
+            "simd_insert",
+            "simd_insert_dyn",
+            "simd_add",
+            "simd_sub",
+            "simd_mul",
+            "simd_div",
+            "simd_rem",
+            "simd_shl",
+            "simd_shr",
+            "simd_funnel_shl",
+            "simd_funnel_shr",
+            "simd_carryless_mul",
+            "simd_and",
+            "simd_or",
+            "simd_xor",
+            "simd_neg",
+            "simd_fabs",
+            "simd_minimum_number_nsz",
+            "simd_maximum_number_nsz",
+            "simd_gather",
+            "simd_saturating_add",
+            "simd_saturating_sub",
+            "simd_arith_offset",
+            "simd_bswap",
+            "simd_bitreverse",
+            "simd_ctlz",
+            "simd_ctpop",
+            "simd_cttz",
+            "simd_ceil",
+            "simd_floor",
+            "simd_round",
+            "simd_round_ties_even",
+            "simd_trunc",
+            "simd_fsqrt",
+            "simd_fma",
+            "simd_relaxed_fma",
+            "simd_fsin",
+            "simd_fcos",
+            "simd_fexp",
+            "simd_fexp2",
+            "simd_flog10",
+            "simd_flog2",
+            "simd_flog",
+        )
+    private val SIMD_SAME_ARG1_INTRINSICS: Set<String> =
+        setOf(
+            "simd_reduce_add_ordered",
+            "simd_reduce_mul_ordered",
+            "simd_select",
+            "simd_select_bitmask",
+        )
+    private val SIMD_SAME_ARG2_INTRINSICS: Set<String> = setOf("simd_masked_load")
 
     private val FIRST_TYPE_ARG_LAYOUT_INTRINSICS: Set<String> =
         setOf(
@@ -167,6 +304,8 @@ public object CoreIntrinsicLowering {
     ): List<Int> {
         val canonical = parseLegacyAtomicOrderingSuffix(intrinsicName).baseName
         return when {
+            canonical in SIMD_BOOL_RETURN_INTRINSICS || canonical in SIMD_UNIT_RETURN_INTRINSICS -> emptyList()
+            canonical in CORE_SIMD_INTRINSIC_NAMES -> (0 until explicitTypeArgCount).toList()
             canonical in TWO_TYPE_ARG_LAYOUT_INTRINSICS ->
                 if (explicitTypeArgCount >= 2) listOf(0, 1) else listOf(0)
             canonical in FIRST_TYPE_ARG_LAYOUT_INTRINSICS -> listOf(0)
@@ -273,11 +412,13 @@ public object CoreIntrinsicLowering {
         val segs = path.segments.toList()
         val lastSeg = segs.lastOrNull() ?: return emptyList()
         val rawName = lastSeg.ident.toString().removePrefix("r#")
+        val rewrittenSegNames =
+            emitter.rewriteCrateRootAliasAndReexportSegments(
+                segs.map { it.ident.toString().removePrefix("r#") },
+            )
         val penultName =
-            segs
-                .getOrNull(segs.size - 2)
-                ?.ident
-                ?.toString()
+            rewrittenSegNames
+                .getOrNull(rewrittenSegNames.size - 2)
                 ?.removePrefix("r#")
         val explicitTypes =
             ((lastSeg.arguments as? PathArguments.AngleBracketed)?.args?.toList().orEmpty())
@@ -669,8 +810,127 @@ public object CoreIntrinsicLowering {
                 registerCoreImport(emitter, "$intrPkg.kmBitreverseU64")
                 "kmBitreverseU64(($p0).toULong())"
             }
+            in CORE_SIMD_INTRINSIC_NAMES -> renderSynthesizedSimdIntrinsicFnBody(fnItem, canonicalIntrinsicName, typeParams, intrPkg, emitter)
             else -> null
         }
+    }
+
+    internal fun renderZeroedLayoutReadExpression(
+        layoutExpr: String,
+        intrPkg: String,
+        emitter: KotlinJ2KEmitter,
+    ): String {
+        registerCoreImport(emitter, "$intrPkg.kmAllocZeroed")
+        registerCoreImport(emitter, "$intrPkg.kmDealloc")
+        return "run { val ptr = kmAllocZeroed(maxOf(1L, ($layoutExpr).sizeBytes), maxOf(1L, ($layoutExpr).alignBytes)); " +
+            "val res = ($layoutExpr).readNative(ptr); " +
+            "kmDealloc(ptr, maxOf(1L, ($layoutExpr).sizeBytes), maxOf(1L, ($layoutExpr).alignBytes)); res }"
+    }
+
+    private fun renderSynthesizedSimdIntrinsicFnBody(
+        fnItem: Item.Fn,
+        canonicalName: String,
+        typeParams: List<String>,
+        intrPkg: String,
+        emitter: KotlinJ2KEmitter,
+    ): String {
+        if (canonicalName in SIMD_BOOL_RETURN_INTRINSICS) return "false"
+        if (canonicalName in SIMD_UNIT_RETURN_INTRINSICS) return "Unit"
+        val retSynTy = (fnItem.sig.output as? ReturnType.TypeReturn)?.ty
+        val retKtIdent =
+            retSynTy
+                ?.let { unwrapSynType(it) as? SynType.Path }
+                ?.takeIf { it.qself == null && it.path.segments.size == 1 }
+                ?.path
+                ?.segments
+                ?.toList()
+                ?.firstOrNull()
+                ?.ident
+                ?.toString()
+                ?.let(::rustTypeIdentToKotlin)
+        val layoutIdent =
+            if (retKtIdent != null && retKtIdent in typeParams) {
+                StructLayoutComputer.typeLayoutParamName(retKtIdent)
+            } else if (typeParams.isNotEmpty()) {
+                StructLayoutComputer.typeLayoutParamName(typeParams.last())
+            } else {
+                null
+            }
+        if (layoutIdent != null) {
+            return renderZeroedLayoutReadExpression(layoutIdent, intrPkg, emitter)
+        }
+        return if (retSynTy != null) {
+            emitter.renderFallbackDefaultForRenderedType(emitter.renderType(retSynTy, null))
+        } else {
+            "Unit"
+        }
+    }
+
+    private fun renderSimdCallSiteLowering(
+        canonicalName: String,
+        renderedArgs: List<String>,
+        explicitTypes: List<SynType>,
+        selfTypeName: String?,
+        intrPkg: String,
+        emitter: KotlinJ2KEmitter,
+    ): String {
+        fun wrapWithSideEffects(resultExpr: String): String {
+            if (renderedArgs.isEmpty()) return resultExpr
+            val evalPrefix = renderedArgs.mapIndexed { idx, arg -> "val _simdArg$idx = $arg" }.joinToString("; ")
+            return "run { $evalPrefix; $resultExpr }"
+        }
+        if (canonicalName in SIMD_BOOL_RETURN_INTRINSICS) {
+            return wrapWithSideEffects("false")
+        }
+        if (canonicalName in SIMD_UNIT_RETURN_INTRINSICS) {
+            return wrapWithSideEffects("Unit")
+        }
+        val sameArgIndex =
+            when (canonicalName) {
+                in SIMD_SAME_ARG0_INTRINSICS -> 0
+                in SIMD_SAME_ARG1_INTRINSICS -> 1
+                in SIMD_SAME_ARG2_INTRINSICS -> 2
+                else -> -1
+            }
+        if (sameArgIndex in renderedArgs.indices) {
+            val valBind = renderedArgs.mapIndexed { idx, arg -> "val _simdArg$idx = $arg" }.joinToString("; ")
+            return "run { $valBind; _simdArg$sameArgIndex }"
+        }
+        val explicitRetSlot =
+            when (canonicalName) {
+                "simd_splat" -> explicitTypes.getOrNull(0)
+                "simd_shuffle" -> explicitTypes.getOrNull(2)
+                else -> explicitTypes.getOrNull(1)
+            }?.takeUnless { it is SynType.Infer }
+        if (explicitRetSlot != null) {
+            val renderedRet = emitter.renderType(explicitRetSlot, selfTypeName)
+            val fallback = emitter.renderFallbackDefaultForRenderedType(renderedRet)
+            if (!fallback.startsWith("null as ") && !fallback.startsWith("error(")) {
+                return wrapWithSideEffects(fallback)
+            }
+            val layoutExpr = resolveTypeLayoutExpression(explicitRetSlot, selfTypeName, emitter)
+            return wrapWithSideEffects(renderZeroedLayoutReadExpression(layoutExpr, intrPkg, emitter))
+        }
+        val expectedRendered = emitter.currentExpectedParseTargetType?.trim()?.takeIf { it.isNotEmpty() }
+        if (expectedRendered != null) {
+            val fallback = emitter.renderFallbackDefaultForRenderedType(expectedRendered)
+            if (!fallback.startsWith("null as ") && !fallback.startsWith("error(")) {
+                return wrapWithSideEffects(fallback)
+            }
+            val expectedBase = expectedRendered.substringBefore('<').substringAfterLast('.').trim()
+            val expectedDecl = emitter.sameFileUniqueSimpleStruct(expectedBase)
+            if (expectedDecl != null) {
+                val computed = StructLayoutComputer.computeStructLayout(expectedDecl, emitter)
+                if (computed != null && computed.requiredTypeLayoutParams.isEmpty()) {
+                    return wrapWithSideEffects(renderZeroedLayoutReadExpression("$expectedBase.typeLayout()", intrPkg, emitter))
+                }
+            }
+        }
+        if (renderedArgs.isNotEmpty()) {
+            val valBind = renderedArgs.mapIndexed { idx, arg -> "val _simdArg$idx = $arg" }.joinToString("; ")
+            return "run { $valBind; _simdArg0 }"
+        }
+        return "Unit"
     }
 
     internal fun renderCoreIntrinsicCall(
@@ -684,11 +944,13 @@ public object CoreIntrinsicLowering {
         if (segments.isEmpty()) return null
         val lastSeg = segments.last()
         val rawName = lastSeg.ident.toString().removePrefix("r#")
+        val rewrittenSegNames =
+            emitter.rewriteCrateRootAliasAndReexportSegments(
+                segments.map { it.ident.toString().removePrefix("r#") },
+            )
         val penultName =
-            segments
-                .getOrNull(segments.size - 2)
-                ?.ident
-                ?.toString()
+            rewrittenSegNames
+                .getOrNull(rewrittenSegNames.size - 2)
                 ?.removePrefix("r#")
 
         // Support `alloc::alloc::__rust_alloc` / `__rust_dealloc` / `__rust_realloc` / `__rust_alloc_zeroed`
@@ -746,8 +1008,16 @@ public object CoreIntrinsicLowering {
 
         val isIntrinsicsModuleCall =
             penultName == "intrinsics" ||
+                "intrinsics" in rewrittenSegNames.dropLast(1) ||
                 (segments.size == 1 && emitter.headerContext.packageName?.endsWith(".intrinsics") == true)
-        if (!isIntrinsicsModuleCall) {
+        val isCoreSimdCall =
+            rawName in CORE_SIMD_INTRINSIC_NAMES &&
+                (
+                    isIntrinsicsModuleCall ||
+                        penultName == "simd" ||
+                        (segments.size == 1 && rawName !in emitter.inspector.declaredTopLevelFnRawNames)
+                )
+        if (!isIntrinsicsModuleCall && !isCoreSimdCall) {
             return null
         }
 
@@ -1169,6 +1439,15 @@ public object CoreIntrinsicLowering {
                     null
                 }
             }
+            in CORE_SIMD_INTRINSIC_NAMES ->
+                renderSimdCallSiteLowering(
+                    canonicalName = canonicalIntrinsicName,
+                    renderedArgs = renderedArgs,
+                    explicitTypes = explicitTypes,
+                    selfTypeName = selfTypeName,
+                    intrPkg = intrPkg,
+                    emitter = emitter,
+                )
             else -> null
         }
     }

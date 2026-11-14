@@ -556,8 +556,10 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                             usesU128 = true
                             "U128"
                         }
+                        NumericKind.F16 -> "F16"
                         NumericKind.F32 -> kotlinF32TypeName()
                         NumericKind.F64 -> "Double"
+                        NumericKind.F128 -> "F128"
                     }
                 } else if (isInferTarget) {
                     savedParseTarget ?: currentEnclosingReturnRenderedType ?: renderType(expr.ty, selfTypeName)
@@ -658,6 +660,10 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                             "ConstPtr$tfSuffix(0L)"
                         }
                     }
+                nonUnitArgs.size == 1 &&
+                    "drop" !in inspector.declaredTopLevelFnRawNames &&
+                    (calleeBase == "drop" || calleeBase == "mem.drop" || calleeBase.endsWith(".mem.drop")) ->
+                    "(${renderExpr(nonUnitArgs[0], indent, selfTypeName)}).let { }"
                 nonUnitArgs.size == 2 &&
                     nonUnitArgs.size == 2 &&
                     (
@@ -1573,7 +1579,12 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
             }
             if (rawMethod == "count_ones" && nonUnitArgs.isEmpty() && expr.turbofish == null) {
                 val recvKind = inferExprNumericKind(expr.receiver, selfTypeName)
-                if (recvKind != null && recvKind != NumericKind.F32 && recvKind != NumericKind.F64) {
+                if (recvKind != null &&
+                    recvKind != NumericKind.F16 &&
+                    recvKind != NumericKind.F32 &&
+                    recvKind != NumericKind.F64 &&
+                    recvKind != NumericKind.F128
+                ) {
                     val recvAtom = if (isAtomicPostfixReceiver(expr.receiver, receiver)) receiver else "($receiver)"
                     if ("core" in headerContext.crateNamespaces) {
                         val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
@@ -1585,12 +1596,16 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
             }
             if (rawMethod == "to_bits" && nonUnitArgs.isEmpty() && expr.turbofish == null) {
                 val recvKind = inferExprNumericKind(expr.receiver, selfTypeName)
-                if (recvKind == NumericKind.F32 || recvKind == NumericKind.F64) {
+                if (recvKind == NumericKind.F16 ||
+                    recvKind == NumericKind.F32 ||
+                    recvKind == NumericKind.F64 ||
+                    recvKind == NumericKind.F128
+                ) {
                     val recvAtom = if (isAtomicPostfixReceiver(expr.receiver, receiver)) receiver else "($receiver)"
-                    return if (recvKind == NumericKind.F32) {
-                        "$recvAtom.toRawBits().toUInt()"
-                    } else {
-                        "$recvAtom.toRawBits().toULong()"
+                    return when (recvKind) {
+                        NumericKind.F16, NumericKind.F128 -> "$recvAtom.toBits()"
+                        NumericKind.F32 -> "$recvAtom.toRawBits().toUInt()"
+                        else -> "$recvAtom.toRawBits().toULong()"
                     }
                 }
             }
@@ -1716,7 +1731,12 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                 expr.turbofish == null
             ) {
                 val recvKind = inferExprNumericKind(expr.receiver, selfTypeName)
-                if (recvKind != null && recvKind != NumericKind.F32 && recvKind != NumericKind.F64) {
+                if (recvKind != null &&
+                    recvKind != NumericKind.F16 &&
+                    recvKind != NumericKind.F32 &&
+                    recvKind != NumericKind.F64 &&
+                    recvKind != NumericKind.F128
+                ) {
                     if ((recvKind == NumericKind.U128 || recvKind == NumericKind.I128) && "core" in headerContext.crateNamespaces) {
                         val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
                         val fnName =
@@ -2106,7 +2126,12 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                     typeArgs.isEmpty()
                 ) {
                     recvNumericKindForMethod?.takeUnless {
-                        it == NumericKind.F32 || it == NumericKind.F64 || it == NumericKind.I128 || it == NumericKind.U128
+                        it == NumericKind.F16 ||
+                            it == NumericKind.F32 ||
+                            it == NumericKind.F64 ||
+                            it == NumericKind.F128 ||
+                            it == NumericKind.I128 ||
+                            it == NumericKind.U128
                     }
                 } else {
                     null
@@ -3621,8 +3646,10 @@ internal fun KotlinJ2KEmitter.primitiveArrayElementNumericKind(arrayType: String
         "ULongArray", "List<ULong>", "MutableList<ULong>" -> NumericKind.U64
         "List<I128>", "MutableList<I128>", "List<$coreNs.I128>", "MutableList<$coreNs.I128>" -> NumericKind.I128
         "List<U128>", "MutableList<U128>", "List<$coreNs.U128>", "MutableList<$coreNs.U128>" -> NumericKind.U128
+        "List<F16>", "MutableList<F16>", "List<$coreNs.F16>", "MutableList<$coreNs.F16>" -> NumericKind.F16
         "FloatArray", "List<Float>", "MutableList<Float>", "List<kotlin.Float>", "MutableList<kotlin.Float>" -> NumericKind.F32
         "DoubleArray", "List<Double>", "MutableList<Double>" -> NumericKind.F64
+        "List<F128>", "MutableList<F128>", "List<$coreNs.F128>", "MutableList<$coreNs.F128>" -> NumericKind.F128
         else -> null
     }
 }
@@ -4349,7 +4376,12 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
                     if (headerContext.rawAbiMode || headerContext.finalClasses) "UByteArray" else "List<UByte>"
                 rawMethod == "len" && expr.args.isEmpty() -> "Int"
                 rawMethod == "to_bits" && expr.args.isEmpty() ->
-                    if (recvNumericKind == NumericKind.F32) "UInt" else "ULong"
+                    when (recvNumericKind) {
+                        NumericKind.F16 -> "UShort"
+                        NumericKind.F32 -> "UInt"
+                        NumericKind.F128 -> "U128"
+                        else -> "ULong"
+                    }
                 (rawMethod == "to_lowercase" || rawMethod == "to_uppercase") &&
                     expr.args.isEmpty() &&
                     inspector.instanceMethodsByType.values.none { rustFunctionIdentToKotlin(rawMethod) in it } -> "String"
@@ -4505,8 +4537,10 @@ internal fun KotlinJ2KEmitter.coerceRenderedNumericExpr(sourceExpr: Expr, render
         NumericKind.I16 -> if (rendered.endsWith(".toShort()")) rendered else "$recv.toShort()"
         NumericKind.I32 -> if (rendered.endsWith(".toInt()")) rendered else "$recv.toInt()"
         NumericKind.I64 -> if (rendered.endsWith(".toLong()")) rendered else "$recv.toLong()"
+        NumericKind.F16 -> convertNumericReceiver(recv, "F16", inferExprNumericKind(sourceExpr, selfTypeName = null))
         NumericKind.F32 -> if (rendered.endsWith(".toFloat()")) rendered else "$recv.toFloat()"
         NumericKind.F64 -> if (rendered.endsWith(".toDouble()")) rendered else "$recv.toDouble()"
+        NumericKind.F128 -> convertNumericReceiver(recv, "F128", inferExprNumericKind(sourceExpr, selfTypeName = null))
         else -> rendered
     }
 }
@@ -4526,8 +4560,10 @@ internal fun KotlinJ2KEmitter.inferExprNumericKind(expr: Expr, selfTypeName: Str
                 is Lit.Byte -> NumericKind.U8
                 is Lit.Float ->
                     when (lit.value.suffix()) {
+                        "f16" -> NumericKind.F16
                         "f32" -> NumericKind.F32
                         "f64" -> NumericKind.F64
+                        "f128" -> NumericKind.F128
                         else -> null
                     }
                 is Lit.Int -> {
@@ -4647,8 +4683,10 @@ internal fun KotlinJ2KEmitter.numericKindToPureTypeName(kind: NumericKind): Stri
         NumericKind.U64 -> "ULong"
         NumericKind.I128 -> "I128"
         NumericKind.U128 -> "U128"
+        NumericKind.F16 -> "F16"
         NumericKind.F32 -> kotlinF32TypeName()
         NumericKind.F64 -> "Double"
+        NumericKind.F128 -> "F128"
     }
 
 internal fun KotlinJ2KEmitter.numericKindFromScannerCode(code: String?): NumericKind? =
@@ -4663,8 +4701,10 @@ internal fun KotlinJ2KEmitter.numericKindFromScannerCode(code: String?): Numeric
         "U64" -> NumericKind.U64
         "I128" -> NumericKind.I128
         "U128" -> NumericKind.U128
+        "F16" -> NumericKind.F16
         "F32" -> NumericKind.F32
         "F64" -> NumericKind.F64
+        "F128" -> NumericKind.F128
         else -> null
     }
 
@@ -4678,8 +4718,12 @@ internal fun KotlinJ2KEmitter.renderIntToBytesMethodCall(
     val isBigEndian =
         rawMethod == "to_be_bytes" ||
             (rawMethod == "to_ne_bytes" && activeCfgProfile.targetEndian == "big")
-    if (recvKind == NumericKind.U128 || recvKind == NumericKind.I128) {
-        if (recvKind == NumericKind.U128) usesU128 = true else usesI128 = true
+    if (recvKind == NumericKind.U128 || recvKind == NumericKind.I128 || recvKind == NumericKind.F16 || recvKind == NumericKind.F128) {
+        if (recvKind == NumericKind.U128) {
+            usesU128 = true
+        } else if (recvKind == NumericKind.I128) {
+            usesI128 = true
+        }
         val recvAtom = if (isAtomicPostfixReceiver(sourceReceiver, receiver)) receiver else "($receiver)"
         val fn = if (isBigEndian) "toBeBytes" else "toLeBytes"
         return "$recvAtom.$fn()"
@@ -4744,7 +4788,7 @@ internal fun KotlinJ2KEmitter.renderIntToBytesMethodCall(
             val elems = shifts.joinToString(", ") { s -> if (s == 0) "rawBits.toUByte()" else "(rawBits shr $s).toUByte()" }
             "run { val rawBits = ($receiver).toRawBits().toULong(); $ctor($elems) }"
         }
-        NumericKind.U128, NumericKind.I128 -> error("handled above")
+        NumericKind.U128, NumericKind.I128, NumericKind.F16, NumericKind.F128 -> error("handled above")
     }
 }
 
@@ -5354,6 +5398,10 @@ internal fun KotlinJ2KEmitter.resolveRenderedTypeLayoutExpr(targetKtRaw: String)
         "F16" -> {
             CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
             return "PrimitiveLayouts.F16_LAYOUT"
+        }
+        "F128" -> {
+            CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
+            return "PrimitiveLayouts.F128_LAYOUT"
         }
         "Char" -> {
             CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
@@ -6235,6 +6283,7 @@ private fun KotlinJ2KEmitter.resolvePrimitiveFromBytesSpec(expr: Expr.Call): Tri
             "f32" -> kotlinF32TypeName()
             "f64" -> "Double"
             "f16", "F16" -> "F16"
+            "f128", "F128" -> "F128"
             "u128", "U128" -> "U128"
             "i128", "I128" -> "I128"
             "usize" ->
@@ -6270,7 +6319,7 @@ private fun KotlinJ2KEmitter.renderPrimitiveFromBytesCall(
 ): String? {
     val (primRaw, _, isBigEndian) = resolvePrimitiveFromBytesSpec(expr) ?: return null
     val savedParseTarget = currentExpectedParseTargetType
-    if (primRaw in setOf("u128", "U128", "i128", "I128", "f16", "F16")) {
+    if (primRaw in setOf("u128", "U128", "i128", "I128", "f16", "F16", "f128", "F128")) {
         currentExpectedParseTargetType = "UByteArray"
         val argRendered =
             try {
@@ -6288,6 +6337,11 @@ private fun KotlinJ2KEmitter.renderPrimitiveFromBytesCall(
                 "i128", "I128" -> {
                     usesI128 = true
                     "I128"
+                }
+                "f128", "F128" -> {
+                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.F128")
+                    "F128"
                 }
                 else -> {
                     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
@@ -6487,10 +6541,24 @@ internal fun KotlinJ2KEmitter.renderUnOpDerefPointerPunning(
     val atom = if (isAtomicPostfixReceiver(srcInner, rval)) rval else "($rval)"
     return when {
         srcKind == dstKind -> rval
+        srcKind == NumericKind.F16 && dstKind == NumericKind.U16 -> "$atom.toBits()"
+        srcKind == NumericKind.F16 && dstKind == NumericKind.I16 -> "$atom.toBits().toShort()"
+        srcKind == NumericKind.U16 && dstKind == NumericKind.F16 -> "F16.fromBits($rval)"
+        srcKind == NumericKind.I16 && dstKind == NumericKind.F16 -> "F16.fromBits($atom.toUShort())"
         srcKind == NumericKind.F32 && dstKind == NumericKind.U32 -> "$atom.toRawBits().toUInt()"
         srcKind == NumericKind.F32 && dstKind == NumericKind.I32 -> "$atom.toRawBits()"
         srcKind == NumericKind.F64 && dstKind == NumericKind.U64 -> "$atom.toRawBits().toULong()"
         srcKind == NumericKind.F64 && dstKind == NumericKind.I64 -> "$atom.toRawBits()"
+        srcKind == NumericKind.F128 && dstKind == NumericKind.U128 -> {
+            usesU128 = true
+            "U128($atom.high, $atom.low)"
+        }
+        srcKind == NumericKind.F128 && dstKind == NumericKind.I128 -> {
+            usesI128 = true
+            "I128($atom.high.toLong(), $atom.low)"
+        }
+        srcKind == NumericKind.U128 && dstKind == NumericKind.F128 -> "F128.fromBits($rval)"
+        srcKind == NumericKind.I128 && dstKind == NumericKind.F128 -> "F128.fromBits($atom.high.toULong(), $atom.low)"
         srcKind == NumericKind.U32 && dstKind == NumericKind.F32 -> "${kotlinF32TypeName()}.fromBits($atom.toInt())"
         srcKind == NumericKind.I32 && dstKind == NumericKind.F32 -> "${kotlinF32TypeName()}.fromBits($rval)"
         srcKind == NumericKind.U64 && dstKind == NumericKind.F64 -> "Double.fromBits($atom.toLong())"
@@ -6517,8 +6585,10 @@ private fun KotlinJ2KEmitter.rustPrimitivePathNameToKind(raw: String): NumericKi
         "u64" -> NumericKind.U64
         "i128" -> NumericKind.I128
         "u128" -> NumericKind.U128
+        "f16" -> NumericKind.F16
         "f32" -> NumericKind.F32
         "f64" -> NumericKind.F64
+        "f128" -> NumericKind.F128
         "isize" ->
             if (headerContext.rawAbiMode || inExternAbiSignature) {
                 when (activeCfgProfile.pointerWidth) {
@@ -6563,7 +6633,7 @@ internal fun KotlinJ2KEmitter.resolvePrimitiveAssociatedConstKind(
             }
             segs.size >= 3 && segs[segs.size - 2] == "consts" && segs.dropLast(3).all { it in allowedPrefixes } ->
                 rustPrimitivePathNameToKind(segs[segs.size - 3])?.takeIf {
-                    it == NumericKind.F32 || it == NumericKind.F64
+                    it == NumericKind.F16 || it == NumericKind.F32 || it == NumericKind.F64 || it == NumericKind.F128
                 }
             segs.size >= 2 && segs.dropLast(2).all { it in allowedPrefixes } ->
                 rustPrimitivePathNameToKind(segs[segs.size - 2])
@@ -6623,7 +6693,11 @@ private fun KotlinJ2KEmitter.inferPrimitiveOpReturnRenderedType(
         }
     }
     val primTy = numericKindToPureTypeName(recvKind)
-    val isFloat = recvKind == NumericKind.F32 || recvKind == NumericKind.F64
+    val isFloat =
+        recvKind == NumericKind.F16 ||
+            recvKind == NumericKind.F32 ||
+            recvKind == NumericKind.F64 ||
+            recvKind == NumericKind.F128
     return when {
         !isFloat &&
             rawMethod in
@@ -6754,6 +6828,23 @@ internal fun KotlinJ2KEmitter.renderStaticPrimitiveCall(
     val spec = parseStaticPrimitiveCallSpec(expr) ?: return null
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
     if (spec.methodName == "from_bits" && spec.turbofishType == null && nonUnitArgs.size == 1) {
+        if (spec.primKind == NumericKind.F16) {
+            val saved = currentExpectedNumericKind
+            currentExpectedNumericKind = NumericKind.U16
+            val argRendered =
+                try {
+                    renderExpr(nonUnitArgs[0], indent, selfTypeName)
+                } finally {
+                    currentExpectedNumericKind = saved
+                }
+            val bitsExpr =
+                if (inferExprNumericKind(nonUnitArgs[0], selfTypeName) == NumericKind.U16) {
+                    argRendered
+                } else {
+                    coerceRenderedNumericExpr(nonUnitArgs[0], argRendered, NumericKind.U16)
+                }
+            return "F16.fromBits($bitsExpr)"
+        }
         if (spec.primKind == NumericKind.F32) {
             val saved = currentExpectedNumericKind
             currentExpectedNumericKind = NumericKind.U32
@@ -6787,6 +6878,24 @@ internal fun KotlinJ2KEmitter.renderStaticPrimitiveCall(
                     coerceRenderedNumericExpr(nonUnitArgs[0], argRendered, NumericKind.I64)
                 }
             return "Double.fromBits($bitsExpr)"
+        }
+        if (spec.primKind == NumericKind.F128) {
+            usesU128 = true
+            val saved = currentExpectedNumericKind
+            currentExpectedNumericKind = NumericKind.U128
+            val argRendered =
+                try {
+                    renderExpr(nonUnitArgs[0], indent, selfTypeName)
+                } finally {
+                    currentExpectedNumericKind = saved
+                }
+            val bitsExpr =
+                if (inferExprNumericKind(nonUnitArgs[0], selfTypeName) == NumericKind.U128) {
+                    argRendered
+                } else {
+                    coerceRenderedNumericExpr(nonUnitArgs[0], argRendered, NumericKind.U128)
+                }
+            return "F128.fromBits($bitsExpr)"
         }
     }
     if (spec.methodName == "from_str_radix" &&
@@ -6859,6 +6968,7 @@ internal fun KotlinJ2KEmitter.renderStaticPrimitiveCall(
         }
     if (spec.methodName == "to_bits" && spec.turbofishType == null && extraExprs.isEmpty()) {
         val recvAtom = if (isAtomicPostfixReceiver(nonUnitArgs[0], recvRendered)) recvRendered else "($recvRendered)"
+        if (spec.primKind == NumericKind.F16 || spec.primKind == NumericKind.F128) return "$recvAtom.toBits()"
         if (spec.primKind == NumericKind.F32) return "$recvAtom.toRawBits().toUInt()"
         if (spec.primKind == NumericKind.F64) return "$recvAtom.toRawBits().toULong()"
     }
@@ -6949,8 +7059,88 @@ private fun KotlinJ2KEmitter.renderConcretePrimitiveOp(
         return null
     }
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    val isFloat = recvKind == NumericKind.F32 || recvKind == NumericKind.F64
     val recvAtom = if (isAtomicPostfixReceiver(recvExpr, renderedRecv)) renderedRecv else "($renderedRecv)"
+    if (recvKind == NumericKind.F16 || recvKind == NumericKind.F128) {
+        if (turbofishType != null) return null
+        val isF16 = recvKind == NumericKind.F16
+        val typeName = if (isF16) "F16" else "F128"
+        val wrapFn = if (isF16) "F16.fromFloat" else "F128.fromDouble"
+        val toScalarFn = if (isF16) "toFloat()" else "toDouble()"
+        if (extraExprs.isEmpty()) {
+            return when (rawMethod) {
+                "is_nan" -> "$recvAtom.isNaN()"
+                "is_infinite" -> "$recvAtom.isInfinite()"
+                "is_finite" -> "$recvAtom.isFinite()"
+                "is_sign_positive" -> "$recvAtom.isSignPositive()"
+                "is_sign_negative" -> "$recvAtom.isSignNegative()"
+                "to_bits" -> "$recvAtom.toBits()"
+                "abs", "floor", "ceil", "round", "sqrt", "exp", "ln", "log2", "log10", "cbrt", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh" -> {
+                    CoreIntrinsicLowering.registerCoreImport(this, "kotlin.math.$rawMethod")
+                    "$wrapFn($rawMethod($recvAtom.$toScalarFn))"
+                }
+                "trunc" -> {
+                    CoreIntrinsicLowering.registerCoreImport(this, "kotlin.math.truncate")
+                    "$wrapFn(truncate($recvAtom.$toScalarFn))"
+                }
+                "exp2" -> {
+                    CoreIntrinsicLowering.registerCoreImport(this, "kotlin.math.pow")
+                    val twoLit = if (isF16) "2.0f" else "2.0"
+                    "$wrapFn($twoLit.pow($recvAtom.$toScalarFn))"
+                }
+                "fract" -> {
+                    CoreIntrinsicLowering.registerCoreImport(this, "kotlin.math.truncate")
+                    "$recvAtom.let { v -> $wrapFn(v.$toScalarFn - truncate(v.$toScalarFn)) }"
+                }
+                "recip" -> "$wrapFn(${if (isF16) "1.0f" else "1.0"} / $recvAtom.$toScalarFn)"
+                "to_degrees" -> {
+                    val scale = if (isF16) "(180.0f / kotlin.math.PI.toFloat())" else "(180.0 / kotlin.math.PI)"
+                    "$wrapFn($recvAtom.$toScalarFn * $scale)"
+                }
+                "to_radians" -> {
+                    val scale = if (isF16) "(kotlin.math.PI.toFloat() / 180.0f)" else "(kotlin.math.PI / 180.0)"
+                    "$wrapFn($recvAtom.$toScalarFn * $scale)"
+                }
+                "signum" ->
+                    "$recvAtom.let { v -> when { v.isNaN() -> v; v.isSignNegative() -> $wrapFn(${if (isF16) "-1.0f" else "-1.0"}); else -> $typeName.ONE } }"
+                else -> null
+            }
+        }
+        if (extraExprs.size == 1 && renderedExtras.size == 1) {
+            return when (rawMethod) {
+                "atan2", "hypot", "log" -> {
+                    val arg0 = coerceNumericArgIfNeeded(extraExprs[0], renderedExtras[0], recvKind, selfTypeName)
+                    val arg0Atom = if (isAtomicPostfixReceiver(extraExprs[0], arg0)) arg0 else "($arg0)"
+                    CoreIntrinsicLowering.registerCoreImport(this, "kotlin.math.$rawMethod")
+                    "$wrapFn($rawMethod($recvAtom.$toScalarFn, $arg0Atom.$toScalarFn))"
+                }
+                "powf" -> {
+                    val arg0 = coerceNumericArgIfNeeded(extraExprs[0], renderedExtras[0], recvKind, selfTypeName)
+                    val arg0Atom = if (isAtomicPostfixReceiver(extraExprs[0], arg0)) arg0 else "($arg0)"
+                    CoreIntrinsicLowering.registerCoreImport(this, "kotlin.math.pow")
+                    "$wrapFn($recvAtom.$toScalarFn.pow($arg0Atom.$toScalarFn))"
+                }
+                "powi" -> {
+                    val intArg = coerceNumericArgIfNeeded(extraExprs[0], renderedExtras[0], NumericKind.I32, selfTypeName)
+                    CoreIntrinsicLowering.registerCoreImport(this, "kotlin.math.pow")
+                    "$wrapFn($recvAtom.$toScalarFn.pow($intArg))"
+                }
+                "min", "max" -> {
+                    val arg0 = coerceNumericArgIfNeeded(extraExprs[0], renderedExtras[0], recvKind, selfTypeName)
+                    val tag = if (rawMethod == "min") "Min" else "Max"
+                    "run { val lhs${tag}0 = ($renderedRecv); val rhs${tag}0 = ($arg0); when { lhs${tag}0.isNaN() -> rhs${tag}0; rhs${tag}0.isNaN() -> lhs${tag}0; else -> ${rawMethod}Of(lhs${tag}0, rhs${tag}0) } }"
+                }
+                else -> null
+            }
+        }
+        if (extraExprs.size == 2 && renderedExtras.size == 2 && rawMethod == "mul_add") {
+            val arg0 = coerceNumericArgIfNeeded(extraExprs[0], renderedExtras[0], recvKind, selfTypeName)
+            val arg1 = coerceNumericArgIfNeeded(extraExprs[1], renderedExtras[1], recvKind, selfTypeName)
+            val arg0Atom = if (isAtomicPostfixReceiver(extraExprs[0], arg0)) arg0 else "($arg0)"
+            return "(($recvAtom * $arg0Atom) + ($arg1))"
+        }
+        return null
+    }
+    val isFloat = recvKind == NumericKind.F32 || recvKind == NumericKind.F64
     if (isFloat) {
         val isF32 = recvKind == NumericKind.F32
         if (extraExprs.isEmpty() && rawMethod == "to_int_unchecked") {

@@ -10,6 +10,7 @@ public data class GradleProjectProperties(
     public val projectNamespace: String? = null,
     public val projectName: String? = null,
     public val crateNamespaces: Map<String, String> = emptyMap(),
+    public val projectFfiName: String? = null,
 )
 
 public data class FolderPackageProperties(
@@ -86,6 +87,7 @@ public fun parseGradleProperties(content: String): GradleProjectProperties {
         projectNamespace = derivedNamespace,
         projectName = name,
         crateNamespaces = extractCrateNamespaceOverrides(map),
+        projectFfiName = map["project.ffi.name"]?.takeIf { it.isNotEmpty() },
     )
 }
 
@@ -203,6 +205,7 @@ public data class FileHeaderContext(
     public val projectGroup: String? = null,
     public val projectNamespace: String? = null,
     public val crateNamespaces: Map<String, String> = emptyMap(),
+    public val projectFfiName: String? = null,
     public val portLintDirective: String = "source",
     public val crateMacroSources: List<String> = emptyList(),
     public val crateFlatFileModules: List<String> = emptyList(),
@@ -211,6 +214,8 @@ public data class FileHeaderContext(
     public val finalClasses: Boolean = false,
     public val selfCrateAliases: Set<String> = emptySet(),
     public val includedSubdirModuleMap: Map<String, String> = emptyMap(),
+    public val rootSelfDirModuleAliases: Set<String> = emptySet(),
+    public val rootExternalModuleReexports: Map<String, String> = emptyMap(),
     public val crateTypeAliasDefaults: Map<String, String> = emptyMap(),
     public val crateOptionFnTypes: Set<String> = emptySet(),
     public val crateNumericTypeKinds: Map<String, String> = emptyMap(),
@@ -533,6 +538,7 @@ internal fun inferFileHeaderContextWithResolvers(
         projectGroup = effectiveGroup,
         projectNamespace = effectiveNamespace,
         crateNamespaces = effectiveCrateNamespaces,
+        projectFfiName = resolvedProps?.projectFfiName,
         portLintDirective = portLintDirective,
         crateMacroSources = crateMacros,
         crateFlatFileModules = crateFlatModules,

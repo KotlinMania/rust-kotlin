@@ -1357,10 +1357,33 @@ internal class FfiInteropCollector(
             }
         }
         val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+        val cVoidPkg =
+            headerContext.crateSymbolSubpackages["CVoid"]
+                ?.firstOrNull()
+                ?.let { sub ->
+                    val projNs =
+                        headerContext.projectNamespace
+                            ?.trim()
+                            ?.removeSuffix(".")
+                            .orEmpty()
+                    when {
+                        projNs.isEmpty() -> null
+                        sub.isEmpty() -> projNs
+                        else -> "$projNs.$sub"
+                    }
+                }
+                ?: headerContext.externalCrateSymbolPackages["core"]
+                    ?.get("CVoid")
+                    ?.filter { ".ffi." in it || it.endsWith(".ffi") }
+                    ?.minByOrNull { it.length }
+                ?: headerContext.externalCrateSymbolPackages["core"]
+                    ?.get("CVoid")
+                    ?.minByOrNull { it.length }
+                ?: "$coreNs.ffi"
         for ((sym, targetPkg) in listOf(
             "ConstPtr" to "$coreNs.ptr",
             "MutPtr" to "$coreNs.ptr",
-            "CVoid" to "$coreNs.ffi",
+            "CVoid" to cVoidPkg,
         )) {
             if (targetPkg != pkgName && sym in usedIdents && sym !in localDeclaredNames && sym !in explicitlyImportedNames) {
                 importsOut += "$targetPkg.$sym"
@@ -4357,7 +4380,7 @@ internal class FfiInteropCollector(
                     NumericKind.U64 -> return CAbiBridgeKind.U64
                     NumericKind.F32 -> return CAbiBridgeKind.F32
                     NumericKind.F64 -> return CAbiBridgeKind.F64
-                    NumericKind.I128, NumericKind.U128, null -> {}
+                    NumericKind.I128, NumericKind.U128, NumericKind.F16, NumericKind.F128, null -> {}
                 }
             }
             val ptrWidth = cfgProfile.pointerWidth
@@ -4704,7 +4727,10 @@ internal class FfiInteropCollector(
             val fromCrate = headerContext.crateNamespaces["libc"]?.trim()?.removeSuffix(".")
             if (!fromCrate.isNullOrEmpty()) return fromCrate
             val fromProj = headerContext.projectNamespace?.trim()?.removeSuffix(".")
-            return fromProj?.takeIf { it.isNotEmpty() }
+            if (!fromProj.isNullOrEmpty() && (fromProj == "libc" || fromProj.endsWith(".libc"))) {
+                return fromProj
+            }
+            return null
         }
 
         internal fun extractLinkNameAttribute(attrs: List<Attribute>): String? {
@@ -4822,6 +4848,13 @@ internal class FfiInteropCollector(
         }
 
         private fun computeFfiModuleNameLower(headerContext: FileHeaderContext): String {
+            val ffiOverride =
+                headerContext.projectFfiName
+                    ?.trim()
+                    ?.lowercase()
+                    ?.filter { it.isLetterOrDigit() || it == '_' }
+                    ?.takeIf { it.isNotEmpty() }
+            if (ffiOverride != null) return ffiOverride
             val nsSegment =
                 headerContext.projectNamespace
                     ?.substringAfterLast('.')
@@ -4951,8 +4984,10 @@ internal class FfiInteropCollector(
                 NumericKind.U32 -> "toUInt"
                 NumericKind.I64 -> "toLong"
                 NumericKind.U64 -> "toULong"
+                NumericKind.F16 -> "toFloat"
                 NumericKind.F32 -> "toFloat"
                 NumericKind.F64 -> "toDouble"
+                NumericKind.F128 -> "toDouble"
                 NumericKind.I128, NumericKind.U128 -> "toLong"
             }
 
@@ -4972,8 +5007,10 @@ internal class FfiInteropCollector(
                     NumericKind.U32 -> "0u"
                     NumericKind.I64 -> "-1L"
                     NumericKind.U64 -> "0uL"
+                    NumericKind.F16 -> "F16.ZERO"
                     NumericKind.F32 -> "0.0f"
                     NumericKind.F64 -> "0.0"
+                    NumericKind.F128 -> "F128.ZERO"
                     NumericKind.I128 -> "I128.ZERO"
                     NumericKind.U128 -> "U128.ZERO"
                 }

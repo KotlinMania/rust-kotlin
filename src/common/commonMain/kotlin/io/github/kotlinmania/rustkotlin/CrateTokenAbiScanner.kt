@@ -7,10 +7,15 @@ import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.procmacro2.Spacing
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
+import io.github.kotlinmania.syn.Attribute
+import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.Item
+import io.github.kotlinmania.syn.Lit
+import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.ModContent
 import io.github.kotlinmania.syn.TraitItem
 import io.github.kotlinmania.syn.TypeParamBound
+import io.github.kotlinmania.syn.UseTree
 import io.github.kotlinmania.io.files.Path as KmPath
 
 internal object CrateTraitAstRegistry {
@@ -33,6 +38,8 @@ internal object CrateTraitAstRegistry {
 internal data class CrateRawAbiMetadata(
     val selfCrateAliases: Set<String> = emptySet(),
     val includedSubdirModuleMap: Map<String, String> = emptyMap(),
+    val rootSelfDirModuleAliases: Set<String> = emptySet(),
+    val rootExternalModuleReexports: Map<String, String> = emptyMap(),
     val typeAliasDefaults: Map<String, String> = emptyMap(),
     val optionFnTypes: Set<String> = emptySet(),
     val numericTypeKinds: Map<String, String> = emptyMap(),
@@ -278,6 +285,8 @@ private fun scanSourcesWithActiveSession(
 
     val selfAliases = linkedSetOf<String>()
     val includedSubdirModules = linkedMapOf<String, String>()
+    val rootSelfDirModuleAliases = linkedSetOf<String>()
+    val rootExternalModuleReexports = linkedMapOf<String, String>()
     val subpkgToRawLeaf = linkedMapOf<String, String>()
     val optionFnTypes = linkedSetOf<String>()
     val aliasDefaults = linkedMapOf<String, String>()
@@ -405,6 +414,14 @@ private fun scanSourcesWithActiveSession(
                 includedSubdirModules[modIdent] = subdir
             }
         }
+        scanRootAliasesAndExternalReexports(
+            libText = libText,
+            byRelPath = byRelPath,
+            selfAliases = selfAliases,
+            includedSubdirModules = includedSubdirModules,
+            rootSelfDirModuleAliasesOut = rootSelfDirModuleAliases,
+            rootExternalModuleReexportsOut = rootExternalModuleReexports,
+        )
     }
 
     for ((relFile, text) in normalizedSources) {
@@ -886,6 +903,8 @@ private fun scanSourcesWithActiveSession(
     return CrateRawAbiMetadata(
         selfCrateAliases = selfAliases,
         includedSubdirModuleMap = includedSubdirModules,
+        rootSelfDirModuleAliases = rootSelfDirModuleAliases,
+        rootExternalModuleReexports = rootExternalModuleReexports,
         typeAliasDefaults = aliasDefaults,
         optionFnTypes = optionFnTypes,
         numericTypeKinds = numericKinds,
@@ -917,6 +936,215 @@ private fun lexScannerTokens(sourceText: String): List<TokenTree> {
         }
     val lexed = TokenStream.fromString(sanitized)
     return if (lexed.isSuccess()) lexed.getOrThrow().toList() else emptyList()
+}
+
+private fun extractScannerPathAttrValue(attrs: List<Attribute>): String? {
+    for (attr in attrs) {
+        val meta = attr.meta
+        if (meta is Meta.NameValue && meta.path.isIdent("path")) {
+            val expr = meta.value
+            if (expr is Expr.Lit && expr.lit is Lit.Str) {
+                return (expr.lit as Lit.Str).value.value()
+            }
+        }
+    }
+    return null
+}
+
+private fun collectScannerUseLeaves(
+    tree: UseTree,
+    prefix: List<String>,
+    out: MutableList<Pair<List<String>, String?>>,
+) {
+    when (tree) {
+        is UseTree.Path -> {
+            val seg = tree.ident.toString().removePrefix("r#")
+            tree.tree?.let { collectScannerUseLeaves(it, prefix + seg, out) }
+        }
+        is UseTree.Name -> {
+            val seg = tree.ident.toString().removePrefix("r#")
+            val alias =
+                tree.rename
+                    ?.ident
+                    ?.toString()
+                    ?.removePrefix("r#")
+                    ?.takeIf { it != "_" }
+            if (seg == "self") {
+                if (prefix.isNotEmpty()) {
+                    out += prefix to alias
+                }
+            } else {
+                out += (prefix + seg) to alias
+            }
+        }
+        is UseTree.Glob -> out += (prefix + "*") to null
+        is UseTree.Group -> {
+            for (sub in tree.items.toList()) {
+                collectScannerUseLeaves(sub, prefix, out)
+            }
+        }
+    }
+}
+
+private fun isPureUseInlineScannerMod(modItem: Item.Mod): Boolean {
+    val content = modItem.content as? ModContent.Inline ?: return false
+    for (sub in content.items) {
+        if (itemHasDocOnlyCfg(sub)) continue
+        when (sub) {
+            is Item.Use -> {}
+            is Item.Mod -> {
+                if (hasCfgTestModAttribute(sub.attrs) || !isPureUseInlineScannerMod(sub)) return false
+            }
+            else -> return false
+        }
+    }
+    return true
+}
+
+private fun collectInlineScannerModUseLeaves(
+    modItem: Item.Mod,
+    out: MutableList<Pair<List<String>, String?>>,
+) {
+    val content = modItem.content as? ModContent.Inline ?: return
+    for (sub in content.items) {
+        if (itemHasDocOnlyCfg(sub)) continue
+        when (sub) {
+            is Item.Use -> collectScannerUseLeaves(sub.tree, emptyList(), out)
+            is Item.Mod -> if (!hasCfgTestModAttribute(sub.attrs)) collectInlineScannerModUseLeaves(sub, out)
+            else -> {}
+        }
+    }
+}
+
+private fun scanRootAliasesAndExternalReexports(
+    libText: String,
+    byRelPath: Map<String, String>,
+    selfAliases: Set<String>,
+    includedSubdirModules: Map<String, String>,
+    rootSelfDirModuleAliasesOut: MutableSet<String>,
+    rootExternalModuleReexportsOut: MutableMap<String, String>,
+) {
+    val recognized = recognizeRustOrNull(libText) ?: return
+    val allRelKeys = byRelPath.keys
+
+    fun isLocalFileModule(modName: String): Boolean =
+        "$modName.rs" in byRelPath ||
+            "$modName/mod.rs" in byRelPath ||
+            modName in includedSubdirModules ||
+            allRelKeys.any { it.startsWith("$modName/") }
+
+    val externCrateAliases = linkedMapOf<String, String>()
+    val externalCrateNames = linkedSetOf("core", "alloc", "std", "proc_macro")
+    val activeRootItems =
+        recognized.file.items.filterNot { item ->
+            itemHasDocOnlyCfg(item) || (item is Item.Mod && hasCfgTestModAttribute(item.attrs))
+        }
+
+    var pointsToRootModRs = false
+    for (item in activeRootItems) {
+        when (item) {
+            is Item.ExternCrate -> {
+                val orig = item.ident.toString().removePrefix("r#")
+                val rename =
+                    item.rename
+                        ?.ident
+                        ?.toString()
+                        ?.removePrefix("r#")
+                if (orig != "self") {
+                    externalCrateNames += orig
+                    if (rename != null && rename != orig && rename != "_") {
+                        externCrateAliases[rename] = orig
+                        if (!isLocalFileModule(rename)) {
+                            rootExternalModuleReexportsOut[rename] = orig
+                        }
+                    }
+                }
+            }
+            is Item.Mod -> {
+                val modIdent = item.ident.toString().removePrefix("r#")
+                if (item.content !is ModContent.Inline) {
+                    val pathVal = extractScannerPathAttrValue(item.attrs)?.replace('\\', '/')?.removePrefix("./")
+                    if (pathVal == "mod.rs") {
+                        rootSelfDirModuleAliasesOut += modIdent
+                        pointsToRootModRs = true
+                    }
+                }
+            }
+            else -> {}
+        }
+    }
+
+    for (item in activeRootItems) {
+        if (item is Item.Use) {
+            val leaves = mutableListOf<Pair<List<String>, String?>>()
+            collectScannerUseLeaves(item.tree, emptyList(), leaves)
+            for ((rawSegs, alias) in leaves) {
+                val firstRaw = rawSegs.firstOrNull() ?: continue
+                val resolvedExt = externCrateAliases[firstRaw] ?: firstRaw
+                if (rawSegs.size == 2 &&
+                    rawSegs[1] != "*" &&
+                    resolvedExt in externalCrateNames &&
+                    resolvedExt !in selfAliases &&
+                    !isLocalFileModule(resolvedExt)
+                ) {
+                    val boundName = alias ?: rawSegs[1]
+                    if (!isLocalFileModule(boundName) && boundName !in rootSelfDirModuleAliasesOut) {
+                        rootExternalModuleReexportsOut[boundName] = "$resolvedExt::${rawSegs[1]}"
+                    }
+                }
+            }
+        }
+    }
+
+    fun inspectPureUseInlineMod(modItem: Item.Mod) {
+        val modName = modItem.ident.toString().removePrefix("r#")
+        if (isLocalFileModule(modName) || !isPureUseInlineScannerMod(modItem)) return
+        val leaves = mutableListOf<Pair<List<String>, String?>>()
+        collectInlineScannerModUseLeaves(modItem, leaves)
+        if (leaves.isEmpty()) return
+        val extTargets =
+            leaves
+                .mapNotNull { (segs, _) ->
+                    val firstRaw = segs.firstOrNull() ?: return@mapNotNull null
+                    val resolvedExt = externCrateAliases[firstRaw] ?: firstRaw
+                    val second = segs.getOrNull(1)?.takeIf { it != "*" } ?: return@mapNotNull null
+                    if (resolvedExt in externalCrateNames && resolvedExt !in selfAliases && !isLocalFileModule(resolvedExt)) {
+                        "$resolvedExt::$second"
+                    } else {
+                        null
+                    }
+                }.distinct()
+        if (extTargets.size == 1 && extTargets.size == leaves.map { it.first.take(2) }.distinct().size) {
+            rootExternalModuleReexportsOut.putIfMissing(modName, extTargets.single())
+            return
+        }
+        val targetsCrate =
+            leaves.any { (segs, _) ->
+                segs.firstOrNull() == "crate" || segs.firstOrNull() == "self" || segs.firstOrNull() in selfAliases
+            }
+        if (targetsCrate) {
+            rootSelfDirModuleAliasesOut += modName
+        }
+    }
+
+    for (item in activeRootItems) {
+        if (item is Item.Mod && item.content is ModContent.Inline) {
+            inspectPureUseInlineMod(item)
+        }
+    }
+    if (pointsToRootModRs) {
+        val modRsText = byRelPath["mod.rs"]
+        val recognizedModRs = if (modRsText != null) recognizeRustOrNull(modRsText) else null
+        recognizedModRs
+            ?.file
+            ?.items
+            ?.filterNot { itemHasDocOnlyCfg(it) || (it is Item.Mod && hasCfgTestModAttribute(it.attrs)) }
+            ?.forEach { item ->
+                if (item is Item.Mod && item.content is ModContent.Inline) {
+                    inspectPureUseInlineMod(item)
+                }
+            }
+    }
 }
 
 private fun scanRootLibDirectives(

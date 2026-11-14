@@ -414,10 +414,93 @@ internal fun KotlinJ2KEmitter.bindOrQualifyResolvedCrossSymbol(resolvedFullImpor
     }
 }
 
+internal fun KotlinJ2KEmitter.rewriteCrateRootAliasAndReexportSegments(segs: List<String>): List<String> {
+    if (segs.isEmpty()) return segs
+    if (headerContext.rootSelfDirModuleAliases.isEmpty() && headerContext.rootExternalModuleReexports.isEmpty()) {
+        return segs
+    }
+    var cur = segs
+    var guard = 0
+    while (guard++ < 4) {
+        val firstRaw = cur.firstOrNull()?.removePrefix("r#") ?: break
+        val isCrateRootPrefix = firstRaw == "crate" || firstRaw in headerContext.selfCrateAliases
+        if (isCrateRootPrefix && cur.size >= 3) {
+            val secondRaw = cur[1].removePrefix("r#")
+            if (secondRaw in headerContext.rootSelfDirModuleAliases) {
+                cur = listOf("crate") + cur.drop(2)
+                continue
+            }
+            val reexportTarget = headerContext.rootExternalModuleReexports[secondRaw]
+            if (reexportTarget != null &&
+                secondRaw !in inspector.localInlineModuleNames &&
+                secondRaw !in inspector.localExternalModuleNames
+            ) {
+                cur = reexportTarget.split("::") + cur.drop(2)
+                continue
+            }
+        }
+        if (cur.size >= 2 &&
+            firstRaw !in inspector.localInlineModuleNames &&
+            firstRaw !in inspector.localExternalModuleNames &&
+            !scopeBuilder.isImportedModuleInScope(firstRaw)
+        ) {
+            if (firstRaw in headerContext.rootSelfDirModuleAliases) {
+                cur = listOf("crate") + cur.drop(1)
+                continue
+            }
+            val reexportTarget = headerContext.rootExternalModuleReexports[firstRaw]
+            if (reexportTarget != null) {
+                cur = reexportTarget.split("::") + cur.drop(1)
+                continue
+            }
+        }
+        break
+    }
+    return cur
+}
+
+internal fun KotlinJ2KEmitter.resolveStdlibFfiSymbolImport(
+    rustLeaf: String,
+    isAllocCString: Boolean = false,
+): String? {
+    val ktSym =
+        if (isAllocCString || rustLeaf == "CString") {
+            "CString"
+        } else {
+            CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS[rustLeaf] ?: return null
+        }
+    if (ktSym in inspector.declaredTypeNames) return null
+    val bestLocal = resolveBestSubpackageForSymbol(ktSym)
+    if (bestLocal != null) {
+        val nsPrefix = currentNamespacePrefix()
+        if (nsPrefix != null) {
+            return if (bestLocal.isEmpty()) "$nsPrefix.$ktSym" else "$nsPrefix.$bestLocal.$ktSym"
+        }
+    }
+    val crateKey = if (ktSym == "CString") "alloc" else "core"
+    val extCandidates = headerContext.externalCrateSymbolPackages[crateKey]?.get(ktSym)
+    if (!extCandidates.isNullOrEmpty()) {
+        val ffiMatch =
+            extCandidates
+                .filter { ".ffi." in it || it.endsWith(".ffi") }
+                .minByOrNull { it.length }
+                ?: extCandidates.minByOrNull { it.length }
+        if (ffiMatch != null) return "$ffiMatch.$ktSym"
+    }
+    val fallbackNs =
+        if (ktSym == "CString") {
+            CoreIntrinsicLowering.resolveAllocNamespace(headerContext)
+        } else {
+            CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+        }
+    return "$fallbackNs.ffi.$ktSym"
+}
+
 internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
-    rawSegStrings: List<String>,
+    rawInputSegStrings: List<String>,
     inTypePosition: Boolean = false,
 ): Pair<String, List<String>>? {
+    val rawSegStrings = rewriteCrateRootAliasAndReexportSegments(rawInputSegStrings)
     if (rawSegStrings.size < 2) return null
     val firstRaw = rawSegStrings.first().removePrefix("r#")
     if (firstRaw in inspector.localInlineModuleNames) return null
@@ -663,11 +746,12 @@ private fun KotlinJ2KEmitter.isIntermediateTypeSegmentInUsePath(
 }
 
 internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
-    segs: List<String>,
+    rawSegsInput: List<String>,
     boundRawAlias: String? = null,
     isSelfImport: Boolean = false,
     forceTypeLeaf: Boolean = false,
 ): String? {
+    val segs = rewriteCrateRootAliasAndReexportSegments(rawSegsInput)
     if (segs.isEmpty()) return null
     val root = segs.first()
     // A same-file type or an imported type's members retain type casing.
@@ -892,6 +976,9 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
     if (root in STDLIB_CRATE_ROOTS && segs.getOrNull(1) in STDLIB_MACRO_OR_PRIMITIVE_MODULES) {
         return null
     }
+    if (root == "libc" && FfiInteropCollector.resolveLibcNamespace(headerContext) == null) {
+        return null
+    }
     val lastRaw = segs.last()
     if (!isSelfImport && !headerContext.rawAbiMode) {
         val cleanSegs = segs.map { it.removePrefix("r#") }
@@ -899,19 +986,15 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
             (cleanSegs.size == 4 && cleanSegs[0] == "std" && cleanSegs[1] == "os" && cleanSegs[2] == "raw")
         ) {
             val leaf = cleanSegs.last()
-            if (leaf == "CString" && resolveBestSubpackageForSymbol("CString") == null) {
-                return "${CoreIntrinsicLowering.resolveAllocNamespace(headerContext)}.ffi.CString"
+            if (leaf == "CString") {
+                resolveStdlibFfiSymbolImport("CString", isAllocCString = true)?.let { return it }
             }
-            CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS[leaf]?.let { ktSym ->
-                if (resolveBestSubpackageForSymbol(ktSym) == null) {
-                    return "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.ffi.$ktSym"
-                }
+            if (leaf in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS) {
+                resolveStdlibFfiSymbolImport(leaf)?.let { return it }
             }
         }
         if (cleanSegs.size == 3 && cleanSegs[0] == "alloc" && cleanSegs[1] == "ffi" && cleanSegs[2] == "CString") {
-            if (resolveBestSubpackageForSymbol("CString") == null) {
-                return "${CoreIntrinsicLowering.resolveAllocNamespace(headerContext)}.ffi.CString"
-            }
+            resolveStdlibFfiSymbolImport("CString", isAllocCString = true)?.let { return it }
         }
     }
     if (!isSelfImport && headerContext.rawAbiMode && lastRaw.removePrefix("r#") == "c_void") {
@@ -2098,7 +2181,17 @@ internal fun KotlinJ2KEmitter.renderItemForeignMod(
                     out += "$fnTrivia$doc$indent$directSig $rustAllocShimBody"
                 } else if (isLocalItem) {
                     val localSig = sig.replaceFirst("expect fun ", "fun ")
-                    val localBody = if (retRendered == "Unit") "{}" else "= $retDefault"
+                    val retSynTy = extractReturnSynType(foreign.sig.output)
+                    val localBody =
+                        when {
+                            retRendered == "Unit" -> "{}"
+                            (retDefault.startsWith("null as ") || retDefault.startsWith("error(")) && retSynTy != null -> {
+                                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+                                val layoutExpr = CoreIntrinsicLowering.resolveTypeLayoutExpression(retSynTy, null, this)
+                                "= ${CoreIntrinsicLowering.renderZeroedLayoutReadExpression(layoutExpr, "$coreNs.intrinsics", this)}"
+                            }
+                            else -> "= $retDefault"
+                        }
                     out += "$fnTrivia$doc$indent$localSig $localBody"
                 } else {
                     val retType = extractReturnSynType(foreign.sig.output)

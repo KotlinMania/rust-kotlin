@@ -18,6 +18,7 @@ import io.github.kotlinmania.syn.Member
 import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.MetaParse
 import io.github.kotlinmania.syn.ModContent
+import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
 import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.ReceiverKind
@@ -208,7 +209,7 @@ internal fun KotlinJ2KEmitter.renderItemType(
     scopeSignatures: MutableMap<String, Int>,
     isLocalItem: Boolean = false,
 ): String {
-    if (isLocalItem || isExternalIdentityTypeReexportAlias(item, headerContext.selfCrateAliases)) {
+    if (isLocalItem || isExternalIdentityTypeReexportAlias(item, headerContext.selfCrateAliases, inspector.localInlineModuleNames)) {
         return ""
     }
     val name = rustTypeIdentToKotlin(item.ident.toString())
@@ -590,8 +591,10 @@ internal fun KotlinJ2KEmitter.renderFallbackDefaultForRenderedType(renderedType:
             usesU128 = true
             return "U128()"
         }
+        NumericKind.F16 -> return "F16()"
         NumericKind.F32 -> return "0.0f"
         NumericKind.F64 -> return "0.0"
+        NumericKind.F128 -> return "F128()"
         null -> {}
     }
     if ((clean.startsWith("Pair<") || clean.startsWith("kotlin.Pair<")) && clean.endsWith(">")) {
@@ -1156,7 +1159,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                 selfTypeName = selfTypeWithGenerics,
                 ownerGenerics = item.generics,
             )
-        superTraits.addAll(renderDistinctSuperTraits(effectiveAttachedImpls, selfTypeWithGenerics))
+        superTraits.addAll(renderDistinctSuperTraits(effectiveAttachedImpls, selfTypeWithGenerics, ownerIsPublic = (vis == "public ")))
         val iterElemTy = extractDirectIteratorItemRenderedType(effectiveAttachedImpls, "Iterator", selfTypeWithGenerics, requireOwnedSelf = false)
         val intoIterElemTy =
             if (iterElemTy == null) {
@@ -1354,6 +1357,17 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                 )
         }
     }
+    val transparentPtrField = liveField ?: fieldNameAndTypes.singleOrNull()
+    if (typeName == "NonNull" && transparentPtrField != null &&
+        transparentPtrField.second
+            .substringBefore('<')
+            .substringAfterLast('.')
+            .trim() in setOf("ConstPtr", "MutPtr")
+    ) {
+        val ptrFieldName = transparentPtrField.first
+        extraIterableMembers += "$indent    public val rawAddress: Long\n$indent        get() = $ptrFieldName.rawAddress"
+        extraIterableMembers += "$indent    public val rawMeta: Long\n$indent        get() = $ptrFieldName.rawMeta"
+    }
 
     val needsSwiftSafeStructCtor =
         liveField == null &&
@@ -1483,7 +1497,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
             else -> buildTupleStructAliasProperties(item.fields, selfTypeWithGenerics, "$indent    ")
         }
     val prevOverrideNames = currentStructOverrideMethodNames
-    currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits)
+    currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits, ownerIsPublic = (vis == "public "))
     val memberLines =
         try {
             renderAttachedImplMembers(
@@ -1578,12 +1592,17 @@ internal fun KotlinJ2KEmitter.extractIteratorSupertraitSpec(
 internal fun KotlinJ2KEmitter.collectLocalSupertraitMethodNames(
     superTraits: List<String>,
     includeReceiverlessMethods: Boolean = false,
+    ownerIsPublic: Boolean = true,
 ): Set<String> {
     val names = linkedSetOf<String>()
     val visitedTraits = hashSetOf<String>()
-    fun visitTraitByBaseName(baseName: String) {
+    fun visitTraitByBaseName(
+        baseName: String,
+        traitPath: Path? = null,
+    ) {
         if (!visitedTraits.add(baseName)) return
-        val traitDecl = lookupDeclaredTraitAst(baseName) ?: return
+        val traitDecl = lookupDeclaredTraitAst(baseName, traitPath) ?: return
+        if (ownerIsPublic && renderVisibility(traitDecl.vis) != "public ") return
         for (tItem in traitDecl.items) {
             if (traitItemHasDocOnlyCfg(tItem)) continue
             if (tItem is TraitItem.Fn &&
@@ -1606,7 +1625,7 @@ internal fun KotlinJ2KEmitter.collectLocalSupertraitMethodNames(
                     ?.ident
                     ?.toString()
                     ?.let(::rustTypeIdentToKotlin) ?: continue
-            visitTraitByBaseName(boundBase)
+            visitTraitByBaseName(boundBase, boundPath)
         }
     }
     for (st in superTraits) {
@@ -1648,6 +1667,7 @@ private fun KotlinJ2KEmitter.collectLocalTraitAndSupertraitFnRawNames(traitDecl:
 internal fun KotlinJ2KEmitter.renderDistinctSuperTraits(
     attachedImpls: List<Item.Impl>,
     selfTypeWithGenerics: String,
+    ownerIsPublic: Boolean = true,
 ): List<String> {
     val seenInterfaces = hashSetOf<String>()
     val result = mutableListOf<String>()
@@ -1671,7 +1691,14 @@ internal fun KotlinJ2KEmitter.renderDistinctSuperTraits(
             }
         val selfBase = selfTypeWithGenerics.substringBefore('<').trim()
         val baseIface = rendered.substringBefore('<').trim()
-        if (baseIface.isNotEmpty() && baseIface != selfBase && !rendered.contains("->") && seenInterfaces.add(baseIface)) {
+        if (baseIface.isNotEmpty() && baseIface != selfBase && !rendered.contains("->")) {
+            if (ownerIsPublic) {
+                val traitDecl = lookupDeclaredTraitAst(baseIface, path)
+                if (traitDecl != null && renderVisibility(traitDecl.vis) != "public ") {
+                    continue
+                }
+            }
+            if (!seenInterfaces.add(baseIface)) continue
             val assocNames = lookupTraitDefaultlessAssocTypes(baseIface, path)
             val fullRendered =
                 if (assocNames.isNotEmpty()) {
@@ -2213,7 +2240,7 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
     val superTraits: List<String>
     try {
         typeParams = renderTypeParameters(item.generics, selfTypeName = selfTypeWithGenerics)
-        superTraits = renderDistinctSuperTraits(attachedImpls, selfTypeWithGenerics)
+        superTraits = renderDistinctSuperTraits(attachedImpls, selfTypeWithGenerics, ownerIsPublic = (vis == "public "))
     } finally {
         activeTypeParamNames = prevEnumTypeParams
     }
@@ -2239,7 +2266,12 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
     }
     if (variants.isEmpty() && typeParams.isEmpty()) {
         val prevOverrideNames = currentStructOverrideMethodNames
-        currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits, includeReceiverlessMethods = true)
+        currentStructOverrideMethodNames =
+            collectLocalSupertraitMethodNames(
+                superTraits,
+                includeReceiverlessMethods = true,
+                ownerIsPublic = (vis == "public "),
+            )
         val attachedMembers =
             try {
                 renderAttachedImplMembers(
@@ -2360,7 +2392,7 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
     }
 
     val prevOverrideNames = currentStructOverrideMethodNames
-    currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits)
+    currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits, ownerIsPublic = (vis == "public "))
     val attachedMembers =
         try {
             renderAttachedImplMembers(selfTypeWithGenerics, item.generics, attachedImpls, "$indent    ", isLocalClass = isLocalItem)

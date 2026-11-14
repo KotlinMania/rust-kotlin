@@ -577,6 +577,9 @@ public object StructLayoutComputer {
         if (renderedFieldKt == "F16") {
             return FieldLayoutSpec(2L, 2L, "2L", "2L", "$primitiveLayoutsRef.F16_LAYOUT")
         }
+        if (renderedFieldKt == "F128") {
+            return FieldLayoutSpec(16L, 16L, "16L", "16L", "$primitiveLayoutsRef.F128_LAYOUT")
+        }
         val numKind = emitter.resolveNumericKind(renderedFieldKt) ?: return null
         if (numKind == NumericKind.I32 && rustLeafIdent == "isize") {
             val layoutConst = if (ptrBytes == 8L) "ISIZE64" else "ISIZE32"
@@ -593,10 +596,12 @@ public object StructLayoutComputer {
             NumericKind.U16 -> FieldLayoutSpec(2L, 2L, "2L", "2L", "$primitiveLayoutsRef.U16")
             NumericKind.I32 -> FieldLayoutSpec(4L, 4L, "4L", "4L", "$primitiveLayoutsRef.I32")
             NumericKind.U32 -> FieldLayoutSpec(4L, 4L, "4L", "4L", "$primitiveLayoutsRef.U32")
+            NumericKind.F16 -> FieldLayoutSpec(2L, 2L, "2L", "2L", "$primitiveLayoutsRef.F16_LAYOUT")
             NumericKind.F32 -> FieldLayoutSpec(4L, 4L, "4L", "4L", "$primitiveLayoutsRef.F32")
             NumericKind.I64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$primitiveLayoutsRef.I64")
             NumericKind.U64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$primitiveLayoutsRef.U64")
             NumericKind.F64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$primitiveLayoutsRef.F64")
+            NumericKind.F128 -> FieldLayoutSpec(16L, 16L, "16L", "16L", "$primitiveLayoutsRef.F128_LAYOUT")
             NumericKind.I128 -> {
                 emitter.usesI128 = true
                 FieldLayoutSpec(

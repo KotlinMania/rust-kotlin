@@ -51,6 +51,8 @@ public object CoreIntrinsicFfiArtifacts {
         return """
 package $coreNamespace.mem
 
+import $coreNamespace.F128
+import $coreNamespace.F16
 import $intrinsicsPkg.kmAlloc
 import $intrinsicsPkg.kmAtomicCxchgU128Pair
 import $intrinsicsPkg.kmAtomicCxchgU16
@@ -428,6 +430,23 @@ public object PrimitiveLayouts {
             override fun toBitsU64(value: Double): ULong = value.toRawBits().toULong()
             override fun fromBitsU64(bits: ULong): Double = Double.fromBits(bits.toLong())
         }
+
+    public val F16_LAYOUT: TypeLayout<F16> =
+        object : TypeLayout<F16> {
+            override val sizeBytes: Long = 2L
+            override val alignBytes: Long = 2L
+            override fun readNative(addr: Long): F16 = F16.fromBits(kmLoadU16(addr))
+            override fun writeNative(addr: Long, value: F16): Unit = kmStoreU16(addr, value.toBits())
+            override fun readBytes(buf: ByteArray, offset: Int): F16 = F16.fromBits(kmBytesLoadU16Le(buf, offset))
+            override fun writeBytes(buf: ByteArray, offset: Int, value: F16): Unit =
+                kmBytesStoreU16Le(buf, offset, value.toBits())
+            override fun readVolatileNative(addr: Long): F16 = F16.fromBits(kmVolatileLoadU16(addr))
+            override fun writeVolatileNative(addr: Long, value: F16): Unit = kmVolatileStoreU16(addr, value.toBits())
+            override fun toBitsU64(value: F16): ULong = value.toBits().toULong()
+            override fun fromBitsU64(bits: ULong): F16 = F16.fromBits(bits.toUShort())
+        }
+
+    public val F128_LAYOUT: TypeLayout<F128> = u128Layout(::F128, { it.high }, { it.low })
 
     public val ISIZE64: TypeLayout<Int> =
         object : TypeLayout<Int> {
@@ -5489,7 +5508,7 @@ public actual fun kmSimdDotF32(aAddr: Long, bAddr: Long, len: Long): Float =
       ],
       "cflags!": [ "-fno-exceptions" ],
       "cflags_cc!": [ "-fno-exceptions" ],
-      "defines": [ "NAPI_DISABLE_CPP_EXCEPTIONS", "KM_NAPI_STANDALONE_MODULE" ],
+      "defines": [ "NAPI_DISABLE_CPP_EXCEPTIONS" ],
       "xcode_settings": {
         "GCC_ENABLE_CPP_EXCEPTIONS": "YES",
         "CLANG_CXX_LIBRARY": "libc++",

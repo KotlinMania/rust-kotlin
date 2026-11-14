@@ -293,6 +293,8 @@ internal fun defaultInitializerForType(kotlinType: String): String =
         "Unit" -> "Unit"
         "I128" -> "I128()"
         "U128" -> "U128()"
+        "F16" -> "F16()"
+        "F128" -> "F128()"
         "ByteArray" -> "ByteArray(0)"
         "UByteArray" -> "UByteArray(0)"
         "ShortArray" -> "ShortArray(0)"

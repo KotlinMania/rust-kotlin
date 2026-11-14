@@ -2,7 +2,9 @@ package io.github.kotlinmania.rustkotlin
 
 import kotlin.test.Test
 import kotlin.test.assertContains
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.TimeSource
 
@@ -237,5 +239,181 @@ class CoreIntrinsicLoweringTest {
         assertContains(kt, "check(a < b == c > d)")
         assertContains(kt, "check(onlyOne)")
         assertContains(kt, "panicsAndAsserts")
+    }
+
+    @Test
+    fun f16F128SynthesisLayoutsAndProjectFfiNameUnificationWork() {
+        val rustSource =
+            """
+            pub fn float_ext(x: f16, y: f128) -> (u16, u128, f16, f128) {
+                let a = 1.5f16;
+                let b = 2.5f128;
+                let c = f16::from_bits(x.to_bits());
+                let inf = f16::INFINITY;
+                let eps = f128::EPSILON;
+                let _ = a + inf;
+                let _ = b + eps;
+                (c.to_bits(), y.to_bits(), c, y)
+            }
+            """.trimIndent()
+        val coreNs = "io.github.kotlinmania.rustlang.core"
+        val header =
+            FileHeaderContext(
+                packageName = "$coreNs.num.flt2dec",
+                projectGroup = "io.github.kotlinmania",
+                projectNamespace = coreNs,
+                crateNamespaces = mapOf("core" to coreNs),
+                isBatchCrateOutput = true,
+            )
+        val kt = renderSingleKotlinFile(rustSource, header).text
+        assertContains(kt, "F16.fromFloat(1.5f)")
+        assertContains(kt, "F128.fromDouble(2.5)")
+        assertContains(kt, "F16.fromBits(")
+        assertContains(kt, "F16.INFINITY")
+        assertContains(kt, "F128.EPSILON")
+
+        val floatSupport = renderSynthesizedFloatSupportFile(coreNs)
+        assertContains(floatSupport, "class F16")
+        assertContains(floatSupport, "class F128")
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(floatSupport, "FloatSupport.kt")
+
+        val typeLayout = CoreIntrinsicFfiArtifacts.renderTypeLayoutSupportKotlin(coreNs)
+        assertContains(typeLayout, "import $coreNs.F16")
+        assertContains(typeLayout, "import $coreNs.F128")
+        assertContains(typeLayout, "F16_LAYOUT")
+        assertContains(typeLayout, "F128_LAYOUT")
+
+        val bindingGyp = CoreIntrinsicFfiArtifacts.renderKmCoreBindingGyp("kmcore")
+        assertFalse(bindingGyp.contains("KM_NAPI_STANDALONE_MODULE"))
+
+        val props =
+            parseGradleProperties(
+                """
+                project.group=io.github.kotlinmania
+                project.namespace=io.github.kotlinmania.rustlang
+                project.ffi.name=kmcore
+                """.trimIndent(),
+            )
+        assertEquals("kmcore", props.projectFfiName)
+
+        val ffiSource =
+            """
+            extern "C" {
+                pub fn custom_km_probe(v: i32) -> i32;
+            }
+            """.trimIndent()
+        val ffiTranslated =
+            renderSingleKotlinFile(
+                ffiSource,
+                FileHeaderContext(
+                    packageName = "io.github.kotlinmania.rustlang.std.sys",
+                    projectGroup = "io.github.kotlinmania",
+                    projectNamespace = "io.github.kotlinmania.rustlang.std",
+                    crateNamespaces = mapOf("core" to coreNs),
+                    projectFfiName = "kmcore",
+                    isBatchCrateOutput = true,
+                ),
+            )
+        assertTrue(ffiTranslated.companionFiles.isNotEmpty())
+        assertTrue(
+            ffiTranslated.companionFiles.all { it.ffiModuleName == "kmcore" },
+            "Expected ffiModuleName=kmcore across companion artifacts, got ${ffiTranslated.companionFiles.map { it.relativePath to it.ffiModuleName }}",
+        )
+        assertTrue(
+            ffiTranslated.companionFiles.any { it.relativePath.endsWith("AndroidActuals.kt") && it.content.contains("\"kmcore_jni\"") },
+            "Expected Android actuals to load kmcore_jni",
+        )
+    }
+
+    @Test
+    fun stdlibTransliterationRewritesAsmSimdDefinitionModsNonNullDropAndLibcFallback() {
+        val coreNs = "io.github.kotlinmania.rustlang.core"
+        val coreArchNs = "io.github.kotlinmania.rustlang.corearch"
+
+        val archHeader =
+            FileHeaderContext(
+                packageName = "$coreArchNs.x86",
+                projectGroup = "io.github.kotlinmania",
+                projectNamespace = coreArchNs,
+                crateNamespaces = mapOf("core" to coreNs, "core_arch" to coreArchNs),
+                rootSelfDirModuleAliases = setOf("core_arch"),
+                rootExternalModuleReexports = mapOf("arch" to "core_arch"),
+                isBatchCrateOutput = true,
+            )
+        val archSource =
+            """
+            use crate::core_arch::simd::Foo;
+            use crate::arch::arm::Bar;
+
+            pub unsafe fn pause_cpu(f: Foo, b: Bar) {
+                core::arch::asm!("nop");
+                core::mem::drop(f);
+                core::mem::drop(b);
+            }
+            """.trimIndent()
+        val archKt = renderSingleKotlinFile(archSource, archHeader).text
+        assertContains(archKt, "import $coreArchNs.simd.Foo")
+        assertContains(archKt, "import $coreArchNs.arm.Bar")
+        assertFalse(archKt.contains("$coreArchNs.core_arch"))
+        assertFalse(archKt.contains("$coreArchNs.arch."))
+        assertContains(archKt, "Unit")
+        assertFalse(archKt.contains("asm("))
+        assertContains(archKt, "(f).let { }")
+        assertContains(archKt, "(b).let { }")
+
+        val coreHeader =
+            FileHeaderContext(
+                packageName = "$coreNs.ffi",
+                projectGroup = "io.github.kotlinmania",
+                projectNamespace = coreNs,
+                crateNamespaces = mapOf("core" to coreNs),
+                isBatchCrateOutput = true,
+            )
+        val coreSource =
+            """
+            pub type c_char = c_char_definition::c_char;
+
+            mod c_char_definition {
+                pub(super) type c_char = i8;
+            }
+
+            #[repr(transparent)]
+            pub struct NonNull<T> {
+                pointer: *const T,
+            }
+
+            pub unsafe fn simd_helpers<T>(a: T, b: T) -> T {
+                let sum = core::intrinsics::simd::simd_add(a, b);
+                let mask = core::intrinsics::simd::simd_eq::<T, u32>(sum, a);
+                core::intrinsics::simd::simd_select(mask, sum, b)
+            }
+            """.trimIndent()
+        val coreKt = renderSingleKotlinFile(coreSource, coreHeader).text
+        assertContains(coreKt, "public typealias CChar = Byte")
+        assertFalse(coreKt.contains("cCharDefinition"))
+        assertFalse(coreKt.contains("c_char_definition"))
+        assertContains(coreKt, "public val rawAddress: Long")
+        assertContains(coreKt, "public val rawMeta: Long")
+        assertFalse(coreKt.contains("core.intrinsics.simd"))
+
+        val headerWithoutLibc =
+            FileHeaderContext(
+                packageName = "io.github.kotlinmania.rustlang.std.sys",
+                projectGroup = "io.github.kotlinmania",
+                projectNamespace = "io.github.kotlinmania.rustlang.std",
+                crateNamespaces = mapOf("core" to coreNs),
+                isBatchCrateOutput = true,
+            )
+        assertNull(FfiInteropCollector.resolveLibcNamespace(headerWithoutLibc))
+
+        val libcFallbackSource =
+            """
+            use libc::c_void;
+            pub type Sz = libc::size_t;
+            pub fn noop(_p: *const c_void) {}
+            """.trimIndent()
+        val libcFallbackKt = renderSingleKotlinFile(libcFallbackSource, headerWithoutLibc).text
+        assertFalse(libcFallbackKt.contains("import io.github.kotlinmania.libc"))
+        assertFalse(libcFallbackKt.contains("import io.github.kotlinmania.rustlang.libc"))
     }
 }

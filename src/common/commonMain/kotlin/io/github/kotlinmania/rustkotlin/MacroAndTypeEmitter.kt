@@ -240,6 +240,7 @@ internal fun KotlinJ2KEmitter.renderMacroInvocationAsStmtOrExpr(
             val callee = rustFunctionIdentToKotlin(macroName)
             "$callee($place)"
         }
+        "asm", "naked_asm", "global_asm" -> "Unit"
         else -> {
             val macSegs = mac.path.segments.toList()
             val segStrings = macSegs.map { it.ident.toString() }
@@ -260,6 +261,9 @@ internal fun KotlinJ2KEmitter.renderMacroInvocationAsStmtOrExpr(
                     }
                 } else if (macroName.removePrefix("r#") !in inspector.declaredTopLevelFnRawNames &&
                     fnName !in KOTLIN_STDLIB_SHADOWED_IMPORTS &&
+                    !(fnName.length == 1 && fnName[0] in 'A'..'Z') &&
+                    fnName !in inspector.enumVariantSimpleNames &&
+                    fnName !in inspector.importedEnumVariantSimpleNames &&
                     scopeBuilder.resolveLocalKotlinName(macroName.removePrefix("r#")) == null &&
                     headerContext.crateSymbolSubpackages.isNotEmpty()
                 ) {
@@ -875,8 +879,10 @@ internal fun KotlinJ2KEmitter.renderCastExpression(
                 usesU128 = true
                 "U128"
             }
+            NumericKind.F16 -> "F16"
             NumericKind.F32 -> kotlinF32TypeName()
             NumericKind.F64 -> "Double"
+            NumericKind.F128 -> "F128"
             null -> if (targetType == "Char" || targetType == "RustChar") targetType else null
         }
     val sourceInferredForNum = inferExprRenderedType(sourceExpr, selfTypeName)
@@ -1099,12 +1105,16 @@ internal fun KotlinJ2KEmitter.isAlreadyRenderedAsNumericKind(rendered: String, k
             NumericKind.U32 -> ".toUInt()"
             NumericKind.I64 -> ".toLong()"
             NumericKind.U64 -> ".toULong()"
+            NumericKind.F16 -> ".toF16()"
             NumericKind.F32 -> ".toFloat()"
             NumericKind.F64 -> ".toDouble()"
+            NumericKind.F128 -> ".toF128()"
             NumericKind.I128 -> ".toI128()"
             NumericKind.U128 -> ".toU128()"
         }
     if (s.endsWith(expectedSuffix)) return true
+    if (kind == NumericKind.F16 && (s.startsWith("F16.") || s == "F16()")) return true
+    if (kind == NumericKind.F128 && (s.startsWith("F128.") || s == "F128()")) return true
     if (s.endsWith(".code") && kind == NumericKind.I32) return true
     if (s.endsWith(".size") && kind == NumericKind.I32) return true
     if (s.endsWith(".hashCode()") && kind == NumericKind.I32) return true
@@ -1174,7 +1184,7 @@ internal fun KotlinJ2KEmitter.convertNumericReceiver(
                 NumericKind.I32 -> "U128.fromInt($recv)"
                 NumericKind.I16 -> "U128.fromShort($recv)"
                 NumericKind.I8 -> "U128.fromByte($recv)"
-                NumericKind.F32, NumericKind.F64 -> "U128.fromULong($recv.toULong())"
+                NumericKind.F16, NumericKind.F32, NumericKind.F64, NumericKind.F128 -> "U128.fromULong($recv.toULong())"
                 null ->
                     when {
                         recv.endsWith("uL") -> "U128.fromULong($recv)"
@@ -1194,7 +1204,7 @@ internal fun KotlinJ2KEmitter.convertNumericReceiver(
                 NumericKind.U32 -> "I128.fromUInt($recv)"
                 NumericKind.U16 -> "I128.fromUShort($recv)"
                 NumericKind.U8 -> "I128.fromUByte($recv)"
-                NumericKind.F32, NumericKind.F64 -> "I128.fromLong($recv.toLong())"
+                NumericKind.F16, NumericKind.F32, NumericKind.F64, NumericKind.F128 -> "I128.fromLong($recv.toLong())"
                 null ->
                     when {
                         recv.endsWith("uL") -> "I128.fromULong($recv)"
@@ -1204,6 +1214,37 @@ internal fun KotlinJ2KEmitter.convertNumericReceiver(
             }
         "Float", "kotlin.Float" -> "$recv.toFloat()"
         "Double" -> "$recv.toDouble()"
+        "F16" ->
+            when (sourceKind) {
+                NumericKind.F16 -> recv
+                NumericKind.F32 -> "F16.fromFloat($recv)"
+                NumericKind.F64 -> "F16.fromDouble($recv)"
+                NumericKind.I8 -> "F16.fromByte($recv)"
+                NumericKind.I16 -> "F16.fromShort($recv)"
+                NumericKind.I32 -> "F16.fromInt($recv)"
+                NumericKind.I64 -> "F16.fromLong($recv)"
+                NumericKind.U8 -> "F16.fromUByte($recv)"
+                NumericKind.U16 -> "F16.fromUShort($recv)"
+                NumericKind.U32 -> "F16.fromUInt($recv)"
+                NumericKind.U64 -> "F16.fromULong($recv)"
+                else -> "F16.fromDouble($recv.toDouble())"
+            }
+        "F128" ->
+            when (sourceKind) {
+                NumericKind.F128 -> recv
+                NumericKind.F16 -> "F128.fromF16($recv)"
+                NumericKind.F32 -> "F128.fromFloat($recv)"
+                NumericKind.F64 -> "F128.fromDouble($recv)"
+                NumericKind.I8 -> "F128.fromByte($recv)"
+                NumericKind.I16 -> "F128.fromShort($recv)"
+                NumericKind.I32 -> "F128.fromInt($recv)"
+                NumericKind.I64 -> "F128.fromLong($recv)"
+                NumericKind.U8 -> "F128.fromUByte($recv)"
+                NumericKind.U16 -> "F128.fromUShort($recv)"
+                NumericKind.U32 -> "F128.fromUInt($recv)"
+                NumericKind.U64 -> "F128.fromULong($recv)"
+                else -> "F128.fromDouble($recv.toDouble())"
+            }
         "Char" -> "$recv.toInt().toChar()"
         "RustChar" -> {
             usesRustChar = true
@@ -1467,8 +1508,10 @@ internal fun KotlinJ2KEmitter.renderIntLiteral(digits: String, suffix: String): 
                 }
             NumericKind.I64 ->
                 if (low64 != null && low64 >= 0x8000000000000000uL) "${clean}uL.toLong()" else "${clean}L"
+            NumericKind.F16 -> if (clean.all { it.isDigit() }) "F16.fromFloat($clean.0f)" else "F16.fromDouble(($clean).toDouble())"
             NumericKind.F32 -> "$clean.0f"
             NumericKind.F64 -> "$clean.0"
+            NumericKind.F128 -> if (clean.all { it.isDigit() }) "F128.fromDouble($clean.0)" else "F128.fromDouble(($clean).toDouble())"
             else ->
                 if (low64 != null && low64 >= 0x8000000000000000uL) "${clean}uL" else clean
         }
@@ -1502,8 +1545,10 @@ internal fun KotlinJ2KEmitter.renderIntLiteral(digits: String, suffix: String): 
                 clean
             }
         "i64" -> if (low64 != null && low64 >= 0x8000000000000000uL) "${clean}uL.toLong()" else "${clean}L"
+        "f16" -> if (clean.all { it.isDigit() }) "F16.fromFloat($clean.0f)" else "F16.fromDouble(($clean).toDouble())"
         "f32" -> "$clean.0f"
         "f64" -> "$clean.0"
+        "f128" -> if (clean.all { it.isDigit() }) "F128.fromDouble($clean.0)" else "F128.fromDouble(($clean).toDouble())"
         else -> clean
     }
 }
@@ -1512,6 +1557,8 @@ internal fun KotlinJ2KEmitter.renderFloatLiteral(digits: String, suffix: String)
     val clean = digits.replace("_", "")
     val normalized = if (clean.endsWith('.')) "${clean}0" else clean
     return when {
+        suffix == "f16" || (suffix.isEmpty() && currentExpectedNumericKind == NumericKind.F16) -> "F16.fromFloat(${normalized}f)"
+        suffix == "f128" || (suffix.isEmpty() && currentExpectedNumericKind == NumericKind.F128) -> "F128.fromDouble($normalized)"
         suffix == "f32" || (suffix.isEmpty() && currentExpectedNumericKind == NumericKind.F32) -> "${normalized}f"
         else -> normalized
     }
@@ -1688,6 +1735,8 @@ internal fun KotlinJ2KEmitter.renderPrimitiveAssociatedConst(
                 when (selfBase) {
                     "Float", "kotlin.Float" -> "f32"
                     "Double" -> "f64"
+                    "F16" -> "f16"
+                    "F128" -> "f128"
                     "Byte" -> "i8"
                     "UByte" -> "u8"
                     "Short" -> "i16"
@@ -1714,7 +1763,7 @@ internal fun KotlinJ2KEmitter.renderPrimitiveAssociatedConst(
                 val segs = leaf.segments.map { it.removePrefix("r#") }
                 if (segs.size == 4 &&
                     segs[0] in setOf("core", "std") &&
-                    segs[1] in setOf("f32", "f64") &&
+                    segs[1] in setOf("f16", "f32", "f64", "f128") &&
                     segs[2] == "consts" &&
                     segs[3] == "*"
                 ) {
@@ -1783,6 +1832,16 @@ internal fun KotlinJ2KEmitter.renderPrimitiveAssociatedConst(
                 "MAX_EXP" -> "1024"
                 "MIN_10_EXP" -> "(-307)"
                 "MAX_10_EXP" -> "308"
+                else -> null
+            }
+        }
+        if (prim == "f16" || prim == "f128") {
+            val owner = if (prim == "f16") "F16" else "F128"
+            return when (c) {
+                "MIN", "MAX", "MIN_POSITIVE", "EPSILON", "INFINITY", "NEG_INFINITY", "NAN",
+                "ZERO", "ONE", "NEG_ZERO", "RADIX", "MANTISSA_DIGITS", "DIGITS",
+                "MIN_EXP", "MAX_EXP", "MIN_10_EXP", "MAX_10_EXP", "BITS",
+                -> "$owner.$c"
                 else -> null
             }
         }
@@ -1871,6 +1930,58 @@ internal fun KotlinJ2KEmitter.renderPrimitiveAssociatedConst(
                 "LN_10" -> "2.302585092994046"
                 else -> null
             }
+        }
+        if (norm[0] == "f16") {
+            val f32Lit =
+                when (c) {
+                    "PI" -> "3.1415927f"
+                    "TAU" -> "6.2831855f"
+                    "FRAC_PI_2" -> "1.5707964f"
+                    "FRAC_PI_3" -> "1.0471976f"
+                    "FRAC_PI_4" -> "0.7853982f"
+                    "FRAC_PI_6" -> "0.5235988f"
+                    "FRAC_PI_8" -> "0.3926991f"
+                    "FRAC_1_PI" -> "0.31830987f"
+                    "FRAC_2_PI" -> "0.63661975f"
+                    "FRAC_2_SQRT_PI" -> "1.1283792f"
+                    "SQRT_2" -> "1.4142135f"
+                    "FRAC_1_SQRT_2" -> "0.70710677f"
+                    "E" -> "2.7182817f"
+                    "LOG2_E" -> "1.442695f"
+                    "LOG2_10" -> "3.321928f"
+                    "LOG10_E" -> "0.4342945f"
+                    "LOG10_2" -> "0.30103f"
+                    "LN_2" -> "0.6931472f"
+                    "LN_10" -> "2.3025851f"
+                    else -> null
+                }
+            if (f32Lit != null) return "F16.fromFloat($f32Lit)"
+        }
+        if (norm[0] == "f128") {
+            val f64Lit =
+                when (c) {
+                    "PI" -> "kotlin.math.PI"
+                    "TAU" -> "6.283185307179586"
+                    "FRAC_PI_2" -> "1.5707963267948966"
+                    "FRAC_PI_3" -> "1.0471975511965979"
+                    "FRAC_PI_4" -> "0.7853981633974483"
+                    "FRAC_PI_6" -> "0.5235987755982989"
+                    "FRAC_PI_8" -> "0.39269908169872414"
+                    "FRAC_1_PI" -> "0.3183098861837907"
+                    "FRAC_2_PI" -> "0.6366197723675814"
+                    "FRAC_2_SQRT_PI" -> "1.1283791670955126"
+                    "SQRT_2" -> "1.4142135623730951"
+                    "FRAC_1_SQRT_2" -> "0.7071067811865476"
+                    "E" -> "kotlin.math.E"
+                    "LOG2_E" -> "1.4426950408889634"
+                    "LOG2_10" -> "3.321928094887362"
+                    "LOG10_E" -> "0.4342944819032518"
+                    "LOG10_2" -> "0.3010299956639812"
+                    "LN_2" -> "0.6931471805599453"
+                    "LN_10" -> "2.302585092994046"
+                    else -> null
+                }
+            if (f64Lit != null) return "F128.fromDouble($f64Lit)"
         }
     }
     return null
@@ -2001,24 +2112,30 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
             }
             return "$firstKtType.${secondRaw}_VALUE"
         }
-        if (filtered[1].arguments is PathArguments.None && (firstRaw == "u128" || firstRaw == "i128")) {
-            val owner128 =
-                if (firstRaw == "u128") {
-                    usesU128 = true
-                    "U128"
-                } else {
-                    usesI128 = true
-                    "I128"
+        if (filtered[1].arguments is PathArguments.None && (firstRaw == "u128" || firstRaw == "i128" || firstRaw == "f16" || firstRaw == "f128")) {
+            val ownerPrim =
+                when (firstRaw) {
+                    "u128" -> {
+                        usesU128 = true
+                        "U128"
+                    }
+                    "i128" -> {
+                        usesI128 = true
+                        "I128"
+                    }
+                    "f16" -> "F16"
+                    else -> "F128"
                 }
+            val bitsCount = if (firstRaw == "f16") "16u" else "128u"
             when (cleanSecond) {
-                "from_be_bytes" -> return if (asCallee) "$owner128.fromBeBytes" else "$owner128::fromBeBytes"
-                "from_le_bytes" -> return if (asCallee) "$owner128.fromLeBytes" else "$owner128::fromLeBytes"
+                "from_be_bytes" -> return if (asCallee) "$ownerPrim.fromBeBytes" else "$ownerPrim::fromBeBytes"
+                "from_le_bytes" -> return if (asCallee) "$ownerPrim.fromLeBytes" else "$ownerPrim::fromLeBytes"
                 "from_ne_bytes" -> {
                     val fn = if (activeCfgProfile.targetEndian == "big") "fromBeBytes" else "fromLeBytes"
-                    return if (asCallee) "$owner128.$fn" else "$owner128::$fn"
+                    return if (asCallee) "$ownerPrim.$fn" else "$ownerPrim::$fn"
                 }
-                "ZERO" -> return "$owner128.ZERO"
-                "BITS" -> return "128u"
+                "ZERO" -> return "$ownerPrim.ZERO"
+                "BITS" -> return bitsCount
             }
         }
         currentTypeParamWitnessCalls[rustTypeIdentToKotlin(firstRaw) to cleanSecond]?.let { return it }
@@ -2348,7 +2465,7 @@ internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): St
                     NumericKind.U64 -> "ULongArray"
                     NumericKind.F32 -> "FloatArray"
                     NumericKind.F64 -> "DoubleArray"
-                    NumericKind.I128, NumericKind.U128, null -> {
+                    NumericKind.I128, NumericKind.U128, NumericKind.F16, NumericKind.F128, null -> {
                         val nonNullElem =
                             when {
                                 elemRendered.endsWith("?") ->
@@ -2511,11 +2628,19 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
         return "Any"
     }
     if (!headerContext.rawAbiMode && lastSeg.arguments is PathArguments.None) {
-        val rawSegNames = rawSegments.map { it.ident.toString().removePrefix("r#") }
+        val rawSegNames =
+            rewriteCrateRootAliasAndReexportSegments(
+                rawSegments.map { it.ident.toString().removePrefix("r#") },
+            )
         val symLeaf = rawSegNames.last()
+        val isSelfContainedLibcFfi =
+            rawSegNames.size == 2 &&
+                rawSegNames[0] == "libc" &&
+                FfiInteropCollector.resolveLibcNamespace(headerContext) == null
         val isStdlibFfiModule =
             (rawSegNames.size == 3 && rawSegNames[0] in setOf("core", "std") && rawSegNames[1] == "ffi") ||
                 (rawSegNames.size == 4 && rawSegNames[0] == "std" && rawSegNames[1] == "os" && rawSegNames[2] == "raw") ||
+                isSelfContainedLibcFfi ||
                 (
                     rawSegNames.size == 2 && rawSegNames[0] in setOf("ffi", "raw") &&
                         run {
@@ -2528,18 +2653,27 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                 rawSegNames[0] == "alloc" &&
                 rawSegNames[1] == "ffi" &&
                 symLeaf == "CString"
+        if (isSelfContainedLibcFfi && symLeaf !in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS) {
+            val ptr64 = activeCfgProfile.pointerWidth != 32
+            when (symLeaf) {
+                "size_t", "usize", "uintptr_t" -> return if (ptr64) "ULong" else "UInt"
+                "ssize_t", "isize", "intptr_t", "ptrdiff_t" -> return if (ptr64) "Long" else "Int"
+                "int8_t" -> return "Byte"
+                "uint8_t" -> return "UByte"
+                "int16_t" -> return "Short"
+                "uint16_t" -> return "UShort"
+                "int32_t", "pid_t", "clockid_t", "wchar_t" -> return "Int"
+                "uint32_t", "uid_t", "gid_t", "socklen_t", "useconds_t", "mode_t" -> return "UInt"
+                "int64_t", "off_t", "time_t", "suseconds_t" -> return "Long"
+                "uint64_t", "dev_t", "ino_t", "rlim_t" -> return "ULong"
+            }
+        }
         val resolvedFfiImport =
             when {
                 isAllocFfiCString || (isStdlibFfiModule && symLeaf == "CString") ->
-                    if ("CString" !in inspector.declaredTypeNames) {
-                        "${CoreIntrinsicLowering.resolveAllocNamespace(headerContext)}.ffi.CString"
-                    } else {
-                        null
-                    }
-                isStdlibFfiModule ->
-                    CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS[symLeaf]
-                        ?.takeIf { it !in inspector.declaredTypeNames }
-                        ?.let { ktSym -> "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.ffi.$ktSym" }
+                    resolveStdlibFfiSymbolImport("CString", isAllocCString = true)
+                isStdlibFfiModule && symLeaf in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS ->
+                    resolveStdlibFfiSymbolImport(symLeaf)
                 else -> null
             }
         if (resolvedFfiImport != null) {
@@ -2768,7 +2902,9 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
     if (isPrimitivePrefix && lastSeg.arguments is PathArguments.None) {
         if (rawName == "u128") usesU128 = true
         if (rawName == "i128") usesI128 = true
+        if (rawName == "f16") return "F16"
         if (rawName == "f32") return kotlinF32TypeName()
+        if (rawName == "f128") return "F128"
         if (rawName == "char" && headerContext.scalarChar && "Char" !in inspector.declaredTypeNames) {
             usesRustChar = true
             return "RustChar"
@@ -2779,8 +2915,9 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
             "CVoid" !in importedSimpleNameToPkg &&
             resolveBestSubpackageForSymbol("CVoid") == null
         ) {
-            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ffi.CVoid")
+            resolveStdlibFfiSymbolImport("c_void")?.let {
+                CoreIntrinsicLowering.registerCoreImport(this, it)
+            }
         }
     }
     val ktBaseIdent = rustTypeIdentToKotlin(rawName)
@@ -2791,6 +2928,9 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
         isPrimitivePrefix &&
         ktBaseIdent !in inspector.declaredTypeNames &&
         ktBaseIdent !in activeTypeParamNames &&
+        !(ktBaseIdent.length == 1 && ktBaseIdent[0] in 'A'..'Z') &&
+        ktBaseIdent !in inspector.enumVariantSimpleNames &&
+        ktBaseIdent !in inspector.importedEnumVariantSimpleNames &&
         (ktBaseIdent !in KOTLIN_STDLIB_SHADOWED_IMPORTS || rawName == "Float") &&
         headerContext.crateSymbolSubpackages.isNotEmpty()
     ) {
@@ -3177,7 +3317,7 @@ internal fun KotlinJ2KEmitter.renderTypeParamBound(bound: TypeParamBound, selfTy
 internal fun KotlinJ2KEmitter.renderVisibility(vis: Visibility): String =
     when (vis) {
         is Visibility.Public -> "public "
-        is Visibility.Restricted -> "internal "
+        is Visibility.Restricted -> if (headerContext.isBatchCrateOutput) "public " else "internal "
         is Visibility.Inherited -> "public "
     }
 
@@ -3366,6 +3506,8 @@ internal fun KotlinJ2KEmitter.resolveNumericKind(kotlinType: String, depth: Int 
         "kotlin.Float" -> return NumericKind.F32
         "Float" -> return if (isKotlinFloatShadowed()) null else NumericKind.F32
         "Double" -> return NumericKind.F64
+        "F16" -> return NumericKind.F16
+        "F128" -> return NumericKind.F128
     }
     val ptrWidth = activeCfgProfile.pointerWidth
     val isWindows =
@@ -3442,7 +3584,7 @@ internal fun KotlinJ2KEmitter.resolveNumericKind(kotlinType: String, depth: Int 
     }
     if (simpleBase in inspector.declaredTypeNames &&
         simpleBase !in inspector.typeAliasTargets &&
-        simpleBase !in setOf("U128", "I128")
+        simpleBase !in setOf("U128", "I128", "F16", "F128")
     ) {
         return null
     }
@@ -3466,7 +3608,7 @@ internal fun KotlinJ2KEmitter.resolveNumericKind(kotlinType: String, depth: Int 
             key in headerContext.crateOptionFnTypes ||
             (
                 scopedDef != null &&
-                    scopedDef !in setOf("I128()", "U128()") &&
+                    scopedDef !in setOf("I128()", "U128()", "F16()", "F128()") &&
                     (scopedDef.endsWith("()") || scopedDef.endsWith("(0)") || scopedDef == "emptyList()" || (!headerContext.rawAbiMode && scopedDef == "null"))
             )
         ) {
@@ -3481,7 +3623,7 @@ internal fun KotlinJ2KEmitter.resolveNumericKind(kotlinType: String, depth: Int 
                 key in headerContext.crateOptionFnTypes ||
                 (
                     scopedDef != null &&
-                        scopedDef !in setOf("I128()", "U128()") &&
+                        scopedDef !in setOf("I128()", "U128()", "F16()", "F128()") &&
                         (scopedDef.endsWith("()") || scopedDef.endsWith("(0)") || scopedDef == "emptyList()" || (!headerContext.rawAbiMode && scopedDef == "null"))
                 )
             ) {
@@ -3551,8 +3693,10 @@ internal fun KotlinJ2KEmitter.renderTypedNumericInitializer(
             NumericKind.I16 -> if (rendered.endsWith(".toShort()")) rendered else "$recv.toShort()"
             NumericKind.I32 -> if (rendered.endsWith(".toInt()")) rendered else "$recv.toInt()"
             NumericKind.I64 -> if (rendered.endsWith(".toLong()")) rendered else "$recv.toLong()"
+            NumericKind.F16 -> convertNumericReceiver(recv, "F16", inferred)
             NumericKind.F32 -> if (rendered.endsWith(".toFloat()")) rendered else "$recv.toFloat()"
             NumericKind.F64 -> if (rendered.endsWith(".toDouble()")) rendered else "$recv.toDouble()"
+            NumericKind.F128 -> convertNumericReceiver(recv, "F128", inferred)
             else -> rendered
         }
     }
