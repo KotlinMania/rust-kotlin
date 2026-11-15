@@ -165,7 +165,7 @@ public object StructLayoutComputer {
         emitter: KotlinJ2KEmitter,
         visiting: Set<String> = emptySet(),
     ): ComputedStructLayout? {
-        val structKtName = rustTypeIdentToKotlin(item.ident.toString())
+        val structKtName = emitter.effectiveStructKotlinName(rustTypeIdentToKotlin(item.ident.toString()))
         if (structKtName in visiting) return null
         if (emitter.computedStructLayoutCache.containsKey(structKtName)) {
             return emitter.computedStructLayoutCache[structKtName]
@@ -221,7 +221,9 @@ public object StructLayoutComputer {
             }
 
         val prevStructTypeParams = emitter.activeTypeParamNames
+        val prevStructConstParams = emitter.activeConstParamNames
         emitter.activeTypeParamNames = prevStructTypeParams + emitter.collectGenericTypeParamNames(item.generics)
+        emitter.activeConstParamNames = prevStructConstParams + emitter.collectGenericConstParamNames(item.generics)
         return try {
             if (emitter.sourceTransparentField(item, selfWithGenerics) != null) {
                 return null
@@ -407,21 +409,72 @@ public object StructLayoutComputer {
                 usedTypeParams.map { paramKt ->
                     TypeLayoutParamSpec(typeLayoutParamName(paramKt), "$typeLayoutRef<$paramKt>")
                 }
+            val constGenericSpecs =
+                item.generics.params
+                    .toList()
+                    .filterIsInstance<GenericParam.ConstParam>()
+                    .map { cp ->
+                        val raw = cp.ident.toString().removePrefix("r#")
+                        raw to rustValueIdentToKotlin(cp.ident.toString())
+                    }
+            var adjustedSizeExpr = finalSizeExpr
+            var adjustedAlignExpr = finalAlignExpr
+            var adjustedHelperOffsetDecls = helperOffsetDecls.toList()
+            var adjustedComputedFields = computedFields.toList()
+            val constLayoutParams = mutableListOf<TypeLayoutParamSpec>()
+            val existingParamNames = usedTypeParams.mapTo(hashSetOf()) { typeLayoutParamName(it) }
+            if (constGenericSpecs.isNotEmpty()) {
+                val allLayoutExprs =
+                    buildList {
+                        add(adjustedSizeExpr)
+                        add(adjustedAlignExpr)
+                        adjustedHelperOffsetDecls.forEach { add(it.helperInitExpr) }
+                        adjustedComputedFields.forEach {
+                            add(it.offsetExpr)
+                            add(it.layoutExpr)
+                        }
+                    }
+                for ((raw, ktParam) in constGenericSpecs) {
+                    val detectRegex = Regex("(?<!\\.)\\b(?:${Regex.escape(raw)}|${Regex.escape(ktParam)})\\b")
+                    if (allLayoutExprs.any { detectRegex.containsMatchIn(it) }) {
+                        if (raw != ktParam) {
+                            val rewriteRegex = Regex("(?<!\\.)\\b${Regex.escape(raw)}\\b")
+                            adjustedSizeExpr = rewriteRegex.replace(adjustedSizeExpr, ktParam)
+                            adjustedAlignExpr = rewriteRegex.replace(adjustedAlignExpr, ktParam)
+                            adjustedHelperOffsetDecls =
+                                adjustedHelperOffsetDecls.map { decl ->
+                                    decl.copy(helperInitExpr = rewriteRegex.replace(decl.helperInitExpr, ktParam))
+                                }
+                            adjustedComputedFields =
+                                adjustedComputedFields.map { field ->
+                                    field.copy(
+                                        offsetExpr = rewriteRegex.replace(field.offsetExpr, ktParam),
+                                        layoutExpr = rewriteRegex.replace(field.layoutExpr, ktParam),
+                                    )
+                                }
+                        }
+                        if (existingParamNames.add(ktParam)) {
+                            constLayoutParams += TypeLayoutParamSpec(ktParam, "Int = 0")
+                        }
+                    }
+                }
+            }
 
             ComputedStructLayout(
                 structKotlinName = structKtName,
                 repr = repr,
                 staticSizeBytes = finalStaticSize,
                 staticAlignBytes = finalStaticAlign,
-                sizeExpr = finalSizeExpr,
-                alignExpr = finalAlignExpr,
-                fields = computedFields,
-                requiredTypeLayoutParams = requiredParams,
-                helperOffsetDecls = helperOffsetDecls,
+                sizeExpr = adjustedSizeExpr,
+                alignExpr = adjustedAlignExpr,
+                fields = adjustedComputedFields,
+                requiredTypeLayoutParams = requiredParams + constLayoutParams,
+                helperOffsetDecls = adjustedHelperOffsetDecls,
                 useBodyPropertiesCtor = useFinalAbiLayout && computedFields.size > 64,
             )
         } finally {
             emitter.activeTypeParamNames = prevStructTypeParams
+            emitter.activeConstParamNames = prevStructConstParams
         }
     }
 

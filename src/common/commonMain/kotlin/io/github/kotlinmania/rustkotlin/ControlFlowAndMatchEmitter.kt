@@ -442,7 +442,7 @@ internal fun KotlinJ2KEmitter.renderIfLetPatternAgainstRhs(pat: Pat, rhs: String
                     "$rhs != null"
                 }
             } else if (coreResultInfo != null) {
-                "$rhs is ${coreResultInfo.first}<*>"
+                "$rhs is ${coreResultInfo.first}<*, *>"
             } else if (patRequiresBooleanCondition(pat)) {
                 renderPatternBooleanCondition(pat, rhs, indent, selfTypeName)
             } else {
@@ -874,7 +874,7 @@ internal fun KotlinJ2KEmitter.tryRenderStdlibResultMatch(
         val ifText =
             if (taggedCoreResult) {
                 val result = sourceResultName()
-                "when ($subjectVar) { is $result.Ok<*> -> $okBranch; is $result.Err<*> -> $errBranch }"
+                "when ($subjectVar) { is $result.Ok<*, *> -> $okBranch; is $result.Err<*, *> -> $errBranch }"
             } else {
                 "if ($subjectVar.isSuccess) $okBranch else $errBranch"
             }
@@ -1490,7 +1490,7 @@ internal fun KotlinJ2KEmitter.renderPatternBooleanCondition(
             } else {
                 val coreResultInfo = coreResultVariantMatchInfo(pat)
                 if (coreResultInfo != null) {
-                    val castType = "${coreResultInfo.first}<*>"
+                    val castType = "${coreResultInfo.first}<*, *>"
                     val elemRecv =
                         if (scopeBuilder.isSmartCastableLocalKotlinName(subjectExpr)) {
                             subjectExpr
@@ -1636,7 +1636,7 @@ internal fun KotlinJ2KEmitter.collectPatternGuardAccessMap(
             } else {
                 val coreResultInfo = coreResultVariantMatchInfo(pat)
                 if (coreResultInfo != null && elems.size == 1 && elems[0] !is Pat.Rest) {
-                    collectPatternGuardAccessMap(elems[0], "($subjectText as ${coreResultInfo.first}<*>).${coreResultInfo.second}", selfTypeName, out)
+                    collectPatternGuardAccessMap(elems[0], "($subjectText as ${coreResultInfo.first}<*, *>).${coreResultInfo.second}", selfTypeName, out)
                 } else {
                     val variantType = renderPathAsType(pat.path, selfTypeName)
                     for ((idx, sub) in elems.withIndex()) {
@@ -1796,7 +1796,7 @@ internal fun KotlinJ2KEmitter.extractMatchArmBindings(
                                 if (subjectAlreadySmartCast) {
                                     "$subjectText.${coreResultInfo.second}"
                                 } else {
-                                    "($subjectText as ${coreResultInfo.first}<*>).${coreResultInfo.second}"
+                                    "($subjectText as ${coreResultInfo.first}<*, *>).${coreResultInfo.second}"
                                 }
                             lines += "${indent}val $boundName = $accessTarget"
                         }
@@ -2136,7 +2136,7 @@ internal fun KotlinJ2KEmitter.renderMatchPatternCondition(
                     "else"
                 }
             } else if (coreResultInfo != null) {
-                "is ${coreResultInfo.first}<*>"
+                "is ${coreResultInfo.first}<*, *>"
             } else {
                 "is ${renderPathAsType(pat.path, selfTypeName)}"
             }

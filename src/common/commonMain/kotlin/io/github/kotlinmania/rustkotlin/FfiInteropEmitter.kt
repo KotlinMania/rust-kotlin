@@ -1357,6 +1357,7 @@ internal class FfiInteropCollector(
             }
         }
         val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+        val allocNs = CoreIntrinsicLowering.resolveAllocNamespace(headerContext)
         val cVoidPkg =
             headerContext.crateSymbolSubpackages["CVoid"]
                 ?.firstOrNull()
@@ -1380,11 +1381,21 @@ internal class FfiInteropCollector(
                     ?.get("CVoid")
                     ?.minByOrNull { it.length }
                 ?: "$coreNs.ffi"
-        for ((sym, targetPkg) in listOf(
-            "ConstPtr" to "$coreNs.ptr",
-            "MutPtr" to "$coreNs.ptr",
-            "CVoid" to cVoidPkg,
-        )) {
+        val ffiPairs =
+            buildList {
+                add("ConstPtr" to "$coreNs.ptr")
+                add("MutPtr" to "$coreNs.ptr")
+                add("CVoid" to cVoidPkg)
+                if (!headerContext.rawAbiMode) {
+                    for (ffiSym in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS.values.distinct()) {
+                        if (ffiSym != "CVoid") {
+                            add(ffiSym to CoreIntrinsicLowering.defaultStdlibFfiSymbolPackage(ffiSym, coreNs, allocNs))
+                        }
+                    }
+                    add("CString" to CoreIntrinsicLowering.defaultStdlibFfiSymbolPackage("CString", coreNs, allocNs))
+                }
+            }
+        for ((sym, targetPkg) in ffiPairs) {
             if (targetPkg != pkgName && sym in usedIdents && sym !in localDeclaredNames && sym !in explicitlyImportedNames) {
                 importsOut += "$targetPkg.$sym"
                 explicitlyImportedNames += sym

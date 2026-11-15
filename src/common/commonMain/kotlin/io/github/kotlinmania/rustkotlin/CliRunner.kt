@@ -1378,7 +1378,10 @@ private fun executeTranslate(
                     int128SupportPath to int128SupportContent,
                     rustAnySupportPath to rustAnySupportContent,
                     floatSupportPath to floatSupportContent,
-                )
+                ) +
+                    renderCoreStdlibSupportFiles(inferredCorePkg).map { (rel, content) ->
+                        "$projRootPrefix$commonMarker${inferredCorePkg.replace('.', '/')}/$rel" to content
+                    }
             if (parsed.dryRun) {
                 if (!parsed.quiet) {
                     report("dry-run: core-type-layout -> $typeLayoutPath")
@@ -1456,6 +1459,29 @@ private fun executeTranslate(
                     writeForce(napiBridgePath, napiBridgeContent)
                 } else {
                     write(napiBridgePath, napiBridgeContent)
+                }
+            }
+        }
+        if (markerIdx >= 0 && !inferredCorePkg.isNullOrBlank() && inferredCorePkg.endsWith(".alloc")) {
+            val projRootPrefix = normOutRoot.substring(0, markerIdx)
+            val corePkgForAlloc =
+                parsed.crateNamespaces["core"]
+                    ?: explicitGradleProps?.crateNamespaces?.get("core")
+                    ?: "${inferredCorePkg.substringBeforeLast('.')}.core"
+            val rustStringPath = "$projRootPrefix$commonMarker${inferredCorePkg.replace('.', '/')}/string/RustString.kt"
+            val rustStringContent = renderAllocRustStringSupportFile(inferredCorePkg, corePkgForAlloc)
+            if (parsed.dryRun) {
+                if (!parsed.quiet) {
+                    report("dry-run: alloc-support -> $rustStringPath")
+                }
+            } else if (!(parsed.skipExisting && exists(rustStringPath))) {
+                if (parsed.forceOverwrite) {
+                    writeForce(rustStringPath, rustStringContent)
+                } else {
+                    write(rustStringPath, rustStringContent)
+                }
+                if (!parsed.quiet) {
+                    report("alloc-support -> $rustStringPath")
                 }
             }
         }

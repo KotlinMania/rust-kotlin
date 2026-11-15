@@ -277,7 +277,7 @@ class SingleFileTranslationTest {
         assertContains(result.text, "val count = reader.read(buf[0 until 0]).getOrElse { return Result.failure(it) }")
         assertContains(result.text, "val reader1 = reader.intoInner()")
         assertContains(result.text, "consume(reader1)")
-        assertContains(result.text, "var reader2 = Crc32Reader.new(((data).slice(start until data.size)), 1, false)")
+        assertContains(result.text, "var reader2 = Crc32Reader.new(((data).subList(start, (data).size)), 1, false)")
         assertContains(result.text, "if (reader2.read(buf[0 until count]).isErr())")
         assertContains(result.text, "io.Error.new(io.ErrorKind.InvalidData, \"Invalid checksum\")")
     }
@@ -4598,7 +4598,7 @@ class SingleFileTranslationTest {
         assertContains(kt, "Pair<UByteArray, UByteArray>")
         assertContains(kt, "ubyteArrayOf((rawBits shr 24).toUByte()")
         assertContains(kt, "y.toLeBytes()")
-        assertContains(kt, "U128.fromBeBytes(((buf).slice(14 until 30)).toUByteArray())")
+        assertContains(kt, "U128.fromBeBytes(((buf).subList(14, 30)).toUByteArray())")
         assertContains(kt, "(arr).sliceArray(0 until 2)")
         assertContains(kt, "Float.fromBits(")
         assertContains(kt, "Double.fromBits(")
@@ -4630,10 +4630,10 @@ class SingleFileTranslationTest {
                     portLintDirective = "none",
                 ),
             ).text
-        assertContains(kt, "import io.github.kotlinmania.rustlang.core.ffi.CInt")
-        assertContains(kt, "import io.github.kotlinmania.rustlang.core.ffi.CChar")
-        assertContains(kt, "import io.github.kotlinmania.rustlang.core.ffi.CStr")
-        assertContains(kt, "import io.github.kotlinmania.rustlang.alloc.ffi.CString")
+        assertContains(kt, "import io.github.kotlinmania.rustlang.core.ffi.primitives.CInt")
+        assertContains(kt, "import io.github.kotlinmania.rustlang.core.ffi.primitives.CChar")
+        assertContains(kt, "import io.github.kotlinmania.rustlang.core.ffi.cstr.CStr")
+        assertContains(kt, "import io.github.kotlinmania.rustlang.alloc.ffi.cstr.CString")
         assertContains(kt, "fun ffiRoundtrip(code: CInt, ch: CChar, s: CStr): CString")
     }
 
@@ -4744,7 +4744,7 @@ class SingleFileTranslationTest {
             """.trimIndent()
         val kt = renderSingleKotlinFile(source).text
         assertContains(kt, "var result = mutableListOf<Pair<String, String>>()")
-        assertContains(kt, ".slice(1 until input.size)))?.let({")
+        assertContains(kt, ".subList(1, (input).size)))?.let({")
         assertContains(kt, "return pos?.let({")
         assertContains(kt, "return Env.new(result)")
         assertFalse(kt.contains("return run {"), "Tail unsafe ending in return should not emit unreachable outer return:\n$kt")

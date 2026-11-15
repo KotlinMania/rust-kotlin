@@ -172,6 +172,10 @@ internal fun KotlinJ2KEmitter.currentSubpackageString(): String {
 }
 
 internal fun KotlinJ2KEmitter.resolveBestSubpackageForSymbol(ktSymbol: String): String? {
+    val nsPrefix = currentNamespacePrefix()
+    if (nsPrefix?.endsWith(".core") == true && ktSymbol in setOf("U128", "I128", "F16", "F128")) {
+        return ""
+    }
     val candidates = headerContext.crateSymbolSubpackages[ktSymbol] ?: return null
     if (candidates.isEmpty()) return null
     val cur = currentSubpackageString()
@@ -504,13 +508,9 @@ internal fun KotlinJ2KEmitter.resolveStdlibFfiSymbolImport(
                 ?: extCandidates.minByOrNull { it.length }
         if (ffiMatch != null) return "$ffiMatch.$ktSym"
     }
-    val fallbackNs =
-        if (ktSym == "CString") {
-            CoreIntrinsicLowering.resolveAllocNamespace(headerContext)
-        } else {
-            CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-        }
-    return "$fallbackNs.ffi.$ktSym"
+    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+    val allocNs = CoreIntrinsicLowering.resolveAllocNamespace(headerContext)
+    return "${CoreIntrinsicLowering.defaultStdlibFfiSymbolPackage(ktSym, coreNs, allocNs)}.$ktSym"
 }
 
 internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
@@ -523,6 +523,24 @@ internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
     if (firstRaw in inspector.localInlineModuleNames) return null
     if (firstRaw == "std" || firstRaw == "alloc" || firstRaw == "Self" || firstRaw in PRIMITIVE_TYPE_NAMES) return null
     if (rawSegStrings.dropLast(1).any { it.removePrefix("r#") in STDLIB_PRELUDE_REEXPORT_MODULES }) {
+        return null
+    }
+    val secondClean = rawSegStrings.getOrNull(1)?.removePrefix("r#")
+    val thirdClean = rawSegStrings.getOrNull(2)?.removePrefix("r#")
+    if (secondClean == "string" &&
+        thirdClean == "String" &&
+        (
+            firstRaw == "alloc" ||
+                firstRaw == "std" ||
+                (
+                    firstRaw == "crate" &&
+                        (
+                            headerContext.packageName == "io.github.kotlinmania.rustlang.alloc" ||
+                                headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.alloc.") == true
+                        )
+                )
+        )
+    ) {
         return null
     }
     if (firstRaw == "core") {
@@ -1164,10 +1182,24 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
         }
         if (afterRoot.size == 1 && mapped.last() != "*" && nsPrefix != null && headerContext.crateSymbolSubpackages.isNotEmpty()) {
             val rawLeaf = afterRoot[0].removePrefix("r#")
-            if (rawLeaf.firstOrNull()?.isLowerCase() != true || isKnownFunctionLeafIdent(afterRoot[0])) {
-                val bestSub = resolveBestSubpackageForSymbol(mapped.last())
-                if (bestSub != null) {
-                    return if (bestSub.isEmpty()) "$nsPrefix.${mapped.last()}" else "$nsPrefix.$bestSub.${mapped.last()}"
+            val directSub =
+                if (rawLeaf.firstOrNull()?.isLowerCase() != true || isKnownFunctionLeafIdent(afterRoot[0])) {
+                    resolveBestSubpackageForSymbol(mapped.last())
+                } else {
+                    null
+                }
+            if (directSub != null) {
+                return if (directSub.isEmpty()) "$nsPrefix.${mapped.last()}" else "$nsPrefix.$directSub.${mapped.last()}"
+            }
+            if (rawLeaf.firstOrNull()?.isLowerCase() == true) {
+                val typeKt = rustTypeIdentToKotlin(afterRoot[0])
+                val typeSub = resolveBestSubpackageForSymbol(typeKt)
+                if (typeSub != null) {
+                    return if (typeSub.isEmpty()) "$nsPrefix.$typeKt" else "$nsPrefix.$typeSub.$typeKt"
+                }
+                val valSub = resolveBestSubpackageForSymbol(mapped.last())
+                if (valSub != null) {
+                    return if (valSub.isEmpty()) "$nsPrefix.${mapped.last()}" else "$nsPrefix.$valSub.${mapped.last()}"
                 }
             }
         }
@@ -1479,7 +1511,8 @@ internal fun KotlinJ2KEmitter.renderItemUse(
         if (isMappedOrSelfStdCrate &&
             leaf.segments.size == 2 &&
             leaf.segments[1].firstOrNull()?.isLowerCase() == true &&
-            !isKnownFunctionLeafIdent(leaf.segments[1])
+            !isKnownFunctionLeafIdent(leaf.segments[1]) &&
+            resolveBestSubpackageForSymbol(rustTypeIdentToKotlin(leaf.segments[1])) == null
         ) {
             continue
         }
@@ -1497,8 +1530,13 @@ internal fun KotlinJ2KEmitter.renderItemUse(
         }
         val finalSimpleName = fullImport.substringAfterLast('.')
         if (leaf.alias == null &&
-            root in STDLIB_CRATE_ROOTS &&
-            (finalSimpleName in KOTLIN_STDLIB_SHADOWED_IMPORTS || finalSimpleName in STDLIB_ERASED_OR_BUILTIN_IMPORTS)
+            (
+                finalSimpleName == "String" ||
+                    (
+                        root in STDLIB_CRATE_ROOTS &&
+                            (finalSimpleName in KOTLIN_STDLIB_SHADOWED_IMPORTS || finalSimpleName in STDLIB_ERASED_OR_BUILTIN_IMPORTS)
+                    )
+            )
         ) {
             continue
         }

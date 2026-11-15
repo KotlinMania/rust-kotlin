@@ -371,7 +371,7 @@ private fun renderMacroGroupApproximation(
         val branches = variants[0].branches
         if (isRawPointerLiteralMacroBranches(branches) && fnName !in occupiedNames) {
             val rawParam = branches[0].paramNames.firstOrNull()?.removePrefix("r#") ?: "lit"
-            val ktParam = rustValueIdentToKotlin(rawParam).ifEmpty { "lit" }
+            val ktParam = sanitizeMacroParamName(rustValueIdentToKotlin(rawParam).ifEmpty { "lit" })
             val bodyText = branches.joinToString(" ") { it.bodyTokens.toString() }
             val isWide = rawMacroName == "w" || "u16" in bodyText || "utf16" in bodyText
             val internFn = if (isWide) "kmInternWideStr" else "kmInternCStr"
@@ -578,6 +578,12 @@ private fun tryRenderScalarConditionalMacro(
     }
 }
 
+private fun sanitizeMacroParamName(ktIdent: String): String =
+    when (ktIdent) {
+        "this", "self", "Self" -> "thisRef"
+        else -> ktIdent
+    }
+
 private fun deriveSlotParameterNames(
     splitPatterns: List<List<List<MacroPat>>>,
     arity: Int,
@@ -590,7 +596,7 @@ private fun deriveSlotParameterNames(
             if (slot < clauses.size) {
                 val mv = findFirstMetavarName(clauses[slot])
                 if (mv != null) {
-                    candidate = rustValueIdentToKotlin(mv)
+                    candidate = sanitizeMacroParamName(rustValueIdentToKotlin(mv))
                     break
                 }
             }
@@ -654,7 +660,7 @@ private fun renderTemplateConditionalMacro(
             for (rawParam in branch.paramNames) {
                 val cleaned = rawParam.removePrefix("r#")
                 if (cleaned.isNotEmpty() && cleaned !in allMetavars) {
-                    var ktParam = rustValueIdentToKotlin(cleaned)
+                    var ktParam = sanitizeMacroParamName(rustValueIdentToKotlin(cleaned))
                     if (ktParam == "_" || ktParam.isEmpty()) ktParam = "value"
                     if (ktParam == "clause" || ktParam in allMetavars.values) {
                         ktParam = "${ktParam}Arg"
@@ -1005,7 +1011,7 @@ private fun appendFormattedMacroTokens(
                     sb.append(' ')
                 }
                 val raw = next.value.toString().removePrefix("r#")
-                val ktParam = allMetavars[raw] ?: rustValueIdentToKotlin(raw)
+                val ktParam = allMetavars[raw] ?: sanitizeMacroParamName(rustValueIdentToKotlin(raw))
                 sb.append('$').append(ktParam)
                 i += 2
                 continue

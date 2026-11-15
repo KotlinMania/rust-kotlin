@@ -43,6 +43,21 @@ internal fun KotlinJ2KEmitter.isSelfParameterizedTraitName(ktTrait: String): Boo
 private val CORE_OPS_OUTPUT_ASSOC_TRAITS =
     setOf("Add", "Sub", "Mul", "Div", "Rem", "BitAnd", "BitOr", "BitXor", "Shl", "Shr", "Neg", "Not")
 
+private val STDLIB_DEFAULTLESS_ASSOC_TYPES: Map<String, List<String>> =
+    mapOf(
+        "Iterator" to listOf("Item"),
+        "IntoIterator" to listOf("Item", "IntoIter"),
+        "Try" to listOf("Output", "Residual"),
+        "Deref" to listOf("Target"),
+        "SliceIndex" to listOf("Output"),
+        "Future" to listOf("Output"),
+        "IntoFuture" to listOf("Output", "IntoFuture"),
+        "FromStr" to listOf("Err"),
+        "TryFrom" to listOf("Error"),
+        "TryInto" to listOf("Error"),
+        "Pattern" to listOf("Searcher"),
+    )
+
 internal fun KotlinJ2KEmitter.lookupTraitDefaultlessAssocTypes(ktTrait: String, traitPath: Path? = null): List<String> {
     inspector.traitDefaultlessAssocTypes[ktTrait]?.let { return it }
     val rawSegs =
@@ -65,8 +80,11 @@ internal fun KotlinJ2KEmitter.lookupTraitDefaultlessAssocTypes(ktTrait: String, 
         headerContext.crateTraitDefaultlessAssocTypes[k]?.let { return it }
     }
     headerContext.crateTraitDefaultlessAssocTypes[ktTrait]?.takeIf { it.isNotEmpty() }?.let { return it }
-    if (ktTrait !in inspector.declaredTypeNames && ktTrait in CORE_OPS_OUTPUT_ASSOC_TRAITS) {
-        return listOf("Output")
+    if (ktTrait !in inspector.declaredTypeNames) {
+        if (ktTrait in CORE_OPS_OUTPUT_ASSOC_TRAITS) {
+            return listOf("Output")
+        }
+        STDLIB_DEFAULTLESS_ASSOC_TYPES[ktTrait]?.let { return it }
     }
     return emptyList()
 }
@@ -219,7 +237,7 @@ internal fun KotlinJ2KEmitter.renderSourceResultTry(expression: String, returnKe
         return "$expression.getOrElse { $returnKeyword Result.failure(it) }"
     }
     val result = sourceResultName()
-    return "when (val tryResult = $expression) { is $result.Ok<*> -> tryResult.value; is $result.Err<*> -> $returnKeyword $result.Err(tryResult.error) }"
+    return "when (val tryResult = $expression) { is $result.Ok<*, *> -> tryResult.value; is $result.Err<*, *> -> $returnKeyword $result.Err(tryResult.error) }"
 }
 
 /** The typed derived-equality method preserves Rust's equality type constraints.

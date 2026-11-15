@@ -911,6 +911,15 @@ internal class KotlinJ2KEmitter(
     internal var currentTailExpectsUnitResultOk: Boolean = false
     internal var usesI128: Boolean = false
     internal var usesRustAny: Boolean = false
+    internal var suppressTraitAssocPlaceholders: Boolean = false
+    internal var activeConstParamNames: Set<String> = emptySet()
+
+    internal fun effectiveStructKotlinName(baseKtName: String): String =
+        if (baseKtName == "String" && headerContext.packageName?.endsWith(".alloc.string") == true) {
+            "RustAllocString"
+        } else {
+            baseKtName
+        }
     internal val computedStructLayoutCache: MutableMap<String, ComputedStructLayout?> = linkedMapOf()
     internal val requiredTypeLayoutParamsCache: MutableMap<String, List<Pair<String, String>>> = linkedMapOf()
     internal val inferExprRenderedTypeCache: MutableMap<InferExprCacheKey, String?> = hashMapOf()
@@ -1401,14 +1410,29 @@ internal class KotlinJ2KEmitter(
                 add("fixedListTypeLayout" to "$activeCoreNs.mem")
                 add("F16" to activeCoreNs)
                 add("F128" to activeCoreNs)
+                add("OverflowingResult" to "$activeCoreNs.num")
                 if (!headerContext.rawAbiMode) {
                     for (ffiSym in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS.values.distinct()) {
                         if (resolveBestSubpackageForSymbol(ffiSym) == null) {
-                            add(ffiSym to "$activeCoreNs.ffi")
+                            add(
+                                ffiSym to
+                                    CoreIntrinsicLowering.defaultStdlibFfiSymbolPackage(
+                                        ffiSym,
+                                        activeCoreNs,
+                                        activeAllocNs,
+                                    ),
+                            )
                         }
                     }
                     if (resolveBestSubpackageForSymbol("CString") == null) {
-                        add("CString" to "$activeAllocNs.ffi")
+                        add(
+                            "CString" to
+                                CoreIntrinsicLowering.defaultStdlibFfiSymbolPackage(
+                                    "CString",
+                                    activeCoreNs,
+                                    activeAllocNs,
+                                ),
+                        )
                     }
                 }
                 if (usesExternalRustLangCore) {
@@ -1418,18 +1442,27 @@ internal class KotlinJ2KEmitter(
                     add("RustTypeId" to activeCoreNs)
                     add("Ordering" to "$activeCoreNs.cmp")
                     add("compareNaturalOrder" to "$activeCoreNs.cmp")
-                    add("ParseIntError" to "$activeCoreNs.num")
-                    add("IntErrorKind" to "$activeCoreNs.num")
-                    add("TryFromIntError" to "$activeCoreNs.num")
+                    add("ParseIntError" to "$activeCoreNs.num.error")
+                    add("IntErrorKind" to "$activeCoreNs.num.error")
+                    add("TryFromIntError" to "$activeCoreNs.num.error")
                     add("FpCategory" to "$activeCoreNs.num")
-                    add("Wrapping" to "$activeCoreNs.num")
+                    add("Wrapping" to "$activeCoreNs.num.wrapping")
+                    add("Pin" to "$activeCoreNs.pin")
+                    add("ControlFlow" to "$activeCoreNs.ops.controlflow")
+                    add("Allocator" to "$activeCoreNs.alloc")
+                    add("AllocError" to "$activeCoreNs.alloc")
+                    add("Layout" to "$activeCoreNs.alloc.layout")
+                    add("transmute" to "$activeCoreNs.mem")
+                    add("transmuteUnchecked" to "$activeCoreNs.mem")
+                    add("sizeOf" to "$activeCoreNs.mem")
+                    add("alignOf" to "$activeCoreNs.mem")
                 }
                 if ("core" in headerContext.crateNamespaces || headerContext.scalarChar) {
                     add("Cell" to "$activeCoreNs.cell")
                     add("RefCell" to "$activeCoreNs.cell")
                     add("Ref" to "$activeCoreNs.cell")
                     add("RefMut" to "$activeCoreNs.cell")
-                    add("OnceCell" to "$activeCoreNs.cell")
+                    add("OnceCell" to "$activeCoreNs.cell.once")
                     add("RustChar" to "$activeCoreNs.char")
                     add("CharTryFromError" to "$activeCoreNs.char")
                     add("RustCharIndex" to "$activeCoreNs.char")
@@ -1459,11 +1492,37 @@ internal class KotlinJ2KEmitter(
                 symSimple !in inspector.declaredTypeNames &&
                 symSimple !in inspector.declaredConstNames.values &&
                 symSimple !in importedSimpleNameToPkg &&
+                !isDeclaredTopLevelFnKotlinName(symSimple) &&
                 containsWholeIdentifier(bodyTextForImports, symSimple)
             ) {
                 val imp = "import $symPkg.$symSimple"
                 if (imp !in combinedExtraTypeImports) {
                     combinedExtraTypeImports += imp
+                }
+            }
+        }
+        if (usesExternalRustLangCore && !headerContext.rawAbiMode) {
+            for ((variantName, variantOwner) in listOf(
+                "Break" to "$activeCoreNs.ops.controlflow.ControlFlow",
+                "Continue" to "$activeCoreNs.ops.controlflow.ControlFlow",
+                "Less" to "$activeCoreNs.cmp.Ordering",
+                "Equal" to "$activeCoreNs.cmp.Ordering",
+                "Greater" to "$activeCoreNs.cmp.Ordering",
+            )) {
+                val ownerPkg = variantOwner.substringBeforeLast('.')
+                if (headerContext.packageName != ownerPkg &&
+                    variantName !in inspector.declaredTypeNames &&
+                    variantName !in inspector.declaredConstNames.values &&
+                    variantName !in inspector.enumVariantSimpleNames &&
+                    variantName !in inspector.importedEnumVariantSimpleNames &&
+                    variantName !in importedSimpleNameToPkg &&
+                    !isDeclaredTopLevelFnKotlinName(variantName) &&
+                    containsWholeIdentifier(bodyTextForImports, variantName)
+                ) {
+                    val imp = "import $variantOwner.$variantName"
+                    if (imp !in combinedExtraTypeImports) {
+                        combinedExtraTypeImports += imp
+                    }
                 }
             }
         }

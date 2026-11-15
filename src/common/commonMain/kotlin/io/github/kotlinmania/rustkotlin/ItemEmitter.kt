@@ -430,6 +430,7 @@ internal fun KotlinJ2KEmitter.renderItemFn(
     val prevNullableLocals = currentNullableLocals
     val prevSmartCastLocals = currentSmartCastNonNullLocals
     val prevTypeParams = activeTypeParamNames
+    val prevConstParams = activeConstParamNames
     val prevSubst = substitutedTypeParamTypes
     val prevIntoSubstTps = currentIntoSubstitutedTypeParams
     val prevIntoSubstParams = currentIntoSubstitutedParams
@@ -467,6 +468,7 @@ internal fun KotlinJ2KEmitter.renderItemFn(
     }
     currentIntoSubstitutedTypeParams = prevIntoSubstTps + intoSubstTps
     activeTypeParamNames = (activeTypeParamNames + collectGenericTypeParamNames(item.sig.generics)) - substitutedTypeParamTypes.keys
+    activeConstParamNames = prevConstParams + collectGenericConstParamNames(item.sig.generics)
     scopeBuilder.enterDef()
     try {
         val sigHeader =
@@ -521,6 +523,7 @@ internal fun KotlinJ2KEmitter.renderItemFn(
         currentTypeParamTraitBounds = prevTypeParamBounds
         currentNullableLocals = prevNullableLocals
         currentSmartCastNonNullLocals = prevSmartCastLocals
+        activeConstParamNames = prevConstParams
         activeTypeParamNames = prevTypeParams
         substitutedTypeParamTypes = prevSubst
         currentIntoSubstitutedTypeParams = prevIntoSubstTps
@@ -1110,7 +1113,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
     scopeSignatures: MutableMap<String, Int> = topLevelSignatureCounts,
     isLocalItem: Boolean = false,
 ): String {
-    val typeName = rustTypeIdentToKotlin(item.ident.toString())
+    val typeName = effectiveStructKotlinName(rustTypeIdentToKotlin(item.ident.toString()))
     val sigKey = "type:$typeName"
     val seenCount = scopeSignatures[sigKey] ?: 0
     scopeSignatures[sigKey] = seenCount + 1
@@ -1142,7 +1145,9 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
     val selfTypeWithGenerics = typeName + renderTypeArgumentsFromGenerics(item.generics)
     val unboundedOwnerTypeParams = collectUnboundedGenericTypeParamNames(item.generics)
     val prevStructTypeParams = activeTypeParamNames
+    val prevStructConstParams = activeConstParamNames
     activeTypeParamNames = activeTypeParamNames + collectGenericTypeParamNames(item.generics)
+    activeConstParamNames = activeConstParamNames + collectGenericConstParamNames(item.generics)
     val typeParams: String
     val whereClause: String
     val superTraits = mutableListOf<String>()
@@ -1285,6 +1290,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
             is Fields.Unit -> {}
         }
     } finally {
+        activeConstParamNames = prevStructConstParams
         activeTypeParamNames = prevStructTypeParams
     }
 
@@ -1682,12 +1688,15 @@ internal fun KotlinJ2KEmitter.renderDistinctSuperTraits(
         if (rawTrait in IGNORED_TRAIT_BOUNDS) continue
         if (isImplicitStdlibSupertraitPath(path)) continue
         val prevBounded = currentBoundedTypeName
+        val prevSuppressAssocs = suppressTraitAssocPlaceholders
         currentBoundedTypeName = selfTypeWithGenerics
+        suppressTraitAssocPlaceholders = true
         val rendered =
             try {
                 renderPathAsType(path, selfTypeName = selfTypeWithGenerics)
             } finally {
                 currentBoundedTypeName = prevBounded
+                suppressTraitAssocPlaceholders = prevSuppressAssocs
             }
         val selfBase = selfTypeWithGenerics.substringBefore('<').trim()
         val baseIface = rendered.substringBefore('<').trim()
@@ -2235,13 +2244,16 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
     val typeArgsUse = renderTypeArgumentsFromGenerics(item.generics)
     val selfTypeWithGenerics = typeName + typeArgsUse
     val prevEnumTypeParams = activeTypeParamNames
+    val prevEnumConstParams = activeConstParamNames
     activeTypeParamNames = activeTypeParamNames + collectGenericTypeParamNames(item.generics)
+    activeConstParamNames = activeConstParamNames + collectGenericConstParamNames(item.generics)
     val typeParams: String
     val superTraits: List<String>
     try {
         typeParams = renderTypeParameters(item.generics, selfTypeName = selfTypeWithGenerics)
         superTraits = renderDistinctSuperTraits(attachedImpls, selfTypeWithGenerics, ownerIsPublic = (vis == "public "))
     } finally {
+        activeConstParamNames = prevEnumConstParams
         activeTypeParamNames = prevEnumTypeParams
     }
     val variants = item.variants.toList().filterNot { isDocOnlyCfgAttribute(it.attrs) }
@@ -2429,6 +2441,7 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
     sb.append(" {\n")
     var prevVariantName: String? = null
     activeTypeParamNames = prevEnumTypeParams + collectGenericTypeParamNames(item.generics)
+    activeConstParamNames = prevEnumConstParams + collectGenericConstParamNames(item.generics)
     try {
         for (v in variants) {
             val vName = rustTypeIdentToKotlin(v.ident.toString())
@@ -2475,6 +2488,7 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
             prevVariantName = vName
         }
     } finally {
+        activeConstParamNames = prevEnumConstParams
         activeTypeParamNames = prevEnumTypeParams
     }
     val derivesEquality =
@@ -2608,6 +2622,11 @@ private fun KotlinJ2KEmitter.appendEnumVariantWithFields(
     specs: List<SwiftSafeFieldSpec>,
     indent: String,
 ) {
+    val addErrAlias =
+        enumName in setOf("Result", "RustResult") &&
+            vName == "Err" &&
+            specs.size == 1 &&
+            specs[0].name == "value"
     if (specs.none { it.isConcreteGenericForSwift }) {
         val params = specs.map { "public var ${it.name}: ${it.renderedType}" }
         sb
@@ -2624,6 +2643,16 @@ private fun KotlinJ2KEmitter.appendEnumVariantWithFields(
             .append("(")
             .append(superCallArgs)
             .append(")")
+        if (addErrAlias) {
+            sb
+                .append(" {\n")
+                .append(indent)
+                .append("    public val error: ")
+                .append(specs[0].renderedType)
+                .append(" get() = value\n")
+                .append(indent)
+                .append("}")
+        }
         return
     }
     val ctorParams =
@@ -2661,6 +2690,14 @@ private fun KotlinJ2KEmitter.appendEnumVariantWithFields(
                 .append(indent)
                 .append("        internal set\n")
         }
+    }
+    if (addErrAlias) {
+        sb
+            .append("\n")
+            .append(indent)
+            .append("    public val error: ")
+            .append(specs[0].renderedType)
+            .append(" get() = value\n")
     }
     val syntheticMethods =
         buildSwiftSafeSyntheticDataMethods(
@@ -3014,6 +3051,7 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
     val memberSelfType = selfParamName ?: (traitName + renderTypeArgumentsFromGenerics(item.generics))
     val prevTraitAssoc = currentTraitAssocParamNames
     val prevTraitTypeParams = activeTypeParamNames
+    val prevTraitConstParams = activeConstParamNames
     val prevTraitMethods = currentTraitMethodRawNames
     currentTraitAssocParamNames = assocTypeNames.toSet()
     currentTraitMethodRawNames = collectLocalTraitAndSupertraitFnRawNames(item)
@@ -3022,6 +3060,7 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
         collectGenericTypeParamNames(item.generics) +
         setOfNotNull(selfParamName) +
         assocTypeNames
+    activeConstParamNames = prevTraitConstParams + collectGenericConstParamNames(item.generics)
     return try {
         val baseTypeParams =
             renderTypeParameters(item.generics, selfTypeName = memberSelfType)
@@ -3096,7 +3135,11 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
                                 "$indent    ",
                                 selfTypeName = memberSelfType,
                             )
-                        members += "${cDoc}$indent    public val $cName: $cType\n$indent        get() = $renderedExpr"
+                        if (renderedExpr == "null" && !cType.endsWith("?")) {
+                            members += "${cDoc}$indent    public val $cName: $cType"
+                        } else {
+                            members += "${cDoc}$indent    public val $cName: $cType\n$indent        get() = $renderedExpr"
+                        }
                     } else {
                         members += "${cDoc}$indent    public val $cName: $cType"
                     }
@@ -3120,6 +3163,7 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
                     val prevIntoSubstTps = currentIntoSubstitutedTypeParams
                     val prevIntoSubstParams = currentIntoSubstitutedParams
                     val prevTraitFnTypeParams = activeTypeParamNames
+                    val prevTraitFnConstParams = activeConstParamNames
                     val prevWitnesses = currentTypeParamWitnessCalls
                     val prevSharedBorrowRecv = currentReceiverIsSharedBorrow
                     val prevMutBorrowRecv = currentReceiverIsMutBorrow
@@ -3153,6 +3197,7 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
                     }
                     currentIntoSubstitutedTypeParams = prevIntoSubstTps + intoSubstTps
                     activeTypeParamNames = (prevTraitFnTypeParams + collectGenericTypeParamNames(tItem.sig.generics)) - substitutedTypeParamTypes.keys
+                    activeConstParamNames = prevTraitFnConstParams + collectGenericConstParamNames(tItem.sig.generics)
                     scopeBuilder.enterDef()
                     try {
                         val sigHeader =
@@ -3223,6 +3268,7 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
                         substitutedTypeParamTypes = prevSubst
                         currentIntoSubstitutedTypeParams = prevIntoSubstTps
                         currentIntoSubstitutedParams = prevIntoSubstParams
+                        activeConstParamNames = prevTraitFnConstParams
                         activeTypeParamNames = prevTraitFnTypeParams
                         currentTypeParamWitnessCalls = prevWitnesses
                         currentReceiverIsSharedBorrow = prevSharedBorrowRecv
@@ -3290,10 +3336,12 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
                 if (uniqueImpl != null) {
                     val savedTraitAssoc = currentTraitAssocParamNames
                     val savedActiveTypeParams = activeTypeParamNames
+                    val savedActiveConstParams = activeConstParamNames
                     val companionMethods =
                         try {
                             currentTraitAssocParamNames = prevTraitAssoc
                             activeTypeParamNames = prevTraitTypeParams
+                            activeConstParamNames = prevTraitConstParams
                             val concreteSelfType = renderType(uniqueImpl.selfType, selfTypeName = null)
                             val directOwner = extractDirectOwnerTypeName(uniqueImpl.selfType, uniqueImpl.generics)
                             val isLocalAttached =
@@ -3364,6 +3412,7 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
                         } finally {
                             currentTraitAssocParamNames = savedTraitAssoc
                             activeTypeParamNames = savedActiveTypeParams
+                            activeConstParamNames = savedActiveConstParams
                         }
                     if (companionMethods.isNotEmpty()) {
                         members +=
@@ -3384,6 +3433,7 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
     } finally {
         currentTraitMethodRawNames = prevTraitMethods
         currentTraitAssocParamNames = prevTraitAssoc
+        activeConstParamNames = prevTraitConstParams
         activeTypeParamNames = prevTraitTypeParams
     }
 }
@@ -3741,6 +3791,7 @@ internal fun KotlinJ2KEmitter.renderImplItemFn(
     val prevNullableLocals = currentNullableLocals
     val prevSmartCastLocals = currentSmartCastNonNullLocals
     val prevTypeParams = activeTypeParamNames
+    val prevConstParams = activeConstParamNames
     val prevSubst = substitutedTypeParamTypes
     val prevIntoSubstTps = currentIntoSubstitutedTypeParams
     val prevIntoSubstParams = currentIntoSubstitutedParams
@@ -3793,6 +3844,11 @@ internal fun KotlinJ2KEmitter.renderImplItemFn(
             addAll(collectGenericTypeParamNames(item.sig.generics))
         }
     activeTypeParamNames = combinedActiveParams - substitutedTypeParamTypes.keys
+    activeConstParamNames =
+        prevConstParams +
+        collectGenericConstParamNames(ownerGenerics) +
+        collectGenericConstParamNames(implGenerics) +
+        collectGenericConstParamNames(item.sig.generics)
     scopeBuilder.enterDef()
     try {
         val activeTraitLast =
@@ -3955,6 +4011,7 @@ internal fun KotlinJ2KEmitter.renderImplItemFn(
         currentHasherStateParam = prevHasherState
         currentNullableLocals = prevNullableLocals
         currentSmartCastNonNullLocals = prevSmartCastLocals
+        activeConstParamNames = prevConstParams
         activeTypeParamNames = prevTypeParams
         substitutedTypeParamTypes = prevSubst
         currentIntoSubstitutedTypeParams = prevIntoSubstTps

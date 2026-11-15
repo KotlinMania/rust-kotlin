@@ -48,6 +48,7 @@ internal fun KotlinJ2KEmitter.liftDefaultlessAssocTypesFromBounds(
     combinedParams: List<GenericParam>,
     ownerWhere: WhereClause?,
     fnWhere: WhereClause?,
+    implWhere: WhereClause? = null,
 ): List<String> {
     val existingParams =
         combinedParams
@@ -74,7 +75,11 @@ internal fun KotlinJ2KEmitter.liftDefaultlessAssocTypesFromBounds(
             inspectBounds(gp.bounds.toList())
         }
     }
-    for (pred in ownerWhere?.predicates?.toList().orEmpty() + fnWhere?.predicates?.toList().orEmpty()) {
+    val allWherePredicates =
+        ownerWhere?.predicates?.toList().orEmpty() +
+            implWhere?.predicates?.toList().orEmpty() +
+            fnWhere?.predicates?.toList().orEmpty()
+    for (pred in allWherePredicates) {
         if (pred is WherePredicate.TypePredicate) {
             inspectBounds(pred.bounds.toList())
         }
@@ -794,6 +799,7 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
             combinedParams = combinedParams,
             ownerWhere = if (includeOwner) ownerGenerics?.whereClause else null,
             fnWhere = sig.generics.whereClause,
+            implWhere = if (includeOwner && implGenerics !== ownerGenerics) implGenerics?.whereClause else null,
         )
     if (liftedAssocs.isNotEmpty()) {
         activeTypeParamNames = activeTypeParamNames + liftedAssocs
@@ -2351,7 +2357,7 @@ internal fun KotlinJ2KEmitter.tryRenderDeferredLocalResultMatchInit(
                 }
             }
         val resultType = sourceResultName()
-        out += "${trivia1}${trivia2}${innerIndent}val $okVar = when (val matchResult = $subjectRendered) { is $resultType.Ok<*> -> matchResult.value; is $resultType.Err<*> -> $errRender }"
+        out += "${trivia1}${trivia2}${innerIndent}val $okVar = when (val matchResult = $subjectRendered) { is $resultType.Ok<*, *> -> matchResult.value; is $resultType.Err<*, *> -> $errRender }"
     } else {
         val errRender =
             run {

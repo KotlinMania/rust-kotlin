@@ -56,6 +56,18 @@ public object CoreIntrinsicLowering {
             "CStr" to "CStr",
         )
 
+    public fun defaultStdlibFfiSymbolPackage(
+        ktSym: String,
+        coreNs: String,
+        allocNs: String,
+    ): String =
+        when (ktSym) {
+            "CString" -> "$allocNs.ffi.cstr"
+            "CStr" -> "$coreNs.ffi.cstr"
+            "CVoid" -> "$coreNs.ffi"
+            else -> "$coreNs.ffi.primitives"
+        }
+
     private val ATOMIC_RMW_OP_CODES: Map<String, Int> =
         mapOf(
             "atomic_xadd" to 1,

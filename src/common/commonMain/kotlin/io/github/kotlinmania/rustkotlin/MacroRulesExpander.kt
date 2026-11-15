@@ -151,6 +151,12 @@ private val UNSUPPORTED_RUST_TARGET_OS =
         "cuda",
         "nvptx",
         "amdgpu",
+        "helenos",
+        "freebsdlike",
+        "netbsdlike",
+        "solarish",
+        "managarm",
+        "zos",
     )
 
 private val UNSUPPORTED_RUST_TARGET_ENV =

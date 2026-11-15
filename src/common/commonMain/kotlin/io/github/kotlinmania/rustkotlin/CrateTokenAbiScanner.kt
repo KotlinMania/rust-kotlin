@@ -809,8 +809,18 @@ private fun scanSourcesWithActiveSession(
     val traitSupertraits = linkedMapOf<String, List<String>>()
     val crateMacroSrcs = normalizedSources.map { it.second }.filter { "macro_rules" in it || "macro " in it }
     val anyMacroDefinesTrait = crateMacroSrcs.any { "trait " in it || "trait\n" in it || "trait\t" in it }
+    val anyMacroDefinesItem =
+        anyMacroDefinesTrait ||
+            crateMacroSrcs.any { src ->
+                "struct " in src || "struct\n" in src || "struct\t" in src ||
+                    "enum " in src || "enum\n" in src || "enum\t" in src ||
+                    "type " in src || "type\n" in src || "type\t" in src ||
+                    "fn " in src || "fn\n" in src || "fn\t" in src ||
+                    "const " in src || "const\n" in src || "const\t" in src ||
+                    "union " in src || "union\n" in src || "union\t" in src
+            }
     for ((relFile, text) in normalizedSources) {
-        if ("trait" !in text && !(anyMacroDefinesTrait && "!" in text)) continue
+        if ("trait" !in text && !(anyMacroDefinesItem && "!" in text)) continue
         val recognized = recognizeRustOrNull(text) ?: continue
         val expandedFile = expandFileMacroRules(recognized.file, crateMacroSrcs).file
         val (subpkg, _) = computeSubpkgAndRecordAncestors(relFile)
@@ -820,6 +830,7 @@ private fun scanSourcesWithActiveSession(
                 when (item) {
                     is Item.Trait -> {
                         val ktTrait = KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
+                        registerSymbolInSubpkg(ktTrait, subpkg)
                         declaredTraitAsts.putIfMissing(ktTrait, item)
                         if (subpkg.isNotEmpty()) {
                             declaredTraitAsts.putIfMissing("$subpkg.$ktTrait", item)
@@ -856,10 +867,13 @@ private fun scanSourcesWithActiveSession(
                                         val assocKt = KotlinNamingPolicy.Default.toTypeIdentifier(tItem.ident.toString(), allowRawAbi = false)
                                         if (assocKt !in astDefaultlessAssocs) astDefaultlessAssocs += assocKt
                                     }
-                                is TraitItem.Fn ->
+                                is TraitItem.Fn -> {
+                                    val ktFn = rustFunctionIdentToKotlin(tItem.sig.ident.toString())
+                                    registerSymbolInSubpkg(ktFn, subpkg)
                                     if (isSynResultReturnType(tItem.sig.output)) {
-                                        astResultMethods += rustFunctionIdentToKotlin(tItem.sig.ident.toString())
+                                        astResultMethods += ktFn
                                     }
+                                }
                                 else -> {}
                             }
                         }
@@ -871,6 +885,34 @@ private fun scanSourcesWithActiveSession(
                             if (subpkg.isNotEmpty()) traitResultMethods["$subpkg.$ktTrait"] = astResultMethods.toList()
                             if (ktTrait !in traitResultMethods) traitResultMethods[ktTrait] = astResultMethods.toList()
                         }
+                    }
+                    is Item.Struct -> {
+                        val ktType = KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
+                        registerSymbolInSubpkg(ktType, subpkg)
+                    }
+                    is Item.Enum -> {
+                        val ktType = KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
+                        registerSymbolInSubpkg(ktType, subpkg)
+                    }
+                    is Item.Union -> {
+                        val ktType = KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
+                        registerSymbolInSubpkg(ktType, subpkg)
+                    }
+                    is Item.ItemType -> {
+                        val ktType = KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
+                        registerSymbolInSubpkg(ktType, subpkg)
+                    }
+                    is Item.Fn -> {
+                        val ktFn = rustFunctionIdentToKotlin(item.sig.ident.toString())
+                        registerSymbolInSubpkg(ktFn, subpkg)
+                    }
+                    is Item.Const -> {
+                        val ktConst = KotlinNamingPolicy.Default.toConstIdentifier(item.ident.toString())
+                        registerSymbolInSubpkg(ktConst, subpkg)
+                    }
+                    is Item.Static -> {
+                        val ktStatic = rustValueIdentToKotlin(item.ident.toString())
+                        registerSymbolInSubpkg(ktStatic, subpkg)
                     }
                     is Item.Mod -> {
                         val content = item.content

@@ -581,7 +581,8 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
             }
             if (expr.func is Expr.Path && (expr.func as Expr.Path).qself == null && nonUnitArgs.size == 1) {
                 val lastFuncSeg = (expr.func as Expr.Path).path.segments.last()
-                if (lastFuncSeg?.ident?.toString() == "transmute") {
+                val rawTransmuteIdent = lastFuncSeg?.ident?.toString()
+                if (rawTransmuteIdent == "transmute" || rawTransmuteIdent == "transmute_unchecked") {
                     val explicitTypes =
                         (lastFuncSeg.arguments as? PathArguments.AngleBracketed)
                             ?.args
@@ -621,6 +622,16 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                         if (toField != null && toField.second == from) {
                             return "$to(${renderExpr(nonUnitArgs[0], indent, selfTypeName)})"
                         }
+                    }
+                    if ("transmute" !in inspector.declaredTopLevelFnRawNames &&
+                        "transmute_unchecked" !in inspector.declaredTopLevelFnRawNames
+                    ) {
+                        val fnName = if (rawTransmuteIdent == "transmute_unchecked") "transmuteUnchecked" else "transmute"
+                        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+                        if (headerContext.packageName != "$coreNs.mem") {
+                            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.$fnName")
+                        }
+                        return "$fnName(${renderExpr(nonUnitArgs[0], indent, selfTypeName)})"
                     }
                 }
             }
@@ -2911,7 +2922,16 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                 }
             when (val m = expr.member) {
                 is Member.Named -> "$safeBase.${rustFieldIdentToKotlin(m.ident.toString())}"
-                is Member.Unnamed -> "$safeBase.${tupleAccessMemberName(expr.base, m.index.index.toInt(), selfTypeName)}"
+                is Member.Unnamed -> {
+                    val idx = m.index.index.toInt()
+                    val cleanBaseTy = baseRenderedTy?.removeSuffix("?")?.trim()
+                    if (cleanBaseTy == "List<Any?>" || (idx >= 3 && cleanBaseTy?.startsWith("List<") != false)) {
+                        val recv = if (safeBase.any { it == ' ' }) "($safeBase)" else safeBase
+                        "$recv[$idx]"
+                    } else {
+                        "$safeBase.${tupleAccessMemberName(expr.base, idx, selfTypeName)}"
+                    }
+                }
             }
         }
         is Expr.Index -> {
@@ -2947,20 +2967,31 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                         headerContext.rawAbiMode ||
                             headerContext.finalClasses ||
                             baseTy?.startsWith("List<") == true ||
-                            baseTy?.startsWith("MutableList<") == true ->
+                            baseTy?.startsWith("MutableList<") == true -> {
+                            val startIdx = start ?: "0"
+                            val endExcl =
+                                when {
+                                    end == null -> "($base).size"
+                                    indexExpr.limits is RangeLimits.Closed -> "(($end) + 1)"
+                                    else -> end
+                                }
                             when {
                                 start == null && end == null -> base
-                                start != null && end != null -> "(($base).slice($start$op$end))"
-                                start != null -> "(($base).slice($start until $base.size))"
-                                else -> "(($base).slice(0$op$end))"
+                                else -> "(($base).subList($startIdx, $endExcl))"
                             }
-                        else ->
+                        }
+                        else -> {
+                            if (start != null || end != null) {
+                                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+                                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.slice.get")
+                            }
                             when {
                                 start == null && end == null -> base
                                 start != null && end != null -> "$base[$start$op$end]"
                                 start != null -> "$base[$start until $base.size]"
                                 else -> "$base[0$op$end]"
                             }
+                        }
                     }
                 } else {
                     val idx = renderExpr(indexExpr, indent, selfTypeName)

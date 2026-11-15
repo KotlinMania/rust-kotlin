@@ -640,4 +640,90 @@ class CoreIntrinsicLoweringTest {
         assertContains(numConstKt, "F16.SIGN_MASK")
         assertContains(numConstKt, "F128.SIGN_MASK")
     }
+
+    @Test
+    fun coreStdlibSupportSynthesisProvidesRequiredHelpersWithoutSuppressOrJavaImports() {
+        val coreNs = "io.github.kotlinmania.rustlang.core"
+        val allocNs = "io.github.kotlinmania.rustlang.alloc"
+        val coreSupportFiles = renderCoreStdlibSupportFiles(coreNs)
+        assertEquals(
+            listOf(
+                "num/PrimNumOps.kt",
+                "slice/SliceSupport.kt",
+                "str/StrSupport.kt",
+                "cmp/CmpSupport.kt",
+                "array/FixedArray.kt",
+            ),
+            coreSupportFiles.map { it.first },
+        )
+        for ((relPath, content) in coreSupportFiles) {
+            assertFalse(content.contains("@Suppress"), "$relPath must not contain @Suppress")
+            assertFalse(content.contains("// port-lint:"), "$relPath must not contain port-lint directive")
+            assertFalse(content.contains("import java."), "$relPath must not import java.*")
+            assertFalse(content.contains("import javax."), "$relPath must not import javax.*")
+        }
+
+        val byPath = coreSupportFiles.toMap()
+        val primNum = byPath.getValue("num/PrimNumOps.kt")
+        assertContains(primNum, "public data class OverflowingResult<T>")
+        assertContains(primNum, "public fun rustCheckedAdd(a: U128, b: U128): U128?")
+        assertContains(primNum, "public fun rustOverflowingMul(a: I128, b: I128): OverflowingResult<I128>")
+
+        val sliceSupport = byPath.getValue("slice/SliceSupport.kt")
+        assertContains(sliceSupport, "public fun <T> rawSliceList(")
+        assertContains(sliceSupport, "public operator fun <T> MutableList<T>.get(range: IntRange): MutableList<T>")
+
+        val strSupport = byPath.getValue("str/StrSupport.kt")
+        assertContains(strSupport, "public class RustStrChars(")
+
+        val cmpSupport = byPath.getValue("cmp/CmpSupport.kt")
+        assertContains(cmpSupport, "public fun compareNaturalOrder(")
+
+        val fixedArray = byPath.getValue("array/FixedArray.kt")
+        assertContains(fixedArray, "public class FixedArray<T>")
+        assertContains(fixedArray, "public fun <T> typeLayout(")
+
+        val rustString = renderAllocRustStringSupportFile(allocNs, coreNs)
+        assertContains(rustString, "package $allocNs.string")
+        assertContains(rustString, "public class RustString")
+        assertContains(rustString, "FromUtf8Error(bytes, checked.value)")
+        assertFalse(rustString.contains("class FromUtf8Error"))
+        assertFalse(rustString.contains("@Suppress"))
+        assertFalse(rustString.contains("import java."))
+
+        val typeLayout = CoreIntrinsicFfiArtifacts.renderTypeLayoutSupportKotlin(coreNs)
+        assertContains(typeLayout, "import $coreNs.slice.flushMutableSliceWriteBacks")
+        assertContains(typeLayout, "flushMutableSliceWriteBacks(addr,")
+        assertContains(typeLayout, "flushMutableSliceWriteBacks(dst.rawAddress, bytes)")
+    }
+
+    @Test
+    fun wave1ConstGenericTypeLayoutDefaultsAndMutableSliceSubListEmit() {
+        val coreNs = "io.github.kotlinmania.rustlang.core"
+        val rustSource =
+            """
+            #[repr(C)]
+            pub struct Buf<const N: usize> {
+                pub data: [u8; N],
+            }
+
+            pub fn sub(s: &mut [u8]) -> &mut [u8] {
+                &mut s[1..3]
+            }
+            """.trimIndent()
+        val kt =
+            renderSingleKotlinFile(
+                rustSource,
+                FileHeaderContext(
+                    packageName = "$coreNs.demo",
+                    projectGroup = "io.github.kotlinmania",
+                    projectNamespace = coreNs,
+                    crateNamespaces = mapOf("core" to coreNs),
+                    isBatchCrateOutput = true,
+                    rawAbiMode = false,
+                ),
+            ).text
+        assertContains(kt, ": Int = 0")
+        assertContains(kt, ".subList(")
+    }
 }

@@ -54,6 +54,7 @@ internal fun KotlinJ2KEmitter.renderMacroInvocationAsStmtOrExpr(
     indent: String,
     selfTypeName: String?,
 ): String {
+    CoreIntrinsicLowering.renderConstEvalSelectMacro(mac, this, indent, selfTypeName)?.let { return it }
     val macroName =
         mac.path.segments
             .last()
@@ -3062,7 +3063,7 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                             if (bounded != null && isSelfParameterizedTraitName(ktBaseIdent)) {
                                 add(bounded)
                             }
-                            if (bounded != null) {
+                            if (bounded != null && !suppressTraitAssocPlaceholders) {
                                 repeat(lookupAssocs.size) { add("Any?") }
                             }
                         }
@@ -3107,7 +3108,7 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                 }
                 val finalAssocs =
                     lookupAssocs.mapNotNull { assocKt ->
-                        explicitAssocByName[assocKt] ?: if (bounded != null || isKnownCoreOps) "Any?" else null
+                        explicitAssocByName[assocKt] ?: if (!suppressTraitAssocPlaceholders && (bounded != null || isKnownCoreOps)) "Any?" else null
                     }
                 val typeArgs =
                     buildList {
@@ -3152,6 +3153,9 @@ internal fun KotlinJ2KEmitter.runtimeConstTypeArgument(arg: GenericArgument.Type
     val raw = segments[0].ident.toString().removePrefix("r#")
     val typeName = rustTypeIdentToKotlin(raw)
     if (typeName in activeTypeParamNames || typeName in inspector.declaredTypeNames) return null
+    if (raw in activeConstParamNames || rustValueIdentToKotlin(raw) in activeConstParamNames) {
+        return rustValueIdentToKotlin(raw)
+    }
     return scopeBuilder.resolveLocalKotlinName(raw) ?: inspector.declaredConstNames[raw]
 }
 
@@ -3196,7 +3200,7 @@ internal fun KotlinJ2KEmitter.renderTypeParametersFromParams(
                         param.bounds
                             .toList()
                             .mapNotNull { renderTypeParamBound(it, selfTypeName) }
-                            .filter { it != "Any" && it != name && !it.contains("->") }
+                            .filter { it != "Any" && it != name && !it.contains("->") && !it.startsWith("SimdElement") }
                     } finally {
                         currentBoundedTypeName = prevBounded
                     }
@@ -3293,7 +3297,7 @@ internal fun KotlinJ2KEmitter.renderCombinedWhereClause(
             try {
                 for (bound in pred.bounds.toList()) {
                     val b = renderTypeParamBound(bound, selfTypeName)
-                    if (b != null && b != "Any" && b != boundedTy && !b.contains("->")) {
+                    if (b != null && b != "Any" && b != boundedTy && !b.contains("->") && !b.startsWith("SimdElement")) {
                         clauses += "$boundedTy : $b"
                     }
                 }
@@ -3497,6 +3501,15 @@ internal fun KotlinJ2KEmitter.collectGenericTypeParamNames(generics: Generics?):
         .toList()
         .mapNotNull { param ->
             (param as? GenericParam.TypeParam)?.ident?.toString()?.let(::rustTypeIdentToKotlin)
+        }.toSet()
+}
+
+internal fun KotlinJ2KEmitter.collectGenericConstParamNames(generics: Generics?): Set<String> {
+    if (generics == null) return emptySet()
+    return generics.params
+        .toList()
+        .mapNotNull { param ->
+            (param as? GenericParam.ConstParam)?.ident?.toString()?.let(::rustValueIdentToKotlin)
         }.toSet()
 }
 
