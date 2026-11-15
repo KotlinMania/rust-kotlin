@@ -1077,6 +1077,46 @@ internal fun KotlinJ2KEmitter.renderExprPath(exprPath: Expr.Path, selfTypeName: 
     val qself = exprPath.qself
     val path = exprPath.path
     if (qself != null) {
+        val lastConst =
+            path.segments
+                .toList()
+                .lastOrNull()
+                ?.ident
+                ?.toString()
+                ?.removePrefix("r#")
+        if (lastConst in SIZED_TYPE_PROPERTY_NAMES) {
+            val segs = path.segments.toList()
+            val traitSegName =
+                if (qself.position > 0) {
+                    segs
+                        .getOrNull(qself.position - 1)
+                        ?.ident
+                        ?.toString()
+                        ?.removePrefix("r#")
+                } else {
+                    null
+                }
+            val qselfInner = unwrapSynType(qself.ty)
+            val qselfSingleKt =
+                (qselfInner as? SynType.Path)
+                    ?.takeIf { it.qself == null && it.path.segments.size == 1 }
+                    ?.path
+                    ?.segments
+                    ?.first()
+                    ?.ident
+                    ?.toString()
+                    ?.let(::rustTypeIdentToKotlin)
+            val isSizedTraitOrTypeParam =
+                traitSegName == "SizedTypeProperties" ||
+                    (qselfSingleKt != null && qselfSingleKt in activeTypeParamNames) ||
+                    (
+                        (qself.position == 0 || traitSegName == null) &&
+                            lastConst in setOf("IS_ZST", "LAYOUT", "MAX_SLICE_LEN", "ALIGNMENT")
+                    )
+            if (isSizedTraitOrTypeParam) {
+                renderSizedTypePropertyConst(qself.ty, lastConst!!, selfTypeName)?.let { return it }
+            }
+        }
         val baseTy = renderType(qself.ty, selfTypeName)
         val allSegs = path.segments.toList()
         val lastSeg = allSegs.lastOrNull()
@@ -1384,6 +1424,27 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
                 .orEmpty()
         return if (asCallee) "this.$ktMethod$methodTypeArgs" else "this::$ktMethod"
     }
+    if (!asCallee && rawSegments.size >= 2) {
+        val constIdent = rawSegNames.last()
+        if (constIdent in SIZED_TYPE_PROPERTY_NAMES) {
+            val headKt = rustTypeIdentToKotlin(rawSegNames[0])
+            val isSizedOwner =
+                headKt in activeTypeParamNames ||
+                    (
+                        rawSegments.size == 2 &&
+                            constIdent in setOf("IS_ZST", "LAYOUT", "MAX_SLICE_LEN", "ALIGNMENT") &&
+                            constIdent !in inspector.declaredConstNames &&
+                            headKt !in inspector.unitStructNames &&
+                            (rawSegNames[0] == "Self" || headKt in inspector.declaredTypeNames || !isScreamingSnakeIdent(rawSegNames[0]))
+                    )
+            if (isSizedOwner) {
+                val ownerSegIdent =
+                    if (rawSegments.size == 2) rawSegments[0].ident else rawSegments[rawSegments.lastIndex - 1].ident
+                val ownerSyn = SynType.Path(null, Path.from(ownerSegIdent))
+                renderSizedTypePropertyConst(ownerSyn, constIdent, selfTypeName)?.let { return it }
+            }
+        }
+    }
     renderPrimitiveAssociatedConst(
         rawSegNames,
         hasTrailingArgs = rawSegments.last().arguments !is PathArguments.None,
@@ -1540,6 +1601,9 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
                         if (lastRaw.first().isUpperCase() && !isScreamingSnakeIdent(lastRaw) && boundHead in inspector.unitStructNames) {
                             return "$boundHead()"
                         }
+                        if (lastRaw.first().isUpperCase() && !isScreamingSnakeIdent(lastRaw)) {
+                            resolveStdlibUnitStructValueExpr(rawSegNames)?.let { return it }
+                        }
                         if (lastRaw.first().isLowerCase() &&
                             '.' !in boundHead &&
                             cleanLast in inspector.declaredTopLevelFnRawNames &&
@@ -1606,6 +1670,9 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
             val singleTypeIdent = rustTypeIdentToKotlin(singleRaw)
             if (singleTypeIdent in inspector.unitStructNames) {
                 return "$singleTypeIdent()"
+            }
+            if (!asCallee) {
+                resolveStdlibUnitStructValueExpr(listOf(singleRaw))?.let { return it }
             }
         }
         if (cleanSingle != "self" &&

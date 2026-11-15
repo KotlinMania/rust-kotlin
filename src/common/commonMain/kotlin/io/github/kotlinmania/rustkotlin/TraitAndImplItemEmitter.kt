@@ -1302,6 +1302,10 @@ internal fun KotlinJ2KEmitter.renderStandaloneItemImpl(
     val prevStandaloneTraitPath = currentStandaloneImplTraitPath
     val prevStandaloneSelfTy = currentStandaloneImplSelfSynType
     val prevAssocTypes = currentImplAssocTypes
+    val prevImplTypeParams = activeTypeParamNames
+    val prevImplConstParams = activeConstParamNames
+    activeTypeParamNames = prevImplTypeParams + collectGenericTypeParamNames(item.generics)
+    activeConstParamNames = prevImplConstParams + collectGenericConstParamNames(item.generics)
     if (closureRecv != null) {
         substitutedTypeParamTypes = prevSubst + (closureRecv.first to closureRecv.second)
     }
@@ -1422,6 +1426,8 @@ internal fun KotlinJ2KEmitter.renderStandaloneItemImpl(
         currentStandaloneImplTraitPath = prevStandaloneTraitPath
         currentStandaloneImplSelfSynType = prevStandaloneSelfTy
         substitutedTypeParamTypes = prevSubst
+        activeConstParamNames = prevImplConstParams
+        activeTypeParamNames = prevImplTypeParams
     }
 }
 

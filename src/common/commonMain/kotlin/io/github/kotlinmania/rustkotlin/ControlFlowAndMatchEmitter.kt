@@ -201,9 +201,13 @@ internal fun KotlinJ2KEmitter.tryRenderSingleEvalIfLet(
         }
 
     val usedInThen = collectUsedRawIdentsInBlock(ifExpr.thenBranch)
+    val prevOuterTyped = currentTypedLocals
     scopeBuilder.enterCompr()
     return try {
         val subjectVar = scopeBuilder.bindLocal("_match", "matchVal", cond.expr.span()).kotlinName
+        inferExprRenderedType(cond.expr, selfTypeName)?.let {
+            currentTypedLocals = currentTypedLocals + (subjectVar to it)
+        }
         val boolCond =
             if (requiresBoolCond) {
                 val savedBoolKind = currentExpectedNumericKind
@@ -263,6 +267,7 @@ internal fun KotlinJ2KEmitter.tryRenderSingleEvalIfLet(
         }
     } finally {
         scopeBuilder.exitCompr()
+        currentTypedLocals = prevOuterTyped
     }
 }
 
@@ -305,7 +310,10 @@ internal fun KotlinJ2KEmitter.renderExprWhile(expr: Expr.While, indent: String, 
             val bodyBlock =
                 try {
                     val subjectVar = scopeBuilder.bindLocal("_match", "matchVal", cond.expr.span()).kotlinName
-                    val condCheck = renderIfLetPatternAgainstRhs(cond.pat, subjectVar, innerIndent, selfTypeName)
+                    inferExprRenderedType(cond.expr, selfTypeName)?.let {
+                        currentTypedLocals = currentTypedLocals + (subjectVar to it)
+                    }
+                    val condCheck = renderIfLetPatternAgainstRhs(cond.pat, subjectVar, innerIndent, selfTypeName, cond.expr)
                     val breakLine =
                         when {
                             condCheck == "$subjectVar != null" -> "${innerIndent}if ($subjectVar == null) break"
@@ -362,7 +370,7 @@ internal fun KotlinJ2KEmitter.renderExprWhile(expr: Expr.While, indent: String, 
 
 internal fun KotlinJ2KEmitter.renderIfLetCondition(pat: Pat, expr: Expr, indent: String, selfTypeName: String?): String {
     val rhs = renderExpr(expr, indent, selfTypeName)
-    return renderIfLetPatternAgainstRhs(pat, rhs, indent, selfTypeName)
+    return renderIfLetPatternAgainstRhs(pat, rhs, indent, selfTypeName, expr)
 }
 
 internal fun KotlinJ2KEmitter.recordOptionLetPatternLocalTypes(pat: Pat, expr: Expr, selfTypeName: String?) {
@@ -430,19 +438,27 @@ internal fun KotlinJ2KEmitter.coreResultVariantMatchInfo(pat: Pat.TupleStruct): 
     return "${sourceResultName()}.$variant" to prop
 }
 
-internal fun KotlinJ2KEmitter.renderIfLetPatternAgainstRhs(pat: Pat, rhs: String, indent: String, selfTypeName: String?): String =
+internal fun KotlinJ2KEmitter.renderIfLetPatternAgainstRhs(
+    pat: Pat,
+    rhs: String,
+    indent: String,
+    selfTypeName: String?,
+    subjectExpr: Expr? = null,
+): String =
     when (pat) {
         is Pat.TupleStruct -> {
             val coreResultInfo = coreResultVariantMatchInfo(pat)
             if (isOptionSomeTupleStructPat(pat)) {
                 val firstSub = pat.elems.toList().firstOrNull()
                 if (firstSub != null && isDiscriminatingOptionInnerPattern(firstSub)) {
-                    renderIfLetPatternAgainstRhs(firstSub, rhs, indent, selfTypeName)
+                    renderIfLetPatternAgainstRhs(firstSub, rhs, indent, selfTypeName, subjectExpr)
                 } else {
                     "$rhs != null"
                 }
             } else if (coreResultInfo != null) {
-                "$rhs is ${coreResultInfo.first}<*, *>"
+                val scrutineeType = subjectExpr?.let { inferExprRenderedType(it, selfTypeName) } ?: currentTypedLocals[rhs]
+                val starArgs = if (isUntypedResultScrutinee(scrutineeType)) "<*, *>" else ""
+                "$rhs is ${coreResultInfo.first}$starArgs"
             } else if (patRequiresBooleanCondition(pat)) {
                 renderPatternBooleanCondition(pat, rhs, indent, selfTypeName)
             } else {
@@ -739,6 +755,7 @@ internal fun KotlinJ2KEmitter.renderExprMatch(expr: Expr.Match, indent: String, 
     val needsSubjectVar =
         mutRefWritebackTarget != null ||
             (!isSimpleSubject && effectiveArms.any { armReferencesSubject(armPattern(it)) })
+    val prevMatchTyped = currentTypedLocals
     scopeBuilder.enterCompr()
     return try {
         val subjectVar =
@@ -790,6 +807,7 @@ internal fun KotlinJ2KEmitter.renderExprMatch(expr: Expr.Match, indent: String, 
         sb.toString()
     } finally {
         scopeBuilder.exitCompr()
+        currentTypedLocals = prevMatchTyped
     }
 }
 
@@ -874,7 +892,8 @@ internal fun KotlinJ2KEmitter.tryRenderStdlibResultMatch(
         val ifText =
             if (taggedCoreResult) {
                 val result = sourceResultName()
-                "when ($subjectVar) { is $result.Ok<*, *> -> $okBranch; is $result.Err<*, *> -> $errBranch }"
+                val starArgs = if (isUntypedResultScrutinee(inferExprRenderedType(expr.expr, selfTypeName))) "<*, *>" else ""
+                "when ($subjectVar) { is $result.Ok$starArgs -> $okBranch; is $result.Err$starArgs -> $errBranch }"
             } else {
                 "if ($subjectVar.isSuccess) $okBranch else $errBranch"
             }
@@ -1490,7 +1509,8 @@ internal fun KotlinJ2KEmitter.renderPatternBooleanCondition(
             } else {
                 val coreResultInfo = coreResultVariantMatchInfo(pat)
                 if (coreResultInfo != null) {
-                    val castType = "${coreResultInfo.first}<*, *>"
+                    val starArgs = if (isUntypedResultScrutinee(currentTypedLocals[subjectExpr])) "<*, *>" else ""
+                    val castType = "${coreResultInfo.first}$starArgs"
                     val elemRecv =
                         if (scopeBuilder.isSmartCastableLocalKotlinName(subjectExpr)) {
                             subjectExpr
@@ -1636,7 +1656,8 @@ internal fun KotlinJ2KEmitter.collectPatternGuardAccessMap(
             } else {
                 val coreResultInfo = coreResultVariantMatchInfo(pat)
                 if (coreResultInfo != null && elems.size == 1 && elems[0] !is Pat.Rest) {
-                    collectPatternGuardAccessMap(elems[0], "($subjectText as ${coreResultInfo.first}<*, *>).${coreResultInfo.second}", selfTypeName, out)
+                    val starArgs = if (isUntypedResultScrutinee(currentTypedLocals[subjectText])) "<*, *>" else ""
+                    collectPatternGuardAccessMap(elems[0], "($subjectText as ${coreResultInfo.first}$starArgs).${coreResultInfo.second}", selfTypeName, out)
                 } else {
                     val variantType = renderPathAsType(pat.path, selfTypeName)
                     for ((idx, sub) in elems.withIndex()) {
@@ -1792,11 +1813,12 @@ internal fun KotlinJ2KEmitter.extractMatchArmBindings(
                         val subNames = extractPatternBindingNames(sub, selfTypeName, includeCtorInTupleStruct = false, bindToScope = bindToScope)
                         val boundName = subNames.singleOrNull()
                         if (boundName != null && boundName != "_") {
+                            val starArgs = if (isUntypedResultScrutinee(currentTypedLocals[subjectText])) "<*, *>" else ""
                             val accessTarget =
                                 if (subjectAlreadySmartCast) {
                                     "$subjectText.${coreResultInfo.second}"
                                 } else {
-                                    "($subjectText as ${coreResultInfo.first}<*, *>).${coreResultInfo.second}"
+                                    "($subjectText as ${coreResultInfo.first}$starArgs).${coreResultInfo.second}"
                                 }
                             lines += "${indent}val $boundName = $accessTarget"
                         }
@@ -2136,7 +2158,8 @@ internal fun KotlinJ2KEmitter.renderMatchPatternCondition(
                     "else"
                 }
             } else if (coreResultInfo != null) {
-                "is ${coreResultInfo.first}<*, *>"
+                val starArgs = if (isUntypedResultScrutinee(currentTypedLocals[subjectText])) "<*, *>" else ""
+                "is ${coreResultInfo.first}$starArgs"
             } else {
                 "is ${renderPathAsType(pat.path, selfTypeName)}"
             }

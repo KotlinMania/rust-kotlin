@@ -164,6 +164,14 @@ internal class CrateSymbolInspector(
     val structFieldNamesByType: MutableMap<String, List<String>> = linkedMapOf()
     val structFieldSynTypesByType: MutableMap<String, Map<String, SynType>> = linkedMapOf()
     val declaredTraitsByName: MutableMap<String, Item.Trait> = linkedMapOf()
+    val typeDefaultArgsByType: MutableMap<String, List<Pair<String, SynType?>>> = linkedMapOf()
+
+    private fun recordTypeDefaultArgs(ktName: String, generics: Generics) {
+        val typeParams = generics.params.toList().filterIsInstance<GenericParam.TypeParam>()
+        if (typeParams.any { it.default != null } && ktName !in typeDefaultArgsByType) {
+            typeDefaultArgsByType[ktName] = typeParams.map { rustTypeIdentToKotlin(it.ident.toString()) to it.default?.type }
+        }
+    }
     val instanceMethodsByType: MutableMap<String, MutableSet<String>> = linkedMapOf()
     val companionMethodsByType: MutableMap<String, MutableSet<String>> = linkedMapOf()
     val nullableFieldsByType: MutableMap<String, MutableSet<String>> = linkedMapOf()
@@ -518,6 +526,7 @@ internal class CrateSymbolInspector(
         if (blockDepth == 0) {
             declaredTypeNames += name
             attachableTypeNames += name
+            recordTypeDefaultArgs(name, i.generics)
         }
         when (val fields = i.fields) {
             is Fields.Unnamed -> {
@@ -579,6 +588,7 @@ internal class CrateSymbolInspector(
         if (blockDepth == 0) {
             declaredTypeNames += name
             attachableTypeNames += name
+            recordTypeDefaultArgs(name, i.generics)
         }
         val enumTypeParams =
             i.generics.params
@@ -694,6 +704,7 @@ internal class CrateSymbolInspector(
             }
         } else if (!isExternalIdentityTypeReexportAlias(i, selfCrateAliases, localInlineModuleNames)) {
             declaredTypeNames += name
+            recordTypeDefaultArgs(name, i.generics)
             if (name !in typeAliasTargets) {
                 typeAliasTargets[name] = i.ty
             }

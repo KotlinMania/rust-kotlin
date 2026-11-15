@@ -798,7 +798,11 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
     if (isStdlibFmtModule) {
         if (rawName == "Formatter") return "StringBuilder"
         if (rawName == "Write") return "Appendable"
-        if (rawName == "Result" || rawName == "Error") return "Unit"
+        if ((rawName == "Result" || rawName == "Error") &&
+            headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") != true
+        ) {
+            return "Unit"
+        }
         if (rawName == "DebugStruct" && "DebugStruct" !in inspector.declaredTypeNames) {
             usesDebugStruct = true
             return "DebugStruct"
@@ -872,6 +876,78 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
             }
         if (resolvedFfiImport != null) {
             return bindOrQualifyResolvedCrossSymbol(resolvedFfiImport)
+        }
+    }
+
+    if (!headerContext.rawAbiMode &&
+        rawName == "Result" &&
+        "Ok" !in inspector.declaredTypeNames &&
+        !hasDeclaredResultEnum()
+    ) {
+        val rawSegNames = rawSegments.map { it.ident.toString().removePrefix("r#") }
+        val modHead = rawSegNames.getOrNull(rawSegNames.size - 2)
+        val resolvedModImp =
+            if (rawSegNames.size == 2 && modHead != null) {
+                scopeBuilder.resolveModuleBinding(modHead)?.importedPath
+            } else {
+                null
+            }
+        val matchesStdMod: (String) -> Boolean = { expected ->
+            val modIdx = rawSegNames.size - 2
+            (
+                modIdx >= 0 &&
+                    rawSegNames[modIdx] == expected &&
+                    (modIdx == 0 || rawSegNames[modIdx - 1] in setOf("core", "std", "alloc"))
+            ) ||
+                resolvedModImp == expected ||
+                resolvedModImp == "core.$expected" ||
+                resolvedModImp == "std.$expected" ||
+                resolvedModImp == "alloc.$expected"
+        }
+        val isTaggedOrRustLangStd =
+            usesTaggedCoreResult() ||
+                headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true
+        if (lastSeg.arguments is PathArguments.None &&
+            rawSegNames.size >= 2 &&
+            matchesStdMod("fmt") &&
+            isTaggedOrRustLangStd &&
+            ("Result" !in inspector.declaredTypeNames || rawSegNames.dropLast(1).lastOrNull() == "fmt" || resolvedModImp != null)
+        ) {
+            if (!usesTaggedCoreResult()) {
+                return if ("Result" in inspector.declaredTypeNames) "kotlin.Result<Unit>" else "Result<Unit>"
+            }
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+            val errRef = bindOrQualifyResolvedCrossSymbol("$coreNs.fmt.Error")
+            val resName =
+                if ("Result" in inspector.declaredTypeNames) {
+                    "$coreNs.result.Result"
+                } else {
+                    sourceResultName()
+                }
+            return "$resName<Unit, $errRef>"
+        }
+        if (lastSeg.arguments is PathArguments.AngleBracketed) {
+            val isStdOrCoreResult =
+                rawSegNames.size == 1 ||
+                    matchesStdMod("result") ||
+                    (rawSegNames.size == 2 && modHead == "result")
+            val argsList =
+                (lastSeg.arguments as PathArguments.AngleBracketed)
+                    .args
+                    .toList()
+                    .mapNotNull { renderGenericArgument(it, selfTypeName) }
+            if (isStdOrCoreResult &&
+                argsList.size == 2 &&
+                (rawSegNames.size >= 2 || "Result" !in inspector.declaredTypeNames)
+            ) {
+                return when {
+                    usesTaggedCoreResult() && "Result" in inspector.declaredTypeNames ->
+                        "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.result.Result<${argsList.joinToString(", ")}>"
+                    usesTaggedCoreResult() -> "${sourceResultName()}<${argsList.joinToString(", ")}>"
+                    "Result" in inspector.declaredTypeNames -> "kotlin.Result<${argsList[0]}>"
+                    else -> "Result<${argsList[0]}>"
+                }
+            }
         }
     }
 
@@ -1267,9 +1343,10 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                             true
                         }
                     }
-                val typeArgs =
-                    filteredArgs.mapNotNull { renderGenericArgument(it, selfTypeName) } +
-                        sourceAssociatedArguments(path, selfTypeName)
+                val rawSegNames = rawSegments.map { it.ident.toString().removePrefix("r#") }
+                val explicitArgs = filteredArgs.mapNotNull { renderGenericArgument(it, selfTypeName) }
+                val defaultedArgs = appendStdlibDefaultTypeArgsIfNeeded(mappedBase, rawName, rawSegNames, explicitArgs, selfTypeName)
+                val typeArgs = defaultedArgs + sourceAssociatedArguments(path, selfTypeName)
                 if (typeArgs.isEmpty()) mappedBase else "$mappedBase<${typeArgs.joinToString(", ")}>"
             }
         }

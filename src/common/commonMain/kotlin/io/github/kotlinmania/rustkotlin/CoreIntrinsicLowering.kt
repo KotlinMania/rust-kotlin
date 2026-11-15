@@ -1499,22 +1499,32 @@ public object CoreIntrinsicLowering {
             val ptrPkg = "$coreNs.ptr"
             val args = spec.callArgsList.map { emitter.renderExpr(it, indent, selfTypeName) }
             registerCoreImport(emitter, "$ptrPkg.MutPtr")
+            fun alignArgExpr(argIdx: Int): String {
+                val alignSyn = spec.callArgsList.getOrNull(argIdx)
+                val alignTy = alignSyn?.let { emitter.inferExprRenderedType(it, selfTypeName) }?.removeSuffix("?")?.trim()
+                val rawArg = args[argIdx]
+                return if (alignTy == "Alignment" || alignTy?.endsWith(".Alignment") == true) {
+                    "($rawArg).asUsize().toLong()"
+                } else {
+                    "($rawArg).toLong()"
+                }
+            }
             return when (rawName) {
                 "__rust_alloc" -> {
                     registerCoreImport(emitter, "$intrPkg.kmAlloc")
-                    "MutPtr(kmAlloc((${args[0]}).toLong(), (${args[1]}).toLong()))"
+                    "MutPtr(kmAlloc((${args[0]}).toLong(), ${alignArgExpr(1)}))"
                 }
                 "__rust_alloc_zeroed" -> {
                     registerCoreImport(emitter, "$intrPkg.kmAllocZeroed")
-                    "MutPtr(kmAllocZeroed((${args[0]}).toLong(), (${args[1]}).toLong()))"
+                    "MutPtr(kmAllocZeroed((${args[0]}).toLong(), ${alignArgExpr(1)}))"
                 }
                 "__rust_realloc" -> {
                     registerCoreImport(emitter, "$intrPkg.kmRealloc")
-                    "MutPtr(kmRealloc((${args[0]}).rawAddress, (${args[1]}).toLong(), (${args[2]}).toLong(), (${args[3]}).toLong()))"
+                    "MutPtr(kmRealloc((${args[0]}).rawAddress, (${args[1]}).toLong(), ${alignArgExpr(2)}, (${args[3]}).toLong()))"
                 }
                 "__rust_dealloc" -> {
                     registerCoreImport(emitter, "$intrPkg.kmDealloc")
-                    "kmDealloc((${args[0]}).rawAddress, (${args[1]}).toLong(), (${args[2]}).toLong())"
+                    "kmDealloc((${args[0]}).rawAddress, (${args[1]}).toLong(), ${alignArgExpr(2)})"
                 }
                 else -> null
             }

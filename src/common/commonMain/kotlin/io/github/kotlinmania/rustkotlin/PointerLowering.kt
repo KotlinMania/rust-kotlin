@@ -510,7 +510,19 @@ internal fun KotlinJ2KEmitter.sourceAssociatedParameters(generics: Generics): Li
 
 internal fun KotlinJ2KEmitter.sourceAssociatedArguments(path: io.github.kotlinmania.syn.Path, selfType: String?): List<String> {
     val segment = path.segments.last() ?: return emptyList()
-    val declaration = transparentDeclaration(segment.ident.toString()) ?: return emptyList()
+    val rawIdent = segment.ident.toString().removePrefix("r#")
+    val declaration = transparentDeclaration(rawIdent)
+    if (declaration == null) {
+        val rawFirstArgSyn =
+            (segment.arguments as? PathArguments.AngleBracketed)
+                ?.args
+                ?.toList()
+                ?.filterIsInstance<GenericArgument.TypeArg>()
+                ?.firstOrNull()
+                ?.type
+        val renderedFirst = rawFirstArgSyn?.let { renderType(it, selfType) }
+        return resolveStdlibAssociatedArgs(rustTypeIdentToKotlin(rawIdent), rawFirstArgSyn, renderedFirst)
+    }
     val parameters =
         declaration.generics.params
             .toList()

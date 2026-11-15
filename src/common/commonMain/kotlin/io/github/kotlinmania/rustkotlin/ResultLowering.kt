@@ -209,14 +209,27 @@ internal fun KotlinJ2KEmitter.renderSourceResultConstructor(call: Expr.Call, var
             .map { renderType(it.type, selfType) }
     val expected = rustResultTypeArguments(currentExpectedParseTargetType) ?: rustResultTypeArguments(currentEnclosingReturnRenderedType)
     val typeArguments =
-        if (explicit.size == 1) "<${explicit[0]}>" else ""
-    val payload = rawArgs.single()
+        when {
+            explicit.size == 2 ->
+                buildExplicitResultTypeArgsSuffix(
+                    explicit[0].takeUnless { it.trim() == "_" } ?: expected?.first,
+                    explicit[1].takeUnless { it.trim() == "_" } ?: expected?.second,
+                )
+            explicit.size == 1 ->
+                if (variant == "Ok") {
+                    buildExplicitResultTypeArgsSuffix(explicit[0].takeUnless { it.trim() == "_" } ?: expected?.first, expected?.second)
+                } else {
+                    buildExplicitResultTypeArgsSuffix(expected?.first, explicit[0].takeUnless { it.trim() == "_" } ?: expected?.second)
+                }
+            else -> buildExplicitResultTypeArgsSuffix(expected?.first, expected?.second)
+        }
+    val payload = rawArgs.singleOrNull()
     val expectedPayload = expected?.let { if (variant == "Ok") it.first else it.second }
     val previousExpected = currentExpectedParseTargetType
     currentExpectedParseTargetType = expectedPayload
     val value =
         try {
-            if (payload is Expr.Tuple && payload.elems.isEmpty()) {
+            if (payload == null || (payload is Expr.Tuple && payload.elems.isEmpty())) {
                 "Unit"
             } else {
                 renderTypedNumericInitializer(payload, expectedPayload?.let { resolveNumericKind(it) } ?: currentExpectedNumericKind, indent, selfType)
@@ -237,7 +250,15 @@ internal fun KotlinJ2KEmitter.renderSourceResultTry(expression: String, returnKe
         return "$expression.getOrElse { $returnKeyword Result.failure(it) }"
     }
     val result = sourceResultName()
-    return "when (val tryResult = $expression) { is $result.Ok<*, *> -> tryResult.value; is $result.Err<*, *> -> $returnKeyword $result.Err(tryResult.error) }"
+    val starArgs = if (isUntypedResultScrutinee(sourceType)) "<*, *>" else ""
+    val errTypeArgs =
+        if (returnKeyword.startsWith("return")) {
+            val enclosingPair = rustResultTypeArguments(currentEnclosingReturnRenderedType)
+            buildExplicitResultTypeArgsSuffix(enclosingPair?.first, enclosingPair?.second)
+        } else {
+            ""
+        }
+    return "when (val tryResult = $expression) { is $result.Ok$starArgs -> tryResult.value; is $result.Err$starArgs -> $returnKeyword $result.Err$errTypeArgs(tryResult.error) }"
 }
 
 /** The typed derived-equality method preserves Rust's equality type constraints.

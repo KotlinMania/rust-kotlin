@@ -927,12 +927,14 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
         }
     }
 
+    val defaultLayoutParamNames = linkedSetOf<String>()
     if (!hasReceiver) {
         transparentConstructorField(selfTypeName, fnBlock)?.let { (_, fieldType) ->
             val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
             CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.TypeLayout")
             val layoutType = "TypeLayout<$fieldType>"
             params += "fieldLayout: $layoutType"
+            defaultLayoutParamNames += "fieldLayout"
             paramTypeSignatureKeys += eraseTypeForSignatureKey(layoutType)
             currentTypedLocals = currentTypedLocals + ("fieldLayout" to layoutType)
         }
@@ -964,6 +966,7 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
     for ((layoutName, layoutType) in layoutParams) {
         if (params.none { it.startsWith("$layoutName:") }) {
             params += "$layoutName: $layoutType"
+            defaultLayoutParamNames += layoutName
             paramTypeSignatureKeys += eraseTypeForSignatureKey(layoutType)
             currentTypedLocals = currentTypedLocals + (layoutName to layoutType)
         }
@@ -1199,7 +1202,22 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
     val inlinePrefix = if (reifiedFnTypeParams.isNotEmpty()) "inline " else ""
     val operatorPrefix = if (hasReceiver && effectiveFnName == "compareTo" && renderedReturnType == "Int") "operator " else ""
     val typeParamsPart = if (effectiveTypeParamsStr.isNotEmpty()) "$effectiveTypeParamsStr " else ""
-    return "${visPrefix}${effectiveOpenPrefix}${operatorPrefix}${inlinePrefix}fun ${typeParamsPart}${receiverPrefix}$effectiveFnName(${params.joinToString(", ")})${retTypeStr}$whereClause"
+    val finalParams =
+        if (!effectiveOpenPrefix.contains("override") && defaultLayoutParamNames.isNotEmpty()) {
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+            params.map { param ->
+                val pName = param.substringBefore(':').trim()
+                if (pName in defaultLayoutParamNames && !param.contains('=')) {
+                    "$param = UnresolvedTypeLayout()"
+                } else {
+                    param
+                }
+            }
+        } else {
+            params
+        }
+    return "${visPrefix}${effectiveOpenPrefix}${operatorPrefix}${inlinePrefix}fun ${typeParamsPart}${receiverPrefix}$effectiveFnName(${finalParams.joinToString(", ")})${retTypeStr}$whereClause"
 }
 
 private fun prefixTopLevelTypeParamWithReified(typeParamsStr: String, tpKt: String): String {
@@ -2357,7 +2375,8 @@ internal fun KotlinJ2KEmitter.tryRenderDeferredLocalResultMatchInit(
                 }
             }
         val resultType = sourceResultName()
-        out += "${trivia1}${trivia2}${innerIndent}val $okVar = when (val matchResult = $subjectRendered) { is $resultType.Ok<*, *> -> matchResult.value; is $resultType.Err<*, *> -> $errRender }"
+        val starArgs = if (isUntypedResultScrutinee(inferExprRenderedType(matchExpr.expr, selfTypeName))) "<*, *>" else ""
+        out += "${trivia1}${trivia2}${innerIndent}val $okVar = when (val matchResult = $subjectRendered) { is $resultType.Ok$starArgs -> matchResult.value; is $resultType.Err$starArgs -> $errRender }"
     } else {
         val errRender =
             run {
@@ -2915,8 +2934,20 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
             currentNullableLocals = currentNullableLocals + patText
         }
     }
+    val coreResultLetElseInfo =
+        if (divergeBody != null && unwrappedPat is Pat.TupleStruct && !patText.startsWith("(")) {
+            coreResultVariantMatchInfo(unwrappedPat)
+        } else {
+            null
+        }
     val typeSuffix = if (typeAnnotation != null && !patText.startsWith("(")) ": $typeAnnotation" else ""
-    return if (divergeBody != null) {
+    return if (coreResultLetElseInfo != null && divergeBody != null) {
+        val isOkVariant = coreResultLetElseInfo.first.endsWith(".Ok")
+        val divergeVariant = if (isOkVariant) "${sourceResultName()}.Err" else "${sourceResultName()}.Ok"
+        val starArgs = if (isUntypedResultScrutinee(inferExprRenderedType(initExpr, selfTypeName))) "<*, *>" else ""
+        val tryVar = scopeBuilder.bindLocal("_try", "tryResult", initExpr.span()).kotlinName
+        "$indent$keyword $patText$typeSuffix = when (val $tryVar = $rhs) { is ${coreResultLetElseInfo.first}$starArgs -> $tryVar.${coreResultLetElseInfo.second}; is $divergeVariant$starArgs -> $divergeBody }"
+    } else if (divergeBody != null) {
         "$indent$keyword $patText$typeSuffix = $rhs ?: $divergeBody"
     } else if (headerContext.isBatchCrateOutput && rhs.contains('\n')) {
         "$indent$keyword $patText$typeSuffix =\n$indent    ${rhs.replace("\n", "\n    ")}"

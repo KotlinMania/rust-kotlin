@@ -1016,6 +1016,76 @@ internal fun KotlinJ2KEmitter.computeRequiredTypeLayoutParameters(
             super.visitExprMethodCall(e)
         }
 
+        override fun visitExprPath(e: Expr.Path) {
+            val constIdent =
+                e.path.segments
+                    .toList()
+                    .lastOrNull()
+                    ?.ident
+                    ?.toString()
+                    ?.removePrefix("r#")
+            if (constIdent in SIZED_TYPE_PROPERTY_NAMES) {
+                val qself = e.qself
+                if (qself != null) {
+                    val segs = e.path.segments.toList()
+                    val traitSegName =
+                        if (qself.position > 0) {
+                            segs
+                                .getOrNull(qself.position - 1)
+                                ?.ident
+                                ?.toString()
+                                ?.removePrefix("r#")
+                        } else {
+                            null
+                        }
+                    if (qself.position == 0 ||
+                        traitSegName == "SizedTypeProperties" ||
+                        constIdent in setOf("IS_ZST", "LAYOUT", "MAX_SLICE_LEN", "ALIGNMENT")
+                    ) {
+                        recordRequiredFromSynType(qself.ty)
+                    }
+                } else {
+                    val segs = e.path.segments.toList()
+                    if (segs.size == 2) {
+                        val ownerRaw = segs[0].ident.toString().removePrefix("r#")
+                        val ownerKt = rustTypeIdentToKotlin(ownerRaw)
+                        val isSizedProp =
+                            ownerRaw != "Self" &&
+                                (
+                                    constIdent in setOf("IS_ZST", "LAYOUT", "MAX_SLICE_LEN", "ALIGNMENT") ||
+                                        !isScreamingSnakeIdent(ownerRaw)
+                                ) &&
+                                ownerKt !in inspector.unitStructNames &&
+                                constIdent !in inspector.declaredConstNames
+                        if (isSizedProp) {
+                            recordRequiredFromSynType(
+                                SynType.Path(
+                                    null,
+                                    io.github.kotlinmania.syn.Path
+                                        .from(segs[0].ident),
+                                ),
+                            )
+                            (segs[0].arguments as? PathArguments.AngleBracketed)
+                                ?.args
+                                ?.toList()
+                                .orEmpty()
+                                .filterIsInstance<GenericArgument.TypeArg>()
+                                .forEach { recordRequiredFromSynType(it.type) }
+                        }
+                    } else if (segs.size >= 3 && constIdent in setOf("IS_ZST", "LAYOUT", "MAX_SLICE_LEN", "ALIGNMENT")) {
+                        recordRequiredFromSynType(
+                            SynType.Path(
+                                null,
+                                io.github.kotlinmania.syn.Path
+                                    .from(segs[0].ident),
+                            ),
+                        )
+                    }
+                }
+            }
+            super.visitExprPath(e)
+        }
+
         override fun visitExprCall(e: Expr.Call) {
             val callArgsList = e.args.toList()
             val path = (e.func as? Expr.Path)?.takeIf { it.qself == null }?.path

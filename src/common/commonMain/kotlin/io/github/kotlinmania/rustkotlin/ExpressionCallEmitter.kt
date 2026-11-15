@@ -669,10 +669,11 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                             renderTypedNumericInitializer(argExpr, paramKind, indent, selfTypeName)
                         } else {
                             currentExpectedNumericKind = null
+                            val paramSynTy = resolveCalleeExprParamSynType(expr.func, argIdx, selfTypeName)
                             val paramParseTarget =
-                                resolveCalleeExprParamSynType(expr.func, argIdx, selfTypeName)
-                                    ?.let { paramSynTy ->
-                                        val rawRendered = renderType(paramSynTy, selfTypeName).removeSuffix("?").trim()
+                                paramSynTy
+                                    ?.let { synTy ->
+                                        val rawRendered = renderType(synTy, selfTypeName).removeSuffix("?").trim()
                                         if (rawRendered.startsWith("List<") ||
                                             rawRendered.startsWith("MutableList<") ||
                                             rawRendered in PRIMITIVE_ARRAY_TYPES
@@ -683,10 +684,24 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                                         }
                                     }
                             currentExpectedParseTargetType = paramParseTarget
-                            try {
-                                renderExpr(argExpr, indent, selfTypeName)
-                            } finally {
-                                currentExpectedParseTargetType = null
+                            val renderedArg =
+                                try {
+                                    renderExpr(argExpr, indent, selfTypeName)
+                                } finally {
+                                    currentExpectedParseTargetType = null
+                                }
+                            val rawCallSegs =
+                                (unwrapParenOrGroupExpr(expr.func) as? Expr.Path)
+                                    ?.takeIf { it.qself == null }
+                                    ?.path
+                                    ?.segments
+                                    ?.toList()
+                                    ?.map { it.ident.toString().removePrefix("r#") }
+                                    .orEmpty()
+                            if (isStdlibConstPtrCallParam(rawCallSegs, paramSynTy, argIdx)) {
+                                coerceMutPtrArgToConstPtr(renderedArg, inferExprRenderedType(argExpr, selfTypeName))
+                            } else {
+                                renderedArg
                             }
                         }
                     }
@@ -822,11 +837,25 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                     "$explicitArgs, ${forwardedWitnesses.joinToString(", ")}"
                 }
             val rewrittenTraitElemCallee = resolveContainerElementTraitCallee(callee)
+            val nonZeroTail = calleeBase.split('.').takeLast(2).joinToString(".")
+            val nonZeroTypeArgs =
+                if (rewrittenTraitElemCallee == null &&
+                    explicitGenericArgs.isEmpty() &&
+                    '<' !in callee &&
+                    nonUnitArgs.size == 1 &&
+                    nonZeroTail in setOf("NonZero.new", "NonZero.newUnchecked")
+                ) {
+                    resolveNonZeroNewExplicitTypeArgs(nonZeroTail, nonUnitArgs, selfTypeName)
+                } else {
+                    null
+                }
             val callExpr =
                 if (rewrittenTraitElemCallee != null) {
                     "$rewrittenTraitElemCallee($fullArgs)"
                 } else if (callee.endsWith(".default()") && nonUnitArgs.isNotEmpty()) {
                     "${callee.removeSuffix(".default()")}.from($fullArgs)"
+                } else if (nonZeroTypeArgs != null) {
+                    "$callee<${nonZeroTypeArgs.first}, ${nonZeroTypeArgs.second}>($fullArgs)"
                 } else {
                     "$callee($fullArgs)"
                 }

@@ -41,6 +41,7 @@ public object CoreIntrinsicFfiArtifacts {
             append("    override fun equals(other: Any?): Boolean =\n")
             append("        other is MutPtr && rawAddress == other.rawAddress && rawMeta == other.rawMeta\n\n")
             append("    override fun hashCode(): Int = 31 * rawAddress.hashCode() + rawMeta.hashCode()\n\n")
+            append("    public fun asConstPtr(): ConstPtr = ConstPtr(rawAddress, rawMeta)\n\n")
             append("    override fun toString(): String = \"0x\" + rawAddress.toULong().toString(16)\n")
             append("}")
         }

@@ -829,7 +829,19 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                     methodSubslicePost += subsliceSpec.third
                     subsliceSpec.second
                 } else {
-                    renderExpr(argExpr, indent, selfTypeName)
+                    val renderedArg = renderExpr(argExpr, indent, selfTypeName)
+                    val isRawPtrRecv =
+                        recvOwnerSimple in setOf("MutPtr", "ConstPtr") ||
+                            inferExprRenderedType(expr.receiver, selfTypeName)
+                                ?.removeSuffix("?")
+                                ?.substringBefore('<')
+                                ?.substringAfterLast('.')
+                                ?.trim() in setOf("MutPtr", "ConstPtr")
+                    if (isRawPtrRecv && isStdlibConstPtrMethodParam(rawMethod, null, argIdx)) {
+                        coerceMutPtrArgToConstPtr(renderedArg, inferExprRenderedType(argExpr, selfTypeName))
+                    } else {
+                        renderedArg
+                    }
                 }
             }
         } finally {

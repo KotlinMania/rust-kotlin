@@ -786,6 +786,7 @@ internal class KotlinJ2KEmitter(
                 sym.referencedUnqualifiedTypeIdents.addAll(sharedInsp.referencedUnqualifiedTypeIdents)
                 sym.referencedPathPrefixTypeIdents.addAll(sharedInsp.referencedPathPrefixTypeIdents)
                 sym.declaredTraitsByName.putAll(sharedInsp.declaredTraitsByName)
+                sym.typeDefaultArgsByType.putAll(sharedInsp.typeDefaultArgsByType)
                 sym.tupleStructArityByType.putAll(sharedInsp.tupleStructArityByType)
                 sym.tupleEnumVariantArity.putAll(sharedInsp.tupleEnumVariantArity)
                 sym.enumTypeParamsByVariant.putAll(sharedInsp.enumTypeParamsByVariant)

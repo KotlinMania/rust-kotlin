@@ -123,6 +123,16 @@ internal fun KotlinJ2KEmitter.isKnownNullableOptionExpr(expr: Expr, renderedRece
                 ?.segments
                 ?.toList()
                 .orEmpty()
+        if (segs.size >= 2 && ("core" in headerContext.crateNamespaces || headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true)) {
+            val rawCallNames = segs.map { it.ident.toString().removePrefix("r#") }
+            val owner = rawCallNames[rawCallNames.lastIndex - 1]
+            val leaf = rawCallNames.last()
+            val selfBase = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
+            val resolvedOwner = if (owner == "Self") selfBase else owner
+            if (leaf == "new" && resolvedOwner in setOf("NonNull", "NonZero", "Alignment")) {
+                return true
+            }
+        }
         val lastRaw =
             segs
                 .lastOrNull()
@@ -453,18 +463,30 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
                         else -> {
                             val ktConst = inspector.declaredConstNames[raw]
                             val constTy = ktConst?.let { inspector.declaredConstTypes[it] }
-                            if (constTy != null) {
-                                renderType(constTy, selfTypeName)
-                            } else if (segs.size == 1) {
-                                val ktLocal = scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
-                                currentTypedLocals[ktLocal]
-                            } else {
-                                null
+                            when {
+                                constTy != null -> renderType(constTy, selfTypeName)
+                                segs.size == 1 -> {
+                                    val ktLocal = scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
+                                    currentTypedLocals[ktLocal]
+                                        ?: if (raw in inspector.unitStructNames) {
+                                            raw
+                                        } else if ("core" in headerContext.crateNamespaces || headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true) {
+                                            resolveStdlibUnitStructValueExpr(listOf(raw))?.removeSuffix("()")
+                                        } else {
+                                            null
+                                        }
+                                }
+                                else -> null
                             }
                         }
                     }
                 }
-                else -> null
+                else ->
+                    if (expr.qself == null && ("core" in headerContext.crateNamespaces || headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true)) {
+                        resolveStdlibUnitStructValueExpr(segs.map { it.ident.toString().removePrefix("r#") })?.removeSuffix("()")
+                    } else {
+                        null
+                    }
             }
         }
         is Expr.Unary ->
@@ -542,6 +564,50 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
         }
         is Expr.Call -> {
             resolvePrimitiveFromBytesSpec(expr)?.let { return it.second }
+            if ("core" in headerContext.crateNamespaces || headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true) {
+                val fnPath = (unwrapParenOrGroupExpr(expr.func) as? Expr.Path)?.takeIf { it.qself == null }
+                val rawSegs =
+                    fnPath
+                        ?.path
+                        ?.segments
+                        ?.toList()
+                        ?.map { it.ident.toString().removePrefix("r#") }
+                        .orEmpty()
+                if (rawSegs.size >= 2) {
+                    val owner = rawSegs[rawSegs.lastIndex - 1]
+                    val method = rawSegs.last()
+                    val selfBase = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
+                    val resolvedOwner = if (owner == "Self") selfBase else owner
+                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+                    when {
+                        resolvedOwner == "NonNull" && method == "new" -> {
+                            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.nonnull.NonNull")
+                            return "NonNull?"
+                        }
+                        resolvedOwner == "NonNull" && method in setOf("new_unchecked", "dangling") -> {
+                            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.nonnull.NonNull")
+                            return "NonNull"
+                        }
+                        resolvedOwner == "Alignment" && method == "new" -> {
+                            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.alignment.Alignment")
+                            return "Alignment?"
+                        }
+                        resolvedOwner == "Alignment" && method == "new_unchecked" -> {
+                            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.alignment.Alignment")
+                            return "Alignment"
+                        }
+                        resolvedOwner == "NonZero" && (method == "new" || method == "new_unchecked") -> {
+                            val kotlinMethod = if (method == "new") "new" else "newUnchecked"
+                            val resolvedArgs = resolveNonZeroNewExplicitTypeArgs("NonZero.$kotlinMethod", expr.args.toList(), selfTypeName)
+                            if (resolvedArgs != null) {
+                                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.num.nonzero.NonZero")
+                                val suffix = if (method == "new") "?" else ""
+                                return "NonZero<${resolvedArgs.second}, ${resolvedArgs.first}>$suffix"
+                            }
+                        }
+                    }
+                }
+            }
             if ("core" in headerContext.crateNamespaces) {
                 val fnPathCall = (expr.func as? Expr.Path)?.takeIf { it.qself == null }
                 val rawCalleeSegs =
@@ -759,6 +825,12 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
                     return "$ptrType<${renderType(it, selfTypeName)}>"
                 }
                 val recvRendered = lazyRecvType
+                val recvBase = recvRendered?.removeSuffix("?")?.substringBefore('<')?.trim()
+                if (recvBase == "NonNull" || recvBase?.endsWith(".NonNull") == true) {
+                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.MutPtr")
+                    return "MutPtr"
+                }
                 val elemRendered = recvRendered?.let { extractIndexedElementRenderedType(it, selfTypeName) }
                 if (elemRendered != null) {
                     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
@@ -901,7 +973,14 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
                 (rawMethod == "ok_or" || rawMethod == "ok_or_else") && expr.args.size == 1 ->
                     if (usesTaggedCoreResult()) {
                         val okInner = lazyRecvType?.removeSuffix("?")?.trim() ?: "*"
-                        "${sourceResultName()}<$okInner, String>"
+                        val errExpr =
+                            if (rawMethod == "ok_or_else") {
+                                (unwrapParenOrGroupExpr(expr.args[0]) as? Expr.Closure)?.body
+                            } else {
+                                expr.args[0]
+                            }
+                        val errInner = errExpr?.let { inferExprRenderedType(it, selfTypeName)?.trim() } ?: "*"
+                        "${sourceResultName()}<$okInner, $errInner>"
                     } else {
                         "Result<*>"
                     }

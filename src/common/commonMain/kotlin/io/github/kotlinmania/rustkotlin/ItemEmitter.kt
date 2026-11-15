@@ -406,8 +406,9 @@ internal fun KotlinJ2KEmitter.renderItemType(
         val field = requireNotNull(sourceTransparentField(declaration, declaration.ident.toString()))
         val fieldType = renderType(sourceStorageAliasField(item, declaration), name)
         val target = renderType(item.ty, name)
-        sb.append("${indent}${vis}class $name$typeParams(fieldStorage: MutPtr<$fieldType>, fieldLayout: TypeLayout<$fieldType>) : $target(fieldStorage, fieldLayout) {\n")
-        sb.append("$indent    public constructor(${field.first}: $fieldType, fieldLayout: TypeLayout<$fieldType>) : this(allocateNativeCell(${field.first}, fieldLayout), fieldLayout)\n")
+        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+        sb.append("${indent}${vis}class $name$typeParams(fieldStorage: MutPtr<$fieldType>, fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()) : $target(fieldStorage, fieldLayout) {\n")
+        sb.append("$indent    public constructor(${field.first}: $fieldType, fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()) : this(allocateNativeCell(${field.first}, fieldLayout), fieldLayout)\n")
         sb.append("$indent    public companion object\n")
         sb.append("$indent}")
         return sb.toString()
@@ -1335,10 +1336,14 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                     val propName = tupleFieldPropertyName(idx, fieldList.size)
                     val prevHint = currentSamNameHint
                     currentSamNameHint = "${typeName}Field${idx}Callback"
+                    val prevFieldTraitAssoc = currentTraitAssocParamNames
+                    currentTraitAssocParamNames =
+                        currentTraitAssocParamNames + sourceAssociatedParameters(item.generics).map { it.associated }
                     val fType =
                         try {
                             renderType(field.ty, selfTypeName = selfTypeWithGenerics)
                         } finally {
+                            currentTraitAssocParamNames = prevFieldTraitAssoc
                             currentSamNameHint = prevHint
                         }
                     val defExpr = if (useFinalAbiLayout) renderStructFieldDefaultOrNull(field.ty, fType, selfTypeWithGenerics) else null
@@ -1382,8 +1387,9 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
         val fieldIsConcreteGeneric =
             !isLocalItem && vis == "public " && isConcreteGenericTypeForSwiftExport(fieldType, unboundedOwnerTypeParams)
         ctorParams.clear()
+        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
         ctorParams += "public val fieldStorage: MutPtr<$fieldType>"
-        ctorParams += "public val fieldLayout: TypeLayout<$fieldType>"
+        ctorParams += "public val fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()"
         bodyFieldProps.clear()
         val setterPrefix = if (fieldIsConcreteGeneric) "internal set" else "set"
         extraIterableMembers += "$indent    public var $fieldName: $fieldType\n" +
@@ -1395,7 +1401,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                 "AlignedTypeLayout(fieldLayout, ${it}L)"
             } ?: "fieldLayout"
         val secCtorVis = if (transparentConcreteForSwift) "internal" else "public"
-        extraIterableMembers += "$indent    $secCtorVis constructor($fieldName: $fieldType, fieldLayout: TypeLayout<$fieldType>) : " +
+        extraIterableMembers += "$indent    $secCtorVis constructor($fieldName: $fieldType, fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()) : " +
             "this(allocateNativeCell($fieldName, $alignedFieldLayout), $alignedFieldLayout)"
         extraIterableMembers += "$indent    public fun pointerLayout(): TypeLayout<$selfTypeWithGenerics> = " +
             "TransparentTypeLayout(fieldLayout, " +
@@ -1404,10 +1410,10 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
             forceInternalPrimaryCtor = true
             val fnTypeParams = if (typeParams.isNotEmpty()) "$typeParams " else ""
             extraCompanionMembers +=
-                "$indent        public operator fun ${fnTypeParams}invoke($fieldName: $fieldType, fieldLayout: TypeLayout<$fieldType>): $selfTypeWithGenerics = " +
+                "$indent        public operator fun ${fnTypeParams}invoke($fieldName: $fieldType, fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()): $selfTypeWithGenerics = " +
                 "$selfTypeWithGenerics($fieldName, fieldLayout)"
             extraCompanionMembers +=
-                "$indent        public fun ${fnTypeParams}fromFieldStorage(fieldStorage: MutPtr<$fieldType>, fieldLayout: TypeLayout<$fieldType>): $selfTypeWithGenerics = " +
+                "$indent        public fun ${fnTypeParams}fromFieldStorage(fieldStorage: MutPtr<$fieldType>, fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()): $selfTypeWithGenerics = " +
                 "$selfTypeWithGenerics(fieldStorage, fieldLayout)"
         }
     } else if (!headerContext.rawAbiMode && !isLocalItem) {
