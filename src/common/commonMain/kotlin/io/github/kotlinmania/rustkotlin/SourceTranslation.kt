@@ -1410,7 +1410,6 @@ internal class KotlinJ2KEmitter(
                 add("fixedListTypeLayout" to "$activeCoreNs.mem")
                 add("F16" to activeCoreNs)
                 add("F128" to activeCoreNs)
-                add("OverflowingResult" to "$activeCoreNs.num")
                 if (!headerContext.rawAbiMode) {
                     for (ffiSym in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS.values.distinct()) {
                         if (resolveBestSubpackageForSymbol(ffiSym) == null) {
@@ -1441,7 +1440,6 @@ internal class KotlinJ2KEmitter(
                     add("RustAny" to activeCoreNs)
                     add("RustTypeId" to activeCoreNs)
                     add("Ordering" to "$activeCoreNs.cmp")
-                    add("compareNaturalOrder" to "$activeCoreNs.cmp")
                     add("ParseIntError" to "$activeCoreNs.num.error")
                     add("IntErrorKind" to "$activeCoreNs.num.error")
                     add("TryFromIntError" to "$activeCoreNs.num.error")

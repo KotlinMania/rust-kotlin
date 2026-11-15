@@ -4400,11 +4400,11 @@ class SingleFileTranslationTest {
                 ),
             ).text
         assertContains(typesKt, "import io.github.kotlinmania.rustlang.core.mem.maybeuninit.MaybeUninit")
-        assertContains(typesKt, "MaybeUninit.zeroed(ObjectSlotLayout<T>())")
-        assertContains(typesKt, "MaybeUninit.uninit(ObjectSlotLayout<T>())")
+        assertContains(typesKt, "MaybeUninit.zeroed(UnresolvedTypeLayout<T>())")
+        assertContains(typesKt, "MaybeUninit.uninit(UnresolvedTypeLayout<T>())")
         assertContains(typesKt, "public fun clone(): Padding<T>")
         assertContains(typesKt, "public fun <T> default(): Padding<T>")
-        assertContains(typesKt, "MaybeUninit.zeroed(ObjectSlotLayout<T>()).assumeInit()")
+        assertContains(typesKt, "MaybeUninit.zeroed(UnresolvedTypeLayout<T>()).assumeInit()")
 
         val kernelsRs =
             """

@@ -549,10 +549,19 @@ internal fun inferFileHeaderContextWithResolvers(
 }
 
 internal fun extractTmpSubcrateName(inputPath: String): String? {
-    val normalized = inputPath.replace('\\', '/')
-    val tmpIdx = normalized.indexOf("/tmp/")
-    if (tmpIdx < 0) return null
-    val afterTmp = normalized.substring(tmpIdx + "/tmp/".length)
+    var cleaned = inputPath.replace('\\', '/')
+    while (cleaned.startsWith("./")) {
+        cleaned = cleaned.substring(2)
+    }
+    val afterTmp =
+        when {
+            cleaned.startsWith("tmp/") -> cleaned.substring("tmp/".length)
+            else -> {
+                val tmpIdx = cleaned.indexOf("/tmp/")
+                if (tmpIdx < 0) return null
+                cleaned.substring(tmpIdx + "/tmp/".length)
+            }
+        }
     val slashAfterRepo = afterTmp.indexOf('/')
     if (slashAfterRepo <= 0) return null
     val repoName = afterTmp.substring(0, slashAfterRepo)
@@ -611,9 +620,19 @@ internal fun inferPortLintRelativePath(
     if (srcIdx >= 0) {
         return normalized.substring(srcIdx + "/src/".length)
     }
-    val tmpIdx = normalized.indexOf("/tmp/")
-    if (tmpIdx >= 0) {
-        val afterTmp = normalized.substring(tmpIdx + "/tmp/".length)
+    var cleanedForTmp = normalized
+    while (cleanedForTmp.startsWith("./")) {
+        cleanedForTmp = cleanedForTmp.substring(2)
+    }
+    val afterTmp =
+        when {
+            cleanedForTmp.startsWith("tmp/") -> cleanedForTmp.substring("tmp/".length)
+            else -> {
+                val tmpIdx = cleanedForTmp.indexOf("/tmp/")
+                if (tmpIdx >= 0) cleanedForTmp.substring(tmpIdx + "/tmp/".length) else null
+            }
+        }
+    if (afterTmp != null) {
         val slashAfterRepo = afterTmp.indexOf('/')
         if (slashAfterRepo >= 0) {
             val insideRepo = afterTmp.substring(slashAfterRepo + 1)

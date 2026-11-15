@@ -3705,8 +3705,8 @@ private fun KotlinJ2KEmitter.renderAddressableLocal(
                     val elemRendered = arrayElemRendered ?: renderType(sourceType.elem, selfTypeName)
                     val elemLayout =
                         sourcePointerLayout(sourceType.elem, selfTypeName) ?: run {
-                            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.ObjectSlotLayout")
-                            "ObjectSlotLayout<$elemRendered>()"
+                            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+                            "UnresolvedTypeLayout<$elemRendered>()"
                         }
                     arrayElementLayoutExpr = elemLayout
                     ""
@@ -3729,8 +3729,8 @@ private fun KotlinJ2KEmitter.renderAddressableLocal(
             sourceType?.let { renderType(it, selfTypeName) }
                 ?: inferExprRenderedType(init, selfTypeName)
                 ?: "Any?"
-        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.ObjectSlotLayout")
-        codec = "ObjectSlotLayout<$fallbackRendered>()"
+        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+        codec = "UnresolvedTypeLayout<$fallbackRendered>()"
     }
     val previousTarget = currentExpectedParseTargetType
     val type =
@@ -3768,8 +3768,8 @@ private fun KotlinJ2KEmitter.renderAddressableLocal(
                 val elemRendered = arrayElemRendered ?: renderType(sourceType.elem, selfTypeName)
                 val elemLayout =
                     arrayElementLayoutExpr ?: sourcePointerLayout(sourceType.elem, selfTypeName) ?: run {
-                        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.ObjectSlotLayout")
-                        "ObjectSlotLayout<$elemRendered>()"
+                        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+                        "UnresolvedTypeLayout<$elemRendered>()"
                     }
                 "AddressableArrayLocal.fromList($rhs, $elemLayout)"
             }

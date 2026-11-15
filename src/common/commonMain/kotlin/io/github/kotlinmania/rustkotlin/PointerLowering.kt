@@ -1017,8 +1017,8 @@ internal fun KotlinJ2KEmitter.transparentFactoryLayout(declaration: Item.Struct,
     val (leaf, substitutions) = transparentFactoryLeaf(declaration, selfType)
     sourcePointerLayout(leaf, selfType, substitutions = substitutions)?.let { return it }
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.ObjectSlotLayout")
-    return "ObjectSlotLayout<${layoutRenderedType(leaf, selfType, substitutions)}>()"
+    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+    return "UnresolvedTypeLayout<${layoutRenderedType(leaf, selfType, substitutions)}>()"
 }
 
 internal fun KotlinJ2KEmitter.transparentConstructionLayout(
@@ -1041,8 +1041,8 @@ internal fun KotlinJ2KEmitter.transparentConstructionLayout(
         return "this.fieldLayout"
     }
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.ObjectSlotLayout")
-    return "ObjectSlotLayout<${field.second}>()"
+    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+    return "UnresolvedTypeLayout<${field.second}>()"
 }
 
 internal fun KotlinJ2KEmitter.sourceInitializerType(expression: Expr): SynType? {
@@ -1112,6 +1112,9 @@ internal fun KotlinJ2KEmitter.sourceInitializerType(expression: Expr): SynType? 
                 }
             inspector.structFieldSynTypesByType[ownerKt]?.get(fieldKt)?.let { return it }
         }
+    }
+    if (source is Expr.Call) {
+        CoreIntrinsicLowering.inferCoreIntrinsicReturnSynType(source, this)?.let { return it }
     }
     if (source is Expr.MethodCall) {
         val rawMethod = source.method.toString().removePrefix("r#")

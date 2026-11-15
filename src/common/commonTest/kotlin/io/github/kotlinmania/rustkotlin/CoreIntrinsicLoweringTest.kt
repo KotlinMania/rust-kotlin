@@ -642,59 +642,51 @@ class CoreIntrinsicLoweringTest {
     }
 
     @Test
-    fun coreStdlibSupportSynthesisProvidesRequiredHelpersWithoutSuppressOrJavaImports() {
+    fun coreIntrinsicFfiArtifactsProvideLayoutAndSliceSupportWithoutLegacyShims() {
         val coreNs = "io.github.kotlinmania.rustlang.core"
-        val allocNs = "io.github.kotlinmania.rustlang.alloc"
-        val coreSupportFiles = renderCoreStdlibSupportFiles(coreNs)
-        assertEquals(
-            listOf(
-                "num/PrimNumOps.kt",
-                "slice/SliceSupport.kt",
-                "str/StrSupport.kt",
-                "cmp/CmpSupport.kt",
-                "array/FixedArray.kt",
-            ),
-            coreSupportFiles.map { it.first },
-        )
-        for ((relPath, content) in coreSupportFiles) {
-            assertFalse(content.contains("@Suppress"), "$relPath must not contain @Suppress")
-            assertFalse(content.contains("// port-lint:"), "$relPath must not contain port-lint directive")
-            assertFalse(content.contains("import java."), "$relPath must not import java.*")
-            assertFalse(content.contains("import javax."), "$relPath must not import javax.*")
-        }
-
-        val byPath = coreSupportFiles.toMap()
-        val primNum = byPath.getValue("num/PrimNumOps.kt")
-        assertContains(primNum, "public data class OverflowingResult<T>")
-        assertContains(primNum, "public fun rustCheckedAdd(a: U128, b: U128): U128?")
-        assertContains(primNum, "public fun rustOverflowingMul(a: I128, b: I128): OverflowingResult<I128>")
-
-        val sliceSupport = byPath.getValue("slice/SliceSupport.kt")
-        assertContains(sliceSupport, "public fun <T> rawSliceList(")
-        assertContains(sliceSupport, "public operator fun <T> MutableList<T>.get(range: IntRange): MutableList<T>")
-
-        val strSupport = byPath.getValue("str/StrSupport.kt")
-        assertContains(strSupport, "public class RustStrChars(")
-
-        val cmpSupport = byPath.getValue("cmp/CmpSupport.kt")
-        assertContains(cmpSupport, "public fun compareNaturalOrder(")
-
-        val fixedArray = byPath.getValue("array/FixedArray.kt")
-        assertContains(fixedArray, "public class FixedArray<T>")
-        assertContains(fixedArray, "public fun <T> typeLayout(")
-
-        val rustString = renderAllocRustStringSupportFile(allocNs, coreNs)
-        assertContains(rustString, "package $allocNs.string")
-        assertContains(rustString, "public class RustString")
-        assertContains(rustString, "FromUtf8Error(bytes, checked.value)")
-        assertFalse(rustString.contains("class FromUtf8Error"))
-        assertFalse(rustString.contains("@Suppress"))
-        assertFalse(rustString.contains("import java."))
-
         val typeLayout = CoreIntrinsicFfiArtifacts.renderTypeLayoutSupportKotlin(coreNs)
-        assertContains(typeLayout, "import $coreNs.slice.flushMutableSliceWriteBacks")
-        assertContains(typeLayout, "flushMutableSliceWriteBacks(addr,")
-        assertContains(typeLayout, "flushMutableSliceWriteBacks(dst.rawAddress, bytes)")
+        assertContains(typeLayout, "public class UnresolvedTypeLayout<T>")
+        assertContains(typeLayout, "public class LinearSliceView<T>")
+        assertContains(typeLayout, "public class LinearMutSliceView<T>")
+        assertContains(typeLayout, "public fun <T> linearSliceView(")
+        assertContains(typeLayout, "public fun <T> linearMutSliceView(")
+        assertContains(typeLayout, "public operator fun <T> MutableList<T>.get(range: IntRange): MutableList<T>")
+        assertContains(typeLayout, "public fun <T : Comparable<T>> kmCompareValues(")
+        assertContains(typeLayout, "isSigned: Boolean")
+        assertFalse(typeLayout.contains("@Suppress"), "TypeLayoutSupport must not contain @Suppress")
+        assertFalse(typeLayout.contains("// port-lint:"), "TypeLayoutSupport must not contain port-lint directive")
+        assertFalse(typeLayout.contains("import java."), "TypeLayoutSupport must not import java.*")
+        assertFalse(typeLayout.contains("import javax."), "TypeLayoutSupport must not import javax.*")
+        assertFalse(typeLayout.contains("ObjectSlotLayout"), "TypeLayoutSupport must not reference ObjectSlotLayout")
+        assertFalse(typeLayout.contains("ManagedSlotRegistry"), "TypeLayoutSupport must not reference ManagedSlotRegistry")
+        assertFalse(typeLayout.contains("flushMutableSliceWriteBacks"), "TypeLayoutSupport must not reference flushMutableSliceWriteBacks")
+
+        val expectKt = CoreIntrinsicFfiArtifacts.renderKmCoreIntrinsicsExpectKotlin(coreNs)
+        assertContains(expectKt, "kmSqrtf32")
+        assertContains(expectKt, "kmFloatToU128Unchecked")
+        assertFalse(expectKt.contains("@Suppress"))
+        assertFalse(expectKt.contains("import java."))
+
+        val defFile = CoreIntrinsicFfiArtifacts.renderKmCoreDef("io.github.kotlinmania.rustlang.core.intrinsics.cinterop")
+        assertContains(defFile, "-lm")
+    }
+
+    @Test
+    fun relativeTmpSubcrateInputResolvesConfiguredCrateNamespace() {
+        val coreNs = "io.github.kotlinmania.rustlang.core"
+        val ctx =
+            inferFileHeaderContext(
+                inputPath = "tmp/rust/library/core/src/num/uint_macros.rs",
+                outputPath = "src/common/commonMain/kotlin/io/github/kotlinmania/rustlang/core/num/NumFunctions.kt",
+                gradleProperties =
+                    GradleProjectProperties(
+                        projectGroup = "io.github.kotlinmania.rustlang",
+                        projectNamespace = "io.github.kotlinmania.rustlang",
+                        crateNamespaces = mapOf("core" to coreNs),
+                    ),
+            )
+        assertEquals(coreNs, ctx.projectNamespace)
+        assertEquals(coreNs, ctx.crateNamespaces["core"])
     }
 
     @Test

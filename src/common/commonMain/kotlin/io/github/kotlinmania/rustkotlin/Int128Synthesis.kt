@@ -65,29 +65,156 @@ internal fun formatI128ConstructorCall(high: ULong, low: ULong): String {
     return "I128($hiLit, $loHex)"
 }
 
-internal val SYNTHESIZED_U128_DECLARATION: String =
-    """
+private fun indent128MemberBlock(block: String): String =
+    block.lines().joinToString("\n") { line ->
+        if (line.isBlank()) "" else "        $line"
+    }
+
+internal fun renderSynthesizedU128Declaration(useCoreIntrinsics: Boolean = false): String {
+    val shiftImpl =
+        if (useCoreIntrinsics) {
+            """
+            public infix fun shr(bitCount: Int): U128 {
+                val out = kmU128Shr(low, high, (bitCount and 127).toUInt())
+                return U128(out.hi, out.lo)
+            }
+
+            public infix fun shl(bitCount: Int): U128 {
+                val out = kmU128Shl(low, high, (bitCount and 127).toUInt())
+                return U128(out.hi, out.lo)
+            }
+            """.trimIndent()
+        } else {
+            """
+            public infix fun shr(bitCount: Int): U128 {
+                val n = bitCount and 127
+                return when {
+                    n == 0 -> this
+                    n < 64 -> U128(high shr n, (low shr n) or (high shl (64 - n)))
+                    else -> U128(0uL, high shr (n - 64))
+                }
+            }
+
+            public infix fun shl(bitCount: Int): U128 {
+                val n = bitCount and 127
+                return when {
+                    n == 0 -> this
+                    n < 64 -> U128((high shl n) or (low shr (64 - n)), low shl n)
+                    else -> U128(low shl (n - 64), 0uL)
+                }
+            }
+            """.trimIndent()
+        }
+    val arithImpl =
+        if (useCoreIntrinsics) {
+            """
+            public operator fun plus(other: U128): U128 {
+                val out = kmU128Add(low, high, other.low, other.high)
+                return U128(out.hi, out.lo)
+            }
+
+            public operator fun minus(other: U128): U128 {
+                val out = kmU128Sub(low, high, other.low, other.high)
+                return U128(out.hi, out.lo)
+            }
+
+            public operator fun times(other: U128): U128 {
+                val out = kmU128Mul(low, high, other.low, other.high)
+                return U128(out.hi, out.lo)
+            }
+
+            public operator fun div(other: U128): U128 = divRem(other).first
+            public operator fun rem(other: U128): U128 = divRem(other).second
+
+            private fun divRem(divisor: U128): Pair<U128, U128> {
+                if (divisor.high == 0uL && divisor.low == 0uL) throw ArithmeticException("/ by zero")
+                val out = kmU128DivRem(low, high, divisor.low, divisor.high)
+                return Pair(U128(out.qHi, out.qLo), U128(out.rHi, out.rLo))
+            }
+            """.trimIndent()
+        } else {
+            """
+            public operator fun plus(other: U128): U128 {
+                val newLow = low + other.low
+                val carry = if (newLow < low) 1uL else 0uL
+                return U128(high + other.high + carry, newLow)
+            }
+
+            public operator fun minus(other: U128): U128 {
+                val borrow = if (low < other.low) 1uL else 0uL
+                return U128(high - other.high - borrow, low - other.low)
+            }
+
+            public operator fun times(other: U128): U128 {
+                val a0 = low and 0xFFFF_FFFFuL
+                val a1 = low shr 32
+                val a2 = high and 0xFFFF_FFFFuL
+                val a3 = high shr 32
+                val b0 = other.low and 0xFFFF_FFFFuL
+                val b1 = other.low shr 32
+                val b2 = other.high and 0xFFFF_FFFFuL
+                val b3 = other.high shr 32
+
+                val p00 = a0 * b0
+                val r0 = p00 and 0xFFFF_FFFFuL
+                var c = p00 shr 32
+
+                val s1 = a0 * b1 + c
+                val t1 = a1 * b0
+                val u1 = (s1 and 0xFFFF_FFFFuL) + (t1 and 0xFFFF_FFFFuL)
+                val r1 = u1 and 0xFFFF_FFFFuL
+                c = (s1 shr 32) + (t1 shr 32) + (u1 shr 32)
+
+                val m20 = a0 * b2
+                val m11 = a1 * b1
+                val m02 = a2 * b0
+                val u2 = (m20 and 0xFFFF_FFFFuL) + (m11 and 0xFFFF_FFFFuL) + (m02 and 0xFFFF_FFFFuL) + (c and 0xFFFF_FFFFuL)
+                val r2 = u2 and 0xFFFF_FFFFuL
+                c = (m20 shr 32) + (m11 shr 32) + (m02 shr 32) + (c shr 32) + (u2 shr 32)
+
+                val r3 = (a0 * b3 + a1 * b2 + a2 * b1 + a3 * b0 + c) and 0xFFFF_FFFFuL
+                return U128((r3 shl 32) or r2, (r1 shl 32) or r0)
+            }
+
+            public operator fun div(other: U128): U128 = divRem(other).first
+            public operator fun rem(other: U128): U128 = divRem(other).second
+
+            private fun divRem(divisor: U128): Pair<U128, U128> {
+                if (divisor.high == 0uL && divisor.low == 0uL) throw ArithmeticException("/ by zero")
+                if (this < divisor) return ZERO to this
+                var quotient = ZERO
+                var remainder = ZERO
+                for (bit in 127 downTo 0) {
+                    remainder = remainder shl 1
+                    val bitVal =
+                        if (bit >= 64) {
+                            (high shr (bit - 64)) and 1uL
+                        } else {
+                            (low shr bit) and 1uL
+                        }
+                    if (bitVal != 0uL) {
+                        remainder = U128(remainder.high, remainder.low or 1uL)
+                    }
+                    if (remainder >= divisor) {
+                        remainder -= divisor
+                        quotient =
+                            if (bit >= 64) {
+                                U128(quotient.high or (1uL shl (bit - 64)), quotient.low)
+                            } else {
+                                U128(quotient.high, quotient.low or (1uL shl bit))
+                            }
+                    }
+                }
+                return quotient to remainder
+            }
+            """.trimIndent()
+        }
+    return """
     public class U128(
         public val high: ULong = 0uL,
         public val low: ULong = 0uL,
     ) {
-        public infix fun shr(bitCount: Int): U128 {
-            val n = bitCount and 127
-            return when {
-                n == 0 -> this
-                n < 64 -> U128(high shr n, (low shr n) or (high shl (64 - n)))
-                else -> U128(0uL, high shr (n - 64))
-            }
-        }
-
-        public infix fun shl(bitCount: Int): U128 {
-            val n = bitCount and 127
-            return when {
-                n == 0 -> this
-                n < 64 -> U128((high shl n) or (low shr (64 - n)), low shl n)
-                else -> U128(low shl (n - 64), 0uL)
-            }
-        }
+${indent128MemberBlock(shiftImpl)}
 
         public infix fun and(other: U128): U128 = U128(high and other.high, low and other.low)
         public infix fun and(mask: ULong): U128 = U128(0uL, low and mask)
@@ -109,79 +236,7 @@ internal val SYNTHESIZED_U128_DECLARATION: String =
 
         public fun inv(): U128 = U128(high.inv(), low.inv())
 
-        public operator fun plus(other: U128): U128 {
-            val newLow = low + other.low
-            val carry = if (newLow < low) 1uL else 0uL
-            return U128(high + other.high + carry, newLow)
-        }
-
-        public operator fun minus(other: U128): U128 {
-            val borrow = if (low < other.low) 1uL else 0uL
-            return U128(high - other.high - borrow, low - other.low)
-        }
-
-        public operator fun times(other: U128): U128 {
-            val a0 = low and 0xFFFF_FFFFuL
-            val a1 = low shr 32
-            val a2 = high and 0xFFFF_FFFFuL
-            val a3 = high shr 32
-            val b0 = other.low and 0xFFFF_FFFFuL
-            val b1 = other.low shr 32
-            val b2 = other.high and 0xFFFF_FFFFuL
-            val b3 = other.high shr 32
-
-            val p00 = a0 * b0
-            val r0 = p00 and 0xFFFF_FFFFuL
-            var c = p00 shr 32
-
-            val s1 = a0 * b1 + c
-            val t1 = a1 * b0
-            val u1 = (s1 and 0xFFFF_FFFFuL) + (t1 and 0xFFFF_FFFFuL)
-            val r1 = u1 and 0xFFFF_FFFFuL
-            c = (s1 shr 32) + (t1 shr 32) + (u1 shr 32)
-
-            val m20 = a0 * b2
-            val m11 = a1 * b1
-            val m02 = a2 * b0
-            val u2 = (m20 and 0xFFFF_FFFFuL) + (m11 and 0xFFFF_FFFFuL) + (m02 and 0xFFFF_FFFFuL) + (c and 0xFFFF_FFFFuL)
-            val r2 = u2 and 0xFFFF_FFFFuL
-            c = (m20 shr 32) + (m11 shr 32) + (m02 shr 32) + (c shr 32) + (u2 shr 32)
-
-            val r3 = (a0 * b3 + a1 * b2 + a2 * b1 + a3 * b0 + c) and 0xFFFF_FFFFuL
-            return U128((r3 shl 32) or r2, (r1 shl 32) or r0)
-        }
-
-        public operator fun div(other: U128): U128 = divRem(other).first
-        public operator fun rem(other: U128): U128 = divRem(other).second
-
-        private fun divRem(divisor: U128): Pair<U128, U128> {
-            check(divisor.high != 0uL || divisor.low != 0uL) { "attempt to divide by zero" }
-            if (this < divisor) return ZERO to this
-            var quotient = ZERO
-            var remainder = ZERO
-            for (bit in 127 downTo 0) {
-                remainder = remainder shl 1
-                val bitVal =
-                    if (bit >= 64) {
-                        (high shr (bit - 64)) and 1uL
-                    } else {
-                        (low shr bit) and 1uL
-                    }
-                if (bitVal != 0uL) {
-                    remainder = U128(remainder.high, remainder.low or 1uL)
-                }
-                if (remainder >= divisor) {
-                    remainder -= divisor
-                    quotient =
-                        if (bit >= 64) {
-                            U128(quotient.high or (1uL shl (bit - 64)), quotient.low)
-                        } else {
-                            U128(quotient.high, quotient.low or (1uL shl bit))
-                        }
-                }
-            }
-            return quotient to remainder
-        }
+${indent128MemberBlock(arithImpl)}
 
         public fun toByte(): Byte = low.toByte()
         public fun toUByte(): UByte = low.toUByte()
@@ -311,30 +366,121 @@ internal val SYNTHESIZED_U128_DECLARATION: String =
             }
         }
     }
-    """.trimIndent()
+        """.trimIndent()
+}
 
-internal val SYNTHESIZED_I128_DECLARATION: String =
-    """
+internal val SYNTHESIZED_U128_DECLARATION: String = renderSynthesizedU128Declaration(useCoreIntrinsics = false)
+
+internal fun renderSynthesizedI128Declaration(useCoreIntrinsics: Boolean = false): String {
+    val shiftImpl =
+        if (useCoreIntrinsics) {
+            """
+            public infix fun shr(bitCount: Int): I128 {
+                val out = kmI128Shr(low, high.toULong(), (bitCount and 127).toUInt())
+                return I128(out.hi.toLong(), out.lo)
+            }
+
+            public infix fun shl(bitCount: Int): I128 {
+                val out = kmU128Shl(low, high.toULong(), (bitCount and 127).toUInt())
+                return I128(out.hi.toLong(), out.lo)
+            }
+            """.trimIndent()
+        } else {
+            """
+            public infix fun shr(bitCount: Int): I128 {
+                val n = bitCount and 127
+                return when {
+                    n == 0 -> this
+                    n < 64 -> I128(high shr n, (low shr n) or (high.toULong() shl (64 - n)))
+                    else -> {
+                        val signFill = if (high < 0L) -1L else 0L
+                        I128(signFill, (high shr (n - 64)).toULong())
+                    }
+                }
+            }
+
+            public infix fun shl(bitCount: Int): I128 {
+                val u = U128(high.toULong(), low) shl bitCount
+                return I128(u.high.toLong(), u.low)
+            }
+            """.trimIndent()
+        }
+    val arithImpl =
+        if (useCoreIntrinsics) {
+            """
+            public operator fun plus(other: I128): I128 {
+                val out = kmU128Add(low, high.toULong(), other.low, other.high.toULong())
+                return I128(out.hi.toLong(), out.lo)
+            }
+
+            public operator fun minus(other: I128): I128 {
+                val out = kmU128Sub(low, high.toULong(), other.low, other.high.toULong())
+                return I128(out.hi.toLong(), out.lo)
+            }
+
+            public operator fun times(other: I128): I128 {
+                val out = kmU128Mul(low, high.toULong(), other.low, other.high.toULong())
+                return I128(out.hi.toLong(), out.lo)
+            }
+
+            public operator fun div(other: I128): I128 {
+                if (other.high == 0L && other.low == 0uL) throw ArithmeticException("/ by zero")
+                val out = kmI128DivRem(low, high.toULong(), other.low, other.high.toULong())
+                return I128(out.qHi.toLong(), out.qLo)
+            }
+
+            public operator fun rem(other: I128): I128 {
+                if (other.high == 0L && other.low == 0uL) throw ArithmeticException("/ by zero")
+                val out = kmI128DivRem(low, high.toULong(), other.low, other.high.toULong())
+                return I128(out.rHi.toLong(), out.rLo)
+            }
+            """.trimIndent()
+        } else {
+            """
+            public operator fun plus(other: I128): I128 {
+                val u = U128(high.toULong(), low) + U128(other.high.toULong(), other.low)
+                return I128(u.high.toLong(), u.low)
+            }
+
+            public operator fun minus(other: I128): I128 {
+                val u = U128(high.toULong(), low) - U128(other.high.toULong(), other.low)
+                return I128(u.high.toLong(), u.low)
+            }
+
+            public operator fun times(other: I128): I128 {
+                val u = U128(high.toULong(), low) * U128(other.high.toULong(), other.low)
+                return I128(u.high.toLong(), u.low)
+            }
+
+            public operator fun div(other: I128): I128 {
+                if (other.high == 0L && other.low == 0uL) throw ArithmeticException("/ by zero")
+                val negA = high < 0L
+                val negB = other.high < 0L
+                val absA = if (negA) -this else this
+                val absB = if (negB) -other else other
+                val q = U128(absA.high.toULong(), absA.low) / U128(absB.high.toULong(), absB.low)
+                val signedQ = I128(q.high.toLong(), q.low)
+                return if (negA != negB) -signedQ else signedQ
+            }
+
+            public operator fun rem(other: I128): I128 {
+                if (other.high == 0L && other.low == 0uL) throw ArithmeticException("/ by zero")
+                val negA = high < 0L
+                val negB = other.high < 0L
+                val absA = if (negA) -this else this
+                val absB = if (negB) -other else other
+                val r = U128(absA.high.toULong(), absA.low) % U128(absB.high.toULong(), absB.low)
+                val signedR = I128(r.high.toLong(), r.low)
+                return if (negA) -signedR else signedR
+            }
+            """.trimIndent()
+        }
+    return """
     public class I128(
         public val high: Long = 0L,
         public val low: ULong = 0uL,
     ) {
-        public infix fun shr(bitCount: Int): I128 {
-            val n = bitCount and 127
-            return when {
-                n == 0 -> this
-                n < 64 -> I128(high shr n, (low shr n) or (high.toULong() shl (64 - n)))
-                else -> {
-                    val signFill = if (high < 0L) -1L else 0L
-                    I128(signFill, (high shr (n - 64)).toULong())
-                }
-            }
-        }
-
-        public infix fun shl(bitCount: Int): I128 {
-            val u = U128(high.toULong(), low) shl bitCount
-            return I128(u.high.toLong(), u.low)
-        }
+${indent128MemberBlock(shiftImpl)}
 
         public infix fun and(other: I128): I128 = I128(high and other.high, low and other.low)
         public infix fun and(mask: Long): I128 = and(fromLong(mask))
@@ -362,40 +508,7 @@ internal val SYNTHESIZED_I128_DECLARATION: String =
             return I128(high.inv() + carry, invLow)
         }
 
-        public operator fun plus(other: I128): I128 {
-            val u = U128(high.toULong(), low) + U128(other.high.toULong(), other.low)
-            return I128(u.high.toLong(), u.low)
-        }
-
-        public operator fun minus(other: I128): I128 {
-            val u = U128(high.toULong(), low) - U128(other.high.toULong(), other.low)
-            return I128(u.high.toLong(), u.low)
-        }
-
-        public operator fun times(other: I128): I128 {
-            val u = U128(high.toULong(), low) * U128(other.high.toULong(), other.low)
-            return I128(u.high.toLong(), u.low)
-        }
-
-        public operator fun div(other: I128): I128 {
-            val negA = high < 0L
-            val negB = other.high < 0L
-            val absA = if (negA) -this else this
-            val absB = if (negB) -other else other
-            val q = U128(absA.high.toULong(), absA.low) / U128(absB.high.toULong(), absB.low)
-            val signedQ = I128(q.high.toLong(), q.low)
-            return if (negA != negB) -signedQ else signedQ
-        }
-
-        public operator fun rem(other: I128): I128 {
-            val negA = high < 0L
-            val negB = other.high < 0L
-            val absA = if (negA) -this else this
-            val absB = if (negB) -other else other
-            val r = U128(absA.high.toULong(), absA.low) % U128(absB.high.toULong(), absB.low)
-            val signedR = I128(r.high.toLong(), r.low)
-            return if (negA) -signedR else signedR
-        }
+${indent128MemberBlock(arithImpl)}
 
         public fun toByte(): Byte = low.toByte()
         public fun toUByte(): UByte = low.toUByte()
@@ -459,21 +572,53 @@ internal val SYNTHESIZED_I128_DECLARATION: String =
             public fun fromLeBytes(bytes: List<UByte>): I128 = U128.fromLeBytes(bytes).toI128()
         }
     }
-    """.trimIndent()
+        """.trimIndent()
+}
+
+internal val SYNTHESIZED_I128_DECLARATION: String = renderSynthesizedI128Declaration(useCoreIntrinsics = false)
 
 internal fun renderSynthesizedInt128SupportFile(
     packageName: String?,
     includeU128: Boolean = true,
     includeI128: Boolean = true,
+    coreIntrinsicsPackage: String? = null,
 ): String =
     buildString {
         append("@file:OptIn(ExperimentalUnsignedTypes::class)\n\n")
         if (!packageName.isNullOrBlank()) {
             append("package ").append(packageName.trim()).append("\n\n")
         }
+        val intrinsicsPkg = coreIntrinsicsPackage?.trim()?.takeIf { it.isNotEmpty() }
+        if (intrinsicsPkg != null && (includeU128 || includeI128)) {
+            val intrinsicImports = linkedSetOf<String>()
+            if (includeU128) {
+                intrinsicImports += "kmU128Add"
+                intrinsicImports += "kmU128DivRem"
+                intrinsicImports += "kmU128Mul"
+                intrinsicImports += "kmU128Shl"
+                intrinsicImports += "kmU128Shr"
+                intrinsicImports += "kmU128Sub"
+            }
+            if (includeI128) {
+                intrinsicImports += "kmI128DivRem"
+                intrinsicImports += "kmI128Shr"
+                intrinsicImports += "kmU128Add"
+                intrinsicImports += "kmU128Mul"
+                intrinsicImports += "kmU128Shl"
+                intrinsicImports += "kmU128Sub"
+            }
+            for (fn in intrinsicImports.sorted()) {
+                append("import ")
+                    .append(intrinsicsPkg)
+                    .append('.')
+                    .append(fn)
+                    .append('\n')
+            }
+            append('\n')
+        }
         val blocks = mutableListOf<String>()
-        if (includeU128) blocks += SYNTHESIZED_U128_DECLARATION
-        if (includeI128) blocks += SYNTHESIZED_I128_DECLARATION
+        if (includeU128) blocks += renderSynthesizedU128Declaration(useCoreIntrinsics = !coreIntrinsicsPackage.isNullOrBlank())
+        if (includeI128) blocks += renderSynthesizedI128Declaration(useCoreIntrinsics = !coreIntrinsicsPackage.isNullOrBlank())
         append(blocks.joinToString("\n\n"))
         append('\n')
     }
