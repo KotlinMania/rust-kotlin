@@ -1015,4 +1015,43 @@ class SingleFileTranslationTypesAndLoweringTest {
         assertContains(kt, "{ it.intoInner() }")
         assertContains(kt, "{ HolderExt.fromBytesVec(it) }")
     }
+
+    @Test fun formatBoolKeywordTurbofishStrParseOrElseTopLevelFnAndBinaryFloatCoercion() {
+        val source =
+            """
+            pub fn fallback_fn() -> Option<i32> {
+                Some(42)
+            }
+
+            pub fn check_all(opt: Option<i32>, version: &str) -> String {
+                let _picked = opt.or_else(fallback_fn);
+                let _parsed: Vec<_> = version.split('.').map(str::parse::<usize>).collect();
+                let f: f32 = 0b1111_1111;
+                let d: f64 = 0xFF;
+                let _ = (f, d);
+                format!("dropped: {}, ok: {}", false, true)
+            }
+            """.trimIndent()
+        val kt =
+            renderSingleKotlinFile(
+                source,
+                FileHeaderContext(
+                    packageName = "io.github.kotlinmania.rustlang.std.sample",
+                    projectGroup = "io.github.kotlinmania",
+                    projectNamespace = "io.github.kotlinmania.rustlang.std",
+                    portLintDirective = "none",
+                ),
+            ).text
+        assertFalse(kt.contains("${'$'}false"), "format! bool should not emit ${'$'}false:\n$kt")
+        assertFalse(kt.contains("${'$'}true"), "format! bool should not emit ${'$'}true:\n$kt")
+        assertContains(kt, "dropped: false, ok: true")
+        assertFalse(kt.contains("?: ."), "or_else(top_level_fn) should not emit stray dot:\n$kt")
+        assertContains(kt, "?: fallbackFn()")
+        assertFalse(kt.contains("::parse<"), "Callable reference must not carry type args:\n$kt")
+        assertContains(kt, ".toIntOrNull()")
+        assertFalse(kt.contains("0b11111111.0f"), "Binary int coerced to Float must not get .0f suffix:\n$kt")
+        assertFalse(kt.contains("0xFF.0"), "Hex int coerced to Float/Double must not get .0/.0f suffix:\n$kt")
+        assertContains(kt, "(0xFF).toFloat()")
+        assertContains(kt, "(0xFF).toDouble()")
+    }
 }

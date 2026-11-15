@@ -919,6 +919,12 @@ internal fun KotlinJ2KEmitter.renderIntLiteral(digits: String, suffix: String): 
     }
     val clean = digits.replace("_", "")
     val low64 = if (parsed128 != null && parsed128.high == 0uL) parsed128.low else null
+    val nonDecAtom =
+        when {
+            low64 != null && low64 >= 0x8000000000000000uL -> "${clean}uL"
+            low64 != null && low64 >= 0x80000000uL -> "${clean}L"
+            else -> clean
+        }
     if (suffix.isEmpty()) {
         return when (currentExpectedNumericKind) {
             NumericKind.U8 ->
@@ -942,10 +948,10 @@ internal fun KotlinJ2KEmitter.renderIntLiteral(digits: String, suffix: String): 
                 }
             NumericKind.I64 ->
                 if (low64 != null && low64 >= 0x8000000000000000uL) "${clean}uL.toLong()" else "${clean}L"
-            NumericKind.F16 -> if (clean.all { it.isDigit() }) "F16.fromFloat($clean.0f)" else "F16.fromDouble(($clean).toDouble())"
-            NumericKind.F32 -> "$clean.0f"
-            NumericKind.F64 -> "$clean.0"
-            NumericKind.F128 -> if (clean.all { it.isDigit() }) "F128.fromDouble($clean.0)" else "F128.fromDouble(($clean).toDouble())"
+            NumericKind.F16 -> if (clean.all { it.isDigit() }) "F16.fromFloat($clean.0f)" else "F16.fromDouble(($nonDecAtom).toDouble())"
+            NumericKind.F32 -> if (clean.all { it.isDigit() }) "$clean.0f" else "($nonDecAtom).toFloat()"
+            NumericKind.F64 -> if (clean.all { it.isDigit() }) "$clean.0" else "($nonDecAtom).toDouble()"
+            NumericKind.F128 -> if (clean.all { it.isDigit() }) "F128.fromDouble($clean.0)" else "F128.fromDouble(($nonDecAtom).toDouble())"
             else ->
                 if (low64 != null && low64 >= 0x8000000000000000uL) "${clean}uL" else clean
         }
@@ -979,10 +985,10 @@ internal fun KotlinJ2KEmitter.renderIntLiteral(digits: String, suffix: String): 
                 clean
             }
         "i64" -> if (low64 != null && low64 >= 0x8000000000000000uL) "${clean}uL.toLong()" else "${clean}L"
-        "f16" -> if (clean.all { it.isDigit() }) "F16.fromFloat($clean.0f)" else "F16.fromDouble(($clean).toDouble())"
-        "f32" -> "$clean.0f"
-        "f64" -> "$clean.0"
-        "f128" -> if (clean.all { it.isDigit() }) "F128.fromDouble($clean.0)" else "F128.fromDouble(($clean).toDouble())"
+        "f16" -> if (clean.all { it.isDigit() }) "F16.fromFloat($clean.0f)" else "F16.fromDouble(($nonDecAtom).toDouble())"
+        "f32" -> if (clean.all { it.isDigit() }) "$clean.0f" else "($nonDecAtom).toFloat()"
+        "f64" -> if (clean.all { it.isDigit() }) "$clean.0" else "($nonDecAtom).toDouble()"
+        "f128" -> if (clean.all { it.isDigit() }) "F128.fromDouble($clean.0)" else "F128.fromDouble(($nonDecAtom).toDouble())"
         else -> clean
     }
 }
@@ -1794,6 +1800,25 @@ private fun KotlinJ2KEmitter.renderValuePositionStaticFnRef(
     selfTypeName: String?,
 ): String {
     val cleanPrev = prevRaw.removePrefix("r#")
+    val baseMethodKt = methodKt.substringBefore('<').trim()
+    val typeArgContent =
+        if ('<' in methodKt && methodKt.endsWith(">")) {
+            methodKt.substringAfter('<').removeSuffix(">").trim()
+        } else {
+            null
+        }
+    if ((cleanPrev == "str" || cleanPrev == "String") && baseMethodKt == "parse") {
+        val strParseMethod = typeArgContent?.let { STR_PRIMITIVE_PARSE_METHODS[it] }
+        if (strParseMethod != null) {
+            return if (usesTaggedCoreResult()) {
+                val res = sourceResultName()
+                "{ (it.$strParseMethod?.let { v -> $res.Ok(v) } ?: $res.Err(\"failed to parse $typeArgContent\")) }"
+            } else {
+                "{ (it.$strParseMethod?.let { v -> Result.success(v) } ?: Result.failure(IllegalArgumentException(\"failed to parse $typeArgContent\"))) }"
+            }
+        }
+        return "{ it.$methodKt() }"
+    }
     val ownerKt =
         if (cleanPrev == "Self") {
             selfTypeName?.substringBefore('<')?.trim().orEmpty()
@@ -1812,12 +1837,12 @@ private fun KotlinJ2KEmitter.renderValuePositionStaticFnRef(
     }
     val isInstanceMethodRef =
         (
-            methodKt in inspector.instanceMethodsByType[ownerKt].orEmpty() &&
-                methodKt !in inspector.companionMethodsByType[ownerKt].orEmpty()
+            baseMethodKt in inspector.instanceMethodsByType[ownerKt].orEmpty() &&
+                baseMethodKt !in inspector.companionMethodsByType[ownerKt].orEmpty()
         ) ||
-            (ownerKt == "PoisonError" && methodKt == "intoInner") ||
+            (ownerKt == "PoisonError" && baseMethodKt == "intoInner") ||
             (
-                methodKt in
+                baseMethodKt in
                     setOf(
                         "intoInner",
                         "asRef",
@@ -1833,6 +1858,9 @@ private fun KotlinJ2KEmitter.renderValuePositionStaticFnRef(
             )
     if (isInstanceMethodRef) {
         return "{ it.$methodKt() }"
+    }
+    if ('<' in methodKt) {
+        return "{ $ownerPath.$methodKt(it) }"
     }
     return "$ownerPath::$methodKt"
 }

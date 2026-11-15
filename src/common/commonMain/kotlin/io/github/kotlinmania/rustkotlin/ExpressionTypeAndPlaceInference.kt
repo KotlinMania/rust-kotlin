@@ -187,8 +187,11 @@ internal fun KotlinJ2KEmitter.unwrapZeroArgClosureText(renderedClosure: String):
         }
         return "run $trimmed"
     }
+    if (trimmed.startsWith("::")) {
+        return "${trimmed.removePrefix("::")}()"
+    }
     if ("::" in trimmed) {
-        return "${trimmed.replace("::", ".")}()"
+        return "${trimmed.replaceFirst("::", ".")}()"
     }
     return "$trimmed()"
 }
