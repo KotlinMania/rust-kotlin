@@ -1260,4 +1260,73 @@ class SingleFileTranslationSynAndMacrosTest {
         assertContains(kt, "total + 3")
         assertContains(kt, "opt != null && opt > 0")
     }
+
+    @Test
+    fun qualifiedExternalMacroInsideWrapperMacroDoesNotRecurse() {
+        val dollar = '$'
+        val rustSource =
+            """
+            macro_rules! log {
+                ($dollar(${dollar}tt:tt)*) => {
+                    #[cfg(feature = "logging")]
+                    {
+                        $dollar(${dollar}tt)*
+                    }
+                }
+            }
+
+            macro_rules! debug {
+                ($dollar(${dollar}tt:tt)*) => { log!(log::debug!($dollar(${dollar}tt)*)) }
+            }
+
+            macro_rules! trace {
+                ($dollar(${dollar}tt:tt)*) => { log!(log::trace!($dollar(${dollar}tt)*)) }
+            }
+
+            /// Computes an offset while logging diagnostics.
+            pub fn compute_offset(val_in: usize) -> usize {
+                debug!("val_in={}", val_in);
+                trace!("done");
+                // Keep this inline comment intact.
+                val_in + 1
+            }
+            """.trimIndent()
+
+        val kt = renderSingleKotlinFile(rustSource).text
+        assertContains(kt, "Computes an offset while logging diagnostics.")
+        assertContains(kt, "Keep this inline comment intact.")
+        assertContains(kt, "public fun computeOffset(valIn: Int): Int")
+        assertContains(kt, "return valIn + 1")
+    }
+
+    @Test
+    fun mutuallyRecursiveBlockWrappedMacroCapsAtMaxDepth() {
+        val rustSource =
+            """
+            macro_rules! ping {
+                () => {
+                    {
+                        pong!();
+                    }
+                };
+            }
+
+            macro_rules! pong {
+                () => {
+                    {
+                        ping!();
+                    }
+                };
+            }
+
+            pub fn run_ping() -> i32 {
+                ping!();
+                7
+            }
+            """.trimIndent()
+
+        val kt = renderSingleKotlinFile(rustSource).text
+        assertContains(kt, "public fun runPing(): Int")
+        assertContains(kt, "return 7")
+    }
 }
