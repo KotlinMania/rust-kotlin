@@ -361,8 +361,8 @@ class CandleSiblingTranspilerFixesTest {
                     crateNamespaces = mapOf("core" to "io.github.kotlinmania.rustlang.core"),
                 ),
             )
-        assertContains(kt, "rustCheckedAdd(a, b) ?: 0u")
-        assertContains(kt, "rustCountOnes(a)")
+        assertContains(kt, "a.checkedAdd(b) ?: 0u")
+        assertContains(kt, "a.countOnes()")
         assertContains(kt, "return a.checkedAdd(b)")
         ZeroUnderscoreIdentifierValidator.requireZeroViolations(kt, "concreteVsGenericCheckedAdd")
     }

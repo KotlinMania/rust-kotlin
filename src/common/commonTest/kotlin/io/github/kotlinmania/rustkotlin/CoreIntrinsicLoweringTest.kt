@@ -2,7 +2,9 @@ package io.github.kotlinmania.rustkotlin
 
 import kotlin.test.Test
 import kotlin.test.assertContains
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.TimeSource
 
@@ -237,5 +239,483 @@ class CoreIntrinsicLoweringTest {
         assertContains(kt, "check(a < b == c > d)")
         assertContains(kt, "check(onlyOne)")
         assertContains(kt, "panicsAndAsserts")
+    }
+
+    @Test
+    fun f16F128SynthesisLayoutsAndProjectFfiNameUnificationWork() {
+        val rustSource =
+            """
+            pub fn float_ext(x: f16, y: f128) -> (u16, u128, f16, f128) {
+                let a = 1.5f16;
+                let b = 2.5f128;
+                let c = f16::from_bits(x.to_bits());
+                let inf = f16::INFINITY;
+                let eps = f128::EPSILON;
+                let _ = a + inf;
+                let _ = b + eps;
+                (c.to_bits(), y.to_bits(), c, y)
+            }
+            """.trimIndent()
+        val coreNs = "io.github.kotlinmania.rustlang.core"
+        val header =
+            FileHeaderContext(
+                packageName = "$coreNs.num.flt2dec",
+                projectGroup = "io.github.kotlinmania",
+                projectNamespace = coreNs,
+                crateNamespaces = mapOf("core" to coreNs),
+                isBatchCrateOutput = true,
+            )
+        val kt = renderSingleKotlinFile(rustSource, header).text
+        assertContains(kt, "F16.fromFloat(1.5f)")
+        assertContains(kt, "F128.fromDouble(2.5)")
+        assertContains(kt, "F16.fromBits(")
+        assertContains(kt, "F16.INFINITY")
+        assertContains(kt, "F128.EPSILON")
+
+        val floatSupport = renderSynthesizedFloatSupportFile(coreNs)
+        assertContains(floatSupport, "class F16")
+        assertContains(floatSupport, "class F128")
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(floatSupport, "FloatSupport.kt")
+
+        val typeLayout = CoreIntrinsicFfiArtifacts.renderTypeLayoutSupportKotlin(coreNs)
+        assertContains(typeLayout, "import $coreNs.F16")
+        assertContains(typeLayout, "import $coreNs.F128")
+        assertContains(typeLayout, "F16_LAYOUT")
+        assertContains(typeLayout, "F128_LAYOUT")
+
+        val bindingGyp = CoreIntrinsicFfiArtifacts.renderKmCoreBindingGyp("kmcore")
+        assertFalse(bindingGyp.contains("KM_NAPI_STANDALONE_MODULE"))
+
+        val props =
+            parseGradleProperties(
+                """
+                project.group=io.github.kotlinmania
+                project.namespace=io.github.kotlinmania.rustlang
+                project.ffi.name=kmcore
+                """.trimIndent(),
+            )
+        assertEquals("kmcore", props.projectFfiName)
+
+        val ffiSource =
+            """
+            extern "C" {
+                pub fn custom_km_probe(v: i32) -> i32;
+            }
+            """.trimIndent()
+        val ffiTranslated =
+            renderSingleKotlinFile(
+                ffiSource,
+                FileHeaderContext(
+                    packageName = "io.github.kotlinmania.rustlang.std.sys",
+                    projectGroup = "io.github.kotlinmania",
+                    projectNamespace = "io.github.kotlinmania.rustlang.std",
+                    crateNamespaces = mapOf("core" to coreNs),
+                    projectFfiName = "kmcore",
+                    isBatchCrateOutput = true,
+                ),
+            )
+        assertTrue(ffiTranslated.companionFiles.isNotEmpty())
+        assertTrue(
+            ffiTranslated.companionFiles.all { it.ffiModuleName == "kmcore" },
+            "Expected ffiModuleName=kmcore across companion artifacts, got ${ffiTranslated.companionFiles.map { it.relativePath to it.ffiModuleName }}",
+        )
+        assertTrue(
+            ffiTranslated.companionFiles.any { it.relativePath.endsWith("AndroidActuals.kt") && it.content.contains("\"kmcore_jni\"") },
+            "Expected Android actuals to load kmcore_jni",
+        )
+    }
+
+    @Test
+    fun stdlibTransliterationRewritesAsmSimdDefinitionModsNonNullDropAndLibcFallback() {
+        val coreNs = "io.github.kotlinmania.rustlang.core"
+        val coreArchNs = "io.github.kotlinmania.rustlang.corearch"
+
+        val archHeader =
+            FileHeaderContext(
+                packageName = "$coreArchNs.x86",
+                projectGroup = "io.github.kotlinmania",
+                projectNamespace = coreArchNs,
+                crateNamespaces = mapOf("core" to coreNs, "core_arch" to coreArchNs),
+                rootSelfDirModuleAliases = setOf("core_arch"),
+                rootExternalModuleReexports = mapOf("arch" to "core_arch"),
+                isBatchCrateOutput = true,
+            )
+        val archSource =
+            """
+            use crate::core_arch::simd::Foo;
+            use crate::arch::arm::Bar;
+
+            pub unsafe fn pause_cpu(f: Foo, b: Bar) {
+                core::arch::asm!("nop");
+                core::mem::drop(f);
+                core::mem::drop(b);
+            }
+            """.trimIndent()
+        val archKt = renderSingleKotlinFile(archSource, archHeader).text
+        assertContains(archKt, "import $coreArchNs.simd.Foo")
+        assertContains(archKt, "import $coreArchNs.arm.Bar")
+        assertFalse(archKt.contains("$coreArchNs.core_arch"))
+        assertFalse(archKt.contains("$coreArchNs.arch."))
+        assertContains(archKt, "Unit")
+        assertFalse(archKt.contains("asm("))
+        assertContains(archKt, "(f).let { }")
+        assertContains(archKt, "(b).let { }")
+
+        val coreHeader =
+            FileHeaderContext(
+                packageName = "$coreNs.ffi",
+                projectGroup = "io.github.kotlinmania",
+                projectNamespace = coreNs,
+                crateNamespaces = mapOf("core" to coreNs),
+                isBatchCrateOutput = true,
+            )
+        val coreSource =
+            """
+            pub type c_char = c_char_definition::c_char;
+
+            mod c_char_definition {
+                pub(super) type c_char = i8;
+            }
+
+            #[repr(transparent)]
+            pub struct NonNull<T> {
+                pointer: *const T,
+            }
+
+            pub unsafe fn simd_helpers<T>(a: T, b: T) -> T {
+                let sum = core::intrinsics::simd::simd_add(a, b);
+                let mask = core::intrinsics::simd::simd_eq::<T, u32>(sum, a);
+                core::intrinsics::simd::simd_select(mask, sum, b)
+            }
+            """.trimIndent()
+        val coreKt = renderSingleKotlinFile(coreSource, coreHeader).text
+        assertContains(coreKt, "public typealias CChar = Byte")
+        assertFalse(coreKt.contains("cCharDefinition"))
+        assertFalse(coreKt.contains("c_char_definition"))
+        assertContains(coreKt, "public val rawAddress: Long")
+        assertContains(coreKt, "public val rawMeta: Long")
+        assertFalse(coreKt.contains("core.intrinsics.simd"))
+
+        val headerWithoutLibc =
+            FileHeaderContext(
+                packageName = "io.github.kotlinmania.rustlang.std.sys",
+                projectGroup = "io.github.kotlinmania",
+                projectNamespace = "io.github.kotlinmania.rustlang.std",
+                crateNamespaces = mapOf("core" to coreNs),
+                isBatchCrateOutput = true,
+            )
+        assertNull(FfiInteropCollector.resolveLibcNamespace(headerWithoutLibc))
+
+        val libcFallbackSource =
+            """
+            use libc::c_void;
+            pub type Sz = libc::size_t;
+            pub fn noop(_p: *const c_void) {}
+            """.trimIndent()
+        val libcFallbackKt = renderSingleKotlinFile(libcFallbackSource, headerWithoutLibc).text
+        assertFalse(libcFallbackKt.contains("import io.github.kotlinmania.libc"))
+        assertFalse(libcFallbackKt.contains("import io.github.kotlinmania.rustlang.libc"))
+    }
+
+    @Test
+    fun stdlibModuleAliasesExternalPathsTargetPruningAndZeroedIoctlLowerCleanly() {
+        val coreNs = "io.github.kotlinmania.rustlang.core"
+        val allocNs = "io.github.kotlinmania.rustlang.alloc"
+        val stdNs = "io.github.kotlinmania.rustlang.std"
+        val libcNs = "io.github.kotlinmania.rustlang.libc"
+        val backtraceNs = "io.github.kotlinmania.rustlang.backtrace"
+        val crateNamespaces =
+            mapOf(
+                "core" to coreNs,
+                "alloc" to allocNs,
+                "std" to stdNs,
+                "libc" to libcNs,
+                "backtrace" to backtraceNs,
+            )
+
+        // 1. Same-crate module alias & external crate submodule call (`memchr::memrchr`)
+        val stdMeta =
+            buildCrateRawAbiMetadataFromSources(
+                sources =
+                    listOf(
+                        "lib.rs" to
+                            """
+                            #[path = "../../backtrace/src/lib.rs"]
+                            mod backtrace_rs;
+                            pub mod sys {
+                                pub mod env {
+                                    pub fn environ() -> usize { 0 }
+                                }
+                            }
+                            """.trimIndent(),
+                        "sys/mod.rs" to "pub mod env;",
+                        "sys/env.rs" to "pub fn environ() -> usize { 0 }",
+                        "sys/pal/hermit/mod.rs" to "pub fn dead_hermit() {}",
+                        "os/wasip2/mod.rs" to "pub fn dead_wasip2() {}",
+                        "os/freebsd/mod.rs" to "pub fn dead_freebsd() {}",
+                        "sys/pal/unix/linux/mod.rs" to "pub fn live_linux() {}",
+                    ),
+                splitModuleRoots = true,
+            )
+        assertEquals("backtrace", stdMeta.rootExternalModuleReexports["backtrace_rs"])
+        assertFalse(
+            stdMeta.symbolSubpackages["deadHermit"]?.isNotEmpty() == true,
+            "Expected dead hermit file to be pruned from metadata: ${stdMeta.symbolSubpackages}",
+        )
+        assertTrue("liveLinux" in stdMeta.symbolSubpackages)
+        assertTrue(isUnsupportedTargetRustRelPath("sys/pal/hermit/mod.rs", CfgTargetProfile()))
+        assertTrue(isUnsupportedTargetRustRelPath("os/wasip2/mod.rs", CfgTargetProfile()))
+        assertFalse(isUnsupportedTargetRustRelPath("sys/pal/unix/linux/mod.rs", CfgTargetProfile()))
+        assertFalse(isUnsupportedTargetRustRelPath("sys/pal/wasi/mod.rs", CfgTargetProfile()))
+
+        val allocHeader =
+            FileHeaderContext(
+                packageName = "$allocNs.io.buffered",
+                projectGroup = "io.github.kotlinmania",
+                projectNamespace = allocNs,
+                crateNamespaces = crateNamespaces,
+                externalCrateSymbolPackages =
+                    mapOf(
+                        "core" to mapOf("memrchr" to listOf("$coreNs.slice.memchr")),
+                    ),
+                isBatchCrateOutput = true,
+            )
+        val allocSource =
+            """
+            use core::slice::memchr;
+            pub fn find_last(byte: u8, haystack: &[u8]) -> Option<usize> {
+                memchr::memrchr(byte, haystack)
+            }
+            """.trimIndent()
+        val allocKt = renderSingleKotlinFile(allocSource, allocHeader).text
+        assertContains(allocKt, "import $coreNs.slice.memchr.memrchr")
+        assertFalse(allocKt.contains("io.github.kotlinmania.memchr"))
+
+        // 2. Same-crate alias (`use crate::sys::env as env_imp`), external #[path] backtrace_rs, and zeroed + ioctl
+        val stdHeader =
+            FileHeaderContext(
+                packageName = "$stdNs.sys.process.unix",
+                projectGroup = "io.github.kotlinmania",
+                projectNamespace = stdNs,
+                crateNamespaces = crateNamespaces,
+                crateSubpackageRawLeafNames = stdMeta.subpackageRawLeafNames,
+                crateSymbolSubpackages = stdMeta.symbolSubpackages,
+                rootExternalModuleReexports = stdMeta.rootExternalModuleReexports,
+                isBatchCrateOutput = true,
+            )
+        val stdSource =
+            """
+            use crate::sys::env as env_imp;
+            pub fn probe(fd: i32, _bt: crate::backtrace_rs::Frame) -> usize {
+                let e = env_imp::environ();
+                let mut info: libc::pidfd_info = unsafe { core::mem::zeroed() };
+                let _ = unsafe { libc::ioctl(fd, libc::PIDFD_GET_INFO, &mut info) };
+                #[cfg(any(target_env = "p2", miri, doc))]
+                let _ = wasip2::dead();
+                e
+            }
+            """.trimIndent()
+        val stdKt = renderSingleKotlinFile(stdSource, stdHeader).text
+        assertContains(stdKt, "import $stdNs.sys.env.environ")
+        assertFalse(stdKt.contains("io.github.kotlinmania.envimp"))
+        assertContains(stdKt, "import $backtraceNs.Frame")
+        assertFalse(stdKt.contains("backtracers"))
+        assertFalse(stdKt.contains("wasip2"))
+        assertContains(stdKt, "PidfdInfo()")
+        assertContains(stdKt, "AddressableLocal(")
+        assertContains(stdKt, ".asMutPtr().rawAddress")
+    }
+
+    @Test
+    fun stdlibFullBuildFixesCfgParamsConstImplLocalModAndNumericConstants() {
+        val coreNs = "io.github.kotlinmania.rustlang.core"
+        val stdNs = "io.github.kotlinmania.rustlang.std"
+
+        // 1. Parameter-level #[cfg(...)] deduplicates colliding parameter names (fseeko64 pattern)
+        val libcSource =
+            """
+            extern "C" {
+                pub fn fseeko64(
+                    stream: *mut u8,
+                    #[cfg(any(not(target_os = "l4re"), all(target_os = "l4re", not(target_pointer_width = "64"))))]
+                    offset: i64,
+                    #[cfg(all(target_os = "l4re", target_pointer_width = "64"))]
+                    offset: i32,
+                    whence: i32,
+                ) -> i32;
+            }
+            """.trimIndent()
+        val libcKt =
+            renderSingleKotlinFile(
+                libcSource,
+                FileHeaderContext(
+                    packageName = "io.github.kotlinmania.rustlang.libc",
+                    projectGroup = "io.github.kotlinmania",
+                    projectNamespace = "io.github.kotlinmania.rustlang.libc",
+                    isBatchCrateOutput = true,
+                ),
+            )
+        assertEquals(1, Regex("""offset\s*:""").findAll(libcKt.text).count(), "Duplicate cfg param should be pruned:\n${libcKt.text}")
+
+        // 2. CrateTokenAbiScanner survives `const impl` and `pub const trait` to index `OneSidedRangeBound`
+        val rangeSource =
+            """
+            pub const trait RangeBounds<T> {
+                fn start_bound(&self) -> usize;
+            }
+            const impl RangeBounds<usize> for usize {
+                fn start_bound(&self) -> usize { *self }
+            }
+            pub enum OneSidedRangeBound {
+                StartInclusive,
+                End,
+                EndInclusive,
+            }
+            """.trimIndent()
+        val coreMeta =
+            buildCrateRawAbiMetadataFromSources(
+                sources = listOf("ops/range.rs" to rangeSource),
+                splitModuleRoots = true,
+            )
+        assertContains(coreMeta.symbolSubpackages["OneSidedRangeBound"].orEmpty(), "ops.range")
+        assertContains(coreMeta.symbolSubpackages["RangeBounds"].orEmpty(), "ops.range")
+
+        // 3. Block-local inline mod `sigpipe` does not emit `public` or synthesize `io.github.kotlinmania.sigpipe`
+        val unixModSource =
+            """
+            unsafe fn reset_sigpipe(handler: u8) -> bool {
+                mod sigpipe {
+                    pub const DEFAULT: u8 = 0;
+                    pub const INHERIT: u8 = 1;
+                }
+                match handler {
+                    sigpipe::DEFAULT => true,
+                    sigpipe::INHERIT => false,
+                    _ => false,
+                }
+            }
+            """.trimIndent()
+        val unixKt =
+            renderSingleKotlinFile(
+                unixModSource,
+                FileHeaderContext(
+                    packageName = "$stdNs.sys.pal.unix",
+                    projectGroup = "io.github.kotlinmania",
+                    projectNamespace = stdNs,
+                    isBatchCrateOutput = true,
+                ),
+            ).text
+        assertFalse(unixKt.contains("io.github.kotlinmania.sigpipe"), "Local mod must not leak phantom crate import:\n$unixKt")
+        assertFalse(unixKt.contains("public val DEFAULT"), "Local mod const must not emit `public`:\n$unixKt")
+
+        // 4. C numeric typedef MAX/MIN and F16/F128 IEEE-754 constants/methods avoid phantom imports
+        val numConstSource =
+            """
+            pub fn max_vals(a: f16, b: f128) -> (usize, usize, u16, U128Bits) {
+                let _ = a;
+                let _ = b;
+                (c_int::MAX as usize, c_uint::MAX as usize, f16::SIGN_MASK, f16::from_bits(1) as u16)
+            }
+            pub fn f128_mask() -> u128 {
+                f128::SIGN_MASK
+            }
+            """.trimIndent()
+        val numConstKt =
+            renderSingleKotlinFile(
+                numConstSource,
+                FileHeaderContext(
+                    packageName = "io.github.kotlinmania.rustlang.libm.math",
+                    projectGroup = "io.github.kotlinmania",
+                    projectNamespace = "io.github.kotlinmania.rustlang.libm",
+                    crateNamespaces = mapOf("core" to coreNs),
+                    isBatchCrateOutput = true,
+                ),
+            ).text
+        assertFalse(numConstKt.contains("io.github.kotlinmania.cint"), numConstKt)
+        assertFalse(numConstKt.contains("io.github.kotlinmania.cuint"), numConstKt)
+        assertFalse(numConstKt.contains("io.github.kotlinmania.f16"), numConstKt)
+        assertFalse(numConstKt.contains("io.github.kotlinmania.f128"), numConstKt)
+        assertContains(numConstKt, "Int.MAX_VALUE")
+        assertContains(numConstKt, "UInt.MAX_VALUE")
+        assertContains(numConstKt, "F16.SIGN_MASK")
+        assertContains(numConstKt, "F128.SIGN_MASK")
+    }
+
+    @Test
+    fun coreIntrinsicFfiArtifactsProvideLayoutAndSliceSupportWithoutLegacyShims() {
+        val coreNs = "io.github.kotlinmania.rustlang.core"
+        val typeLayout = CoreIntrinsicFfiArtifacts.renderTypeLayoutSupportKotlin(coreNs)
+        assertContains(typeLayout, "public class UnresolvedTypeLayout<T>")
+        assertContains(typeLayout, "public class LinearSliceView<T>")
+        assertContains(typeLayout, "public class LinearMutSliceView<T>")
+        assertContains(typeLayout, "public fun <T> linearSliceView(")
+        assertContains(typeLayout, "public fun <T> linearMutSliceView(")
+        assertContains(typeLayout, "public operator fun <T> MutableList<T>.get(range: IntRange): MutableList<T>")
+        assertContains(typeLayout, "public fun <T : Comparable<T>> kmCompareValues(")
+        assertContains(typeLayout, "isSigned: Boolean")
+        assertFalse(typeLayout.contains("@Suppress"), "TypeLayoutSupport must not contain @Suppress")
+        assertFalse(typeLayout.contains("// port-lint:"), "TypeLayoutSupport must not contain port-lint directive")
+        assertFalse(typeLayout.contains("import java."), "TypeLayoutSupport must not import java.*")
+        assertFalse(typeLayout.contains("import javax."), "TypeLayoutSupport must not import javax.*")
+        assertFalse(typeLayout.contains("ObjectSlotLayout"), "TypeLayoutSupport must not reference ObjectSlotLayout")
+        assertFalse(typeLayout.contains("ManagedSlotRegistry"), "TypeLayoutSupport must not reference ManagedSlotRegistry")
+        assertFalse(typeLayout.contains("flushMutableSliceWriteBacks"), "TypeLayoutSupport must not reference flushMutableSliceWriteBacks")
+
+        val expectKt = CoreIntrinsicFfiArtifacts.renderKmCoreIntrinsicsExpectKotlin(coreNs)
+        assertContains(expectKt, "kmSqrtf32")
+        assertContains(expectKt, "kmFloatToU128Unchecked")
+        assertFalse(expectKt.contains("@Suppress"))
+        assertFalse(expectKt.contains("import java."))
+
+        val defFile = CoreIntrinsicFfiArtifacts.renderKmCoreDef("io.github.kotlinmania.rustlang.core.intrinsics.cinterop")
+        assertContains(defFile, "-lm")
+    }
+
+    @Test
+    fun relativeTmpSubcrateInputResolvesConfiguredCrateNamespace() {
+        val coreNs = "io.github.kotlinmania.rustlang.core"
+        val ctx =
+            inferFileHeaderContext(
+                inputPath = "tmp/rust/library/core/src/num/uint_macros.rs",
+                outputPath = "src/common/commonMain/kotlin/io/github/kotlinmania/rustlang/core/num/NumFunctions.kt",
+                gradleProperties =
+                    GradleProjectProperties(
+                        projectGroup = "io.github.kotlinmania.rustlang",
+                        projectNamespace = "io.github.kotlinmania.rustlang",
+                        crateNamespaces = mapOf("core" to coreNs),
+                    ),
+            )
+        assertEquals(coreNs, ctx.projectNamespace)
+        assertEquals(coreNs, ctx.crateNamespaces["core"])
+    }
+
+    @Test
+    fun wave1ConstGenericTypeLayoutDefaultsAndMutableSliceSubListEmit() {
+        val coreNs = "io.github.kotlinmania.rustlang.core"
+        val rustSource =
+            """
+            #[repr(C)]
+            pub struct Buf<const N: usize> {
+                pub data: [u8; N],
+            }
+
+            pub fn sub(s: &mut [u8]) -> &mut [u8] {
+                &mut s[1..3]
+            }
+            """.trimIndent()
+        val kt =
+            renderSingleKotlinFile(
+                rustSource,
+                FileHeaderContext(
+                    packageName = "$coreNs.demo",
+                    projectGroup = "io.github.kotlinmania",
+                    projectNamespace = coreNs,
+                    crateNamespaces = mapOf("core" to coreNs),
+                    isBatchCrateOutput = true,
+                    rawAbiMode = false,
+                ),
+            ).text
+        assertContains(kt, ": Int = 0")
+        assertContains(kt, ".subList(")
     }
 }

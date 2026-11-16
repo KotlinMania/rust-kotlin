@@ -14,11 +14,14 @@ import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.ExprParse
 import io.github.kotlinmania.syn.File
 import io.github.kotlinmania.syn.FileParse
+import io.github.kotlinmania.syn.FnArg
 import io.github.kotlinmania.syn.ImplItem
 import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.Macro
 import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.ModContent
+import io.github.kotlinmania.syn.Pat
+import io.github.kotlinmania.syn.Signature
 import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.gen.Fold
@@ -148,6 +151,12 @@ private val UNSUPPORTED_RUST_TARGET_OS =
         "cuda",
         "nvptx",
         "amdgpu",
+        "helenos",
+        "freebsdlike",
+        "netbsdlike",
+        "solarish",
+        "managarm",
+        "zos",
     )
 
 private val UNSUPPORTED_RUST_TARGET_ENV =
@@ -157,6 +166,8 @@ private val UNSUPPORTED_RUST_TARGET_ENV =
         "ohos",
         "uclibc",
         "newlib",
+        "p2",
+        "p3",
     )
 
 private val UNSUPPORTED_RUST_TARGET_VENDOR =
@@ -168,6 +179,38 @@ private val UNSUPPORTED_RUST_TARGET_VENDOR =
         "uwp",
         "win7",
     )
+
+private val PRUNED_UNSUPPORTED_TARGET_PATH_SEGMENTS =
+    UNSUPPORTED_RUST_TARGET_OS +
+        UNSUPPORTED_RUST_TARGET_ENV +
+        UNSUPPORTED_RUST_TARGET_VENDOR +
+        setOf(
+            "fortanix_sgx",
+            "solid",
+            "itron",
+            "wasip2",
+            "wasip3",
+            "wali",
+            "miri",
+            "switch",
+        )
+
+internal fun isUnsupportedTargetRustRelPath(
+    relPath: String,
+    cfgProfile: CfgTargetProfile,
+): Boolean {
+    val norm = relPath.replace('\\', '/').trimStart('/').trimEnd('/')
+    if (norm.isEmpty()) return false
+    val withoutExt = norm.substringBeforeLast('.')
+    val segs = withoutExt.split('/').filter { it.isNotEmpty() }
+    return segs.any { rawSeg ->
+        val seg = rawSeg.lowercase()
+        seg in PRUNED_UNSUPPORTED_TARGET_PATH_SEGMENTS &&
+            seg != cfgProfile.targetOs?.lowercase() &&
+            seg != cfgProfile.targetEnv?.lowercase() &&
+            seg != cfgProfile.targetVendor?.lowercase()
+    }
+}
 
 private fun parseCfgSelectArms(innerTrees: List<TokenTree>): List<CfgSelectArm>? {
     if (innerTrees.isEmpty()) return emptyList()
@@ -552,30 +595,30 @@ internal fun evalCfgTriState(tokens: List<TokenTree>, forRuntimeCfgMacro: Boolea
                 }
                 "target_os" -> {
                     profile.targetOs?.let { litText == it }
-                        ?: if (dirContainsSegment(relDir, litText)) {
-                            true
-                        } else if (litText in UNSUPPORTED_RUST_TARGET_OS) {
+                        ?: if (litText in UNSUPPORTED_RUST_TARGET_OS) {
                             false
+                        } else if (dirContainsSegment(relDir, litText)) {
+                            true
                         } else {
                             resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
                         }
                 }
                 "target_env" -> {
                     profile.targetEnv?.let { litText == it }
-                        ?: if (dirContainsSegment(relDir, litText)) {
-                            true
-                        } else if (litText in UNSUPPORTED_RUST_TARGET_ENV) {
+                        ?: if (litText in UNSUPPORTED_RUST_TARGET_ENV) {
                             false
+                        } else if (dirContainsSegment(relDir, litText)) {
+                            true
                         } else {
                             resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
                         }
                 }
                 "target_vendor" -> {
                     profile.targetVendor?.let { litText == it }
-                        ?: if (dirContainsSegment(relDir, litText)) {
-                            true
-                        } else if (litText in UNSUPPORTED_RUST_TARGET_VENDOR) {
+                        ?: if (litText in UNSUPPORTED_RUST_TARGET_VENDOR) {
                             false
+                        } else if (dirContainsSegment(relDir, litText)) {
+                            true
                         } else {
                             resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
                         }
@@ -615,6 +658,7 @@ internal fun evalCfgTriState(tokens: List<TokenTree>, forRuntimeCfgMacro: Boolea
     if (ident == "false") return false
     if (ident in profile.enabledCfgFlags) return true
     if (ident in profile.disabledCfgFlags) return false
+    if (ident in setOf("miri", "doc", "rustdoc", "doctest", "bootstrap")) return false
     if (ident == "test") return if (forRuntimeCfgMacro) false else null
     if (ident == "unix" || ident == "windows" || ident == "wasm") {
         profile.targetFamilies?.let { return ident in it }
@@ -958,6 +1002,102 @@ internal class MacroRulesFileExpander(
         activeDefinitions.clear()
         activeDefinitions.putAll(savedDefs)
         return block.copy(stmts = expandedStmts)
+    }
+
+    override fun foldSignature(sig: Signature): Signature {
+        val folded = super.foldSignature(sig)
+        val args = folded.inputs.toList()
+        if (args.isEmpty()) return folded
+        val keptSet = linkedSetOf<Int>()
+        for ((idx, arg) in args.withIndex()) {
+            if (!isDocOnlyCfgAttribute(fnArgAttrs(arg))) {
+                keptSet += idx
+            }
+        }
+        val byCleanIdent = linkedMapOf<String, MutableList<Int>>()
+        for (idx in keptSet) {
+            val cleanIdent = fnArgCleanIdent(args[idx]) ?: continue
+            if (cleanIdent == "_") continue
+            byCleanIdent.getOrPut(cleanIdent) { mutableListOf() } += idx
+        }
+        for ((_, group) in byCleanIdent) {
+            if (group.size <= 1) continue
+            val winnerIdx = group.maxByOrNull { cfgAttrPreferenceScore(fnArgAttrs(args[it])) }!!
+            for (idx in group) {
+                if (idx != winnerIdx) keptSet.remove(idx)
+            }
+        }
+        if (keptSet.size < args.size) {
+            var idx = 0
+            folded.inputs.retain {
+                val keep = idx in keptSet
+                idx++
+                keep
+            }
+        }
+        return folded
+    }
+
+    override fun foldTypeFnPtr(ty: SynType.FnPtr): SynType.FnPtr {
+        val folded = super.foldTypeFnPtr(ty)
+        val args = folded.inputs.toList()
+        if (args.isEmpty()) return folded
+        val keptSet = linkedSetOf<Int>()
+        for ((idx, arg) in args.withIndex()) {
+            if (!isDocOnlyCfgAttribute(arg.attrs)) {
+                keptSet += idx
+            }
+        }
+        val byCleanIdent = linkedMapOf<String, MutableList<Int>>()
+        for (idx in keptSet) {
+            val cleanIdent =
+                args[idx]
+                    .name
+                    ?.ident
+                    ?.toString()
+                    ?.removePrefix("r#") ?: continue
+            if (cleanIdent == "_") continue
+            byCleanIdent.getOrPut(cleanIdent) { mutableListOf() } += idx
+        }
+        for ((_, group) in byCleanIdent) {
+            if (group.size <= 1) continue
+            val winnerIdx = group.maxByOrNull { cfgAttrPreferenceScore(args[it].attrs) }!!
+            for (idx in group) {
+                if (idx != winnerIdx) keptSet.remove(idx)
+            }
+        }
+        if (keptSet.size < args.size) {
+            var idx = 0
+            folded.inputs.retain {
+                val keep = idx in keptSet
+                idx++
+                keep
+            }
+        }
+        return folded
+    }
+
+    private fun fnArgAttrs(arg: FnArg): List<Attribute> =
+        when (arg) {
+            is FnArg.Receiver -> arg.attrs
+            is FnArg.Typed -> arg.patType.attrs
+        }
+
+    private fun fnArgCleanIdent(arg: FnArg): String? =
+        (arg as? FnArg.Typed)?.let {
+            (it.patType.pat as? Pat.Ident)?.ident?.toString()?.removePrefix("r#")
+        }
+
+    private fun cfgAttrPreferenceScore(attrs: List<Attribute>): Int {
+        val cfgPredicates =
+            attrs.mapNotNull { attr ->
+                val meta = attr.meta
+                if (meta is Meta.List && meta.path.isIdent("cfg")) meta.tokens.clone().toList() else null
+            }
+        if (cfgPredicates.isEmpty()) return 1
+        if (cfgPredicates.all { evalCfgTriState(it, forRuntimeCfgMacro = false) == true }) return 3
+        if (cfgPredicates.all { evalCfgExpressionTokens(it) }) return 2
+        return 0
     }
 
     override fun foldType(t: SynType): SynType {

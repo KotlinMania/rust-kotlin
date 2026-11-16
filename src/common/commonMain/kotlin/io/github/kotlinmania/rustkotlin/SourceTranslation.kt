@@ -20,6 +20,7 @@ import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.TraitItem
 import io.github.kotlinmania.syn.TypeParamBound
+import io.github.kotlinmania.syn.UseTree
 import io.github.kotlinmania.syn.Visibility
 import io.github.kotlinmania.syn.WherePredicate
 import io.github.kotlinmania.syn.gen.Visit
@@ -69,16 +70,17 @@ internal fun translateRustSourceToKotlinArtifacts(
         validateSupportedRustSemantics(recognized.file, allowStdlibDestructors = allowStdlibDestructors)
         val trivia = SourceTrivia.collect(recognized.source, recognized.tokens)
         val macroExpansion = expandFileMacroRules(recognized.file, headerContext.crateMacroSources)
+        val flattenedFile = flattenPrivateDefinitionInlineMods(macroExpansion.file)
         if (headerContext.isDocExample) {
-            TranslationSession.sourceLayoutFile = macroExpansion.file
+            TranslationSession.sourceLayoutFile = flattenedFile
         } else if (TranslationSession.sourceLayoutFile == null) {
-            TranslationSession.sourceLayoutFile = macroExpansion.file
+            TranslationSession.sourceLayoutFile = flattenedFile
         }
         val emitter =
             KotlinJ2KEmitter(
                 source = recognized.source,
                 originalFile = recognized.file,
-                file = selectParentItemsExcludingSplitInlineMods(macroExpansion.file, headerContext),
+                file = selectParentItemsExcludingSplitInlineMods(flattenedFile, headerContext),
                 trivia = trivia,
                 macroDefs = macroExpansion.definitions,
                 macroWrapperSpansByTargetOffset = macroExpansion.macroWrapperSpansByTargetOffset,
@@ -87,7 +89,7 @@ internal fun translateRustSourceToKotlinArtifacts(
         val parentText = emitter.emitFile()
         val splitModCompanions =
             emitSplitInlineModCompanions(
-                expandedFile = macroExpansion.file,
+                expandedFile = flattenedFile,
                 source = recognized.source,
                 trivia = trivia,
                 macroDefs = macroExpansion.definitions,
@@ -177,6 +179,93 @@ private fun selectSplitCandidateInlineMods(file: File, headerContext: FileHeader
     return if (hasCollision) candidates else emptyList()
 }
 
+private fun flattenPrivateDefinitionInlineMods(file: File): File {
+    val defModsByRaw = linkedMapOf<String, Item.Mod>()
+    for (item in file.items) {
+        if (itemHasDocOnlyCfg(item)) continue
+        if (item is Item.Mod && item.vis !is Visibility.Public && item.content is ModContent.Inline) {
+            val modRaw = item.ident.toString().removePrefix("r#")
+            if (modRaw.endsWith("_definition")) {
+                defModsByRaw[modRaw] = item
+            }
+        }
+    }
+    if (defModsByRaw.isEmpty()) return file
+
+    val innerTypesByModAndName = linkedMapOf<Pair<String, String>, MutableList<Item.ItemType>>()
+    for ((modRaw, modItem) in defModsByRaw) {
+        val content = modItem.content as ModContent.Inline
+        for (inner in content.items) {
+            if (itemHasDocOnlyCfg(inner)) continue
+            if (inner is Item.ItemType) {
+                val innerRaw = inner.ident.toString().removePrefix("r#")
+                innerTypesByModAndName.getOrPut(modRaw to innerRaw) { mutableListOf() }.add(inner)
+            }
+        }
+    }
+
+    val replacementByIdx = linkedMapOf<Int, List<Item.ItemType>>()
+    val matchedPairsByMod = linkedMapOf<String, MutableSet<String>>()
+    file.items.forEachIndexed { idx, item ->
+        if (itemHasDocOnlyCfg(item)) return@forEachIndexed
+        if (item is Item.ItemType && item.generics.params.isEmpty()) {
+            val rhs = unwrapSynType(item.ty) as? SynType.Path ?: return@forEachIndexed
+            if (rhs.qself != null) return@forEachIndexed
+            val segs = rhs.path.segments.toList()
+            if (segs.size != 2 || segs[1].arguments !is PathArguments.None) return@forEachIndexed
+            val modSeg = segs[0].ident.toString().removePrefix("r#")
+            val innerSeg = segs[1].ident.toString().removePrefix("r#")
+            val outerRaw = item.ident.toString().removePrefix("r#")
+            if (outerRaw != innerSeg) return@forEachIndexed
+            val hoisted = innerTypesByModAndName[modSeg to innerSeg] ?: return@forEachIndexed
+            replacementByIdx[idx] =
+                hoisted.map { inner ->
+                    inner.copy(
+                        attrs = item.attrs + inner.attrs,
+                        vis = item.vis,
+                    )
+                }
+            matchedPairsByMod.getOrPut(modSeg) { hashSetOf() }.add(innerSeg)
+        }
+    }
+    if (replacementByIdx.isEmpty()) return file
+
+    val consumedModNames = hashSetOf<String>()
+    for ((modRaw, modItem) in defModsByRaw) {
+        val matchedNames = matchedPairsByMod[modRaw] ?: continue
+        val content = modItem.content as ModContent.Inline
+        val allNonDocMatched =
+            content.items.all { inner ->
+                itemHasDocOnlyCfg(inner) ||
+                    (inner is Item.ItemType && inner.ident.toString().removePrefix("r#") in matchedNames)
+            }
+        if (allNonDocMatched) {
+            consumedModNames += modRaw
+        }
+    }
+
+    val rewritten = mutableListOf<Item>()
+    file.items.forEachIndexed { idx, item ->
+        val replacement = replacementByIdx[idx]
+        when {
+            replacement != null -> rewritten.addAll(replacement)
+            item is Item.Mod &&
+                item.vis !is Visibility.Public &&
+                item.content is ModContent.Inline &&
+                item.ident.toString().removePrefix("r#") in consumedModNames -> {
+                // Hoisted into outer alias position.
+            }
+            else -> rewritten += item
+        }
+    }
+    return File(
+        shebang = file.shebang,
+        frontmatter = file.frontmatter,
+        attrs = file.attrs,
+        items = rewritten,
+    )
+}
+
 private fun selectParentItemsExcludingSplitInlineMods(file: File, headerContext: FileHeaderContext): File {
     val splitMods = selectSplitCandidateInlineMods(file, headerContext)
     if (splitMods.isEmpty()) return file
@@ -184,9 +273,26 @@ private fun selectParentItemsExcludingSplitInlineMods(file: File, headerContext:
     return File(
         shebang = file.shebang,
         attrs = file.attrs,
-        items = file.items.filterNot { it in excludedSet },
+        items =
+            file.items.map { item ->
+                if (item in excludedSet && item is Item.Mod) item.copy(content = null) else item
+            },
     )
 }
+
+private fun useTreeStartsWithSuper(tree: UseTree): Boolean =
+    when (tree) {
+        is UseTree.Path -> tree.ident.toString().removePrefix("r#") == "super"
+        is UseTree.Group -> tree.items.toList().any(::useTreeStartsWithSuper)
+        else -> false
+    }
+
+private fun useTreeRootIdent(tree: UseTree): String? =
+    when (tree) {
+        is UseTree.Path -> tree.ident.toString().removePrefix("r#")
+        is UseTree.Name -> tree.ident.toString().removePrefix("r#")
+        else -> null
+    }
 
 private fun emitSplitInlineModCompanions(
     expandedFile: File,
@@ -200,6 +306,18 @@ private fun emitSplitInlineModCompanions(
     if (splitMods.isEmpty()) return emptyList()
     val basePkg = headerContext.packageName!!.trim().removeSuffix(".")
     val effectiveNs = headerContext.projectNamespace ?: basePkg
+    val parentLocalMods =
+        expandedFile.items
+            .filterIsInstance<Item.Mod>()
+            .mapTo(hashSetOf()) { it.ident.toString().removePrefix("r#") }
+    val parentUses =
+        expandedFile.items
+            .filterIsInstance<Item.Use>()
+            .filterNot(::itemHasDocOnlyCfg)
+            .filter { u ->
+                val root = useTreeRootIdent(u.tree)
+                root != null && root != "self" && root != "super" && root !in parentLocalMods
+            }.map { it.copy(vis = Visibility.Inherited) }
     val out = mutableListOf<CompanionInteropFile>()
     for (modItem in splitMods) {
         val rawMod = modItem.ident.toString().removePrefix("r#")
@@ -219,11 +337,17 @@ private fun emitSplitInlineModCompanions(
                 currentRelativeSourceDir = childRelDir,
                 isModuleRootSource = false,
             )
+        val inlineItems = (modItem.content as ModContent.Inline).items
+        val hasSuperImport =
+            inlineItems.any { child ->
+                child is Item.Use && !itemHasDocOnlyCfg(child) && useTreeStartsWithSuper(child.tree)
+            }
+        val childItems = if (hasSuperImport && parentUses.isNotEmpty()) parentUses + inlineItems else inlineItems
         val rawChildFile =
             File(
                 shebang = null,
                 attrs = modItem.attrs,
-                items = (modItem.content as ModContent.Inline).items,
+                items = childItems,
             )
         val prevLayout = TranslationSession.sourceLayoutFile
         val prevRelDir = TranslationSession.currentRelativeSourceDir
@@ -385,8 +509,8 @@ internal fun translateModuleRootIntoFocusedChunks(
         validateSupportedRustSemantics(recognized.file, allowStdlibDestructors = allowStdlibDestructors)
         val trivia = SourceTrivia.collect(recognized.source, recognized.tokens)
         val macroExpansion = expandFileMacroRules(recognized.file, headerContext.crateMacroSources)
-        if (TranslationSession.sourceLayoutFile == null) TranslationSession.sourceLayoutFile = macroExpansion.file
-        val expandedFile = macroExpansion.file
+        val expandedFile = flattenPrivateDefinitionInlineMods(macroExpansion.file)
+        if (TranslationSession.sourceLayoutFile == null) TranslationSession.sourceLayoutFile = expandedFile
 
         val substantiveItems =
             expandedFile.items.filter { item ->
@@ -662,6 +786,7 @@ internal class KotlinJ2KEmitter(
                 sym.referencedUnqualifiedTypeIdents.addAll(sharedInsp.referencedUnqualifiedTypeIdents)
                 sym.referencedPathPrefixTypeIdents.addAll(sharedInsp.referencedPathPrefixTypeIdents)
                 sym.declaredTraitsByName.putAll(sharedInsp.declaredTraitsByName)
+                sym.typeDefaultArgsByType.putAll(sharedInsp.typeDefaultArgsByType)
                 sym.tupleStructArityByType.putAll(sharedInsp.tupleStructArityByType)
                 sym.tupleEnumVariantArity.putAll(sharedInsp.tupleEnumVariantArity)
                 sym.enumTypeParamsByVariant.putAll(sharedInsp.enumTypeParamsByVariant)
@@ -787,6 +912,15 @@ internal class KotlinJ2KEmitter(
     internal var currentTailExpectsUnitResultOk: Boolean = false
     internal var usesI128: Boolean = false
     internal var usesRustAny: Boolean = false
+    internal var suppressTraitAssocPlaceholders: Boolean = false
+    internal var activeConstParamNames: Set<String> = emptySet()
+
+    internal fun effectiveStructKotlinName(baseKtName: String): String =
+        if (baseKtName == "String" && headerContext.packageName?.endsWith(".alloc.string") == true) {
+            "RustAllocString"
+        } else {
+            baseKtName
+        }
     internal val computedStructLayoutCache: MutableMap<String, ComputedStructLayout?> = linkedMapOf()
     internal val requiredTypeLayoutParamsCache: MutableMap<String, List<Pair<String, String>>> = linkedMapOf()
     internal val inferExprRenderedTypeCache: MutableMap<InferExprCacheKey, String?> = hashMapOf()
@@ -811,12 +945,25 @@ internal class KotlinJ2KEmitter(
         val standaloneItems = mutableListOf<Item>()
 
         currentOmittedTestIdents = computeTransitivelyOmittedQuickcheckOrRandIdents(file.items, emptySet())
+        val sharedModFile = TranslationSession.sharedModuleFile
+        if (sharedModFile != null) {
+            for (sharedItem in sharedModFile.items) {
+                if (itemHasDocOnlyCfg(sharedItem)) continue
+                if (sharedItem is Item.Use) {
+                    registerUseItemInScope(sharedItem)
+                }
+            }
+        }
         for (item in file.items) {
             if (itemHasDocOnlyCfg(item)) continue
             if (item is Item.Use) {
-                registerUseItemInScope(item)
-                continue
+                if (sharedModFile == null || sharedModFile.items.none { it === item }) {
+                    registerUseItemInScope(item)
+                }
             }
+        }
+        for (item in file.items) {
+            if (itemHasDocOnlyCfg(item) || item is Item.Use) continue
             if (item is Item.Impl && !shouldOmitItemForUnportedQuickcheckOrRand(item)) {
                 val ownerType = extractDirectOwnerTypeName(item.selfType, item.generics)
                 if (ownerType != null && ownerType in inspector.attachableTypeNames) {
@@ -1267,11 +1414,25 @@ internal class KotlinJ2KEmitter(
                 if (!headerContext.rawAbiMode) {
                     for (ffiSym in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS.values.distinct()) {
                         if (resolveBestSubpackageForSymbol(ffiSym) == null) {
-                            add(ffiSym to "$activeCoreNs.ffi")
+                            add(
+                                ffiSym to
+                                    CoreIntrinsicLowering.defaultStdlibFfiSymbolPackage(
+                                        ffiSym,
+                                        activeCoreNs,
+                                        activeAllocNs,
+                                    ),
+                            )
                         }
                     }
                     if (resolveBestSubpackageForSymbol("CString") == null) {
-                        add("CString" to "$activeAllocNs.ffi")
+                        add(
+                            "CString" to
+                                CoreIntrinsicLowering.defaultStdlibFfiSymbolPackage(
+                                    "CString",
+                                    activeCoreNs,
+                                    activeAllocNs,
+                                ),
+                        )
                     }
                 }
                 if (usesExternalRustLangCore) {
@@ -1280,19 +1441,27 @@ internal class KotlinJ2KEmitter(
                     add("RustAny" to activeCoreNs)
                     add("RustTypeId" to activeCoreNs)
                     add("Ordering" to "$activeCoreNs.cmp")
-                    add("compareNaturalOrder" to "$activeCoreNs.cmp")
-                    add("ParseIntError" to "$activeCoreNs.num")
-                    add("IntErrorKind" to "$activeCoreNs.num")
-                    add("TryFromIntError" to "$activeCoreNs.num")
+                    add("ParseIntError" to "$activeCoreNs.num.error")
+                    add("IntErrorKind" to "$activeCoreNs.num.error")
+                    add("TryFromIntError" to "$activeCoreNs.num.error")
                     add("FpCategory" to "$activeCoreNs.num")
-                    add("Wrapping" to "$activeCoreNs.num")
+                    add("Wrapping" to "$activeCoreNs.num.wrapping")
+                    add("Pin" to "$activeCoreNs.pin")
+                    add("ControlFlow" to "$activeCoreNs.ops.controlflow")
+                    add("Allocator" to "$activeCoreNs.alloc")
+                    add("AllocError" to "$activeCoreNs.alloc")
+                    add("Layout" to "$activeCoreNs.alloc.layout")
+                    add("transmute" to "$activeCoreNs.mem")
+                    add("transmuteUnchecked" to "$activeCoreNs.mem")
+                    add("sizeOf" to "$activeCoreNs.mem")
+                    add("alignOf" to "$activeCoreNs.mem")
                 }
                 if ("core" in headerContext.crateNamespaces || headerContext.scalarChar) {
                     add("Cell" to "$activeCoreNs.cell")
                     add("RefCell" to "$activeCoreNs.cell")
                     add("Ref" to "$activeCoreNs.cell")
                     add("RefMut" to "$activeCoreNs.cell")
-                    add("OnceCell" to "$activeCoreNs.cell")
+                    add("OnceCell" to "$activeCoreNs.cell.once")
                     add("RustChar" to "$activeCoreNs.char")
                     add("CharTryFromError" to "$activeCoreNs.char")
                     add("RustCharIndex" to "$activeCoreNs.char")
@@ -1322,11 +1491,37 @@ internal class KotlinJ2KEmitter(
                 symSimple !in inspector.declaredTypeNames &&
                 symSimple !in inspector.declaredConstNames.values &&
                 symSimple !in importedSimpleNameToPkg &&
+                !isDeclaredTopLevelFnKotlinName(symSimple) &&
                 containsWholeIdentifier(bodyTextForImports, symSimple)
             ) {
                 val imp = "import $symPkg.$symSimple"
                 if (imp !in combinedExtraTypeImports) {
                     combinedExtraTypeImports += imp
+                }
+            }
+        }
+        if (usesExternalRustLangCore && !headerContext.rawAbiMode) {
+            for ((variantName, variantOwner) in listOf(
+                "Break" to "$activeCoreNs.ops.controlflow.ControlFlow",
+                "Continue" to "$activeCoreNs.ops.controlflow.ControlFlow",
+                "Less" to "$activeCoreNs.cmp.Ordering",
+                "Equal" to "$activeCoreNs.cmp.Ordering",
+                "Greater" to "$activeCoreNs.cmp.Ordering",
+            )) {
+                val ownerPkg = variantOwner.substringBeforeLast('.')
+                if (headerContext.packageName != ownerPkg &&
+                    variantName !in inspector.declaredTypeNames &&
+                    variantName !in inspector.declaredConstNames.values &&
+                    variantName !in inspector.enumVariantSimpleNames &&
+                    variantName !in inspector.importedEnumVariantSimpleNames &&
+                    variantName !in importedSimpleNameToPkg &&
+                    !isDeclaredTopLevelFnKotlinName(variantName) &&
+                    containsWholeIdentifier(bodyTextForImports, variantName)
+                ) {
+                    val imp = "import $variantOwner.$variantName"
+                    if (imp !in combinedExtraTypeImports) {
+                        combinedExtraTypeImports += imp
+                    }
                 }
             }
         }
@@ -1353,10 +1548,20 @@ internal class KotlinJ2KEmitter(
         }
         extraImports.addAll(
             combinedExtraTypeImports.filter { imp ->
-                val rawSimple = imp.removePrefix("import ").substringBefore(" as ").substringAfterLast('.')
-                val targetPkg = imp.removePrefix("import ").substringBefore(" as ").substringBeforeLast('.', missingDelimiterValue = "")
+                val impPath = imp.removePrefix("import ").substringBefore(" as ").trim()
+                val rawSimple = impPath.substringAfterLast('.')
+                val targetPkg = impPath.substringBeforeLast('.', missingDelimiterValue = "")
+                val isSingleUpperTypeParam = rawSimple.length == 1 && rawSimple[0] in 'A'..'Z'
+                val isEnumVariantShadowed =
+                    (rawSimple in inspector.enumVariantSimpleNames || rawSimple in inspector.importedEnumVariantSimpleNames) &&
+                        !impPath.endsWith(".Result.$rawSimple") &&
+                        impPath != "Result.$rawSimple" &&
+                        !impPath.endsWith(".Option.$rawSimple") &&
+                        impPath != "Option.$rawSimple"
                 targetPkg != headerContext.packageName &&
                     rawSimple !in inspector.declaredTypeNames &&
+                    !isSingleUpperTypeParam &&
+                    !isEnumVariantShadowed &&
                     containsWholeIdentifier(bodyTextForImports, rawSimple)
             },
         )
@@ -1922,7 +2127,7 @@ internal class KotlinJ2KEmitter(
             is Item.Trait -> renderItemTrait(item, indent, scopeSignatures, isLocalItem = isLocalItem)
             is Item.TraitAlias -> renderItemTraitAlias(item, indent, scopeSignatures, isLocalItem = isLocalItem)
             is Item.Impl -> renderStandaloneItemImpl(item, indent, scopeSignatures, isLocalItem = isLocalItem)
-            is Item.Mod -> renderItemMod(item, indent, scopeSignatures)
+            is Item.Mod -> renderItemMod(item, indent, scopeSignatures, isLocalItem = isLocalItem)
             is Item.Macro -> renderItemMacro(item, indent, isLocalItem = isLocalItem)
             is Item.ForeignMod -> renderItemForeignMod(item, indent, isLocalItem = isLocalItem)
             is Item.ExternCrate -> ""
@@ -2415,8 +2620,10 @@ internal val PRIMITIVE_TYPE_NAMES =
         "i64",
         "i128",
         "isize",
+        "f16",
         "f32",
         "f64",
+        "f128",
         "bool",
         "str",
         "char",
@@ -2472,8 +2679,10 @@ internal val IGNORED_QUOTE_KEYWORDS =
         "i64",
         "i128",
         "isize",
+        "f16",
         "f32",
         "f64",
+        "f128",
         "bool",
         "str",
         "char",

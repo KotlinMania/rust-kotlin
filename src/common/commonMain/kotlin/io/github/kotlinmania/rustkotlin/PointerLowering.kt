@@ -128,9 +128,19 @@ internal fun KotlinJ2KEmitter.shouldUseAddressBackedMutableReference(
             ?.last()
             ?.ident
             ?.toString()
-    if (primitive in setOf("isize", "usize", "i128", "u128", "f32", "f64", "char")) return true
+    if (primitive in setOf("isize", "usize", "i128", "u128", "f16", "f32", "f64", "f128", "char")) return true
     if (resolved is SynType.Ptr) return true
     if (runtimeCellField(resolved) != null) return true
+    val firstRawSeg =
+        (resolved as? SynType.Path)
+            ?.path
+            ?.segments
+            ?.toList()
+            ?.firstOrNull()
+            ?.ident
+            ?.toString()
+            ?.removePrefix("r#")
+    if (firstRawSeg in setOf("libc", "wasip1", "windows_sys", "wasi")) return true
     val rendered =
         (resolved as? SynType.Path)
             ?.path
@@ -139,6 +149,10 @@ internal fun KotlinJ2KEmitter.shouldUseAddressBackedMutableReference(
             ?.ident
             ?.toString()
             ?.let { if (it == "Self") selfTypeName else rustTypeIdentToKotlin(it) }
+    val renderedPkg = rendered?.let { importedSimpleNameToPkg[it] }
+    if (renderedPkg != null && (".libc" in renderedPkg || ".wasip1" in renderedPkg || ".windowssys" in renderedPkg)) {
+        return true
+    }
     val decl = transparentDeclaration(rendered)
     if (decl != null && sourceTransparentField(decl, rendered ?: decl.ident.toString()) != null) {
         return true
@@ -496,7 +510,19 @@ internal fun KotlinJ2KEmitter.sourceAssociatedParameters(generics: Generics): Li
 
 internal fun KotlinJ2KEmitter.sourceAssociatedArguments(path: io.github.kotlinmania.syn.Path, selfType: String?): List<String> {
     val segment = path.segments.last() ?: return emptyList()
-    val declaration = transparentDeclaration(segment.ident.toString()) ?: return emptyList()
+    val rawIdent = segment.ident.toString().removePrefix("r#")
+    val declaration = transparentDeclaration(rawIdent)
+    if (declaration == null) {
+        val rawFirstArgSyn =
+            (segment.arguments as? PathArguments.AngleBracketed)
+                ?.args
+                ?.toList()
+                ?.filterIsInstance<GenericArgument.TypeArg>()
+                ?.firstOrNull()
+                ?.type
+        val renderedFirst = rawFirstArgSyn?.let { renderType(it, selfType) }
+        return resolveStdlibAssociatedArgs(rustTypeIdentToKotlin(rawIdent), rawFirstArgSyn, renderedFirst)
+    }
     val parameters =
         declaration.generics.params
             .toList()
@@ -854,6 +880,10 @@ internal fun KotlinJ2KEmitter.sourcePointerLayout(
             CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
             return "PrimitiveLayouts.F64"
         }
+        "f128", "F128" -> {
+            CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
+            return "PrimitiveLayouts.F128_LAYOUT"
+        }
         "char" -> {
             CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
             return "PrimitiveLayouts.CHAR"
@@ -899,7 +929,7 @@ internal fun KotlinJ2KEmitter.sourcePointerLayout(
                 ?.last()
                 ?.ident
                 ?.toString()
-        if (fixedScalarPointerCodec(referent) != null || scalarName in setOf("isize", "usize", "i128", "u128", "f32", "f64", "char")) {
+        if (fixedScalarPointerCodec(referent) != null || scalarName in setOf("isize", "usize", "i128", "u128", "f16", "f32", "f64", "f128", "char")) {
             val innerLayout = sourcePointerLayout(referent, selfType, available, substitutions, visiting + rendered) ?: return null
             CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
             return "PrimitiveLayouts.mutableReferenceLayout<${renderType(referent, selfType)}>($innerLayout, ${activeCfgProfile.pointerWidth}L)"
@@ -999,8 +1029,8 @@ internal fun KotlinJ2KEmitter.transparentFactoryLayout(declaration: Item.Struct,
     val (leaf, substitutions) = transparentFactoryLeaf(declaration, selfType)
     sourcePointerLayout(leaf, selfType, substitutions = substitutions)?.let { return it }
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.ObjectSlotLayout")
-    return "ObjectSlotLayout<${layoutRenderedType(leaf, selfType, substitutions)}>()"
+    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+    return "UnresolvedTypeLayout<${layoutRenderedType(leaf, selfType, substitutions)}>()"
 }
 
 internal fun KotlinJ2KEmitter.transparentConstructionLayout(
@@ -1023,8 +1053,8 @@ internal fun KotlinJ2KEmitter.transparentConstructionLayout(
         return "this.fieldLayout"
     }
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.ObjectSlotLayout")
-    return "ObjectSlotLayout<${field.second}>()"
+    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+    return "UnresolvedTypeLayout<${field.second}>()"
 }
 
 internal fun KotlinJ2KEmitter.sourceInitializerType(expression: Expr): SynType? {
@@ -1094,6 +1124,9 @@ internal fun KotlinJ2KEmitter.sourceInitializerType(expression: Expr): SynType? 
                 }
             inspector.structFieldSynTypesByType[ownerKt]?.get(fieldKt)?.let { return it }
         }
+    }
+    if (source is Expr.Call) {
+        CoreIntrinsicLowering.inferCoreIntrinsicReturnSynType(source, this)?.let { return it }
     }
     if (source is Expr.MethodCall) {
         val rawMethod = source.method.toString().removePrefix("r#")
@@ -1431,7 +1464,7 @@ internal fun KotlinJ2KEmitter.primitiveArrayLayoutFactory(
         NumericKind.U64 -> "uLongArray"
         NumericKind.F32 -> "floatArray"
         NumericKind.F64 -> "doubleArray"
-        NumericKind.I128, NumericKind.U128, null -> null
+        NumericKind.I128, NumericKind.U128, NumericKind.F16, NumericKind.F128, null -> null
     }
 }
 

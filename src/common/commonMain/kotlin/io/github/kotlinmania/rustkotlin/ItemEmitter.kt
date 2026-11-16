@@ -2,9 +2,7 @@ package io.github.kotlinmania.rustkotlin
 
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
-import io.github.kotlinmania.rustkotlin.reused.starlark.AssignCount
 import io.github.kotlinmania.syn.Attribute
-import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.Fields
 import io.github.kotlinmania.syn.FnArg
@@ -14,7 +12,6 @@ import io.github.kotlinmania.syn.Generics
 import io.github.kotlinmania.syn.ImplItem
 import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.Lit
-import io.github.kotlinmania.syn.Member
 import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.MetaParse
 import io.github.kotlinmania.syn.ModContent
@@ -24,22 +21,17 @@ import io.github.kotlinmania.syn.ReceiverKind
 import io.github.kotlinmania.syn.Signature
 import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
-import io.github.kotlinmania.syn.TraitItem
 import io.github.kotlinmania.syn.TypeParamBound
-import io.github.kotlinmania.syn.UnOp
 import io.github.kotlinmania.syn.Variant
 import io.github.kotlinmania.syn.Visibility
-import io.github.kotlinmania.syn.WhereClause
 import io.github.kotlinmania.syn.WherePredicate
-import io.github.kotlinmania.syn.gen.Visit
 import io.github.kotlinmania.syn.parse2
-import io.github.kotlinmania.syn.span
 
-private data class RustPanicExpectation(
+internal data class RustPanicExpectation(
     val message: String?,
 )
 
-private fun extractRustPanicExpectation(attrs: List<Attribute>): RustPanicExpectation? {
+internal fun extractRustPanicExpectation(attrs: List<Attribute>): RustPanicExpectation? {
     val attribute = attrs.firstOrNull { it.path().isIdent("should_panic") } ?: return null
     val meta = attribute.meta
     if (meta is Meta.PathMeta) return RustPanicExpectation(null)
@@ -63,7 +55,7 @@ private fun extractRustPanicExpectation(attrs: List<Attribute>): RustPanicExpect
     return RustPanicExpectation(literal.value.value())
 }
 
-private fun wrapRustPanicTestBody(
+internal fun wrapRustPanicTestBody(
     body: String,
     indent: String,
     expectation: RustPanicExpectation,
@@ -89,6 +81,248 @@ private fun wrapRustPanicTestBody(
         append(indent).append('}')
     }
 
+internal fun reserveUniqueSignature(
+    scopeSignatures: MutableMap<String, Int>,
+    key: String,
+): Boolean {
+    val seenCount = scopeSignatures[key] ?: 0
+    scopeSignatures[key] = seenCount + 1
+    return seenCount == 0
+}
+
+internal fun hasDeriveTrait(
+    attrs: List<Attribute>,
+    traitName: String,
+): Boolean =
+    attrs.any { attribute ->
+        val derive = attribute.meta as? Meta.List
+        derive != null &&
+            derive.path.segments
+                .last()
+                ?.ident
+                .toString() in setOf("derive", "derive_const") &&
+            derive.tokens
+                .clone()
+                .toList()
+                .any { it is TokenTree.Ident && it.value.toString() == traitName }
+    }
+
+internal fun KotlinJ2KEmitter.beginItemHeaderAndVisibility(
+    leadingTrivia: String,
+    attrs: List<Attribute>,
+    vis: Visibility,
+    indent: String,
+    isLocalItem: Boolean = false,
+): Pair<StringBuilder, String> {
+    val sb = StringBuilder()
+    sb.append(leadingTrivia)
+    sb.append(renderKDocFromAttributes(attrs, indent))
+    val visStr = if (isLocalItem) "" else renderVisibility(vis)
+    return sb to visStr
+}
+
+internal inline fun <R> KotlinJ2KEmitter.withGenericParamScope(
+    generics: Generics,
+    block: () -> R,
+): R {
+    val prevTypeParams = activeTypeParamNames
+    val prevConstParams = activeConstParamNames
+    activeTypeParamNames = prevTypeParams + collectGenericTypeParamNames(generics)
+    activeConstParamNames = prevConstParams + collectGenericConstParamNames(generics)
+    return try {
+        block()
+    } finally {
+        activeConstParamNames = prevConstParams
+        activeTypeParamNames = prevTypeParams
+    }
+}
+
+internal inline fun <R> KotlinJ2KEmitter.withFunctionRenderScope(
+    sig: Signature,
+    selfTypeName: String?,
+    ownerGenerics: Generics? = null,
+    implGenerics: Generics? = null,
+    updateEnclosingFunctionName: Boolean = true,
+    resetHasherState: Boolean = false,
+    block: () -> R,
+): R {
+    val prevClosureLabel = currentClosureLabel
+    val prevEnclosingFn = currentEnclosingFunctionName
+    val prevEnclosingRet = currentEnclosingReturnRenderedType
+    val prevEnclosingSynRet = currentEnclosingReturnSynType
+    val prevEnclosingFmtResult = currentEnclosingReturnsFmtResult
+    val prevTailExpectsUnitResultOk = currentTailExpectsUnitResultOk
+    val prevMutableListLocals = currentMutableListLocals
+    val prevDequeLocals = currentDequeLocals
+    val prevIterableLocals = currentIterableLocals
+    val prevSourceParameterTypes = currentSourceParameterTypes
+    val prevTypedLocals = currentTypedLocals
+    val prevWitnessedBounds = currentWitnessedTraitBounds
+    val prevTypeParamBounds = currentTypeParamTraitBounds
+    val prevHasherState = currentHasherStateParam
+    val prevNullableLocals = currentNullableLocals
+    val prevSmartCastLocals = currentSmartCastNonNullLocals
+    val prevTypeParams = activeTypeParamNames
+    val prevConstParams = activeConstParamNames
+    val prevSubst = substitutedTypeParamTypes
+    val prevIntoSubstTps = currentIntoSubstitutedTypeParams
+    val prevIntoSubstParams = currentIntoSubstitutedParams
+    val prevWitnesses = currentTypeParamWitnessCalls
+    val prevSharedBorrowRecv = currentReceiverIsSharedBorrow
+    val prevMutBorrowRecv = currentReceiverIsMutBorrow
+    currentClosureLabel = null
+    if (updateEnclosingFunctionName) {
+        currentEnclosingFunctionName = rustFunctionIdentToKotlin(sig.ident.toString())
+    }
+    currentEnclosingReturnRenderedType = null
+    currentEnclosingReturnSynType = null
+    val firstReceiverRef =
+        (
+            sig.inputs
+                .toList()
+                .firstOrNull() as? FnArg.Receiver
+        )?.kind as? ReceiverKind.Reference
+    currentReceiverIsSharedBorrow = firstReceiverRef?.let { it.mutability == null } == true
+    currentReceiverIsMutBorrow = firstReceiverRef?.let { it.mutability != null } == true
+    currentMutableListLocals = emptySet()
+    currentDequeLocals = emptySet()
+    currentIterableLocals = emptySet()
+    currentSourceParameterTypes = emptyMap()
+    currentTypedLocals = emptyMap()
+    currentWitnessedTraitBounds = emptyMap()
+    currentTypeParamTraitBounds = emptyMap()
+    if (resetHasherState) {
+        currentHasherStateParam = null
+    }
+    currentNullableLocals = emptySet()
+    currentSmartCastNonNullLocals = emptySet()
+    currentIntoSubstitutedParams = emptySet()
+    val intoSubstTps = linkedSetOf<String>()
+    val mergedSubsts =
+        buildMap {
+            if (implGenerics != null) {
+                putAll(
+                    extractFnTraitSubstitutions(
+                        implGenerics.params.toList(),
+                        implGenerics.whereClause,
+                        selfTypeName,
+                        intoSubstTps,
+                    ),
+                )
+            }
+            val sigGenerics = sig.generics
+            putAll(
+                extractFnTraitSubstitutions(
+                    sigGenerics.params.toList(),
+                    sigGenerics.whereClause,
+                    selfTypeName,
+                    intoSubstTps,
+                ),
+            )
+        }
+    if (mergedSubsts.isNotEmpty()) {
+        substitutedTypeParamTypes = prevSubst + mergedSubsts
+    }
+    currentIntoSubstitutedTypeParams = prevIntoSubstTps + intoSubstTps
+    val combinedTypeParams =
+        buildSet {
+            addAll(prevTypeParams)
+            addAll(collectGenericTypeParamNames(ownerGenerics))
+            addAll(collectGenericTypeParamNames(implGenerics))
+            addAll(collectGenericTypeParamNames(sig.generics))
+        }
+    activeTypeParamNames = combinedTypeParams - substitutedTypeParamTypes.keys
+    activeConstParamNames =
+        prevConstParams +
+        collectGenericConstParamNames(ownerGenerics) +
+        collectGenericConstParamNames(implGenerics) +
+        collectGenericConstParamNames(sig.generics)
+    scopeBuilder.enterDef()
+    return try {
+        block()
+    } finally {
+        scopeBuilder.exitDef()
+        currentClosureLabel = prevClosureLabel
+        if (updateEnclosingFunctionName) {
+            currentEnclosingFunctionName = prevEnclosingFn
+        }
+        currentEnclosingReturnRenderedType = prevEnclosingRet
+        currentEnclosingReturnSynType = prevEnclosingSynRet
+        currentEnclosingReturnsFmtResult = prevEnclosingFmtResult
+        currentTailExpectsUnitResultOk = prevTailExpectsUnitResultOk
+        currentMutableListLocals = prevMutableListLocals
+        currentDequeLocals = prevDequeLocals
+        currentIterableLocals = prevIterableLocals
+        currentSourceParameterTypes = prevSourceParameterTypes
+        currentTypedLocals = prevTypedLocals
+        currentWitnessedTraitBounds = prevWitnessedBounds
+        currentTypeParamTraitBounds = prevTypeParamBounds
+        if (resetHasherState) {
+            currentHasherStateParam = prevHasherState
+        }
+        currentNullableLocals = prevNullableLocals
+        currentSmartCastNonNullLocals = prevSmartCastLocals
+        activeConstParamNames = prevConstParams
+        activeTypeParamNames = prevTypeParams
+        substitutedTypeParamTypes = prevSubst
+        currentIntoSubstitutedTypeParams = prevIntoSubstTps
+        currentIntoSubstitutedParams = prevIntoSubstParams
+        currentTypeParamWitnessCalls = prevWitnesses
+        currentReceiverIsSharedBorrow = prevSharedBorrowRecv
+        currentReceiverIsMutBorrow = prevMutBorrowRecv
+    }
+}
+
+private fun KotlinJ2KEmitter.renderConstOrStaticItem(
+    leadingTrivia: String,
+    attrs: List<Attribute>,
+    vis: Visibility,
+    rawIdent: String,
+    ty: SynType,
+    expr: Expr,
+    declKeyword: String,
+    indent: String,
+    scopeSignatures: MutableMap<String, Int>,
+    isLocalItem: Boolean,
+): String {
+    val (sb, visStr) = beginItemHeaderAndVisibility(leadingTrivia, attrs, vis, indent, isLocalItem)
+    val cleanRaw = rawIdent.removePrefix("r#")
+    val baseName =
+        if (!isLocalItem) {
+            inspector.declaredConstNames[cleanRaw] ?: rustConstIdentToKotlin(rawIdent)
+        } else {
+            rustConstIdentToKotlin(rawIdent)
+        }
+    val name = disambiguateName(baseName, scopeSignatures)
+    val renderedTy = renderType(ty, selfTypeName = null)
+    val numKind = resolveNumericKind(renderedTy)
+    val prevParseTarget = currentExpectedParseTargetType
+    currentExpectedParseTargetType = renderedTy
+    val initExpr =
+        try {
+            renderTypedNumericInitializer(expr, numKind, indent, selfTypeName = null)
+        } finally {
+            currentExpectedParseTargetType = prevParseTarget
+        }
+    sb
+        .append(indent)
+        .append(visStr)
+        .append(declKeyword)
+        .append(name)
+        .append(": ")
+        .append(renderedTy)
+    if (headerContext.isBatchCrateOutput && initExpr.contains('\n')) {
+        sb
+            .append(" =\n")
+            .append(indent)
+            .append("    ")
+            .append(initExpr.replace("\n", "\n    "))
+    } else {
+        sb.append(" = ").append(initExpr)
+    }
+    return sb.toString()
+}
+
 internal fun KotlinJ2KEmitter.renderItemConst(
     item: Item.Const,
     indent: String,
@@ -113,45 +347,18 @@ internal fun KotlinJ2KEmitter.renderItemConst(
         }
         return ""
     }
-    val sb = StringBuilder()
-    sb.append(renderLeadingTrivia(item, indent))
-    sb.append(renderKDocFromAttributes(item.attrs, indent))
-    val vis = if (isLocalItem) "" else renderVisibility(item.vis)
-    val cleanRaw = rawIdent.removePrefix("r#")
-    val baseName =
-        if (!isLocalItem) {
-            inspector.declaredConstNames[cleanRaw] ?: rustConstIdentToKotlin(rawIdent)
-        } else {
-            rustConstIdentToKotlin(rawIdent)
-        }
-    val name = disambiguateName(baseName, scopeSignatures)
-    val ty = renderType(item.ty, selfTypeName = null)
-    val numKind = resolveNumericKind(ty)
-    val prevParseTarget = currentExpectedParseTargetType
-    currentExpectedParseTargetType = ty
-    val initExpr =
-        try {
-            renderTypedNumericInitializer(item.expr, numKind, indent, selfTypeName = null)
-        } finally {
-            currentExpectedParseTargetType = prevParseTarget
-        }
-    sb
-        .append(indent)
-        .append(vis)
-        .append("val ")
-        .append(name)
-        .append(": ")
-        .append(ty)
-    if (headerContext.isBatchCrateOutput && initExpr.contains('\n')) {
-        sb
-            .append(" =\n")
-            .append(indent)
-            .append("    ")
-            .append(initExpr.replace("\n", "\n    "))
-    } else {
-        sb.append(" = ").append(initExpr)
-    }
-    return sb.toString()
+    return renderConstOrStaticItem(
+        leadingTrivia = renderLeadingTrivia(item, indent),
+        attrs = item.attrs,
+        vis = item.vis,
+        rawIdent = rawIdent,
+        ty = item.ty,
+        expr = item.expr,
+        declKeyword = "val ",
+        indent = indent,
+        scopeSignatures = scopeSignatures,
+        isLocalItem = isLocalItem,
+    )
 }
 
 internal fun KotlinJ2KEmitter.renderItemStatic(
@@ -159,48 +366,19 @@ internal fun KotlinJ2KEmitter.renderItemStatic(
     indent: String,
     scopeSignatures: MutableMap<String, Int>,
     isLocalItem: Boolean = false,
-): String {
-    val sb = StringBuilder()
-    sb.append(renderLeadingTrivia(item, indent))
-    sb.append(renderKDocFromAttributes(item.attrs, indent))
-    val vis = if (isLocalItem) "" else renderVisibility(item.vis)
-    val rawIdent = item.ident.toString()
-    val cleanRaw = rawIdent.removePrefix("r#")
-    val baseName =
-        if (!isLocalItem) {
-            inspector.declaredConstNames[cleanRaw] ?: rustConstIdentToKotlin(rawIdent)
-        } else {
-            rustConstIdentToKotlin(rawIdent)
-        }
-    val name = disambiguateName(baseName, scopeSignatures)
-    val ty = renderType(item.ty, selfTypeName = null)
-    val numKind = resolveNumericKind(ty)
-    val prevParseTarget = currentExpectedParseTargetType
-    currentExpectedParseTargetType = ty
-    val expr =
-        try {
-            renderTypedNumericInitializer(item.expr, numKind, indent, selfTypeName = null)
-        } finally {
-            currentExpectedParseTargetType = prevParseTarget
-        }
-    sb
-        .append(indent)
-        .append(vis)
-        .append("var ")
-        .append(name)
-        .append(": ")
-        .append(ty)
-    if (headerContext.isBatchCrateOutput && expr.contains('\n')) {
-        sb
-            .append(" =\n")
-            .append(indent)
-            .append("    ")
-            .append(expr.replace("\n", "\n    "))
-    } else {
-        sb.append(" = ").append(expr)
-    }
-    return sb.toString()
-}
+): String =
+    renderConstOrStaticItem(
+        leadingTrivia = renderLeadingTrivia(item, indent),
+        attrs = item.attrs,
+        vis = item.vis,
+        rawIdent = item.ident.toString(),
+        ty = item.ty,
+        expr = item.expr,
+        declKeyword = "var ",
+        indent = indent,
+        scopeSignatures = scopeSignatures,
+        isLocalItem = isLocalItem,
+    )
 
 internal fun KotlinJ2KEmitter.renderItemType(
     item: Item.ItemType,
@@ -208,14 +386,11 @@ internal fun KotlinJ2KEmitter.renderItemType(
     scopeSignatures: MutableMap<String, Int>,
     isLocalItem: Boolean = false,
 ): String {
-    if (isLocalItem || isExternalIdentityTypeReexportAlias(item, headerContext.selfCrateAliases)) {
+    if (isLocalItem || isExternalIdentityTypeReexportAlias(item, headerContext.selfCrateAliases, inspector.localInlineModuleNames)) {
         return ""
     }
     val name = rustTypeIdentToKotlin(item.ident.toString())
-    val sigKey = "typealias:$name"
-    val seenCount = scopeSignatures[sigKey] ?: 0
-    scopeSignatures[sigKey] = seenCount + 1
-    if (seenCount > 0) {
+    if (!reserveUniqueSignature(scopeSignatures, "typealias:$name")) {
         return ""
     }
     val sb = StringBuilder()
@@ -231,8 +406,9 @@ internal fun KotlinJ2KEmitter.renderItemType(
         val field = requireNotNull(sourceTransparentField(declaration, declaration.ident.toString()))
         val fieldType = renderType(sourceStorageAliasField(item, declaration), name)
         val target = renderType(item.ty, name)
-        sb.append("${indent}${vis}class $name$typeParams(fieldStorage: MutPtr<$fieldType>, fieldLayout: TypeLayout<$fieldType>) : $target(fieldStorage, fieldLayout) {\n")
-        sb.append("$indent    public constructor(${field.first}: $fieldType, fieldLayout: TypeLayout<$fieldType>) : this(allocateNativeCell(${field.first}, fieldLayout), fieldLayout)\n")
+        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+        sb.append("${indent}${vis}class $name$typeParams(fieldStorage: MutPtr<$fieldType>, fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()) : $target(fieldStorage, fieldLayout) {\n")
+        sb.append("$indent    public constructor(${field.first}: $fieldType, fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()) : this(allocateNativeCell(${field.first}, fieldLayout), fieldLayout)\n")
         sb.append("$indent    public companion object\n")
         sb.append("$indent}")
         return sb.toString()
@@ -335,77 +511,6 @@ internal fun KotlinJ2KEmitter.renderItemType(
     return sb.toString()
 }
 
-internal fun KotlinJ2KEmitter.extractFnTraitSubstitutions(
-    params: List<GenericParam>,
-    whereClause: WhereClause?,
-    selfTypeName: String?,
-    intoSubstitutedOut: MutableSet<String>? = null,
-): Map<String, String> {
-    val fnTypeParams =
-        params
-            .mapNotNull { (it as? GenericParam.TypeParam)?.ident?.toString()?.let(::rustTypeIdentToKotlin) }
-            .toSet()
-    if (fnTypeParams.isEmpty()) return emptyMap()
-    val result = linkedMapOf<String, String>()
-    val allBoundsByTp = linkedMapOf<String, MutableList<TypeParamBound.Trait>>()
-    fun inspectBounds(tpName: String, bounds: List<TypeParamBound>) {
-        for (b in bounds) {
-            if (b is TypeParamBound.Trait && b.maybe == null) {
-                val lastSeg = b.path.segments.last() ?: continue
-                val rawName = lastSeg.ident.toString()
-                if ((rawName == "Fn" || rawName == "FnMut" || rawName == "FnOnce") &&
-                    lastSeg.arguments is PathArguments.Parenthesized
-                ) {
-                    result[tpName] = renderPathAsType(b.path, selfTypeName)
-                } else if (rawName !in IGNORED_TRAIT_BOUNDS) {
-                    allBoundsByTp.getOrPut(tpName) { mutableListOf() }.add(b)
-                }
-            }
-        }
-    }
-    for (gp in params) {
-        if (gp is GenericParam.TypeParam) {
-            val tpName = rustTypeIdentToKotlin(gp.ident.toString())
-            inspectBounds(tpName, gp.bounds.toList())
-        }
-    }
-    for (pred in whereClause?.predicates?.toList().orEmpty()) {
-        if (pred is WherePredicate.TypePredicate) {
-            val tpName = renderType(pred.boundedTy, selfTypeName)
-            if (tpName in fnTypeParams) {
-                inspectBounds(tpName, pred.bounds.toList())
-            }
-        }
-    }
-    val convertibleTraits =
-        buildSet {
-            if ("Into" !in inspector.declaredTypeNames) add("Into")
-            if ("AsRef" !in inspector.declaredTypeNames) add("AsRef")
-            if ("Borrow" !in inspector.declaredTypeNames) add("Borrow")
-        }
-    if (convertibleTraits.isNotEmpty()) {
-        for ((tpName, traitBounds) in allBoundsByTp) {
-            if (tpName in result || traitBounds.size != 1) continue
-            val sole = traitBounds[0]
-            val lastSeg = sole.path.segments.last() ?: continue
-            if (lastSeg.ident.toString() !in convertibleTraits) continue
-            val typeArgs =
-                (lastSeg.arguments as? PathArguments.AngleBracketed)
-                    ?.args
-                    ?.toList()
-                    ?.filterIsInstance<GenericArgument.TypeArg>()
-                    .orEmpty()
-            if (typeArgs.size != 1) continue
-            val targetRendered = renderType(typeArgs[0].type, selfTypeName).trim()
-            if (targetRendered.isNotEmpty() && fnTypeParams.none { containsWholeIdentifier(targetRendered, it) }) {
-                result[tpName] = targetRendered
-                intoSubstitutedOut?.add(tpName)
-            }
-        }
-    }
-    return result
-}
-
 internal fun KotlinJ2KEmitter.renderItemFn(
     item: Item.Fn,
     indent: String,
@@ -413,61 +518,10 @@ internal fun KotlinJ2KEmitter.renderItemFn(
     isLocalItem: Boolean = false,
 ): String {
     val vis = if (isLocalItem) "" else renderVisibility(item.vis)
-    val prevClosureLabel = currentClosureLabel
-    val prevEnclosingFn = currentEnclosingFunctionName
-    val prevEnclosingRet = currentEnclosingReturnRenderedType
-    val prevEnclosingSynRet = currentEnclosingReturnSynType
-    val prevEnclosingFmtResult = currentEnclosingReturnsFmtResult
-    val prevTailExpectsUnitResultOk = currentTailExpectsUnitResultOk
-    val prevMutableListLocals = currentMutableListLocals
-    val prevDequeLocals = currentDequeLocals
-    val prevIterableLocals = currentIterableLocals
-    val prevSourceParameterTypes = currentSourceParameterTypes
-    val prevTypedLocals = currentTypedLocals
-    val prevWitnessedBounds = currentWitnessedTraitBounds
-    val prevTypeParamBounds = currentTypeParamTraitBounds
-    val prevNullableLocals = currentNullableLocals
-    val prevSmartCastLocals = currentSmartCastNonNullLocals
-    val prevTypeParams = activeTypeParamNames
-    val prevSubst = substitutedTypeParamTypes
-    val prevIntoSubstTps = currentIntoSubstitutedTypeParams
-    val prevIntoSubstParams = currentIntoSubstitutedParams
-    val prevWitnesses = currentTypeParamWitnessCalls
-    val prevSharedBorrowRecv = currentReceiverIsSharedBorrow
-    val prevMutBorrowRecv = currentReceiverIsMutBorrow
-    currentClosureLabel = null
-    currentEnclosingFunctionName = rustFunctionIdentToKotlin(item.sig.ident.toString())
-    currentEnclosingReturnRenderedType = null
-    currentEnclosingReturnSynType = null
-    val firstReceiverRef =
-        (
-            item.sig.inputs
-                .toList()
-                .firstOrNull() as? FnArg.Receiver
-        )?.kind as? ReceiverKind.Reference
-    currentReceiverIsSharedBorrow = firstReceiverRef?.let { it.mutability == null } == true
-    currentReceiverIsMutBorrow = firstReceiverRef?.let { it.mutability != null } == true
-    currentMutableListLocals = emptySet()
-    currentDequeLocals = emptySet()
-    currentIterableLocals = emptySet()
-    currentSourceParameterTypes = emptyMap()
-    currentTypedLocals = emptyMap()
-    currentWitnessedTraitBounds = emptyMap()
-    currentTypeParamTraitBounds = emptyMap()
-    currentNullableLocals = emptySet()
-    currentSmartCastNonNullLocals = emptySet()
-    currentIntoSubstitutedParams = emptySet()
-    val fnGenerics = item.sig.generics
-    val fnParamList = fnGenerics.params.toList()
-    val intoSubstTps = linkedSetOf<String>()
-    val fnSubsts = extractFnTraitSubstitutions(fnParamList, fnGenerics.whereClause, null, intoSubstTps)
-    if (fnSubsts.isNotEmpty()) {
-        substitutedTypeParamTypes = prevSubst + fnSubsts
-    }
-    currentIntoSubstitutedTypeParams = prevIntoSubstTps + intoSubstTps
-    activeTypeParamNames = (activeTypeParamNames + collectGenericTypeParamNames(item.sig.generics)) - substitutedTypeParamTypes.keys
-    scopeBuilder.enterDef()
-    try {
+    return withFunctionRenderScope(
+        sig = item.sig,
+        selfTypeName = null,
+    ) {
         val sigHeader =
             renderFunctionSignature(
                 sig = item.sig,
@@ -478,7 +532,7 @@ internal fun KotlinJ2KEmitter.renderItemFn(
                 scopeSignatures = scopeSignatures,
                 isInterfaceMethod = false,
                 fnBlock = item.block,
-            ) ?: return ""
+            ) ?: return@withFunctionRenderScope ""
         val sb = StringBuilder()
         sb.append(renderLeadingTrivia(item, indent))
         sb.append(renderKDocFromAttributes(item.attrs, indent))
@@ -502,31 +556,7 @@ internal fun KotlinJ2KEmitter.renderItemFn(
             )
         sb.append(" ")
         sb.append(if (panicExpectation == null) body else wrapRustPanicTestBody(body, indent, panicExpectation))
-        return sb.toString()
-    } finally {
-        scopeBuilder.exitDef()
-        currentClosureLabel = prevClosureLabel
-        currentEnclosingFunctionName = prevEnclosingFn
-        currentEnclosingReturnRenderedType = prevEnclosingRet
-        currentEnclosingReturnSynType = prevEnclosingSynRet
-        currentEnclosingReturnsFmtResult = prevEnclosingFmtResult
-        currentTailExpectsUnitResultOk = prevTailExpectsUnitResultOk
-        currentMutableListLocals = prevMutableListLocals
-        currentDequeLocals = prevDequeLocals
-        currentIterableLocals = prevIterableLocals
-        currentSourceParameterTypes = prevSourceParameterTypes
-        currentTypedLocals = prevTypedLocals
-        currentWitnessedTraitBounds = prevWitnessedBounds
-        currentTypeParamTraitBounds = prevTypeParamBounds
-        currentNullableLocals = prevNullableLocals
-        currentSmartCastNonNullLocals = prevSmartCastLocals
-        activeTypeParamNames = prevTypeParams
-        substitutedTypeParamTypes = prevSubst
-        currentIntoSubstitutedTypeParams = prevIntoSubstTps
-        currentIntoSubstitutedParams = prevIntoSubstParams
-        currentTypeParamWitnessCalls = prevWitnesses
-        currentReceiverIsSharedBorrow = prevSharedBorrowRecv
-        currentReceiverIsMutBorrow = prevMutBorrowRecv
+        sb.toString()
     }
 }
 
@@ -590,8 +620,10 @@ internal fun KotlinJ2KEmitter.renderFallbackDefaultForRenderedType(renderedType:
             usesU128 = true
             return "U128()"
         }
+        NumericKind.F16 -> return "F16()"
         NumericKind.F32 -> return "0.0f"
         NumericKind.F64 -> return "0.0"
+        NumericKind.F128 -> return "F128()"
         null -> {}
     }
     if ((clean.startsWith("Pair<") || clean.startsWith("kotlin.Pair<")) && clean.endsWith(">")) {
@@ -653,29 +685,10 @@ internal fun KotlinJ2KEmitter.normalizeArrayLengthToIntExpr(
             trimmed.endsWith("u") || trimmed.endsWith("U") || trimmed.endsWith("L") -> trimmed.dropLast(1)
             else -> null
         }
-    if (unsignedStripped != null &&
-        unsignedStripped.isNotEmpty() &&
-        (
-            unsignedStripped.all { it.isDigit() || it == '_' } ||
-                (
-                    (unsignedStripped.startsWith("0x") || unsignedStripped.startsWith("0X")) &&
-                        unsignedStripped.drop(2).isNotEmpty() &&
-                        unsignedStripped.drop(2).all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' || it == '_' }
-                )
-        )
-    ) {
+    if (unsignedStripped != null && isDecimalOrHexLiteralDigits(unsignedStripped)) {
         return unsignedStripped
     }
-    if (trimmed.isNotEmpty() &&
-        (
-            trimmed.all { it.isDigit() || it == '_' } ||
-                (
-                    (trimmed.startsWith("0x") || trimmed.startsWith("0X")) &&
-                        trimmed.drop(2).isNotEmpty() &&
-                        trimmed.drop(2).all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' || it == '_' }
-                )
-        )
-    ) {
+    if (isDecimalOrHexLiteralDigits(trimmed)) {
         return trimmed
     }
     if (trimmed.endsWith(".toInt()") ||
@@ -770,15 +783,15 @@ internal fun KotlinJ2KEmitter.renderStructFieldDefaultOrNull(
     return renderStructFieldDefault(fieldSynTy, renderedType, selfTypeName)
 }
 
-internal fun KotlinJ2KEmitter.buildArrayAwareDataClassMethods(
-    typeName: String,
+private fun KotlinJ2KEmitter.buildFieldEqualsAndHashCodeMethods(
+    typeCheckTarget: String,
     fields: List<Pair<String, String>>,
     memberIndent: String,
 ): List<String> {
     val eqLines = mutableListOf<String>()
     eqLines += "${memberIndent}override fun equals(other: Any?): Boolean {"
     eqLines += "$memberIndent    if (this === other) return true"
-    eqLines += "$memberIndent    if (other !is $typeName) return false"
+    eqLines += "$memberIndent    if (other !is $typeCheckTarget) return false"
     for ((fName, fType) in fields) {
         if (isPrimitiveArrayRenderedType(fType)) {
             eqLines += "$memberIndent    if (!this.$fName.contentEquals(other.$fName)) return false"
@@ -792,25 +805,40 @@ internal fun KotlinJ2KEmitter.buildArrayAwareDataClassMethods(
     val hashLines = mutableListOf<String>()
     if (fields.isEmpty()) {
         hashLines += "${memberIndent}override fun hashCode(): Int = 0"
-    } else if (fields.size == 1) {
-        val (firstName, firstType) = fields[0]
-        val firstHash = if (isPrimitiveArrayRenderedType(firstType)) "this.$firstName.contentHashCode()" else "this.$firstName.hashCode()"
-        hashLines += "${memberIndent}override fun hashCode(): Int = $firstHash"
     } else {
-        hashLines += "${memberIndent}override fun hashCode(): Int {"
-        val (firstName, firstType) = fields[0]
-        val firstHash = if (isPrimitiveArrayRenderedType(firstType)) "this.$firstName.contentHashCode()" else "this.$firstName.hashCode()"
-        hashLines += "$memberIndent    var result = $firstHash"
-        for (i in 1 until fields.size) {
-            val (fName, fType) = fields[i]
-            val fHash = if (isPrimitiveArrayRenderedType(fType)) "this.$fName.contentHashCode()" else "this.$fName.hashCode()"
-            hashLines += "$memberIndent    result = 31 * result + $fHash"
+        val firstHash =
+            if (isPrimitiveArrayRenderedType(fields[0].second)) {
+                "this.${fields[0].first}.contentHashCode()"
+            } else {
+                "this.${fields[0].first}.hashCode()"
+            }
+        if (fields.size == 1) {
+            hashLines += "${memberIndent}override fun hashCode(): Int = $firstHash"
+        } else {
+            hashLines += "${memberIndent}override fun hashCode(): Int {"
+            hashLines += "$memberIndent    var result = $firstHash"
+            for (i in 1 until fields.size) {
+                val (fName, fType) = fields[i]
+                val fHash =
+                    if (isPrimitiveArrayRenderedType(fType)) {
+                        "this.$fName.contentHashCode()"
+                    } else {
+                        "this.$fName.hashCode()"
+                    }
+                hashLines += "$memberIndent    result = 31 * result + $fHash"
+            }
+            hashLines += "$memberIndent    return result"
+            hashLines += "$memberIndent}"
         }
-        hashLines += "$memberIndent    return result"
-        hashLines += "$memberIndent}"
     }
     return listOf(eqLines.joinToString("\n"), hashLines.joinToString("\n"))
 }
+
+internal fun KotlinJ2KEmitter.buildArrayAwareDataClassMethods(
+    typeName: String,
+    fields: List<Pair<String, String>>,
+    memberIndent: String,
+): List<String> = buildFieldEqualsAndHashCodeMethods(typeName, fields, memberIndent)
 
 internal data class SwiftSafeFieldSpec(
     val name: String,
@@ -1029,44 +1057,93 @@ internal fun KotlinJ2KEmitter.buildSwiftSafeSyntheticDataMethods(
             result += "${memberIndent}public fun copy($copyParams): $selfTypeWithGenerics = $selfTypeWithGenerics($copyArgs)"
         }
     }
-    val starSuffix = if (typeParamCount > 0) "<" + List(typeParamCount) { "*" }.joinToString(", ") + ">" else ""
-    val eqLines = mutableListOf<String>()
-    eqLines += "${memberIndent}override fun equals(other: Any?): Boolean {"
-    eqLines += "$memberIndent    if (this === other) return true"
-    eqLines += "$memberIndent    if (other !is $typeName$starSuffix) return false"
-    for (spec in specs) {
-        if (isPrimitiveArrayRenderedType(spec.renderedType)) {
-            eqLines += "$memberIndent    if (!this.${spec.name}.contentEquals(other.${spec.name})) return false"
-        } else {
-            eqLines += "$memberIndent    if (this.${spec.name} != other.${spec.name}) return false"
-        }
-    }
-    eqLines += "$memberIndent    return true"
-    eqLines += "$memberIndent}"
-    result += eqLines.joinToString("\n")
 
-    val hashLines = mutableListOf<String>()
-    if (specs.isEmpty()) {
-        hashLines += "${memberIndent}override fun hashCode(): Int = 0"
-    } else if (specs.size == 1) {
-        val first = specs[0]
-        val firstHash = if (isPrimitiveArrayRenderedType(first.renderedType)) "this.${first.name}.contentHashCode()" else "this.${first.name}.hashCode()"
-        hashLines += "${memberIndent}override fun hashCode(): Int = $firstHash"
-    } else {
-        hashLines += "${memberIndent}override fun hashCode(): Int {"
-        val first = specs[0]
-        val firstHash = if (isPrimitiveArrayRenderedType(first.renderedType)) "this.${first.name}.contentHashCode()" else "this.${first.name}.hashCode()"
-        hashLines += "$memberIndent    var result = $firstHash"
-        for (i in 1 until specs.size) {
-            val spec = specs[i]
-            val fHash = if (isPrimitiveArrayRenderedType(spec.renderedType)) "this.${spec.name}.contentHashCode()" else "this.${spec.name}.hashCode()"
-            hashLines += "$memberIndent    result = 31 * result + $fHash"
-        }
-        hashLines += "$memberIndent    return result"
-        hashLines += "$memberIndent}"
-    }
-    result += hashLines.joinToString("\n")
+    val starSuffix = if (typeParamCount > 0) "<" + List(typeParamCount) { "*" }.joinToString(", ") + ">" else ""
+    result.addAll(
+        buildFieldEqualsAndHashCodeMethods(
+            typeCheckTarget = "$typeName$starSuffix",
+            fields = specs.map { it.name to it.renderedType },
+            memberIndent = memberIndent,
+        ),
+    )
     return result
+}
+
+private fun KotlinJ2KEmitter.populateSwiftSafeCtorAndDataMethods(
+    specs: List<SwiftSafeFieldSpec>,
+    ctorParams: MutableList<String>,
+    swiftSafePropsOut: MutableList<String>,
+    extraMembersOut: MutableList<String>,
+    extraCompanionMembersOut: MutableList<String>,
+    attachedImpls: List<Item.Impl>,
+    typeName: String,
+    typeParamCount: Int,
+    typeParams: String,
+    selfTypeWithGenerics: String,
+    wouldHaveBeenDataClass: Boolean,
+    indent: String,
+) {
+    ctorParams.clear()
+    for (spec in specs) {
+        if (spec.vis == "public " && spec.isConcreteGenericForSwift) {
+            ctorParams += "${spec.name}CtorArg: ${spec.renderedType}"
+            swiftSafePropsOut +=
+                "${spec.leadingHeader}$indent    public var ${spec.name}: ${spec.renderedType} = ${spec.name}CtorArg\n$indent        internal set"
+        } else {
+            ctorParams += "${spec.docPrefix}${spec.vis}var ${spec.name}: ${spec.renderedType}"
+        }
+    }
+    if (specs.isNotEmpty() && specs.all { it.defaultExpr != null }) {
+        val defaultCtorArgs =
+            specs.joinToString(",\n") { spec ->
+                val paramKey = if (spec.vis == "public " && spec.isConcreteGenericForSwift) "${spec.name}CtorArg" else spec.name
+                "$indent        $paramKey = ${spec.defaultExpr}"
+            }
+        extraMembersOut += "$indent    public constructor() : this(\n$defaultCtorArgs,\n$indent    )"
+    }
+    extraCompanionMembersOut += renderSwiftSafeCompanionInvoke(typeParams, selfTypeWithGenerics, specs, "$indent    ")
+    if (wouldHaveBeenDataClass) {
+        extraMembersOut.addAll(
+            buildSwiftSafeSyntheticDataMethods(
+                typeName = typeName,
+                typeParamCount = typeParamCount,
+                selfTypeWithGenerics = selfTypeWithGenerics,
+                specs = specs,
+                includeCopyAndComponents = true,
+                hasCopyCollision = attachedImplDefinesInstanceMethod(attachedImpls, "copy"),
+                memberIndent = "$indent    ",
+            ),
+        )
+    }
+}
+
+private fun KotlinJ2KEmitter.appendFormattedCtorParams(
+    sb: StringBuilder,
+    indent: String,
+    ctorHeaderPrefix: String,
+    ctorParams: List<String>,
+) {
+    if (headerContext.isBatchCrateOutput || ctorParams.any { it.contains('\n') } || ctorParams.size > 2) {
+        sb.append(ctorHeaderPrefix).append("(\n")
+        for (p in ctorParams) {
+            if (p.startsWith('\n')) {
+                sb.append(p.removePrefix("\n")).append(",\n")
+            } else {
+                sb
+                    .append(indent)
+                    .append("    ")
+                    .append(p)
+                    .append(",\n")
+            }
+        }
+        sb.append(indent).append(")")
+    } else {
+        sb
+            .append(ctorHeaderPrefix)
+            .append("(")
+            .append(ctorParams.joinToString(", "))
+            .append(")")
+    }
 }
 
 internal fun renderSwiftSafeCompanionInvoke(
@@ -1107,11 +1184,8 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
     scopeSignatures: MutableMap<String, Int> = topLevelSignatureCounts,
     isLocalItem: Boolean = false,
 ): String {
-    val typeName = rustTypeIdentToKotlin(item.ident.toString())
-    val sigKey = "type:$typeName"
-    val seenCount = scopeSignatures[sigKey] ?: 0
-    scopeSignatures[sigKey] = seenCount + 1
-    if (seenCount > 0) {
+    val typeName = effectiveStructKotlinName(rustTypeIdentToKotlin(item.ident.toString()))
+    if (!reserveUniqueSignature(scopeSignatures, "type:$typeName")) {
         return ""
     }
     val useFinalAbiLayout = headerContext.rawAbiMode || headerContext.finalClasses
@@ -1132,14 +1206,13 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
         } else {
             attachedImpls
         }
-    val sb = StringBuilder()
-    sb.append(renderLeadingTrivia(item, indent))
-    sb.append(renderKDocFromAttributes(item.attrs, indent))
-    val vis = if (isLocalItem) "" else renderVisibility(item.vis)
+    val (sb, vis) = beginItemHeaderAndVisibility(renderLeadingTrivia(item, indent), item.attrs, item.vis, indent, isLocalItem)
     val selfTypeWithGenerics = typeName + renderTypeArgumentsFromGenerics(item.generics)
     val unboundedOwnerTypeParams = collectUnboundedGenericTypeParamNames(item.generics)
     val prevStructTypeParams = activeTypeParamNames
+    val prevStructConstParams = activeConstParamNames
     activeTypeParamNames = activeTypeParamNames + collectGenericTypeParamNames(item.generics)
+    activeConstParamNames = activeConstParamNames + collectGenericConstParamNames(item.generics)
     val typeParams: String
     val whereClause: String
     val superTraits = mutableListOf<String>()
@@ -1156,7 +1229,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                 selfTypeName = selfTypeWithGenerics,
                 ownerGenerics = item.generics,
             )
-        superTraits.addAll(renderDistinctSuperTraits(effectiveAttachedImpls, selfTypeWithGenerics))
+        superTraits.addAll(renderDistinctSuperTraits(effectiveAttachedImpls, selfTypeWithGenerics, ownerIsPublic = (vis == "public ")))
         val iterElemTy = extractDirectIteratorItemRenderedType(effectiveAttachedImpls, "Iterator", selfTypeWithGenerics, requireOwnedSelf = false)
         val intoIterElemTy =
             if (iterElemTy == null) {
@@ -1263,10 +1336,14 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                     val propName = tupleFieldPropertyName(idx, fieldList.size)
                     val prevHint = currentSamNameHint
                     currentSamNameHint = "${typeName}Field${idx}Callback"
+                    val prevFieldTraitAssoc = currentTraitAssocParamNames
+                    currentTraitAssocParamNames =
+                        currentTraitAssocParamNames + sourceAssociatedParameters(item.generics).map { it.associated }
                     val fType =
                         try {
                             renderType(field.ty, selfTypeName = selfTypeWithGenerics)
                         } finally {
+                            currentTraitAssocParamNames = prevFieldTraitAssoc
                             currentSamNameHint = prevHint
                         }
                     val defExpr = if (useFinalAbiLayout) renderStructFieldDefaultOrNull(field.ty, fType, selfTypeWithGenerics) else null
@@ -1282,6 +1359,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
             is Fields.Unit -> {}
         }
     } finally {
+        activeConstParamNames = prevStructConstParams
         activeTypeParamNames = prevStructTypeParams
     }
 
@@ -1309,8 +1387,9 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
         val fieldIsConcreteGeneric =
             !isLocalItem && vis == "public " && isConcreteGenericTypeForSwiftExport(fieldType, unboundedOwnerTypeParams)
         ctorParams.clear()
+        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
         ctorParams += "public val fieldStorage: MutPtr<$fieldType>"
-        ctorParams += "public val fieldLayout: TypeLayout<$fieldType>"
+        ctorParams += "public val fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()"
         bodyFieldProps.clear()
         val setterPrefix = if (fieldIsConcreteGeneric) "internal set" else "set"
         extraIterableMembers += "$indent    public var $fieldName: $fieldType\n" +
@@ -1322,7 +1401,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                 "AlignedTypeLayout(fieldLayout, ${it}L)"
             } ?: "fieldLayout"
         val secCtorVis = if (transparentConcreteForSwift) "internal" else "public"
-        extraIterableMembers += "$indent    $secCtorVis constructor($fieldName: $fieldType, fieldLayout: TypeLayout<$fieldType>) : " +
+        extraIterableMembers += "$indent    $secCtorVis constructor($fieldName: $fieldType, fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()) : " +
             "this(allocateNativeCell($fieldName, $alignedFieldLayout), $alignedFieldLayout)"
         extraIterableMembers += "$indent    public fun pointerLayout(): TypeLayout<$selfTypeWithGenerics> = " +
             "TransparentTypeLayout(fieldLayout, " +
@@ -1331,10 +1410,10 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
             forceInternalPrimaryCtor = true
             val fnTypeParams = if (typeParams.isNotEmpty()) "$typeParams " else ""
             extraCompanionMembers +=
-                "$indent        public operator fun ${fnTypeParams}invoke($fieldName: $fieldType, fieldLayout: TypeLayout<$fieldType>): $selfTypeWithGenerics = " +
+                "$indent        public operator fun ${fnTypeParams}invoke($fieldName: $fieldType, fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()): $selfTypeWithGenerics = " +
                 "$selfTypeWithGenerics($fieldName, fieldLayout)"
             extraCompanionMembers +=
-                "$indent        public fun ${fnTypeParams}fromFieldStorage(fieldStorage: MutPtr<$fieldType>, fieldLayout: TypeLayout<$fieldType>): $selfTypeWithGenerics = " +
+                "$indent        public fun ${fnTypeParams}fromFieldStorage(fieldStorage: MutPtr<$fieldType>, fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()): $selfTypeWithGenerics = " +
                 "$selfTypeWithGenerics(fieldStorage, fieldLayout)"
         }
     } else if (!headerContext.rawAbiMode && !isLocalItem) {
@@ -1354,6 +1433,17 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                 )
         }
     }
+    val transparentPtrField = liveField ?: fieldNameAndTypes.singleOrNull()
+    if (typeName == "NonNull" && transparentPtrField != null &&
+        transparentPtrField.second
+            .substringBefore('<')
+            .substringAfterLast('.')
+            .trim() in setOf("ConstPtr", "MutPtr")
+    ) {
+        val ptrFieldName = transparentPtrField.first
+        extraIterableMembers += "$indent    public val rawAddress: Long\n$indent        get() = $ptrFieldName.rawAddress"
+        extraIterableMembers += "$indent    public val rawMeta: Long\n$indent        get() = $ptrFieldName.rawMeta"
+    }
 
     val needsSwiftSafeStructCtor =
         liveField == null &&
@@ -1370,38 +1460,20 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
 
     if (needsSwiftSafeStructCtor) {
         forceInternalPrimaryCtor = true
-        ctorParams.clear()
-        for (spec in fieldSpecs) {
-            if (spec.vis == "public " && spec.isConcreteGenericForSwift) {
-                ctorParams += "${spec.name}CtorArg: ${spec.renderedType}"
-                swiftSafeBodyProps +=
-                    "${spec.leadingHeader}$indent    public var ${spec.name}: ${spec.renderedType} = ${spec.name}CtorArg\n$indent        internal set"
-            } else {
-                ctorParams += "${spec.docPrefix}${spec.vis}var ${spec.name}: ${spec.renderedType}"
-            }
-        }
-        if (fieldSpecs.isNotEmpty() && fieldSpecs.all { it.defaultExpr != null }) {
-            val defaultCtorArgs =
-                fieldSpecs.joinToString(",\n") { spec ->
-                    val paramKey = if (spec.vis == "public " && spec.isConcreteGenericForSwift) "${spec.name}CtorArg" else spec.name
-                    "$indent        $paramKey = ${spec.defaultExpr}"
-                }
-            extraIterableMembers += "$indent    public constructor() : this(\n$defaultCtorArgs,\n$indent    )"
-        }
-        extraCompanionMembers += renderSwiftSafeCompanionInvoke(typeParams, selfTypeWithGenerics, fieldSpecs, "$indent    ")
-        if (wouldHaveBeenDataClass) {
-            extraIterableMembers.addAll(
-                buildSwiftSafeSyntheticDataMethods(
-                    typeName = typeName,
-                    typeParamCount = typeParamCount,
-                    selfTypeWithGenerics = selfTypeWithGenerics,
-                    specs = fieldSpecs,
-                    includeCopyAndComponents = true,
-                    hasCopyCollision = attachedImplDefinesInstanceMethod(effectiveAttachedImpls, "copy"),
-                    memberIndent = "$indent    ",
-                ),
-            )
-        }
+        populateSwiftSafeCtorAndDataMethods(
+            specs = fieldSpecs,
+            ctorParams = ctorParams,
+            swiftSafePropsOut = swiftSafeBodyProps,
+            extraMembersOut = extraIterableMembers,
+            extraCompanionMembersOut = extraCompanionMembers,
+            attachedImpls = effectiveAttachedImpls,
+            typeName = typeName,
+            typeParamCount = typeParamCount,
+            typeParams = typeParams,
+            selfTypeWithGenerics = selfTypeWithGenerics,
+            wouldHaveBeenDataClass = wouldHaveBeenDataClass,
+            indent = indent,
+        )
     }
 
     val isDataClass = wouldHaveBeenDataClass && !needsSwiftSafeStructCtor
@@ -1411,18 +1483,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
     if (!isDataClass &&
         !useBodyPropertiesForLargeStruct &&
         !attachedImplDefinesInstanceMethod(effectiveAttachedImpls, "clone") &&
-        item.attrs.any { attribute ->
-            val derive = attribute.meta as? Meta.List
-            derive != null &&
-                derive.path.segments
-                    .last()
-                    ?.ident
-                    .toString() in setOf("derive", "derive_const") &&
-                derive.tokens
-                    .clone()
-                    .toList()
-                    .any { it is TokenTree.Ident && it.value.toString() == "Clone" }
-        }
+        hasDeriveTrait(item.attrs, "Clone")
     ) {
         val cloneOpenMod = if (useFinalAbiLayout) "" else "open "
         if (liveField != null) {
@@ -1449,27 +1510,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
         .append(typeParams)
     if (ctorParams.isNotEmpty() && !useBodyPropertiesForLargeStruct) {
         val ctorHeaderPrefix = if (forceInternalPrimaryCtor) " internal constructor" else ""
-        if (headerContext.isBatchCrateOutput || ctorParams.any { it.contains('\n') } || ctorParams.size > 2) {
-            sb.append(ctorHeaderPrefix).append("(\n")
-            for (p in ctorParams) {
-                if (p.startsWith('\n')) {
-                    sb.append(p.removePrefix("\n")).append(",\n")
-                } else {
-                    sb
-                        .append(indent)
-                        .append("    ")
-                        .append(p)
-                        .append(",\n")
-                }
-            }
-            sb.append(indent).append(")")
-        } else {
-            sb
-                .append(ctorHeaderPrefix)
-                .append("(")
-                .append(ctorParams.joinToString(", "))
-                .append(")")
-        }
+        appendFormattedCtorParams(sb, indent, ctorHeaderPrefix, ctorParams)
     }
     if (superTraits.isNotEmpty()) {
         sb.append(" : ").append(superTraits.joinToString(", "))
@@ -1483,7 +1524,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
             else -> buildTupleStructAliasProperties(item.fields, selfTypeWithGenerics, "$indent    ")
         }
     val prevOverrideNames = currentStructOverrideMethodNames
-    currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits)
+    currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits, ownerIsPublic = (vis == "public "))
     val memberLines =
         try {
             renderAttachedImplMembers(
@@ -1509,424 +1550,6 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
     return sb.toString()
 }
 
-internal fun KotlinJ2KEmitter.extractDirectIteratorItemRenderedType(
-    attachedImpls: List<Item.Impl>,
-    traitRawName: String,
-    selfTypeWithGenerics: String,
-    requireOwnedSelf: Boolean,
-): String? {
-    for (impl in attachedImpls) {
-        if (isDocOnlyCfgAttribute(impl.attrs)) continue
-        if (requireOwnedSelf && unwrapSynType(impl.selfType) is SynType.Reference) continue
-        val rawTrait =
-            impl.traitPath
-                ?.path
-                ?.segments
-                ?.last()
-                ?.ident
-                ?.toString() ?: continue
-        if (rawTrait != traitRawName) continue
-        for (sub in impl.items) {
-            if (sub is ImplItem.AssocType && sub.ident.toString() == "Item") {
-                return renderType(sub.ty, selfTypeWithGenerics)
-            }
-        }
-    }
-    return null
-}
-
-internal data class IteratorSupertraitSpec(
-    val itemType: String,
-    val hasDoubleEnded: Boolean,
-    val hasExactSize: Boolean,
-)
-
-internal fun KotlinJ2KEmitter.extractIteratorSupertraitSpec(
-    bounds: List<TypeParamBound>,
-    selfTypeName: String?,
-): IteratorSupertraitSpec? {
-    var sawIteratorFamily = false
-    var hasDoubleEnded = false
-    var hasExactSize = false
-    var itemRendered: String? = null
-    for (b in bounds) {
-        if (b !is TypeParamBound.Trait || b.maybe != null) continue
-        val lastSeg = b.path.segments.last() ?: continue
-        val rawName = lastSeg.ident.toString()
-        if (rawName == "Iterator" || rawName == "DoubleEndedIterator" || rawName == "ExactSizeIterator") {
-            sawIteratorFamily = true
-            if (rawName == "DoubleEndedIterator") hasDoubleEnded = true
-            if (rawName == "ExactSizeIterator") hasExactSize = true
-            val angle = lastSeg.arguments as? PathArguments.AngleBracketed
-            if (angle != null && itemRendered == null) {
-                for (ga in angle.args.toList()) {
-                    if (ga is GenericArgument.AssocTypeArg && ga.assoc.ident.toString() == "Item") {
-                        itemRendered = renderType(ga.assoc.ty, selfTypeName)
-                    }
-                }
-            }
-        }
-    }
-    if (!sawIteratorFamily || itemRendered == null) return null
-    return IteratorSupertraitSpec(
-        itemType = itemRendered,
-        hasDoubleEnded = hasDoubleEnded,
-        hasExactSize = hasExactSize,
-    )
-}
-
-internal fun KotlinJ2KEmitter.collectLocalSupertraitMethodNames(
-    superTraits: List<String>,
-    includeReceiverlessMethods: Boolean = false,
-): Set<String> {
-    val names = linkedSetOf<String>()
-    val visitedTraits = hashSetOf<String>()
-    fun visitTraitByBaseName(baseName: String) {
-        if (!visitedTraits.add(baseName)) return
-        val traitDecl = lookupDeclaredTraitAst(baseName) ?: return
-        for (tItem in traitDecl.items) {
-            if (traitItemHasDocOnlyCfg(tItem)) continue
-            if (tItem is TraitItem.Fn &&
-                (includeReceiverlessMethods || tItem.sig.inputs.firstOrNull() is FnArg.Receiver)
-            ) {
-                names += rustFunctionIdentToKotlin(tItem.sig.ident.toString())
-            }
-        }
-        val iterSpec = extractIteratorSupertraitSpec(traitDecl.supertraits.toList(), null)
-        if (iterSpec != null) {
-            names += "next"
-            if (iterSpec.hasDoubleEnded) names += "nextBack"
-            if (iterSpec.hasExactSize) names += "len"
-        }
-        for (bound in traitDecl.supertraits) {
-            val boundPath = (bound as? TypeParamBound.Trait)?.path ?: continue
-            val boundBase =
-                boundPath.segments
-                    .last()
-                    ?.ident
-                    ?.toString()
-                    ?.let(::rustTypeIdentToKotlin) ?: continue
-            visitTraitByBaseName(boundBase)
-        }
-    }
-    for (st in superTraits) {
-        visitTraitByBaseName(st.substringBefore('<').trim())
-    }
-    return names
-}
-
-private fun KotlinJ2KEmitter.collectLocalTraitAndSupertraitFnRawNames(traitDecl: Item.Trait): Set<String> {
-    val rawNames = linkedSetOf<String>()
-    val visited = hashSetOf<String>()
-    fun visitDecl(decl: Item.Trait) {
-        val ktName = rustTypeIdentToKotlin(decl.ident.toString())
-        if (!visited.add(ktName)) return
-        for (tItem in decl.items) {
-            if (traitItemHasDocOnlyCfg(tItem)) continue
-            if (tItem is TraitItem.Fn) {
-                rawNames +=
-                    tItem.sig.ident
-                        .toString()
-                        .removePrefix("r#")
-            }
-        }
-        for (bound in decl.supertraits) {
-            val boundPath = (bound as? TypeParamBound.Trait)?.path ?: continue
-            val boundKt =
-                boundPath.segments
-                    .last()
-                    ?.ident
-                    ?.toString()
-                    ?.let(::rustTypeIdentToKotlin) ?: continue
-            lookupDeclaredTraitAst(boundKt, boundPath)?.let(::visitDecl)
-        }
-    }
-    visitDecl(traitDecl)
-    return rawNames
-}
-
-internal fun KotlinJ2KEmitter.renderDistinctSuperTraits(
-    attachedImpls: List<Item.Impl>,
-    selfTypeWithGenerics: String,
-): List<String> {
-    val seenInterfaces = hashSetOf<String>()
-    val result = mutableListOf<String>()
-    for (impl in attachedImpls) {
-        if (isDocOnlyCfgAttribute(impl.attrs)) continue
-        val path = impl.traitPath?.path ?: continue
-        val rawTrait =
-            path.segments
-                .last()
-                ?.ident
-                ?.toString() ?: continue
-        if (rawTrait in IGNORED_TRAIT_BOUNDS) continue
-        if (isImplicitStdlibSupertraitPath(path)) continue
-        val prevBounded = currentBoundedTypeName
-        currentBoundedTypeName = selfTypeWithGenerics
-        val rendered =
-            try {
-                renderPathAsType(path, selfTypeName = selfTypeWithGenerics)
-            } finally {
-                currentBoundedTypeName = prevBounded
-            }
-        val selfBase = selfTypeWithGenerics.substringBefore('<').trim()
-        val baseIface = rendered.substringBefore('<').trim()
-        if (baseIface.isNotEmpty() && baseIface != selfBase && !rendered.contains("->") && seenInterfaces.add(baseIface)) {
-            val assocNames = lookupTraitDefaultlessAssocTypes(baseIface, path)
-            val fullRendered =
-                if (assocNames.isNotEmpty()) {
-                    val implAssocByName =
-                        impl.items.filterIsInstance<ImplItem.AssocType>().associate {
-                            rustTypeIdentToKotlin(it.ident.toString()) to renderType(it.ty, selfTypeWithGenerics)
-                        }
-                    val assocArgs = assocNames.map { implAssocByName[it] ?: "Any" }
-                    if (rendered.endsWith(">")) {
-                        "${rendered.dropLast(1)}, ${assocArgs.joinToString(", ")}>"
-                    } else {
-                        "$rendered<${assocArgs.joinToString(", ")}>"
-                    }
-                } else {
-                    rendered
-                }
-            result += fullRendered
-        }
-    }
-    return result
-}
-
-internal fun KotlinJ2KEmitter.structImplsMutateField(attachedImpls: List<Item.Impl>, rawFieldIdent: String): Boolean {
-    var mutated = false
-    val visitor =
-        object : Visit() {
-            override fun visitExprMethodCall(e: Expr.MethodCall) {
-                val m = e.method.toString()
-                if (m in MUTATING_VEC_METHODS) {
-                    val recv = e.receiver
-                    if (recv is Expr.Field &&
-                        recv.base is Expr.Path &&
-                        (recv.base as Expr.Path).path.isIdent("self") &&
-                        recv.member is Member.Named &&
-                        (recv.member as Member.Named).ident.toString().removePrefix("r#") == rawFieldIdent
-                    ) {
-                        mutated = true
-                        return
-                    }
-                }
-                super.visitExprMethodCall(e)
-            }
-        }
-    for (impl in attachedImpls) {
-        visitor.visitItemImpl(impl)
-        if (mutated) return true
-    }
-    return false
-}
-
-internal fun KotlinJ2KEmitter.buildTupleStructAliasProperties(
-    fields: Fields,
-    selfTypeName: String,
-    memberIndent: String,
-): List<String> {
-    if (fields !is Fields.Unnamed) return emptyList()
-    val list = fields.fields.unnamed.toList()
-    if (list.size != 1) return emptyList()
-    val fType = renderType(list[0].ty, selfTypeName)
-    return listOf(
-        "${memberIndent}public var field0: $fType\n" +
-            "$memberIndent    get() = value\n" +
-            "$memberIndent    set(v) {\n" +
-            "$memberIndent        value = v\n" +
-            "$memberIndent    }",
-    )
-}
-
-internal fun KotlinJ2KEmitter.renderAttachedImplMembers(
-    typeName: String,
-    ownerGenerics: Generics,
-    attachedImpls: List<Item.Impl>,
-    indent: String,
-    extraProperties: List<String> = emptyList(),
-    extraMembers: List<String> = emptyList(),
-    extraCompanionMembers: List<String> = emptyList(),
-    isLocalClass: Boolean = false,
-    structFieldNames: Set<String> = emptySet(),
-    isObjectOwner: Boolean = false,
-): String {
-    val prevObjectOwner = currentAttachedImplIsObjectOwner
-    currentAttachedImplIsObjectOwner = isObjectOwner
-    try {
-        val instanceMembers = mutableListOf<String>()
-        val companionMembers = mutableListOf<String>()
-        val instanceSignatures = linkedMapOf<String, Int>()
-        val companionSignatures = linkedMapOf<String, Int>()
-
-        if (headerContext.rawAbiMode || headerContext.finalClasses) {
-            for (fName in structFieldNames) {
-                instanceSignatures["$fName()"] = 1
-            }
-        }
-
-        instanceMembers.addAll(extraProperties)
-        instanceMembers.addAll(extraMembers)
-        if (!isLocalClass && !isObjectOwner) {
-            companionMembers.addAll(extraCompanionMembers)
-        } else if (isObjectOwner && extraCompanionMembers.isNotEmpty()) {
-            instanceMembers.addAll(extraCompanionMembers)
-        }
-        if (extraMembers.any { it.contains("fun hashCode(): Int") }) {
-            instanceSignatures["hashCode()"] = 1
-        }
-        if (extraMembers.any { it.contains("fun equals(other: Any?): Boolean") }) {
-            instanceSignatures["equals(Any?)"] = 1
-        }
-
-        val ownerFallbackAssocTypes =
-            buildMap<String, SynType> {
-                for (impl in attachedImpls) {
-                    if (isDocOnlyCfgAttribute(impl.attrs)) continue
-                    for (implItem in impl.items) {
-                        if (implItem is ImplItem.AssocType) {
-                            val key = implItem.ident.toString()
-                            if (key !in this) {
-                                put(key, implItem.ty)
-                            }
-                        }
-                    }
-                }
-            }
-
-        for (impl in attachedImpls) {
-            if (isDocOnlyCfgAttribute(impl.attrs)) continue
-            val implComments =
-                (renderLeadingTrivia(impl, indent) + renderKDocFromAttributes(impl.attrs, indent))
-                    .trimEnd()
-            val instStart = instanceMembers.size
-            val compStart = companionMembers.size
-            val prevAssocTypes = currentImplAssocTypes
-            val prevAttachedTraitPath = currentAttachedImplTraitPath
-            val prevAttachedIsRefSelf = currentAttachedImplIsRefSelf
-            val prevSubst = substitutedTypeParamTypes
-            currentAttachedImplTraitPath = impl.traitPath?.path
-            currentAttachedImplIsRefSelf = unwrapSynType(impl.selfType) is SynType.Reference
-            val selfPathParam =
-                (unwrapSynType(impl.selfType) as? SynType.Path)
-                    ?.takeIf { it.qself == null && it.path.segments.len() == 1 }
-                    ?.path
-                    ?.segments
-                    ?.first()
-                    ?.ident
-                    ?.toString()
-                    ?.let(::rustTypeIdentToKotlin)
-            val ownerBaseName = typeName.substringBefore('<').trim()
-            if (selfPathParam != null &&
-                selfPathParam != ownerBaseName &&
-                selfPathParam in collectGenericTypeParamNames(impl.generics)
-            ) {
-                substitutedTypeParamTypes = prevSubst + (selfPathParam to typeName)
-            }
-            currentImplAssocTypes =
-                buildMap {
-                    putAll(prevAssocTypes)
-                    putAll(ownerFallbackAssocTypes)
-                    for (implItem in impl.items) {
-                        if (implItem is ImplItem.AssocType) {
-                            put(implItem.ident.toString(), implItem.ty)
-                        }
-                    }
-                }
-            try {
-                for (implItem in impl.items) {
-                    if (implItemHasDocOnlyCfg(implItem)) continue
-                    when (implItem) {
-                        is ImplItem.Const -> {
-                            val routeToInstance = isLocalClass || isObjectOwner
-                            val constIndent = if (routeToInstance) indent else "$indent    "
-                            val targetList = if (routeToInstance) instanceMembers else companionMembers
-                            val targetSigs = if (routeToInstance) instanceSignatures else companionSignatures
-                            targetList += renderImplItemConst(implItem, constIndent, typeName, targetSigs)
-                        }
-                        is ImplItem.Fn -> {
-                            val hasReceiver = implItem.sig.inputs.firstOrNull() is FnArg.Receiver
-                            if (!hasReceiver && !isLocalClass && !isObjectOwner) {
-                                val rendered =
-                                    renderImplItemFn(
-                                        item = implItem,
-                                        indent = "$indent    ",
-                                        selfTypeName = typeName,
-                                        ownerGenerics = ownerGenerics,
-                                        implGenerics = impl.generics,
-                                        scopeSignatures = companionSignatures,
-                                        isCompanionMember = true,
-                                    )
-                                if (rendered.isNotBlank()) companionMembers += rendered
-                            } else {
-                                val rendered =
-                                    renderImplItemFn(
-                                        item = implItem,
-                                        indent = indent,
-                                        selfTypeName = typeName,
-                                        ownerGenerics = ownerGenerics,
-                                        implGenerics = impl.generics,
-                                        scopeSignatures = instanceSignatures,
-                                    )
-                                if (rendered.isNotBlank()) instanceMembers += rendered
-                            }
-                        }
-                        is ImplItem.AssocType -> {}
-                        is ImplItem.Macro -> {
-                            instanceMembers +=
-                                renderImplOrTraitMacroMembers(
-                                    mac = implItem.mac,
-                                    indent = indent,
-                                    selfTypeName = typeName,
-                                    ownerGenerics = ownerGenerics,
-                                    scopeSignatures = instanceSignatures,
-                                    asTopLevelExtension = false,
-                                    isInterface = false,
-                                )
-                        }
-                        is ImplItem.Verbatim -> {}
-                    }
-                }
-            } finally {
-                currentImplAssocTypes = prevAssocTypes
-                currentAttachedImplTraitPath = prevAttachedTraitPath
-                currentAttachedImplIsRefSelf = prevAttachedIsRefSelf
-                substitutedTypeParamTypes = prevSubst
-            }
-            if (implComments.isNotBlank()) {
-                when {
-                    instanceMembers.size > instStart -> {
-                        instanceMembers[instStart] = "$implComments\n${instanceMembers[instStart]}"
-                    }
-                    companionMembers.size > compStart -> {
-                        val reindented =
-                            implComments.lines().joinToString("\n") { line ->
-                                if (line.isBlank()) line else "    $line"
-                            }
-                        companionMembers[compStart] = "$reindented\n${companionMembers[compStart]}"
-                    }
-                    else -> {
-                        instanceMembers += implComments
-                    }
-                }
-            }
-        }
-
-        if (companionMembers.isNotEmpty()) {
-            val compSb = StringBuilder()
-            compSb.append(indent).append("public companion object {\n")
-            compSb.append(companionMembers.joinToString("\n\n"))
-            compSb.append('\n').append(indent).append("}")
-            instanceMembers += compSb.toString()
-        }
-
-        return instanceMembers.filter { it.isNotBlank() }.joinToString("\n\n")
-    } finally {
-        currentAttachedImplIsObjectOwner = prevObjectOwner
-    }
-}
-
 internal fun KotlinJ2KEmitter.renderItemUnion(
     item: Item.Union,
     attachedImpls: List<Item.Impl>,
@@ -1935,17 +1558,11 @@ internal fun KotlinJ2KEmitter.renderItemUnion(
     isLocalItem: Boolean = false,
 ): String {
     val typeName = rustTypeIdentToKotlin(item.ident.toString())
-    val sigKey = "type:$typeName"
-    val seenCount = scopeSignatures[sigKey] ?: 0
-    scopeSignatures[sigKey] = seenCount + 1
-    if (seenCount > 0) {
+    if (!reserveUniqueSignature(scopeSignatures, "type:$typeName")) {
         return ""
     }
     val useFinalAbiLayout = headerContext.rawAbiMode || headerContext.finalClasses
-    val sb = StringBuilder()
-    sb.append(renderLeadingTrivia(item, indent))
-    sb.append(renderKDocFromAttributes(item.attrs, indent))
-    val vis = if (isLocalItem) "" else renderVisibility(item.vis)
+    val (sb, vis) = beginItemHeaderAndVisibility(renderLeadingTrivia(item, indent), item.attrs, item.vis, indent, isLocalItem)
     val selfTypeWithGenerics = typeName + renderTypeArgumentsFromGenerics(item.generics)
     val unboundedOwnerTypeParams = collectUnboundedGenericTypeParamNames(item.generics)
     val typeParamCount =
@@ -2015,38 +1632,20 @@ internal fun KotlinJ2KEmitter.renderItemUnion(
             (!hasExplicitDebug && traitIdent == "Debug") || (useFinalAbiLayout && traitIdent == "Default")
         }
     if (needsSwiftSafeUnionCtor) {
-        ctorParams.clear()
-        for (spec in unionSpecs) {
-            if (spec.vis == "public " && spec.isConcreteGenericForSwift) {
-                ctorParams += "${spec.name}CtorArg: ${spec.renderedType}"
-                swiftSafeUnionProps +=
-                    "${spec.leadingHeader}$indent    public var ${spec.name}: ${spec.renderedType} = ${spec.name}CtorArg\n$indent        internal set"
-            } else {
-                ctorParams += "${spec.docPrefix}${spec.vis}var ${spec.name}: ${spec.renderedType}"
-            }
-        }
-        if (unionSpecs.isNotEmpty() && unionSpecs.all { it.defaultExpr != null }) {
-            val defaultCtorArgs =
-                unionSpecs.joinToString(",\n") { spec ->
-                    val paramKey = if (spec.vis == "public " && spec.isConcreteGenericForSwift) "${spec.name}CtorArg" else spec.name
-                    "$indent        $paramKey = ${spec.defaultExpr}"
-                }
-            extraUnionMembers += "$indent    public constructor() : this(\n$defaultCtorArgs,\n$indent    )"
-        }
-        extraUnionCompanionMembers += renderSwiftSafeCompanionInvoke(typeParams, selfTypeWithGenerics, unionSpecs, "$indent    ")
-        if (wouldHaveBeenDataClass) {
-            extraUnionMembers.addAll(
-                buildSwiftSafeSyntheticDataMethods(
-                    typeName = typeName,
-                    typeParamCount = typeParamCount,
-                    selfTypeWithGenerics = selfTypeWithGenerics,
-                    specs = unionSpecs,
-                    includeCopyAndComponents = true,
-                    hasCopyCollision = attachedImplDefinesInstanceMethod(filteredImpls, "copy"),
-                    memberIndent = "$indent    ",
-                ),
-            )
-        }
+        populateSwiftSafeCtorAndDataMethods(
+            specs = unionSpecs,
+            ctorParams = ctorParams,
+            swiftSafePropsOut = swiftSafeUnionProps,
+            extraMembersOut = extraUnionMembers,
+            extraCompanionMembersOut = extraUnionCompanionMembers,
+            attachedImpls = filteredImpls,
+            typeName = typeName,
+            typeParamCount = typeParamCount,
+            typeParams = typeParams,
+            selfTypeWithGenerics = selfTypeWithGenerics,
+            wouldHaveBeenDataClass = wouldHaveBeenDataClass,
+            indent = indent,
+        )
     }
     val isDataClass = wouldHaveBeenDataClass && !needsSwiftSafeUnionCtor
     if (isDataClass && fieldNameAndTypes.any { isPrimitiveArrayRenderedType(it.second) }) {
@@ -2066,27 +1665,7 @@ internal fun KotlinJ2KEmitter.renderItemUnion(
         .append(typeParams)
     if (ctorParams.isNotEmpty() && !useBodyPropertiesForLargeUnion) {
         val ctorHeaderPrefix = if (needsSwiftSafeUnionCtor) " internal constructor" else ""
-        if (headerContext.isBatchCrateOutput || ctorParams.any { it.contains('\n') } || ctorParams.size > 2) {
-            sb.append(ctorHeaderPrefix).append("(\n")
-            for (p in ctorParams) {
-                if (p.startsWith('\n')) {
-                    sb.append(p.removePrefix("\n")).append(",\n")
-                } else {
-                    sb
-                        .append(indent)
-                        .append("    ")
-                        .append(p)
-                        .append(",\n")
-                }
-            }
-            sb.append(indent).append(")")
-        } else {
-            sb
-                .append(ctorHeaderPrefix)
-                .append("(")
-                .append(ctorParams.joinToString(", "))
-                .append(")")
-        }
+        appendFormattedCtorParams(sb, indent, ctorHeaderPrefix, ctorParams)
     }
     val memberLines =
         renderAttachedImplMembers(
@@ -2194,27 +1773,24 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
     isLocalItem: Boolean = false,
 ): String {
     val typeName = rustTypeIdentToKotlin(item.ident.toString())
-    val sigKey = "type:$typeName"
-    val seenCount = scopeSignatures[sigKey] ?: 0
-    scopeSignatures[sigKey] = seenCount + 1
-    if (seenCount > 0) {
+    if (!reserveUniqueSignature(scopeSignatures, "type:$typeName")) {
         return ""
     }
     val useFinalAbiLayout = headerContext.rawAbiMode || headerContext.finalClasses
-    val sb = StringBuilder()
-    sb.append(renderLeadingTrivia(item, indent))
-    sb.append(renderKDocFromAttributes(item.attrs, indent))
-    val vis = if (isLocalItem) "" else renderVisibility(item.vis)
+    val (sb, vis) = beginItemHeaderAndVisibility(renderLeadingTrivia(item, indent), item.attrs, item.vis, indent, isLocalItem)
     val typeArgsUse = renderTypeArgumentsFromGenerics(item.generics)
     val selfTypeWithGenerics = typeName + typeArgsUse
     val prevEnumTypeParams = activeTypeParamNames
+    val prevEnumConstParams = activeConstParamNames
     activeTypeParamNames = activeTypeParamNames + collectGenericTypeParamNames(item.generics)
+    activeConstParamNames = activeConstParamNames + collectGenericConstParamNames(item.generics)
     val typeParams: String
     val superTraits: List<String>
     try {
         typeParams = renderTypeParameters(item.generics, selfTypeName = selfTypeWithGenerics)
-        superTraits = renderDistinctSuperTraits(attachedImpls, selfTypeWithGenerics)
+        superTraits = renderDistinctSuperTraits(attachedImpls, selfTypeWithGenerics, ownerIsPublic = (vis == "public "))
     } finally {
+        activeConstParamNames = prevEnumConstParams
         activeTypeParamNames = prevEnumTypeParams
     }
     val variants = item.variants.toList().filterNot { isDocOnlyCfgAttribute(it.attrs) }
@@ -2239,7 +1815,12 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
     }
     if (variants.isEmpty() && typeParams.isEmpty()) {
         val prevOverrideNames = currentStructOverrideMethodNames
-        currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits, includeReceiverlessMethods = true)
+        currentStructOverrideMethodNames =
+            collectLocalSupertraitMethodNames(
+                superTraits,
+                includeReceiverlessMethods = true,
+                ownerIsPublic = (vis == "public "),
+            )
         val attachedMembers =
             try {
                 renderAttachedImplMembers(
@@ -2360,7 +1941,7 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
     }
 
     val prevOverrideNames = currentStructOverrideMethodNames
-    currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits)
+    currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits, ownerIsPublic = (vis == "public "))
     val attachedMembers =
         try {
             renderAttachedImplMembers(selfTypeWithGenerics, item.generics, attachedImpls, "$indent    ", isLocalClass = isLocalItem)
@@ -2397,6 +1978,7 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
     sb.append(" {\n")
     var prevVariantName: String? = null
     activeTypeParamNames = prevEnumTypeParams + collectGenericTypeParamNames(item.generics)
+    activeConstParamNames = prevEnumConstParams + collectGenericConstParamNames(item.generics)
     try {
         for (v in variants) {
             val vName = rustTypeIdentToKotlin(v.ident.toString())
@@ -2443,20 +2025,10 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
             prevVariantName = vName
         }
     } finally {
+        activeConstParamNames = prevEnumConstParams
         activeTypeParamNames = prevEnumTypeParams
     }
-    val derivesEquality =
-        item.attrs.any { attribute ->
-            val derive = attribute.meta as? Meta.List
-            derive != null && derive.path.segments
-                .last()
-                ?.ident
-                .toString() in setOf("derive", "derive_const") &&
-                derive.tokens
-                    .clone()
-                    .toList()
-                    .any { it is TokenTree.Ident && it.value.toString() == "PartialEq" }
-        }
+    val derivesEquality = hasDeriveTrait(item.attrs, "PartialEq")
     if (derivesEquality) {
         sb.append("\n$indent    public fun rustEquals(other: $selfTypeWithGenerics): Boolean = this == other\n")
     }
@@ -2576,6 +2148,11 @@ private fun KotlinJ2KEmitter.appendEnumVariantWithFields(
     specs: List<SwiftSafeFieldSpec>,
     indent: String,
 ) {
+    val addErrAlias =
+        enumName in setOf("Result", "RustResult") &&
+            vName == "Err" &&
+            specs.size == 1 &&
+            specs[0].name == "value"
     if (specs.none { it.isConcreteGenericForSwift }) {
         val params = specs.map { "public var ${it.name}: ${it.renderedType}" }
         sb
@@ -2592,6 +2169,16 @@ private fun KotlinJ2KEmitter.appendEnumVariantWithFields(
             .append("(")
             .append(superCallArgs)
             .append(")")
+        if (addErrAlias) {
+            sb
+                .append(" {\n")
+                .append(indent)
+                .append("    public val error: ")
+                .append(specs[0].renderedType)
+                .append(" get() = value\n")
+                .append(indent)
+                .append("}")
+        }
         return
     }
     val ctorParams =
@@ -2630,6 +2217,14 @@ private fun KotlinJ2KEmitter.appendEnumVariantWithFields(
                 .append("        internal set\n")
         }
     }
+    if (addErrAlias) {
+        sb
+            .append("\n")
+            .append(indent)
+            .append("    public val error: ")
+            .append(specs[0].renderedType)
+            .append(" get() = value\n")
+    }
     val syntheticMethods =
         buildSwiftSafeSyntheticDataMethods(
             typeName = vName,
@@ -2653,1282 +2248,4 @@ private fun KotlinJ2KEmitter.appendEnumVariantWithFields(
         .append("    }\n")
         .append(indent)
         .append("}")
-}
-
-private fun synTypeMentionsAssoc(ty: SynType, rawAssocName: String): Boolean {
-    var found = false
-    val v =
-        object : Visit() {
-            override fun visitTypePath(t: SynType.Path) {
-                val segs = t.path.segments.toList()
-                val q = t.qself
-                if (q != null) {
-                    val qPath = q.ty as? SynType.Path
-                    val isSelf =
-                        qPath
-                            ?.path
-                            ?.segments
-                            ?.toList()
-                            ?.singleOrNull()
-                            ?.ident
-                            ?.toString() == "Self"
-                    if (isSelf && segs
-                            .getOrNull(q.position)
-                            ?.ident
-                            ?.toString()
-                            ?.removePrefix("r#") == rawAssocName
-                    ) {
-                        found = true
-                    }
-                } else if (segs.size == 2 &&
-                    segs[0].ident.toString() == "Self" &&
-                    segs[1].ident.toString().removePrefix("r#") == rawAssocName
-                ) {
-                    found = true
-                } else if (segs.size == 1 && segs[0].ident.toString().removePrefix("r#") == rawAssocName) {
-                    found = true
-                }
-                super.visitTypePath(t)
-            }
-        }
-    v.visitType(ty)
-    return found
-}
-
-private fun synTypeAllowsOutPosition(ty: SynType, rawAssocName: String): Boolean {
-    if (!synTypeMentionsAssoc(ty, rawAssocName)) return true
-    return when (ty) {
-        is SynType.Group -> synTypeAllowsOutPosition(ty.elem, rawAssocName)
-        is SynType.Paren -> synTypeAllowsOutPosition(ty.elem, rawAssocName)
-        is SynType.Reference -> ty.mutability == null && synTypeAllowsOutPosition(ty.elem, rawAssocName)
-        is SynType.Tuple -> {
-            val elems = ty.elems.toList()
-            elems.size <= 3 && elems.all { synTypeAllowsOutPosition(it, rawAssocName) }
-        }
-        is SynType.FnPtr -> false
-        is SynType.Path -> {
-            val segs = ty.path.segments.toList()
-            val q = ty.qself
-            if (q != null) {
-                val qPath = q.ty as? SynType.Path
-                val isSelf =
-                    qPath
-                        ?.path
-                        ?.segments
-                        ?.toList()
-                        ?.singleOrNull()
-                        ?.ident
-                        ?.toString() == "Self"
-                return isSelf && segs.size == 1 && segs[0].ident.toString().removePrefix("r#") == rawAssocName
-            }
-            if (segs.size == 2 && segs[0].ident.toString() == "Self" && segs[1].ident.toString().removePrefix("r#") == rawAssocName) {
-                return true
-            }
-            if (segs.size == 1 && segs[0].ident.toString().removePrefix("r#") == rawAssocName) {
-                return true
-            }
-            val lastSeg = segs.lastOrNull() ?: return false
-            val rawLast = lastSeg.ident.toString().removePrefix("r#")
-            val covariantStdWrappers = setOf("Option", "Result", "Vec", "Box", "Rc", "Arc", "Cow")
-            if (rawLast !in covariantStdWrappers) return false
-            val args = (lastSeg.arguments as? PathArguments.AngleBracketed)?.args?.toList().orEmpty()
-            args.all { ga ->
-                when (ga) {
-                    is GenericArgument.TypeArg -> synTypeAllowsOutPosition(ga.type, rawAssocName)
-                    is GenericArgument.LifetimeArg -> true
-                    else -> false
-                }
-            }
-        }
-        else -> false
-    }
-}
-
-private fun isAssocTypeCovariantInTrait(item: Item.Trait, rawAssocName: String): Boolean {
-    var mentionedInSuperOrWhere = false
-    val checkVisitor =
-        object : Visit() {
-            override fun visitTypePath(t: SynType.Path) {
-                val segs = t.path.segments.toList()
-                val q = t.qself
-                if (q != null) {
-                    val qPath = q.ty as? SynType.Path
-                    val isSelf =
-                        qPath
-                            ?.path
-                            ?.segments
-                            ?.toList()
-                            ?.singleOrNull()
-                            ?.ident
-                            ?.toString() == "Self"
-                    if (isSelf && segs
-                            .getOrNull(q.position)
-                            ?.ident
-                            ?.toString()
-                            ?.removePrefix("r#") == rawAssocName
-                    ) {
-                        mentionedInSuperOrWhere = true
-                    }
-                } else if (segs.size == 2 &&
-                    segs[0].ident.toString() == "Self" &&
-                    segs[1].ident.toString().removePrefix("r#") == rawAssocName
-                ) {
-                    mentionedInSuperOrWhere = true
-                } else if (segs.size == 1 && segs[0].ident.toString().removePrefix("r#") == rawAssocName) {
-                    mentionedInSuperOrWhere = true
-                }
-                super.visitTypePath(t)
-            }
-        }
-    for (bound in item.supertraits.toList()) {
-        checkVisitor.visitTypeParamBound(bound)
-    }
-    item.generics.whereClause?.let { checkVisitor.visitWhereClause(it) }
-    if (mentionedInSuperOrWhere) return false
-
-    for (tItem in item.items) {
-        if (traitItemHasDocOnlyCfg(tItem)) continue
-        when (tItem) {
-            is TraitItem.AssocType -> {
-                if (tItem.ident.toString().removePrefix("r#") != rawAssocName) {
-                    for (b in tItem.bounds.toList()) {
-                        checkVisitor.visitTypeParamBound(b)
-                    }
-                    tItem.generics.whereClause?.let { checkVisitor.visitWhereClause(it) }
-                    if (mentionedInSuperOrWhere) return false
-                }
-            }
-            is TraitItem.Const -> {
-                if (!synTypeAllowsOutPosition(tItem.ty, rawAssocName)) return false
-            }
-            is TraitItem.Fn -> {
-                for (arg in tItem.sig.inputs.toList()) {
-                    if (arg is FnArg.Typed && synTypeMentionsAssoc(arg.patType.ty, rawAssocName)) {
-                        return false
-                    }
-                }
-                tItem.sig.generics.whereClause
-                    ?.let { checkVisitor.visitWhereClause(it) }
-                if (mentionedInSuperOrWhere) return false
-                val retTy = extractReturnSynType(tItem.sig.output)
-                if (retTy != null && !synTypeAllowsOutPosition(retTy, rawAssocName)) {
-                    return false
-                }
-            }
-            else -> {}
-        }
-    }
-    return true
-}
-
-private fun KotlinJ2KEmitter.hasInvalidDefaultBodyOnErasedInterface(
-    defaultBlock: Block,
-    sig: Signature,
-    body: String,
-    selfParamName: String?,
-    traitName: String,
-    instanceMethodRawNames: Set<String>,
-): Boolean {
-    var mutatesDerefSelf = false
-    var returnsBareSelfOrUnaryOnSelf = false
-    var callsStaticSelfOrTraitFn = false
-    val blockVisitor =
-        object : Visit() {
-            override fun visitExprAssign(e: Expr.Assign) {
-                val lhs = unwrapParenOrGroupExpr(e.left)
-                if (lhs is Expr.Unary && lhs.op is UnOp.Deref) {
-                    val inner = unwrapParenOrGroupExpr(lhs.expr) as? Expr.Path
-                    if (inner?.qself == null && inner?.path?.isIdent("self") == true) {
-                        mutatesDerefSelf = true
-                    }
-                }
-                super.visitExprAssign(e)
-            }
-
-            override fun visitExprUnary(e: Expr.Unary) {
-                val inner = unwrapParenOrGroupExpr(e.expr) as? Expr.Path
-                if (inner?.qself == null && inner?.path?.isIdent("self") == true && e.op !is UnOp.Deref) {
-                    returnsBareSelfOrUnaryOnSelf = true
-                }
-                super.visitExprUnary(e)
-            }
-
-            override fun visitExprCall(e: Expr.Call) {
-                val fnPath = unwrapParenOrGroupExpr(e.func) as? Expr.Path
-                if (fnPath != null && fnPath.qself == null) {
-                    val segs = fnPath.path.segments.toList()
-                    val head =
-                        segs
-                            .firstOrNull()
-                            ?.ident
-                            ?.toString()
-                            ?.removePrefix("r#")
-                    val tail =
-                        segs
-                            .lastOrNull()
-                            ?.ident
-                            ?.toString()
-                            ?.removePrefix("r#")
-                    val firstArgPath =
-                        e.args
-                            .toList()
-                            .firstOrNull()
-                            ?.let { unwrapParenOrGroupExpr(it) as? Expr.Path }
-                    val passesSelfFirst =
-                        firstArgPath?.qself == null && firstArgPath?.path?.isIdent("self") == true
-                    if (segs.size == 2 && head == "Self" && tail != null &&
-                        tail !in currentTraitMethodRawNames &&
-                        (tail !in instanceMethodRawNames || !passesSelfFirst)
-                    ) {
-                        callsStaticSelfOrTraitFn = true
-                    } else if (segs.size >= 2 && head != null && tail != null &&
-                        (head == traitName || rustTypeIdentToKotlin(head) == traitName) &&
-                        (tail !in instanceMethodRawNames || !passesSelfFirst)
-                    ) {
-                        callsStaticSelfOrTraitFn = true
-                    } else if (segs.size == 2 &&
-                        head != null &&
-                        head != "Self" &&
-                        head.firstOrNull()?.isUpperCase() == true &&
-                        lookupDeclaredTraitAst(rustTypeIdentToKotlin(head)) != null &&
-                        !passesSelfFirst
-                    ) {
-                        callsStaticSelfOrTraitFn = true
-                    }
-                }
-                super.visitExprCall(e)
-            }
-        }
-    blockVisitor.visitBlock(defaultBlock)
-    if (mutatesDerefSelf) return true
-    if (selfParamName == null) return false
-
-    if (Regex("""\bas\s+${Regex.escape(selfParamName)}\b""").containsMatchIn(body)) return true
-    if (Regex("""\bthis\s*=""").containsMatchIn(body)) return true
-    if (Regex("""[!+\-*/%]\s*this\b|\bthis\s*(?:\+|-|\*|/|%|shl|shr)\b""").containsMatchIn(body)) return true
-    if (callsStaticSelfOrTraitFn || returnsBareSelfOrUnaryOnSelf) return true
-
-    val retSyn = extractReturnSynType(sig.output)
-    if (retSyn != null && synTypeReferencesDirectSelf(retSyn)) {
-        if (Regex("""(?m)(?:^|\belse\b|return)\s+this\b(?:\s*[;}]|$)""").containsMatchIn(body)) {
-            return true
-        }
-    }
-    return false
-}
-
-internal fun KotlinJ2KEmitter.pickUnusedTraitSelfParamName(
-    generics: Generics,
-    assocTypeNames: List<String>,
-    traitItem: Item.Trait? = null,
-): String {
-    val memberGenerics =
-        traitItem
-            ?.items
-            ?.flatMap { tItem ->
-                when (tItem) {
-                    is TraitItem.Fn -> collectGenericTypeParamNames(tItem.sig.generics)
-                    is TraitItem.AssocType -> collectGenericTypeParamNames(tItem.generics)
-                    else -> emptySet()
-                }
-            }.orEmpty()
-    val existing = collectGenericTypeParamNames(generics) + assocTypeNames + memberGenerics
-    for (candidate in listOf("T", "SelfType", "S", "Target")) {
-        if (candidate !in existing) return candidate
-    }
-    return "SelfType0"
-}
-
-internal fun KotlinJ2KEmitter.renderItemTrait(
-    item: Item.Trait,
-    indent: String,
-    scopeSignatures: MutableMap<String, Int> = topLevelSignatureCounts,
-    isLocalItem: Boolean = false,
-): String {
-    val traitName = rustTypeIdentToKotlin(item.ident.toString())
-    val sigKey = "type:$traitName"
-    val seenCount = scopeSignatures[sigKey] ?: 0
-    scopeSignatures[sigKey] = seenCount + 1
-    if (seenCount > 0) {
-        return ""
-    }
-    val sb = StringBuilder()
-    sb.append(renderLeadingTrivia(item, indent))
-    sb.append(renderKDocFromAttributes(item.attrs, indent))
-    val vis = if (isLocalItem) "" else renderVisibility(item.vis)
-    val assocTypeNames = lookupTraitDefaultlessAssocTypes(traitName)
-    val rawAssocByKtName =
-        item.items
-            .filterIsInstance<TraitItem.AssocType>()
-            .associate { rustTypeIdentToKotlin(it.ident.toString()) to it.ident.toString().removePrefix("r#") }
-    val traitInstanceMethodRawNames =
-        item.items
-            .filterIsInstance<TraitItem.Fn>()
-            .filter { fnItem ->
-                fnItem.sig.inputs
-                    .toList()
-                    .firstOrNull() is FnArg.Receiver
-            }.mapTo(linkedSetOf()) {
-                it.sig.ident
-                    .toString()
-                    .removePrefix("r#")
-            }
-    val selfParamName =
-        if (isSelfParameterizedTraitName(traitName)) {
-            pickUnusedTraitSelfParamName(item.generics, assocTypeNames, item)
-        } else {
-            null
-        }
-    val memberSelfType = selfParamName ?: (traitName + renderTypeArgumentsFromGenerics(item.generics))
-    val prevTraitAssoc = currentTraitAssocParamNames
-    val prevTraitTypeParams = activeTypeParamNames
-    val prevTraitMethods = currentTraitMethodRawNames
-    currentTraitAssocParamNames = assocTypeNames.toSet()
-    currentTraitMethodRawNames = collectLocalTraitAndSupertraitFnRawNames(item)
-    activeTypeParamNames =
-        prevTraitTypeParams +
-        collectGenericTypeParamNames(item.generics) +
-        setOfNotNull(selfParamName) +
-        assocTypeNames
-    return try {
-        val baseTypeParams =
-            renderTypeParameters(item.generics, selfTypeName = memberSelfType)
-                .removePrefix("<")
-                .removeSuffix(">")
-        val allowOutAssoc = selfParamName != null || usesTaggedCoreResult()
-        val assocParamDecls =
-            assocTypeNames.map { assocKt ->
-                val rawAssoc = rawAssocByKtName[assocKt]
-                val isCovariant = allowOutAssoc && rawAssoc != null && isAssocTypeCovariantInTrait(item, rawAssoc)
-                if (isCovariant) "out $assocKt" else assocKt
-            }
-        val combinedTraitParams =
-            buildList {
-                if (baseTypeParams.isNotEmpty()) add(baseTypeParams)
-                if (selfParamName != null) add(selfParamName)
-                addAll(assocParamDecls)
-            }
-        val typeParams =
-            if (combinedTraitParams.isEmpty()) {
-                ""
-            } else {
-                "<${combinedTraitParams.joinToString(", ")}>"
-            }
-        val prevBounded = currentBoundedTypeName
-        currentBoundedTypeName = memberSelfType
-        val (superBounds, whereClause) =
-            try {
-                val sbList =
-                    item.supertraits
-                        .toList()
-                        .mapNotNull { renderTypeParamBound(it, selfTypeName = memberSelfType) }
-                        .distinct()
-                val wc =
-                    renderWhereClause(
-                        item.generics.whereClause,
-                        selfTypeName = memberSelfType,
-                        ownerGenerics = item.generics,
-                        extraDeclaredNames = setOfNotNull(selfParamName) + assocTypeNames,
-                    )
-                sbList to wc
-            } finally {
-                currentBoundedTypeName = prevBounded
-            }
-
-        sb
-            .append(indent)
-            .append(vis)
-            .append("interface ")
-            .append(traitName)
-            .append(typeParams)
-        if (superBounds.isNotEmpty()) {
-            sb.append(" : ").append(superBounds.joinToString(", "))
-        }
-        sb.append(whereClause)
-
-        val traitSignatures = linkedMapOf<String, Int>()
-        val members = mutableListOf<String>()
-        for (tItem in item.items) {
-            if (traitItemHasDocOnlyCfg(tItem)) continue
-            when (tItem) {
-                is TraitItem.Const -> {
-                    val cDoc = renderKDocFromAttributes(tItem.attrs, "$indent    ")
-                    val cName = disambiguateName(rustConstIdentToKotlin(tItem.ident.toString()), traitSignatures)
-                    val cType = renderType(tItem.ty, selfTypeName = memberSelfType)
-                    val defaultExpr = tItem.default?.expr
-                    if (defaultExpr != null) {
-                        val renderedExpr =
-                            renderTypedNumericInitializer(
-                                defaultExpr,
-                                resolveNumericKind(cType),
-                                "$indent    ",
-                                selfTypeName = memberSelfType,
-                            )
-                        members += "${cDoc}$indent    public val $cName: $cType\n$indent        get() = $renderedExpr"
-                    } else {
-                        members += "${cDoc}$indent    public val $cName: $cType"
-                    }
-                }
-                is TraitItem.Fn -> {
-                    val prevClosureLabel = currentClosureLabel
-                    val prevEnclosingRet = currentEnclosingReturnRenderedType
-                    val prevEnclosingSynRet = currentEnclosingReturnSynType
-                    val prevEnclosingFmtResult = currentEnclosingReturnsFmtResult
-                    val prevTailExpectsUnitResultOk = currentTailExpectsUnitResultOk
-                    val prevMutableListLocals = currentMutableListLocals
-                    val prevDequeLocals = currentDequeLocals
-                    val prevIterableLocals = currentIterableLocals
-                    val prevSourceParameterTypes = currentSourceParameterTypes
-                    val prevTypedLocals = currentTypedLocals
-                    val prevWitnessedBounds = currentWitnessedTraitBounds
-                    val prevTypeParamBounds = currentTypeParamTraitBounds
-                    val prevNullableLocals = currentNullableLocals
-                    val prevSmartCastLocals = currentSmartCastNonNullLocals
-                    val prevSubst = substitutedTypeParamTypes
-                    val prevIntoSubstTps = currentIntoSubstitutedTypeParams
-                    val prevIntoSubstParams = currentIntoSubstitutedParams
-                    val prevTraitFnTypeParams = activeTypeParamNames
-                    val prevWitnesses = currentTypeParamWitnessCalls
-                    val prevSharedBorrowRecv = currentReceiverIsSharedBorrow
-                    val prevMutBorrowRecv = currentReceiverIsMutBorrow
-                    currentClosureLabel = null
-                    currentEnclosingReturnRenderedType = null
-                    currentEnclosingReturnSynType = null
-                    val traitFirstReceiverRef =
-                        (
-                            tItem.sig.inputs
-                                .toList()
-                                .firstOrNull() as? FnArg.Receiver
-                        )?.kind as? ReceiverKind.Reference
-                    currentReceiverIsSharedBorrow = traitFirstReceiverRef?.let { it.mutability == null } == true
-                    currentReceiverIsMutBorrow = traitFirstReceiverRef?.let { it.mutability != null } == true
-                    currentMutableListLocals = emptySet()
-                    currentDequeLocals = emptySet()
-                    currentIterableLocals = emptySet()
-                    currentSourceParameterTypes = emptyMap()
-                    currentTypedLocals = emptyMap()
-                    currentWitnessedTraitBounds = emptyMap()
-                    currentTypeParamTraitBounds = emptyMap()
-                    currentNullableLocals = emptySet()
-                    currentSmartCastNonNullLocals = emptySet()
-                    currentIntoSubstitutedParams = emptySet()
-                    val traitFnGenerics = tItem.sig.generics
-                    val traitFnParams = traitFnGenerics.params.toList()
-                    val intoSubstTps = linkedSetOf<String>()
-                    val fnSubsts = extractFnTraitSubstitutions(traitFnParams, traitFnGenerics.whereClause, memberSelfType, intoSubstTps)
-                    if (fnSubsts.isNotEmpty()) {
-                        substitutedTypeParamTypes = prevSubst + fnSubsts
-                    }
-                    currentIntoSubstitutedTypeParams = prevIntoSubstTps + intoSubstTps
-                    activeTypeParamNames = (prevTraitFnTypeParams + collectGenericTypeParamNames(tItem.sig.generics)) - substitutedTypeParamTypes.keys
-                    scopeBuilder.enterDef()
-                    try {
-                        val sigHeader =
-                            renderFunctionSignature(
-                                sig = tItem.sig,
-                                visPrefix = "public ",
-                                openPrefix = "",
-                                selfTypeName = memberSelfType,
-                                ownerGenerics = item.generics,
-                                scopeSignatures = traitSignatures,
-                                isInterfaceMethod = true,
-                                fnBlock = tItem.default,
-                            )
-                        if (sigHeader != null) {
-                            val fnDoc = renderKDocFromAttributes(tItem.attrs, "$indent    ")
-                            val defaultBlock = tItem.default
-                            if (defaultBlock != null) {
-                                val retType = extractReturnSynType(tItem.sig.output)
-                                val shadows = computeReassignedParamShadows(tItem.sig, defaultBlock, "$indent        ")
-                                val prevInTraitDefault = inTraitDefaultMethodBody
-                                inTraitDefaultMethodBody = true
-                                val body =
-                                    try {
-                                        renderBlock(
-                                            defaultBlock,
-                                            "$indent    ",
-                                            selfTypeName = memberSelfType,
-                                            returnType = retType,
-                                            leadingInjectedLines = shadows,
-                                            allowExpressionBody = true,
-                                        )
-                                    } finally {
-                                        inTraitDefaultMethodBody = prevInTraitDefault
-                                    }
-                                if (hasInvalidDefaultBodyOnErasedInterface(
-                                        defaultBlock = defaultBlock,
-                                        sig = tItem.sig,
-                                        body = body,
-                                        selfParamName = selfParamName,
-                                        traitName = traitName,
-                                        instanceMethodRawNames = traitInstanceMethodRawNames,
-                                    )
-                                ) {
-                                    members += "${fnDoc}$indent    $sigHeader"
-                                } else {
-                                    members += "${fnDoc}$indent    $sigHeader $body"
-                                }
-                            } else {
-                                members += "${fnDoc}$indent    $sigHeader"
-                            }
-                        }
-                    } finally {
-                        scopeBuilder.exitDef()
-                        currentClosureLabel = prevClosureLabel
-                        currentEnclosingReturnRenderedType = prevEnclosingRet
-                        currentEnclosingReturnSynType = prevEnclosingSynRet
-                        currentEnclosingReturnsFmtResult = prevEnclosingFmtResult
-                        currentTailExpectsUnitResultOk = prevTailExpectsUnitResultOk
-                        currentMutableListLocals = prevMutableListLocals
-                        currentDequeLocals = prevDequeLocals
-                        currentIterableLocals = prevIterableLocals
-                        currentSourceParameterTypes = prevSourceParameterTypes
-                        currentTypedLocals = prevTypedLocals
-                        currentWitnessedTraitBounds = prevWitnessedBounds
-                        currentTypeParamTraitBounds = prevTypeParamBounds
-                        currentNullableLocals = prevNullableLocals
-                        currentSmartCastNonNullLocals = prevSmartCastLocals
-                        substitutedTypeParamTypes = prevSubst
-                        currentIntoSubstitutedTypeParams = prevIntoSubstTps
-                        currentIntoSubstitutedParams = prevIntoSubstParams
-                        activeTypeParamNames = prevTraitFnTypeParams
-                        currentTypeParamWitnessCalls = prevWitnesses
-                        currentReceiverIsSharedBorrow = prevSharedBorrowRecv
-                        currentReceiverIsMutBorrow = prevMutBorrowRecv
-                    }
-                }
-                is TraitItem.AssocType -> {}
-                is TraitItem.Macro -> {
-                    members +=
-                        renderImplOrTraitMacroMembers(
-                            mac = tItem.mac,
-                            indent = "$indent    ",
-                            selfTypeName = memberSelfType,
-                            ownerGenerics = item.generics,
-                            scopeSignatures = traitSignatures,
-                            asTopLevelExtension = false,
-                            isInterface = true,
-                        )
-                }
-                is TraitItem.Verbatim -> {}
-            }
-        }
-        val iterSuperSpec = extractIteratorSupertraitSpec(item.supertraits.toList(), memberSelfType)
-        if (iterSuperSpec != null) {
-            if ("next()" !in traitSignatures) {
-                traitSignatures["next()"] = 1
-                members += "$indent    public fun next(): ${iterSuperSpec.itemType}?"
-            }
-            if (iterSuperSpec.hasDoubleEnded && "nextBack()" !in traitSignatures) {
-                traitSignatures["nextBack()"] = 1
-                members += "$indent    public fun nextBack(): ${iterSuperSpec.itemType}?"
-            }
-            if (iterSuperSpec.hasExactSize && "len()" !in traitSignatures) {
-                traitSignatures["len()"] = 1
-                members += "$indent    public fun len(): Int"
-            }
-        }
-
-        if (!isLocalItem && item.generics.params.isEmpty() && assocTypeNames.isEmpty()) {
-            val receiverlessTraitFns =
-                item.items
-                    .filterIsInstance<TraitItem.Fn>()
-                    .filter { tFn ->
-                        !traitItemHasDocOnlyCfg(tFn) &&
-                            tFn.sig.inputs
-                                .toList()
-                                .firstOrNull() !is FnArg.Receiver
-                    }
-            if (receiverlessTraitFns.isNotEmpty()) {
-                val rawTraitIdent = item.ident.toString()
-                val moduleItems = (TranslationSession.sharedModuleFile?.items ?: file.items).toList()
-                val uniqueImpl =
-                    moduleItems
-                        .filterIsInstance<Item.Impl>()
-                        .singleOrNull { implItem ->
-                            !itemHasDocOnlyCfg(implItem) &&
-                                implItem.generics.params.isEmpty() &&
-                                implItem.traitPath
-                                    ?.path
-                                    ?.segments
-                                    ?.last()
-                                    ?.ident
-                                    ?.toString() == rawTraitIdent
-                        }
-                if (uniqueImpl != null) {
-                    val savedTraitAssoc = currentTraitAssocParamNames
-                    val savedActiveTypeParams = activeTypeParamNames
-                    val companionMethods =
-                        try {
-                            currentTraitAssocParamNames = prevTraitAssoc
-                            activeTypeParamNames = prevTraitTypeParams
-                            val concreteSelfType = renderType(uniqueImpl.selfType, selfTypeName = null)
-                            val directOwner = extractDirectOwnerTypeName(uniqueImpl.selfType, uniqueImpl.generics)
-                            val isLocalAttached =
-                                directOwner != null &&
-                                    directOwner in inspector.attachableTypeNames &&
-                                    TranslationSession.sharedModuleFile == null
-                            val implFnsByRawName =
-                                uniqueImpl.items
-                                    .filterIsInstance<ImplItem.Fn>()
-                                    .filter { !implItemHasDocOnlyCfg(it) }
-                                    .associateBy {
-                                        it.sig.ident
-                                            .toString()
-                                            .removePrefix("r#")
-                                    }
-                            val companionSigs = linkedMapOf<String, Int>()
-                            val implTraitPath = uniqueImpl.traitPath!!.path
-                            receiverlessTraitFns.mapNotNull { tFn ->
-                                val rawFnName =
-                                    tFn.sig.ident
-                                        .toString()
-                                        .removePrefix("r#")
-                                val implFn = implFnsByRawName[rawFnName] ?: return@mapNotNull null
-                                val prevCompTyped = currentTypedLocals
-                                val prevCompSourceParams = currentSourceParameterTypes
-                                val prevCompIntoParams = currentIntoSubstitutedParams
-                                val prevCompIterable = currentIterableLocals
-                                val prevCompNullable = currentNullableLocals
-                                val prevCompMutList = currentMutableListLocals
-                                val prevCompNumKinds = currentFunctionParamNumericKinds
-                                scopeBuilder.enterDef()
-                                val sigHeader =
-                                    try {
-                                        renderFunctionSignature(
-                                            sig = implFn.sig,
-                                            visPrefix = "public ",
-                                            openPrefix = "",
-                                            selfTypeName = concreteSelfType,
-                                            ownerGenerics = null,
-                                            scopeSignatures = companionSigs,
-                                            isInterfaceMethod = false,
-                                            isCompanionMember = true,
-                                            fnBlock = implFn.block,
-                                        )
-                                    } finally {
-                                        scopeBuilder.exitDef()
-                                        currentTypedLocals = prevCompTyped
-                                        currentSourceParameterTypes = prevCompSourceParams
-                                        currentIntoSubstitutedParams = prevCompIntoParams
-                                        currentIterableLocals = prevCompIterable
-                                        currentNullableLocals = prevCompNullable
-                                        currentMutableListLocals = prevCompMutList
-                                        currentFunctionParamNumericKinds = prevCompNumKinds
-                                    }
-                                        ?: return@mapNotNull null
-                                val ktFnName = rustFunctionIdentToKotlin(implFn.sig.ident.toString())
-                                val targetCall =
-                                    if (isLocalAttached) {
-                                        "$concreteSelfType.$ktFnName"
-                                    } else {
-                                        disambiguateReceiverlessTraitImplFnName(implTraitPath, ktFnName, uniqueImpl.selfType)
-                                    }
-                                val forwardArgs = extractSigHeaderForwardArgs(sigHeader)
-                                val docAttrs = implFn.attrs.ifEmpty { tFn.attrs }
-                                val doc = renderKDocFromAttributes(docAttrs, "$indent        ")
-                                "$doc$indent        $sigHeader = $targetCall(${forwardArgs.joinToString(", ")})"
-                            }
-                        } finally {
-                            currentTraitAssocParamNames = savedTraitAssoc
-                            activeTypeParamNames = savedActiveTypeParams
-                        }
-                    if (companionMethods.isNotEmpty()) {
-                        members +=
-                            "$indent    public companion object {\n" +
-                            companionMethods.joinToString("\n") +
-                            "\n$indent    }"
-                    }
-                }
-            }
-        }
-
-        if (members.isNotEmpty()) {
-            sb.append(" {\n")
-            sb.append(members.joinToString("\n\n"))
-            sb.append('\n').append(indent).append("}")
-        }
-        sb.toString()
-    } finally {
-        currentTraitMethodRawNames = prevTraitMethods
-        currentTraitAssocParamNames = prevTraitAssoc
-        activeTypeParamNames = prevTraitTypeParams
-    }
-}
-
-private fun extractSigHeaderForwardArgs(sigHeader: String): List<String> {
-    val funIdx = sigHeader.indexOf("fun ")
-    if (funIdx < 0) return emptyList()
-    var i = funIdx + 4
-    var angleDepth = 0
-    while (i < sigHeader.length) {
-        val ch = sigHeader[i]
-        when {
-            ch == '<' -> angleDepth++
-            ch == '>' -> if (angleDepth > 0 && (i == 0 || sigHeader[i - 1] != '-')) angleDepth--
-            ch == '(' && angleDepth == 0 -> break
-        }
-        i++
-    }
-    if (i >= sigHeader.length || sigHeader[i] != '(') return emptyList()
-    val openIdx = i
-    var parenDepth = 0
-    var closeIdx = -1
-    while (i < sigHeader.length) {
-        when (sigHeader[i]) {
-            '(' -> parenDepth++
-            ')' -> {
-                parenDepth--
-                if (parenDepth == 0) {
-                    closeIdx = i
-                    break
-                }
-            }
-        }
-        i++
-    }
-    if (closeIdx <= openIdx) return emptyList()
-    val body = sigHeader.substring(openIdx + 1, closeIdx).trim()
-    if (body.isEmpty()) return emptyList()
-    return PhantomRawPointerTypeStripper
-        .splitTopLevelCommaList(body)
-        .mapNotNull { entry ->
-            entry
-                .substringBefore(':')
-                .trim()
-                .substringAfterLast(' ')
-                .takeIf { it.isNotEmpty() }
-        }
-}
-
-private fun KotlinJ2KEmitter.stdlibIteratorTypeName(): String {
-    val iteratorShadowed =
-        "Iterator" in inspector.declaredTypeNames ||
-            "Iterator" in headerContext.moduleDeclaredTypeNames ||
-            extraTypePathImports.any { it.endsWith(".Iterator") || it.endsWith(".Iterator as Iterator") } ||
-            inspector.allUseItems.any { useItem ->
-                val leaves = mutableListOf<UseLeaf>()
-                collectUseLeaves(useItem.tree, emptyList(), leaves)
-                leaves.any { leaf ->
-                    val name = leaf.alias ?: leaf.segments.lastOrNull()
-                    name?.removePrefix("r#") == "Iterator"
-                }
-            }
-    return if (iteratorShadowed) "kotlin.collections.Iterator" else "Iterator"
-}
-
-internal fun KotlinJ2KEmitter.renderItemTraitAlias(
-    item: Item.TraitAlias,
-    indent: String,
-    scopeSignatures: MutableMap<String, Int> = topLevelSignatureCounts,
-    isLocalItem: Boolean = false,
-): String {
-    val name = rustTypeIdentToKotlin(item.ident.toString())
-    val sigKey = "type:$name"
-    val seenCount = scopeSignatures[sigKey] ?: 0
-    scopeSignatures[sigKey] = seenCount + 1
-    if (seenCount > 0) {
-        return ""
-    }
-    val sb = StringBuilder()
-    sb.append(renderLeadingTrivia(item, indent))
-    sb.append(renderKDocFromAttributes(item.attrs, indent))
-    val vis = if (isLocalItem) "" else renderVisibility(item.vis)
-    val aliasSelfType = name + renderTypeArgumentsFromGenerics(item.generics)
-    val typeParams = renderTypeParameters(item.generics, selfTypeName = aliasSelfType)
-    val prevBounded = currentBoundedTypeName
-    currentBoundedTypeName = aliasSelfType
-    val bounds =
-        try {
-            item.bounds
-                .toList()
-                .mapNotNull { renderTypeParamBound(it, selfTypeName = aliasSelfType) }
-                .distinct()
-        } finally {
-            currentBoundedTypeName = prevBounded
-        }
-    sb
-        .append(indent)
-        .append(vis)
-        .append("interface ")
-        .append(name)
-        .append(typeParams)
-    if (bounds.isNotEmpty()) {
-        sb.append(" : ").append(bounds.joinToString(", "))
-    }
-    return sb.toString()
-}
-
-internal fun KotlinJ2KEmitter.extractFnTraitClosureReceiver(item: Item.Impl): Pair<String, String>? {
-    val selfPath = unwrapSynType(item.selfType) as? SynType.Path ?: return null
-    if (selfPath.qself != null) return null
-    val selfSegs = selfPath.path.segments.toList()
-    if (selfSegs.size != 1 || selfSegs[0].arguments !is PathArguments.None) return null
-    val selfParamName = rustTypeIdentToKotlin(selfSegs[0].ident.toString())
-    val ownerTypeParams = collectGenericTypeParamNames(item.generics)
-    if (selfParamName !in ownerTypeParams) return null
-
-    val candidateBounds = mutableListOf<TypeParamBound>()
-    for (gp in item.generics.params.toList()) {
-        if (gp is GenericParam.TypeParam && rustTypeIdentToKotlin(gp.ident.toString()) == selfParamName) {
-            candidateBounds.addAll(gp.bounds.toList())
-        }
-    }
-    val wherePreds = item.generics.whereClause?.predicates
-    for (pred in wherePreds?.toList().orEmpty()) {
-        if (pred is WherePredicate.TypePredicate) {
-            val predTy = unwrapSynType(pred.boundedTy) as? SynType.Path
-            if (predTy != null && predTy.qself == null && predTy.path.segments.len() == 1) {
-                val firstSeg = predTy.path.segments.first()
-                val rawPred = firstSeg?.ident?.toString()
-                val predIdent = rawPred?.let(::rustTypeIdentToKotlin)
-                if (predIdent == selfParamName) {
-                    candidateBounds.addAll(pred.bounds.toList())
-                }
-            }
-        }
-    }
-    for (bound in candidateBounds) {
-        if (bound is TypeParamBound.Trait) {
-            val lastSeg = bound.path.segments.last() ?: continue
-            val boundIdent = lastSeg.ident.toString()
-            if ((boundIdent == "Fn" || boundIdent == "FnMut" || boundIdent == "FnOnce") &&
-                lastSeg.arguments is PathArguments.Parenthesized
-            ) {
-                val fnType = renderPathAsType(bound.path, selfTypeName = null)
-                return selfParamName to fnType
-            }
-        }
-    }
-    return null
-}
-
-internal fun KotlinJ2KEmitter.renderStandaloneItemImpl(
-    item: Item.Impl,
-    indent: String,
-    scopeSignatures: MutableMap<String, Int> = topLevelSignatureCounts,
-    isLocalItem: Boolean = false,
-): String {
-    val implComments =
-        (renderLeadingTrivia(item, indent) + renderKDocFromAttributes(item.attrs, indent))
-            .trimEnd()
-    val closureRecv = extractFnTraitClosureReceiver(item)
-    val prevSubst = substitutedTypeParamTypes
-    val prevStandaloneTraitPath = currentStandaloneImplTraitPath
-    val prevStandaloneSelfTy = currentStandaloneImplSelfSynType
-    val prevAssocTypes = currentImplAssocTypes
-    if (closureRecv != null) {
-        substitutedTypeParamTypes = prevSubst + (closureRecv.first to closureRecv.second)
-    }
-    currentStandaloneImplTraitPath = item.traitPath?.path
-    currentStandaloneImplSelfSynType = item.selfType
-    currentImplAssocTypes =
-        buildMap {
-            putAll(prevAssocTypes)
-            for (implItem in item.items) {
-                if (implItem is ImplItem.AssocType) {
-                    put(implItem.ident.toString(), implItem.ty)
-                }
-            }
-        }
-    return try {
-        val selfTypeRendered =
-            if (closureRecv != null) {
-                "(${closureRecv.second})"
-            } else {
-                renderType(item.selfType, selfTypeName = null)
-            }
-        val standaloneTraitKt =
-            item.traitPath
-                ?.path
-                ?.segments
-                ?.last()
-                ?.ident
-                ?.toString()
-                ?.let(::rustTypeIdentToKotlin)
-        if (standaloneTraitKt != null && lookupDeclaredTraitAst(standaloneTraitKt) != null) {
-            val implTypeParams = collectGenericTypeParamNames(item.generics)
-            if (selfTypeRendered in implTypeParams) {
-                val selfBounds = mutableListOf<TypeParamBound>()
-                for (gp in item.generics.params.toList()) {
-                    if (gp is GenericParam.TypeParam && rustTypeIdentToKotlin(gp.ident.toString()) == selfTypeRendered) {
-                        selfBounds.addAll(gp.bounds.toList())
-                    }
-                }
-                for (pred in item.generics.whereClause
-                    ?.predicates
-                    ?.toList()
-                    .orEmpty()) {
-                    if (pred is WherePredicate.TypePredicate && renderType(pred.boundedTy, null) == selfTypeRendered) {
-                        selfBounds.addAll(pred.bounds.toList())
-                    }
-                }
-                val alreadyImplementsTrait =
-                    selfBounds.any { b ->
-                        b is TypeParamBound.Trait &&
-                            b.maybe == null &&
-                            b.path.segments
-                                .last()
-                                ?.ident
-                                ?.toString()
-                                ?.let(::rustTypeIdentToKotlin) == standaloneTraitKt
-                    }
-                if (alreadyImplementsTrait) {
-                    return ""
-                }
-            }
-        }
-        val scopeSigs = scopeSignatures
-        val renderedMembers = mutableListOf<String>()
-        for (implItem in item.items) {
-            if (implItemHasDocOnlyCfg(implItem)) continue
-            when (implItem) {
-                is ImplItem.Const -> {
-                    renderedMembers +=
-                        renderImplItemConst(
-                            item = implItem,
-                            indent = indent,
-                            selfTypeName = selfTypeRendered,
-                            scopeSignatures = scopeSigs,
-                            isLocalItem = isLocalItem,
-                        )
-                }
-                is ImplItem.Fn -> {
-                    val rendered =
-                        renderImplItemFn(
-                            item = implItem,
-                            indent = indent,
-                            selfTypeName = selfTypeRendered,
-                            ownerGenerics = item.generics,
-                            implGenerics = item.generics,
-                            scopeSignatures = scopeSigs,
-                            asTopLevelExtension = true,
-                            isLocalItem = isLocalItem,
-                        )
-                    if (rendered.isNotBlank()) renderedMembers += rendered
-                }
-                is ImplItem.AssocType -> {}
-                is ImplItem.Macro -> {
-                    renderedMembers +=
-                        renderImplOrTraitMacroMembers(
-                            mac = implItem.mac,
-                            indent = indent,
-                            selfTypeName = selfTypeRendered,
-                            ownerGenerics = item.generics,
-                            scopeSignatures = scopeSigs,
-                            asTopLevelExtension = true,
-                            isInterface = false,
-                            isLocalItem = isLocalItem,
-                        )
-                }
-                is ImplItem.Verbatim -> {}
-            }
-        }
-        if (implComments.isNotBlank()) {
-            if (renderedMembers.isNotEmpty()) {
-                renderedMembers[0] = "$implComments\n${renderedMembers[0]}"
-            } else {
-                renderedMembers += implComments
-            }
-        }
-        renderedMembers.joinToString("\n\n")
-    } finally {
-        currentImplAssocTypes = prevAssocTypes
-        currentStandaloneImplTraitPath = prevStandaloneTraitPath
-        currentStandaloneImplSelfSynType = prevStandaloneSelfTy
-        substitutedTypeParamTypes = prevSubst
-    }
-}
-
-internal fun KotlinJ2KEmitter.renderImplItemConst(
-    item: ImplItem.Const,
-    indent: String,
-    selfTypeName: String?,
-    scopeSignatures: MutableMap<String, Int>,
-    isLocalItem: Boolean = false,
-): String {
-    val sb = StringBuilder()
-    sb.append(renderLeadingTrivia(item, indent))
-    sb.append(renderKDocFromAttributes(item.attrs, indent))
-    val vis = if (isLocalItem) "" else renderVisibility(item.vis)
-    val name = disambiguateName(rustConstIdentToKotlin(item.ident.toString()), scopeSignatures)
-    val ty = renderType(item.ty, selfTypeName)
-    val numKind = resolveNumericKind(ty)
-    val expr = renderTypedNumericInitializer(item.expr, numKind, indent, selfTypeName)
-    sb
-        .append(indent)
-        .append(vis)
-        .append("val ")
-        .append(name)
-        .append(": ")
-        .append(ty)
-        .append(" = ")
-        .append(expr)
-    return sb.toString()
-}
-
-internal fun KotlinJ2KEmitter.renderImplItemFn(
-    item: ImplItem.Fn,
-    indent: String,
-    selfTypeName: String?,
-    ownerGenerics: Generics?,
-    implGenerics: Generics? = null,
-    scopeSignatures: MutableMap<String, Int>,
-    asTopLevelExtension: Boolean = false,
-    isCompanionMember: Boolean = false,
-    isLocalItem: Boolean = false,
-): String {
-    val vis = if (isLocalItem) "" else renderVisibility(item.vis)
-    val useFinalAbiLayout = headerContext.rawAbiMode || headerContext.finalClasses
-    val openMod =
-        if (!useFinalAbiLayout &&
-            !asTopLevelExtension &&
-            !isCompanionMember &&
-            !isLocalItem &&
-            !currentAttachedImplIsObjectOwner &&
-            indent.isNotEmpty()
-        ) {
-            "open "
-        } else {
-            ""
-        }
-    val prevClosureLabel = currentClosureLabel
-    val prevEnclosingFn = currentEnclosingFunctionName
-    val prevEnclosingRet = currentEnclosingReturnRenderedType
-    val prevEnclosingSynRet = currentEnclosingReturnSynType
-    val prevEnclosingFmtResult = currentEnclosingReturnsFmtResult
-    val prevTailExpectsUnitResultOk = currentTailExpectsUnitResultOk
-    val prevMutableListLocals = currentMutableListLocals
-    val prevDequeLocals = currentDequeLocals
-    val prevIterableLocals = currentIterableLocals
-    val prevSourceParameterTypes = currentSourceParameterTypes
-    val prevTypedLocals = currentTypedLocals
-    val prevWitnessedBounds = currentWitnessedTraitBounds
-    val prevTypeParamBounds = currentTypeParamTraitBounds
-    val prevHasherState = currentHasherStateParam
-    val prevNullableLocals = currentNullableLocals
-    val prevSmartCastLocals = currentSmartCastNonNullLocals
-    val prevTypeParams = activeTypeParamNames
-    val prevSubst = substitutedTypeParamTypes
-    val prevIntoSubstTps = currentIntoSubstitutedTypeParams
-    val prevIntoSubstParams = currentIntoSubstitutedParams
-    val prevWitnesses = currentTypeParamWitnessCalls
-    val prevSharedBorrowRecv = currentReceiverIsSharedBorrow
-    val prevMutBorrowRecv = currentReceiverIsMutBorrow
-    currentClosureLabel = null
-    currentEnclosingFunctionName = rustFunctionIdentToKotlin(item.sig.ident.toString())
-    currentEnclosingReturnRenderedType = null
-    currentEnclosingReturnSynType = null
-    val firstReceiverRef =
-        (
-            item.sig.inputs
-                .toList()
-                .firstOrNull() as? FnArg.Receiver
-        )?.kind as? ReceiverKind.Reference
-    currentReceiverIsSharedBorrow = firstReceiverRef?.let { it.mutability == null } == true
-    currentReceiverIsMutBorrow = firstReceiverRef?.let { it.mutability != null } == true
-    currentMutableListLocals = emptySet()
-    currentDequeLocals = emptySet()
-    currentIterableLocals = emptySet()
-    currentSourceParameterTypes = emptyMap()
-    currentTypedLocals = emptyMap()
-    currentWitnessedTraitBounds = emptyMap()
-    currentTypeParamTraitBounds = emptyMap()
-    currentHasherStateParam = null
-    currentNullableLocals = emptySet()
-    currentSmartCastNonNullLocals = emptySet()
-    currentIntoSubstitutedParams = emptySet()
-    val intoSubstTps = linkedSetOf<String>()
-    val implFnSubsts =
-        buildMap {
-            if (implGenerics != null) {
-                val implGenParams = implGenerics.params.toList()
-                putAll(extractFnTraitSubstitutions(implGenParams, implGenerics.whereClause, selfTypeName, intoSubstTps))
-            }
-            val itemGenerics = item.sig.generics
-            val itemGenParams = itemGenerics.params.toList()
-            putAll(extractFnTraitSubstitutions(itemGenParams, itemGenerics.whereClause, selfTypeName, intoSubstTps))
-        }
-    if (implFnSubsts.isNotEmpty()) {
-        substitutedTypeParamTypes = prevSubst + implFnSubsts
-    }
-    currentIntoSubstitutedTypeParams = prevIntoSubstTps + intoSubstTps
-    val combinedActiveParams =
-        buildSet {
-            addAll(activeTypeParamNames)
-            addAll(collectGenericTypeParamNames(ownerGenerics))
-            addAll(collectGenericTypeParamNames(implGenerics))
-            addAll(collectGenericTypeParamNames(item.sig.generics))
-        }
-    activeTypeParamNames = combinedActiveParams - substitutedTypeParamTypes.keys
-    scopeBuilder.enterDef()
-    try {
-        val activeTraitLast =
-            (currentAttachedImplTraitPath ?: currentStandaloneImplTraitPath)
-                ?.segments
-                ?.last()
-                ?.ident
-                ?.toString()
-        val inputsList = item.sig.inputs.toList()
-        if (activeTraitLast == "Hash" &&
-            item.sig.ident.toString() == "hash" &&
-            inputsList.size == 2 &&
-            inputsList[0] is FnArg.Receiver &&
-            inputsList[1] is FnArg.Typed &&
-            !asTopLevelExtension &&
-            !isCompanionMember
-        ) {
-            val hashSigKey = "hashCode()"
-            val seen = scopeSignatures[hashSigKey] ?: 0
-            scopeSignatures[hashSigKey] = seen + 1
-            if (seen > 0) return ""
-            val stateArg = inputsList[1] as FnArg.Typed
-            val rawState = extractRawParamIdent(stateArg.patType.pat) ?: "state"
-            val stateKt =
-                scopeBuilder
-                    .bindLocal(
-                        rawName = rawState,
-                        baseKotlinName = rustValueIdentToKotlin(rawState),
-                        span = stateArg.patType.pat.span(),
-                        assignCount = AssignCount.Any,
-                    ).kotlinName
-            currentHasherStateParam = stateKt
-            currentEnclosingReturnRenderedType = "Int"
-            val sb = StringBuilder()
-            sb.append(renderLeadingTrivia(item, indent))
-            sb.append(renderKDocFromAttributes(item.attrs, indent))
-            val rawBody =
-                renderBlock(
-                    item.block,
-                    indent,
-                    selfTypeName = selfTypeName,
-                    returnType = null,
-                )
-            val body =
-                when {
-                    containsWholeIdentifier(rawBody, stateKt) -> {
-                        val openPrefix = "{\n"
-                        val closeSuffix = "\n$indent}"
-                        if (rawBody.startsWith(openPrefix) && rawBody.endsWith(closeSuffix)) {
-                            val inner = rawBody.substring(openPrefix.length, rawBody.length - closeSuffix.length)
-                            "{\n$indent    var $stateKt = 0\n$inner\n$indent    return $stateKt\n$indent}"
-                        } else {
-                            "{\n$indent    var $stateKt = 0\n$indent    return $stateKt\n$indent}"
-                        }
-                    }
-                    rawBody.contains("error(") -> rawBody
-                    rawBody == "{}" && (headerContext.isBatchCrateOutput || TranslationSession.finalStructs) -> "= 0"
-                    rawBody == "{}" -> "{\n$indent    return 0\n$indent}"
-                    rawBody.endsWith("\n$indent}") ->
-                        rawBody.substring(0, rawBody.length - "\n$indent}".length) + "\n$indent    return 0\n$indent}"
-                    else -> "{\n$indent    return 0\n$indent}"
-                }
-            sb.append(indent).append("${vis}override fun hashCode(): Int ").append(body)
-            return sb.toString()
-        }
-        val sigHeader =
-            renderFunctionSignature(
-                sig = item.sig,
-                visPrefix = vis,
-                openPrefix = openMod,
-                selfTypeName = selfTypeName,
-                ownerGenerics = ownerGenerics,
-                implGenerics = implGenerics,
-                scopeSignatures = scopeSignatures,
-                isInterfaceMethod = false,
-                asTopLevelExtension = asTopLevelExtension,
-                isCompanionMember = isCompanionMember,
-                fnBlock = item.block,
-            ) ?: return ""
-        val sb = StringBuilder()
-        sb.append(renderLeadingTrivia(item, indent))
-        sb.append(renderKDocFromAttributes(item.attrs, indent))
-        if (!isLocalItem && hasTestAttribute(item.attrs)) {
-            sb.append(indent).append("@kotlin.test.Test\n")
-        }
-        val retType = extractReturnSynType(item.sig.output)
-        val panicExpectation = if (!isLocalItem && hasTestAttribute(item.attrs)) extractRustPanicExpectation(item.attrs) else null
-        val bodyIndent = if (panicExpectation == null) indent else "$indent    "
-        val shadows = computeReassignedParamShadows(item.sig, item.block, "$bodyIndent    ")
-        val accessorFields =
-            if (retType is SynType.Reference && retType.mutability != null) {
-                selfTypeName?.substringBefore('<')?.let { owner ->
-                    mutableReferenceProjection(owner, item.sig.ident.toString(), linkedSetOf())
-                }
-            } else {
-                null
-            }
-        val rawStorageProjection =
-            if (retType is SynType.Ptr && selfTypeName != null) {
-                val owner = selfTypeName.substringBefore('<')
-                val declaration =
-                    file.items.filterIsInstance<Item.Struct>().singleOrNull {
-                        rustTypeIdentToKotlin(it.ident.toString()) == owner
-                    }
-                val field = declaration?.let { sourceTransparentField(it, selfTypeName) }
-                val projection = mutableReferenceProjection(owner, item.sig.ident.toString(), linkedSetOf())
-                field != null && projection == listOf(field.first) &&
-                    renderType(retType.elem, selfTypeName) == field.second
-            } else {
-                false
-            }
-        val body =
-            if (rawStorageProjection) {
-                val retPtr = retType as? SynType.Ptr
-                if (retPtr != null && retPtr.mutability is io.github.kotlinmania.syn.PointerMutability.Const) {
-                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.ConstPtr")
-                    "{\n$bodyIndent    return ConstPtr(this.fieldStorage.rawAddress)\n$bodyIndent}"
-                } else {
-                    "{\n$bodyIndent    return this.fieldStorage\n$bodyIndent}"
-                }
-            } else if (accessorFields != null && mutableReferencePointeeType(currentEnclosingReturnRenderedType) != null) {
-                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.RustMutableReference")
-                "{\n$bodyIndent    return RustMutableReference(this.fieldStorage, this.fieldLayout)\n$bodyIndent}"
-            } else if (accessorFields != null) {
-                val owner = "this" + accessorFields.dropLast(1).joinToString("") { ".$it" }
-                "{\n$bodyIndent    return $owner::${accessorFields.last()}\n$bodyIndent}"
-            } else {
-                renderBlock(
-                    item.block,
-                    bodyIndent,
-                    selfTypeName = selfTypeName,
-                    returnType = retType,
-                    leadingInjectedLines = shadows,
-                    allowExpressionBody = panicExpectation == null,
-                )
-            }
-        sb
-            .append(indent)
-            .append(sigHeader)
-            .append(" ")
-            .append(if (panicExpectation == null) body else wrapRustPanicTestBody(body, indent, panicExpectation))
-        return sb.toString()
-    } finally {
-        scopeBuilder.exitDef()
-        currentClosureLabel = prevClosureLabel
-        currentEnclosingFunctionName = prevEnclosingFn
-        currentEnclosingReturnRenderedType = prevEnclosingRet
-        currentEnclosingReturnSynType = prevEnclosingSynRet
-        currentEnclosingReturnsFmtResult = prevEnclosingFmtResult
-        currentTailExpectsUnitResultOk = prevTailExpectsUnitResultOk
-        currentMutableListLocals = prevMutableListLocals
-        currentDequeLocals = prevDequeLocals
-        currentIterableLocals = prevIterableLocals
-        currentSourceParameterTypes = prevSourceParameterTypes
-        currentTypedLocals = prevTypedLocals
-        currentWitnessedTraitBounds = prevWitnessedBounds
-        currentTypeParamTraitBounds = prevTypeParamBounds
-        currentHasherStateParam = prevHasherState
-        currentNullableLocals = prevNullableLocals
-        currentSmartCastNonNullLocals = prevSmartCastLocals
-        activeTypeParamNames = prevTypeParams
-        substitutedTypeParamTypes = prevSubst
-        currentIntoSubstitutedTypeParams = prevIntoSubstTps
-        currentIntoSubstitutedParams = prevIntoSubstParams
-        currentTypeParamWitnessCalls = prevWitnesses
-        currentReceiverIsSharedBorrow = prevSharedBorrowRecv
-        currentReceiverIsMutBorrow = prevMutBorrowRecv
-    }
 }

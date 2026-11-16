@@ -90,10 +90,16 @@ internal fun renderRustFormatStringToKotlin(
                     nextLiteral?.firstOrNull()?.let { ch ->
                         ch.isLetterOrDigit() || ch == '_'
                     } ?: false
-                if (isSimpleKotlinIdentifier(piece.expr) && !nextContinuesIdent) {
-                    sb.append('$').append(piece.expr)
-                } else {
-                    sb.append("\${").append(piece.expr).append('}')
+                when {
+                    piece.expr == "true" || piece.expr == "false" -> {
+                        sb.append(piece.expr)
+                    }
+                    isSimpleKotlinIdentifier(piece.expr) && !nextContinuesIdent -> {
+                        sb.append('$').append(piece.expr)
+                    }
+                    else -> {
+                        sb.append("\${").append(piece.expr).append('}')
+                    }
                 }
             }
         }
@@ -127,8 +133,41 @@ internal fun escapeKotlinStringContent(text: String): String =
         }
     }
 
+private val KOTLIN_HARD_KEYWORDS: Set<String> =
+    setOf(
+        "as",
+        "break",
+        "class",
+        "continue",
+        "do",
+        "else",
+        "false",
+        "for",
+        "fun",
+        "if",
+        "in",
+        "interface",
+        "is",
+        "null",
+        "object",
+        "package",
+        "return",
+        "super",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typealias",
+        "typeof",
+        "val",
+        "var",
+        "when",
+        "while",
+    )
+
 private fun isSimpleKotlinIdentifier(expr: String): Boolean {
     if (expr.isEmpty()) return false
+    if (expr in KOTLIN_HARD_KEYWORDS) return false
     val first = expr.first()
     if (!(first.isLetter() || first == '_')) return false
     return expr.all { it.isLetterOrDigit() || it == '_' }

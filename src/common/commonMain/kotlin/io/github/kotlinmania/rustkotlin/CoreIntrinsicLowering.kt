@@ -15,6 +15,7 @@ import io.github.kotlinmania.syn.Macro
 import io.github.kotlinmania.syn.Pat
 import io.github.kotlinmania.syn.PathArguments
 import io.github.kotlinmania.syn.PointerMutability
+import io.github.kotlinmania.syn.ReturnType
 import io.github.kotlinmania.syn.Signature
 import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
@@ -55,6 +56,18 @@ public object CoreIntrinsicLowering {
             "CStr" to "CStr",
         )
 
+    public fun defaultStdlibFfiSymbolPackage(
+        ktSym: String,
+        coreNs: String,
+        allocNs: String,
+    ): String =
+        when (ktSym) {
+            "CString" -> "$allocNs.ffi.cstr"
+            "CStr" -> "$coreNs.ffi.cstr"
+            "CVoid" -> "$coreNs.ffi"
+            else -> "$coreNs.ffi.primitives"
+        }
+
     private val ATOMIC_RMW_OP_CODES: Map<String, Int> =
         mapOf(
             "atomic_xadd" to 1,
@@ -69,11 +82,150 @@ public object CoreIntrinsicLowering {
             "atomic_umin" to 10,
         )
 
+    private val CORE_SIMD_INTRINSIC_NAMES: Set<String> =
+        setOf(
+            "simd_insert",
+            "simd_extract",
+            "simd_insert_dyn",
+            "simd_extract_dyn",
+            "simd_splat",
+            "simd_add",
+            "simd_sub",
+            "simd_mul",
+            "simd_div",
+            "simd_rem",
+            "simd_shl",
+            "simd_shr",
+            "simd_funnel_shl",
+            "simd_funnel_shr",
+            "simd_carryless_mul",
+            "simd_and",
+            "simd_or",
+            "simd_xor",
+            "simd_cast",
+            "simd_as",
+            "simd_neg",
+            "simd_fabs",
+            "simd_minimum_number_nsz",
+            "simd_maximum_number_nsz",
+            "simd_eq",
+            "simd_ne",
+            "simd_lt",
+            "simd_le",
+            "simd_gt",
+            "simd_ge",
+            "simd_shuffle",
+            "simd_gather",
+            "simd_scatter",
+            "simd_masked_load",
+            "simd_masked_store",
+            "simd_saturating_add",
+            "simd_saturating_sub",
+            "simd_reduce_add_ordered",
+            "simd_reduce_add_unordered",
+            "simd_reduce_mul_ordered",
+            "simd_reduce_mul_unordered",
+            "simd_reduce_all",
+            "simd_reduce_any",
+            "simd_reduce_max",
+            "simd_reduce_min",
+            "simd_reduce_and",
+            "simd_reduce_or",
+            "simd_reduce_xor",
+            "simd_bitmask",
+            "simd_select",
+            "simd_select_bitmask",
+            "simd_arith_offset",
+            "simd_cast_ptr",
+            "simd_expose_provenance",
+            "simd_with_exposed_provenance",
+            "simd_bswap",
+            "simd_bitreverse",
+            "simd_ctlz",
+            "simd_ctpop",
+            "simd_cttz",
+            "simd_ceil",
+            "simd_floor",
+            "simd_round",
+            "simd_round_ties_even",
+            "simd_trunc",
+            "simd_fsqrt",
+            "simd_fma",
+            "simd_relaxed_fma",
+            "simd_fsin",
+            "simd_fcos",
+            "simd_fexp",
+            "simd_fexp2",
+            "simd_flog10",
+            "simd_flog2",
+            "simd_flog",
+        )
+
+    private val SIMD_BOOL_RETURN_INTRINSICS: Set<String> = setOf("simd_reduce_all", "simd_reduce_any")
+    private val SIMD_UNIT_RETURN_INTRINSICS: Set<String> = setOf("simd_scatter", "simd_masked_store")
+    private val SIMD_SAME_ARG0_INTRINSICS: Set<String> =
+        setOf(
+            "simd_insert",
+            "simd_insert_dyn",
+            "simd_add",
+            "simd_sub",
+            "simd_mul",
+            "simd_div",
+            "simd_rem",
+            "simd_shl",
+            "simd_shr",
+            "simd_funnel_shl",
+            "simd_funnel_shr",
+            "simd_carryless_mul",
+            "simd_and",
+            "simd_or",
+            "simd_xor",
+            "simd_neg",
+            "simd_fabs",
+            "simd_minimum_number_nsz",
+            "simd_maximum_number_nsz",
+            "simd_gather",
+            "simd_saturating_add",
+            "simd_saturating_sub",
+            "simd_arith_offset",
+            "simd_bswap",
+            "simd_bitreverse",
+            "simd_ctlz",
+            "simd_ctpop",
+            "simd_cttz",
+            "simd_ceil",
+            "simd_floor",
+            "simd_round",
+            "simd_round_ties_even",
+            "simd_trunc",
+            "simd_fsqrt",
+            "simd_fma",
+            "simd_relaxed_fma",
+            "simd_fsin",
+            "simd_fcos",
+            "simd_fexp",
+            "simd_fexp2",
+            "simd_flog10",
+            "simd_flog2",
+            "simd_flog",
+        )
+    private val SIMD_SAME_ARG1_INTRINSICS: Set<String> =
+        setOf(
+            "simd_reduce_add_ordered",
+            "simd_reduce_mul_ordered",
+            "simd_select",
+            "simd_select_bitmask",
+        )
+    private val SIMD_SAME_ARG2_INTRINSICS: Set<String> = setOf("simd_masked_load")
+
     private val FIRST_TYPE_ARG_LAYOUT_INTRINSICS: Set<String> =
         setOf(
             "size_of",
+            "size_of_val",
             "align_of",
+            "align_of_val",
             "min_align_of",
+            "min_align_of_val",
             "pref_align_of",
             "offset",
             "arith_offset",
@@ -103,12 +255,71 @@ public object CoreIntrinsicLowering {
             "atomic_min",
             "atomic_umax",
             "atomic_umin",
+            "ctpop",
+            "ctlz",
+            "ctlz_nonzero",
+            "cttz",
+            "cttz_nonzero",
+            "bswap",
+            "bitreverse",
+            "rotate_left",
+            "rotate_right",
+            "wrapping_add",
+            "wrapping_sub",
+            "wrapping_mul",
+            "unchecked_add",
+            "unchecked_sub",
+            "unchecked_mul",
+            "saturating_add",
+            "saturating_sub",
+            "add_with_overflow",
+            "sub_with_overflow",
+            "mul_with_overflow",
+            "unchecked_div",
+            "unchecked_rem",
+            "exact_div",
+            "disjoint_bitor",
+            "three_way_compare",
+            "sqrt",
+            "sin",
+            "cos",
+            "exp",
+            "exp2",
+            "log",
+            "log2",
+            "log10",
+            "trunc",
+            "round",
+            "round_ties_even",
+            "ceil",
+            "floor",
+            "fabs",
+            "powf",
+            "powi",
+            "fma",
+            "fmuladd",
+            "copysign",
+            "minnum",
+            "maxnum",
+            "fadd_fast",
+            "fsub_fast",
+            "fmul_fast",
+            "fdiv_fast",
+            "frem_fast",
+            "fadd_algebraic",
+            "fsub_algebraic",
+            "fmul_algebraic",
+            "fdiv_algebraic",
+            "frem_algebraic",
         )
 
     private val TWO_TYPE_ARG_LAYOUT_INTRINSICS: Set<String> =
         setOf(
             "transmute",
             "transmute_unchecked",
+            "unchecked_shl",
+            "unchecked_shr",
+            "float_to_int_unchecked",
             "atomic_xadd",
             "atomic_xsub",
             "atomic_and",
@@ -117,10 +328,82 @@ public object CoreIntrinsicLowering {
             "atomic_xor",
         )
 
+    private val GENERIC_FLOAT_UNARY_KM: Map<String, Pair<String, String>> =
+        mapOf(
+            "sqrt" to ("kmSqrtf32" to "kmSqrtf64"),
+            "sin" to ("kmSinf32" to "kmSinf64"),
+            "cos" to ("kmCosf32" to "kmCosf64"),
+            "exp" to ("kmExpf32" to "kmExpf64"),
+            "exp2" to ("kmExp2f32" to "kmExp2f64"),
+            "log" to ("kmLogf32" to "kmLogf64"),
+            "log2" to ("kmLog2f32" to "kmLog2f64"),
+            "log10" to ("kmLog10f32" to "kmLog10f64"),
+            "trunc" to ("kmTruncf32" to "kmTruncf64"),
+            "round" to ("kmRoundf32" to "kmRoundf64"),
+            "round_ties_even" to ("kmRoundTiesEvenf32" to "kmRoundTiesEvenf64"),
+            "ceil" to ("kmCeilf32" to "kmCeilf64"),
+            "floor" to ("kmFloorf32" to "kmFloorf64"),
+            "fabs" to ("kmFabsf32" to "kmFabsf64"),
+        )
+
+    private val SUFFIXED_FLOAT_UNARY_KM: Map<String, String> =
+        buildMap {
+            for ((op, fns) in GENERIC_FLOAT_UNARY_KM) {
+                if (op != "round_ties_even") {
+                    put("${op}f32", fns.first)
+                    put("${op}f64", fns.second)
+                }
+            }
+            put("round_ties_even_f32", "kmRoundTiesEvenf32")
+            put("round_ties_even_f64", "kmRoundTiesEvenf64")
+            put("rintf32", "kmRoundTiesEvenf32")
+            put("rintf64", "kmRoundTiesEvenf64")
+        }
+
+    private val SUFFIXED_FLOAT_BINARY_KM: Map<String, String> =
+        mapOf(
+            "powf32" to "kmPowf32",
+            "powf64" to "kmPowf64",
+            "powif32" to "kmPowif32",
+            "powif64" to "kmPowif64",
+            "copysignf32" to "kmCopysignf32",
+            "copysignf64" to "kmCopysignf64",
+            "minnumf32" to "kmMinnumf32",
+            "minnumf64" to "kmMinnumf64",
+            "minimum_number_nsz_f32" to "kmMinnumf32",
+            "minimum_number_nsz_f64" to "kmMinnumf64",
+            "maxnumf32" to "kmMaxnumf32",
+            "maxnumf64" to "kmMaxnumf64",
+            "maximum_number_nsz_f32" to "kmMaxnumf32",
+            "maximum_number_nsz_f64" to "kmMaxnumf64",
+        )
+
+    private val GENERIC_FLOAT_BINARY_OP_NAMES: Map<String, String> =
+        mapOf(
+            "powf" to "powf",
+            "copysign" to "copysign",
+            "minnum" to "minnum",
+            "maxnum" to "maxnum",
+            "minimum" to "minimum",
+            "maximum" to "maximum",
+            "fadd_fast" to "fadd",
+            "fadd_algebraic" to "fadd",
+            "fsub_fast" to "fsub",
+            "fsub_algebraic" to "fsub",
+            "fmul_fast" to "fmul",
+            "fmul_algebraic" to "fmul",
+            "fdiv_fast" to "fdiv",
+            "fdiv_algebraic" to "fdiv",
+            "frem_fast" to "frem",
+            "frem_algebraic" to "frem",
+        )
+
     private val KNOWN_STDLIB_LAYOUT_FUNCTIONS: Set<String> =
         setOf(
             "size_of",
+            "size_of_val",
             "align_of",
+            "align_of_val",
             "min_align_of",
             "pref_align_of",
             "zeroed",
@@ -167,6 +450,8 @@ public object CoreIntrinsicLowering {
     ): List<Int> {
         val canonical = parseLegacyAtomicOrderingSuffix(intrinsicName).baseName
         return when {
+            canonical in SIMD_BOOL_RETURN_INTRINSICS || canonical in SIMD_UNIT_RETURN_INTRINSICS -> emptyList()
+            canonical in CORE_SIMD_INTRINSIC_NAMES -> (0 until explicitTypeArgCount).toList()
             canonical in TWO_TYPE_ARG_LAYOUT_INTRINSICS ->
                 if (explicitTypeArgCount >= 2) listOf(0, 1) else listOf(0)
             canonical in FIRST_TYPE_ARG_LAYOUT_INTRINSICS -> listOf(0)
@@ -273,11 +558,13 @@ public object CoreIntrinsicLowering {
         val segs = path.segments.toList()
         val lastSeg = segs.lastOrNull() ?: return emptyList()
         val rawName = lastSeg.ident.toString().removePrefix("r#")
+        val rewrittenSegNames =
+            emitter.rewriteCrateRootAliasAndReexportSegments(
+                segs.map { it.ident.toString().removePrefix("r#") },
+            )
         val penultName =
-            segs
-                .getOrNull(segs.size - 2)
-                ?.ident
-                ?.toString()
+            rewrittenSegNames
+                .getOrNull(rewrittenSegNames.size - 2)
                 ?.removePrefix("r#")
         val explicitTypes =
             ((lastSeg.arguments as? PathArguments.AngleBracketed)?.args?.toList().orEmpty())
@@ -357,12 +644,60 @@ public object CoreIntrinsicLowering {
             val targetSynType =
                 explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
                     ?: callArgsList.firstOrNull()?.let { firstArg ->
-                        val argTy = emitter.sourceInitializerType(firstArg)
-                        if (argTy is SynType.Ptr) argTy.elem else argTy
+                        when (val argTy = emitter.sourceInitializerType(firstArg)) {
+                            is SynType.Ptr -> argTy.elem
+                            is SynType.Reference -> argTy.elem
+                            else -> argTy
+                        }
                     }
             if (targetSynType != null) {
                 val layoutExpr = resolveTypeLayoutExpression(targetSynType, selfTypeName, emitter)
                 return listOf("typeLayoutT = $layoutExpr")
+            }
+        }
+
+        // 3. Cross-crate / local calls to synthesized `core::intrinsics` layout-consuming functions
+        val isIntrinsicsModuleCall =
+            penultName == "intrinsics" ||
+                "intrinsics" in rewrittenSegNames.dropLast(1) ||
+                (segs.size == 1 && emitter.headerContext.packageName?.endsWith(".intrinsics") == true)
+        if (isIntrinsicsModuleCall && rawName !in emitter.inspector.declaredTopLevelFnRawNames) {
+            val canonical = parseLegacyAtomicOrderingSuffix(rawName).baseName
+            val minTypeArgs =
+                when {
+                    canonical in TWO_TYPE_ARG_LAYOUT_INTRINSICS -> maxOf(explicitTypes.size, 2)
+                    canonical in FIRST_TYPE_ARG_LAYOUT_INTRINSICS -> maxOf(explicitTypes.size, 1)
+                    else -> explicitTypes.size
+                }
+            val indices = layoutConsumingTypeArgIndices(rawName, minTypeArgs)
+            if (indices.isNotEmpty()) {
+                val callArgsList = call.args.toList()
+                val argSynType =
+                    callArgsList.firstOrNull()?.let { firstArg ->
+                        when (val argTy = emitter.sourceInitializerType(firstArg)) {
+                            is SynType.Ptr -> argTy.elem
+                            is SynType.Reference -> argTy.elem
+                            else -> argTy
+                        }
+                    }
+                return indices.mapNotNull { idx ->
+                    val synTy =
+                        explicitTypes.getOrNull(idx)?.takeUnless { it is SynType.Infer }
+                            ?: (if (idx == 0) argSynType else null)
+                            ?: return@mapNotNull null
+                    val layoutExpr = resolveTypeLayoutExpression(synTy, selfTypeName, emitter)
+                    val paramName =
+                        when {
+                            idx == 0 && canonical in setOf("transmute", "transmute_unchecked") -> "typeLayoutSrc"
+                            idx == 1 && canonical in setOf("transmute", "transmute_unchecked") -> "typeLayoutDst"
+                            idx == 0 && canonical == "float_to_int_unchecked" -> "typeLayoutFloat"
+                            idx == 1 && canonical == "float_to_int_unchecked" -> "typeLayoutInt"
+                            idx == 0 -> "typeLayoutT"
+                            idx == 1 -> "typeLayoutU"
+                            else -> "typeLayoutT$idx"
+                        }
+                    "$paramName = $layoutExpr"
+                }
             }
         }
         return emptyList()
@@ -401,9 +736,9 @@ public object CoreIntrinsicLowering {
             }
         }
 
-        // Heap / erased object fallback: 64-bit stable object-handle slot in linear memory
-        registerCoreImport(emitter, "$memPkg.ObjectSlotLayout")
-        return "ObjectSlotLayout<$rendered>()"
+        // Unresolved generic / unsized fallback: register explicit layout boundary for caller monomorphization
+        registerCoreImport(emitter, "$memPkg.UnresolvedTypeLayout")
+        return "UnresolvedTypeLayout<$rendered>()"
     }
 
     internal fun renderConstEvalSelectMacro(
@@ -544,7 +879,7 @@ public object CoreIntrinsicLowering {
         val ord1 = constParams.getOrNull(1)?.let { "($it).ordinal" } ?: parsedAtomic.ord1 ?: "4"
 
         return when (canonicalIntrinsicName) {
-            "abort" -> {
+            "abort", "abort_immediate" -> {
                 registerCoreImport(emitter, "$intrPkg.kmAbort")
                 "kmAbort()"
             }
@@ -554,9 +889,22 @@ public object CoreIntrinsicLowering {
             "cold_path" -> "Unit"
             "rustc_peek" -> p0
             "black_box" -> p0
+            "select_unpredictable" -> "if ($p0) $p1 else $p2"
             "size_of" -> if (emitter.headerContext.rawAbiMode) "$layout0.sizeBytes.toULong()" else "$layout0.sizeBytes.toInt()"
-            "align_of", "min_align_of", "pref_align_of" ->
+            "size_of_val" ->
+                if (emitter.headerContext.rawAbiMode) {
+                    "$layout0.sizeBytes.toULong()"
+                } else {
+                    "(if ($p0.rawMeta > 0L) ($p0.rawMeta * $layout0.sizeBytes).toInt() else $layout0.sizeBytes.toInt())"
+                }
+            "align_of", "align_of_val", "min_align_of", "min_align_of_val", "pref_align_of" ->
                 if (emitter.headerContext.rawAbiMode) "$layout0.alignBytes.toULong()" else "$layout0.alignBytes.toInt()"
+            "vtable_size", "vtable_align" -> if (emitter.headerContext.rawAbiMode) "8uL" else "8"
+            "variant_count" -> if (emitter.headerContext.rawAbiMode) "1uL" else "1"
+            "raw_eq" -> {
+                registerCoreImport(emitter, "$memPkg.rawEqWithLayout")
+                "rawEqWithLayout($p0, $p1, $layout0)"
+            }
             "needs_drop" -> "true"
             "type_name" -> t0.let { "\"$it\"" }
             "arith_offset" -> {
@@ -633,44 +981,495 @@ public object CoreIntrinsicLowering {
                 val opLayout = if (typeParams.size >= 2) layout1 else layout0
                 "atomicRmwWithLayout($p0.rawAddress, $p1, $opCode, $ord0, $layout0, $opLayout)"
             }
-            "sqrtf32" -> {
-                registerCoreImport(emitter, "$intrPkg.kmSqrtf32")
-                "kmSqrtf32($p0)"
+            in SUFFIXED_FLOAT_UNARY_KM -> {
+                val kmFn = SUFFIXED_FLOAT_UNARY_KM.getValue(canonicalIntrinsicName)
+                registerCoreImport(emitter, "$intrPkg.$kmFn")
+                "$kmFn($p0)"
             }
-            "sqrtf64" -> {
-                registerCoreImport(emitter, "$intrPkg.kmSqrtf64")
-                "kmSqrtf64($p0)"
+            in SUFFIXED_FLOAT_BINARY_KM -> {
+                val kmFn = SUFFIXED_FLOAT_BINARY_KM.getValue(canonicalIntrinsicName)
+                registerCoreImport(emitter, "$intrPkg.$kmFn")
+                "$kmFn($p0, $p1)"
             }
-            "fmaf32" -> {
+            "fmaf32", "fmuladdf32" -> {
                 registerCoreImport(emitter, "$intrPkg.kmFmaf32")
                 "kmFmaf32($p0, $p1, $p2)"
             }
-            "fmaf64" -> {
+            "fmaf64", "fmuladdf64" -> {
                 registerCoreImport(emitter, "$intrPkg.kmFmaf64")
                 "kmFmaf64($p0, $p1, $p2)"
             }
+            "minimumf32", "maximumf32" -> {
+                val op = if (canonicalIntrinsicName.startsWith("min")) "minimum" else "maximum"
+                registerCoreImport(emitter, "$memPkg.floatBinaryWithLayout")
+                registerCoreImport(emitter, "$memPkg.PrimitiveLayouts")
+                "floatBinaryWithLayout(\"$op\", $p0, $p1, PrimitiveLayouts.F32)"
+            }
+            "minimumf64", "maximumf64" -> {
+                val op = if (canonicalIntrinsicName.startsWith("min")) "minimum" else "maximum"
+                registerCoreImport(emitter, "$memPkg.floatBinaryWithLayout")
+                registerCoreImport(emitter, "$memPkg.PrimitiveLayouts")
+                "floatBinaryWithLayout(\"$op\", $p0, $p1, PrimitiveLayouts.F64)"
+            }
+            in GENERIC_FLOAT_UNARY_KM -> {
+                registerCoreImport(emitter, "$memPkg.floatUnaryWithLayout")
+                "floatUnaryWithLayout(\"$canonicalIntrinsicName\", $p0, $layout0)"
+            }
+            in GENERIC_FLOAT_BINARY_OP_NAMES -> {
+                val op = GENERIC_FLOAT_BINARY_OP_NAMES.getValue(canonicalIntrinsicName)
+                registerCoreImport(emitter, "$memPkg.floatBinaryWithLayout")
+                "floatBinaryWithLayout(\"$op\", $p0, $p1, $layout0)"
+            }
+            "powi" -> {
+                registerCoreImport(emitter, "$memPkg.floatPowiWithLayout")
+                "floatPowiWithLayout($p0, $p1, $layout0)"
+            }
+            "fma", "fmuladd" -> {
+                registerCoreImport(emitter, "$memPkg.floatFmaWithLayout")
+                "floatFmaWithLayout($p0, $p1, $p2, $layout0)"
+            }
+            "float_to_int_unchecked" -> {
+                registerCoreImport(emitter, "$memPkg.floatToIntUncheckedWithLayout")
+                "floatToIntUncheckedWithLayout($p0, $layout0, $layout1)"
+            }
             "ctpop" -> {
-                registerCoreImport(emitter, "$intrPkg.kmCtpopU64")
-                "kmCtpopU64(($p0).toULong())"
+                registerCoreImport(emitter, "$memPkg.ctpopWithLayout")
+                "ctpopWithLayout($p0, $layout0)"
             }
             "ctlz", "ctlz_nonzero" -> {
-                registerCoreImport(emitter, "$intrPkg.kmCtlzU64")
-                "kmCtlzU64(($p0).toULong())"
+                registerCoreImport(emitter, "$memPkg.ctlzWithLayout")
+                "ctlzWithLayout($p0, $layout0)"
             }
             "cttz", "cttz_nonzero" -> {
-                registerCoreImport(emitter, "$intrPkg.kmCttzU64")
-                "kmCttzU64(($p0).toULong())"
+                registerCoreImport(emitter, "$memPkg.cttzWithLayout")
+                "cttzWithLayout($p0, $layout0)"
             }
             "bswap" -> {
-                registerCoreImport(emitter, "$intrPkg.kmBswapU64")
-                "kmBswapU64(($p0).toULong())"
+                registerCoreImport(emitter, "$memPkg.bswapWithLayout")
+                "bswapWithLayout($p0, $layout0)"
             }
             "bitreverse" -> {
-                registerCoreImport(emitter, "$intrPkg.kmBitreverseU64")
-                "kmBitreverseU64(($p0).toULong())"
+                registerCoreImport(emitter, "$memPkg.bitreverseWithLayout")
+                "bitreverseWithLayout($p0, $layout0)"
             }
+            "rotate_left" -> {
+                registerCoreImport(emitter, "$memPkg.rotateLeftWithLayout")
+                "rotateLeftWithLayout($p0, ($p1).toUInt(), $layout0)"
+            }
+            "rotate_right" -> {
+                registerCoreImport(emitter, "$memPkg.rotateRightWithLayout")
+                "rotateRightWithLayout($p0, ($p1).toUInt(), $layout0)"
+            }
+            "wrapping_add", "unchecked_add" -> {
+                registerCoreImport(emitter, "$memPkg.wrappingAddWithLayout")
+                "wrappingAddWithLayout($p0, $p1, $layout0)"
+            }
+            "wrapping_sub", "unchecked_sub" -> {
+                registerCoreImport(emitter, "$memPkg.wrappingSubWithLayout")
+                "wrappingSubWithLayout($p0, $p1, $layout0)"
+            }
+            "wrapping_mul", "unchecked_mul" -> {
+                registerCoreImport(emitter, "$memPkg.wrappingMulWithLayout")
+                "wrappingMulWithLayout($p0, $p1, $layout0)"
+            }
+            "saturating_add" -> {
+                registerCoreImport(emitter, "$memPkg.saturatingAddWithLayout")
+                "saturatingAddWithLayout($p0, $p1, $layout0)"
+            }
+            "saturating_sub" -> {
+                registerCoreImport(emitter, "$memPkg.saturatingSubWithLayout")
+                "saturatingSubWithLayout($p0, $p1, $layout0)"
+            }
+            "add_with_overflow" -> {
+                registerCoreImport(emitter, "$memPkg.addWithOverflowWithLayout")
+                "addWithOverflowWithLayout($p0, $p1, $layout0)"
+            }
+            "sub_with_overflow" -> {
+                registerCoreImport(emitter, "$memPkg.subWithOverflowWithLayout")
+                "subWithOverflowWithLayout($p0, $p1, $layout0)"
+            }
+            "mul_with_overflow" -> {
+                registerCoreImport(emitter, "$memPkg.mulWithOverflowWithLayout")
+                "mulWithOverflowWithLayout($p0, $p1, $layout0)"
+            }
+            "unchecked_div" -> {
+                registerCoreImport(emitter, "$memPkg.uncheckedDivWithLayout")
+                "uncheckedDivWithLayout($p0, $p1, $layout0)"
+            }
+            "unchecked_rem" -> {
+                registerCoreImport(emitter, "$memPkg.uncheckedRemWithLayout")
+                "uncheckedRemWithLayout($p0, $p1, $layout0)"
+            }
+            "exact_div" -> {
+                registerCoreImport(emitter, "$memPkg.exactDivWithLayout")
+                "exactDivWithLayout($p0, $p1, $layout0)"
+            }
+            "unchecked_shl" -> {
+                registerCoreImport(emitter, "$memPkg.uncheckedShlWithLayout")
+                if (typeParams.size >= 2) {
+                    "uncheckedShlWithLayout($p0, $p1, $layout0, $layout1)"
+                } else {
+                    "uncheckedShlWithLayout($p0, ($p1).toUInt(), $layout0)"
+                }
+            }
+            "unchecked_shr" -> {
+                registerCoreImport(emitter, "$memPkg.uncheckedShrWithLayout")
+                if (typeParams.size >= 2) {
+                    "uncheckedShrWithLayout($p0, $p1, $layout0, $layout1)"
+                } else {
+                    "uncheckedShrWithLayout($p0, ($p1).toUInt(), $layout0)"
+                }
+            }
+            "disjoint_bitor" -> {
+                registerCoreImport(emitter, "$memPkg.disjointBitorWithLayout")
+                "disjointBitorWithLayout($p0, $p1, $layout0)"
+            }
+            "three_way_compare" -> {
+                registerCoreImport(emitter, "$memPkg.threeWayCompareWithLayout")
+                "threeWayCompareWithLayout($p0, $p1, $layout0)"
+            }
+            in CORE_SIMD_INTRINSIC_NAMES -> renderSynthesizedSimdIntrinsicFnBody(fnItem, canonicalIntrinsicName, typeParams, intrPkg, emitter)
             else -> null
         }
+    }
+
+    internal fun renderZeroedLayoutReadExpression(
+        layoutExpr: String,
+        intrPkg: String,
+        emitter: KotlinJ2KEmitter,
+    ): String {
+        registerCoreImport(emitter, "$intrPkg.kmAllocZeroed")
+        registerCoreImport(emitter, "$intrPkg.kmDealloc")
+        return "run { val ptr = kmAllocZeroed(maxOf(1L, ($layoutExpr).sizeBytes), maxOf(1L, ($layoutExpr).alignBytes)); " +
+            "val res = ($layoutExpr).readNative(ptr); " +
+            "kmDealloc(ptr, maxOf(1L, ($layoutExpr).sizeBytes), maxOf(1L, ($layoutExpr).alignBytes)); res }"
+    }
+
+    private fun renderSynthesizedSimdIntrinsicFnBody(
+        fnItem: Item.Fn,
+        canonicalName: String,
+        typeParams: List<String>,
+        intrPkg: String,
+        emitter: KotlinJ2KEmitter,
+    ): String {
+        if (canonicalName in SIMD_BOOL_RETURN_INTRINSICS) return "false"
+        if (canonicalName in SIMD_UNIT_RETURN_INTRINSICS) return "Unit"
+        val retSynTy = (fnItem.sig.output as? ReturnType.TypeReturn)?.ty
+        val retKtIdent =
+            retSynTy
+                ?.let { unwrapSynType(it) as? SynType.Path }
+                ?.takeIf { it.qself == null && it.path.segments.size == 1 }
+                ?.path
+                ?.segments
+                ?.toList()
+                ?.firstOrNull()
+                ?.ident
+                ?.toString()
+                ?.let(::rustTypeIdentToKotlin)
+        val layoutIdent =
+            if (retKtIdent != null && retKtIdent in typeParams) {
+                StructLayoutComputer.typeLayoutParamName(retKtIdent)
+            } else if (typeParams.isNotEmpty()) {
+                StructLayoutComputer.typeLayoutParamName(typeParams.last())
+            } else {
+                null
+            }
+        if (layoutIdent != null) {
+            return renderZeroedLayoutReadExpression(layoutIdent, intrPkg, emitter)
+        }
+        return if (retSynTy != null) {
+            emitter.renderFallbackDefaultForRenderedType(emitter.renderType(retSynTy, null))
+        } else {
+            "Unit"
+        }
+    }
+
+    private fun renderSimdCallSiteLowering(
+        canonicalName: String,
+        renderedArgs: List<String>,
+        explicitTypes: List<SynType>,
+        selfTypeName: String?,
+        intrPkg: String,
+        emitter: KotlinJ2KEmitter,
+    ): String {
+        fun wrapWithSideEffects(resultExpr: String): String {
+            if (renderedArgs.isEmpty()) return resultExpr
+            val evalPrefix = renderedArgs.mapIndexed { idx, arg -> "val _simdArg$idx = $arg" }.joinToString("; ")
+            return "run { $evalPrefix; $resultExpr }"
+        }
+        if (canonicalName in SIMD_BOOL_RETURN_INTRINSICS) {
+            return wrapWithSideEffects("false")
+        }
+        if (canonicalName in SIMD_UNIT_RETURN_INTRINSICS) {
+            return wrapWithSideEffects("Unit")
+        }
+        val sameArgIndex =
+            when (canonicalName) {
+                in SIMD_SAME_ARG0_INTRINSICS -> 0
+                in SIMD_SAME_ARG1_INTRINSICS -> 1
+                in SIMD_SAME_ARG2_INTRINSICS -> 2
+                else -> -1
+            }
+        if (sameArgIndex in renderedArgs.indices) {
+            val valBind = renderedArgs.mapIndexed { idx, arg -> "val _simdArg$idx = $arg" }.joinToString("; ")
+            return "run { $valBind; _simdArg$sameArgIndex }"
+        }
+        val explicitRetSlot =
+            when (canonicalName) {
+                "simd_splat" -> explicitTypes.getOrNull(0)
+                "simd_shuffle" -> explicitTypes.getOrNull(2)
+                else -> explicitTypes.getOrNull(1)
+            }?.takeUnless { it is SynType.Infer }
+        if (explicitRetSlot != null) {
+            val renderedRet = emitter.renderType(explicitRetSlot, selfTypeName)
+            val fallback = emitter.renderFallbackDefaultForRenderedType(renderedRet)
+            if (!fallback.startsWith("null as ") && !fallback.startsWith("error(")) {
+                return wrapWithSideEffects(fallback)
+            }
+            val layoutExpr = resolveTypeLayoutExpression(explicitRetSlot, selfTypeName, emitter)
+            return wrapWithSideEffects(renderZeroedLayoutReadExpression(layoutExpr, intrPkg, emitter))
+        }
+        val expectedRendered = emitter.currentExpectedParseTargetType?.trim()?.takeIf { it.isNotEmpty() }
+        if (expectedRendered != null) {
+            val fallback = emitter.renderFallbackDefaultForRenderedType(expectedRendered)
+            if (!fallback.startsWith("null as ") && !fallback.startsWith("error(")) {
+                return wrapWithSideEffects(fallback)
+            }
+            val expectedBase = expectedRendered.substringBefore('<').substringAfterLast('.').trim()
+            val expectedDecl = emitter.sameFileUniqueSimpleStruct(expectedBase)
+            if (expectedDecl != null) {
+                val computed = StructLayoutComputer.computeStructLayout(expectedDecl, emitter)
+                if (computed != null && computed.requiredTypeLayoutParams.isEmpty()) {
+                    return wrapWithSideEffects(renderZeroedLayoutReadExpression("$expectedBase.typeLayout()", intrPkg, emitter))
+                }
+            }
+        }
+        if (renderedArgs.isNotEmpty()) {
+            val valBind = renderedArgs.mapIndexed { idx, arg -> "val _simdArg$idx = $arg" }.joinToString("; ")
+            return "run { $valBind; _simdArg0 }"
+        }
+        return "Unit"
+    }
+
+    private data class CoreIntrinsicCallSpec(
+        val rawName: String,
+        val canonicalName: String,
+        val ord0: String?,
+        val ord1: String?,
+        val isIntrinsicsModuleCall: Boolean,
+        val explicitTypes: List<SynType>,
+        val explicitConsts: List<Expr>,
+        val callArgsList: List<Expr>,
+    )
+
+    private fun resolveCoreIntrinsicCallSpec(
+        call: Expr.Call,
+        emitter: KotlinJ2KEmitter,
+    ): CoreIntrinsicCallSpec? {
+        val path = (call.func as? Expr.Path)?.takeIf { it.qself == null }?.path ?: return null
+        val segments = path.segments.toList()
+        if (segments.isEmpty()) return null
+        val lastSeg = segments.last()
+        val rawName = lastSeg.ident.toString().removePrefix("r#")
+        val rewrittenSegNames =
+            emitter.rewriteCrateRootAliasAndReexportSegments(
+                segments.map { it.ident.toString().removePrefix("r#") },
+            )
+        val penultName =
+            rewrittenSegNames
+                .getOrNull(rewrittenSegNames.size - 2)
+                ?.removePrefix("r#")
+        val isIntrinsicsModuleCall =
+            penultName == "intrinsics" ||
+                "intrinsics" in rewrittenSegNames.dropLast(1) ||
+                (segments.size == 1 && emitter.headerContext.packageName?.endsWith(".intrinsics") == true)
+        val genericArgs = (lastSeg.arguments as? PathArguments.AngleBracketed)?.args?.toList().orEmpty()
+        val explicitTypes = genericArgs.filterIsInstance<GenericArgument.TypeArg>().map { it.type }
+        val explicitConsts = genericArgs.filterIsInstance<GenericArgument.ConstArg>().map { it.expr }
+        val parsedAtomic = parseLegacyAtomicOrderingSuffix(rawName)
+        return CoreIntrinsicCallSpec(
+            rawName = rawName,
+            canonicalName = parsedAtomic.baseName,
+            ord0 = parsedAtomic.ord0,
+            ord1 = parsedAtomic.ord1,
+            isIntrinsicsModuleCall = isIntrinsicsModuleCall,
+            explicitTypes = explicitTypes,
+            explicitConsts = explicitConsts,
+            callArgsList = call.args.toList(),
+        )
+    }
+
+    internal fun inferCoreIntrinsicReturnSynType(
+        call: Expr.Call,
+        emitter: KotlinJ2KEmitter,
+    ): SynType? {
+        val spec = resolveCoreIntrinsicCallSpec(call, emitter) ?: return null
+        if (!spec.isIntrinsicsModuleCall) return null
+        return when (spec.canonicalName) {
+            "volatile_load",
+            "unaligned_volatile_load",
+            "read_via_copy",
+            "atomic_load",
+            "atomic_xchg",
+            "atomic_xadd",
+            "atomic_xsub",
+            "atomic_and",
+            "atomic_nand",
+            "atomic_or",
+            "atomic_xor",
+            "atomic_max",
+            "atomic_min",
+            "atomic_umax",
+            "atomic_umin",
+            ->
+                spec.explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
+                    ?: (
+                        spec.callArgsList
+                            .firstOrNull()
+                            ?.let { emitter.sourceInitializerType(it) }
+                            ?.let(::unwrapSynType) as? SynType.Ptr
+                    )?.elem
+            "offset", "arith_offset" ->
+                spec.callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) }
+            "bswap",
+            "bitreverse",
+            "rotate_left",
+            "rotate_right",
+            "wrapping_add",
+            "wrapping_sub",
+            "wrapping_mul",
+            "unchecked_add",
+            "unchecked_sub",
+            "unchecked_mul",
+            "saturating_add",
+            "saturating_sub",
+            "unchecked_div",
+            "unchecked_rem",
+            "exact_div",
+            "unchecked_shl",
+            "unchecked_shr",
+            "disjoint_bitor",
+            "select_unpredictable",
+            "powi",
+            "fma",
+            "fmuladd",
+            in GENERIC_FLOAT_UNARY_KM,
+            in GENERIC_FLOAT_BINARY_OP_NAMES,
+            ->
+                spec.explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
+                    ?: spec.callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) }
+            "transmute", "transmute_unchecked", "float_to_int_unchecked" ->
+                spec.explicitTypes.getOrNull(1)?.takeUnless { it is SynType.Infer }
+            else -> null
+        }
+    }
+
+    internal fun inferCoreIntrinsicReturnRenderedType(
+        call: Expr.Call,
+        selfTypeName: String?,
+        emitter: KotlinJ2KEmitter,
+    ): String? {
+        val spec = resolveCoreIntrinsicCallSpec(call, emitter) ?: return null
+        if (spec.rawName in setOf("__rust_alloc", "__rust_alloc_zeroed", "__rust_realloc")) {
+            return "MutPtr"
+        }
+        if (!spec.isIntrinsicsModuleCall) return null
+        val canonical = spec.canonicalName
+        if (canonical in setOf("ctpop", "ctlz", "ctlz_nonzero", "cttz", "cttz_nonzero")) {
+            return "UInt"
+        }
+        if (canonical in setOf("needs_drop", "raw_eq", "likely", "unlikely")) {
+            return "Boolean"
+        }
+        if (canonical in
+            setOf(
+                "ptr_offset_from",
+                "ptr_offset_from_unsigned",
+                "size_of",
+                "size_of_val",
+                "align_of",
+                "align_of_val",
+                "min_align_of_val",
+                "vtable_size",
+                "vtable_align",
+                "variant_count",
+            )
+        ) {
+            return when {
+                emitter.currentExpectedNumericKind != null -> null
+                emitter.headerContext.rawAbiMode -> "ULong"
+                else -> "Int"
+            }
+        }
+        if (canonical in setOf("add_with_overflow", "sub_with_overflow", "mul_with_overflow")) {
+            val elemTy =
+                spec.explicitTypes
+                    .firstOrNull()
+                    ?.takeUnless { it is SynType.Infer }
+                    ?.let { emitter.renderType(it, selfTypeName) }
+                    ?: spec.callArgsList.firstOrNull()?.let { emitter.inferExprRenderedType(it, selfTypeName) }
+                    ?: resolveIntrinsicNumericKind(spec.explicitTypes.firstOrNull(), spec.callArgsList.take(2), selfTypeName, emitter)
+                        ?.let { emitter.numericKindToPureTypeName(it) }
+                    ?: return null
+            return "Pair<$elemTy, Boolean>"
+        }
+        if (canonical in setOf("atomic_cxchg", "atomic_cxchgweak")) {
+            val pointeeTy =
+                spec.explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
+                    ?: (
+                        spec.callArgsList
+                            .firstOrNull()
+                            ?.let { emitter.sourceInitializerType(it) }
+                            ?.let(::unwrapSynType) as? SynType.Ptr
+                    )?.elem
+            val elemTy =
+                pointeeTy?.let { emitter.renderType(it, selfTypeName) }
+                    ?: spec.callArgsList.getOrNull(1)?.let { emitter.inferExprRenderedType(it, selfTypeName) }
+                    ?: return null
+            return "Pair<$elemTy, Boolean>"
+        }
+        val suffixedKm = SUFFIXED_FLOAT_UNARY_KM[canonical] ?: SUFFIXED_FLOAT_BINARY_KM[canonical]
+        if (suffixedKm != null) {
+            return if (suffixedKm.endsWith("f32")) "Float" else "Double"
+        }
+        if (canonical in setOf("fmaf32", "fmuladdf32", "minimumf32", "maximumf32")) {
+            return "Float"
+        }
+        if (canonical in setOf("fmaf64", "fmuladdf64", "minimumf64", "maximumf64")) {
+            return "Double"
+        }
+        inferCoreIntrinsicReturnSynType(call, emitter)?.let { return emitter.renderType(it, selfTypeName) }
+        if (canonical in
+            setOf(
+                "bswap",
+                "bitreverse",
+                "rotate_left",
+                "rotate_right",
+                "wrapping_add",
+                "wrapping_sub",
+                "wrapping_mul",
+                "unchecked_add",
+                "unchecked_sub",
+                "unchecked_mul",
+                "saturating_add",
+                "saturating_sub",
+                "unchecked_div",
+                "unchecked_rem",
+                "exact_div",
+                "unchecked_shl",
+                "unchecked_shr",
+                "disjoint_bitor",
+                "select_unpredictable",
+                "powi",
+                "fma",
+                "fmuladd",
+            ) ||
+            canonical in GENERIC_FLOAT_UNARY_KM ||
+            canonical in GENERIC_FLOAT_BINARY_OP_NAMES
+        ) {
+            return spec.callArgsList.firstOrNull()?.let { emitter.inferExprRenderedType(it, selfTypeName) }
+        }
+        return null
     }
 
     internal fun renderCoreIntrinsicCall(
@@ -682,44 +1481,56 @@ public object CoreIntrinsicLowering {
         val path = (call.func as? Expr.Path)?.takeIf { it.qself == null }?.path ?: return null
         val segments = path.segments.toList()
         if (segments.isEmpty()) return null
-        val lastSeg = segments.last()
-        val rawName = lastSeg.ident.toString().removePrefix("r#")
+        val rewrittenSegNames =
+            emitter.rewriteCrateRootAliasAndReexportSegments(
+                segments.map { it.ident.toString().removePrefix("r#") },
+            )
         val penultName =
-            segments
-                .getOrNull(segments.size - 2)
-                ?.ident
-                ?.toString()
+            rewrittenSegNames
+                .getOrNull(rewrittenSegNames.size - 2)
                 ?.removePrefix("r#")
+        val spec = resolveCoreIntrinsicCallSpec(call, emitter) ?: return null
+        val rawName = spec.rawName
 
         // Support `alloc::alloc::__rust_alloc` / `__rust_dealloc` / `__rust_realloc` / `__rust_alloc_zeroed`
         if (rawName in setOf("__rust_alloc", "__rust_dealloc", "__rust_realloc", "__rust_alloc_zeroed")) {
             val coreNs = resolveCoreNamespace(emitter.headerContext)
             val intrPkg = "$coreNs.intrinsics"
             val ptrPkg = "$coreNs.ptr"
-            val args = call.args.toList().map { emitter.renderExpr(it, indent, selfTypeName) }
+            val args = spec.callArgsList.map { emitter.renderExpr(it, indent, selfTypeName) }
             registerCoreImport(emitter, "$ptrPkg.MutPtr")
+            fun alignArgExpr(argIdx: Int): String {
+                val alignSyn = spec.callArgsList.getOrNull(argIdx)
+                val alignTy = alignSyn?.let { emitter.inferExprRenderedType(it, selfTypeName) }?.removeSuffix("?")?.trim()
+                val rawArg = args[argIdx]
+                return if (alignTy == "Alignment" || alignTy?.endsWith(".Alignment") == true) {
+                    "($rawArg).asUsize().toLong()"
+                } else {
+                    "($rawArg).toLong()"
+                }
+            }
             return when (rawName) {
                 "__rust_alloc" -> {
                     registerCoreImport(emitter, "$intrPkg.kmAlloc")
-                    "MutPtr(kmAlloc((${args[0]}).toLong(), (${args[1]}).toLong()))"
+                    "MutPtr(kmAlloc((${args[0]}).toLong(), ${alignArgExpr(1)}))"
                 }
                 "__rust_alloc_zeroed" -> {
                     registerCoreImport(emitter, "$intrPkg.kmAllocZeroed")
-                    "MutPtr(kmAllocZeroed((${args[0]}).toLong(), (${args[1]}).toLong()))"
+                    "MutPtr(kmAllocZeroed((${args[0]}).toLong(), ${alignArgExpr(1)}))"
                 }
                 "__rust_realloc" -> {
                     registerCoreImport(emitter, "$intrPkg.kmRealloc")
-                    "MutPtr(kmRealloc((${args[0]}).rawAddress, (${args[1]}).toLong(), (${args[2]}).toLong(), (${args[3]}).toLong()))"
+                    "MutPtr(kmRealloc((${args[0]}).rawAddress, (${args[1]}).toLong(), ${alignArgExpr(2)}, (${args[3]}).toLong()))"
                 }
                 "__rust_dealloc" -> {
                     registerCoreImport(emitter, "$intrPkg.kmDealloc")
-                    "kmDealloc((${args[0]}).rawAddress, (${args[1]}).toLong(), (${args[2]}).toLong())"
+                    "kmDealloc((${args[0]}).rawAddress, (${args[1]}).toLong(), ${alignArgExpr(2)})"
                 }
                 else -> null
             }
         }
 
-        val callArgsList = call.args.toList()
+        val callArgsList = spec.callArgsList
 
         // Support `core::hint::spin_loop()` / `hint::black_box(...)`
         if (penultName == "hint" && rawName == "spin_loop" && callArgsList.isEmpty()) {
@@ -744,10 +1555,15 @@ public object CoreIntrinsicLowering {
             return argRendered
         }
 
-        val isIntrinsicsModuleCall =
-            penultName == "intrinsics" ||
-                (segments.size == 1 && emitter.headerContext.packageName?.endsWith(".intrinsics") == true)
-        if (!isIntrinsicsModuleCall) {
+        val isIntrinsicsModuleCall = spec.isIntrinsicsModuleCall
+        val isCoreSimdCall =
+            rawName in CORE_SIMD_INTRINSIC_NAMES &&
+                (
+                    isIntrinsicsModuleCall ||
+                        penultName == "simd" ||
+                        (segments.size == 1 && rawName !in emitter.inspector.declaredTopLevelFnRawNames)
+                )
+        if (!isIntrinsicsModuleCall && !isCoreSimdCall) {
             return null
         }
 
@@ -755,16 +1571,14 @@ public object CoreIntrinsicLowering {
         val intrPkg = "$coreNs.intrinsics"
         val memPkg = "$coreNs.mem"
         val ptrPkg = "$coreNs.ptr"
-        val genericArgs = (lastSeg.arguments as? PathArguments.AngleBracketed)?.args?.toList().orEmpty()
-        val explicitTypes = genericArgs.filterIsInstance<GenericArgument.TypeArg>().map { it.type }
-        val explicitConsts = genericArgs.filterIsInstance<GenericArgument.ConstArg>().map { it.expr }
+        val explicitTypes = spec.explicitTypes
+        val explicitConsts = spec.explicitConsts
         val renderedArgs = callArgsList.map { emitter.renderExpr(it, indent, selfTypeName) }
 
-        val parsedAtomic = parseLegacyAtomicOrderingSuffix(rawName)
-        val canonicalIntrinsicName = parsedAtomic.baseName
+        val canonicalIntrinsicName = spec.canonicalName
 
         fun orderingCode(constIdx: Int): String {
-            val legacyOrd = if (constIdx == 0) parsedAtomic.ord0 else parsedAtomic.ord1
+            val legacyOrd = if (constIdx == 0) spec.ord0 else spec.ord1
             if (legacyOrd != null && constIdx >= explicitConsts.size) return legacyOrd
             var expr = explicitConsts.getOrNull(constIdx) ?: return legacyOrd ?: "4"
             while (true) {
@@ -802,7 +1616,7 @@ public object CoreIntrinsicLowering {
         }
 
         return when (canonicalIntrinsicName) {
-            "abort" -> {
+            "abort", "abort_immediate" -> {
                 registerCoreImport(emitter, "$intrPkg.kmAbort")
                 "kmAbort()"
             }
@@ -811,6 +1625,8 @@ public object CoreIntrinsicLowering {
             "prefetch_read_data", "prefetch_write_data", "prefetch_read_instruction", "prefetch_write_instruction",
             -> "Unit"
             "likely", "unlikely", "rustc_peek" -> renderedArgs.firstOrNull() ?: "Unit"
+            "select_unpredictable" ->
+                if (renderedArgs.size >= 3) "if (${renderedArgs[0]}) ${renderedArgs[1]} else ${renderedArgs[2]}" else null
             "ub_checks", "overflow_checks", "is_val_statically_known" -> "false"
             "black_box" -> {
                 val arg0 = renderedArgs.firstOrNull() ?: return "Unit"
@@ -827,10 +1643,63 @@ public object CoreIntrinsicLowering {
                 val layout = resolveTypeLayoutExpression(ty, selfTypeName, emitter)
                 if (emitter.headerContext.rawAbiMode) "($layout).sizeBytes.toULong()" else "($layout).sizeBytes.toInt()"
             }
-            "align_of", "min_align_of", "pref_align_of" -> {
-                val ty = explicitTypes.firstOrNull() ?: return null
+            "size_of_val" -> {
+                val ptrExpr = renderedArgs.firstOrNull() ?: return null
+                val firstArg = callArgsList.firstOrNull()
+                val pointeeTy =
+                    explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
+                        ?: when (val argTy = firstArg?.let { emitter.sourceInitializerType(it) }) {
+                            is SynType.Ptr -> argTy.elem
+                            is SynType.Reference -> argTy.elem
+                            else -> argTy
+                        }
+                        ?: return null
+                val layout = resolveTypeLayoutExpression(pointeeTy, selfTypeName, emitter)
+                if (emitter.headerContext.rawAbiMode) {
+                    "($layout).sizeBytes.toULong()"
+                } else {
+                    val isPtrArg =
+                        firstArg?.let { emitter.inferExprRenderedType(it, selfTypeName) }?.let {
+                            it.startsWith("ConstPtr") || it.startsWith("MutPtr") || ".ptr." in it
+                        } == true
+                    if (isPtrArg) {
+                        val atomPtr = if (emitter.isAtomicPostfixReceiver(firstArg, ptrExpr)) ptrExpr else "($ptrExpr)"
+                        "(if ($atomPtr.rawMeta > 0L) ($atomPtr.rawMeta * ($layout).sizeBytes).toInt() else ($layout).sizeBytes.toInt())"
+                    } else {
+                        "($layout).sizeBytes.toInt()"
+                    }
+                }
+            }
+            "align_of", "align_of_val", "min_align_of", "min_align_of_val", "pref_align_of" -> {
+                val firstArg = callArgsList.firstOrNull()
+                val ty =
+                    explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
+                        ?: when (val argTy = firstArg?.let { emitter.sourceInitializerType(it) }) {
+                            is SynType.Ptr -> argTy.elem
+                            is SynType.Reference -> argTy.elem
+                            else -> argTy
+                        }
+                        ?: return null
                 val layout = resolveTypeLayoutExpression(ty, selfTypeName, emitter)
                 if (emitter.headerContext.rawAbiMode) "($layout).alignBytes.toULong()" else "($layout).alignBytes.toInt()"
+            }
+            "vtable_size", "vtable_align" -> if (emitter.headerContext.rawAbiMode) "8uL" else "8"
+            "variant_count" -> if (emitter.headerContext.rawAbiMode) "1uL" else "1"
+            "raw_eq" -> {
+                if (renderedArgs.size < 2) return null
+                val targetTy =
+                    explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
+                        ?: callArgsList.firstOrNull()?.let { firstArg ->
+                            when (val argTy = emitter.sourceInitializerType(firstArg)) {
+                                is SynType.Ptr -> argTy.elem
+                                is SynType.Reference -> argTy.elem
+                                else -> argTy
+                            }
+                        }
+                        ?: return null
+                registerCoreImport(emitter, "$memPkg.rawEqWithLayout")
+                val layout = resolveTypeLayoutExpression(targetTy, selfTypeName, emitter)
+                "rawEqWithLayout(${renderedArgs[0]}, ${renderedArgs[1]}, $layout)"
             }
             "needs_drop" -> {
                 val ty = explicitTypes.firstOrNull() ?: return "true"
@@ -845,7 +1714,7 @@ public object CoreIntrinsicLowering {
                 val isTrivial =
                     ty is SynType.Ptr ||
                         ty is SynType.Reference ||
-                        primName in setOf("bool", "char", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128", "isize", "usize", "f32", "f64")
+                        primName in setOf("bool", "char", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128", "isize", "usize", "f16", "f32", "f64", "f128")
                 if (isTrivial) "false" else "true"
             }
             "type_name" -> {
@@ -1082,80 +1951,46 @@ public object CoreIntrinsicLowering {
                     "atomicRmwWithLayout(${rawAddrOf(0)}, ${renderedArgs[1]}, $opCode, ${orderingCode(0)}, $dstLayout, $opLayout)"
                 }
             }
-            "ctpop" -> {
-                registerCoreImport(emitter, "$intrPkg.kmCtpopU64")
-                val maskExpr = bitIntrinsicUnsigned64Arg(explicitTypes.firstOrNull(), renderedArgs[0], emitter)
-                "kmCtpopU64($maskExpr)"
-            }
-            "ctlz", "ctlz_nonzero" -> {
-                registerCoreImport(emitter, "$intrPkg.kmCtlzU64")
-                val bitWidth = (explicitTypes.firstOrNull()?.let { staticScalarByteWidth(it, emitter) } ?: 8L) * 8L
-                val arg64 = bitIntrinsicUnsigned64Arg(explicitTypes.firstOrNull(), renderedArgs[0], emitter)
-                if (bitWidth < 64L) {
-                    "(kmCtlzU64($arg64) - ${(64L - bitWidth)}u)"
-                } else {
-                    "kmCtlzU64($arg64)"
-                }
-            }
-            "cttz", "cttz_nonzero" -> {
-                registerCoreImport(emitter, "$intrPkg.kmCttzU64")
-                val bitWidth = (explicitTypes.firstOrNull()?.let { staticScalarByteWidth(it, emitter) } ?: 8L) * 8L
-                val arg64 = bitIntrinsicUnsigned64Arg(explicitTypes.firstOrNull(), renderedArgs[0], emitter)
-                if (bitWidth < 64L) {
-                    "minOf(${bitWidth}u, kmCttzU64($arg64))"
-                } else {
-                    "kmCttzU64($arg64)"
-                }
-            }
-            "bswap" -> {
-                val width = explicitTypes.firstOrNull()?.let { staticScalarByteWidth(it, emitter) } ?: 8L
-                val prim = explicitScalarRustName(explicitTypes.firstOrNull(), emitter)
-                when (width) {
-                    1L -> renderedArgs[0]
-                    2L -> {
-                        registerCoreImport(emitter, "$intrPkg.kmBswapU16")
-                        val raw = "kmBswapU16((${renderedArgs[0]}).toUShort())"
-                        if (prim == "i16") "$raw.toShort()" else raw
-                    }
-                    4L -> {
-                        registerCoreImport(emitter, "$intrPkg.kmBswapU32")
-                        val raw = "kmBswapU32((${renderedArgs[0]}).toUInt())"
-                        if (prim == "i32" || (prim in setOf("isize", "usize") && !emitter.headerContext.rawAbiMode)) "$raw.toInt()" else raw
-                    }
-                    else -> {
-                        registerCoreImport(emitter, "$intrPkg.kmBswapU64")
-                        val raw = "kmBswapU64((${renderedArgs[0]}).toULong())"
-                        if (prim == "i64" || (prim == "isize" && emitter.headerContext.rawAbiMode)) "$raw.toLong()" else raw
-                    }
-                }
-            }
-            "bitreverse" -> {
-                registerCoreImport(emitter, "$intrPkg.kmBitreverseU64")
-                val bitWidth = (explicitTypes.firstOrNull()?.let { staticScalarByteWidth(it, emitter) } ?: 8L) * 8L
-                val prim = explicitScalarRustName(explicitTypes.firstOrNull(), emitter)
-                val arg64 = bitIntrinsicUnsigned64Arg(explicitTypes.firstOrNull(), renderedArgs[0], emitter)
-                val shifted = if (bitWidth < 64L) "(kmBitreverseU64($arg64) shr ${(64L - bitWidth).toInt()})" else "kmBitreverseU64($arg64)"
-                castUnsigned64BackToRustScalar(shifted, prim, emitter)
-            }
-            "fmaf32", "fmuladdf32" -> {
-                registerCoreImport(emitter, "$intrPkg.kmFmaf32")
-                "kmFmaf32(${renderedArgs[0]}, ${renderedArgs[1]}, ${renderedArgs[2]})"
-            }
-            "fmaf64", "fmuladdf64" -> {
-                registerCoreImport(emitter, "$intrPkg.kmFmaf64")
-                "kmFmaf64(${renderedArgs[0]}, ${renderedArgs[1]}, ${renderedArgs[2]})"
-            }
-            "sqrtf32" -> {
-                registerCoreImport(emitter, "$intrPkg.kmSqrtf32")
-                "kmSqrtf32(${renderedArgs[0]})"
-            }
-            "sqrtf64" -> {
-                registerCoreImport(emitter, "$intrPkg.kmSqrtf64")
-                "kmSqrtf64(${renderedArgs[0]})"
-            }
-            "wrapping_add" -> "(${renderedArgs[0]} + ${renderedArgs[1]})"
-            "wrapping_sub" -> "(${renderedArgs[0]} - ${renderedArgs[1]})"
-            "wrapping_mul" -> "(${renderedArgs[0]} * ${renderedArgs[1]})"
+            "ctpop", "ctlz", "ctlz_nonzero", "cttz", "cttz_nonzero", "bswap", "bitreverse",
+            "rotate_left", "rotate_right",
+            "wrapping_add", "wrapping_sub", "wrapping_mul",
+            "unchecked_add", "unchecked_sub", "unchecked_mul",
+            "saturating_add", "saturating_sub",
+            "add_with_overflow", "sub_with_overflow", "mul_with_overflow",
+            "unchecked_div", "unchecked_rem", "exact_div",
+            "unchecked_shl", "unchecked_shr",
+            "disjoint_bitor", "three_way_compare",
+            ->
+                renderIntOrBitIntrinsicCall(
+                    canonicalName = canonicalIntrinsicName,
+                    renderedArgs = renderedArgs,
+                    callArgsList = callArgsList,
+                    explicitTypes = explicitTypes,
+                    selfTypeName = selfTypeName,
+                    coreNs = coreNs,
+                    intrPkg = intrPkg,
+                    memPkg = memPkg,
+                    emitter = emitter,
+                )
+            in SUFFIXED_FLOAT_UNARY_KM,
+            in SUFFIXED_FLOAT_BINARY_KM,
+            "fmaf32", "fmuladdf32", "fmaf64", "fmuladdf64",
+            "minimumf32", "maximumf32", "minimumf64", "maximumf64",
+            in GENERIC_FLOAT_UNARY_KM,
+            in GENERIC_FLOAT_BINARY_OP_NAMES,
+            "powi", "fma", "fmuladd", "float_to_int_unchecked",
+            ->
+                renderFloatIntrinsicCall(
+                    canonicalName = canonicalIntrinsicName,
+                    renderedArgs = renderedArgs,
+                    callArgsList = callArgsList,
+                    explicitTypes = explicitTypes,
+                    selfTypeName = selfTypeName,
+                    coreNs = coreNs,
+                    intrPkg = intrPkg,
+                    memPkg = memPkg,
+                    emitter = emitter,
+                )
             "transmute", "transmute_unchecked" -> {
                 val srcTy = explicitTypes.getOrNull(0)?.takeUnless { it is SynType.Infer } ?: callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) }
                 val dstTy = explicitTypes.getOrNull(1)?.takeUnless { it is SynType.Infer } ?: emitter.currentEnclosingReturnSynType
@@ -1169,6 +2004,15 @@ public object CoreIntrinsicLowering {
                     null
                 }
             }
+            in CORE_SIMD_INTRINSIC_NAMES ->
+                renderSimdCallSiteLowering(
+                    canonicalName = canonicalIntrinsicName,
+                    renderedArgs = renderedArgs,
+                    explicitTypes = explicitTypes,
+                    selfTypeName = selfTypeName,
+                    intrPkg = intrPkg,
+                    emitter = emitter,
+                )
             else -> null
         }
     }
@@ -1224,7 +2068,7 @@ public object CoreIntrinsicLowering {
                 ?.toString()
                 ?.removePrefix("r#") ?: return null
         return ident.takeIf {
-            it in setOf("bool", "char", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128", "isize", "usize", "f32", "f64")
+            it in setOf("bool", "char", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128", "isize", "usize", "f16", "f32", "f64", "f128")
         }
     }
 
@@ -1233,41 +2077,657 @@ public object CoreIntrinsicLowering {
         if (resolved is SynType.Ptr) return (emitter.activeCfgProfile.pointerWidth / 8).toLong()
         return when (explicitScalarRustName(resolved, emitter)) {
             "bool", "i8", "u8" -> 1L
-            "i16", "u16" -> 2L
+            "i16", "u16", "f16" -> 2L
             "i32", "u32", "f32", "char" -> 4L
             "i64", "u64", "f64" -> 8L
             "isize", "usize" -> (emitter.activeCfgProfile.pointerWidth / 8).toLong()
-            "i128", "u128" -> 16L
+            "i128", "u128", "f128" -> 16L
             else -> null
         }
     }
 
-    private fun bitIntrinsicUnsigned64Arg(type: SynType?, valueExpr: String, emitter: KotlinJ2KEmitter): String =
-        when (explicitScalarRustName(type, emitter)) {
-            "i8" -> "($valueExpr).toUByte().toULong()"
-            "u8" -> "($valueExpr).toULong()"
-            "i16" -> "($valueExpr).toUShort().toULong()"
-            "u16" -> "($valueExpr).toULong()"
-            "i32" -> "($valueExpr).toUInt().toULong()"
-            "u32" -> "($valueExpr).toULong()"
-            "isize" -> if (emitter.headerContext.rawAbiMode) "($valueExpr).toULong()" else "($valueExpr).toLong().toULong()"
-            "usize" -> if (emitter.headerContext.rawAbiMode) "($valueExpr).toULong()" else "($valueExpr).toUInt().toULong()"
-            else -> "($valueExpr).toULong()"
+    private fun rustScalarToNumericKind(prim: String, emitter: KotlinJ2KEmitter): NumericKind? =
+        when (prim) {
+            "i8" -> NumericKind.I8
+            "u8" -> NumericKind.U8
+            "i16" -> NumericKind.I16
+            "u16" -> NumericKind.U16
+            "i32" -> NumericKind.I32
+            "u32" -> NumericKind.U32
+            "i64" -> NumericKind.I64
+            "u64" -> NumericKind.U64
+            "i128" -> NumericKind.I128
+            "u128" -> NumericKind.U128
+            "isize" -> if (emitter.headerContext.rawAbiMode) NumericKind.I64 else NumericKind.I32
+            "usize" -> if (emitter.headerContext.rawAbiMode) NumericKind.U64 else NumericKind.U32
+            "f16" -> NumericKind.F16
+            "f32" -> NumericKind.F32
+            "f64" -> NumericKind.F64
+            "f128" -> NumericKind.F128
+            else -> null
         }
 
-    private fun castUnsigned64BackToRustScalar(u64Expr: String, prim: String?, emitter: KotlinJ2KEmitter): String =
-        when (prim) {
-            "i8" -> "($u64Expr).toUByte().toByte()"
-            "u8" -> "($u64Expr).toUByte()"
-            "i16" -> "($u64Expr).toUShort().toShort()"
-            "u16" -> "($u64Expr).toUShort()"
-            "i32" -> "($u64Expr).toUInt().toInt()"
-            "u32" -> "($u64Expr).toUInt()"
-            "i64" -> "($u64Expr).toLong()"
-            "isize" -> if (emitter.headerContext.rawAbiMode) "($u64Expr).toLong()" else "($u64Expr).toLong().toInt()"
-            "usize" -> if (emitter.headerContext.rawAbiMode) u64Expr else "($u64Expr).toInt()"
-            else -> u64Expr
+    private fun resolveIntrinsicNumericKind(
+        explicitType: SynType?,
+        argExprs: List<Expr>,
+        selfTypeName: String?,
+        emitter: KotlinJ2KEmitter,
+    ): NumericKind? {
+        explicitType?.takeUnless { it is SynType.Infer }?.let { ty ->
+            explicitScalarRustName(ty, emitter)?.let { rustScalarToNumericKind(it, emitter) }?.let { return it }
         }
+        val firstNonLit = argExprs.firstOrNull { emitter.unwrapParenOrGroupExpr(it) !is Expr.Lit }
+        if (firstNonLit != null) {
+            emitter.inferExprNumericKind(firstNonLit, selfTypeName)?.let { return it }
+        }
+        for (arg in argExprs) {
+            emitter.inferExprNumericKind(arg, selfTypeName)?.let { return it }
+        }
+        return null
+    }
+
+    private fun numericKindWidthTag(kind: NumericKind): String? =
+        when (kind) {
+            NumericKind.I8 -> "I8"
+            NumericKind.U8 -> "U8"
+            NumericKind.I16 -> "I16"
+            NumericKind.U16 -> "U16"
+            NumericKind.I32 -> "I32"
+            NumericKind.U32 -> "U32"
+            NumericKind.I64 -> "I64"
+            NumericKind.U64 -> "U64"
+            NumericKind.I128 -> "I128"
+            NumericKind.U128 -> "U128"
+            else -> null
+        }
+
+    private fun numericKindUnsignedBitTag(kind: NumericKind): String? =
+        when (kind) {
+            NumericKind.I8, NumericKind.U8 -> "U8"
+            NumericKind.I16, NumericKind.U16 -> "U16"
+            NumericKind.I32, NumericKind.U32 -> "U32"
+            NumericKind.I64, NumericKind.U64 -> "U64"
+            NumericKind.I128, NumericKind.U128 -> "U128"
+            else -> null
+        }
+
+    private fun toExactWidthUnsignedExpr(expr: String, kind: NumericKind): String =
+        when (kind) {
+            NumericKind.I8 -> "($expr).toUByte()"
+            NumericKind.I16 -> "($expr).toUShort()"
+            NumericKind.I32 -> "($expr).toUInt()"
+            NumericKind.I64 -> "($expr).toULong()"
+            else -> expr
+        }
+
+    private fun fromExactWidthUnsignedExpr(expr: String, kind: NumericKind): String =
+        when (kind) {
+            NumericKind.I8 -> "($expr).toByte()"
+            NumericKind.I16 -> "($expr).toShort()"
+            NumericKind.I32 -> "($expr).toInt()"
+            NumericKind.I64 -> "($expr).toLong()"
+            else -> expr
+        }
+
+    private fun reconstruct128Expr(
+        kind: NumericKind,
+        loField: String,
+        hiField: String,
+        coreNs: String,
+        emitter: KotlinJ2KEmitter,
+    ): String =
+        if (kind == NumericKind.I128) {
+            registerCoreImport(emitter, "$coreNs.I128")
+            "I128($hiField.toLong(), $loField)"
+        } else {
+            registerCoreImport(emitter, "$coreNs.U128")
+            "U128($hiField, $loField)"
+        }
+
+    private fun layoutExprForNumericKind(
+        kind: NumericKind,
+        coreNs: String,
+        memPkg: String,
+        emitter: KotlinJ2KEmitter,
+    ): String {
+        registerCoreImport(emitter, "$memPkg.PrimitiveLayouts")
+        return when (kind) {
+            NumericKind.I8 -> "PrimitiveLayouts.I8"
+            NumericKind.U8 -> "PrimitiveLayouts.U8"
+            NumericKind.I16 -> "PrimitiveLayouts.I16"
+            NumericKind.U16 -> "PrimitiveLayouts.U16"
+            NumericKind.I32 -> "PrimitiveLayouts.I32"
+            NumericKind.U32 -> "PrimitiveLayouts.U32"
+            NumericKind.I64 -> "PrimitiveLayouts.I64"
+            NumericKind.U64 -> "PrimitiveLayouts.U64"
+            NumericKind.I128 -> {
+                registerCoreImport(emitter, "$coreNs.I128")
+                "PrimitiveLayouts.i128Layout(::I128, { it.high }, { it.low })"
+            }
+            NumericKind.U128 -> {
+                registerCoreImport(emitter, "$coreNs.U128")
+                "PrimitiveLayouts.u128Layout(::U128, { it.high }, { it.low })"
+            }
+            NumericKind.F16 -> "PrimitiveLayouts.F16_LAYOUT"
+            NumericKind.F32 -> "PrimitiveLayouts.F32"
+            NumericKind.F64 -> "PrimitiveLayouts.F64"
+            NumericKind.F128 -> "PrimitiveLayouts.F128_LAYOUT"
+        }
+    }
+
+    private fun renderIntOrBitIntrinsicCall(
+        canonicalName: String,
+        renderedArgs: List<String>,
+        callArgsList: List<Expr>,
+        explicitTypes: List<SynType>,
+        selfTypeName: String?,
+        coreNs: String,
+        intrPkg: String,
+        memPkg: String,
+        emitter: KotlinJ2KEmitter,
+    ): String? {
+        val symmetricCount =
+            when (canonicalName) {
+                "ctpop", "ctlz", "ctlz_nonzero", "cttz", "cttz_nonzero", "bswap", "bitreverse",
+                "rotate_left", "rotate_right", "unchecked_shl", "unchecked_shr",
+                -> 1
+                else -> 2
+            }
+        val kind = resolveIntrinsicNumericKind(explicitTypes.firstOrNull(), callArgsList.take(symmetricCount), selfTypeName, emitter)
+        val firstTargetTy =
+            explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
+                ?: callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) }
+        fun fallbackWithLayout(fnName: String, argsPart: String): String? {
+            val ty = firstTargetTy ?: return null
+            val layout = resolveTypeLayoutExpression(ty, selfTypeName, emitter)
+            registerCoreImport(emitter, "$memPkg.$fnName")
+            return "$fnName($argsPart, $layout)"
+        }
+        return when (canonicalName) {
+            "ctpop", "ctlz", "ctlz_nonzero", "cttz", "cttz_nonzero" -> {
+                val arg0 = renderedArgs.firstOrNull() ?: return null
+                val uTag = kind?.let { numericKindUnsignedBitTag(it) }
+                val stem =
+                    when (canonicalName) {
+                        "ctpop" -> "kmCtpop"
+                        "ctlz", "ctlz_nonzero" -> "kmCtlz"
+                        else -> "kmCttz"
+                    }
+                when {
+                    uTag == "U128" -> {
+                        val kmFn = "${stem}U128"
+                        registerCoreImport(emitter, "$intrPkg.$kmFn")
+                        val hiExpr = if (kind == NumericKind.I128) "v.high.toULong()" else "v.high"
+                        "($arg0).let { v -> $kmFn(v.low, $hiExpr) }"
+                    }
+                    uTag != null -> {
+                        val kmFn = "$stem$uTag"
+                        registerCoreImport(emitter, "$intrPkg.$kmFn")
+                        "$kmFn(${toExactWidthUnsignedExpr(arg0, kind)})"
+                    }
+                    else -> {
+                        val withLayout =
+                            when (canonicalName) {
+                                "ctpop" -> "ctpopWithLayout"
+                                "ctlz", "ctlz_nonzero" -> "ctlzWithLayout"
+                                else -> "cttzWithLayout"
+                            }
+                        fallbackWithLayout(withLayout, arg0)
+                    }
+                }
+            }
+            "bswap", "bitreverse" -> {
+                val arg0 = renderedArgs.firstOrNull() ?: return null
+                if (canonicalName == "bswap" && (kind == NumericKind.I8 || kind == NumericKind.U8)) {
+                    return arg0
+                }
+                val uTag = kind?.let { numericKindUnsignedBitTag(it) }
+                val stem = if (canonicalName == "bswap") "kmBswap" else "kmBitreverse"
+                when {
+                    uTag == "U128" -> {
+                        val kmFn = "${stem}U128"
+                        registerCoreImport(emitter, "$intrPkg.$kmFn")
+                        val hiExpr = if (kind == NumericKind.I128) "v.high.toULong()" else "v.high"
+                        val built = reconstruct128Expr(kind, "r.lo", "r.hi", coreNs, emitter)
+                        "($arg0).let { v -> $kmFn(v.low, $hiExpr).let { r -> $built } }"
+                    }
+                    uTag != null -> {
+                        val kmFn = "$stem$uTag"
+                        registerCoreImport(emitter, "$intrPkg.$kmFn")
+                        fromExactWidthUnsignedExpr("$kmFn(${toExactWidthUnsignedExpr(arg0, kind)})", kind)
+                    }
+                    else -> fallbackWithLayout(if (canonicalName == "bswap") "bswapWithLayout" else "bitreverseWithLayout", arg0)
+                }
+            }
+            "rotate_left", "rotate_right" -> {
+                if (renderedArgs.size < 2) return null
+                val arg0 = renderedArgs[0]
+                val shift = "(${renderedArgs[1]}).toUInt()"
+                val uTag = kind?.let { numericKindUnsignedBitTag(it) }
+                val stem = if (canonicalName == "rotate_left") "kmRotateLeft" else "kmRotateRight"
+                when {
+                    uTag == "U128" -> {
+                        val kmFn = "${stem}U128"
+                        registerCoreImport(emitter, "$intrPkg.$kmFn")
+                        val hiExpr = if (kind == NumericKind.I128) "v.high.toULong()" else "v.high"
+                        val built = reconstruct128Expr(kind, "r.lo", "r.hi", coreNs, emitter)
+                        "($arg0).let { v -> $kmFn(v.low, $hiExpr, $shift).let { r -> $built } }"
+                    }
+                    uTag != null -> {
+                        val kmFn = "$stem$uTag"
+                        registerCoreImport(emitter, "$intrPkg.$kmFn")
+                        fromExactWidthUnsignedExpr("$kmFn(${toExactWidthUnsignedExpr(arg0, kind)}, $shift)", kind)
+                    }
+                    else -> {
+                        val fn = if (canonicalName == "rotate_left") "rotateLeftWithLayout" else "rotateRightWithLayout"
+                        fallbackWithLayout(fn, "$arg0, $shift")
+                    }
+                }
+            }
+            "wrapping_add", "wrapping_sub", "wrapping_mul", "unchecked_add", "unchecked_sub", "unchecked_mul" -> {
+                if (renderedArgs.size < 2) return null
+                val a = renderedArgs[0]
+                val b = renderedArgs[1]
+                val op =
+                    when {
+                        canonicalName.endsWith("_add") -> "+"
+                        canonicalName.endsWith("_sub") -> "-"
+                        else -> "*"
+                    }
+                when (kind) {
+                    NumericKind.I8 -> "((($a) $op ($b))).toByte()"
+                    NumericKind.U8 -> "((($a) $op ($b))).toUByte()"
+                    NumericKind.I16 -> "((($a) $op ($b))).toShort()"
+                    NumericKind.U16 -> "((($a) $op ($b))).toUShort()"
+                    NumericKind.I32, NumericKind.U32, NumericKind.I64, NumericKind.U64 -> "(($a) $op ($b))"
+                    NumericKind.I128, NumericKind.U128 -> {
+                        val kmFn =
+                            when {
+                                canonicalName.endsWith("_add") -> "kmU128Add"
+                                canonicalName.endsWith("_sub") -> "kmU128Sub"
+                                else -> "kmU128Mul"
+                            }
+                        registerCoreImport(emitter, "$intrPkg.$kmFn")
+                        val hiL = if (kind == NumericKind.I128) "lhs.high.toULong()" else "lhs.high"
+                        val hiR = if (kind == NumericKind.I128) "rhs.high.toULong()" else "rhs.high"
+                        val built = reconstruct128Expr(kind, "it.lo", "it.hi", coreNs, emitter)
+                        "run { val lhs = $a; val rhs = $b; $kmFn(lhs.low, $hiL, rhs.low, $hiR).let { $built } }"
+                    }
+                    else -> {
+                        val fn =
+                            when {
+                                canonicalName.endsWith("_add") -> "wrappingAddWithLayout"
+                                canonicalName.endsWith("_sub") -> "wrappingSubWithLayout"
+                                else -> "wrappingMulWithLayout"
+                            }
+                        fallbackWithLayout(fn, "$a, $b")
+                    }
+                }
+            }
+            "saturating_add", "saturating_sub" -> {
+                if (renderedArgs.size < 2) return null
+                val a = renderedArgs[0]
+                val b = renderedArgs[1]
+                val stem = if (canonicalName == "saturating_add") "kmSaturatingAdd" else "kmSaturatingSub"
+                val wTag = kind?.let { numericKindWidthTag(it) }
+                when {
+                    (kind == NumericKind.I128 || kind == NumericKind.U128) && wTag != null -> {
+                        val kmFn = "$stem$wTag"
+                        registerCoreImport(emitter, "$intrPkg.$kmFn")
+                        val hiL = if (kind == NumericKind.I128) "lhs.high.toULong()" else "lhs.high"
+                        val hiR = if (kind == NumericKind.I128) "rhs.high.toULong()" else "rhs.high"
+                        val built = reconstruct128Expr(kind, "it.lo", "it.hi", coreNs, emitter)
+                        "run { val lhs = $a; val rhs = $b; $kmFn(lhs.low, $hiL, rhs.low, $hiR).let { $built } }"
+                    }
+                    wTag != null -> {
+                        val kmFn = "$stem$wTag"
+                        registerCoreImport(emitter, "$intrPkg.$kmFn")
+                        "$kmFn($a, $b)"
+                    }
+                    else -> fallbackWithLayout(if (canonicalName == "saturating_add") "saturatingAddWithLayout" else "saturatingSubWithLayout", "$a, $b")
+                }
+            }
+            "add_with_overflow", "sub_with_overflow", "mul_with_overflow" -> {
+                if (renderedArgs.size < 2) return null
+                val a = renderedArgs[0]
+                val b = renderedArgs[1]
+                val stem =
+                    when (canonicalName) {
+                        "add_with_overflow" -> "Add"
+                        "sub_with_overflow" -> "Sub"
+                        else -> "Mul"
+                    }
+                val wTag = kind?.let { numericKindWidthTag(it) }
+                when {
+                    (kind == NumericKind.I128 || kind == NumericKind.U128) && wTag != null -> {
+                        val kmFn = "km${stem}WithOverflow$wTag"
+                        registerCoreImport(emitter, "$intrPkg.$kmFn")
+                        val hiL = if (kind == NumericKind.I128) "lhs.high.toULong()" else "lhs.high"
+                        val hiR = if (kind == NumericKind.I128) "rhs.high.toULong()" else "rhs.high"
+                        val built = reconstruct128Expr(kind, "it.lo", "it.hi", coreNs, emitter)
+                        "run { val lhs = $a; val rhs = $b; $kmFn(lhs.low, $hiL, rhs.low, $hiR).let { Pair($built, it.overflowed) } }"
+                    }
+                    wTag != null -> {
+                        val kmFn = "km${stem}WithOverflow$wTag"
+                        registerCoreImport(emitter, "$intrPkg.$kmFn")
+                        "$kmFn($a, $b).let { Pair(it.value, it.overflowed) }"
+                    }
+                    else -> {
+                        val fn =
+                            when (canonicalName) {
+                                "add_with_overflow" -> "addWithOverflowWithLayout"
+                                "sub_with_overflow" -> "subWithOverflowWithLayout"
+                                else -> "mulWithOverflowWithLayout"
+                            }
+                        fallbackWithLayout(fn, "$a, $b")
+                    }
+                }
+            }
+            "unchecked_div", "unchecked_rem", "exact_div" -> {
+                if (renderedArgs.size < 2) return null
+                val a = renderedArgs[0]
+                val b = renderedArgs[1]
+                val op = if (canonicalName == "unchecked_rem") "%" else "/"
+                when (kind) {
+                    NumericKind.I8 -> "((($a) $op ($b))).toByte()"
+                    NumericKind.U8 -> "((($a) $op ($b))).toUByte()"
+                    NumericKind.I16 -> "((($a) $op ($b))).toShort()"
+                    NumericKind.U16 -> "((($a) $op ($b))).toUShort()"
+                    NumericKind.I32, NumericKind.U32, NumericKind.I64, NumericKind.U64, NumericKind.I128, NumericKind.U128 -> "(($a) $op ($b))"
+                    else -> {
+                        val fn =
+                            when (canonicalName) {
+                                "unchecked_rem" -> "uncheckedRemWithLayout"
+                                "exact_div" -> "exactDivWithLayout"
+                                else -> "uncheckedDivWithLayout"
+                            }
+                        fallbackWithLayout(fn, "$a, $b")
+                    }
+                }
+            }
+            "unchecked_shl", "unchecked_shr" -> {
+                if (renderedArgs.size < 2) return null
+                val x = renderedArgs[0]
+                val shift = renderedArgs[1]
+                val isLeft = canonicalName == "unchecked_shl"
+                val op = if (isLeft) "shl" else "shr"
+                when (kind) {
+                    NumericKind.I8 -> "((($x).toInt() $op ($shift).toInt()).toByte())"
+                    NumericKind.U8 -> "(((($x).toUInt() and 0xFFu) $op ($shift).toInt()).toUByte())"
+                    NumericKind.I16 -> "((($x).toInt() $op ($shift).toInt()).toShort())"
+                    NumericKind.U16 -> "(((($x).toUInt() and 0xFFFFu) $op ($shift).toInt()).toUShort())"
+                    NumericKind.I32, NumericKind.U32, NumericKind.I64, NumericKind.U64 -> "(($x) $op ($shift).toInt())"
+                    NumericKind.U128 -> {
+                        val kmFn = if (isLeft) "kmU128Shl" else "kmU128Shr"
+                        registerCoreImport(emitter, "$intrPkg.$kmFn")
+                        registerCoreImport(emitter, "$coreNs.U128")
+                        "($x).let { v -> $kmFn(v.low, v.high, ($shift).toUInt()).let { r -> U128(r.hi, r.lo) } }"
+                    }
+                    NumericKind.I128 -> {
+                        val kmFn = if (isLeft) "kmU128Shl" else "kmI128Shr"
+                        registerCoreImport(emitter, "$intrPkg.$kmFn")
+                        registerCoreImport(emitter, "$coreNs.I128")
+                        "($x).let { v -> $kmFn(v.low, v.high.toULong(), ($shift).toUInt()).let { r -> I128(r.hi.toLong(), r.lo) } }"
+                    }
+                    else -> {
+                        val ty0 = firstTargetTy ?: return null
+                        val layout0 = resolveTypeLayoutExpression(ty0, selfTypeName, emitter)
+                        val fn = if (isLeft) "uncheckedShlWithLayout" else "uncheckedShrWithLayout"
+                        registerCoreImport(emitter, "$memPkg.$fn")
+                        val shiftTy =
+                            explicitTypes.getOrNull(1)?.takeUnless { it is SynType.Infer }
+                                ?: callArgsList.getOrNull(1)?.let { emitter.sourceInitializerType(it) }
+                        if (shiftTy != null && explicitTypes.size >= 2) {
+                            val layout1 = resolveTypeLayoutExpression(shiftTy, selfTypeName, emitter)
+                            "$fn($x, $shift, $layout0, $layout1)"
+                        } else {
+                            "$fn($x, ($shift).toUInt(), $layout0)"
+                        }
+                    }
+                }
+            }
+            "disjoint_bitor" -> {
+                if (renderedArgs.size < 2) return null
+                val a = renderedArgs[0]
+                val b = renderedArgs[1]
+                if (kind != null && numericKindWidthTag(kind) != null) {
+                    "(($a) or ($b))"
+                } else {
+                    fallbackWithLayout("disjointBitorWithLayout", "$a, $b")
+                }
+            }
+            "three_way_compare" -> {
+                if (renderedArgs.size < 2) return null
+                val a = renderedArgs[0]
+                val b = renderedArgs[1]
+                if (kind != null && numericKindWidthTag(kind) != null) {
+                    registerCoreImport(emitter, "$coreNs.cmp.Ordering")
+                    "run { val lhs = $a; val rhs = $b; when { lhs < rhs -> Ordering.Less; lhs > rhs -> Ordering.Greater; else -> Ordering.Equal } }"
+                } else {
+                    fallbackWithLayout("threeWayCompareWithLayout", "$a, $b")
+                }
+            }
+            else -> null
+        }
+    }
+
+    private fun renderFloatIntrinsicCall(
+        canonicalName: String,
+        renderedArgs: List<String>,
+        callArgsList: List<Expr>,
+        explicitTypes: List<SynType>,
+        selfTypeName: String?,
+        coreNs: String,
+        intrPkg: String,
+        memPkg: String,
+        emitter: KotlinJ2KEmitter,
+    ): String? {
+        SUFFIXED_FLOAT_UNARY_KM[canonicalName]?.let { kmFn ->
+            val arg0 = renderedArgs.firstOrNull() ?: return null
+            registerCoreImport(emitter, "$intrPkg.$kmFn")
+            return "$kmFn($arg0)"
+        }
+        SUFFIXED_FLOAT_BINARY_KM[canonicalName]?.let { kmFn ->
+            if (renderedArgs.size < 2) return null
+            registerCoreImport(emitter, "$intrPkg.$kmFn")
+            return "$kmFn(${renderedArgs[0]}, ${renderedArgs[1]})"
+        }
+        when (canonicalName) {
+            "fmaf32", "fmuladdf32" -> {
+                if (renderedArgs.size < 3) return null
+                registerCoreImport(emitter, "$intrPkg.kmFmaf32")
+                return "kmFmaf32(${renderedArgs[0]}, ${renderedArgs[1]}, ${renderedArgs[2]})"
+            }
+            "fmaf64", "fmuladdf64" -> {
+                if (renderedArgs.size < 3) return null
+                registerCoreImport(emitter, "$intrPkg.kmFmaf64")
+                return "kmFmaf64(${renderedArgs[0]}, ${renderedArgs[1]}, ${renderedArgs[2]})"
+            }
+            "minimumf32", "maximumf32", "minimumf64", "maximumf64" -> {
+                if (renderedArgs.size < 2) return null
+                val op = if (canonicalName.startsWith("min")) "minimum" else "maximum"
+                val layoutName = if (canonicalName.endsWith("f32")) "PrimitiveLayouts.F32" else "PrimitiveLayouts.F64"
+                registerCoreImport(emitter, "$memPkg.floatBinaryWithLayout")
+                registerCoreImport(emitter, "$memPkg.PrimitiveLayouts")
+                return "floatBinaryWithLayout(\"$op\", ${renderedArgs[0]}, ${renderedArgs[1]}, $layoutName)"
+            }
+        }
+
+        if (canonicalName == "float_to_int_unchecked") {
+            val arg0 = renderedArgs.firstOrNull() ?: return null
+            val srcTy =
+                explicitTypes.getOrNull(0)?.takeUnless { it is SynType.Infer }
+                    ?: callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) }
+            val dstTy =
+                explicitTypes.getOrNull(1)?.takeUnless { it is SynType.Infer }
+                    ?: emitter.currentEnclosingReturnSynType
+            val srcKind = resolveIntrinsicNumericKind(srcTy, callArgsList.take(1), selfTypeName, emitter)
+            val dstKind =
+                dstTy?.let { explicitScalarRustName(it, emitter)?.let { s -> rustScalarToNumericKind(s, emitter) } }
+                    ?: emitter.currentExpectedNumericKind
+            if (srcKind == NumericKind.F32 || srcKind == NumericKind.F64) {
+                val isF32 = srcKind == NumericKind.F32
+                val u64Km = if (isF32) "kmFloatToU64Unchecked" else "kmDoubleToU64Unchecked"
+                val u128Km = if (isF32) "kmFloatToU128Unchecked" else "kmDoubleToU128Unchecked"
+                when (dstKind) {
+                    NumericKind.I8 -> return "($arg0).toInt().toByte()"
+                    NumericKind.I16 -> return "($arg0).toInt().toShort()"
+                    NumericKind.I32 -> return "($arg0).toInt()"
+                    NumericKind.I64 -> return "($arg0).toLong()"
+                    NumericKind.U8 -> {
+                        registerCoreImport(emitter, "$intrPkg.$u64Km")
+                        return "$u64Km($arg0).toUByte()"
+                    }
+                    NumericKind.U16 -> {
+                        registerCoreImport(emitter, "$intrPkg.$u64Km")
+                        return "$u64Km($arg0).toUShort()"
+                    }
+                    NumericKind.U32 -> {
+                        registerCoreImport(emitter, "$intrPkg.$u64Km")
+                        return "$u64Km($arg0).toUInt()"
+                    }
+                    NumericKind.U64 -> {
+                        registerCoreImport(emitter, "$intrPkg.$u64Km")
+                        return "$u64Km($arg0)"
+                    }
+                    NumericKind.U128 -> {
+                        registerCoreImport(emitter, "$intrPkg.$u128Km")
+                        registerCoreImport(emitter, "$coreNs.U128")
+                        return "$u128Km($arg0).let { U128(it.hi, it.lo) }"
+                    }
+                    NumericKind.I128 -> {
+                        registerCoreImport(emitter, "$memPkg.floatToIntUncheckedWithLayout")
+                        val srcLayout = layoutExprForNumericKind(srcKind, coreNs, memPkg, emitter)
+                        val dstLayout = layoutExprForNumericKind(NumericKind.I128, coreNs, memPkg, emitter)
+                        return "floatToIntUncheckedWithLayout($arg0, $srcLayout, $dstLayout)"
+                    }
+                    else -> Unit
+                }
+            }
+            val srcLayout =
+                srcKind?.let { layoutExprForNumericKind(it, coreNs, memPkg, emitter) }
+                    ?: srcTy?.let { resolveTypeLayoutExpression(it, selfTypeName, emitter) }
+                    ?: return null
+            val dstLayout =
+                dstKind?.let { layoutExprForNumericKind(it, coreNs, memPkg, emitter) }
+                    ?: dstTy?.let { resolveTypeLayoutExpression(it, selfTypeName, emitter) }
+                    ?: return null
+            registerCoreImport(emitter, "$memPkg.floatToIntUncheckedWithLayout")
+            return "floatToIntUncheckedWithLayout($arg0, $srcLayout, $dstLayout)"
+        }
+
+        val arity =
+            when {
+                canonicalName in GENERIC_FLOAT_UNARY_KM -> 1
+                canonicalName == "powi" -> 1
+                canonicalName in GENERIC_FLOAT_BINARY_OP_NAMES -> 2
+                else -> 3
+            }
+        val kind = resolveIntrinsicNumericKind(explicitTypes.firstOrNull(), callArgsList.take(arity), selfTypeName, emitter)
+        val targetTy =
+            explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
+                ?: callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) }
+        fun floatLayoutExpr(): String? =
+            when {
+                kind != null && kind in setOf(NumericKind.F16, NumericKind.F32, NumericKind.F64, NumericKind.F128) ->
+                    layoutExprForNumericKind(kind, coreNs, memPkg, emitter)
+                targetTy != null -> resolveTypeLayoutExpression(targetTy, selfTypeName, emitter)
+                else -> null
+            }
+
+        GENERIC_FLOAT_UNARY_KM[canonicalName]?.let { (f32Km, f64Km) ->
+            val arg0 = renderedArgs.firstOrNull() ?: return null
+            return when (kind) {
+                NumericKind.F32 -> {
+                    registerCoreImport(emitter, "$intrPkg.$f32Km")
+                    "$f32Km($arg0)"
+                }
+                NumericKind.F64 -> {
+                    registerCoreImport(emitter, "$intrPkg.$f64Km")
+                    "$f64Km($arg0)"
+                }
+                else -> {
+                    val layout = floatLayoutExpr() ?: return null
+                    registerCoreImport(emitter, "$memPkg.floatUnaryWithLayout")
+                    "floatUnaryWithLayout(\"$canonicalName\", $arg0, $layout)"
+                }
+            }
+        }
+
+        GENERIC_FLOAT_BINARY_OP_NAMES[canonicalName]?.let { op ->
+            if (renderedArgs.size < 2) return null
+            val a = renderedArgs[0]
+            val b = renderedArgs[1]
+            if (kind == NumericKind.F32 || kind == NumericKind.F64) {
+                val isF32 = kind == NumericKind.F32
+                when (op) {
+                    "fadd" -> return "(($a) + ($b))"
+                    "fsub" -> return "(($a) - ($b))"
+                    "fmul" -> return "(($a) * ($b))"
+                    "fdiv" -> return "(($a) / ($b))"
+                    "frem" -> return "(($a) % ($b))"
+                    "powf", "copysign", "minnum", "maxnum" -> {
+                        val kmFn =
+                            when (op) {
+                                "powf" -> if (isF32) "kmPowf32" else "kmPowf64"
+                                "copysign" -> if (isF32) "kmCopysignf32" else "kmCopysignf64"
+                                "minnum" -> if (isF32) "kmMinnumf32" else "kmMinnumf64"
+                                else -> if (isF32) "kmMaxnumf32" else "kmMaxnumf64"
+                            }
+                        registerCoreImport(emitter, "$intrPkg.$kmFn")
+                        return "$kmFn($a, $b)"
+                    }
+                }
+            }
+            val layout = floatLayoutExpr() ?: return null
+            registerCoreImport(emitter, "$memPkg.floatBinaryWithLayout")
+            return "floatBinaryWithLayout(\"$op\", $a, $b, $layout)"
+        }
+
+        if (canonicalName == "powi") {
+            if (renderedArgs.size < 2) return null
+            val a = renderedArgs[0]
+            val x = renderedArgs[1]
+            return when (kind) {
+                NumericKind.F32 -> {
+                    registerCoreImport(emitter, "$intrPkg.kmPowif32")
+                    "kmPowif32($a, $x)"
+                }
+                NumericKind.F64 -> {
+                    registerCoreImport(emitter, "$intrPkg.kmPowif64")
+                    "kmPowif64($a, $x)"
+                }
+                else -> {
+                    val layout = floatLayoutExpr() ?: return null
+                    registerCoreImport(emitter, "$memPkg.floatPowiWithLayout")
+                    "floatPowiWithLayout($a, $x, $layout)"
+                }
+            }
+        }
+
+        if (canonicalName == "fma" || canonicalName == "fmuladd") {
+            if (renderedArgs.size < 3) return null
+            val a = renderedArgs[0]
+            val b = renderedArgs[1]
+            val c = renderedArgs[2]
+            return when (kind) {
+                NumericKind.F32 -> {
+                    registerCoreImport(emitter, "$intrPkg.kmFmaf32")
+                    "kmFmaf32($a, $b, $c)"
+                }
+                NumericKind.F64 -> {
+                    registerCoreImport(emitter, "$intrPkg.kmFmaf64")
+                    "kmFmaf64($a, $b, $c)"
+                }
+                else -> {
+                    val layout = floatLayoutExpr() ?: return null
+                    registerCoreImport(emitter, "$memPkg.floatFmaWithLayout")
+                    "floatFmaWithLayout($a, $b, $c, $layout)"
+                }
+            }
+        }
+        return null
+    }
 
     private fun renderDirectScalarLoad(
         pointee: SynType,

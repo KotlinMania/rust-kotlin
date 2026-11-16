@@ -165,7 +165,7 @@ public object StructLayoutComputer {
         emitter: KotlinJ2KEmitter,
         visiting: Set<String> = emptySet(),
     ): ComputedStructLayout? {
-        val structKtName = rustTypeIdentToKotlin(item.ident.toString())
+        val structKtName = emitter.effectiveStructKotlinName(rustTypeIdentToKotlin(item.ident.toString()))
         if (structKtName in visiting) return null
         if (emitter.computedStructLayoutCache.containsKey(structKtName)) {
             return emitter.computedStructLayoutCache[structKtName]
@@ -221,7 +221,9 @@ public object StructLayoutComputer {
             }
 
         val prevStructTypeParams = emitter.activeTypeParamNames
+        val prevStructConstParams = emitter.activeConstParamNames
         emitter.activeTypeParamNames = prevStructTypeParams + emitter.collectGenericTypeParamNames(item.generics)
+        emitter.activeConstParamNames = prevStructConstParams + emitter.collectGenericConstParamNames(item.generics)
         return try {
             if (emitter.sourceTransparentField(item, selfWithGenerics) != null) {
                 return null
@@ -407,21 +409,72 @@ public object StructLayoutComputer {
                 usedTypeParams.map { paramKt ->
                     TypeLayoutParamSpec(typeLayoutParamName(paramKt), "$typeLayoutRef<$paramKt>")
                 }
+            val constGenericSpecs =
+                item.generics.params
+                    .toList()
+                    .filterIsInstance<GenericParam.ConstParam>()
+                    .map { cp ->
+                        val raw = cp.ident.toString().removePrefix("r#")
+                        raw to rustValueIdentToKotlin(cp.ident.toString())
+                    }
+            var adjustedSizeExpr = finalSizeExpr
+            var adjustedAlignExpr = finalAlignExpr
+            var adjustedHelperOffsetDecls = helperOffsetDecls.toList()
+            var adjustedComputedFields = computedFields.toList()
+            val constLayoutParams = mutableListOf<TypeLayoutParamSpec>()
+            val existingParamNames = usedTypeParams.mapTo(hashSetOf()) { typeLayoutParamName(it) }
+            if (constGenericSpecs.isNotEmpty()) {
+                val allLayoutExprs =
+                    buildList {
+                        add(adjustedSizeExpr)
+                        add(adjustedAlignExpr)
+                        adjustedHelperOffsetDecls.forEach { add(it.helperInitExpr) }
+                        adjustedComputedFields.forEach {
+                            add(it.offsetExpr)
+                            add(it.layoutExpr)
+                        }
+                    }
+                for ((raw, ktParam) in constGenericSpecs) {
+                    val detectRegex = Regex("(?<!\\.)\\b(?:${Regex.escape(raw)}|${Regex.escape(ktParam)})\\b")
+                    if (allLayoutExprs.any { detectRegex.containsMatchIn(it) }) {
+                        if (raw != ktParam) {
+                            val rewriteRegex = Regex("(?<!\\.)\\b${Regex.escape(raw)}\\b")
+                            adjustedSizeExpr = rewriteRegex.replace(adjustedSizeExpr, ktParam)
+                            adjustedAlignExpr = rewriteRegex.replace(adjustedAlignExpr, ktParam)
+                            adjustedHelperOffsetDecls =
+                                adjustedHelperOffsetDecls.map { decl ->
+                                    decl.copy(helperInitExpr = rewriteRegex.replace(decl.helperInitExpr, ktParam))
+                                }
+                            adjustedComputedFields =
+                                adjustedComputedFields.map { field ->
+                                    field.copy(
+                                        offsetExpr = rewriteRegex.replace(field.offsetExpr, ktParam),
+                                        layoutExpr = rewriteRegex.replace(field.layoutExpr, ktParam),
+                                    )
+                                }
+                        }
+                        if (existingParamNames.add(ktParam)) {
+                            constLayoutParams += TypeLayoutParamSpec(ktParam, "Int = 0")
+                        }
+                    }
+                }
+            }
 
             ComputedStructLayout(
                 structKotlinName = structKtName,
                 repr = repr,
                 staticSizeBytes = finalStaticSize,
                 staticAlignBytes = finalStaticAlign,
-                sizeExpr = finalSizeExpr,
-                alignExpr = finalAlignExpr,
-                fields = computedFields,
-                requiredTypeLayoutParams = requiredParams,
-                helperOffsetDecls = helperOffsetDecls,
+                sizeExpr = adjustedSizeExpr,
+                alignExpr = adjustedAlignExpr,
+                fields = adjustedComputedFields,
+                requiredTypeLayoutParams = requiredParams + constLayoutParams,
+                helperOffsetDecls = adjustedHelperOffsetDecls,
                 useBodyPropertiesCtor = useFinalAbiLayout && computedFields.size > 64,
             )
         } finally {
             emitter.activeTypeParamNames = prevStructTypeParams
+            emitter.activeConstParamNames = prevStructConstParams
         }
     }
 
@@ -577,6 +630,9 @@ public object StructLayoutComputer {
         if (renderedFieldKt == "F16") {
             return FieldLayoutSpec(2L, 2L, "2L", "2L", "$primitiveLayoutsRef.F16_LAYOUT")
         }
+        if (renderedFieldKt == "F128") {
+            return FieldLayoutSpec(16L, 16L, "16L", "16L", "$primitiveLayoutsRef.F128_LAYOUT")
+        }
         val numKind = emitter.resolveNumericKind(renderedFieldKt) ?: return null
         if (numKind == NumericKind.I32 && rustLeafIdent == "isize") {
             val layoutConst = if (ptrBytes == 8L) "ISIZE64" else "ISIZE32"
@@ -593,10 +649,12 @@ public object StructLayoutComputer {
             NumericKind.U16 -> FieldLayoutSpec(2L, 2L, "2L", "2L", "$primitiveLayoutsRef.U16")
             NumericKind.I32 -> FieldLayoutSpec(4L, 4L, "4L", "4L", "$primitiveLayoutsRef.I32")
             NumericKind.U32 -> FieldLayoutSpec(4L, 4L, "4L", "4L", "$primitiveLayoutsRef.U32")
+            NumericKind.F16 -> FieldLayoutSpec(2L, 2L, "2L", "2L", "$primitiveLayoutsRef.F16_LAYOUT")
             NumericKind.F32 -> FieldLayoutSpec(4L, 4L, "4L", "4L", "$primitiveLayoutsRef.F32")
             NumericKind.I64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$primitiveLayoutsRef.I64")
             NumericKind.U64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$primitiveLayoutsRef.U64")
             NumericKind.F64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$primitiveLayoutsRef.F64")
+            NumericKind.F128 -> FieldLayoutSpec(16L, 16L, "16L", "16L", "$primitiveLayoutsRef.F128_LAYOUT")
             NumericKind.I128 -> {
                 emitter.usesI128 = true
                 FieldLayoutSpec(
@@ -956,6 +1014,76 @@ internal fun KotlinJ2KEmitter.computeRequiredTypeLayoutParameters(
                 }
             }
             super.visitExprMethodCall(e)
+        }
+
+        override fun visitExprPath(e: Expr.Path) {
+            val constIdent =
+                e.path.segments
+                    .toList()
+                    .lastOrNull()
+                    ?.ident
+                    ?.toString()
+                    ?.removePrefix("r#")
+            if (constIdent in SIZED_TYPE_PROPERTY_NAMES) {
+                val qself = e.qself
+                if (qself != null) {
+                    val segs = e.path.segments.toList()
+                    val traitSegName =
+                        if (qself.position > 0) {
+                            segs
+                                .getOrNull(qself.position - 1)
+                                ?.ident
+                                ?.toString()
+                                ?.removePrefix("r#")
+                        } else {
+                            null
+                        }
+                    if (qself.position == 0 ||
+                        traitSegName == "SizedTypeProperties" ||
+                        constIdent in setOf("IS_ZST", "LAYOUT", "MAX_SLICE_LEN", "ALIGNMENT")
+                    ) {
+                        recordRequiredFromSynType(qself.ty)
+                    }
+                } else {
+                    val segs = e.path.segments.toList()
+                    if (segs.size == 2) {
+                        val ownerRaw = segs[0].ident.toString().removePrefix("r#")
+                        val ownerKt = rustTypeIdentToKotlin(ownerRaw)
+                        val isSizedProp =
+                            ownerRaw != "Self" &&
+                                (
+                                    constIdent in setOf("IS_ZST", "LAYOUT", "MAX_SLICE_LEN", "ALIGNMENT") ||
+                                        !isScreamingSnakeIdent(ownerRaw)
+                                ) &&
+                                ownerKt !in inspector.unitStructNames &&
+                                constIdent !in inspector.declaredConstNames
+                        if (isSizedProp) {
+                            recordRequiredFromSynType(
+                                SynType.Path(
+                                    null,
+                                    io.github.kotlinmania.syn.Path
+                                        .from(segs[0].ident),
+                                ),
+                            )
+                            (segs[0].arguments as? PathArguments.AngleBracketed)
+                                ?.args
+                                ?.toList()
+                                .orEmpty()
+                                .filterIsInstance<GenericArgument.TypeArg>()
+                                .forEach { recordRequiredFromSynType(it.type) }
+                        }
+                    } else if (segs.size >= 3 && constIdent in setOf("IS_ZST", "LAYOUT", "MAX_SLICE_LEN", "ALIGNMENT")) {
+                        recordRequiredFromSynType(
+                            SynType.Path(
+                                null,
+                                io.github.kotlinmania.syn.Path
+                                    .from(segs[0].ident),
+                            ),
+                        )
+                    }
+                }
+            }
+            super.visitExprPath(e)
         }
 
         override fun visitExprCall(e: Expr.Call) {

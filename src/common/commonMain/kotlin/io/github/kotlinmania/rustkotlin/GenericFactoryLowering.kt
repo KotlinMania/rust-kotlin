@@ -237,8 +237,8 @@ internal fun KotlinJ2KEmitter.genericFactoryCallArguments(call: Expr.Call, selfT
         val layout =
             if (actual != null) {
                 sourcePointerLayout(actual, selfType) ?: run {
-                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.ObjectSlotLayout")
-                    "ObjectSlotLayout<${renderType(actual, selfType)}>()"
+                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+                    "UnresolvedTypeLayout<${renderType(actual, selfType)}>()"
                 }
             } else {
                 val fallbackRendered =
@@ -246,8 +246,8 @@ internal fun KotlinJ2KEmitter.genericFactoryCallArguments(call: Expr.Call, selfT
                         .toList()
                         .firstOrNull()
                         ?.let { inferExprRenderedType(it, selfType) } ?: "Any?"
-                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.ObjectSlotLayout")
-                "ObjectSlotLayout<$fallbackRendered>()"
+                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+                "UnresolvedTypeLayout<$fallbackRendered>()"
             }
         "${factoryLayoutName(parameter)} = $layout"
     }
@@ -259,6 +259,6 @@ internal fun KotlinJ2KEmitter.sourceFactoryCallLayout(call: Expr.Call, declarati
     val (leaf, substitutions) = transparentFactoryLeaf(declaration, selfType)
     sourcePointerLayout(leaf, selfType, substitutions = substitutions + bindings)?.let { return it }
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.ObjectSlotLayout")
-    return "ObjectSlotLayout<${renderType(substituteSourceType(leaf, substitutions + bindings), selfType)}>()"
+    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+    return "UnresolvedTypeLayout<${renderType(substituteSourceType(leaf, substitutions + bindings), selfType)}>()"
 }

@@ -857,10 +857,27 @@ private fun executeTranslate(
         } else {
             parsed.cfgTargetProfile
         }
-    val filteredDiscovered =
+    val supportedDiscovered =
         if (parsed.recursive && discovered.size > 1) {
+            discovered.filterNot { ent ->
+                val discRoot = ent.discoveryRoot
+                val normEnt = ent.inputPath.replace('\\', '/')
+                val relPath =
+                    if (discRoot != null && normEnt.startsWith("$discRoot/")) {
+                        normEnt.removePrefix("$discRoot/")
+                    } else {
+                        ent.relativeDir.takeIf { it.isNotEmpty() }?.let { "$it/${normEnt.substringAfterLast('/')}" }
+                            ?: normEnt.substringAfterLast('/')
+                    }
+                isUnsupportedTargetRustRelPath(relPath, effectiveCfgProfile)
+            }
+        } else {
+            discovered
+        }
+    val filteredDiscovered =
+        if (parsed.recursive && supportedDiscovered.size > 1) {
             val disabledByRoot = mutableMapOf<String, Set<String>>()
-            for ((discRoot, entriesInRoot) in discovered.groupBy { it.discoveryRoot }) {
+            for ((discRoot, entriesInRoot) in supportedDiscovered.groupBy { it.discoveryRoot }) {
                 if (discRoot == null) continue
                 val relTextMap = linkedMapOf<String, String>()
                 for (ent in entriesInRoot) {
@@ -880,7 +897,7 @@ private fun executeTranslate(
                         skipCfgTest = parsed.portLintDirective != "tests",
                     )
             }
-            discovered.filterNot { ent ->
+            supportedDiscovered.filterNot { ent ->
                 val discRoot = ent.discoveryRoot ?: return@filterNot false
                 val disabledSet = disabledByRoot[discRoot].orEmpty()
                 if (disabledSet.isEmpty()) return@filterNot false
@@ -894,7 +911,7 @@ private fun executeTranslate(
                 isRelPathUnderDisabledModulePrefix(relPath, disabledSet)
             }
         } else {
-            discovered
+            supportedDiscovered
         }
     var resolvedProjectNamespaceForScaffold: String? = parsed.namespaceOverride ?: explicitGradleProps?.projectNamespace
     val isBatchOutput =
@@ -979,7 +996,13 @@ private fun executeTranslate(
             )
 
         val finalGroup = parsed.groupOverride ?: inferredHeader.projectGroup
-        val finalNamespace = parsed.namespaceOverride ?: inferredHeader.projectNamespace
+        val finalNamespace =
+            parsed.namespaceOverride
+                ?: parsed.packageOverride
+                    ?.trim()
+                    ?.removeSuffix(".")
+                    ?.takeIf { it.isNotEmpty() }
+                ?: inferredHeader.projectNamespace
         if (resolvedProjectNamespaceForScaffold == null && finalNamespace != null) {
             resolvedProjectNamespaceForScaffold = finalNamespace
         }
@@ -1059,6 +1082,7 @@ private fun executeTranslate(
                 projectGroup = finalGroup,
                 projectNamespace = finalNamespace,
                 crateNamespaces = finalCrateNamespaces,
+                projectFfiName = inferredHeader.projectFfiName,
                 portLintDirective = if (isModRoot) "none" else parsed.portLintDirective,
                 crateMacroSources = inferredHeader.crateMacroSources,
                 crateFlatFileModules = inferredHeader.crateFlatFileModules,
@@ -1066,6 +1090,8 @@ private fun executeTranslate(
                 finalClasses = parsed.finalStructs,
                 selfCrateAliases = crateMetadata.selfCrateAliases,
                 includedSubdirModuleMap = crateMetadata.includedSubdirModuleMap,
+                rootSelfDirModuleAliases = crateMetadata.rootSelfDirModuleAliases,
+                rootExternalModuleReexports = crateMetadata.rootExternalModuleReexports,
                 crateTypeAliasDefaults = crateMetadata.typeAliasDefaults,
                 crateOptionFnTypes = crateMetadata.optionFnTypes,
                 crateNumericTypeKinds = effectiveFfiMeta?.numericTypeKinds.orEmpty(),
@@ -1347,12 +1373,31 @@ private fun executeTranslate(
             val constPtrContent = "package $inferredCorePkg.ptr\n\n${CoreIntrinsicFfiArtifacts.renderConstPtrClassHeader()}\n"
             val mutPtrPath = "$projRootPrefix$commonMarker${inferredCorePkg.replace('.', '/')}/ptr/MutPtr.kt"
             val mutPtrContent = "package $inferredCorePkg.ptr\n\n${CoreIntrinsicFfiArtifacts.renderMutPtrClassHeader()}\n"
+            val int128SupportPath = "$projRootPrefix$commonMarker${inferredCorePkg.replace('.', '/')}/Int128Support.kt"
+            val int128SupportContent =
+                renderSynthesizedInt128SupportFile(
+                    inferredCorePkg,
+                    coreIntrinsicsPackage = "$inferredCorePkg.intrinsics",
+                )
+            val rustAnySupportPath = "$projRootPrefix$commonMarker${inferredCorePkg.replace('.', '/')}/RustAnySupport.kt"
+            val rustAnySupportContent = renderSynthesizedAnySupportFile(inferredCorePkg)
+            val floatSupportPath = "$projRootPrefix$commonMarker${inferredCorePkg.replace('.', '/')}/FloatSupport.kt"
+            val floatSupportContent = renderSynthesizedFloatSupportFile(inferredCorePkg)
+            val supportFiles =
+                listOf(
+                    int128SupportPath to int128SupportContent,
+                    rustAnySupportPath to rustAnySupportContent,
+                    floatSupportPath to floatSupportContent,
+                )
             if (parsed.dryRun) {
                 if (!parsed.quiet) {
                     report("dry-run: core-type-layout -> $typeLayoutPath")
                     if (parsed.splitModuleRoots) {
                         report("dry-run: core-ptr -> $constPtrPath")
                         report("dry-run: core-ptr -> $mutPtrPath")
+                    }
+                    for ((supPath, _) in supportFiles) {
+                        report("dry-run: core-support -> $supPath")
                     }
                     for (comp in kmCoreCompanions) {
                         report("dry-run: core-intrinsic-companion -> ${resolveCompanionOutputPath(intrinsicsAnchor, comp)}")
@@ -1364,6 +1409,14 @@ private fun executeTranslate(
                         writeForce(typeLayoutPath, typeLayoutContent)
                     } else {
                         write(typeLayoutPath, typeLayoutContent)
+                    }
+                }
+                for ((supPath, supContent) in supportFiles) {
+                    if (parsed.skipExisting && exists(supPath)) continue
+                    if (parsed.forceOverwrite) {
+                        writeForce(supPath, supContent)
+                    } else {
+                        write(supPath, supContent)
                     }
                 }
                 if (parsed.splitModuleRoots) {
@@ -1387,7 +1440,7 @@ private fun executeTranslate(
                 }
                 if (!parsed.quiet) {
                     val ptrCount = if (parsed.splitModuleRoots) 2 else 0
-                    report("core-intrinsic-artifacts -> $projRootPrefix (${kmCoreCompanions.size + 1 + ptrCount} files)")
+                    report("core-intrinsic-artifacts -> $projRootPrefix (${kmCoreCompanions.size + 1 + supportFiles.size + ptrCount} files)")
                 }
             }
         } else if (markerIdx >= 0 && emittedNapiModules.isNotEmpty() && !parsed.dryRun) {
@@ -1402,6 +1455,9 @@ private fun executeTranslate(
                 }
             }
             for (ffiMod in emittedNapiModules) {
+                if (ffiMod == "kmcore" && exists("${projRootPrefix}src/js/node-kmcore/src/kmcore_bindings.cpp")) {
+                    continue
+                }
                 val stem = "${ffiMod}_kmcore_intrinsics"
                 val napiBridgePath = "${projRootPrefix}src/js/node-$ffiMod/src/${stem}_bindings.cpp"
                 if (parsed.skipExisting && exists(napiBridgePath)) continue

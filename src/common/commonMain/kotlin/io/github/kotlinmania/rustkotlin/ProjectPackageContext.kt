@@ -10,6 +10,7 @@ public data class GradleProjectProperties(
     public val projectNamespace: String? = null,
     public val projectName: String? = null,
     public val crateNamespaces: Map<String, String> = emptyMap(),
+    public val projectFfiName: String? = null,
 )
 
 public data class FolderPackageProperties(
@@ -86,6 +87,7 @@ public fun parseGradleProperties(content: String): GradleProjectProperties {
         projectNamespace = derivedNamespace,
         projectName = name,
         crateNamespaces = extractCrateNamespaceOverrides(map),
+        projectFfiName = map["project.ffi.name"]?.takeIf { it.isNotEmpty() },
     )
 }
 
@@ -203,6 +205,7 @@ public data class FileHeaderContext(
     public val projectGroup: String? = null,
     public val projectNamespace: String? = null,
     public val crateNamespaces: Map<String, String> = emptyMap(),
+    public val projectFfiName: String? = null,
     public val portLintDirective: String = "source",
     public val crateMacroSources: List<String> = emptyList(),
     public val crateFlatFileModules: List<String> = emptyList(),
@@ -211,6 +214,8 @@ public data class FileHeaderContext(
     public val finalClasses: Boolean = false,
     public val selfCrateAliases: Set<String> = emptySet(),
     public val includedSubdirModuleMap: Map<String, String> = emptyMap(),
+    public val rootSelfDirModuleAliases: Set<String> = emptySet(),
+    public val rootExternalModuleReexports: Map<String, String> = emptyMap(),
     public val crateTypeAliasDefaults: Map<String, String> = emptyMap(),
     public val crateOptionFnTypes: Set<String> = emptySet(),
     public val crateNumericTypeKinds: Map<String, String> = emptyMap(),
@@ -533,6 +538,7 @@ internal fun inferFileHeaderContextWithResolvers(
         projectGroup = effectiveGroup,
         projectNamespace = effectiveNamespace,
         crateNamespaces = effectiveCrateNamespaces,
+        projectFfiName = resolvedProps?.projectFfiName,
         portLintDirective = portLintDirective,
         crateMacroSources = crateMacros,
         crateFlatFileModules = crateFlatModules,
@@ -543,10 +549,19 @@ internal fun inferFileHeaderContextWithResolvers(
 }
 
 internal fun extractTmpSubcrateName(inputPath: String): String? {
-    val normalized = inputPath.replace('\\', '/')
-    val tmpIdx = normalized.indexOf("/tmp/")
-    if (tmpIdx < 0) return null
-    val afterTmp = normalized.substring(tmpIdx + "/tmp/".length)
+    var cleaned = inputPath.replace('\\', '/')
+    while (cleaned.startsWith("./")) {
+        cleaned = cleaned.substring(2)
+    }
+    val afterTmp =
+        when {
+            cleaned.startsWith("tmp/") -> cleaned.substring("tmp/".length)
+            else -> {
+                val tmpIdx = cleaned.indexOf("/tmp/")
+                if (tmpIdx < 0) return null
+                cleaned.substring(tmpIdx + "/tmp/".length)
+            }
+        }
     val slashAfterRepo = afterTmp.indexOf('/')
     if (slashAfterRepo <= 0) return null
     val repoName = afterTmp.substring(0, slashAfterRepo)
@@ -605,9 +620,19 @@ internal fun inferPortLintRelativePath(
     if (srcIdx >= 0) {
         return normalized.substring(srcIdx + "/src/".length)
     }
-    val tmpIdx = normalized.indexOf("/tmp/")
-    if (tmpIdx >= 0) {
-        val afterTmp = normalized.substring(tmpIdx + "/tmp/".length)
+    var cleanedForTmp = normalized
+    while (cleanedForTmp.startsWith("./")) {
+        cleanedForTmp = cleanedForTmp.substring(2)
+    }
+    val afterTmp =
+        when {
+            cleanedForTmp.startsWith("tmp/") -> cleanedForTmp.substring("tmp/".length)
+            else -> {
+                val tmpIdx = cleanedForTmp.indexOf("/tmp/")
+                if (tmpIdx >= 0) cleanedForTmp.substring(tmpIdx + "/tmp/".length) else null
+            }
+        }
+    if (afterTmp != null) {
         val slashAfterRepo = afterTmp.indexOf('/')
         if (slashAfterRepo >= 0) {
             val insideRepo = afterTmp.substring(slashAfterRepo + 1)

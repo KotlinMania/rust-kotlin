@@ -18,9 +18,11 @@ import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.Lit
 import io.github.kotlinmania.syn.Macro
 import io.github.kotlinmania.syn.Member
+import io.github.kotlinmania.syn.ModContent
 import io.github.kotlinmania.syn.Pat
 import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
+import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.ReturnType
 import io.github.kotlinmania.syn.Signature
 import io.github.kotlinmania.syn.Stmt
@@ -46,6 +48,7 @@ internal fun KotlinJ2KEmitter.liftDefaultlessAssocTypesFromBounds(
     combinedParams: List<GenericParam>,
     ownerWhere: WhereClause?,
     fnWhere: WhereClause?,
+    implWhere: WhereClause? = null,
 ): List<String> {
     val existingParams =
         combinedParams
@@ -72,7 +75,11 @@ internal fun KotlinJ2KEmitter.liftDefaultlessAssocTypesFromBounds(
             inspectBounds(gp.bounds.toList())
         }
     }
-    for (pred in ownerWhere?.predicates?.toList().orEmpty() + fnWhere?.predicates?.toList().orEmpty()) {
+    val allWherePredicates =
+        ownerWhere?.predicates?.toList().orEmpty() +
+            implWhere?.predicates?.toList().orEmpty() +
+            fnWhere?.predicates?.toList().orEmpty()
+    for (pred in allWherePredicates) {
         if (pred is WherePredicate.TypePredicate) {
             inspectBounds(pred.bounds.toList())
         }
@@ -607,6 +614,10 @@ internal fun KotlinJ2KEmitter.describeSynTypeForDisambiguation(ty: SynType?): St
     if (ty == null) return ""
     return when (val u = unwrapSynType(ty)) {
         is SynType.Reference -> describeSynTypeForDisambiguation(u.elem)
+        is SynType.Ptr -> {
+            val mutPrefix = if (u.mutability is PointerMutability.Mut) "MutPtr" else "ConstPtr"
+            "$mutPrefix${describeSynTypeForDisambiguation(u.elem)}"
+        }
         is SynType.Array -> {
             val elemDesc = describeSynTypeForDisambiguation(u.elem)
             val lenDesc = renderExpr(u.len, "", null).filter { it.isLetterOrDigit() }
@@ -680,12 +691,14 @@ internal fun KotlinJ2KEmitter.disambiguateReceiverTraitImplFnName(
             ?.mapNotNull { (it as? GenericArgument.TypeArg)?.type?.let(this::describeSynTypeForDisambiguation) }
             ?.joinToString("")
             .orEmpty()
-    val unwrappedSelf = selfSynType?.let(::unwrapSynType) as? SynType.Array
+    val unwrappedSelf = selfSynType?.let(::unwrapSynType)
     val selfArrSuffix =
-        if (unwrappedSelf != null) {
-            "From${describeSynTypeForDisambiguation(unwrappedSelf)}"
-        } else {
-            ""
+        when {
+            unwrappedSelf is SynType.Array -> "From${describeSynTypeForDisambiguation(unwrappedSelf)}"
+            traitArgSuffix.isEmpty() &&
+                (unwrappedSelf is SynType.Ptr || unwrappedSelf is SynType.Tuple || unwrappedSelf is SynType.Slice) ->
+                "From${describeSynTypeForDisambiguation(unwrappedSelf)}"
+            else -> ""
         }
     return "$fnName$traitArgSuffix$selfArrSuffix"
 }
@@ -786,6 +799,7 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
             combinedParams = combinedParams,
             ownerWhere = if (includeOwner) ownerGenerics?.whereClause else null,
             fnWhere = sig.generics.whereClause,
+            implWhere = if (includeOwner && implGenerics !== ownerGenerics) implGenerics?.whereClause else null,
         )
     if (liftedAssocs.isNotEmpty()) {
         activeTypeParamNames = activeTypeParamNames + liftedAssocs
@@ -913,12 +927,14 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
         }
     }
 
+    val defaultLayoutParamNames = linkedSetOf<String>()
     if (!hasReceiver) {
         transparentConstructorField(selfTypeName, fnBlock)?.let { (_, fieldType) ->
             val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
             CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.TypeLayout")
             val layoutType = "TypeLayout<$fieldType>"
             params += "fieldLayout: $layoutType"
+            defaultLayoutParamNames += "fieldLayout"
             paramTypeSignatureKeys += eraseTypeForSignatureKey(layoutType)
             currentTypedLocals = currentTypedLocals + ("fieldLayout" to layoutType)
         }
@@ -950,6 +966,7 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
     for ((layoutName, layoutType) in layoutParams) {
         if (params.none { it.startsWith("$layoutName:") }) {
             params += "$layoutName: $layoutType"
+            defaultLayoutParamNames += layoutName
             paramTypeSignatureKeys += eraseTypeForSignatureKey(layoutType)
             currentTypedLocals = currentTypedLocals + (layoutName to layoutType)
         }
@@ -1185,7 +1202,22 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
     val inlinePrefix = if (reifiedFnTypeParams.isNotEmpty()) "inline " else ""
     val operatorPrefix = if (hasReceiver && effectiveFnName == "compareTo" && renderedReturnType == "Int") "operator " else ""
     val typeParamsPart = if (effectiveTypeParamsStr.isNotEmpty()) "$effectiveTypeParamsStr " else ""
-    return "${visPrefix}${effectiveOpenPrefix}${operatorPrefix}${inlinePrefix}fun ${typeParamsPart}${receiverPrefix}$effectiveFnName(${params.joinToString(", ")})${retTypeStr}$whereClause"
+    val finalParams =
+        if (!effectiveOpenPrefix.contains("override") && defaultLayoutParamNames.isNotEmpty()) {
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+            params.map { param ->
+                val pName = param.substringBefore(':').trim()
+                if (pName in defaultLayoutParamNames && !param.contains('=')) {
+                    "$param = UnresolvedTypeLayout()"
+                } else {
+                    param
+                }
+            }
+        } else {
+            params
+        }
+    return "${visPrefix}${effectiveOpenPrefix}${operatorPrefix}${inlinePrefix}fun ${typeParamsPart}${receiverPrefix}$effectiveFnName(${finalParams.joinToString(", ")})${retTypeStr}$whereClause"
 }
 
 private fun prefixTopLevelTypeParamWithReified(typeParamsStr: String, tpKt: String): String {
@@ -1467,6 +1499,7 @@ internal fun KotlinJ2KEmitter.computeReceiverSignatureKey(receiverPrefix: String
 internal fun KotlinJ2KEmitter.eraseTypeForSignatureKey(renderedType: String): String {
     val nonNull = renderedType.removeSuffix("?")
     val base = nonNull.substringBefore('<').trim()
+    if (base in activeTypeParamNames) return "*"
     val keepNullability = base in KOTLIN_JVM_VALUE_TYPES
     return if (keepNullability && renderedType.endsWith("?")) "$base?" else base
 }
@@ -1688,6 +1721,7 @@ internal fun KotlinJ2KEmitter.renderBlock(
     val blockEntryExpectedKind = currentExpectedNumericKind
     val blockEntryTailExpectsUnitResultOk = currentTailExpectsUnitResultOk
     val savedBlockLocalFnRawNames = hashSetOf<String>()
+    val savedBlockLocalInlineModNames = hashSetOf<String>()
     val prevBlockLocalFnReturnSynTypes = linkedMapOf<String, SynType?>()
     currentExpectedNumericKind = null
     currentTailExpectsUnitResultOk = false
@@ -1746,6 +1780,12 @@ internal fun KotlinJ2KEmitter.renderBlock(
             if (itemHasDocOnlyCfg(itemInStmt)) continue
             if (itemInStmt is Item.Use) {
                 registerUseItemInScope(itemInStmt)
+            } else if (itemInStmt is Item.Mod && itemInStmt.content is ModContent.Inline) {
+                val modRaw = itemInStmt.ident.toString().removePrefix("r#")
+                if (modRaw !in inspector.localInlineModuleNames) {
+                    savedBlockLocalInlineModNames += modRaw
+                    inspector.localInlineModuleNames += modRaw
+                }
             }
         }
         val hoistedItems = mutableListOf<Pair<String?, String>>()
@@ -1840,6 +1880,7 @@ internal fun KotlinJ2KEmitter.renderBlock(
         }
     } finally {
         inspector.declaredTopLevelFnRawNames.removeAll(savedBlockLocalFnRawNames)
+        inspector.localInlineModuleNames.removeAll(savedBlockLocalInlineModNames)
         for ((fnKey, prevSyn) in prevBlockLocalFnReturnSynTypes) {
             if (prevSyn == null) {
                 inspector.topLevelFnReturnSynTypes.remove(fnKey)
@@ -2334,7 +2375,8 @@ internal fun KotlinJ2KEmitter.tryRenderDeferredLocalResultMatchInit(
                 }
             }
         val resultType = sourceResultName()
-        out += "${trivia1}${trivia2}${innerIndent}val $okVar = when (val matchResult = $subjectRendered) { is $resultType.Ok<*> -> matchResult.value; is $resultType.Err<*> -> $errRender }"
+        val starArgs = if (isUntypedResultScrutinee(inferExprRenderedType(matchExpr.expr, selfTypeName))) "<*, *>" else ""
+        out += "${trivia1}${trivia2}${innerIndent}val $okVar = when (val matchResult = $subjectRendered) { is $resultType.Ok$starArgs -> matchResult.value; is $resultType.Err$starArgs -> $errRender }"
     } else {
         val errRender =
             run {
@@ -2892,8 +2934,20 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
             currentNullableLocals = currentNullableLocals + patText
         }
     }
+    val coreResultLetElseInfo =
+        if (divergeBody != null && unwrappedPat is Pat.TupleStruct && !patText.startsWith("(")) {
+            coreResultVariantMatchInfo(unwrappedPat)
+        } else {
+            null
+        }
     val typeSuffix = if (typeAnnotation != null && !patText.startsWith("(")) ": $typeAnnotation" else ""
-    return if (divergeBody != null) {
+    return if (coreResultLetElseInfo != null && divergeBody != null) {
+        val isOkVariant = coreResultLetElseInfo.first.endsWith(".Ok")
+        val divergeVariant = if (isOkVariant) "${sourceResultName()}.Err" else "${sourceResultName()}.Ok"
+        val starArgs = if (isUntypedResultScrutinee(inferExprRenderedType(initExpr, selfTypeName))) "<*, *>" else ""
+        val tryVar = scopeBuilder.bindLocal("_try", "tryResult", initExpr.span()).kotlinName
+        "$indent$keyword $patText$typeSuffix = when (val $tryVar = $rhs) { is ${coreResultLetElseInfo.first}$starArgs -> $tryVar.${coreResultLetElseInfo.second}; is $divergeVariant$starArgs -> $divergeBody }"
+    } else if (divergeBody != null) {
         "$indent$keyword $patText$typeSuffix = $rhs ?: $divergeBody"
     } else if (headerContext.isBatchCrateOutput && rhs.contains('\n')) {
         "$indent$keyword $patText$typeSuffix =\n$indent    ${rhs.replace("\n", "\n    ")}"
@@ -3585,6 +3639,38 @@ private fun KotlinJ2KEmitter.renderAddressableLocal(
                 }
                 super.visitExprMethodCall(e)
             }
+            override fun visitExprCall(e: Expr.Call) {
+                val calleeLeaf =
+                    (e.func as? Expr.Path)
+                        ?.path
+                        ?.segments
+                        ?.toList()
+                        ?.lastOrNull()
+                        ?.ident
+                        ?.toString()
+                        ?.removePrefix("r#")
+                val minVarargAddrIdx =
+                    when (calleeLeaf) {
+                        "ioctl", "fcntl" -> 2
+                        "syscall", "prctl" -> 1
+                        else -> Int.MAX_VALUE
+                    }
+                for ((argIdx, argExpr) in e.args.toList().withIndex()) {
+                    val reference = unwrapParenOrGroupExpr(argExpr) as? Expr.Reference
+                    if (reference != null && isSelfIdentPath(reference.expr)) {
+                        val isPtrParam =
+                            argIdx >= minVarargAddrIdx ||
+                                resolveCalleeExprParamSynType(e.func, argIdx, selfTypeName) is SynType.Ptr
+                        if (isPtrParam) {
+                            rawAddressTaken = true
+                            if (reference.mutability == null) {
+                                storageOnlyMentions++
+                            }
+                        }
+                    }
+                }
+                super.visitExprCall(e)
+            }
             override fun visitExprRawAddr(e: Expr.RawAddr) {
                 if (isSelfIdentPath(e.expr)) {
                     rawAddressTaken = true
@@ -3650,8 +3736,8 @@ private fun KotlinJ2KEmitter.renderAddressableLocal(
                     val elemRendered = arrayElemRendered ?: renderType(sourceType.elem, selfTypeName)
                     val elemLayout =
                         sourcePointerLayout(sourceType.elem, selfTypeName) ?: run {
-                            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.ObjectSlotLayout")
-                            "ObjectSlotLayout<$elemRendered>()"
+                            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+                            "UnresolvedTypeLayout<$elemRendered>()"
                         }
                     arrayElementLayoutExpr = elemLayout
                     ""
@@ -3665,15 +3751,17 @@ private fun KotlinJ2KEmitter.renderAddressableLocal(
                 }
         }
     if (codec == null) {
-        if (!rawAddressTaken) {
+        val allowAddressBackedMutRef =
+            mutRefTaken && sourceType != null && shouldUseAddressBackedMutableReference(sourceType, selfTypeName)
+        if (!rawAddressTaken && !allowAddressBackedMutRef) {
             return null
         }
         val fallbackRendered =
             sourceType?.let { renderType(it, selfTypeName) }
                 ?: inferExprRenderedType(init, selfTypeName)
                 ?: "Any?"
-        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.ObjectSlotLayout")
-        codec = "ObjectSlotLayout<$fallbackRendered>()"
+        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+        codec = "UnresolvedTypeLayout<$fallbackRendered>()"
     }
     val previousTarget = currentExpectedParseTargetType
     val type =
@@ -3711,8 +3799,8 @@ private fun KotlinJ2KEmitter.renderAddressableLocal(
                 val elemRendered = arrayElemRendered ?: renderType(sourceType.elem, selfTypeName)
                 val elemLayout =
                     arrayElementLayoutExpr ?: sourcePointerLayout(sourceType.elem, selfTypeName) ?: run {
-                        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.ObjectSlotLayout")
-                        "ObjectSlotLayout<$elemRendered>()"
+                        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+                        "UnresolvedTypeLayout<$elemRendered>()"
                     }
                 "AddressableArrayLocal.fromList($rhs, $elemLayout)"
             }
