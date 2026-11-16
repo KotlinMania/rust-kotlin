@@ -262,7 +262,7 @@ Other Kotlin Multiplatform targets are declared in the build but switched off in
 
 All dependencies are KotlinMania ports published under `io.github.kotlinmania`:
 `proc-macro2-kotlin`, `syn-kotlin`, `quote-kotlin`, `rust-lang-kotlin`, `km-io`,
-`libc-kotlin`, `serde-json-kotlin`, `serde-derive`, `anyhow-kotlin`, `num-bigint-kotlin`,
+`libc-kotlin`, `serde-json-kotlin`, `serde-kotlin`, `anyhow-kotlin`, `num-bigint-kotlin`,
 `rand-kotlin` and `windows-sys-kotlin`. Versions are pinned in
 [gradle/libs.versions.toml](gradle/libs.versions.toml). `maven.properties` controls
 whether Maven Local is consulted first.
