@@ -685,7 +685,7 @@ class SingleFileTranslationFfiAndAbiTest {
             isDirectory = { it == "tmp/windows-sys/src" },
             collectRustFiles = { fileMap.keys.toList() },
             report = {},
-            resolveGradleProperties = { null },
+            resolveRustKotlinProperties = { null },
             resolvePackageProperties = { null },
             resolveCrateMacroSources = { emptyList() },
             resolveCrateFlatFileModules = { _, _ -> emptySet() },

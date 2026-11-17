@@ -131,10 +131,10 @@ class RustTranspilerPluginTest : BasePlatformTestCase() {
         assertTrue(updatedText.contains("public fun add(a: Int, b: Int): Int"))
     }
 
-    fun testGradlePropertiesConfiguresPackageAndImportsWithoutHardcoding() {
-        val gradlePropsFile =
+    fun testRustKotlinPropertiesConfiguresPackageAndImportsWithoutHardcoding() {
+        val rustKotlinPropsFile =
             myFixture.tempDirFixture.createFile(
-                "gradle.properties",
+                "rustkotlin.properties",
                 """
                 project.group=org.example.customgroup
                 project.namespace=org.example.customgroup.mycrate
@@ -152,7 +152,7 @@ class RustTranspilerPluginTest : BasePlatformTestCase() {
             )
 
         val service = project.getService(RustTranspilerService::class.java)
-        val props = service.loadGradleProperties(gradlePropsFile)
+        val props = service.loadRustKotlinProperties(rustKotlinPropsFile)
         val generatedKt = checkNotNull(service.transpileVirtualFile(rustFile, props))
         val kotlinText = VfsUtilCore.loadText(generatedKt)
 
@@ -161,10 +161,10 @@ class RustTranspilerPluginTest : BasePlatformTestCase() {
         assertFalse(kotlinText.contains("io.github.kotlinmania"))
     }
 
-    fun testPerFolderPackagePropertiesOverridesGradleProperties() {
-        val gradlePropsFile =
+    fun testPerFolderPackagePropertiesOverridesRustKotlinProperties() {
+        val rustKotlinPropsFile =
             myFixture.tempDirFixture.createFile(
-                "gradle.properties",
+                "rustkotlin.properties",
                 """
                 project.group=io.github.kotlinmania
                 project.namespace=io.github.kotlinmania.indexmap
@@ -187,7 +187,7 @@ class RustTranspilerPluginTest : BasePlatformTestCase() {
             )
 
         val service = project.getService(RustTranspilerService::class.java)
-        val props = service.loadGradleProperties(gradlePropsFile)
+        val props = service.loadRustKotlinProperties(rustKotlinPropsFile)
         val generatedKt = checkNotNull(service.transpileVirtualFile(rustFile, props))
         val kotlinText = VfsUtilCore.loadText(generatedKt)
 
@@ -197,7 +197,7 @@ class RustTranspilerPluginTest : BasePlatformTestCase() {
 
     fun testRightClickDirectoryRecursivelyTranslatesRustFilesToNeighboringKtFiles() {
         myFixture.tempDirFixture.createFile(
-            "gradle.properties",
+            "rustkotlin.properties",
             """
             project.group=io.github.kotlinmania
             project.namespace=io.github.kotlinmania.serdejson
@@ -298,7 +298,7 @@ class RustTranspilerPluginTest : BasePlatformTestCase() {
 
     fun testCrateLevelMacroUseDiscoveryExpandsLibcStructsInVirtualDirectory() {
         myFixture.tempDirFixture.createFile(
-            "gradle.properties",
+            "rustkotlin.properties",
             """
             project.group=io.github.kotlinmania
             project.name=libc-kotlin
@@ -380,7 +380,7 @@ class RustTranspilerPluginTest : BasePlatformTestCase() {
 
     fun testInlineCAndExternCRustFileEmitsCompanionCInteropFilesInVirtualDirectory() {
         myFixture.tempDirFixture.createFile(
-            "gradle.properties",
+            "rustkotlin.properties",
             """
             project.group=io.github.kotlinmania
             project.name=libc-kotlin

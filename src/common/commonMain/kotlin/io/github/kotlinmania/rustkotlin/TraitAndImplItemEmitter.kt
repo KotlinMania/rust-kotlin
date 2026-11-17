@@ -850,7 +850,36 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
         val assocParamDecls =
             assocTypeNames.map { assocKt ->
                 val rawAssoc = rawAssocByKtName[assocKt]
-                val isCovariant = allowOutAssoc && rawAssoc != null && isAssocTypeCovariantInTrait(item, rawAssoc)
+                val inheritedCovariant =
+                    rawAssoc == null &&
+                        isAssocTypeCovariantInTrait(item, assocKt) &&
+                        item.supertraits.toList().any { bound ->
+                            val path = (bound as? TypeParamBound.Trait)?.takeIf { it.maybe == null }?.path ?: return@any false
+                            val superKt =
+                                rustTypeIdentToKotlin(
+                                    path.segments
+                                        .last()
+                                        ?.ident
+                                        ?.toString()
+                                        .orEmpty(),
+                                )
+                            assocKt in lookupTraitDefaultlessAssocTypes(superKt, path)
+                        } &&
+                        item.supertraits.toList().all { bound ->
+                            val path = (bound as? TypeParamBound.Trait)?.takeIf { it.maybe == null }?.path ?: return@all true
+                            val superKt =
+                                rustTypeIdentToKotlin(
+                                    path.segments
+                                        .last()
+                                        ?.ident
+                                        ?.toString()
+                                        .orEmpty(),
+                                )
+                            if (assocKt !in lookupTraitDefaultlessAssocTypes(superKt, path)) return@all true
+                            val superDecl = lookupDeclaredTraitAst(superKt, path) ?: return@all false
+                            isAssocTypeCovariantInTrait(superDecl, assocKt)
+                        }
+                val isCovariant = allowOutAssoc && ((rawAssoc != null && isAssocTypeCovariantInTrait(item, rawAssoc)) || inheritedCovariant)
                 if (isCovariant) "out $assocKt" else assocKt
             }
         val combinedTraitParams =
@@ -946,7 +975,7 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
                             val defaultBlock = tItem.default
                             if (defaultBlock != null) {
                                 val retType = extractReturnSynType(tItem.sig.output)
-                                val shadows = computeReassignedParamShadows(tItem.sig, defaultBlock, "$indent        ")
+                                val shadows = computeReassignedParamShadows(tItem.sig, defaultBlock, "$indent        ", selfTypeName = memberSelfType)
                                 val prevInTraitDefault = inTraitDefaultMethodBody
                                 inTraitDefaultMethodBody = true
                                 val body =
@@ -1573,7 +1602,7 @@ internal fun KotlinJ2KEmitter.renderImplItemFn(
         val retType = extractReturnSynType(item.sig.output)
         val panicExpectation = if (!isLocalItem && hasTestAttribute(item.attrs)) extractRustPanicExpectation(item.attrs) else null
         val bodyIndent = if (panicExpectation == null) indent else "$indent    "
-        val shadows = computeReassignedParamShadows(item.sig, item.block, "$bodyIndent    ")
+        val shadows = computeReassignedParamShadows(item.sig, item.block, "$bodyIndent    ", selfTypeName = selfTypeName)
         val accessorFields =
             if (retType is SynType.Reference && retType.mutability != null) {
                 selfTypeName?.substringBefore('<')?.let { owner ->

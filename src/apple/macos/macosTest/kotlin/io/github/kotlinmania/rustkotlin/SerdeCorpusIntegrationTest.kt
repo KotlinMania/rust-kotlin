@@ -78,6 +78,16 @@ class SerdeCorpusIntegrationTest {
         if (fs.metadataOrNull(srcRoot)?.isDirectory != true) return
         val tempOutRoot = KmPath("build/test-scratch/serde-core-${randomLong().toULong()}")
         fs.createDirectories(tempOutRoot, mustCreate = false)
+        val serdePropsContent =
+            """
+            project.group=io.github.kotlinmania
+            project.name=serde-kotlin
+            project.namespace=io.github.kotlinmania.serde
+            crate.serde_core=io.github.kotlinmania.serdecore
+            """.trimIndent()
+        val serdePropsPath = KmPath(tempOutRoot, "rustkotlin.properties").toString()
+        writeOverwrite(serdePropsPath, serdePropsContent)
+        val serdeProps = parseRustKotlinProperties(serdePropsContent)
         val rustFiles = mutableListOf<KmPath>()
         fun collectAllRustFiles(dir: KmPath) {
             for (entry in fs.list(dir)) {
@@ -104,7 +114,13 @@ class SerdeCorpusIntegrationTest {
                     fs.createDirectories(outDir, mustCreate = false)
                     val ktFile = KmPath(outDir, ktName)
                     runSingleFileCommand(
-                        arrayOf("translate", rustFile.toString(), ktFile.toString()),
+                        arrayOf(
+                            "translate",
+                            "--rustkotlin-properties",
+                            serdePropsPath,
+                            rustFile.toString(),
+                            ktFile.toString(),
+                        ),
                         read = ::readInput,
                         write = ::writeOverwrite,
                         report = {},
@@ -119,6 +135,7 @@ class SerdeCorpusIntegrationTest {
                         inferFileHeaderContext(
                             inputPath = rustFile.toString(),
                             outputPath = rustFile.toString().removeSuffix(".rs") + ".kt",
+                            rustKotlinProperties = serdeProps,
                         )
                     val translated = renderSingleKotlinFile(source, headerContext)
                     assertTrue(translated.text.isNotEmpty(), "Expected non-empty translation for $rustFile")
@@ -160,6 +177,7 @@ class SerdeCorpusIntegrationTest {
                         inferFileHeaderContext(
                             inputPath = rf.toString(),
                             outputPath = rf.toString().removeSuffix(".rs") + ".kt",
+                            rustKotlinProperties = serdeProps,
                         )
                     val tr = renderSingleKotlinFile(src, hc)
                     assertTrue(tr.text.isNotEmpty(), "Expected non-empty translation for $rf")
@@ -174,6 +192,17 @@ class SerdeCorpusIntegrationTest {
     fun synNamedRegressionCorpusTranslation() {
         val srcRoot = KmPath("../syn-kotlin/tmp/syn/src")
         if (fs.metadataOrNull(srcRoot)?.isDirectory != true) return
+        val scratchDir = KmPath("build/test-scratch/syn-${randomLong().toULong()}")
+        fs.createDirectories(scratchDir, mustCreate = false)
+        val synPropsPath = KmPath(scratchDir, "rustkotlin.properties").toString()
+        writeOverwrite(
+            synPropsPath,
+            """
+            project.group=io.github.kotlinmania
+            project.name=syn-kotlin
+            project.namespace=io.github.kotlinmania.syn
+            """.trimIndent(),
+        )
 
         fun translateStdout(name: String): String {
             val captured = mutableListOf<String>()
@@ -182,6 +211,8 @@ class SerdeCorpusIntegrationTest {
                     "translate",
                     "--stdout",
                     "--quiet",
+                    "--rustkotlin-properties",
+                    synPropsPath,
                     "--package",
                     "io.github.kotlinmania.syn",
                     "--source-root",
@@ -194,109 +225,113 @@ class SerdeCorpusIntegrationTest {
             return captured.joinToString("\n")
         }
 
-        val customKeywordKt = translateStdout("custom_keyword")
-        assertContains(customKeywordKt, "// port-lint: source custom_keyword.rs")
-        assertContains(customKeywordKt, "public const val CFG_FEATURE_PARSING: Boolean = true")
-        assertContains(customKeywordKt, "public const val CFG_FEATURE_CLONE_IMPLS: Boolean = true")
-        assertFalse(customKeywordKt.contains("CLONE-IMPLS"))
-        assertContains(customKeywordKt, "public fun customKeyword(")
+        try {
+            val customKeywordKt = translateStdout("custom_keyword")
+            assertContains(customKeywordKt, "// port-lint: source custom_keyword.rs")
+            assertContains(customKeywordKt, "public const val CFG_FEATURE_PARSING: Boolean = true")
+            assertContains(customKeywordKt, "public const val CFG_FEATURE_CLONE_IMPLS: Boolean = true")
+            assertFalse(customKeywordKt.contains("CLONE-IMPLS"))
+            assertContains(customKeywordKt, "public fun customKeyword(")
 
-        val customPunctuationKt = translateStdout("custom_punctuation")
-        assertContains(customPunctuationKt, "// port-lint: source custom_punctuation.rs")
-        assertContains(customPunctuationKt, "public fun customPunctuationLen(")
-        assertContains(customPunctuationKt, "when {")
+            val customPunctuationKt = translateStdout("custom_punctuation")
+            assertContains(customPunctuationKt, "// port-lint: source custom_punctuation.rs")
+            assertContains(customPunctuationKt, "public fun customPunctuationLen(")
+            assertContains(customPunctuationKt, "when {")
 
-        val macrosKt = translateStdout("macros")
-        assertContains(macrosKt, "// port-lint: source macros.rs")
-        assertContains(macrosKt, "internal fun astStruct(")
-        assertContains(macrosKt, "internal fun astEnum(")
+            val macrosKt = translateStdout("macros")
+            assertContains(macrosKt, "// port-lint: source macros.rs")
+            assertContains(macrosKt, "internal fun astStruct(")
+            assertContains(macrosKt, "internal fun astEnum(")
 
-        val parseMacroInputKt = translateStdout("parse_macro_input")
-        assertContains(parseMacroInputKt, "// port-lint: source parse_macro_input.rs")
-        assertContains(parseMacroInputKt, "public fun parseMacroInput(")
+            val parseMacroInputKt = translateStdout("parse_macro_input")
+            assertContains(parseMacroInputKt, "// port-lint: source parse_macro_input.rs")
+            assertContains(parseMacroInputKt, "public fun parseMacroInput(")
 
-        val dropsErr = assertFailsWith<IllegalArgumentException> { translateStdout("drops") }
-        assertContains(dropsErr.message.orEmpty(), "Unsupported Rust destructor-suppression semantics")
+            val dropsErr = assertFailsWith<IllegalArgumentException> { translateStdout("drops") }
+            assertContains(dropsErr.message.orEmpty(), "Unsupported Rust destructor-suppression semantics")
 
-        val fixupKt = translateStdout("fixup")
-        assertContains(fixupKt, "// port-lint: source fixup.rs")
-        assertContains(fixupKt, "package io.github.kotlinmania.syn")
+            val fixupKt = translateStdout("fixup")
+            assertContains(fixupKt, "// port-lint: source fixup.rs")
+            assertContains(fixupKt, "package io.github.kotlinmania.syn")
 
-        val exportKt = translateStdout("export")
-        assertContains(exportKt, "public typealias Formatter = StringBuilder")
-        assertContains(exportKt, "public typealias FmtResult = Unit")
-        assertContains(exportKt, "public typealias TokenStream2 = TokenStream")
-        assertContains(exportKt, "public open class Private(internal var value: Unit)")
-        assertFalse(exportKt.contains("= Any"))
-        assertFalse(exportKt.contains("typealias Boolean"))
-        assertFalse(exportKt.contains("typealias String"))
-        assertFalse(exportKt.contains("typealias Span"))
-        assertFalse(exportKt.contains("typealias TokenStream ="))
+            val exportKt = translateStdout("export")
+            assertContains(exportKt, "public typealias Formatter = StringBuilder")
+            assertContains(exportKt, "public typealias FmtResult = Unit")
+            assertContains(exportKt, "public typealias TokenStream2 = TokenStream")
+            assertContains(exportKt, "public open class Private(internal var value: Unit)")
+            assertFalse(exportKt.contains("= Any"))
+            assertFalse(exportKt.contains("typealias Boolean"))
+            assertFalse(exportKt.contains("typealias String"))
+            assertFalse(exportKt.contains("typealias Span"))
+            assertFalse(exportKt.contains("typealias TokenStream ="))
 
-        val threadKt = translateStdout("thread")
-        assertContains(threadKt, "internal open class ThreadBound<T>")
-        assertContains(threadKt, "internal fun <T> new(value: T): ThreadBound<T>")
-        assertContains(threadKt, "public open fun clone(): ThreadBound<T>")
-        assertContains(threadKt, "internal expect fun currentThreadBoundToken(): Any")
-        assertContains(threadKt, "Send bound requires Copy")
-        assertContains(threadKt, "Copy the bytes of T")
+            val threadKt = translateStdout("thread")
+            assertContains(threadKt, "internal open class ThreadBound<T>")
+            assertContains(threadKt, "internal fun <T> new(value: T): ThreadBound<T>")
+            assertContains(threadKt, "public open fun clone(): ThreadBound<T>")
+            assertContains(threadKt, "internal expect fun currentThreadBoundToken(): Any")
+            assertContains(threadKt, "Send bound requires Copy")
+            assertContains(threadKt, "Copy the bytes of T")
 
-        val spanKt = translateStdout("span")
-        assertContains(spanKt, "public interface IntoSpans<S>")
-        assertContains(spanKt, "public fun Span.intoSpansDelimSpan(): DelimSpan")
-        assertEquals(9, Regex("public fun (Span|List<Span>|DelimSpan)\\.intoSpans").findAll(spanKt).count())
+            val spanKt = translateStdout("span")
+            assertContains(spanKt, "public interface IntoSpans<S>")
+            assertContains(spanKt, "public fun Span.intoSpansDelimSpan(): DelimSpan")
+            assertEquals(9, Regex("public fun (Span|List<Span>|DelimSpan)\\.intoSpans").findAll(spanKt).count())
 
-        val spannedKt = translateStdout("spanned")
-        assertContains(spannedKt, "import io.github.kotlinmania.quote.span as quoteSpan")
-        assertContains(spannedKt, "public interface Spanned")
-        assertContains(spannedKt, "return this.quoteSpan()")
-        assertFalse(spannedKt.contains("return this.span()"))
-        assertFalse(spannedKt.contains("__span"))
-        assertFalse(spannedKt.contains("import io.github.kotlinmania.priv.Sealed"))
+            val spannedKt = translateStdout("spanned")
+            assertContains(spannedKt, "import io.github.kotlinmania.quote.span as quoteSpan")
+            assertContains(spannedKt, "public interface Spanned")
+            assertContains(spannedKt, "return this.quoteSpan()")
+            assertFalse(spannedKt.contains("return this.span()"))
+            assertFalse(spannedKt.contains("__span"))
+            assertFalse(spannedKt.contains("import io.github.kotlinmania.priv.Sealed"))
 
-        val parseKt = translateStdout("parse")
-        assertContains(parseKt, "public interface Parse<T>")
-        assertContains(parseKt, "public fun parse(input: ParseStream): Result<T>")
-        assertContains(parseKt, "public interface Parser<Output>")
-        assertContains(parseKt, "public fun <T> ((ParseStream) -> Result<T>).parse2(")
-        assertFalse(parseKt.contains("typealias Output<T> = T"))
+            val parseKt = translateStdout("parse")
+            assertContains(parseKt, "public interface Parse<T>")
+            assertContains(parseKt, "public fun parse(input: ParseStream): Result<T>")
+            assertContains(parseKt, "public interface Parser<Output>")
+            assertContains(parseKt, "public fun <T> ((ParseStream) -> Result<T>).parse2(")
+            assertFalse(parseKt.contains("typealias Output<T> = T"))
 
-        val parseQuoteKt = translateStdout("parse_quote")
-        assertContains(parseQuoteKt, "public interface ParseQuote<T>")
-        assertContains(parseQuoteKt, "parseTFn: (ParseStream) -> Result<T>")
-        assertContains(parseQuoteKt, "parseQuoteParsePat(")
-        assertContains(parseQuoteKt, "input.parse(Visibility::parse)")
-        assertContains(parseQuoteKt, "`@...`")
-        assertContains(parseQuoteKt, "`@file:...`")
-        assertFalse(parseQuoteKt.contains("<T as"))
-        assertFalse(parseQuoteKt.contains("T::parse"))
-        assertFalse(parseQuoteKt.contains("Box::new"))
+            val parseQuoteKt = translateStdout("parse_quote")
+            assertContains(parseQuoteKt, "public interface ParseQuote<T>")
+            assertContains(parseQuoteKt, "parseTFn: (ParseStream) -> Result<T>")
+            assertContains(parseQuoteKt, "parseQuoteParsePat(")
+            assertContains(parseQuoteKt, "input.parse(Visibility::parse)")
+            assertContains(parseQuoteKt, "`@...`")
+            assertContains(parseQuoteKt, "`@file:...`")
+            assertFalse(parseQuoteKt.contains("<T as"))
+            assertFalse(parseQuoteKt.contains("T::parse"))
+            assertFalse(parseQuoteKt.contains("Box::new"))
 
-        val punctuatedKt = translateStdout("punctuated")
-        assertContains(punctuatedKt, "public open class Punctuated<T, P>")
-        assertContains(punctuatedKt, "public sealed class Pair<T, P>")
-        assertContains(punctuatedKt, "kotlin.Pair<T, P>")
-        assertContains(punctuatedKt, "public open class Iter<T>(public var inner: IterTrait<T>)")
-        assertContains(punctuatedKt, "public open class IterMut<T>(public var inner: IterMutTrait<T>)")
-        assertContains(punctuatedKt, "public open class IntoIter<T>(public var inner: ArrayDeque<T>)")
-        assertContains(punctuatedKt, "open class PrivateIter<T, P>(")
-        assertContains(punctuatedKt, ": IterTrait<T>")
-        assertContains(punctuatedKt, "override fun hashCode(): Int")
-        assertContains(punctuatedKt, "defaultPFn: () -> P")
-        assertContains(punctuatedKt, "parseQuote(\"scope\")")
-        assertFalse(punctuatedKt.contains("typealias Item<T> = T"))
-        assertFalse(punctuatedKt.contains("typealias Output<T> = T"))
-        assertFalse(punctuatedKt.contains("is Any ->"))
-        assertFalse(punctuatedKt.contains("core.hash"))
+            val punctuatedKt = translateStdout("punctuated")
+            assertContains(punctuatedKt, "public open class Punctuated<T, P>")
+            assertContains(punctuatedKt, "public sealed class Pair<T, P>")
+            assertContains(punctuatedKt, "kotlin.Pair<T, P>")
+            assertContains(punctuatedKt, "public open class Iter<T>(public var inner: IterTrait<T>)")
+            assertContains(punctuatedKt, "public open class IterMut<T>(public var inner: IterMutTrait<T>)")
+            assertContains(punctuatedKt, "public open class IntoIter<T>(public var inner: ArrayDeque<T>)")
+            assertContains(punctuatedKt, "open class PrivateIter<T, P>(")
+            assertContains(punctuatedKt, ": IterTrait<T>")
+            assertContains(punctuatedKt, "override fun hashCode(): Int")
+            assertContains(punctuatedKt, "defaultPFn: () -> P")
+            assertContains(punctuatedKt, "parseQuote(\"scope\")")
+            assertFalse(punctuatedKt.contains("typealias Item<T> = T"))
+            assertFalse(punctuatedKt.contains("typealias Output<T> = T"))
+            assertFalse(punctuatedKt.contains("is Any ->"))
+            assertFalse(punctuatedKt.contains("core.hash"))
 
-        val metaKt = translateStdout("meta")
-        assertContains(metaKt, "@ProcMacroAttribute")
-        assertContains(metaKt, "@tea(kind = \"EarlGrey\", hot)")
-        assertContains(metaKt, "val content = parens.content")
-        assertContains(metaKt, "input.call(::parseMetaPath)")
-        assertContains(metaKt, "this.input.parse(Eq::parse)")
-        assertFalse(metaKt.contains("#[proc_macro_attribute]"))
-        assertFalse(metaKt.contains("content: Any?"))
-        assertFalse(metaKt.contains("is Ok ->"))
+            val metaKt = translateStdout("meta")
+            assertContains(metaKt, "@ProcMacroAttribute")
+            assertContains(metaKt, "@tea(kind = \"EarlGrey\", hot)")
+            assertContains(metaKt, "val content = parens.content")
+            assertContains(metaKt, "input.call(::parseMetaPath)")
+            assertContains(metaKt, "this.input.parse(Eq::parse)")
+            assertFalse(metaKt.contains("#[proc_macro_attribute]"))
+            assertFalse(metaKt.contains("content: Any?"))
+            assertFalse(metaKt.contains("is Ok ->"))
+        } finally {
+            deleteRecursively(scratchDir)
+        }
     }
 }

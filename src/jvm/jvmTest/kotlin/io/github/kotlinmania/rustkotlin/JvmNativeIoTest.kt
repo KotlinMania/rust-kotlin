@@ -95,7 +95,7 @@ class JvmNativeIoTest {
         val ioDir = coreRoot.resolve("io")
         val allocBufferDir =
             repoRoot.resolve("src/common/commonMain/kotlin/io/github/kotlinmania/rustlang/alloc/io/buffered/bufreader/buffer")
-        val gradlePropsPath = repoRoot.resolve("gradle.properties").toString()
+        val rustKotlinPropsPath = repoRoot.resolve("rustkotlin.properties").toString()
         val maybeUninitPath = maybeUninitDir.resolve("MaybeUninit.kt").toString()
         val peekablePath = peekableDir.resolve("Peekable.kt").toString()
         val nonNullPath = nonNullDir.resolve("NonNull.kt").toString()
@@ -108,7 +108,7 @@ class JvmNativeIoTest {
                 SystemFileSystem.createDirectories(dir, mustCreate = false)
             }
             writeOverwrite(
-                gradlePropsPath,
+                rustKotlinPropsPath,
                 "project.namespace=io.github.kotlinmania.rustlang\ncrate.core=io.github.kotlinmania.rustlang.core\n",
             )
             writeOverwrite(
@@ -171,7 +171,7 @@ class JvmNativeIoTest {
                 peekablePath,
                 maybeUninitPath,
                 anchorPath,
-                gradlePropsPath,
+                rustKotlinPropsPath,
             ).forEach { path ->
                 SystemFileSystem.delete(KmPath(path), mustExist = false)
             }

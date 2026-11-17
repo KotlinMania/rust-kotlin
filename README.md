@@ -11,36 +11,28 @@
 
 A deterministic Rust-to-Kotlin source translator. One `.rs` file in, one `.kt` file out.
 
-`rust-kotlin` parses Rust with [`proc-macro2-kotlin`](https://github.com/KotlinMania/proc-macro2-kotlin)
-and [`syn-kotlin`](https://github.com/KotlinMania/syn-kotlin) (Kotlin ports of the Rust
-crates), walks the syntax tree, and emits Kotlin Multiplatform source. There is no
-language model in the loop: the same input and flags always produce the same output.
+`rust-kotlin` parses Rust with [`proc-macro2-kotlin`](https://github.com/KotlinMania/proc-macro2-kotlin),
+[`syn-kotlin`](https://github.com/KotlinMania/syn-kotlin), and [`quote-kotlin`](https://github.com/KotlinMania/quote-kotlin)
+(Kotlin ports of the Rust crates), walks the syntax tree, and emits Kotlin Multiplatform source.
+There is no language model in the loop: the same input and flags always produce the same output.
 
 It ships as two front ends over one translation core:
 
 - a **native command-line tool** (`rust-kotlin.kexe`), with no JVM at runtime
 - an **IntelliJ IDEA plugin** that adds a *Convert Rust File to Kotlin File* action
 
-It is the generator behind the KotlinMania Rust ports, including
-[`rust-lang-kotlin`](https://github.com/KotlinMania/rust-lang-kotlin).
+It is the generator behind all 25 crates of
+[`rust-lang-kotlin`](https://github.com/KotlinMania/rust-lang-kotlin) as well as downstream KotlinMania ports.
 
 ---
 
 ## What it does
 
-- Translates items, expressions, patterns, generics, traits and impls into idiomatic
-  Kotlin naming (`dist_sq` becomes `distSq`, `off_t` becomes `OffT`).
-- Lowers `Option<T>` to nullable types and `match` to `when`, and maps Rust primitives
-  and slices onto Kotlin types.
-- Computes struct layouts and emits a `TypeLayout<T>` for each struct so generic code
-  can read and write values at native addresses.
-- Discovers and expands crate-local `macro_rules!` macros.
-- Evaluates `cfg` predicates against a configurable target profile (arch, OS, env,
-  pointer width, endianness, features).
-- Lowers `extern "C"` blocks and compiler intrinsics to companion `.def`, `.h`,
-  `.c`/`.cpp`, JNI and N-API sources.
-- Translates inline `#[cfg(test)]` modules into a separate test output tree.
-- Writes a `// port-lint: source <path>` provenance header on each generated file.
+- **AST-driven item, trait/impl & expression translation**: Translates items, generics (isolating `impl`-level `const` generics and propagating trailing default type arguments from AST declarations as well as stdlib `Global` and `ControlFlow<B, Unit>` defaults), traits, inherent and trait `impl`s (with companion forwarders and devirtualization), patterns, and expressions into idiomatic Kotlin naming (`dist_sq` becomes `distSq`, `off_t` becomes `OffT`), with Kotlin keyword escaping (such as `format`), `or_else` and turbofish function-reference lowering, hex float literals, and mutable slice subslice write-back.
+- **Tagged `Result<T, E>` & `Option<T>` lowering**: Lowers `Option<T>` to nullable types (including `NonNull::new`, `NonZero::new`, and `Alignment::new`) and `Result<T, E>` to `rust-lang-kotlin`'s tagged `Result<T, E>` when `core` crate mapping is configured — preserving `<T, E>` smart-casts across `?`, `match`, `if let`, `while let`, match guards, and `let ... else` without `<*, *>` erasure, emitting explicit `<T, E>` on `Result.Ok` / `Result.Err`, and qualifying `fmt::Result` and `core::result::Result` when shadowed by local `type Result` aliases.
+- **Runtime memory layouts, `SizedTypeProperties` & pointer semantics**: Computes deterministic struct layouts and emits `TypeLayout<T>` dictionaries (defaulting synthesized `typeLayout*` and `fieldLayout` parameters to `UnresolvedTypeLayout()` on non-override functions and constructors), lowers `SizedTypeProperties` constants (`SIZE`, `ALIGN`, `ALIGNMENT`, `IS_ZST`, `LAYOUT`, `MAX_SLICE_LEN`), binds `NonZero<T, NonZeroInner>` and `Atomic` storage types, lowers `__rust_alloc*` `Alignment.asUsize()`, and coerces `MutPtr` call/method arguments to `ConstPtr` via `MutPtr.asConstPtr()`.
+- **C FFI intrinsics & `rust-lang-kotlin` delegation**: Delegates stdlib scalar, pointer, and error types (`U128`, `I128`, `F16`, `F128`, `RustAny`, `RustTypeId`, `MutPtr`, `ConstPtr`, `NonNull`, `Alignment`, `AllocError`, `LayoutError`, `ParseBoolError`) directly to `rust-lang-kotlin` instead of synthesizing per-crate duplicates, and lowers `extern "C"` blocks, compiler intrinsics, `core_arch` / portable SIMD, and WASI/POSIX/Windows declarations into companion `.def`, `.h`, `.c`/`.cpp`, Kotlin/Native `cinterop`, JVM JNI, and JS/Wasm N-API bridges (backed by a linear-memory arena where needed).
+- **Macros, `cfg` profiles & module-root splitting**: Expands crate-local `macro_rules!` macros, evaluates `cfg` predicates and `cfg_select!` blocks against a configurable target profile (arch, OS, env, pointer width, endianness, features), resolves inline `mod` and external path modules, splits `lib.rs` / `mod.rs` implementations (`--split-module-roots`) into focused `.kt` files without generating `Lib.kt` or `Mod.kt` facades, routes inline `#[cfg(test)]` modules into `--test-output`, enforces Swift Export and Kotlin/JS klib invariants (`sealed class` sum types, collection interfaces on public signatures, `charArrayOf(...).concatToString()` for unpaired UTF-16 surrogates), and writes `// port-lint: source <path>` provenance headers.
 
 Generated code targets the Rust standard library port in
 [`rust-lang-kotlin`](https://github.com/KotlinMania/rust-lang-kotlin) for types that
@@ -174,7 +166,7 @@ Existing `.kt` targets are never overwritten unless you pass `--force`; use
 | `--dry-run` | Print planned `input -> output` actions only |
 | `-f`, `--force`, `--overwrite` | Overwrite existing `.kt` files |
 | `--skip-existing` | Skip targets that already exist |
-| `-g`, `--gradle-properties <file>` | `gradle.properties` used to infer group and namespace |
+| `--rustkotlin-properties <file>` | `rustkotlin.properties` used to infer group, namespace, and crate mappings |
 | `--package-properties <file>` | `package.properties` with package and crate overrides |
 | `-p`, `--package <pkg>` | Explicit Kotlin package (sub-packages appended in recursive mode) |
 | `-n`, `--namespace <ns>` | Kotlin namespace of the crate root |
@@ -208,7 +200,7 @@ The `ide-plugin` module wraps the same translation core for IntelliJ IDEA 2025.3
 - **Convert Rust File to Kotlin File**: available from the *Code* menu, the Project
   view context menu and the editor context menu (search abbreviation `r2k`). Works on a
   single `.rs` file or recursively on a directory, with an overwrite prompt per file.
-- **Rust Transpiler tool window**: pick a `gradle.properties` for package and group
+- **Rust Transpiler tool window**: pick a `rustkotlin.properties` for package, group, and crate mappings
   inference, then translate the active editor file.
 
 Run a sandbox IDE with the plugin loaded:
@@ -238,6 +230,12 @@ Build the native CLI:
 
 The binary is written to `build/bin/macosArm64/releaseExecutable/rust-kotlin.kexe`.
 
+Run the full build (native CLI, JVM library, `detekt`, `ktlintCheck`, tests, and `:ide-plugin:buildPlugin`):
+
+```bash
+./gradlew build
+```
+
 Run the test suites:
 
 ```bash
@@ -264,8 +262,8 @@ Other Kotlin Multiplatform targets are declared in the build but switched off in
 
 All dependencies are KotlinMania ports published under `io.github.kotlinmania`:
 `proc-macro2-kotlin`, `syn-kotlin`, `quote-kotlin`, `rust-lang-kotlin`, `km-io`,
-`libc-kotlin`, `serde-json-kotlin`, `anyhow-kotlin`, `num-bigint-kotlin`, `rand-kotlin`
-and `windows-sys-kotlin`. Versions are pinned in
+`libc-kotlin`, `serde-json-kotlin`, `serde-kotlin`, `anyhow-kotlin`, `num-bigint-kotlin`,
+`rand-kotlin` and `windows-sys-kotlin`. Versions are pinned in
 [gradle/libs.versions.toml](gradle/libs.versions.toml). `maven.properties` controls
 whether Maven Local is consulted first.
 
@@ -278,7 +276,10 @@ Marketplace; build from source. The `--version` string printed by the CLI is har
 separately and currently reads `0.1.0`.
 
 Output is a mechanical first translation. It is designed to be compiled, measured
-against upstream and corrected, not to be shipped unread.
+against upstream and corrected, not to be shipped unread. The current snapshot
+regenerates all 25 crates of [`rust-lang-kotlin`](https://github.com/KotlinMania/rust-lang-kotlin)
+(`1,876` Kotlin files) with `EXIT=0` and zero syntax errors while multi-wave semantic
+lowering continues.
 
 GitHub Actions workflows are manual-only: `ci.yml` runs on `workflow_dispatch`, the
 per-platform workflows are reusable, and `publish.yml` runs on a published release.
@@ -299,6 +300,23 @@ third_party/             provenance and licenses for adapted upstream sources
 verification/            build and publication verification notes
 tools/                   CLI smoke test
 ```
+
+Modularized `src/common/commonMain/` subsystems (all files kept under 4,000 lines):
+
+- **Frontend, crate scanners & macros**: `SynFrontend.kt`, `CrateSymbolInspector.kt`,
+  `CrateTokenAbiScanner.kt`, `CrateMacroAndTypeTokenScanner.kt`, `MacroRulesExpander.kt`,
+  `MacroEmitter.kt`
+- **Item, trait/impl, type & control-flow emitters**: `ItemEmitter.kt`,
+  `TraitAndImplItemEmitter.kt`, `SignatureAndStatementEmitter.kt`, `TypeReferenceEmitter.kt`,
+  `ControlFlowAndMatchEmitter.kt`, `ForeignAndMacroItemEmitter.kt`
+- **Expression emitters & type/place inference**: `ExpressionEmitter.kt`,
+  `ExpressionCallEmitter.kt`, `ExpressionMethodCallEmitter.kt`,
+  `ExpressionOperatorAndCastEmitter.kt`, `ExpressionPrimitiveAndPointerOps.kt`,
+  `ExpressionTypeAndPlaceInference.kt`
+- **Layouts, `Result`/pointer/stdlib helpers & multi-target FFI bridges**:
+  `StructLayoutComputer.kt`, `ResultLowering.kt`, `PointerLowering.kt`,
+  `StdlibTypeAndLayoutHelpers.kt`, `CoreIntrinsicLowering.kt`, `CoreIntrinsic*`,
+  `FfiInteropEmitter.kt`, `FfiNativeCinteropGenerator.kt`, `FfiJniAndNapiGenerator.kt`
 
 Related documents: [CHANGELOG.md](CHANGELOG.md), [AGENTS.md](AGENTS.md),
 [SWIFT.md](SWIFT.md), [verification/README.md](verification/README.md).

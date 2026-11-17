@@ -1692,22 +1692,37 @@ private fun sanitizeProseAndCommentVocabulary(
                 }
             }
         }
-        if (ch == '\'' && isRustLifetimeTickAt(withoutSendSync, i)) {
-            val identStart = i + 1
-            var identEnd = identStart
-            while (identEnd < withoutSendSync.length && (withoutSendSync[identEnd].isLetterOrDigit() || withoutSendSync[identEnd] == '_')) {
-                identEnd++
+        if (ch == '\'') {
+            val closingTick = isSingleQuotedProseIdentAt(withoutSendSync, i)
+            if (closingTick != null) {
+                val rawIdent = withoutSendSync.substring(i + 1, closingTick)
+                val trimmedPrefix = withoutSendSync.substring(0, i).trimEnd()
+                val looksLikeComparisonLiteral =
+                    trimmedPrefix.endsWith("==") || trimmedPrefix.endsWith("!=") || trimmedPrefix.endsWith("=")
+                if (rawIdent.length > 1 || (!convertCamelIdentifiersOnly && !looksLikeComparisonLiteral)) {
+                    val mapped = mapCommentVocabularyWord(rawIdent, convertCamelIdentifiersOnly = convertCamelIdentifiersOnly)
+                    sb.append('`').append(mapped).append('`')
+                    i = closingTick + 1
+                    continue
+                }
             }
-            val ltName = withoutSendSync.substring(identStart, identEnd)
-            val prevNonWs = sb.lastOrNull()
-            val nextChar = withoutSendSync.getOrNull(identEnd)
-            if (prevNonWs == '(' && nextChar == ')') {
-                sb.append('"').append(ltName).append('"')
-            } else {
-                sb.append(ltName)
+            if (isRustLifetimeTickAt(withoutSendSync, i)) {
+                val identStart = i + 1
+                var identEnd = identStart
+                while (identEnd < withoutSendSync.length && (withoutSendSync[identEnd].isLetterOrDigit() || withoutSendSync[identEnd] == '_')) {
+                    identEnd++
+                }
+                val ltName = withoutSendSync.substring(identStart, identEnd)
+                val prevNonWs = sb.lastOrNull()
+                val nextChar = withoutSendSync.getOrNull(identEnd)
+                if (prevNonWs == '(' && nextChar == ')') {
+                    sb.append('"').append(ltName).append('"')
+                } else {
+                    sb.append(ltName)
+                }
+                i = identEnd
+                continue
             }
-            i = identEnd
-            continue
         }
         if (ch.isLetter() || ch == '_') {
             var end = i + 1
@@ -1788,6 +1803,16 @@ private fun sanitizeProseAndCommentVocabulary(
             i = end
             continue
         }
+        if (!convertCamelIdentifiersOnly && ch == '{') {
+            sb.append('(')
+            i++
+            continue
+        }
+        if (!convertCamelIdentifiersOnly && ch == '}') {
+            sb.append(')')
+            i++
+            continue
+        }
         sb.append(ch)
         i++
     }
@@ -1826,6 +1851,21 @@ private val KNOWN_RUST_PROSE_MACROS: Set<String> =
         "env",
         "compile",
     )
+
+private fun isSingleQuotedProseIdentAt(text: String, tickIdx: Int): Int? {
+    if (tickIdx + 1 >= text.length) return null
+    val firstIdent = text[tickIdx + 1]
+    if (!firstIdent.isLetter() && firstIdent != '_') return null
+    val prev = if (tickIdx > 0) text[tickIdx - 1] else ' '
+    val validPrefix =
+        prev.isWhitespace() || prev == '&' || prev == ':' || prev == '<' || prev == ',' || prev == ';' || prev == '(' || prev == '['
+    if (!validPrefix) return null
+    var end = tickIdx + 2
+    while (end < text.length && (text[end].isLetterOrDigit() || text[end] == '_')) {
+        end++
+    }
+    return if (end < text.length && text[end] == '\'') end else null
+}
 
 private fun isRustLifetimeTickAt(text: String, tickIdx: Int): Boolean {
     if (tickIdx + 1 >= text.length) return false

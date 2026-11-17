@@ -659,6 +659,13 @@ internal fun translateModuleRootIntoFocusedChunks(
                         ?: fullInspector.typeAliasTargets[rustTypeIdentToKotlin(simple)]
                 },
             )
+        fun headerForChunk(chunkFileName: String): FileHeaderContext =
+            if (chunkHeader.testClassName != null) {
+                val base = chunkFileName.removeSuffix(".kt")
+                chunkHeader.copy(testClassName = if (base.endsWith("Tests")) base else "${base}Tests")
+            } else {
+                chunkHeader
+            }
         val emittedChunks = mutableListOf<ModuleRootChunkTranslation>()
         for ((chunkFileName, chunkItems) in plannedChunks) {
             val chunkAst = File(shebang = null, attrs = emptyList(), items = chunkItems)
@@ -670,7 +677,7 @@ internal fun translateModuleRootIntoFocusedChunks(
                     trivia = trivia,
                     macroDefs = macroExpansion.definitions,
                     macroWrapperSpansByTargetOffset = macroExpansion.macroWrapperSpansByTargetOffset,
-                    headerContext = chunkHeader,
+                    headerContext = headerForChunk(chunkFileName),
                     sharedFfiCollector = sharedFfiCollector,
                     sharedDeclaredTypeNames = sharedDeclaredTypeNames,
                     sharedSamNamesByShape = sharedSamNamesByShape,
@@ -704,7 +711,7 @@ internal fun translateModuleRootIntoFocusedChunks(
                         trivia = trivia,
                         macroDefs = macroExpansion.definitions,
                         macroWrapperSpansByTargetOffset = macroExpansion.macroWrapperSpansByTargetOffset,
-                        headerContext = chunkHeader,
+                        headerContext = headerForChunk(firstChunkName),
                     )
                 emittedChunks +=
                     ModuleRootChunkTranslation(
@@ -793,6 +800,7 @@ internal class KotlinJ2KEmitter(
                 sym.enumVariantFieldTypes.putAll(sharedInsp.enumVariantFieldTypes)
                 sym.selfParameterizedTraits.addAll(sharedInsp.selfParameterizedTraits)
                 sym.traitSupertraits.putAll(sharedInsp.traitSupertraits)
+                sym.traitSupertraitBindings.putAll(sharedInsp.traitSupertraitBindings)
                 sym.traitDefaultlessAssocTypes.putAll(sharedInsp.traitDefaultlessAssocTypes)
                 sym.traitResultMethods.putAll(sharedInsp.traitResultMethods)
                 sym.instanceMethodsByType.putAll(sharedInsp.instanceMethodsByType)
@@ -809,6 +817,32 @@ internal class KotlinJ2KEmitter(
                     if (superNames.any { it in sym.selfParameterizedTraits || it in KNOWN_SELF_PARAMETERIZED_TRAITS }) {
                         sym.selfParameterizedTraits += ktTrait
                         selfClosedChanged = true
+                    }
+                }
+            }
+            var assocClosedChanged = true
+            while (assocClosedChanged) {
+                assocClosedChanged = false
+                for ((ktTrait, superBindings) in sym.traitSupertraitBindings) {
+                    val cur = sym.traitDefaultlessAssocTypes[ktTrait].orEmpty().toMutableList()
+                    var addedHere = false
+                    for ((superKt, boundAssocs) in superBindings) {
+                        if (superKt in RUST_STD_IMPLICIT_SUPERTRAITS && superKt !in sym.declaredTraitsByName) continue
+                        val inherited =
+                            (
+                                sym.traitDefaultlessAssocTypes[superKt]
+                                    ?: headerContext.crateTraitDefaultlessAssocTypes[superKt]
+                            ).orEmpty()
+                        for (assoc in inherited) {
+                            if (assoc !in boundAssocs && assoc !in cur) {
+                                cur += assoc
+                                addedHere = true
+                            }
+                        }
+                    }
+                    if (addedHere) {
+                        sym.traitDefaultlessAssocTypes[ktTrait] = cur
+                        assocClosedChanged = true
                     }
                 }
             }
@@ -1201,7 +1235,7 @@ internal class KotlinJ2KEmitter(
         for (item in standaloneItems) {
             if (shouldOmitItemForUnportedQuickcheckOrRand(item)) {
                 val omissionComment =
-                    "// Omitted quickcheck/rand property test items pending quickcheck-kotlin / rand-kotlin port (Hermes Kanban t_19971811)."
+                    "// Omitted quickcheck/rand property test items pending quickcheck-kotlin / rand-kotlin port (Hermes Kanban card 19971811)."
                 if (renderedItems.lastOrNull() != omissionComment) {
                     renderedItems += omissionComment
                 }
@@ -2253,6 +2287,7 @@ internal val IGNORED_TRAIT_BOUNDS =
         "TrivialDrop",
         "Destruct",
         "Hasher",
+        "Tuple",
     )
 internal val RUST_STD_IMPLICIT_SUPERTRAITS =
     setOf(
@@ -2287,6 +2322,9 @@ internal val RUST_STD_IMPLICIT_SUPERTRAITS =
         "LowerHex",
         "UpperHex",
         "Binary",
+        "LowerExp",
+        "UpperExp",
+        "Pointer",
         "From",
         "TryFrom",
         "Into",
@@ -2480,7 +2518,12 @@ internal val STDLIB_ERASED_OR_BUILTIN_IMPORTS =
             "LowerHex",
             "UpperHex",
             "Binary",
+            "LowerExp",
+            "UpperExp",
+            "Pointer",
         )
+internal val FMT_TRAIT_NAMES: Set<String> =
+    setOf("Debug", "Display", "Octal", "LowerHex", "UpperHex", "Binary", "LowerExp", "UpperExp", "Pointer")
 internal val KNOWN_SELF_PARAMETERIZED_TRAITS = setOf("Parse", "ParseQuote")
 internal val KOTLIN_COLLECTION_INTERFACES = setOf("List", "MutableList", "Map", "MutableMap", "Set", "MutableSet", "ArrayDeque")
 internal val MUTATING_VEC_METHODS =

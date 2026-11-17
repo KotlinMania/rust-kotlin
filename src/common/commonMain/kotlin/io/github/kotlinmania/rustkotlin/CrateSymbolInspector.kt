@@ -179,6 +179,7 @@ internal class CrateSymbolInspector(
     val vecFieldsByType: MutableMap<String, MutableSet<String>> = linkedMapOf()
     val selfParameterizedTraits: MutableSet<String> = linkedSetOf()
     val traitSupertraits: MutableMap<String, List<String>> = linkedMapOf()
+    val traitSupertraitBindings: MutableMap<String, List<Pair<String, Set<String>>>> = linkedMapOf()
     val traitDefaultlessAssocTypes: MutableMap<String, List<String>> = linkedMapOf()
     val traitResultMethods: MutableMap<String, MutableSet<String>> = linkedMapOf()
     val localInlineModuleNames: MutableSet<String> = linkedSetOf()
@@ -651,21 +652,36 @@ internal class CrateSymbolInspector(
             selfParameterizedTraits += ktTraitName
         }
         if (blockDepth == 0) {
-            val superNames =
+            val superEntries =
                 i.supertraits
                     .toList()
                     .mapNotNull { bound ->
-                        (bound as? TypeParamBound.Trait)
-                            ?.takeIf { it.maybe == null }
-                            ?.path
-                            ?.segments
-                            ?.last()
-                            ?.ident
-                            ?.toString()
-                            ?.let(::rustTypeIdentToKotlin)
-                    }.distinct()
-            if (superNames.isNotEmpty()) {
-                traitSupertraits[ktTraitName] = superNames
+                        val path =
+                            (bound as? TypeParamBound.Trait)
+                                ?.takeIf { it.maybe == null }
+                                ?.path
+                                ?: return@mapNotNull null
+                        val lastSeg = path.segments.last() ?: return@mapNotNull null
+                        val raw =
+                            lastSeg.ident
+                                .toString()
+                                .removePrefix("r#")
+                        if (raw in IGNORED_TRAIT_BOUNDS) return@mapNotNull null
+                        val kt = rustTypeIdentToKotlin(raw)
+                        if (kt in RUST_STD_IMPLICIT_SUPERTRAITS && kt !in declaredTypeNames) return@mapNotNull null
+                        val boundAssocs =
+                            (lastSeg.arguments as? PathArguments.AngleBracketed)
+                                ?.args
+                                ?.toList()
+                                ?.filterIsInstance<GenericArgument.AssocTypeArg>()
+                                ?.map { rustTypeIdentToKotlin(it.assoc.ident.toString()) }
+                                ?.toSet()
+                                .orEmpty()
+                        kt to boundAssocs
+                    }
+            if (superEntries.isNotEmpty()) {
+                traitSupertraits[ktTraitName] = superEntries.map { it.first }.distinct()
+                traitSupertraitBindings[ktTraitName] = superEntries
             }
         }
         super.visitItemTrait(i)

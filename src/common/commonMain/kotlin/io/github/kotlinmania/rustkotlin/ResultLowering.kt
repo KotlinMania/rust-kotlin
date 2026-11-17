@@ -421,7 +421,7 @@ internal fun KotlinJ2KEmitter.isFmtWriteOrUnitExpr(expr: Expr, selfTypeName: Str
                 .toList()
                 .map { it.ident.toString().removePrefix("r#") }
         val tailPair = if (segs.size >= 2) "${segs[segs.lastIndex - 1]}.${segs.last()}" else segs.lastOrNull()
-        if (tailPair in setOf("Debug.fmt", "Display.fmt", "Octal.fmt", "LowerHex.fmt", "UpperHex.fmt", "Binary.fmt") &&
+        if (tailPair != null && tailPair.endsWith(".fmt") && tailPair.removeSuffix(".fmt") in FMT_TRAIT_NAMES &&
             core.args.size == 2
         ) {
             return true

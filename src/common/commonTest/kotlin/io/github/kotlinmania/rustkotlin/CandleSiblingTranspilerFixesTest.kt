@@ -436,7 +436,7 @@ class CandleSiblingTranspilerFixesTest {
             isDirectory = { it == "src" || it == "out/main" || it == "out/test" },
             collectRustFiles = { listOf("src/lib.rs") },
             report = {},
-            resolveGradleProperties = { null },
+            resolveRustKotlinProperties = { null },
             resolvePackageProperties = { null },
             resolveCrateMacroSources = { emptyList() },
             resolveCrateFlatFileModules = { _, _ -> emptySet() },

@@ -6,8 +6,10 @@ import io.github.kotlinmania.io.readString
 import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
+import io.github.kotlinmania.syn.GenericArgument
 import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.ModContent
+import io.github.kotlinmania.syn.PathArguments
 import io.github.kotlinmania.syn.TraitItem
 import io.github.kotlinmania.syn.TypeParamBound
 import io.github.kotlinmania.io.files.Path as KmPath
@@ -386,6 +388,7 @@ private fun scanSourcesWithActiveSession(
     val constLeafTargets = mutableListOf<Triple<String, String, String>>()
     val sharedInlineRelFiles = discoverSharedInlineModuleRelFiles(byRelPath)
     val traitDefaultlessAssocTypes = linkedMapOf<String, List<String>>()
+    val traitSupertraitBindings = linkedMapOf<String, List<Pair<String, Set<String>>>>()
     val traitResultMethods = linkedMapOf<String, List<String>>()
 
     fun registerFnSignatureTokens(
@@ -878,6 +881,24 @@ private fun scanSourcesWithActiveSession(
         val recognized = recognizeRustOrNull(text) ?: continue
         val expandedFile = expandFileMacroRules(recognized.file, crateMacroSrcs).file
         val (subpkg, _) = computeSubpkgAndRecordAncestors(relFile)
+        val sameFileTraitNames = linkedSetOf<String>()
+        fun collectFileTraitNames(items: List<Item>) {
+            for (item in items) {
+                if (itemHasDocOnlyCfg(item)) continue
+                when (item) {
+                    is Item.Trait ->
+                        sameFileTraitNames += KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
+                    is Item.Mod -> {
+                        val content = item.content
+                        if (content is ModContent.Inline && !hasCfgTestModAttribute(item.attrs)) {
+                            collectFileTraitNames(content.items)
+                        }
+                    }
+                    else -> {}
+                }
+            }
+        }
+        collectFileTraitNames(expandedFile.items)
         fun walkTraitItems(items: List<Item>) {
             for (item in items) {
                 if (itemHasDocOnlyCfg(item)) continue
@@ -892,23 +913,44 @@ private fun scanSourcesWithActiveSession(
                         if (traitReferencesSelfOutsideReceiver(item)) {
                             selfParameterizedTraits += ktTrait
                         }
-                        val superNames =
+                        val superEntries =
                             item.supertraits
                                 .toList()
                                 .mapNotNull { bound ->
-                                    (bound as? TypeParamBound.Trait)
-                                        ?.takeIf { it.maybe == null }
-                                        ?.path
-                                        ?.segments
-                                        ?.last()
-                                        ?.ident
-                                        ?.toString()
-                                        ?.let { KotlinNamingPolicy.Default.toTypeIdentifier(it, allowRawAbi = rawAbiMode) }
-                                }.distinct()
-                        if (superNames.isNotEmpty()) {
+                                    val path =
+                                        (bound as? TypeParamBound.Trait)
+                                            ?.takeIf { it.maybe == null }
+                                            ?.path
+                                            ?: return@mapNotNull null
+                                    val lastSeg = path.segments.last() ?: return@mapNotNull null
+                                    val raw =
+                                        lastSeg.ident
+                                            .toString()
+                                            .removePrefix("r#")
+                                    if (raw in IGNORED_TRAIT_BOUNDS) return@mapNotNull null
+                                    val kt = KotlinNamingPolicy.Default.toTypeIdentifier(raw, allowRawAbi = rawAbiMode)
+                                    if (kt in RUST_STD_IMPLICIT_SUPERTRAITS && kt !in sameFileTraitNames) return@mapNotNull null
+                                    val boundAssocs =
+                                        (lastSeg.arguments as? PathArguments.AngleBracketed)
+                                            ?.args
+                                            ?.toList()
+                                            ?.filterIsInstance<GenericArgument.AssocTypeArg>()
+                                            ?.map {
+                                                KotlinNamingPolicy.Default.toTypeIdentifier(
+                                                    it.assoc.ident.toString(),
+                                                    allowRawAbi = false,
+                                                )
+                                            }?.toSet()
+                                            .orEmpty()
+                                    kt to boundAssocs
+                                }
+                        if (superEntries.isNotEmpty()) {
+                            val superNames = superEntries.map { it.first }.distinct()
                             traitSupertraits[ktTrait] = superNames
+                            traitSupertraitBindings[ktTrait] = superEntries
                             if (subpkg.isNotEmpty()) {
                                 traitSupertraits["$subpkg.$ktTrait"] = superNames
+                                traitSupertraitBindings["$subpkg.$ktTrait"] = superEntries
                             }
                         }
                         val astDefaultlessAssocs = mutableListOf<String>()
@@ -989,6 +1031,27 @@ private fun scanSourcesWithActiveSession(
             if (superNames.any { it in selfParameterizedTraits || it in KNOWN_SELF_PARAMETERIZED_TRAITS }) {
                 selfParameterizedTraits += simpleTrait
                 selfClosureChanged = true
+            }
+        }
+    }
+    var assocClosureChanged = true
+    while (assocClosureChanged) {
+        assocClosureChanged = false
+        for ((ktTrait, superEntries) in traitSupertraitBindings) {
+            val cur = traitDefaultlessAssocTypes[ktTrait].orEmpty().toMutableList()
+            var added = false
+            for ((superKt, boundAssocs) in superEntries) {
+                val inherited = traitDefaultlessAssocTypes[superKt].orEmpty()
+                for (assoc in inherited) {
+                    if (assoc !in boundAssocs && assoc !in cur) {
+                        cur += assoc
+                        added = true
+                    }
+                }
+            }
+            if (added) {
+                traitDefaultlessAssocTypes[ktTrait] = cur
+                assocClosureChanged = true
             }
         }
     }
@@ -1569,7 +1632,7 @@ internal fun discoverExternalCrateAbiFromDisk(
     var depth = 0
     while (cur != null && depth < 24) {
         val hasRepoMarker =
-            isScannerKmRegularFile(KmPath(cur, "gradle.properties")) ||
+            isScannerKmRegularFile(KmPath(cur, "rustkotlin.properties")) ||
                 isScannerKmRegularFile(KmPath(cur, "build.gradle.kts"))
         if (hasRepoMarker) {
             currentAnchorRepo = cur
@@ -1598,11 +1661,11 @@ internal fun discoverExternalCrateAbiFromDisk(
     val propsNsCache = linkedMapOf<KmPath, String?>()
     fun readRepoPropsNs(dir: KmPath): String? =
         propsNsCache.getOrPut(dir) {
-            val propsFile = KmPath(dir, "gradle.properties")
+            val propsFile = KmPath(dir, "rustkotlin.properties")
             if (!isScannerKmRegularFile(propsFile)) {
                 null
             } else {
-                parseGradleProperties(readScannerKmFileText(propsFile)).projectNamespace?.trim()?.removeSuffix(".")
+                parseRustKotlinProperties(readScannerKmFileText(propsFile)).projectNamespace?.trim()?.removeSuffix(".")
             }
         }
 

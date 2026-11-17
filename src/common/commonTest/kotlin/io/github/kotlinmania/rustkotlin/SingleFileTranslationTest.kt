@@ -89,7 +89,7 @@ class SingleFileTranslationTest {
                     error("write failed")
                 },
                 report = {},
-                resolveGradleProperties = { null },
+                resolveRustKotlinProperties = { null },
                 resolvePackageProperties = { null },
                 resolveCrateMacroSources = { emptyList() },
                 resolveCrateFlatFileModules = { _, _ -> emptySet() },
@@ -169,16 +169,16 @@ class SingleFileTranslationTest {
         assertContains(result.text, "return u.arbitraryIter().getOrElse { return Result.failure(it) }.collect()")
     }
 
-    @Test fun gradlePropertiesAndPerFolderPackagePropertiesResolveViaKmIo() {
-        val gradleProps =
-            parseGradleProperties(
+    @Test fun rustKotlinPropertiesAndPerFolderPackagePropertiesResolveViaKmIo() {
+        val rustKotlinProps =
+            parseRustKotlinProperties(
                 """
                 project.group=io.github.kotlinmania
                 project.name=indexmap-kotlin
                 """.trimIndent(),
             )
-        assertEquals("io.github.kotlinmania", gradleProps.projectGroup)
-        assertEquals("io.github.kotlinmania.indexmap", gradleProps.projectNamespace)
+        assertEquals("io.github.kotlinmania", rustKotlinProps.projectGroup)
+        assertEquals("io.github.kotlinmania.indexmap", rustKotlinProps.projectNamespace)
 
         val folderProps =
             parsePackageProperties(
@@ -191,9 +191,9 @@ class SingleFileTranslationTest {
             inferFileHeaderContextWithResolvers(
                 inputPath = "/workspace/indexmap-kotlin/tmp/indexmap/src/map/slice.rs",
                 outputPath = "/workspace/indexmap-kotlin/tmp/indexmap/src/map/Slice.kt",
-                gradleProperties = gradleProps,
+                rustKotlinProperties = rustKotlinProps,
                 packageProperties = folderProps,
-                resolveGradleProperties = { null },
+                resolveRustKotlinProperties = { null },
                 resolvePackageProperties = { null },
                 resolveCrateMacroSources = { emptyList() },
                 resolveCrateFlatFileModules = { _, _ -> emptySet() },
