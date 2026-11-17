@@ -705,6 +705,7 @@ internal fun scanModuleTokenTrees(
     insideExternBlock: Boolean = false,
     traitDefaultlessAssocTypes: MutableMap<String, List<String>> = linkedMapOf(),
     traitResultMethods: MutableMap<String, List<String>> = linkedMapOf(),
+    registerFnConstParams: (String, String, Int, List<String>) -> Unit = { _, _, _, _ -> },
 ) {
     val pendingAttrs = mutableListOf<List<TokenTree>>()
     var i = 0
@@ -763,6 +764,7 @@ internal fun scanModuleTokenTrees(
                     ffiReferencedIdents = ffiReferencedIdents,
                     constLeafTargets = constLeafTargets,
                     insideExternBlock = true,
+                    registerFnConstParams = registerFnConstParams,
                 )
             }
             i = externBraceIdx + 1
@@ -815,6 +817,7 @@ internal fun scanModuleTokenTrees(
                                 insideExternBlock = insideExternBlock,
                                 traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
                                 traitResultMethods = traitResultMethods,
+                                registerFnConstParams = registerFnConstParams,
                             )
                         }
                     } else if (innerTrees.any { (it as? TokenTree.Ident)?.value?.toString() == "pub" }) {
@@ -842,6 +845,7 @@ internal fun scanModuleTokenTrees(
                             constLeafTargets = constLeafTargets,
                             insideCEnumMacro = insideCEnumMacro || macroLeafIdent == "c_enum",
                             insideExternBlock = insideExternBlock,
+                            registerFnConstParams = registerFnConstParams,
                         )
                     }
                 }
@@ -906,6 +910,7 @@ internal fun scanModuleTokenTrees(
                                 insideExternBlock = insideExternBlock,
                                 traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
                                 traitResultMethods = traitResultMethods,
+                                registerFnConstParams = registerFnConstParams,
                             )
                         }
                     }
@@ -1050,6 +1055,10 @@ internal fun scanModuleTokenTrees(
                             if (pLists != null || retTy != null) {
                                 registerFnSig(subpkg, ktFn, pLists, retTy, insideExternBlock)
                             }
+                            val constParams = extractFnConstParamNamesFromHeader(trees, kwIdx + 1)
+                            if (pLists != null && constParams.isNotEmpty()) {
+                                registerFnConstParams(subpkg, ktFn, pLists.size, constParams)
+                            }
                         }
                     } else if (afterConstText != null && afterConstText != "_" && afterConstText !in SCANNER_ITEM_KEYWORDS && !skippedByCfg) {
                         val ktConst = KotlinNamingPolicy.Default.toConstIdentifier(afterConstText)
@@ -1088,6 +1097,10 @@ internal fun scanModuleTokenTrees(
                         val retTy = extractFnReturnTypeFromHeader(trees, kwIdx, endFnIdx, rawAbiMode, insideExternBlock = insideExternBlock)
                         if (pLists != null || retTy != null) {
                             registerFnSig(subpkg, ktFn, pLists, retTy, insideExternBlock)
+                        }
+                        val constParams = extractFnConstParamNamesFromHeader(trees, kwIdx)
+                        if (pLists != null && constParams.isNotEmpty()) {
+                            registerFnConstParams(subpkg, ktFn, pLists.size, constParams)
                         }
                     }
                     i = endFnIdx
@@ -1137,6 +1150,7 @@ internal fun scanModuleTokenTrees(
                     insideExternBlock = insideExternBlock,
                     traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
                     traitResultMethods = traitResultMethods,
+                    registerFnConstParams = registerFnConstParams,
                 )
             }
             i = skipItemAfterHeader(trees, i + 1)
@@ -1181,6 +1195,7 @@ internal fun scanModuleTokenTrees(
                     subpkg = subpkg,
                     rawAbiMode = rawAbiMode,
                     registerFnSig = registerFnSig,
+                    registerFnConstParams = registerFnConstParams,
                 )
             }
             i = endImplIdx
@@ -1207,6 +1222,10 @@ internal fun scanModuleTokenTrees(
                     val retTy = extractFnReturnTypeFromHeader(trees, i, endFnIdx, rawAbiMode, insideExternBlock = insideExternBlock)
                     if (pLists != null || retTy != null) {
                         registerFnSig(subpkg, ktFn, pLists, retTy, insideExternBlock)
+                    }
+                    val constParams = extractFnConstParamNamesFromHeader(trees, i)
+                    if (pLists != null && constParams.isNotEmpty()) {
+                        registerFnConstParams(subpkg, ktFn, pLists.size, constParams)
                     }
                 }
                 i = endFnIdx
@@ -1675,6 +1694,24 @@ internal fun mapTokensFieldTypeQuick(
     subpkg: String = "",
 ): String? {
     if (tokens.isEmpty()) return null
+    val firstTok = tokens[0]
+    if (firstTok is TokenTree.Ident && firstTok.value.toString() == "pub") {
+        val secondTok = tokens.getOrNull(1)
+        val visLen =
+            if (secondTok is TokenTree.Group && secondTok.value.delimiter() == Delimiter.Parenthesis) {
+                2
+            } else {
+                1
+            }
+        return mapTokensFieldTypeQuick(
+            tokens = tokens.drop(visLen),
+            rawAbiMode = rawAbiMode,
+            selfOwnerKt = selfOwnerKt,
+            insideExternBlock = insideExternBlock,
+            numericKinds = numericKinds,
+            subpkg = subpkg,
+        )
+    }
     if (tokens.size == 1 && (tokens[0] as? TokenTree.Group)?.value?.delimiter() == Delimiter.Parenthesis) {
         if ((tokens[0] as TokenTree.Group).value.stream().isEmpty()) return "Unit"
     }
@@ -1980,6 +2017,35 @@ private fun extractNonMethodFnParamTokenLists(
     return paramTypes
 }
 
+private fun extractConstParamNamesFromGenericBrackets(
+    trees: List<TokenTree>,
+    ltIdx: Int,
+): List<String> {
+    val closeIdx = skipBalancedAngleBrackets(trees, ltIdx) ?: return emptyList()
+    if (closeIdx <= ltIdx + 1) return emptyList()
+    val inner = trees.subList(ltIdx + 1, closeIdx - 1)
+    val clauses = MacroRulesFileExpander.splitTopLevelCommaClauses(inner)
+    val constNames = mutableListOf<String>()
+    for (clause in clauses) {
+        val stripped = stripLeadingScannerAttrs(clause)
+        if ((stripped.firstOrNull() as? TokenTree.Ident)?.value?.toString() == "const") {
+            val identRaw = (stripped.getOrNull(1) as? TokenTree.Ident)?.value?.toString()?.removePrefix("r#") ?: continue
+            constNames += rustValueIdentToKotlin(identRaw)
+        }
+    }
+    return constNames
+}
+
+private fun extractFnConstParamNamesFromHeader(
+    trees: List<TokenTree>,
+    startIdx: Int,
+): List<String> {
+    val fnIdx = skipFnQualifiersAndFindFnKw(trees, startIdx, allowBareLiteral = true) ?: return emptyList()
+    val afterIdent = fnIdx + 2
+    if ((trees.getOrNull(afterIdent) as? TokenTree.Punct)?.value?.asChar() != '<') return emptyList()
+    return extractConstParamNamesFromGenericBrackets(trees, afterIdent)
+}
+
 private fun scanInherentImplAssociatedFunctions(
     trees: List<TokenTree>,
     implKwIdx: Int,
@@ -1987,13 +2053,51 @@ private fun scanInherentImplAssociatedFunctions(
     subpkg: String,
     rawAbiMode: Boolean,
     registerFnSig: (String, String, List<List<TokenTree>>?, String?, Boolean) -> Unit,
+    registerFnConstParams: (String, String, Int, List<String>) -> Unit = { _, _, _, _ -> },
 ) {
     val headerSlice = trees.subList(implKwIdx + 1, endImplIdx)
-    if (headerSlice.any { (it as? TokenTree.Ident)?.value?.toString() == "for" }) return
     val braceTree = headerSlice.lastOrNull { (it as? TokenTree.Group)?.value?.delimiter() == Delimiter.Brace } as? TokenTree.Group ?: return
     val beforeBrace = headerSlice.subList(0, headerSlice.indexOf(braceTree))
-    if (beforeBrace.any { (it as? TokenTree.Punct)?.value?.asChar() == '<' }) return
-    val ownerLeaf = extractSimplePathLeafIdent(beforeBrace) ?: return
+    val hasGenericsOrFor =
+        beforeBrace.any {
+            (it as? TokenTree.Punct)?.value?.asChar() == '<' ||
+                (it as? TokenTree.Ident)?.value?.toString() == "for"
+        }
+    var scanIdx = 0
+    val implConsts =
+        if ((beforeBrace.firstOrNull() as? TokenTree.Punct)?.value?.asChar() == '<') {
+            val closeIdx = skipBalancedAngleBrackets(beforeBrace, 0) ?: return
+            val consts = extractConstParamNamesFromGenericBrackets(beforeBrace, 0)
+            scanIdx = closeIdx
+            consts
+        } else {
+            emptyList()
+        }
+    if (scanIdx < beforeBrace.size) {
+        val afterImplType = beforeBrace.subList(scanIdx, beforeBrace.size)
+        var angleDepth = 0
+        for (tok in afterImplType) {
+            if (tok is TokenTree.Punct) {
+                val c = tok.value.asChar()
+                if (c == '<') {
+                    angleDepth++
+                } else if (c == '>' && angleDepth > 0) {
+                    angleDepth--
+                }
+            } else if (angleDepth == 0 && tok is TokenTree.Ident && tok.value.toString() == "for") {
+                return
+            }
+        }
+    }
+    val typeHeadTokens =
+        beforeBrace
+            .subList(scanIdx, beforeBrace.size)
+            .takeWhile {
+                val c = (it as? TokenTree.Punct)?.value?.asChar()
+                val kw = (it as? TokenTree.Ident)?.value?.toString()
+                c != '<' && kw != "where"
+            }
+    val ownerLeaf = extractSimplePathLeafIdent(typeHeadTokens) ?: return
     val ownerKt = KotlinNamingPolicy.Default.toTypeIdentifier(ownerLeaf, allowRawAbi = rawAbiMode)
     if (ownerKt.isEmpty()) return
 
@@ -2018,9 +2122,15 @@ private fun scanInherentImplAssociatedFunctions(
             if (fnIdent != null && !skipped) {
                 val ktMethod = rustFunctionIdentToKotlin(fnIdent)
                 val pLists = extractNonMethodFnParamTokenLists(bodyTrees, kwIdx)
-                val retTy = extractFnReturnTypeFromHeader(bodyTrees, kwIdx, endFnIdx, rawAbiMode, ownerKt)
-                if (pLists != null || retTy != null) {
-                    registerFnSig(subpkg, "$ownerKt.$ktMethod", pLists, retTy, false)
+                if (!hasGenericsOrFor) {
+                    val retTy = extractFnReturnTypeFromHeader(bodyTrees, kwIdx, endFnIdx, rawAbiMode, ownerKt)
+                    if (pLists != null || retTy != null) {
+                        registerFnSig(subpkg, "$ownerKt.$ktMethod", pLists, retTy, false)
+                    }
+                }
+                val combinedConsts = (implConsts + extractFnConstParamNamesFromHeader(bodyTrees, kwIdx)).distinct()
+                if (pLists != null && combinedConsts.isNotEmpty()) {
+                    registerFnConstParams(subpkg, "$ownerKt.$ktMethod", pLists.size, combinedConsts)
                 }
             }
             i = endFnIdx

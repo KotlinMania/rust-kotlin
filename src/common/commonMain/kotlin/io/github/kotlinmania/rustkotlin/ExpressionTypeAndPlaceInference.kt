@@ -1773,6 +1773,10 @@ internal fun KotlinJ2KEmitter.resolveCallArgExpectedCollectionOrArrayType(
                                     headerContext.crateStructFieldTypes["$scoped.$fieldKey"]
                                 }
                                 ?: headerContext.crateStructFieldTypes["$ctorKt.$fieldKey"]
+                                ?: headerContext.crateStructFieldTypes.entries
+                                    .mapNotNull { (k, v) -> if (k.endsWith(".$ctorKt.$fieldKey")) v else null }
+                                    .distinct()
+                                    .singleOrNull()
                         }?.removeSuffix("?")?.trim()
                 } else {
                     null

@@ -238,10 +238,12 @@ public data class FileHeaderContext(
     public val crateSelfParameterizedTraits: Set<String> = emptySet(),
     public val crateTraitSupertraits: Map<String, List<String>> = emptyMap(),
     public val crateTraitAstRegistryKey: String? = null,
+    public val crateFnConstParamNames: Map<String, Pair<Int, List<String>>> = emptyMap(),
     public val scalarChar: Boolean = false,
     public val externalCrateSymbolPackages: Map<String, Map<String, List<String>>> = emptyMap(),
     public val externalCrateTwoFieldResultFns: Set<String> = emptySet(),
     public val externalCrateNullableReturnFns: Set<String> = emptySet(),
+    public val externalCrateFnConstParams: Map<String, Pair<Int, List<String>>> = emptyMap(),
     public val testClassName: String? = null,
 ) {
     public constructor(
@@ -447,6 +449,7 @@ internal fun discoverCrateMacroSourcesFromDisk(inputPath: String?): List<String>
     addMacroSourceFile(KmPath(crateSrcRoot, "macros.rs"), followMacroUse = true)
     for (dir in ancestorDirs) {
         addMacroSourceFile(KmPath(dir, "mod.rs"), followMacroUse = true)
+        addMacroSourceFile(KmPath(dir, "macros.rs"), followMacroUse = true)
     }
 
     val cachedEntries = entries.toList()
@@ -545,6 +548,7 @@ internal fun inferFileHeaderContextWithResolvers(
         externalCrateSymbolPackages = externalAbi.symbolPackages,
         externalCrateTwoFieldResultFns = externalAbi.twoFieldResultFns,
         externalCrateNullableReturnFns = externalAbi.nullableReturnFns,
+        externalCrateFnConstParams = externalAbi.fnConstParams,
     )
 }
 

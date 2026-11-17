@@ -520,7 +520,12 @@ internal fun KotlinJ2KEmitter.sourceAssociatedParameters(generics: Generics): Li
             boundsByParam[rawParamIdent]
                 .orEmpty()
                 .filterIsInstance<TypeParamBound.Trait>()
-                .flatMap { bound ->
+                .filter { bound ->
+                    bound.path.segments
+                        .last()
+                        ?.ident
+                        ?.toString() != "SimdElement"
+                }.flatMap { bound ->
                     val trait =
                         bound.path.segments
                             .last()

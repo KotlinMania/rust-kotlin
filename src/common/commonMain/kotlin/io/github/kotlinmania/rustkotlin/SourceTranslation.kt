@@ -151,8 +151,7 @@ private fun collectDirectDeclaredItemCollisionNames(items: List<Item>): Set<Stri
     return names
 }
 
-private fun selectSplitCandidateInlineMods(file: File, headerContext: FileHeaderContext): List<Item.Mod> {
-    if (headerContext.packageName.isNullOrBlank()) return emptyList()
+internal fun selectSplitCandidateInlineModsForFile(file: File): List<Item.Mod> {
     val candidates =
         file.items.filterIsInstance<Item.Mod>().filter { modItem ->
             modItem.content is ModContent.Inline &&
@@ -177,6 +176,11 @@ private fun selectSplitCandidateInlineMods(file: File, headerContext: FileHeader
         if (hasCollision) break
     }
     return if (hasCollision) candidates else emptyList()
+}
+
+private fun selectSplitCandidateInlineMods(file: File, headerContext: FileHeaderContext): List<Item.Mod> {
+    if (headerContext.packageName.isNullOrBlank()) return emptyList()
+    return selectSplitCandidateInlineModsForFile(file)
 }
 
 private fun flattenPrivateDefinitionInlineMods(file: File): File {
@@ -1587,21 +1591,28 @@ internal class KotlinJ2KEmitter(
         }
         extraImports.addAll(
             combinedExtraTypeImports.filter { imp ->
-                val impPath = imp.removePrefix("import ").substringBefore(" as ").trim()
+                val afterImport = imp.removePrefix("import ").trim()
+                val impPath = afterImport.substringBefore(" as ").trim()
                 val rawSimple = impPath.substringAfterLast('.')
+                val boundSimple =
+                    if (" as " in afterImport) {
+                        afterImport.substringAfter(" as ").trim()
+                    } else {
+                        rawSimple
+                    }
                 val targetPkg = impPath.substringBeforeLast('.', missingDelimiterValue = "")
-                val isSingleUpperTypeParam = rawSimple.length == 1 && rawSimple[0] in 'A'..'Z'
+                val isSingleUpperTypeParam = boundSimple.length == 1 && boundSimple[0] in 'A'..'Z'
                 val isEnumVariantShadowed =
-                    (rawSimple in inspector.enumVariantSimpleNames || rawSimple in inspector.importedEnumVariantSimpleNames) &&
+                    (boundSimple in inspector.enumVariantSimpleNames || boundSimple in inspector.importedEnumVariantSimpleNames) &&
                         !impPath.endsWith(".Result.$rawSimple") &&
                         impPath != "Result.$rawSimple" &&
                         !impPath.endsWith(".Option.$rawSimple") &&
                         impPath != "Option.$rawSimple"
                 targetPkg != headerContext.packageName &&
-                    rawSimple !in inspector.declaredTypeNames &&
+                    boundSimple !in inspector.declaredTypeNames &&
                     !isSingleUpperTypeParam &&
                     !isEnumVariantShadowed &&
-                    containsWholeIdentifier(bodyTextForImports, rawSimple)
+                    containsWholeIdentifier(bodyTextForImports, boundSimple)
             },
         )
         val rawProjNs = headerContext.projectNamespace?.trim()?.removeSuffix(".")

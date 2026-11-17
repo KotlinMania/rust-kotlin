@@ -1589,6 +1589,17 @@ internal class MacroRulesFileExpander(
                 return substituteMacroTokensWithEnv(branch.bodyTokens.clone(), env)
             }
         }
+        if (inputTrees.any { it is TokenTree.Group && it.value.delimiter() == Delimiter.None }) {
+            val flattenedTrees = flattenTopLevelNoneGroups(inputTrees)
+            for (branch in def.branches) {
+                if (hasTtMetavar(branch.pattern)) continue
+                val env = MacroMatchEnv()
+                val consumed = matchPatternSequence(branch.pattern, 0, flattenedTrees, 0, env)
+                if (consumed == flattenedTrees.size) {
+                    return substituteMacroTokensWithEnv(branch.bodyTokens.clone(), env)
+                }
+            }
+        }
         return null
     }
 
@@ -2221,8 +2232,36 @@ internal class MacroRulesFileExpander(
                 is TokenTree.Punct -> pat.isPunct && tt.value.asChar().toString() == pat.text
                 is TokenTree.Ident -> !pat.isPunct && tt.value.toString() == pat.text
                 is TokenTree.Literal -> !pat.isPunct && tt.value.toString() == pat.text
-                is TokenTree.Group -> false
+                is TokenTree.Group ->
+                    tt.value.delimiter() == Delimiter.None &&
+                        tt.value
+                            .stream()
+                            .toList()
+                            .singleOrNull()
+                            ?.let { tokenMatchesLiteral(it, pat) } == true
             }
+
+        private fun hasTtMetavar(pats: List<MacroPat>): Boolean =
+            pats.any { p ->
+                when (p) {
+                    is MacroPat.Metavar -> p.fragSpec == "tt"
+                    is MacroPat.GroupPat -> hasTtMetavar(p.inner)
+                    is MacroPat.Repetition -> hasTtMetavar(p.inner)
+                    is MacroPat.LiteralToken -> false
+                }
+            }
+
+        private fun flattenTopLevelNoneGroups(trees: List<TokenTree>): List<TokenTree> {
+            val out = mutableListOf<TokenTree>()
+            for (tt in trees) {
+                if (tt is TokenTree.Group && tt.value.delimiter() == Delimiter.None) {
+                    out.addAll(flattenTopLevelNoneGroups(tt.value.stream().toList()))
+                } else {
+                    out.add(tt)
+                }
+            }
+            return out
+        }
 
         private fun collectDirectPatMetavars(pats: List<MacroPat>): Set<String> {
             val vars = linkedSetOf<String>()

@@ -710,21 +710,29 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
             else -> rustMethodIdentToKotlin(rawMethod)
         }
     val macroTypeArgs = mutableListOf<String>()
+    val explicitMethodConstArgs = mutableListOf<String>()
     val typeArgs =
         expr.turbofish
             ?.let { tf ->
                 val renderedArgs = mutableListOf<String>()
                 for (ga in tf.args.toList()) {
-                    val unwrappedMacro = (ga as? GenericArgument.TypeArg)?.type?.let { unwrapSynType(it) } as? SynType.Macro
-                    if (unwrappedMacro != null) {
-                        val renderedMac = renderMacroInvocationAsStmtOrExpr(unwrappedMacro.mac, indent, selfTypeName)
-                        if (rawMethod == "parse" && nonUnitArgs.isEmpty() && renderedMac.endsWith(".default()")) {
-                            macroTypeArgs += "${renderedMac.removeSuffix(".default()")}::parse"
-                        } else {
-                            macroTypeArgs += renderedMac
+                    when (ga) {
+                        is GenericArgument.ConstArg -> explicitMethodConstArgs += renderExpr(ga.expr, indent, selfTypeName)
+                        is GenericArgument.TypeArg -> {
+                            runtimeConstTypeArgument(ga)?.let { explicitMethodConstArgs += it }
+                            val unwrappedMacro = unwrapSynType(ga.type) as? SynType.Macro
+                            if (unwrappedMacro != null) {
+                                val renderedMac = renderMacroInvocationAsStmtOrExpr(unwrappedMacro.mac, indent, selfTypeName)
+                                if (rawMethod == "parse" && nonUnitArgs.isEmpty() && renderedMac.endsWith(".default()")) {
+                                    macroTypeArgs += "${renderedMac.removeSuffix(".default()")}::parse"
+                                } else {
+                                    macroTypeArgs += renderedMac
+                                }
+                            } else {
+                                renderGenericArgument(ga, selfTypeName)?.let { renderedArgs += it }
+                            }
                         }
-                    } else {
-                        renderGenericArgument(ga, selfTypeName)?.let { renderedArgs += it }
+                        else -> renderGenericArgument(ga, selfTypeName)?.let { renderedArgs += it }
                     }
                 }
                 if (renderedArgs.isNotEmpty()) "<${renderedArgs.joinToString(", ")}>" else ""
@@ -1422,7 +1430,25 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
         } else {
             renderedValueArgs
         }
-    val valueArgs = macroTypeArgs + adjustedRenderedValueArgs
+    val inferredRecvOwnerSimple =
+        if (unwrapParenOrGroupExpr(expr.receiver).let { it is Expr.Path && it.path.isIdent("self") }) {
+            selfTypeName
+        } else {
+            currentTypedLocals[receiver] ?: inferExprRenderedType(expr.receiver, selfTypeName)
+        }?.removeSuffix("?")?.substringBefore('<')?.substringAfterLast('.')?.trim()
+    val methodConstEntry = inferredRecvOwnerSimple?.let { inspector.methodConstParamNames["$it.$method"] }
+    val forwardedMethodConstArgs =
+        if (explicitMethodConstArgs.isEmpty() &&
+            activeConstParamNames.isNotEmpty() &&
+            methodConstEntry != null &&
+            methodConstEntry.first == nonUnitArgs.size &&
+            methodConstEntry.second.all { it in activeConstParamNames }
+        ) {
+            methodConstEntry.second
+        } else {
+            emptyList()
+        }
+    val valueArgs = macroTypeArgs + adjustedRenderedValueArgs + forwardedMethodConstArgs
     val args = valueArgs.joinToString(", ")
     if ("core" in headerContext.crateNamespaces &&
         typeArgs.isEmpty() &&

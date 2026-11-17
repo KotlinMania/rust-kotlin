@@ -795,13 +795,52 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                 )?.args
                     ?.toList()
                     .orEmpty()
-            val constValueArgs =
+            val explicitConstValueArgs =
                 explicitGenericArgs.mapNotNull { arg ->
                     when (arg) {
                         is GenericArgument.ConstArg -> renderExpr(arg.expr, indent, selfTypeName)
                         is GenericArgument.TypeArg -> runtimeConstTypeArgument(arg)
                         else -> null
                     }
+                }
+            val constValueArgs =
+                if (explicitConstValueArgs.isNotEmpty() || activeConstParamNames.isEmpty()) {
+                    explicitConstValueArgs
+                } else {
+                    val calleeSimple = calleeBase.substringAfterLast('.')
+                    val sameFileOrCrateConsts =
+                        (
+                            inspector.fnConstParamNames[calleeBase]
+                                ?: inspector.fnConstParamNames[calleeSimple]
+                                ?: headerContext.crateFnConstParamNames[calleeBase]
+                                ?: headerContext.crateFnConstParamNames[calleeSimple]
+                        )?.takeIf { (arity, consts) -> arity == nonUnitArgs.size && consts.all { it in activeConstParamNames } }
+                            ?.second
+                    sameFileOrCrateConsts
+                        ?: run {
+                            val extKeys =
+                                buildList {
+                                    if ('.' in calleeBase) {
+                                        val ownerPart = calleeBase.substringBeforeLast('.')
+                                        val fnPart = calleeBase.substringAfterLast('.')
+                                        val ownerPkg = importedSimpleNameToPkg[ownerPart]
+                                        if (ownerPkg != null) add("$ownerPkg.$ownerPart.$fnPart")
+                                        add(calleeBase)
+                                    } else {
+                                        val fnPkg = importedSimpleNameToPkg[calleeBase]
+                                        if (fnPkg != null) add("$fnPkg.$calleeBase")
+                                        add(calleeBase)
+                                    }
+                                }
+                            extKeys
+                                .firstNotNullOfOrNull { key ->
+                                    val shape = headerContext.externalCrateFnConstParams[key] ?: return@firstNotNullOfOrNull null
+                                    val needed = shape.first - nonUnitArgs.size
+                                    if (needed <= 0 || needed > shape.second.size) return@firstNotNullOfOrNull null
+                                    val tailConsts = shape.second.takeLast(needed)
+                                    tailConsts.takeIf { it.all { c -> c in activeConstParamNames } }
+                                }.orEmpty()
+                        }
                 }
             // Function signatures lift Rust const parameters before
             // trait witnesses. Preserve actual order/volatile values.

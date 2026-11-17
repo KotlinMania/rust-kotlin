@@ -54,12 +54,14 @@ internal data class CrateRawAbiMetadata(
     val selfParameterizedTraits: Set<String> = emptySet(),
     val traitSupertraits: Map<String, List<String>> = emptyMap(),
     val traitAstRegistryKey: String? = null,
+    val fnConstParamNames: Map<String, Pair<Int, List<String>>> = emptyMap(),
 )
 
 internal data class ExternalCrateAbiMetadata(
     val symbolPackages: Map<String, Map<String, List<String>>> = emptyMap(),
     val twoFieldResultFns: Set<String> = emptySet(),
     val nullableReturnFns: Set<String> = emptySet(),
+    val fnConstParams: Map<String, Pair<Int, List<String>>> = emptyMap(),
 )
 
 private var diskCrateRawAbiMetadataCache: Map<String, CrateRawAbiMetadata> = emptyMap()
@@ -390,6 +392,25 @@ private fun scanSourcesWithActiveSession(
     val traitDefaultlessAssocTypes = linkedMapOf<String, List<String>>()
     val traitSupertraitBindings = linkedMapOf<String, List<Pair<String, Set<String>>>>()
     val traitResultMethods = linkedMapOf<String, List<String>>()
+    val fnConstParamNames = linkedMapOf<String, Pair<Int, List<String>>>()
+
+    fun registerFnConstParams(
+        subpkg: String,
+        key: String,
+        valueArity: Int,
+        constParams: List<String>,
+    ) {
+        if (constParams.isEmpty()) return
+        if (key !in fnConstParamNames) {
+            fnConstParamNames[key] = valueArity to constParams
+        }
+        if (subpkg.isNotEmpty()) {
+            val scopedKey = "$subpkg.$key"
+            if (scopedKey !in fnConstParamNames) {
+                fnConstParamNames[scopedKey] = valueArity to constParams
+            }
+        }
+    }
 
     fun registerFnSignatureTokens(
         subpkg: String,
@@ -536,6 +557,7 @@ private fun scanSourcesWithActiveSession(
             constLeafTargets = constLeafTargets,
             traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
             traitResultMethods = traitResultMethods,
+            registerFnConstParams = ::registerFnConstParams,
         )
     }
 
@@ -873,6 +895,7 @@ private fun scanSourcesWithActiveSession(
                     "enum " in src || "enum\n" in src || "enum\t" in src ||
                     "type " in src || "type\n" in src || "type\t" in src ||
                     "fn " in src || "fn\n" in src || "fn\t" in src ||
+                    "mod " in src || "mod\n" in src || "mod\t" in src ||
                     "const " in src || "const\n" in src || "const\t" in src ||
                     "union " in src || "union\n" in src || "union\t" in src
             }
@@ -899,13 +922,19 @@ private fun scanSourcesWithActiveSession(
             }
         }
         collectFileTraitNames(expandedFile.items)
-        fun walkTraitItems(items: List<Item>) {
+        val splitInlineMods =
+            if (splitModuleRoots) {
+                selectSplitCandidateInlineModsForFile(expandedFile).toSet()
+            } else {
+                emptySet()
+            }
+        fun walkTraitItems(items: List<Item>, curSubpkg: String = subpkg) {
             for (item in items) {
                 if (itemHasDocOnlyCfg(item)) continue
                 when (item) {
                     is Item.Trait -> {
                         val ktTrait = KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
-                        registerSymbolInSubpkg(ktTrait, subpkg)
+                        registerSymbolInSubpkg(ktTrait, curSubpkg)
                         declaredTraitAsts.putIfMissing(ktTrait, item)
                         if (subpkg.isNotEmpty()) {
                             declaredTraitAsts.putIfMissing("$subpkg.$ktTrait", item)
@@ -965,7 +994,7 @@ private fun scanSourcesWithActiveSession(
                                     }
                                 is TraitItem.Fn -> {
                                     val ktFn = rustFunctionIdentToKotlin(tItem.sig.ident.toString())
-                                    registerSymbolInSubpkg(ktFn, subpkg)
+                                    registerSymbolInSubpkg(ktFn, curSubpkg)
                                     if (isSynResultReturnType(tItem.sig.output)) {
                                         astResultMethods += ktFn
                                     }
@@ -984,36 +1013,46 @@ private fun scanSourcesWithActiveSession(
                     }
                     is Item.Struct -> {
                         val ktType = KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
-                        registerSymbolInSubpkg(ktType, subpkg)
+                        registerSymbolInSubpkg(ktType, curSubpkg)
                     }
                     is Item.Enum -> {
                         val ktType = KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
-                        registerSymbolInSubpkg(ktType, subpkg)
+                        registerSymbolInSubpkg(ktType, curSubpkg)
                     }
                     is Item.Union -> {
                         val ktType = KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
-                        registerSymbolInSubpkg(ktType, subpkg)
+                        registerSymbolInSubpkg(ktType, curSubpkg)
                     }
                     is Item.ItemType -> {
                         val ktType = KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
-                        registerSymbolInSubpkg(ktType, subpkg)
+                        registerSymbolInSubpkg(ktType, curSubpkg)
                     }
                     is Item.Fn -> {
                         val ktFn = rustFunctionIdentToKotlin(item.sig.ident.toString())
-                        registerSymbolInSubpkg(ktFn, subpkg)
+                        registerSymbolInSubpkg(ktFn, curSubpkg)
                     }
                     is Item.Const -> {
                         val ktConst = KotlinNamingPolicy.Default.toConstIdentifier(item.ident.toString())
-                        registerSymbolInSubpkg(ktConst, subpkg)
+                        registerSymbolInSubpkg(ktConst, curSubpkg)
                     }
                     is Item.Static -> {
                         val ktStatic = rustValueIdentToKotlin(item.ident.toString())
-                        registerSymbolInSubpkg(ktStatic, subpkg)
+                        registerSymbolInSubpkg(ktStatic, curSubpkg)
                     }
                     is Item.Mod -> {
                         val content = item.content
                         if (content is ModContent.Inline && !hasCfgTestModAttribute(item.attrs)) {
-                            walkTraitItems(content.items)
+                            val rawMod = item.ident.toString().removePrefix("r#")
+                            val modKt = rustModuleIdentToKotlin(rawMod.replace('-', '_'))
+                            val nextSub =
+                                if (item in splitInlineMods && modKt.isNotEmpty()) {
+                                    val childSub = if (curSubpkg.isEmpty()) modKt else "$curSubpkg.$modKt"
+                                    subpkgToRawLeaf.putIfMissing(childSub, rawMod)
+                                    childSub
+                                } else {
+                                    curSubpkg
+                                }
+                            walkTraitItems(content.items, nextSub)
                         }
                     }
                     else -> {}
@@ -1088,6 +1127,7 @@ private fun scanSourcesWithActiveSession(
         selfParameterizedTraits = selfParameterizedTraits,
         traitSupertraits = traitSupertraits,
         traitAstRegistryKey = traitRegistryKey,
+        fnConstParamNames = fnConstParamNames,
     )
 }
 
@@ -1602,6 +1642,8 @@ private fun buildFnPtrInvokeTemplate(
 private val EXTERNAL_PKG_REGEX = Regex("""^\s*package\s+([A-Za-z0-9_.]+)""")
 private val EXTERNAL_LEADING_ANN_REGEX = Regex("""^(?:@[A-Za-z_][A-Za-z0-9_.]*(?:\([^)]*\))?\s+)+""")
 private val EXTERNAL_DATA_CLASS_REGEX = Regex("""^public\s+data\s+class\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(""")
+private val EXTERNAL_OWNER_CLASS_REGEX =
+    Regex("""^(?:public|internal|private)?\s*(?:(?:sealed|data|enum|value|abstract|open|inner|expect|actual)\s+)*(?:class|interface|object)\s+([A-Za-z_][A-Za-z0-9_]*)""")
 private val EXTERNAL_PUBLIC_FUN_REGEX =
     Regex("""^public\s+(?:(?:inline|infix|operator|suspend|tailrec|external)\s+)*fun\s+(?:<[^>]+>\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(""")
 private val EXTERNAL_PUBLIC_TYPE_OR_VAL_REGEX =
@@ -1735,6 +1777,7 @@ internal fun discoverExternalCrateAbiFromDisk(
     val symbolPackages = linkedMapOf<String, Map<String, List<String>>>()
     val twoFieldResultFns = linkedSetOf<String>()
     val nullableReturnFns = linkedSetOf<String>()
+    val fnConstParams = linkedMapOf<String, Pair<Int, List<String>>>()
 
     for (matched in matchedCrates) {
         val crateKey = matched.crateKey
@@ -1747,6 +1790,7 @@ internal fun discoverExternalCrateAbiFromDisk(
                 pkgMapBySym = pkgMapBySym,
                 twoFieldResultFns = twoFieldResultFns,
                 nullableReturnFns = nullableReturnFns,
+                fnConstParams = fnConstParams,
             )
         }
         if (pkgMapBySym.isNotEmpty()) {
@@ -1769,6 +1813,7 @@ internal fun discoverExternalCrateAbiFromDisk(
             symbolPackages = symbolPackages,
             twoFieldResultFns = twoFieldResultFns,
             nullableReturnFns = nullableReturnFns,
+            fnConstParams = fnConstParams,
         )
     if (symbolPackages.isNotEmpty()) {
         if (diskExternalCrateAbiCache.size >= 32) {
@@ -1786,6 +1831,7 @@ private fun scanExternalKotlinFileSymbols(
     pkgMapBySym: MutableMap<String, LinkedHashSet<String>>,
     twoFieldResultFns: MutableSet<String>,
     nullableReturnFns: MutableSet<String>,
+    fnConstParams: MutableMap<String, Pair<Int, List<String>>>,
 ) {
     val lines = sourceText.lines()
     var pkg: String? = null
@@ -1801,7 +1847,10 @@ private fun scanExternalKotlinFileSymbols(
     val twoFieldClasses = linkedSetOf<String>()
     val candidateTwoFieldFns = mutableListOf<Pair<String, String>>()
     var braceDepth = 0
+    var parenDepth = 0
     var inBlockComment = false
+    var currentOwnerCls: String? = null
+    var companionDepth: Int? = null
 
     fun updateBraceDepth(line: String) {
         var i = 0
@@ -1840,6 +1889,8 @@ private fun scanExternalKotlinFileSymbols(
                 }
                 ch == '"' -> inStr = true
                 ch == '\'' -> inChar = true
+                ch == '(' -> parenDepth++
+                ch == ')' -> if (parenDepth > 0) parenDepth--
                 ch == '{' -> braceDepth++
                 ch == '}' -> if (braceDepth > 0) braceDepth--
             }
@@ -1878,22 +1929,51 @@ private fun scanExternalKotlinFileSymbols(
     for (lineIdx in lines.indices) {
         val line = lines[lineIdx]
         val depthBefore = braceDepth
+        val parenBefore = parenDepth
         val wasInComment = inBlockComment
         updateBraceDepth(line)
-        if (wasInComment || depthBefore != 0) continue
+        if (braceDepth == 0 && parenDepth == 0) {
+            currentOwnerCls = null
+            companionDepth = null
+        } else {
+            val activeCompDepth = companionDepth
+            if (activeCompDepth != null && braceDepth < activeCompDepth) {
+                companionDepth = null
+            }
+        }
+        if (wasInComment || parenBefore != 0) continue
 
         val header = line.trim().replace(EXTERNAL_LEADING_ANN_REGEX, "")
+        if (depthBefore == 0) {
+            EXTERNAL_OWNER_CLASS_REGEX.find(header)?.let { clsMatch ->
+                if (braceDepth > 0 || parenDepth > 0) {
+                    currentOwnerCls = clsMatch.groupValues[1]
+                }
+            }
+        } else if (depthBefore == 1 &&
+            currentOwnerCls != null &&
+            (header.startsWith("public companion object") || header.startsWith("companion object")) &&
+            braceDepth >= 2
+        ) {
+            companionDepth = braceDepth
+        }
+
+        val isTopLevel = depthBefore == 0
+        val isCompanionMember = !isTopLevel && companionDepth != null && depthBefore == companionDepth
+        if (!isTopLevel && !isCompanionMember) continue
         if (!header.startsWith("public ")) continue
 
-        EXTERNAL_DATA_CLASS_REGEX.find(header)?.let { dcMatch ->
-            val clsName = dcMatch.groupValues[1]
-            pkgMapBySym.getOrPut(clsName) { linkedSetOf() } += packageName
-            val paramsText = extractAfterMatchingParen(lineIdx)?.first
-            if (paramsText != null) {
-                val inner = paramsText.substringAfter('(').substringBeforeLast(')')
-                val propCount = Regex("""\b(val|var)\s+""").findAll(inner).count()
-                if (propCount == 2) {
-                    twoFieldClasses += clsName
+        if (isTopLevel) {
+            EXTERNAL_DATA_CLASS_REGEX.find(header)?.let { dcMatch ->
+                val clsName = dcMatch.groupValues[1]
+                pkgMapBySym.getOrPut(clsName) { linkedSetOf() } += packageName
+                val paramsText = extractAfterMatchingParen(lineIdx)?.first
+                if (paramsText != null) {
+                    val inner = paramsText.substringAfter('(').substringBeforeLast(')')
+                    val propCount = Regex("""\b(val|var)\s+""").findAll(inner).count()
+                    if (propCount == 2) {
+                        twoFieldClasses += clsName
+                    }
                 }
             }
         }
@@ -1901,8 +1981,24 @@ private fun scanExternalKotlinFileSymbols(
         val funMatch = EXTERNAL_PUBLIC_FUN_REGEX.find(header)
         if (funMatch != null) {
             val fnName = funMatch.groupValues[1]
+            val extractedParen = extractAfterMatchingParen(lineIdx)
+            val paramNames = extractedParen?.first?.let(::extractExternalNonDefaultParamNames).orEmpty()
+            if (paramNames.isNotEmpty()) {
+                val shape = paramNames.size to paramNames
+                if (isTopLevel) {
+                    fnConstParams.putIfMissing("$packageName.$fnName", shape)
+                    fnConstParams.putIfMissing(fnName, shape)
+                } else {
+                    val owner = currentOwnerCls
+                    if (owner != null) {
+                        fnConstParams.putIfMissing("$packageName.$owner.$fnName", shape)
+                        fnConstParams.putIfMissing("$owner.$fnName", shape)
+                    }
+                }
+            }
+            if (!isTopLevel) continue
             pkgMapBySym.getOrPut(fnName) { linkedSetOf() } += packageName
-            val afterParen = extractAfterMatchingParen(lineIdx)?.second
+            val afterParen = extractedParen?.second
             val retSimple =
                 afterParen
                     ?.let { EXTERNAL_RETURN_TYPE_REGEX.find(it)?.groupValues?.get(1) }
@@ -1916,9 +2012,11 @@ private fun scanExternalKotlinFileSymbols(
             continue
         }
 
-        EXTERNAL_PUBLIC_TYPE_OR_VAL_REGEX.find(header)?.let { tvMatch ->
-            val symName = tvMatch.groupValues[1]
-            pkgMapBySym.getOrPut(symName) { linkedSetOf() } += packageName
+        if (isTopLevel) {
+            EXTERNAL_PUBLIC_TYPE_OR_VAL_REGEX.find(header)?.let { tvMatch ->
+                val symName = tvMatch.groupValues[1]
+                pkgMapBySym.getOrPut(symName) { linkedSetOf() } += packageName
+            }
         }
     }
     for ((fnName, retSimple) in candidateTwoFieldFns) {
@@ -1926,6 +2024,64 @@ private fun scanExternalKotlinFileSymbols(
             twoFieldResultFns += "$packageName.$fnName"
         }
     }
+}
+
+private fun extractExternalNonDefaultParamNames(paramsText: String): List<String> {
+    val startParen = paramsText.indexOf('(')
+    val endParen = paramsText.lastIndexOf(')')
+    if (startParen < 0 || endParen <= startParen) return emptyList()
+    val inner = paramsText.substring(startParen + 1, endParen)
+    if (inner.isBlank()) return emptyList()
+    val names = mutableListOf<String>()
+    var angleDepth = 0
+    var parenDepth = 0
+    var bracketDepth = 0
+    var clauseStart = 0
+    fun processClause(rawClause: String) {
+        val trimmed = rawClause.trim()
+        if (trimmed.isEmpty()) return
+        var eqFound = false
+        var a = 0
+        var p = 0
+        var b = 0
+        for (ch in trimmed) {
+            when (ch) {
+                '<' -> a++
+                '>' -> if (a > 0) a--
+                '(' -> p++
+                ')' -> if (p > 0) p--
+                '[' -> b++
+                ']' -> if (b > 0) b--
+                '=' ->
+                    if (a == 0 && p == 0 && b == 0) {
+                        eqFound = true
+                        break
+                    }
+            }
+        }
+        if (eqFound) return
+        val colonIdx = trimmed.indexOf(':')
+        if (colonIdx <= 0) return
+        val name = trimmed.substring(0, colonIdx).replace("vararg ", "").trim()
+        if (name.isNotEmpty()) names += name
+    }
+    for (idx in inner.indices) {
+        when (inner[idx]) {
+            '<' -> angleDepth++
+            '>' -> if ((idx == 0 || inner[idx - 1] != '-') && angleDepth > 0) angleDepth--
+            '(' -> parenDepth++
+            ')' -> if (parenDepth > 0) parenDepth--
+            '[' -> bracketDepth++
+            ']' -> if (bracketDepth > 0) bracketDepth--
+            ',' ->
+                if (angleDepth == 0 && parenDepth == 0 && bracketDepth == 0) {
+                    processClause(inner.substring(clauseStart, idx))
+                    clauseStart = idx + 1
+                }
+        }
+    }
+    processClause(inner.substring(clauseStart))
+    return names
 }
 
 private fun hasNullableExternalReturnType(afterParen: String): Boolean {

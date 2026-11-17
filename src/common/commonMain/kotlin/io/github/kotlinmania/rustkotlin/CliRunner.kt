@@ -1109,10 +1109,12 @@ private fun executeTranslate(
                 crateSelfParameterizedTraits = crateMetadata.selfParameterizedTraits,
                 crateTraitSupertraits = crateMetadata.traitSupertraits,
                 crateTraitAstRegistryKey = crateMetadata.traitAstRegistryKey,
+                crateFnConstParamNames = crateMetadata.fnConstParamNames,
                 scalarChar = parsed.scalarChar,
                 externalCrateSymbolPackages = externalCrateMeta.symbolPackages,
                 externalCrateTwoFieldResultFns = externalCrateMeta.twoFieldResultFns,
                 externalCrateNullableReturnFns = externalCrateMeta.nullableReturnFns,
+                externalCrateFnConstParams = externalCrateMeta.fnConstParams,
                 cfgTargetProfile =
                     if (parsed.portLintDirective != "tests") {
                         parsed.cfgTargetProfile.copy(

@@ -186,6 +186,13 @@ internal class CrateSymbolInspector(
     val localExternalModuleNames: MutableSet<String> = linkedSetOf()
     val declaredTopLevelFnRawNames: MutableSet<String> = linkedSetOf()
     val externFnKotlinNames: MutableSet<String> = linkedSetOf()
+    val fnConstParamNames: MutableMap<String, Pair<Int, List<String>>> = linkedMapOf()
+    val methodConstParamNames: MutableMap<String, Pair<Int, List<String>>> = linkedMapOf()
+    val collidingInlineForeignFnRenames: MutableMap<Pair<String, String>, String> = linkedMapOf()
+    private val inlineModStack: ArrayDeque<String> = ArrayDeque()
+    private val outerTopLevelFnArities: MutableSet<Pair<String, Int>> = linkedSetOf()
+    private val inlineModForeignFns: MutableList<Triple<String, String, Int>> = mutableListOf()
+    private val pendingImplMethodConsts: MutableList<QuadImplConstSpec> = mutableListOf()
     val topLevelFnReturnSynTypes: MutableMap<String, SynType> = linkedMapOf()
     val implMethodReturnSynTypes: MutableMap<Pair<String, String>, SynType> = linkedMapOf()
     val referencedUnqualifiedTypeIdents: MutableSet<String> = linkedSetOf()
@@ -283,7 +290,37 @@ internal class CrateSymbolInspector(
             }
         }
         super.visitFile(f)
+        if (blockDepth == 0) {
+            for ((modRaw, rawFn, arity) in inlineModForeignFns) {
+                val ktFn = rustFunctionIdentToKotlin(rawFn)
+                if ((ktFn to arity) in outerTopLevelFnArities) {
+                    collidingInlineForeignFnRenames[modRaw to rawFn] = rustFunctionIdentToKotlin("${modRaw}_$rawFn")
+                }
+            }
+            for (spec in pendingImplMethodConsts) {
+                val combinedConsts =
+                    if (spec.ownerName in attachableTypeNames) {
+                        spec.fnConsts
+                    } else {
+                        (spec.implConsts + spec.fnConsts).distinct()
+                    }
+                if (combinedConsts.isNotEmpty()) {
+                    val key = "${spec.ownerName}.${spec.fnKt}"
+                    if (key !in methodConstParamNames) {
+                        methodConstParamNames[key] = spec.valueArity to combinedConsts
+                    }
+                }
+            }
+        }
     }
+
+    private data class QuadImplConstSpec(
+        val ownerName: String,
+        val fnKt: String,
+        val valueArity: Int,
+        val fnConsts: List<String>,
+        val implConsts: List<String>,
+    )
 
     override fun visitItem(i: Item) {
         if (itemHasDocOnlyCfg(i)) return
@@ -293,9 +330,17 @@ internal class CrateSymbolInspector(
                 when (foreign) {
                     is ForeignItem.Fn -> {
                         val rawFnIdent = foreign.sig.ident.toString()
+                        val cleanRawFnIdent = rawFnIdent.removePrefix("r#")
                         if (blockDepth == 0) {
-                            declaredTopLevelFnRawNames += rawFnIdent.removePrefix("r#")
+                            declaredTopLevelFnRawNames += cleanRawFnIdent
                             externFnKotlinNames += rustFunctionIdentToKotlin(rawFnIdent)
+                            val activeMod = inlineModStack.lastOrNull()
+                            if (activeMod != null) {
+                                val foreignArity = foreign.sig.inputs.count { it is FnArg.Typed }
+                                if (foreignArity == 0) {
+                                    inlineModForeignFns += Triple(activeMod, cleanRawFnIdent, foreignArity)
+                                }
+                            }
                         }
                         for (arg in foreign.sig.inputs.toList()) {
                             if (arg is FnArg.Typed) {
@@ -371,16 +416,36 @@ internal class CrateSymbolInspector(
     override fun visitItemFn(i: Item.Fn) {
         if (blockDepth == 0) {
             val rawIdent = i.sig.ident.toString()
-            declaredTopLevelFnRawNames += rawIdent.removePrefix("r#")
+            val cleanRaw = rawIdent.removePrefix("r#")
+            val ktFn = rustFunctionIdentToKotlin(rawIdent)
+            declaredTopLevelFnRawNames += cleanRaw
+            if (inlineModStack.isEmpty()) {
+                val arity = i.sig.inputs.count { it is FnArg.Typed }
+                if (arity == 0) {
+                    outerTopLevelFnArities += ktFn to arity
+                }
+            }
+            val constParams =
+                i.sig.generics.params
+                    .toList()
+                    .mapNotNull {
+                        (it as? GenericParam.ConstParam)
+                            ?.ident
+                            ?.toString()
+                            ?.removePrefix("r#")
+                            ?.let(::rustValueIdentToKotlin)
+                    }
+            if (constParams.isNotEmpty()) {
+                val valueArity = i.sig.inputs.count { it is FnArg.Typed }
+                fnConstParamNames.putIfMissingKey(cleanRaw, ktFn, valueArity, constParams)
+            }
             val genParams = i.sig.generics.params
             if (genParams.isEmpty()) {
                 val out = i.sig.output
                 if (out is ReturnType.TypeReturn) {
-                    val cleanRaw = rawIdent.removePrefix("r#")
                     if (cleanRaw !in topLevelFnReturnSynTypes) {
                         topLevelFnReturnSynTypes[cleanRaw] = out.ty
                     }
-                    val ktFn = rustFunctionIdentToKotlin(rawIdent)
                     if (ktFn !in topLevelFnReturnSynTypes) {
                         topLevelFnReturnSynTypes[ktFn] = out.ty
                     }
@@ -388,6 +453,16 @@ internal class CrateSymbolInspector(
             }
         }
         super.visitItemFn(i)
+    }
+
+    private fun MutableMap<String, Pair<Int, List<String>>>.putIfMissingKey(
+        cleanRaw: String,
+        ktFn: String,
+        arity: Int,
+        consts: List<String>,
+    ) {
+        if (cleanRaw !in this) this[cleanRaw] = arity to consts
+        if (ktFn !in this) this[ktFn] = arity to consts
     }
 
     override fun visitBlock(b: Block) {
@@ -729,14 +804,25 @@ internal class CrateSymbolInspector(
     }
 
     override fun visitItemMod(i: Item.Mod) {
+        val rawMod = i.ident.toString().removePrefix("r#")
         if (blockDepth == 0) {
             if (i.content is ModContent.Inline) {
-                localInlineModuleNames += i.ident.toString().removePrefix("r#")
+                localInlineModuleNames += rawMod
             } else {
-                localExternalModuleNames += i.ident.toString().removePrefix("r#")
+                localExternalModuleNames += rawMod
             }
         }
-        super.visitItemMod(i)
+        val pushedMod = blockDepth == 0 && i.content is ModContent.Inline
+        if (pushedMod) {
+            inlineModStack.addLast(rawMod)
+        }
+        try {
+            super.visitItemMod(i)
+        } finally {
+            if (pushedMod && inlineModStack.isNotEmpty()) {
+                inlineModStack.removeLast()
+            }
+        }
     }
 
     override fun visitItemImpl(i: Item.Impl) {
@@ -745,6 +831,16 @@ internal class CrateSymbolInspector(
             i.generics.params
                 .toList()
                 .any { it is GenericParam.TypeParam }
+        val implConsts =
+            i.generics.params
+                .toList()
+                .mapNotNull {
+                    (it as? GenericParam.ConstParam)
+                        ?.ident
+                        ?.toString()
+                        ?.removePrefix("r#")
+                        ?.let(::rustValueIdentToKotlin)
+                }
         for (implItem in i.items) {
             if (implItem is ImplItem.AssocType) {
                 val assocName = rustTypeIdentToKotlin(implItem.ident.toString())
@@ -771,10 +867,31 @@ internal class CrateSymbolInspector(
             } else if (implItem is ImplItem.Fn && ownerName != null) {
                 if (isDocOnlyCfgAttribute(implItem.attrs)) continue
                 val fnKt = rustFunctionIdentToKotlin(implItem.sig.ident.toString())
+                val valueArity = implItem.sig.inputs.count { it is FnArg.Typed }
+                val fnConsts =
+                    implItem.sig.generics.params
+                        .toList()
+                        .mapNotNull {
+                            (it as? GenericParam.ConstParam)
+                                ?.ident
+                                ?.toString()
+                                ?.removePrefix("r#")
+                                ?.let(::rustValueIdentToKotlin)
+                        }
                 if (implItem.sig.inputs.firstOrNull() is FnArg.Receiver) {
                     instanceMethodsByType.getOrPut(ownerName) { linkedSetOf() }.add(fnKt)
+                    if (fnConsts.isNotEmpty() || implConsts.isNotEmpty()) {
+                        pendingImplMethodConsts += QuadImplConstSpec(ownerName, fnKt, valueArity, fnConsts, implConsts)
+                    }
                 } else {
                     companionMethodsByType.getOrPut(ownerName) { linkedSetOf() }.add(fnKt)
+                    val combinedConsts = (implConsts + fnConsts).distinct()
+                    if (combinedConsts.isNotEmpty()) {
+                        val key = "$ownerName.$fnKt"
+                        if (key !in fnConstParamNames) {
+                            fnConstParamNames[key] = valueArity to combinedConsts
+                        }
+                    }
                 }
                 val fnHasTypeParams =
                     implItem.sig.generics.params
