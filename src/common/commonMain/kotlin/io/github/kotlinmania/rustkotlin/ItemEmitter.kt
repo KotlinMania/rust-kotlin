@@ -1323,7 +1323,12 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                     }
                     val combinedFieldHeader = fieldTrivia + fieldDoc
                     val docPrefix = if (combinedFieldHeader.isNotEmpty()) "\n$combinedFieldHeader$indent    " else ""
-                    val defExpr = if (useFinalAbiLayout) renderStructFieldDefaultOrNull(field.ty, fType, selfTypeWithGenerics) else null
+                    val defExpr =
+                        if (useFinalAbiLayout || hasReprSimdAttr(item.attrs)) {
+                            renderStructFieldDefaultOrNull(field.ty, fType, selfTypeWithGenerics)
+                        } else {
+                            null
+                        }
                     val defaultSuffix = defExpr?.let { " = $it" }.orEmpty()
                     val isConcreteGen = !isLocalItem && vis == "public " && isConcreteGenericTypeForSwiftExport(fType, unboundedOwnerTypeParams)
                     val setterLine = if (fVis == "public " && isConcreteGen) "\n$indent        internal set" else ""
@@ -1353,7 +1358,12 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                             currentTraitAssocParamNames = prevFieldTraitAssoc
                             currentSamNameHint = prevHint
                         }
-                    val defExpr = if (useFinalAbiLayout) renderStructFieldDefaultOrNull(field.ty, fType, selfTypeWithGenerics) else null
+                    val defExpr =
+                        if (useFinalAbiLayout || hasReprSimdAttr(item.attrs)) {
+                            renderStructFieldDefaultOrNull(field.ty, fType, selfTypeWithGenerics)
+                        } else {
+                            null
+                        }
                     val defaultSuffix = defExpr?.let { " = $it" }.orEmpty()
                     val isConcreteGen = !isLocalItem && vis == "public " && isConcreteGenericTypeForSwiftExport(fType, unboundedOwnerTypeParams)
                     val setterLine = if (fVis == "public " && isConcreteGen) "\n$indent        internal set" else ""
@@ -1790,7 +1800,10 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
     val selfTypeWithGenerics = typeName + typeArgsUse
     val prevEnumTypeParams = activeTypeParamNames
     val prevEnumConstParams = activeConstParamNames
-    activeTypeParamNames = activeTypeParamNames + collectGenericTypeParamNames(item.generics)
+    activeTypeParamNames =
+        activeTypeParamNames +
+        collectGenericTypeParamNames(item.generics) +
+        sourceAssociatedParameters(item.generics).map { it.associated }
     activeConstParamNames = activeConstParamNames + collectGenericConstParamNames(item.generics)
     val typeParams: String
     val superTraits: List<String>
@@ -1948,12 +1961,17 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
         return sb.toString()
     }
 
+    val enumAssocTypeParamNames = sourceAssociatedParameters(item.generics).map { it.associated }
     val prevOverrideNames = currentStructOverrideMethodNames
     currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits, ownerIsPublic = (vis == "public "))
+    activeTypeParamNames = prevEnumTypeParams + collectGenericTypeParamNames(item.generics) + enumAssocTypeParamNames + enumAssocTypeParamNames
+    activeConstParamNames = prevEnumConstParams + collectGenericConstParamNames(item.generics)
     val attachedMembers =
         try {
             renderAttachedImplMembers(selfTypeWithGenerics, item.generics, attachedImpls, "$indent    ", isLocalClass = isLocalItem)
         } finally {
+            activeConstParamNames = prevEnumConstParams
+            activeTypeParamNames = prevEnumTypeParams
             currentStructOverrideMethodNames = prevOverrideNames
         }
     val hasDiscriminants = isSimpleEnum && typeParams.isEmpty() && variants.any { it.discriminant != null }
@@ -1985,7 +2003,7 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
     }
     sb.append(" {\n")
     var prevVariantName: String? = null
-    activeTypeParamNames = prevEnumTypeParams + collectGenericTypeParamNames(item.generics)
+    activeTypeParamNames = prevEnumTypeParams + collectGenericTypeParamNames(item.generics) + enumAssocTypeParamNames
     activeConstParamNames = prevEnumConstParams + collectGenericConstParamNames(item.generics)
     try {
         for (v in variants) {

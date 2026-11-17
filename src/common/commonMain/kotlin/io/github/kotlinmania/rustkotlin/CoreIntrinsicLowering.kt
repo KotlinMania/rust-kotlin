@@ -1364,6 +1364,117 @@ public object CoreIntrinsicLowering {
         }
     }
 
+    private fun isUsableRenderedTypeArg(ty: String?): Boolean {
+        val clean = ty?.trim() ?: return false
+        if (clean.isEmpty()) return false
+        if (clean in setOf("Any", "Any?", "Nothing", "RustAny", "_")) return false
+        if ('*' in clean) return false
+        if ("->" in clean && !clean.startsWith("(")) return false
+        return !clean.startsWith("Result.Err")
+    }
+
+    internal fun resolveRenderedTypeLayoutExpression(
+        renderedType: String,
+        emitter: KotlinJ2KEmitter,
+    ): String {
+        val coreNs = resolveCoreNamespace(emitter.headerContext)
+        val memPkg = "$coreNs.mem"
+        val clean = renderedType.trim()
+        val expectedLayoutType = "$memPkg.TypeLayout<$clean>"
+        emitter.currentTypedLocals
+            .filterValues { it == expectedLayoutType }
+            .keys
+            .singleOrNull()
+            ?.let { return it }
+        val candidateParam = StructLayoutComputer.typeLayoutParamName(clean)
+        if (candidateParam in emitter.currentTypedLocals) {
+            return candidateParam
+        }
+        val structSimple = clean.substringBefore('<').substringAfterLast('.')
+        val structDecl = emitter.sameFileUniqueSimpleStruct(structSimple)
+        if (structDecl != null) {
+            val computed = StructLayoutComputer.computeStructLayout(structDecl, emitter)
+            if (computed != null && computed.requiredTypeLayoutParams.isEmpty()) {
+                return "$structSimple.typeLayout()"
+            }
+        }
+        registerCoreImport(emitter, "$memPkg.UnresolvedTypeLayout")
+        return "UnresolvedTypeLayout<$clean>()"
+    }
+
+    internal fun renderTransmuteCall(
+        rawTransmuteIdent: String,
+        explicitTypes: List<SynType>,
+        argExpr: Expr,
+        indent: String,
+        selfTypeName: String?,
+        emitter: KotlinJ2KEmitter,
+    ): String? {
+        val srcExplicitSyn = explicitTypes.getOrNull(0)?.takeUnless { it is SynType.Infer }
+        val dstExplicitSyn = explicitTypes.getOrNull(1)?.takeUnless { it is SynType.Infer }
+        val expectedTarget = emitter.currentExpectedParseTargetType?.trim()?.takeIf { it.isNotEmpty() }
+        val srcSyn = srcExplicitSyn ?: emitter.sourceInitializerType(argExpr)
+        val dstSyn = dstExplicitSyn ?: if (expectedTarget == null) emitter.currentEnclosingReturnSynType else null
+        val prevParseTarget = emitter.currentExpectedParseTargetType
+        emitter.currentExpectedParseTargetType = srcExplicitSyn?.let { emitter.renderType(it, selfTypeName) }
+        val renderedArg =
+            try {
+                emitter.renderExpr(argExpr, indent, selfTypeName)
+            } finally {
+                emitter.currentExpectedParseTargetType = prevParseTarget
+            }
+        val srcRendered =
+            (
+                srcSyn?.let { emitter.renderType(it, selfTypeName) }
+                    ?: emitter.inferExprRenderedType(argExpr, selfTypeName)
+            )?.takeIf(::isUsableRenderedTypeArg)
+        val dstRendered =
+            (
+                dstSyn?.let { emitter.renderType(it, selfTypeName) }
+                    ?: expectedTarget
+                    ?: emitter.currentEnclosingReturnRenderedType
+            )?.takeIf(::isUsableRenderedTypeArg)
+        if (srcRendered != null && dstRendered != null) {
+            if (srcRendered == dstRendered && srcRendered != "Unit") {
+                return renderedArg
+            }
+            val coreNs = resolveCoreNamespace(emitter.headerContext)
+            val ptrPkg = "$coreNs.ptr"
+            val memPkg = "$coreNs.mem"
+            if (srcSyn != null && dstSyn != null) {
+                renderFastScalarTransmute(srcSyn, dstSyn, renderedArg, ptrPkg, emitter)?.let { return it }
+            }
+            val fromField = emitter.transparentPointerField(srcRendered, selfTypeName)
+            if (fromField != null && fromField.second == dstRendered) {
+                return "($renderedArg).${fromField.first}"
+            }
+            val toField = emitter.transparentPointerField(dstRendered, selfTypeName)
+            if (toField != null && toField.second == srcRendered) {
+                return "$dstRendered($renderedArg)"
+            }
+            val srcLayout =
+                srcSyn?.let { resolveTypeLayoutExpression(it, selfTypeName, emitter) }
+                    ?: resolveRenderedTypeLayoutExpression(srcRendered, emitter)
+            val dstLayout =
+                dstSyn?.let { resolveTypeLayoutExpression(it, selfTypeName, emitter) }
+                    ?: resolveRenderedTypeLayoutExpression(dstRendered, emitter)
+            registerCoreImport(emitter, "$memPkg.transmuteWithLayouts")
+            return "transmuteWithLayouts<$srcRendered, $dstRendered>($renderedArg, $srcLayout, $dstLayout)"
+        }
+        if ("transmute" !in emitter.inspector.declaredTopLevelFnRawNames &&
+            "transmute_unchecked" !in emitter.inspector.declaredTopLevelFnRawNames
+        ) {
+            val fnName = if (rawTransmuteIdent == "transmute_unchecked") "transmuteUnchecked" else "transmute"
+            val coreNs = resolveCoreNamespace(emitter.headerContext)
+            val memPkg = "$coreNs.mem"
+            if (emitter.headerContext.packageName != memPkg) {
+                registerCoreImport(emitter, "$memPkg.$fnName")
+            }
+            return "$fnName($renderedArg)"
+        }
+        return null
+    }
+
     internal fun inferCoreIntrinsicReturnRenderedType(
         call: Expr.Call,
         selfTypeName: String?,
@@ -1469,6 +1580,55 @@ public object CoreIntrinsicLowering {
         ) {
             return spec.callArgsList.firstOrNull()?.let { emitter.inferExprRenderedType(it, selfTypeName) }
         }
+        if (canonical in setOf("transmute", "transmute_unchecked", "float_to_int_unchecked")) {
+            return spec.explicitTypes
+                .getOrNull(1)
+                ?.takeUnless { it is SynType.Infer }
+                ?.let { emitter.renderType(it, selfTypeName) }
+        }
+        if (canonical in CORE_SIMD_INTRINSIC_NAMES) {
+            when (canonical) {
+                "simd_splat" ->
+                    return spec.explicitTypes
+                        .firstOrNull()
+                        ?.takeUnless { it is SynType.Infer }
+                        ?.let { emitter.renderType(it, selfTypeName) }
+                "simd_shuffle" ->
+                    return spec.explicitTypes
+                        .getOrNull(2)
+                        ?.takeUnless { it is SynType.Infer }
+                        ?.let { emitter.renderType(it, selfTypeName) }
+                "simd_cast", "simd_as", "simd_bitmask" ->
+                    return spec.explicitTypes
+                        .getOrNull(1)
+                        ?.takeUnless { it is SynType.Infer }
+                        ?.let { emitter.renderType(it, selfTypeName) }
+                "simd_select" ->
+                    return spec.explicitTypes
+                        .getOrNull(1)
+                        ?.takeUnless { it is SynType.Infer }
+                        ?.let { emitter.renderType(it, selfTypeName) }
+                        ?: spec.callArgsList.getOrNull(1)?.let { emitter.inferExprRenderedType(it, selfTypeName) }
+                in SIMD_BOOL_RETURN_INTRINSICS -> return "Boolean"
+                in SIMD_UNIT_RETURN_INTRINSICS -> return "Unit"
+                in SIMD_SAME_ARG0_INTRINSICS ->
+                    return spec.explicitTypes
+                        .firstOrNull()
+                        ?.takeUnless { it is SynType.Infer }
+                        ?.let { emitter.renderType(it, selfTypeName) }
+                        ?: spec.callArgsList.firstOrNull()?.let { emitter.inferExprRenderedType(it, selfTypeName) }
+                in SIMD_SAME_ARG1_INTRINSICS ->
+                    return spec.callArgsList.getOrNull(1)?.let { emitter.inferExprRenderedType(it, selfTypeName) }
+                in SIMD_SAME_ARG2_INTRINSICS ->
+                    return spec.callArgsList.getOrNull(2)?.let { emitter.inferExprRenderedType(it, selfTypeName) }
+                else ->
+                    return spec.explicitTypes
+                        .firstOrNull()
+                        ?.takeUnless { it is SynType.Infer }
+                        ?.let { emitter.renderType(it, selfTypeName) }
+                        ?: spec.callArgsList.firstOrNull()?.let { emitter.inferExprRenderedType(it, selfTypeName) }
+            }
+        }
         return null
     }
 
@@ -1502,8 +1662,13 @@ public object CoreIntrinsicLowering {
             fun alignArgExpr(argIdx: Int): String {
                 val alignSyn = spec.callArgsList.getOrNull(argIdx)
                 val alignTy = alignSyn?.let { emitter.inferExprRenderedType(it, selfTypeName) }?.removeSuffix("?")?.trim()
+                val isAlignmentMethodCall =
+                    (alignSyn?.let { emitter.unwrapParenOrGroupExpr(it) } as? Expr.MethodCall)
+                        ?.method
+                        ?.toString()
+                        ?.removePrefix("r#") == "alignment"
                 val rawArg = args[argIdx]
-                return if (alignTy == "Alignment" || alignTy?.endsWith(".Alignment") == true) {
+                return if (alignTy == "Alignment" || alignTy?.endsWith(".Alignment") == true || (alignTy == null && isAlignmentMethodCall)) {
                     "($rawArg).asUsize().toLong()"
                 } else {
                     "($rawArg).toLong()"
@@ -1573,7 +1738,63 @@ public object CoreIntrinsicLowering {
         val ptrPkg = "$coreNs.ptr"
         val explicitTypes = spec.explicitTypes
         val explicitConsts = spec.explicitConsts
-        val renderedArgs = callArgsList.map { emitter.renderExpr(it, indent, selfTypeName) }
+        val simdExpectedArgTarget =
+            if (isCoreSimdCall) {
+                explicitTypes
+                    .firstOrNull()
+                    ?.takeUnless { it is SynType.Infer }
+                    ?.let { emitter.renderType(it, selfTypeName) }
+                    ?.takeIf(::isUsableRenderedTypeArg)
+                    ?: if (spec.canonicalName !in setOf("simd_select_bitmask", "simd_gather", "simd_scatter", "simd_masked_load", "simd_masked_store")) {
+                        callArgsList.firstNotNullOfOrNull { argExpr ->
+                            val rawCallName =
+                                ((argExpr as? Expr.Call)?.func as? Expr.Path)
+                                    ?.path
+                                    ?.segments
+                                    ?.toList()
+                                    ?.lastOrNull()
+                                    ?.ident
+                                    ?.toString()
+                                    ?.removePrefix("r#")
+                            if (rawCallName in setOf("transmute", "transmute_unchecked")) {
+                                null
+                            } else {
+                                emitter
+                                    .inferExprRenderedType(argExpr, selfTypeName)
+                                    ?.takeIf(::isUsableRenderedTypeArg)
+                            }
+                        }
+                    } else {
+                        null
+                    }
+            } else {
+                null
+            }
+        val renderedArgs =
+            if (simdExpectedArgTarget != null) {
+                callArgsList.mapIndexed { argIdx, argExpr ->
+                    val shouldPropagate =
+                        when (spec.canonicalName) {
+                            "simd_shuffle" -> argIdx < 2
+                            "simd_extract" -> argIdx == 0
+                            "simd_insert" -> argIdx == 0
+                            else -> true
+                        }
+                    if (shouldPropagate) {
+                        val prevTarget = emitter.currentExpectedParseTargetType
+                        emitter.currentExpectedParseTargetType = simdExpectedArgTarget
+                        try {
+                            emitter.renderExpr(argExpr, indent, selfTypeName)
+                        } finally {
+                            emitter.currentExpectedParseTargetType = prevTarget
+                        }
+                    } else {
+                        emitter.renderExpr(argExpr, indent, selfTypeName)
+                    }
+                }
+            } else {
+                callArgsList.map { emitter.renderExpr(it, indent, selfTypeName) }
+            }
 
         val canonicalIntrinsicName = spec.canonicalName
 
@@ -1991,19 +2212,17 @@ public object CoreIntrinsicLowering {
                     memPkg = memPkg,
                     emitter = emitter,
                 )
-            "transmute", "transmute_unchecked" -> {
-                val srcTy = explicitTypes.getOrNull(0)?.takeUnless { it is SynType.Infer } ?: callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) }
-                val dstTy = explicitTypes.getOrNull(1)?.takeUnless { it is SynType.Infer } ?: emitter.currentEnclosingReturnSynType
-                if (srcTy != null && dstTy != null) {
-                    renderFastScalarTransmute(srcTy, dstTy, renderedArgs[0], ptrPkg, emitter)?.let { return it }
-                    registerCoreImport(emitter, "$memPkg.transmuteWithLayouts")
-                    val srcLayout = resolveTypeLayoutExpression(srcTy, selfTypeName, emitter)
-                    val dstLayout = resolveTypeLayoutExpression(dstTy, selfTypeName, emitter)
-                    "transmuteWithLayouts(${renderedArgs[0]}, $srcLayout, $dstLayout)"
-                } else {
-                    null
+            "transmute", "transmute_unchecked" ->
+                callArgsList.singleOrNull()?.let { arg0 ->
+                    renderTransmuteCall(
+                        rawTransmuteIdent = rawName,
+                        explicitTypes = explicitTypes,
+                        argExpr = arg0,
+                        indent = indent,
+                        selfTypeName = selfTypeName,
+                        emitter = emitter,
+                    )
                 }
-            }
             in CORE_SIMD_INTRINSIC_NAMES ->
                 renderSimdCallSiteLowering(
                     canonicalName = canonicalIntrinsicName,

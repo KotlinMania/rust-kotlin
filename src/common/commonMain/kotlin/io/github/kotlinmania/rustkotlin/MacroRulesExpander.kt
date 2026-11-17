@@ -974,9 +974,28 @@ internal class MacroRulesFileExpander(
                 .ident
                 .toString()
                 .removePrefix("r#")
+        val middleName =
+            segs
+                .getOrNull(1)
+                ?.ident
+                ?.toString()
+                ?.removePrefix("r#")
+        val isStdMacroRoot =
+            firstName == "std" ||
+                firstName == "core" ||
+                firstName == "crate" ||
+                firstName == "\$crate" ||
+                firstName == "self" ||
+                firstName == "super"
         return when {
-            macName == "cfg_if" && (segs.size == 1 || (segs.size == 2 && firstName == "cfg_if")) -> "cfg_if"
-            macName == "cfg_select" && (segs.size == 1 || (segs.size == 2 && (firstName == "std" || firstName == "core"))) -> "cfg_select"
+            macName == "cfg_if" &&
+                (segs.size == 1 || (segs.size == 2 && (firstName == "cfg_if" || isStdMacroRoot))) -> "cfg_if"
+            macName == "cfg_select" &&
+                (
+                    segs.size == 1 ||
+                        (segs.size == 2 && isStdMacroRoot) ||
+                        (segs.size == 3 && isStdMacroRoot && middleName == "macros")
+                ) -> "cfg_select"
             else -> null
         }
     }
@@ -1169,13 +1188,18 @@ internal class MacroRulesFileExpander(
 
     override fun foldExpr(e: Expr): Expr {
         if (e is Expr.Macro && activeExpansionDepth <= MAX_MACRO_EXPANSION_DEPTH) {
-            if (resolveBuiltinCfgMacroName(e.mac) == "cfg_select") {
+            val exprCfgMacroName = resolveBuiltinCfgMacroName(e.mac)
+            if (exprCfgMacroName == "cfg_select" || exprCfgMacroName == "cfg_if") {
+                val rawToks =
+                    e.mac.tokens
+                        .clone()
+                        .toList()
                 val selected =
-                    chooseSingleActiveCfgSelectBody(
-                        e.mac.tokens
-                            .clone()
-                            .toList(),
-                    )
+                    if (exprCfgMacroName == "cfg_select") {
+                        chooseSingleActiveCfgSelectBody(rawToks)
+                    } else {
+                        selectActiveCfgIfBodies(rawToks)?.firstOrNull()
+                    }
                 if (selected != null) {
                     val parsedExpr =
                         if (selected.isEmpty()) {

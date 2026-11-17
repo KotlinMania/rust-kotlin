@@ -2193,6 +2193,16 @@ internal fun KotlinJ2KEmitter.extractEnumReprKotlinType(attrs: List<Attribute>):
     return null
 }
 
+internal fun KotlinJ2KEmitter.hasReprSimdAttr(attrs: List<Attribute>): Boolean =
+    attrs.any { attr ->
+        val meta = attr.meta
+        meta is Meta.List &&
+            meta.path.isIdent("repr") &&
+            meta.tokens.clone().toList().any { tt ->
+                (tt as? TokenTree.Ident)?.value?.toString() == "simd"
+            }
+    }
+
 internal fun KotlinJ2KEmitter.isStdlibAnyPathSegments(segNames: List<String>): Boolean {
     if (segNames.isEmpty()) return false
     val last = segNames.last()

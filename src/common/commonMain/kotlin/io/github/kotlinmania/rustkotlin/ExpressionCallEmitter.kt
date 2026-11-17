@@ -114,54 +114,51 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                     .orEmpty()
                     .filterIsInstance<GenericArgument.TypeArg>()
                     .map { it.type }
-            val sourceValueType = explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer } ?: sourceInitializerType(nonUnitArgs[0])
-            val destinationValueType = explicitTypes.getOrNull(1)?.takeUnless { it is SynType.Infer } ?: currentEnclosingReturnSynType
-            if (sourceValueType != null && destinationValueType != null) {
-                val sourceLayout = sourcePointerLayout(sourceValueType, selfTypeName)
-                val destinationLayout = sourcePointerLayout(destinationValueType, selfTypeName)
-                if (sourceLayout != null && destinationLayout != null) {
-                    val value = renderExpr(nonUnitArgs[0], indent, selfTypeName)
-                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.transmuteWithLayouts")
-                    return "transmuteWithLayouts($value, $sourceLayout, $destinationLayout)"
-                }
-            }
-            val tfTypes =
-                (lastFuncSeg.arguments as? PathArguments.AngleBracketed)
-                    ?.args
-                    ?.toList()
-                    ?.mapNotNull { (it as? GenericArgument.TypeArg)?.type }
-                    .orEmpty()
-            if (tfTypes.size == 2 && renderType(tfTypes[0], selfTypeName) == renderType(tfTypes[1], selfTypeName)) {
-                return renderExpr(nonUnitArgs[0], indent, selfTypeName)
-            }
-            if (tfTypes.size == 2) {
-                val from = renderType(tfTypes[0], selfTypeName)
-                val to = renderType(tfTypes[1], selfTypeName)
-                val fromField = transparentPointerField(from, selfTypeName)
-                if (fromField != null && fromField.second == to) {
-                    return "(${renderExpr(nonUnitArgs[0], indent, selfTypeName)}).${fromField.first}"
-                }
-                val toField = transparentPointerField(to, selfTypeName)
-                if (toField != null && toField.second == from) {
-                    return "$to(${renderExpr(nonUnitArgs[0], indent, selfTypeName)})"
-                }
-            }
-            if ("transmute" !in inspector.declaredTopLevelFnRawNames &&
-                "transmute_unchecked" !in inspector.declaredTopLevelFnRawNames
-            ) {
-                val fnName = if (rawTransmuteIdent == "transmute_unchecked") "transmuteUnchecked" else "transmute"
-                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                if (headerContext.packageName != "$coreNs.mem") {
-                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.$fnName")
-                }
-                return "$fnName(${renderExpr(nonUnitArgs[0], indent, selfTypeName)})"
-            }
+            CoreIntrinsicLowering
+                .renderTransmuteCall(
+                    rawTransmuteIdent = rawTransmuteIdent,
+                    explicitTypes = explicitTypes,
+                    argExpr = nonUnitArgs[0],
+                    indent = indent,
+                    selfTypeName = selfTypeName,
+                    emitter = this,
+                )?.let { return it }
         }
     }
     val callee = renderCalleeExpr(expr.func, indent, selfTypeName)
     val calleeBase = callee.substringBefore('<').trim()
     return when {
+        nonUnitArgs.isEmpty() &&
+            (calleeBase == "Default.default" || calleeBase.endsWith(".Default.default")) -> {
+            currentTypeParamWitnessCalls["*" to "default"]?.let { return "$it()" }
+            val targetTy = (currentExpectedParseTargetType ?: currentEnclosingReturnRenderedType)?.removeSuffix("?")?.trim()
+            if (!targetTy.isNullOrEmpty()) {
+                val init = defaultInitializerForType(targetTy)
+                val targetBase = targetTy.substringBefore('<').substringAfterLast('.').trim()
+                when {
+                    init != "null as $targetTy" &&
+                        init != "$targetTy()" &&
+                        init in setOf("ArrayDeque()", "I128()", "U128()", "F16()", "F128()") ->
+                        init
+                    init != "null as $targetTy" &&
+                        init != "$targetTy()" &&
+                        !init.startsWith("$targetTy(") ->
+                        init
+                    targetBase.isNotEmpty() &&
+                        targetBase !in setOf("Any", "RustAny", "Unit", "Nothing") &&
+                        targetBase !in activeTypeParamNames &&
+                        (
+                            targetBase in inspector.declaredTypeNames ||
+                                targetBase in headerContext.crateSymbolSubpackages ||
+                                headerContext.externalCrateSymbolPackages.values.any { targetBase in it }
+                        ) ->
+                        "$targetBase.default()"
+                    else -> "$callee()"
+                }
+            } else {
+                "$callee()"
+            }
+        }
         nonUnitArgs.isEmpty() &&
             "null" !in inspector.declaredTopLevelFnRawNames &&
             "null_mut" !in inspector.declaredTopLevelFnRawNames &&
@@ -670,16 +667,21 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                             val paramParseTarget =
                                 paramSynTy
                                     ?.let { synTy ->
-                                        val rawRendered = renderType(synTy, selfTypeName).removeSuffix("?").trim()
-                                        if (rawRendered.startsWith("List<") ||
-                                            rawRendered.startsWith("MutableList<") ||
-                                            rawRendered in PRIMITIVE_ARRAY_TYPES
-                                        ) {
-                                            rawRendered
-                                        } else {
-                                            null
-                                        }
+                                        renderType(synTy, selfTypeName)
+                                            .removeSuffix("?")
+                                            .trim()
+                                            .takeIf {
+                                                it.startsWith("List<") ||
+                                                    it.startsWith("MutableList<") ||
+                                                    it in PRIMITIVE_ARRAY_TYPES
+                                            }
                                     }
+                                    ?: resolveCallArgExpectedCollectionOrArrayType(
+                                        func = expr.func,
+                                        argIdx = argIdx,
+                                        totalArgs = nonUnitArgs.size,
+                                        selfTypeName = selfTypeName,
+                                    )
                             currentExpectedParseTargetType = paramParseTarget
                             val renderedArg =
                                 try {

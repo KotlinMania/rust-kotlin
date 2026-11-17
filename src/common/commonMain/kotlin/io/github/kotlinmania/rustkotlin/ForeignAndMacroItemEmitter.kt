@@ -171,6 +171,35 @@ internal fun KotlinJ2KEmitter.currentSubpackageString(): String {
     }
 }
 
+internal fun KotlinJ2KEmitter.resolveExternalDepReexportPkg(
+    explicitModule: String,
+    symKt: String,
+    nsPrefix: String?,
+): String? {
+    for (depCrate in listOf("core", "alloc")) {
+        val depNs =
+            headerContext.crateNamespaces[depCrate]
+                ?.trim()
+                ?.removeSuffix(".")
+                ?.takeIf { it.isNotEmpty() } ?: continue
+        if (depNs == nsPrefix) continue
+        val extCandidates = headerContext.externalCrateSymbolPackages[depCrate]?.get(symKt) ?: continue
+        val exactPkg = if (explicitModule.isEmpty()) depNs else "$depNs.$explicitModule"
+        val matchedPkg =
+            when {
+                exactPkg in extCandidates -> exactPkg
+                else ->
+                    extCandidates
+                        .filter { it.startsWith("$exactPkg.") }
+                        .minByOrNull { it.count { ch -> ch == '.' } }
+            }
+        if (matchedPkg != null) {
+            return "$matchedPkg.$symKt"
+        }
+    }
+    return null
+}
+
 internal fun KotlinJ2KEmitter.resolveBestSubpackageForSymbol(ktSymbol: String): String? {
     val nsPrefix = currentNamespacePrefix()
     if (nsPrefix?.endsWith(".core") == true && ktSymbol in setOf("U128", "I128", "F16", "F128")) {
@@ -645,15 +674,20 @@ internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
                 }
             val symCandidates = headerContext.crateSymbolSubpackages[symKt].orEmpty()
             val finalSubpkg =
-                if (symCandidates.isEmpty() || modSubpkg in symCandidates) {
-                    modSubpkg
-                } else {
-                    symCandidates
-                        .filter { it.startsWith("$modSubpkg.") }
-                        .minByOrNull { it.count { ch -> ch == '.' } }
-                        ?: modSubpkg
+                when {
+                    modSubpkg in symCandidates -> modSubpkg
+                    else ->
+                        symCandidates
+                            .filter { it.startsWith("$modSubpkg.") }
+                            .minByOrNull { it.count { ch -> ch == '.' } }
                 }
-            return "$nsPrefix.$finalSubpkg.$symKt" to trailing
+            if (finalSubpkg != null) {
+                return "$nsPrefix.$finalSubpkg.$symKt" to trailing
+            }
+            resolveExternalDepReexportPkg(modSubpkg, symKt, nsPrefix)?.let { resolvedExt ->
+                return resolvedExt to trailing
+            }
+            return "$nsPrefix.$modSubpkg.$symKt" to trailing
         }
         val matchedExtCrate: Pair<String, List<String>>? =
             if (importedPath in headerContext.crateNamespaces) {
@@ -1015,10 +1049,20 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
             val targetPrefix = baseSegs.joinToString(".")
             val candidates = headerContext.crateSymbolSubpackages[mappedRem[0]]
             if (candidates != null && targetPrefix !in candidates) {
+                val childSub =
+                    candidates
+                        .filter { it.startsWith("$targetPrefix.") }
+                        .minByOrNull { it.count { ch -> ch == '.' } }
+                if (childSub != null) {
+                    return "$nsPrefix.$childSub.${mappedRem[0]}"
+                }
+                resolveExternalDepReexportPkg(targetPrefix, mappedRem[0], nsPrefix)?.let { return it }
                 val best = resolveBestSubpackageForSymbol(mappedRem[0])
                 if (best != null) {
                     return if (best.isEmpty()) "$nsPrefix.${mappedRem[0]}" else "$nsPrefix.$best.${mappedRem[0]}"
                 }
+            } else if (candidates == null) {
+                resolveExternalDepReexportPkg(targetPrefix, mappedRem[0], nsPrefix)?.let { return it }
             }
         }
         val combined = baseSegs + mappedRem
@@ -1231,27 +1275,7 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
                     return if (sub.isEmpty()) "$nsPrefix.${mapped.last()}" else "$nsPrefix.$sub.${mapped.last()}"
                 }
             }
-            for (depCrate in listOf("core", "alloc")) {
-                val depNs =
-                    headerContext.crateNamespaces[depCrate]
-                        ?.trim()
-                        ?.removeSuffix(".")
-                        ?.takeIf { it.isNotEmpty() } ?: continue
-                if (depNs == nsPrefix) continue
-                val extCandidates = headerContext.externalCrateSymbolPackages[depCrate]?.get(mapped.last()) ?: continue
-                val exactPkg = if (explicitModule.isEmpty()) depNs else "$depNs.$explicitModule"
-                val matchedPkg =
-                    when {
-                        exactPkg in extCandidates -> exactPkg
-                        else ->
-                            extCandidates
-                                .filter { it.startsWith("$exactPkg.") }
-                                .minByOrNull { it.count { ch -> ch == '.' } }
-                    }
-                if (matchedPkg != null) {
-                    return "$matchedPkg.${mapped.last()}"
-                }
-            }
+            resolveExternalDepReexportPkg(explicitModule, mapped.last(), nsPrefix)?.let { return it }
             if (!candidates.isNullOrEmpty()) {
                 val best = resolveBestSubpackageForSymbol(mapped.last())
                 if (best != null) {

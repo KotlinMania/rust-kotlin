@@ -154,7 +154,7 @@ class StdlibSemanticWaveATest {
         assertContains(kt, "ControlFlow<Int, Unit>")
         assertContains(kt, "NonZero<UInt, NonZeroU32Inner>")
         assertContains(kt, "NonZero.new<NonZeroU32Inner, UInt>(")
-        assertContains(kt, "copyNonoverlapping((srcPtr).asConstPtr(), dstPtr, count)")
+        assertContains(kt, "copyNonoverlapping((srcPtr).asConstPtr(), dstPtr, count, typeLayoutT = PrimitiveLayouts.U8)")
         assertContains(kt, "dstPtr.copyFrom((srcPtr).asConstPtr(), count)")
         assertContains(kt, ".asUsize().toLong()")
     }

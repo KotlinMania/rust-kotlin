@@ -1534,7 +1534,12 @@ internal class KotlinJ2KEmitter(
                 }
             }
         }
-        if (usesExternalRustLangCore && !headerContext.rawAbiMode) {
+        val isInCoreOrUsingExternalCore =
+            usesExternalRustLangCore ||
+                "core" in headerContext.crateNamespaces ||
+                headerContext.packageName == activeCoreNs ||
+                headerContext.packageName?.startsWith("$activeCoreNs.") == true
+        if (isInCoreOrUsingExternalCore && !headerContext.rawAbiMode) {
             for ((variantName, variantOwner) in listOf(
                 "Break" to "$activeCoreNs.ops.controlflow.ControlFlow",
                 "Continue" to "$activeCoreNs.ops.controlflow.ControlFlow",
