@@ -131,6 +131,39 @@ internal fun KotlinJ2KEmitter.isFmtResultSynType(ty: SynType?): Boolean {
     return isStdFmt
 }
 
+/** Resolve two Result payload types, expanding 1-arg `io::Result<T>` and 0-arg `fmt::Result` aliases when applicable. */
+internal fun KotlinJ2KEmitter.resolveEnclosingResultTypeArguments(rendered: String?): Pair<String, String>? {
+    rustResultTypeArguments(rendered)?.let { return it }
+    val type = rendered?.trim()?.removeSuffix("?")?.trim() ?: return null
+    val base = type.substringBefore('<').substringAfterLast('.').trim()
+    if (base != "Result" && base != "RustResult") return null
+    if ('<' in type && type.endsWith('>')) {
+        val singleOk = type.substringAfter('<').dropLast(1).trim()
+        if (singleOk.isEmpty()) return null
+        val aliasTarget = inspector.typeAliasTargets["Result"]?.let { renderType(it, null) }
+        val aliasPair = rustResultTypeArguments(aliasTarget)
+        if (aliasPair != null) {
+            return singleOk to aliasPair.second
+        }
+        val importsIoResult =
+            importedSimpleNameToPkg["Result"]?.let { it.endsWith(".io") || it.endsWith(".io.error") } == true ||
+                extraTypePathImports.any { ".io." in it && it.endsWith(".Result") }
+        val errName =
+            when {
+                importsIoResult -> "Error"
+                "Error" in importedSimpleNameToPkg -> "Error"
+                else -> return null
+            }
+        return singleOk to errName
+    }
+    if (type == "Result") {
+        val aliasTarget = inspector.typeAliasTargets["Result"]?.let { renderType(it, null) }
+        rustResultTypeArguments(aliasTarget)?.let { return it }
+        if ("Error" in importedSimpleNameToPkg) return "Unit" to "Error"
+    }
+    return null
+}
+
 /** Keep both Rust alternatives and their independent payload types when tagged Result is active. */
 internal fun rustResultTypeArguments(rendered: String?): Pair<String, String>? {
     val type = rendered?.trim() ?: return null
@@ -251,14 +284,31 @@ internal fun KotlinJ2KEmitter.renderSourceResultTry(expression: String, returnKe
     }
     val result = sourceResultName()
     val starArgs = if (isUntypedResultScrutinee(sourceType)) "<*, *>" else ""
-    val errTypeArgs =
+    val enclosingPair =
         if (returnKeyword.startsWith("return")) {
-            val enclosingPair = rustResultTypeArguments(currentEnclosingReturnRenderedType)
-            buildExplicitResultTypeArgsSuffix(enclosingPair?.first, enclosingPair?.second)
+            resolveEnclosingResultTypeArguments(currentEnclosingReturnRenderedType)
+        } else {
+            null
+        }
+    val errTypeArgs =
+        if (enclosingPair != null) {
+            buildExplicitResultTypeArgsSuffix(enclosingPair.first, enclosingPair.second)
         } else {
             ""
         }
-    return "when (val tryResult = $expression) { is $result.Ok$starArgs -> tryResult.value; is $result.Err$starArgs -> $returnKeyword $result.Err$errTypeArgs(tryResult.error) }"
+    val errPayloadExpr =
+        if (starArgs.isNotEmpty() && enclosingPair != null && isUsableExplicitResultTypeArg(enclosingPair.second)) {
+            "(tryResult.error as ${enclosingPair.second})"
+        } else {
+            "tryResult.error"
+        }
+    val elseBranch =
+        if (starArgs.isNotEmpty()) {
+            "; else -> error(\"Unexpected $result variant: \$tryResult\")"
+        } else {
+            ""
+        }
+    return "when (val tryResult = $expression) { is $result.Ok$starArgs -> tryResult.value; is $result.Err$starArgs -> $returnKeyword $result.Err$errTypeArgs($errPayloadExpr)$elseBranch }"
 }
 
 /** The typed derived-equality method preserves Rust's equality type constraints.

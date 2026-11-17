@@ -1492,7 +1492,7 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
         val only = rawSegments.last().ident.toString()
         val cleanOnly = only.removePrefix("r#")
         return if (only == "self") {
-            "this"
+            scopeBuilder.resolveLocalKotlinName("self") ?: "this"
         } else if (only == "Self") {
             selfTypeName?.substringBefore('<')?.trim() ?: "Self"
         } else {
@@ -1569,7 +1569,9 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
                 "BITS" -> return bitsCount
             }
         }
-        currentTypeParamWitnessCalls[rustTypeIdentToKotlin(firstRaw) to cleanSecond]?.let { return it }
+        val selfBaseLookup = selfTypeName?.substringBefore('<')?.trim()
+        val firstWitnessKey = if (firstRaw == "Self" && selfBaseLookup != null) selfBaseLookup else rustTypeIdentToKotlin(firstRaw)
+        currentTypeParamWitnessCalls[firstWitnessKey to cleanSecond]?.let { return it }
         if (firstRaw == "Default" && cleanSecond == "default") {
             currentTypeParamWitnessCalls["*" to "default"]?.let { return it }
         }
@@ -1687,6 +1689,33 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
     }
 
     val isSingleSegment = (rawSegments.size == 1)
+    if (filtered.size == 2) {
+        val ownerRaw = filtered[0].ident.toString()
+        val memberRaw = filtered[1].ident.toString()
+        val cleanMember = memberRaw.removePrefix("r#")
+        val ownerKt =
+            if (ownerRaw == "Self") {
+                selfTypeName?.substringBefore('<')?.trim()
+            } else {
+                rustTypeIdentToKotlin(ownerRaw)
+            }
+        if (ownerKt != null &&
+            ownerKt in activeTypeParamNames &&
+            cleanMember.firstOrNull()?.isLowerCase() == true &&
+            !isScreamingSnakeIdent(memberRaw)
+        ) {
+            val memberRendered =
+                renderPathSegmentInExpr(
+                    rawIdent = memberRaw,
+                    arguments = filtered[1].arguments,
+                    selfTypeName = selfTypeName,
+                    isLast = true,
+                    isSingleSegment = false,
+                    asCallee = asCallee,
+                )
+            return if (asCallee) memberRendered else "::$memberRendered"
+        }
+    }
     val parts =
         filtered.mapIndexed { idx, seg ->
             renderPathSegmentInExpr(
@@ -1737,7 +1766,7 @@ internal fun KotlinJ2KEmitter.renderPathSegmentInExpr(
     val importedTypeKotlinName = resolveImportedUppercaseTypeBinding(rawIdent)
     val base =
         when {
-            rawIdent == "self" -> "this"
+            rawIdent == "self" -> scopeBuilder.resolveLocalKotlinName("self") ?: "this"
             rawIdent == "Self" -> selfTypeName?.substringBefore('<')?.trim() ?: "Self"
             isSingleSegment &&
                 isLast &&
@@ -1761,7 +1790,20 @@ internal fun KotlinJ2KEmitter.renderPathSegmentInExpr(
                 inspector.declaredConstNames.getValue(cleanIdent)
             !isLast && rawIdent in PRIMITIVE_TYPE_NAMES ->
                 if (rawIdent == "f32") kotlinF32TypeName() else rustTypeIdentToKotlin(rawIdent)
-            rawIdent.first().isUpperCase() -> rustTypeIdentToKotlin(rawIdent)
+            rawIdent.first().isUpperCase() -> {
+                val ktSym = rustTypeIdentToKotlin(rawIdent)
+                if (isSingleSegment && ktSym in activeTypeParamNames && ktSym in inspector.enumVariantSimpleNames) {
+                    val selfBase = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
+                    val ownerEnum =
+                        selfBase?.takeIf { "$it.$ktSym" in inspector.enumVariantFieldTypes || ktSym in inspector.enumVariantSimpleNames }
+                            ?: inspector.enumVariantFieldTypes.keys
+                                .firstOrNull { it.endsWith(".$ktSym") && '.' in it }
+                                ?.substringBeforeLast('.')
+                    if (ownerEnum != null && ownerEnum !in activeTypeParamNames) "$ownerEnum.$ktSym" else ktSym
+                } else {
+                    ktSym
+                }
+            }
             !isLast &&
                 rustTypeIdentToKotlin(rawIdent) in inspector.declaredTypeNames &&
                 rustTypeIdentToKotlin(rawIdent) !in inspector.typeAliasTargets ->

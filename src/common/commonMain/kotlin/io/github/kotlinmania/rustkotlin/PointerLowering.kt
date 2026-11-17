@@ -1,5 +1,6 @@
 package io.github.kotlinmania.rustkotlin
 
+import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
@@ -16,6 +17,7 @@ import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.ModContent
 import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
+import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.TraitItem
@@ -23,6 +25,7 @@ import io.github.kotlinmania.syn.TypeParamBound
 import io.github.kotlinmania.syn.UseTree
 import io.github.kotlinmania.syn.gen.Fold
 import io.github.kotlinmania.syn.gen.Visit
+import io.github.kotlinmania.syn.parse2
 import io.github.kotlinmania.syn.span
 
 /** Keep pointer identity distinct from Kotlin's nullable pointee/value types. */
@@ -484,29 +487,64 @@ internal data class SourceAssociatedParameter(
     val associated: String,
 )
 
-internal fun KotlinJ2KEmitter.sourceAssociatedParameters(generics: Generics): List<SourceAssociatedParameter> =
-    generics.params
-        .toList()
-        .filterIsInstance<GenericParam.TypeParam>()
-        .flatMap { parameter ->
-            parameter.bounds.toList().filterIsInstance<TypeParamBound.Trait>().flatMap { bound ->
-                val trait =
-                    bound.path.segments
-                        .last()
-                        ?.ident
-                        .toString()
-                sameFileLayoutIndex()
-                    .traitsByIdent[trait]
-                    ?.singleOrNull()
-                    ?.items
-                    ?.filterIsInstance<TraitItem.AssocType>()
-                    .orEmpty()
-                    .filter { it.default == null }
-                    .map {
-                        SourceAssociatedParameter(parameter.ident.toString(), trait, rustTypeIdentToKotlin(it.ident.toString()))
+internal fun KotlinJ2KEmitter.sourceAssociatedParameters(generics: Generics): List<SourceAssociatedParameter> {
+    val declaredTypeParams =
+        generics.params
+            .toList()
+            .filterIsInstance<GenericParam.TypeParam>()
+            .map { it.ident.toString() }
+    val declaredTypeParamSet = declaredTypeParams.toSet()
+    val boundsByParam = linkedMapOf<String, MutableList<TypeParamBound>>()
+    for (parameter in generics.params.toList().filterIsInstance<GenericParam.TypeParam>()) {
+        boundsByParam
+            .getOrPut(parameter.ident.toString()) { mutableListOf() }
+            .addAll(parameter.bounds.toList())
+    }
+    for (pred in generics.whereClause
+        ?.predicates
+        ?.toList()
+        .orEmpty()) {
+        val tp = pred as? io.github.kotlinmania.syn.WherePredicate.TypePredicate ?: continue
+        val unwrapped = unwrapSynType(tp.boundedTy) as? SynType.Path ?: continue
+        if (unwrapped.qself != null || unwrapped.path.segments.size != 1) continue
+        val paramIdent =
+            unwrapped.path.segments
+                .first()
+                ?.ident
+                ?.toString() ?: continue
+        if (paramIdent !in declaredTypeParamSet) continue
+        boundsByParam.getOrPut(paramIdent) { mutableListOf() }.addAll(tp.bounds.toList())
+    }
+    return declaredTypeParams
+        .flatMap { rawParamIdent ->
+            boundsByParam[rawParamIdent]
+                .orEmpty()
+                .filterIsInstance<TypeParamBound.Trait>()
+                .flatMap { bound ->
+                    val trait =
+                        bound.path.segments
+                            .last()
+                            ?.ident
+                            .toString()
+                    val sameFileAssocs =
+                        sameFileLayoutIndex()
+                            .traitsByIdent[trait]
+                            ?.singleOrNull()
+                            ?.items
+                            ?.filterIsInstance<TraitItem.AssocType>()
+                            .orEmpty()
+                            .filter { it.default == null }
+                            .map { rustTypeIdentToKotlin(it.ident.toString()) }
+                    val assocNames =
+                        sameFileAssocs.ifEmpty {
+                            lookupTraitDefaultlessAssocTypes(rustTypeIdentToKotlin(trait), bound.path)
+                        }
+                    assocNames.map { assocKt ->
+                        SourceAssociatedParameter(rawParamIdent, trait, assocKt)
                     }
-            }
+                }
         }.distinct()
+}
 
 internal fun KotlinJ2KEmitter.sourceAssociatedArguments(path: io.github.kotlinmania.syn.Path, selfType: String?): List<String> {
     val segment = path.segments.last() ?: return emptyList()
@@ -1130,8 +1168,90 @@ internal fun KotlinJ2KEmitter.sourceInitializerType(expression: Expr): SynType? 
     }
     if (source is Expr.MethodCall) {
         val rawMethod = source.method.toString().removePrefix("r#")
+        if (rawMethod in setOf("cast", "cast_mut", "cast_const") && source.args.isEmpty()) {
+            val targetElem =
+                source.turbofish
+                    ?.args
+                    ?.toList()
+                    ?.filterIsInstance<GenericArgument.TypeArg>()
+                    ?.firstOrNull()
+                    ?.type
+                    ?: (sourceInitializerType(source.receiver) as? SynType.Ptr)?.elem
+            if (targetElem != null) {
+                val baseRecvTy = sourceInitializerType(source.receiver)
+                val mutability =
+                    when {
+                        rawMethod == "cast_mut" ->
+                            PointerMutability.Mut(
+                                io.github.kotlinmania.syn.token.Mut
+                                    .default(),
+                            )
+                        rawMethod == "cast_const" ->
+                            PointerMutability.Const(
+                                io.github.kotlinmania.syn.token.Const
+                                    .default(),
+                            )
+                        baseRecvTy is SynType.Ptr -> baseRecvTy.mutability
+                        else ->
+                            PointerMutability.Mut(
+                                io.github.kotlinmania.syn.token.Mut
+                                    .default(),
+                            )
+                    }
+                return SynType.Ptr(
+                    io.github.kotlinmania.syn.token.Star
+                        .default(),
+                    mutability,
+                    targetElem,
+                )
+            }
+        }
         if (rawMethod in setOf("as_ptr", "as_mut_ptr") && source.args.isEmpty()) {
-            sourceArrayLocal(source.receiver)?.second?.let { elem ->
+            fun unwrapPointerContainerElem(ty: SynType?): SynType? {
+                val u = ty?.let(::unwrapSynType) ?: return null
+                return when (u) {
+                    is SynType.Reference -> unwrapPointerContainerElem(u.elem) ?: u.elem
+                    is SynType.Slice -> u.elem
+                    is SynType.Array -> u.elem
+                    is SynType.Path -> {
+                        val lastSeg =
+                            u.path.segments
+                                .toList()
+                                .lastOrNull() ?: return null
+                        val ident = lastSeg.ident.toString().removePrefix("r#")
+                        val u8SynType = parse2(SynType.Companion::parse, TokenStream.fromString("u8").getOrThrow()).getOrThrow()
+                        if (ident == "str") {
+                            u8SynType
+                        } else if (ident in setOf("NonNull", "Vec", "Box", "Unique")) {
+                            val firstArg =
+                                (lastSeg.arguments as? PathArguments.AngleBracketed)
+                                    ?.args
+                                    ?.toList()
+                                    ?.filterIsInstance<GenericArgument.TypeArg>()
+                                    ?.firstOrNull()
+                                    ?.type
+                                    ?: return null
+                            when (val inner = unwrapSynType(firstArg)) {
+                                is SynType.Slice -> inner.elem
+                                is SynType.Array -> inner.elem
+                                is SynType.Path if inner.path.segments
+                                    .toList()
+                                    .lastOrNull()
+                                    ?.ident
+                                    ?.toString() == "str" -> u8SynType
+                                else -> firstArg
+                            }
+                        } else {
+                            null
+                        }
+                    }
+                    else -> null
+                }
+            }
+            val inferredElem =
+                sourceArrayLocal(source.receiver)?.second
+                    ?: unwrapPointerContainerElem(sourceInitializerType(source.receiver))
+            inferredElem?.let { elem ->
                 val mutability =
                     if (rawMethod == "as_mut_ptr") {
                         io.github.kotlinmania.syn.PointerMutability

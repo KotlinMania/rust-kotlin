@@ -1692,17 +1692,14 @@ internal fun discoverExternalCrateAbiFromDisk(
             return rustModuleIdentToKotlin(stem.replace('-', '_')) == crateKey ||
                 stem.replace("-", "").equals(crateKey.replace("_", ""), ignoreCase = true)
         }
-        val exactRoot =
+        val exactPropsNsRoot =
             candidateRepos.firstNotNullOfOrNull { dir ->
-                val propsNs = readRepoPropsNs(dir)
-                val matches =
-                    (propsNs != null && propsNs == crateNs) ||
-                        (propsNs == null && dirMatchesCrateKey(dir))
-                if (!matches) return@firstNotNullOfOrNull null
+                val propsNs = readRepoPropsNs(dir) ?: return@firstNotNullOfOrNull null
+                if (propsNs != crateNs) return@firstNotNullOfOrNull null
                 KmPath(dir, "src/common/commonMain/kotlin").takeIf(::isScannerKmDirectory)
             }
         val prefixRoot =
-            if (exactRoot != null) {
+            if (exactPropsNsRoot != null) {
                 null
             } else {
                 candidateRepos.firstNotNullOfOrNull { dir ->
@@ -1711,7 +1708,16 @@ internal fun discoverExternalCrateAbiFromDisk(
                     KmPath(dir, "src/common/commonMain/kotlin/${crateNs.replace('.', '/')}").takeIf(::isScannerKmDirectory)
                 }
             }
-        val kotlinRoot = exactRoot ?: prefixRoot ?: continue
+        val fallbackDirRoot =
+            if (exactPropsNsRoot != null || prefixRoot != null) {
+                null
+            } else {
+                candidateRepos.firstNotNullOfOrNull { dir ->
+                    if (readRepoPropsNs(dir) != null || !dirMatchesCrateKey(dir)) return@firstNotNullOfOrNull null
+                    KmPath(dir, "src/common/commonMain/kotlin").takeIf(::isScannerKmDirectory)
+                }
+            }
+        val kotlinRoot = exactPropsNsRoot ?: prefixRoot ?: fallbackDirRoot ?: continue
         val ktFiles = mutableListOf<KmPath>()
         collectKtFilesRecursive(kotlinRoot, ktFiles)
         if (ktFiles.isNotEmpty()) {
@@ -1737,6 +1743,7 @@ internal fun discoverExternalCrateAbiFromDisk(
         for (ktFile in matched.ktFiles) {
             scanExternalKotlinFileSymbols(
                 sourceText = readScannerKmFileText(ktFile),
+                expectedCrateNs = crateNs,
                 pkgMapBySym = pkgMapBySym,
                 twoFieldResultFns = twoFieldResultFns,
                 nullableReturnFns = nullableReturnFns,
@@ -1775,6 +1782,7 @@ internal fun discoverExternalCrateAbiFromDisk(
 
 private fun scanExternalKotlinFileSymbols(
     sourceText: String,
+    expectedCrateNs: String,
     pkgMapBySym: MutableMap<String, LinkedHashSet<String>>,
     twoFieldResultFns: MutableSet<String>,
     nullableReturnFns: MutableSet<String>,
@@ -1789,6 +1797,7 @@ private fun scanExternalKotlinFileSymbols(
         }
     }
     val packageName = pkg ?: return
+    if (packageName != expectedCrateNs && !packageName.startsWith("$expectedCrateNs.")) return
     val twoFieldClasses = linkedSetOf<String>()
     val candidateTwoFieldFns = mutableListOf<Pair<String, String>>()
     var braceDepth = 0

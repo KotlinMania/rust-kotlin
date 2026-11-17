@@ -691,6 +691,22 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                         unwrapMaybeUninitRenderedInner(inferExprRenderedType(effectiveReceiverExpr, selfTypeName)) != null
                 ) ->
                 if (cleanMethod == "as_mut_ptr") "asMutPtr" else "asPtr"
+            cleanMethod == "as_mut_ptr" &&
+                (
+                    inferExprRenderedType(effectiveReceiverExpr, selfTypeName)
+                        ?.removeSuffix("?")
+                        ?.substringBefore('<')
+                        ?.substringAfterLast('.')
+                        ?.trim() == "NonNull" ||
+                        (sourceInitializerType(effectiveReceiverExpr)?.let(::unwrapSynType) as? SynType.Path)
+                            ?.path
+                            ?.segments
+                            ?.toList()
+                            ?.lastOrNull()
+                            ?.ident
+                            ?.toString()
+                            ?.removePrefix("r#") == "NonNull"
+                ) -> "asPtr"
             else -> rustMethodIdentToKotlin(rawMethod)
         }
     val macroTypeArgs = mutableListOf<String>()

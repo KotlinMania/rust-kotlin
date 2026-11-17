@@ -135,8 +135,28 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
             val inner = renderExpr(expr.expr, indent, selfTypeName)
             val retKw = currentClosureLabel?.let { "return@$it" } ?: "return"
             val enclosingRet = currentEnclosingReturnRenderedType
+            val exprInferredTy = inferExprRenderedType(expr.expr, selfTypeName)
+            val exprBase = exprInferredTy?.substringBefore('<')?.substringAfterLast('.')?.trim()
+            val enclosingBase = enclosingRet?.substringBefore('<')?.substringAfterLast('.')?.trim()
             if (enclosingRet == "Unit" || isFmtWriteOrUnitExpr(expr.expr, selfTypeName)) {
                 inner
+            } else if (exprBase == "ControlFlow" || (exprBase == null && enclosingBase == "ControlFlow")) {
+                val cfBreakTypeArgs =
+                    enclosingRet
+                        ?.takeIf { enclosingBase == "ControlFlow" && '<' in it && it.endsWith(">") }
+                        ?.let {
+                            val argsInner = it.substringAfter('<').dropLast(1)
+                            val comma = findTopLevelGenericCommaIndex(argsInner)
+                            if (comma >= 0) {
+                                buildExplicitResultTypeArgsSuffix(argsInner.substring(0, comma), argsInner.substring(comma + 1))
+                            } else {
+                                ""
+                            }
+                        }.orEmpty()
+                val isUntypedCf = exprBase != "ControlFlow"
+                val starArgs = if (isUntypedCf) "<*, *>" else ""
+                val elseArm = if (isUntypedCf) "; else -> error(\"Unexpected ControlFlow variant: \$tryResult\")" else ""
+                "when (val tryResult = $inner) { is ControlFlow.Continue$starArgs -> tryResult.value; is ControlFlow.Break$starArgs -> $retKw ControlFlow.Break$cfBreakTypeArgs(tryResult.value)$elseArm }"
             } else if (enclosingRet != null &&
                 enclosingRet.endsWith("?") &&
                 !enclosingRet.startsWith("Result<") &&
@@ -144,7 +164,7 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
             ) {
                 "($inner ?: $retKw null)"
             } else {
-                renderSourceResultTry(inner, retKw, inferExprRenderedType(expr.expr, selfTypeName))
+                renderSourceResultTry(inner, retKw, exprInferredTy)
             }
         }
         is Expr.Await -> renderExpr(expr.base, indent, selfTypeName)

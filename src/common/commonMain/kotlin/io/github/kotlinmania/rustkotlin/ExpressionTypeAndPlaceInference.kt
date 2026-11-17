@@ -3,6 +3,7 @@ package io.github.kotlinmania.rustkotlin
 import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.BinOp
 import io.github.kotlinmania.syn.Expr
+import io.github.kotlinmania.syn.Fields
 import io.github.kotlinmania.syn.FnArg
 import io.github.kotlinmania.syn.GenericArgument
 import io.github.kotlinmania.syn.ImplItem
@@ -1740,6 +1741,50 @@ internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
     return typedParams.getOrNull(typedIdx)?.patType?.ty
 }
 
+internal fun KotlinJ2KEmitter.resolveCallArgExpectedCollectionOrArrayType(
+    func: Expr,
+    argIdx: Int,
+    totalArgs: Int,
+    selfTypeName: String?,
+    localStructFields: Map<String, List<SynType>> = emptyMap(),
+): String? {
+    val paramSynTy = resolveCalleeExprParamSynType(func, argIdx, selfTypeName)
+    val paramRendered =
+        paramSynTy?.let { renderType(it, selfTypeName).removeSuffix("?").trim() }
+            ?: run {
+                val fnPath = (unwrapParenOrGroupExpr(func) as? Expr.Path)?.takeIf { it.qself == null }?.path
+                val rawCtor =
+                    fnPath
+                        ?.segments
+                        ?.toList()
+                        ?.lastOrNull()
+                        ?.ident
+                        ?.toString()
+                        ?.removePrefix("r#")
+                val ctorKt = rawCtor?.let(::rustTypeIdentToKotlin)
+                if (ctorKt != null && rawCtor.firstOrNull()?.isUpperCase() == true) {
+                    val localTy = localStructFields[ctorKt]?.getOrNull(argIdx)?.let { renderType(it, selfTypeName).removeSuffix("?").trim() }
+                    localTy
+                        ?: run {
+                            val fieldKey = if (totalArgs == 1) "value" else "field$argIdx"
+                            val synMap = inspector.structFieldSynTypesByType[ctorKt]
+                            synMap?.get(fieldKey)?.let { renderType(it, selfTypeName).removeSuffix("?").trim() }
+                                ?: scopedAbiKeysForRenderedType(ctorKt).firstNotNullOfOrNull { scoped ->
+                                    headerContext.crateStructFieldTypes["$scoped.$fieldKey"]
+                                }
+                                ?: headerContext.crateStructFieldTypes["$ctorKt.$fieldKey"]
+                        }?.removeSuffix("?")?.trim()
+                } else {
+                    null
+                }
+            }
+    return paramRendered?.takeIf {
+        it.startsWith("List<") ||
+            it.startsWith("MutableList<") ||
+            it in PRIMITIVE_ARRAY_TYPES
+    }
+}
+
 internal fun KotlinJ2KEmitter.inferUntypedArrayLocalTargetTypeFromRemainingStmts(
     pat: Pat,
     remainingStmts: List<Stmt>,
@@ -1768,23 +1813,37 @@ internal fun KotlinJ2KEmitter.inferUntypedArrayLocalTargetTypeFromRemainingStmts
     }
 
     var inferredTarget: String? = null
+    val localTupleStructFields = linkedMapOf<String, List<SynType>>()
     val visitor =
         object : Visit() {
+            override fun visitItemStruct(i: Item.Struct) {
+                val structKt = rustTypeIdentToKotlin(i.ident.toString())
+                val fields = i.fields
+                if (fields is Fields.Unnamed) {
+                    localTupleStructFields[structKt] =
+                        fields.fields.unnamed
+                            .toList()
+                            .map { it.ty }
+                }
+                super.visitItemStruct(i)
+            }
+
             override fun visitExprCall(e: Expr.Call) {
                 if (inferredTarget != null) return
                 val argsList = e.args.toList()
                 for ((argIdx, argExpr) in argsList.withIndex()) {
                     val basePlace = unwrapBorrowedSlicePlace(argExpr) as? Expr.Path ?: continue
                     if (basePlace.qself != null || !basePlace.path.isIdent(raw)) continue
-                    val paramTy = resolveCalleeExprParamSynType(e.func, argIdx, selfTypeName) ?: continue
-                    val rendered = renderType(paramTy, selfTypeName).removeSuffix("?").trim()
-                    if (rendered.startsWith("List<") ||
-                        rendered.startsWith("MutableList<") ||
-                        rendered in PRIMITIVE_ARRAY_TYPES
-                    ) {
-                        inferredTarget = rendered
-                        return
-                    }
+                    val target =
+                        resolveCallArgExpectedCollectionOrArrayType(
+                            func = e.func,
+                            argIdx = argIdx,
+                            totalArgs = argsList.size,
+                            selfTypeName = selfTypeName,
+                            localStructFields = localTupleStructFields,
+                        ) ?: continue
+                    inferredTarget = target
+                    return
                 }
                 super.visitExprCall(e)
             }

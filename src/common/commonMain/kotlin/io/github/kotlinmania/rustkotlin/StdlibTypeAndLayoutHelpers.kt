@@ -120,7 +120,10 @@ private val STDLIB_CONST_PTR_METHOD_PARAM_INDICES: Map<String, Set<Int>> =
 /** True when a Result scrutinee has an erased or unknown Kotlin type that still needs `<*, *>` casts. */
 internal fun isUntypedResultScrutinee(renderedType: String?): Boolean {
     val clean = renderedType?.removeSuffix("?")?.trim() ?: return false
-    return clean == "Any" || clean == "RustAny" || clean == "*"
+    if (clean == "Any" || clean == "RustAny" || clean == "*" || clean == "Nothing") return true
+    if (clean.length == 1 && clean[0] in 'A'..'Z') return true
+    val simpleBase = clean.substringBefore('<').substringAfterLast('.').trim()
+    return simpleBase != "Result" && simpleBase != "RustResult"
 }
 
 /** True when a rendered Result type argument can be emitted explicitly on `Result.Ok<T, E>` or `Result.Err<T, E>`. */

@@ -1429,6 +1429,32 @@ private fun KotlinJ2KEmitter.appendDestructuredParamLines(
     }
 }
 
+internal fun KotlinJ2KEmitter.blockReassignsDirectSelf(block: Block): Boolean {
+    fun isDirectSelfLhs(lhs: Expr): Boolean {
+        val unwrapped = unwrapParenOrGroupExpr(lhs)
+        if (unwrapped is Expr.Unary && unwrapped.op is UnOp.Deref) {
+            val inner = unwrapParenOrGroupExpr(unwrapped.expr)
+            return inner is Expr.Path && inner.qself == null && inner.path.isIdent("self")
+        }
+        return unwrapped is Expr.Path && unwrapped.qself == null && unwrapped.path.isIdent("self")
+    }
+    var reassigned = false
+    val visitor =
+        object : Visit() {
+            override fun visitItemFn(i: Item.Fn) {}
+
+            override fun visitExprAssign(e: Expr.Assign) {
+                if (isDirectSelfLhs(e.left)) {
+                    reassigned = true
+                    return
+                }
+                super.visitExprAssign(e)
+            }
+        }
+    visitor.visitBlock(block)
+    return reassigned
+}
+
 internal fun KotlinJ2KEmitter.computeReassignedParamShadows(
     sig: Signature,
     block: Block,
@@ -1438,6 +1464,23 @@ internal fun KotlinJ2KEmitter.computeReassignedParamShadows(
     val shadows = mutableListOf<String>()
     var paramIdx = 0
     for (arg in sig.inputs) {
+        if (arg is FnArg.Receiver) {
+            if (blockReassignsDirectSelf(block)) {
+                val shadowSelf =
+                    scopeBuilder
+                        .bindLocal(
+                            rawName = "self",
+                            baseKotlinName = "selfMut",
+                            span = arg.span(),
+                            assignCount = AssignCount.Any,
+                        ).kotlinName
+                if (selfTypeName != null) {
+                    currentTypedLocals = currentTypedLocals + (shadowSelf to selfTypeName)
+                }
+                shadows += "${innerIndent}var $shadowSelf = this"
+            }
+            continue
+        }
         if (arg is FnArg.Typed) {
             val rawParam = extractRawParamIdent(arg.patType.pat)
             if (rawParam != null && rawParam != "_") {
