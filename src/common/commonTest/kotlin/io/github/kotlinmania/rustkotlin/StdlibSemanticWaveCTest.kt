@@ -989,4 +989,140 @@ class StdlibSemanticWaveCTest {
         assertContains(out, "val x: U = defaultUFn()")
         assertContains(out, "val x1: T = defaultTFn()")
     }
+
+    @Test
+    fun `wave c5 fixes tuple ufcs component6 quote transmute arg foreign collision trait dedup unit enum cast uncheckedShl and self compound assign`() {
+        val rustSource =
+            """
+            use crate::{ToTokens, ext::HasIterator as HasIter};
+            use core::ops::{self, BitAnd};
+
+            pub trait MyInt:
+                ops::AddAssign
+                + ops::Add<Output = Self>
+                + ops::Shl<i32, Output = Self>
+                + ops::Shl<u32, Output = Self>
+            {}
+
+            pub struct MaskPair(pub u32, pub u32);
+            pub struct HasIterator;
+
+            pub enum Feature {
+                rv32i,
+                zvbb,
+            }
+
+            pub struct TwoF64(pub f64, pub f64);
+
+            pub fn check_feature_and_shift(index: i64, p: TwoF64) -> (u32, i64, f64) {
+                (Feature::zvbb as u32, index.unchecked_shl(2), p.1)
+            }
+
+            pub fn test_tuple_6_from(arr: [i32; 6]) -> (i32, i32, i32, i32, i32, i32) {
+                let (a, b, c, d, e, f) = arr;
+                (a, b, c, d, e, f)
+            }
+
+            impl<U: PartialOrd, T: PartialOrd> PartialOrd for (U, T) {
+                fn lt(&self, other: &(U, T)) -> bool {
+                    PartialOrd::lt(&self.0, &other.0)
+                }
+            }
+
+            pub struct V16(i8);
+            pub fn simd_add<T>(a: T, b: T) -> T { a }
+
+            pub unsafe fn msa_addvi_b<const IMM5: u32>(a: V16) -> V16 {
+                extern "C" {
+                    fn msa_addvi_b(a: V16, imm: i32) -> V16;
+                }
+                msa_addvi_b(a, IMM5 as i32)
+            }
+
+            extern "C" {
+                #[link_name = "llvm.s390.v"]
+                fn s390_v(a: i32, b: i32) -> i32;
+            }
+            pub unsafe fn s390_v(a: i32) -> i32 { a }
+
+            pub fn call_local_vst(ptr: *mut u8) {
+                extern "C" {
+                    fn vst2(a: *mut u8);
+                }
+                unsafe { vst2(core::mem::transmute(ptr)) }
+            }
+
+            pub fn call_simd_add_transmute(a: V16, b: V16) -> V16 {
+                simd_add(core::mem::transmute(a), b)
+            }
+
+            pub fn emit_tok(t: HasIter) -> HasIter {
+                ToTokens::to_tokens(t);
+                t
+            }
+
+            pub struct MyCow(pub i32);
+            impl ops::AddAssign<i32> for MyCow {
+                fn add_assign(&mut self, rhs: i32) { self.0 += rhs; }
+            }
+            impl ops::Add<i32> for MyCow {
+                type Output = MyCow;
+                fn add(mut self, rhs: i32) -> MyCow {
+                    self += rhs;
+                    self
+                }
+            }
+            """
+        val out =
+            translateRustSourceToKotlin(
+                recognizeRust(rustSource.trimIndent()),
+                headerContext =
+                    FileHeaderContext(
+                        packageName = "io.github.kotlinmania.rustlang.procmacro.quote",
+                        projectNamespace = "io.github.kotlinmania.rustlang.procmacro",
+                        crateNamespaces =
+                            mapOf(
+                                "core" to "io.github.kotlinmania.rustlang.core",
+                                "proc_macro" to "io.github.kotlinmania.rustlang.procmacro",
+                            ),
+                        crateSubpackageRawLeafNames =
+                            mapOf(
+                                "quote" to "quote",
+                                "totokens" to "totokens",
+                            ),
+                        crateSymbolSubpackages =
+                            mapOf(
+                                "HasIterator" to listOf("quote"),
+                                "ToTokens" to listOf("totokens"),
+                            ),
+                        externalCrateSymbolPackages =
+                            mapOf(
+                                "core" to
+                                    mapOf(
+                                        "AddAssign" to listOf("io.github.kotlinmania.rustlang.core.ops.arith"),
+                                        "Add" to listOf("io.github.kotlinmania.rustlang.core.ops.arith"),
+                                        "Shl" to listOf("io.github.kotlinmania.rustlang.core.ops.bit"),
+                                        "BitAnd" to listOf("io.github.kotlinmania.rustlang.core.ops.bit"),
+                                    ),
+                            ),
+                    ),
+            )
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(out, "WaveC5Sample.kt")
+        assertContains(out, "import io.github.kotlinmania.rustlang.core.mem.component6")
+        assertContains(out, "Feature.Zvbb")
+        assertFalse(out.contains("Feature::zvbb"), "Must resolve lowercase enum variant to Feature.Zvbb:\n$out")
+        assertContains(out, "public fun toUInt(): UInt = kmDiscriminant().toUInt()")
+        assertContains(out, "(index shl 2)")
+        assertContains(out, "p.field1")
+        assertContains(out, "kmPartialCompareValues(this.first, other.first)")
+        assertContains(out, "public expect fun externS390V(a: Int, b: Int): Int")
+        assertContains(out, "public interface MyInt : AddAssign<MyInt>, Add<MyInt, MyInt>, Shl<Int, MyInt>")
+        assertFalse(out.contains("Shl<UInt"), "Must deduplicate Shl supertrait instantiations:\n$out")
+        assertFalse(out.contains("ToTokens.ToTokens("), "Multi-segment ToTokens::to_tokens must not emit ToTokens.ToTokens:\n$out")
+        assertFalse(out.contains("UnresolvedTypeLayout<T>"), "Homogeneous binary simdAdd transmute must not leak callee generic T:\n$out")
+        assertFalse(out.contains("UnresolvedTypeLayout<Unit>"), "Call argument transmute must not fall back to enclosing Unit return:\n$out")
+        assertFalse(Regex("""\bHasIter\b""").containsMatchIn(out), "Same-package use rename HasIter must rewrite to HasIterator without shadowing:\n$out")
+        assertContains(out, "public fun emitTok(t: HasIterator): HasIterator")
+        assertContains(out, "this.addAssign(rhs)")
+    }
 }

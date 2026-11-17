@@ -9,6 +9,29 @@ import io.github.kotlinmania.syn.Lit
 import io.github.kotlinmania.syn.PathArguments
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.TraitItem
+
+private val HOMOGENEOUS_BINARY_SIMD_INTRINSICS =
+    setOf(
+        "simd_add",
+        "simd_sub",
+        "simd_mul",
+        "simd_div",
+        "simd_rem",
+        "simd_and",
+        "simd_or",
+        "simd_xor",
+        "simd_shl",
+        "simd_shr",
+        "simd_eq",
+        "simd_ne",
+        "simd_lt",
+        "simd_le",
+        "simd_gt",
+        "simd_ge",
+        "simd_fmin",
+        "simd_fmax",
+    )
+
 private val BYTE_SWAP_CALLEE_KIND: Map<String, NumericKind?> =
     mapOf(
         "Byte.toLe" to null,
@@ -652,6 +675,7 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
             val savedParseTarget = currentExpectedParseTargetType
             currentExpectedNumericKind = null
             currentExpectedParseTargetType = null
+            callArgumentNestingDepth++
             val renderedArgList =
                 try {
                     rawArgs.mapIndexed { argIdx, argExpr ->
@@ -691,37 +715,6 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                         } else {
                             currentExpectedNumericKind = null
                             val paramSynTy = resolveCalleeExprParamSynType(expr.func, argIdx, selfTypeName)
-                            val paramParseTarget =
-                                paramSynTy
-                                    ?.let { synTy ->
-                                        renderType(synTy, selfTypeName)
-                                            .removeSuffix("?")
-                                            .trim()
-                                            .takeIf {
-                                                val unwrappedArg = unwrapParenOrGroupExpr(argExpr)
-                                                val castTy = (unwrappedArg as? Expr.Cast)?.ty
-                                                val isInferCastArg =
-                                                    castTy is SynType.Infer || (castTy is SynType.Ptr && castTy.elem is SynType.Infer)
-                                                it.startsWith("List<") ||
-                                                    it.startsWith("MutableList<") ||
-                                                    it in PRIMITIVE_ARRAY_TYPES ||
-                                                    it.startsWith("RangeInclusive<") ||
-                                                    (it != "Unit" && isInferCastArg)
-                                            }
-                                    }
-                                    ?: resolveCallArgExpectedCollectionOrArrayType(
-                                        func = expr.func,
-                                        argIdx = argIdx,
-                                        totalArgs = rawArgs.size,
-                                        selfTypeName = selfTypeName,
-                                    )
-                            currentExpectedParseTargetType = paramParseTarget
-                            val renderedArg =
-                                try {
-                                    renderExpr(argExpr, indent, selfTypeName)
-                                } finally {
-                                    currentExpectedParseTargetType = null
-                                }
                             val rawCallSegs =
                                 (unwrapParenOrGroupExpr(expr.func) as? Expr.Path)
                                     ?.takeIf { it.qself == null }
@@ -730,6 +723,87 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                                     ?.toList()
                                     ?.map { it.ident.toString().removePrefix("r#") }
                                     .orEmpty()
+                            val unwrappedArg = unwrapParenOrGroupExpr(argExpr)
+                            val isTransmuteOrDefaultCall =
+                                unwrappedArg is Expr.Call &&
+                                    (unwrapParenOrGroupExpr(unwrappedArg.func) as? Expr.Path)
+                                        ?.path
+                                        ?.segments
+                                        ?.toList()
+                                        ?.lastOrNull()
+                                        ?.ident
+                                        ?.toString()
+                                        ?.removePrefix("r#") in setOf("transmute", "transmute_unchecked", "default")
+                            val isConversionMethodArg =
+                                unwrappedArg is Expr.MethodCall &&
+                                    unwrappedArg.method.toString().removePrefix("r#") in setOf("into", "try_into")
+                            val isTransmuteOrConversionArg = isTransmuteOrDefaultCall || isConversionMethodArg
+                            val paramParseTarget =
+                                paramSynTy
+                                    ?.let { synTy ->
+                                        renderType(synTy, selfTypeName)
+                                            .removeSuffix("?")
+                                            .trim()
+                                            .takeIf { renderedParamTy ->
+                                                val castTy = (unwrappedArg as? Expr.Cast)?.ty
+                                                val isInferCastArg =
+                                                    castTy is SynType.Infer || (castTy is SynType.Ptr && castTy.elem is SynType.Infer)
+                                                val isCalleeGenericPlaceholder =
+                                                    rawCallSegs.lastOrNull() in HOMOGENEOUS_BINARY_SIMD_INTRINSICS ||
+                                                        (
+                                                            renderedParamTy.length == 1 &&
+                                                                renderedParamTy[0] in 'A'..'Z' &&
+                                                                renderedParamTy !in inspector.declaredTypeNames &&
+                                                                renderedParamTy !in importedSimpleNameToPkg
+                                                        )
+                                                val isConcreteConvTarget =
+                                                    isTransmuteOrConversionArg &&
+                                                        renderedParamTy.isNotEmpty() &&
+                                                        renderedParamTy != "Unit" &&
+                                                        renderedParamTy != "Any" &&
+                                                        renderedParamTy != "Any?" &&
+                                                        '*' !in renderedParamTy &&
+                                                        renderedParamTy !in activeTypeParamNames &&
+                                                        !isCalleeGenericPlaceholder
+                                                renderedParamTy.startsWith("List<") ||
+                                                    renderedParamTy.startsWith("MutableList<") ||
+                                                    renderedParamTy in PRIMITIVE_ARRAY_TYPES ||
+                                                    renderedParamTy.startsWith("RangeInclusive<") ||
+                                                    (renderedParamTy != "Unit" && isInferCastArg) ||
+                                                    isConcreteConvTarget
+                                            }
+                                    }
+                                    ?: resolveCallArgExpectedCollectionOrArrayType(
+                                        func = expr.func,
+                                        argIdx = argIdx,
+                                        totalArgs = rawArgs.size,
+                                        selfTypeName = selfTypeName,
+                                    )
+                                    ?: if (isTransmuteOrConversionArg &&
+                                        rawArgs.size == 2 &&
+                                        rawCallSegs.lastOrNull() in HOMOGENEOUS_BINARY_SIMD_INTRINSICS
+                                    ) {
+                                        inferExprRenderedType(rawArgs[1 - argIdx], selfTypeName)
+                                            ?.removeSuffix("?")
+                                            ?.trim()
+                                            ?.takeIf { peerTy ->
+                                                peerTy.isNotEmpty() &&
+                                                    peerTy != "Unit" &&
+                                                    peerTy != "Any" &&
+                                                    peerTy != "Any?" &&
+                                                    '*' !in peerTy &&
+                                                    peerTy !in activeTypeParamNames
+                                            }
+                                    } else {
+                                        null
+                                    }
+                            currentExpectedParseTargetType = paramParseTarget
+                            val renderedArg =
+                                try {
+                                    renderExpr(argExpr, indent, selfTypeName)
+                                } finally {
+                                    currentExpectedParseTargetType = null
+                                }
                             if (isStdlibConstPtrCallParam(rawCallSegs, paramSynTy, argIdx)) {
                                 coerceMutPtrArgToConstPtr(renderedArg, inferExprRenderedType(argExpr, selfTypeName))
                             } else {
@@ -738,6 +812,7 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                         }
                     }
                 } finally {
+                    callArgumentNestingDepth--
                     currentExpectedNumericKind = savedKind
                     currentExpectedParseTargetType = savedParseTarget
                 }
@@ -796,6 +871,20 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                                 }
                         }
                     }
+                if (ownerSimple in setOf("PartialOrd", "Ord") && renderedArgList.size == 2) {
+                    val arg0RenderedTy =
+                        inferExprRenderedType(rawArgs[0], selfTypeName)
+                            ?.let { mutableReferencePointeeType(it) ?: it }
+                            ?.removeSuffix("?")
+                            ?.trim()
+                    tryRenderUnconstrainedCmpLowering(
+                        rawMethod = methodBase,
+                        cleanRecvTy = arg0RenderedTy,
+                        recvRendered = renderedArgList[0],
+                        argRendered = renderedArgList[1],
+                        allowWhenRecvUninferred = true,
+                    )?.let { return it }
+                }
                 if (isUfcsTraitReceiverCall) {
                     val recvAtom = if (isAtomicPostfixReceiver(rawArgs[0], renderedArgList[0])) renderedArgList[0] else "(${renderedArgList[0]})"
                     val restArgs = renderedArgList.drop(1).joinToString(", ")

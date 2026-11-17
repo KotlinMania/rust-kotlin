@@ -190,6 +190,18 @@ internal fun KotlinJ2KEmitter.registerUseItemInScope(item: Item.Use) {
             } else {
                 importedPath
             }
+        if (!isModuleImport && !isKnownSubpkgModule && leaf.alias != null) {
+            val importPkg = normalizedImportedPath.substringBeforeLast('.', missingDelimiterValue = "")
+            val finalSimple = normalizedImportedPath.substringAfterLast('.')
+            if (headerContext.packageName != null &&
+                importPkg == headerContext.packageName &&
+                finalSimple.isNotEmpty() &&
+                finalSimple != "*" &&
+                kotlinName != finalSimple
+            ) {
+                samePackageUseRenames[kotlinName] = finalSimple
+            }
+        }
         scopeBuilder.bindModuleImport(
             rawName = boundRawName,
             kotlinName = kotlinName,
@@ -1097,6 +1109,42 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
                     }
                 }
             }
+        val nsPrefix = currentNamespacePrefix()
+        if (nsPrefix != null && afterSelf.size >= 2 && headerContext.crateSymbolSubpackages.isNotEmpty()) {
+            val interTypeIdx =
+                afterSelf.indices.take(afterSelf.lastIndex).firstOrNull { idx ->
+                    isIntermediateTypeSegmentInUsePath(afterSelf[idx], idx, afterSelf, curSubSegs)
+                }
+            if (interTypeIdx != null) {
+                val typeKt = mappedTail[interTypeIdx]
+                val targetPrefix = (curSubSegs + mappedTail.take(interTypeIdx)).joinToString(".")
+                val candidates = headerContext.crateSymbolSubpackages[typeKt].orEmpty()
+                val resolvedSub =
+                    if (targetPrefix in candidates) {
+                        targetPrefix
+                    } else {
+                        resolveBestSubpackageAmong(
+                            candidates.filter { targetPrefix.isEmpty() || it.startsWith("$targetPrefix.") },
+                        )
+                    }
+                if (resolvedSub != null) {
+                    val tail = mappedTail.drop(interTypeIdx).joinToString(".")
+                    return if (resolvedSub.isEmpty()) "$nsPrefix.$tail" else "$nsPrefix.$resolvedSub.$tail"
+                }
+            }
+        }
+        if (nsPrefix != null && afterSelf.size == 1 && mappedTail[0] != "*" && headerContext.crateSymbolSubpackages.isNotEmpty()) {
+            val candidates = headerContext.crateSymbolSubpackages[mappedTail[0]]
+            if (candidates != null && curSubpkg !in candidates) {
+                val childSub =
+                    resolveBestSubpackageAmong(
+                        candidates.filter { curSubpkg.isEmpty() || it.startsWith("$curSubpkg.") },
+                    )
+                if (childSub != null) {
+                    return if (childSub.isEmpty()) "$nsPrefix.${mappedTail[0]}" else "$nsPrefix.$childSub.${mappedTail[0]}"
+                }
+            }
+        }
         return "$curPkg.${mappedTail.joinToString(".")}"
     }
     if (root == "super") {
@@ -1374,6 +1422,12 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
         }
         if (afterRoot.size == 1 && mapped.last() != "*" && nsPrefix != null && headerContext.crateSymbolSubpackages.isNotEmpty()) {
             val rawLeaf = afterRoot[0].removePrefix("r#")
+            if (rawLeaf.firstOrNull()?.isLowerCase() == true && !isKnownFunctionLeafIdent(afterRoot[0])) {
+                val leafMod = rustModuleIdentToKotlin(rawLeaf.replace('-', '_'))
+                if (leafMod in headerContext.crateSubpackageRawLeafNames) {
+                    return "$nsPrefix.$leafMod"
+                }
+            }
             val directSub =
                 if (rawLeaf.firstOrNull()?.isLowerCase() != true || isKnownFunctionLeafIdent(afterRoot[0])) {
                     resolveBestSubpackageForSymbol(mapped.last())
@@ -1392,6 +1446,17 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
                 val valSub = resolveBestSubpackageForSymbol(mapped.last())
                 if (valSub != null) {
                     return if (valSub.isEmpty()) "$nsPrefix.${mapped.last()}" else "$nsPrefix.$valSub.${mapped.last()}"
+                }
+            }
+            if (mapped.last() !in inspector.declaredTypeNames &&
+                mapped.last() !in inspector.declaredConstNames.values &&
+                !isDeclaredTopLevelFnKotlinName(mapped.last())
+            ) {
+                for (extCrate in listOf("core", "alloc", "std")) {
+                    val extPkgs = headerContext.externalCrateSymbolPackages[extCrate]?.get(mapped.last())
+                    if (!extPkgs.isNullOrEmpty()) {
+                        return "${extPkgs.first()}.${mapped.last()}"
+                    }
                 }
             }
         }
@@ -1422,6 +1487,14 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
         // subpackage that declaration is emitted into (with split module roots, `op.rs` -> `op`).
         if (afterRoot.size >= 2 && mapped.last() != "*" && nsPrefix != null) {
             val explicitModule = mapped.drop(1).dropLast(1).joinToString(".")
+            val rawLastClean = afterRoot.last().removePrefix("r#")
+            if (rawLastClean.firstOrNull()?.isLowerCase() == true && !isKnownFunctionLeafIdent(rawLastClean)) {
+                val expectedLeafKt = rustModuleIdentToKotlin(rawLastClean.replace('-', '_'))
+                val exactChild = if (explicitModule.isEmpty()) expectedLeafKt else "$explicitModule.$expectedLeafKt"
+                if (exactChild in headerContext.crateSubpackageRawLeafNames) {
+                    return "$nsPrefix.$exactChild"
+                }
+            }
             val normalizedExplicitModule =
                 if (explicitModule == "os.wasi.ffi" || explicitModule.startsWith("os.wasi.ffi.")) {
                     explicitModule.replaceFirst("os.wasi.ffi", "os.unix.ffi")
@@ -1447,7 +1520,6 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
                 }
             }
             resolveExternalDepReexportPkg(explicitModule, mapped.last(), nsPrefix)?.let { return it }
-            val rawLastClean = afterRoot.last().removePrefix("r#")
             if (rawLastClean.firstOrNull()?.isLowerCase() == true && !isKnownFunctionLeafIdent(rawLastClean)) {
                 val expectedLeafKt = rustModuleIdentToKotlin(rawLastClean.replace('-', '_'))
                 val exactChild = if (explicitModule.isEmpty()) expectedLeafKt else "$explicitModule.$expectedLeafKt"
@@ -1775,7 +1847,20 @@ internal fun KotlinJ2KEmitter.renderItemUse(
             continue
         }
         val importPkg = fullImport.substringBeforeLast('.', missingDelimiterValue = "")
-        if (leaf.alias == null && headerContext.packageName != null && importPkg == headerContext.packageName) {
+        if (headerContext.packageName != null && importPkg == headerContext.packageName) {
+            if (leaf.alias != null) {
+                val rawAliasIdent =
+                    if (isImportedTypeLeaf(leaf.segments.last(), leaf.alias, leaf.isSelfImport)) {
+                        rustTypeIdentToKotlin(leaf.alias)
+                    } else if (leaf.alias.first().isUpperCase()) {
+                        rustTypeIdentToKotlin(leaf.alias)
+                    } else {
+                        null
+                    }
+                if (rawAliasIdent != null && rawAliasIdent != finalSimpleName) {
+                    samePackageUseRenames[rawAliasIdent] = finalSimpleName
+                }
+            }
             continue
         }
         val lastSeg = leaf.segments.last()
@@ -2620,10 +2705,22 @@ internal fun KotlinJ2KEmitter.renderItemForeignMod(
                 } else if (isLocalItem) {
                     val localSig = sig.replaceFirst("expect fun ", "fun ")
                     val retSynTy = extractReturnSynType(foreign.sig.output)
+                    val retBaseSimple = retRendered.substringBefore('<').substringAfterLast('.').trim()
+                    val isReturnStructWithFields =
+                        retDefault.endsWith("()") &&
+                            (
+                                retBaseSimple in inspector.tupleStructArityByType ||
+                                    inspector.structFieldSynTypesByType[retBaseSimple]?.isNotEmpty() == true ||
+                                    retBaseSimple in headerContext.externalCrateTupleStructArity ||
+                                    scopedAbiKeysForRenderedType(retBaseSimple).any { k ->
+                                        "$k.value" in headerContext.crateStructFieldTypes ||
+                                            "$k.field0" in headerContext.crateStructFieldTypes
+                                    }
+                            )
                     val localBody =
                         when {
                             retRendered == "Unit" -> "{}"
-                            (retDefault.startsWith("null as ") || retDefault.startsWith("error(")) && retSynTy != null -> {
+                            (retDefault.startsWith("null as ") || retDefault.startsWith("error(") || isReturnStructWithFields) && retSynTy != null -> {
                                 val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
                                 val layoutExpr = CoreIntrinsicLowering.resolveTypeLayoutExpression(retSynTy, null, this)
                                 "= ${CoreIntrinsicLowering.renderZeroedLayoutReadExpression(layoutExpr, "$coreNs.intrinsics", this)}"

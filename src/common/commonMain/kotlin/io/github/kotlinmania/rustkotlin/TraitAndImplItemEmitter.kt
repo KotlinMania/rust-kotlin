@@ -274,7 +274,16 @@ internal fun KotlinJ2KEmitter.renderDistinctSuperTraits(
                 }
             }
             if (!seenInterfaces.add(baseIface)) continue
-            val assocNames = lookupTraitDefaultlessAssocTypes(baseIface, path)
+            val assocNames =
+                lookupTraitDefaultlessAssocTypes(baseIface, path).ifEmpty {
+                    if (baseIface !in inspector.declaredTypeNames &&
+                        baseIface in setOf("Add", "Sub", "Mul", "Div", "Rem", "BitAnd", "BitOr", "BitXor", "Shl", "Shr", "Neg", "Not")
+                    ) {
+                        listOf("Output")
+                    } else {
+                        emptyList()
+                    }
+                }
             val fullRendered =
                 if (assocNames.isNotEmpty()) {
                     val implAssocByName =
@@ -903,7 +912,7 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
                     item.supertraits
                         .toList()
                         .mapNotNull { renderTypeParamBound(it, selfTypeName = memberSelfType) }
-                        .distinct()
+                        .distinctBy { it.substringBefore('<').substringAfterLast('.').trim() }
                 val wc =
                     renderWhereClause(
                         item.generics.whereClause,

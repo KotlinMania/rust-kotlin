@@ -791,6 +791,7 @@ internal class KotlinJ2KEmitter(
                 sym.localInlineModuleNames.addAll(sharedInsp.localInlineModuleNames)
                 sym.localExternalModuleNames.addAll(sharedInsp.localExternalModuleNames)
                 sym.allUseItems.addAll(sharedInsp.allUseItems)
+                sym.enumTypeNames.addAll(sharedInsp.enumTypeNames)
                 sym.enumVariantSimpleNames.addAll(sharedInsp.enumVariantSimpleNames)
                 sym.importedEnumVariantSimpleNames.addAll(sharedInsp.importedEnumVariantSimpleNames)
                 sym.ffiReferencedTypeNames.addAll(sharedInsp.ffiReferencedTypeNames)
@@ -891,8 +892,11 @@ internal class KotlinJ2KEmitter(
     internal val synthesizedSamDefaultsByName = sharedSamDefaultsByName ?: linkedMapOf<String, String>()
     internal val importedSimpleNameToPkg = linkedMapOf<String, String>()
     internal val extraTypePathImports = linkedSetOf<String>()
+    internal val samePackageUseRenames = linkedMapOf<String, String>()
     internal val standaloneTraitImplKeys = linkedSetOf<Pair<String, String>>()
     internal val witnessedSuppressedTraitNames = linkedSetOf<String>()
+    internal var callArgumentNestingDepth: Int = 0
+    internal var activeLocalBlockItems: List<Item> = emptyList()
     internal var currentImplAssocTypes: Map<String, SynType> = emptyMap()
     internal var currentTraitAssocParamNames: Set<String> = emptySet()
     internal var currentTypeParamWitnessCalls: Map<Pair<String, String>, String> = emptyMap()
@@ -1630,6 +1634,21 @@ internal class KotlinJ2KEmitter(
                     val imp = "import $variantOwner.$variantName"
                     if (imp !in combinedExtraTypeImports) {
                         combinedExtraTypeImports += imp
+                    }
+                }
+            }
+        }
+        if (isInCoreOrUsingExternalCore && !headerContext.rawAbiMode && headerContext.packageName != "$activeCoreNs.mem") {
+            val maxTupleDestructuringArity =
+                Regex("""\b(?:val|var)\s*\(([^()]+)\)\s*=""")
+                    .findAll(bodyTextForImports)
+                    .maxOfOrNull { match -> match.groupValues[1].count { it == ',' } + 1 }
+                    ?: 0
+            if (maxTupleDestructuringArity >= 6) {
+                for (compIdx in 6..minOf(maxTupleDestructuringArity, 12)) {
+                    val compImp = "import $activeCoreNs.mem.component$compIdx"
+                    if (compImp !in extraImports) {
+                        extraImports += compImp
                     }
                 }
             }

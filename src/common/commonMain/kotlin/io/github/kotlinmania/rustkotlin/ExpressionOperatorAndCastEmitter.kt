@@ -239,7 +239,15 @@ internal fun KotlinJ2KEmitter.renderExprBinary(expr: Expr.Binary, indent: String
             } else {
                 "$rhsLeft $compoundBitOp $safeRight"
             }
-        if (left == "this") {
+        val selfAssignMethod =
+            if (left == "this") {
+                resolveSelfCompoundAssignMethodName(expr.op, selfTypeName)
+            } else {
+                null
+            }
+        if (left == "this" && selfAssignMethod != null) {
+            "this.$selfAssignMethod($right)"
+        } else if (left == "this") {
             "($rhsBitExpr).let {}"
         } else {
             "$left = $rhsBitExpr"
@@ -298,8 +306,13 @@ internal fun KotlinJ2KEmitter.renderExprBinary(expr: Expr.Binary, indent: String
         val op = renderBinOp(expr.op)
         "(kmCompareValues($left, $right) $op 0)"
     } else if (left == "this" && isCompoundAssignOp(expr.op)) {
-        val op = renderBinOp(expr.op).removeSuffix("=")
-        "($left $op $right).let {}"
+        val selfAssignMethod = resolveSelfCompoundAssignMethodName(expr.op, selfTypeName)
+        if (selfAssignMethod != null) {
+            "this.$selfAssignMethod($right)"
+        } else {
+            val op = renderBinOp(expr.op).removeSuffix("=")
+            "($left $op $right).let {}"
+        }
     } else {
         val op = renderBinOp(expr.op)
         if (headerContext.isBatchCrateOutput && right.contains('\n')) {
@@ -648,4 +661,33 @@ internal fun KotlinJ2KEmitter.renderExprAssign(expr: Expr.Assign, indent: String
         return "($right).let {}"
     }
     return "$left = $right"
+}
+
+private fun KotlinJ2KEmitter.resolveSelfCompoundAssignMethodName(
+    op: BinOp,
+    selfTypeName: String?,
+): String? {
+    val ownerBase =
+        selfTypeName
+            ?.substringBefore('<')
+            ?.substringAfterLast('.')
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: return null
+    val assignMethod =
+        when (op) {
+            is BinOp.AddAssign -> "addAssign"
+            is BinOp.SubAssign -> "subAssign"
+            is BinOp.MulAssign -> "mulAssign"
+            is BinOp.DivAssign -> "divAssign"
+            is BinOp.RemAssign -> "remAssign"
+            is BinOp.BitAndAssign -> "bitandAssign"
+            is BinOp.BitOrAssign -> "bitorAssign"
+            is BinOp.BitXorAssign -> "bitxorAssign"
+            is BinOp.ShlAssign -> "shlAssign"
+            is BinOp.ShrAssign -> "shrAssign"
+            else -> return null
+        }
+    if (currentEnclosingFunctionName == assignMethod) return null
+    return assignMethod.takeIf { it in inspector.instanceMethodsByType[ownerBase].orEmpty() }
 }

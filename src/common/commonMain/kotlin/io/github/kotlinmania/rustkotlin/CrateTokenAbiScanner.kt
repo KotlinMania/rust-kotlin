@@ -63,6 +63,7 @@ internal data class ExternalCrateAbiMetadata(
     val twoFieldResultFns: Set<String> = emptySet(),
     val nullableReturnFns: Set<String> = emptySet(),
     val fnConstParams: Map<String, Pair<Int, List<String>>> = emptyMap(),
+    val tupleStructArity: Map<String, Int> = emptyMap(),
 )
 
 private var diskCrateRawAbiMetadataCache: Map<String, CrateRawAbiMetadata> = emptyMap()
@@ -1653,6 +1654,7 @@ private val EXTERNAL_PUBLIC_FUN_REGEX =
 private val EXTERNAL_PUBLIC_TYPE_OR_VAL_REGEX =
     Regex("""^public\s+(?:(?:const|sealed|data|enum|value|abstract|open|inner|expect|actual|external)\s+)*(?:class|interface|object|typealias|val|var)\s+([A-Za-z_][A-Za-z0-9_]*)""")
 private val EXTERNAL_RETURN_TYPE_REGEX = Regex("""^\s*:\s*([A-Za-z_][A-Za-z0-9_.]*)""")
+private val EXTERNAL_TUPLE_MEMBER_PROP_REGEX = Regex("""^public\s+(?:open\s+|override\s+)*(?:var|val)\s+(value|field(\d+))\s*:""")
 
 internal fun discoverExternalCrateAbiFromDisk(
     anchorPath: String?,
@@ -1782,6 +1784,7 @@ internal fun discoverExternalCrateAbiFromDisk(
     val twoFieldResultFns = linkedSetOf<String>()
     val nullableReturnFns = linkedSetOf<String>()
     val fnConstParams = linkedMapOf<String, Pair<Int, List<String>>>()
+    val tupleStructArity = linkedMapOf<String, Int>()
 
     for (matched in matchedCrates) {
         val crateKey = matched.crateKey
@@ -1795,6 +1798,7 @@ internal fun discoverExternalCrateAbiFromDisk(
                 twoFieldResultFns = twoFieldResultFns,
                 nullableReturnFns = nullableReturnFns,
                 fnConstParams = fnConstParams,
+                tupleStructArity = tupleStructArity,
             )
         }
         if (pkgMapBySym.isNotEmpty()) {
@@ -1818,6 +1822,7 @@ internal fun discoverExternalCrateAbiFromDisk(
             twoFieldResultFns = twoFieldResultFns,
             nullableReturnFns = nullableReturnFns,
             fnConstParams = fnConstParams,
+            tupleStructArity = tupleStructArity,
         )
     if (symbolPackages.isNotEmpty()) {
         if (diskExternalCrateAbiCache.size >= 32) {
@@ -1836,6 +1841,7 @@ private fun scanExternalKotlinFileSymbols(
     twoFieldResultFns: MutableSet<String>,
     nullableReturnFns: MutableSet<String>,
     fnConstParams: MutableMap<String, Pair<Int, List<String>>>,
+    tupleStructArity: MutableMap<String, Int>,
 ) {
     val lines = sourceText.lines()
     var pkg: String? = null
@@ -1964,10 +1970,59 @@ private fun scanExternalKotlinFileSymbols(
 
         val isTopLevel = depthBefore == 0
         val isCompanionMember = !isTopLevel && companionDepth != null && depthBefore == companionDepth
-        if (!isTopLevel && !isCompanionMember) continue
+        if (!isTopLevel && !isCompanionMember) {
+            val ownerCls = currentOwnerCls
+            if (depthBefore == 1 && ownerCls != null) {
+                EXTERNAL_TUPLE_MEMBER_PROP_REGEX.find(header)?.let { propMatch ->
+                    val propName = propMatch.groupValues[1]
+                    val fieldIdxStr = propMatch.groupValues[2]
+                    if (propName == "value") {
+                        tupleStructArity.putIfMissing(ownerCls, 1)
+                    } else if (fieldIdxStr.isNotEmpty()) {
+                        val fieldIdx = fieldIdxStr.toIntOrNull()
+                        if (fieldIdx != null && fieldIdx >= 1) {
+                            tupleStructArity[ownerCls] = maxOf(tupleStructArity[ownerCls] ?: 0, fieldIdx + 1)
+                        }
+                    }
+                }
+            }
+            continue
+        }
         if (!header.startsWith("public ")) continue
 
         if (isTopLevel) {
+            EXTERNAL_OWNER_CLASS_REGEX.find(header)?.let { clsMatch ->
+                val clsName = clsMatch.groupValues[1]
+                val afterCls = header.substring(clsMatch.range.last + 1).trimStart()
+                val startsCtor =
+                    afterCls.startsWith("(") ||
+                        afterCls.startsWith("<") ||
+                        afterCls.startsWith("internal constructor") ||
+                        afterCls.startsWith("public constructor")
+                if (startsCtor && ('(' in afterCls || parenDepth > 0)) {
+                    val paramsText = extractAfterMatchingParen(lineIdx)?.first
+                    if (paramsText != null) {
+                        val rawCtorNames = extractExternalNonDefaultParamNames(paramsText)
+                        val cleanCtorNames =
+                            rawCtorNames.map { raw ->
+                                raw
+                                    .replace(Regex("""^(?:(?:public|internal|private|open|override)\s+)*(?:val|var)\s+"""), "")
+                                    .trim()
+                            }
+                        if (cleanCtorNames.size == 1 && cleanCtorNames[0] in setOf("value", "valueCtorArg")) {
+                            tupleStructArity.putIfMissing(clsName, 1)
+                        } else if (cleanCtorNames.size >= 2 && cleanCtorNames[0] in setOf("field0", "field0CtorArg")) {
+                            val fieldCount =
+                                cleanCtorNames.count { p ->
+                                    Regex("""^field\d+(?:CtorArg)?$""").matches(p)
+                                }
+                            if (fieldCount >= 2) {
+                                tupleStructArity.putIfMissing(clsName, fieldCount)
+                            }
+                        }
+                    }
+                }
+            }
             EXTERNAL_DATA_CLASS_REGEX.find(header)?.let { dcMatch ->
                 val clsName = dcMatch.groupValues[1]
                 pkgMapBySym.getOrPut(clsName) { linkedSetOf() } += packageName

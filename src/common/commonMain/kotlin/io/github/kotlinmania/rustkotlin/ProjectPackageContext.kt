@@ -245,6 +245,7 @@ public data class FileHeaderContext(
     public val externalCrateTwoFieldResultFns: Set<String> = emptySet(),
     public val externalCrateNullableReturnFns: Set<String> = emptySet(),
     public val externalCrateFnConstParams: Map<String, Pair<Int, List<String>>> = emptyMap(),
+    public val externalCrateTupleStructArity: Map<String, Int> = emptyMap(),
     public val testClassName: String? = null,
 ) {
     public constructor(

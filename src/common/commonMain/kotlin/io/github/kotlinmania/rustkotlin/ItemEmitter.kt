@@ -2111,6 +2111,45 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
     if (derivesEquality) {
         sb.append("\n$indent    public fun rustEquals(other: $selfTypeWithGenerics): Boolean = this == other\n")
     }
+    if (isSimpleEnum && typeParams.isEmpty() && variants.isNotEmpty()) {
+        val convSpecs =
+            listOf(
+                "toByte" to "Byte",
+                "toUByte" to "UByte",
+                "toShort" to "Short",
+                "toUShort" to "UShort",
+                "toInt" to "Int",
+                "toUInt" to "UInt",
+                "toLong" to "Long",
+                "toULong" to "ULong",
+            )
+        if (reprKotlinType != null) {
+            for ((fnName, retType) in convSpecs) {
+                if (!containsWholeIdentifier(attachedMembers, "fun $fnName(")) {
+                    val bodyExpr = if (retType == reprKotlinType) "value" else "value.$fnName()"
+                    sb.append("\n$indent    public fun $fnName(): $retType = $bodyExpr\n")
+                }
+            }
+        } else {
+            val variantBranches =
+                variants.mapIndexed { idx, v ->
+                    val vName = rustTypeIdentToKotlin(v.ident.toString())
+                    "$indent        $vName -> $idx"
+                }
+            sb
+                .append("\n$indent    private fun kmDiscriminant(): Int =\n")
+                .append("$indent        when (this) {\n")
+                .append(variantBranches.joinToString("\n"))
+                .append('\n')
+                .append("$indent        }\n")
+            for ((fnName, retType) in convSpecs) {
+                if (!containsWholeIdentifier(attachedMembers, "fun $fnName(")) {
+                    val bodyExpr = if (retType == "Int") "kmDiscriminant()" else "kmDiscriminant().$fnName()"
+                    sb.append("\n$indent    public fun $fnName(): $retType = $bodyExpr\n")
+                }
+            }
+        }
+    }
     if (attachedMembers.isNotEmpty()) {
         sb.append('\n').append(attachedMembers).append('\n')
     }

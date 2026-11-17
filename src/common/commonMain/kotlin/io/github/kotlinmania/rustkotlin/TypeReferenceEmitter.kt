@@ -1205,7 +1205,13 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
             }
         }
     }
-    val ktBaseIdent = rustTypeIdentToKotlin(rawName)
+    val mappedRawBaseIdent = rustTypeIdentToKotlin(rawName)
+    val ktBaseIdent =
+        if (rawSegments.size == 1 && prefixQualifier.isEmpty() && externalQualifiedOverride == null) {
+            samePackageUseRenames[mappedRawBaseIdent] ?: mappedRawBaseIdent
+        } else {
+            mappedRawBaseIdent
+        }
     if (prefixQualifier.isEmpty() &&
         externalQualifiedOverride == null &&
         rawSegments.size <= 2 &&
@@ -1242,12 +1248,26 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
         }
 
     val traitDecl = lookupDeclaredTraitAst(ktBaseIdent, path)
+    val isCoreOpsName =
+        ktBaseIdent in CORE_OPS_BINARY_TRAITS ||
+            ktBaseIdent in CORE_OPS_UNARY_OUTPUT_TRAITS ||
+            ktBaseIdent in CORE_OPS_ASSIGN_TRAITS
+    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+    val selfOpsSubpkg = resolveBestSubpackageForSymbol(ktBaseIdent)
     val isExternalCoreOps =
         traitDecl == null &&
             ktBaseIdent !in inspector.declaredTypeNames &&
-            prefixQualifier.isEmpty() &&
-            externalQualifiedOverride == null &&
-            resolveBestSubpackageForSymbol(ktBaseIdent) == null
+            isCoreOpsName &&
+            (
+                (
+                    prefixQualifier.isEmpty() &&
+                        externalQualifiedOverride == null &&
+                        (selfOpsSubpkg == null || selfOpsSubpkg.startsWith("ops"))
+                ) ||
+                    importedSimpleNameToPkg[ktBaseIdent]?.startsWith("$coreNs.ops") == true ||
+                    prefixQualifier == "ops." ||
+                    prefixQualifier.endsWith(".ops.")
+            )
     val bounded = currentBoundedTypeName
     val opsDefaultRhs = bounded ?: selfTypeName ?: "Any?"
     val declaredTypeParams =
@@ -1258,27 +1278,44 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
             ?.filterIsInstance<GenericParam.TypeParam>()
             .orEmpty()
     val lookupAssocs = lookupTraitDefaultlessAssocTypes(ktBaseIdent, path)
-    val isKnownCoreOps =
-        isExternalCoreOps &&
-            (
-                ktBaseIdent in CORE_OPS_BINARY_TRAITS ||
-                    ktBaseIdent in CORE_OPS_UNARY_OUTPUT_TRAITS ||
-                    ktBaseIdent in CORE_OPS_ASSIGN_TRAITS
-            )
-    if (isKnownCoreOps && !headerContext.rawAbiMode && "core" in headerContext.crateNamespaces) {
-        CoreIntrinsicLowering.registerCoreImport(
-            this,
-            "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.ops.$ktBaseIdent",
-        )
+    val isKnownCoreOps = isExternalCoreOps
+    val effectiveLookupAssocs =
+        if (lookupAssocs.isNotEmpty()) {
+            lookupAssocs
+        } else if (isKnownCoreOps && (ktBaseIdent in CORE_OPS_BINARY_TRAITS || ktBaseIdent in CORE_OPS_UNARY_OUTPUT_TRAITS)) {
+            listOf("Output")
+        } else {
+            emptyList()
+        }
+    if (isKnownCoreOps &&
+        prefixQualifier.isEmpty() &&
+        externalQualifiedOverride == null &&
+        ktBaseIdent !in importedSimpleNameToPkg &&
+        !headerContext.rawAbiMode &&
+        "core" in headerContext.crateNamespaces
+    ) {
+        val extCoreOpsPkg = headerContext.externalCrateSymbolPackages["core"]?.get(ktBaseIdent)?.firstOrNull()
+        val selfCoreOpsPkg = selfOpsSubpkg?.let { if (it.isEmpty()) coreNs else "$coreNs.$it" }
+        val opsFqcn =
+            when {
+                extCoreOpsPkg != null -> "$extCoreOpsPkg.$ktBaseIdent"
+                selfCoreOpsPkg != null -> "$selfCoreOpsPkg.$ktBaseIdent"
+                else -> "$coreNs.ops.$ktBaseIdent"
+            }
+        CoreIntrinsicLowering.registerCoreImport(this, opsFqcn)
     }
 
     return when (val args = lastSeg.arguments) {
         is PathArguments.None -> {
             when {
                 isExternalCoreOps && ktBaseIdent in CORE_OPS_BINARY_TRAITS ->
-                    "$mappedBase<$opsDefaultRhs, Any?>"
+                    if (suppressTraitAssocPlaceholders) {
+                        "$mappedBase<$opsDefaultRhs>"
+                    } else {
+                        "$mappedBase<$opsDefaultRhs, Any?>"
+                    }
                 isExternalCoreOps && ktBaseIdent in CORE_OPS_UNARY_OUTPUT_TRAITS ->
-                    "$mappedBase<Any?>"
+                    if (suppressTraitAssocPlaceholders) mappedBase else "$mappedBase<Any?>"
                 isExternalCoreOps && ktBaseIdent in CORE_OPS_ASSIGN_TRAITS ->
                     "$mappedBase<$opsDefaultRhs>"
                 else -> {
@@ -1292,7 +1329,7 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                             if (bounded != null && isSelfParameterizedTraitName(ktBaseIdent)) {
                                 add(bounded)
                             }
-                            for (assocKt in lookupAssocs) {
+                            for (assocKt in effectiveLookupAssocs) {
                                 if (assocKt in currentTraitAssocParamNames) {
                                     add(assocKt)
                                 } else if (bounded != null && !suppressTraitAssocPlaceholders) {
@@ -1306,8 +1343,8 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
         }
         is PathArguments.AngleBracketed -> {
             val declaredTraitAssocs =
-                if (lookupAssocs.isNotEmpty() || ktBaseIdent in inspector.declaredTypeNames || isKnownCoreOps) {
-                    lookupAssocs
+                if (effectiveLookupAssocs.isNotEmpty() || ktBaseIdent in inspector.declaredTypeNames || isKnownCoreOps) {
+                    effectiveLookupAssocs
                 } else {
                     null
                 }
@@ -1340,7 +1377,7 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                     }
                 }
                 val finalAssocs =
-                    lookupAssocs.mapNotNull { assocKt ->
+                    effectiveLookupAssocs.mapNotNull { assocKt ->
                         explicitAssocByName[assocKt]
                             ?: if (assocKt in currentTraitAssocParamNames) {
                                 assocKt
