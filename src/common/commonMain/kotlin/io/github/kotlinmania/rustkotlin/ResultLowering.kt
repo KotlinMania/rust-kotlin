@@ -59,6 +59,11 @@ private val STDLIB_DEFAULTLESS_ASSOC_TYPES: Map<String, List<String>> =
         "TryFrom" to listOf("Error"),
         "TryInto" to listOf("Error"),
         "Pattern" to listOf("Searcher"),
+        "DoubleEndedIterator" to listOf("Item"),
+        "ExactSizeIterator" to listOf("Item"),
+        "FusedIterator" to listOf("Item"),
+        "TrustedLen" to listOf("Item"),
+        "AsyncIterator" to listOf("Item"),
     )
 
 internal fun KotlinJ2KEmitter.lookupTraitDefaultlessAssocTypes(ktTrait: String, traitPath: Path? = null): List<String> {
@@ -121,16 +126,14 @@ internal fun KotlinJ2KEmitter.isFmtResultSynType(ty: SynType?): Boolean {
     if (pathTy.qself != null) return false
     val rawSegments = pathTy.path.segments.toList()
     if (rawSegments.isEmpty()) return false
-    val last =
-        rawSegments
-            .last()
-            .ident
-            .toString()
-            .removePrefix("r#")
-    if (last != "Result") return false
+    val segNames =
+        rewriteCrateRootAliasAndReexportSegments(
+            rawSegments.map { it.ident.toString().removePrefix("r#") },
+        )
+    if (segNames.lastOrNull() != "Result") return false
     val isStdFmt =
-        (rawSegments.size >= 3 && rawSegments[0].ident.toString() in setOf("core", "std", "alloc") && rawSegments[1].ident.toString() == "fmt") ||
-            (rawSegments.size == 2 && rawSegments[0].ident.toString() == "fmt")
+        (segNames.size >= 3 && segNames[0] in setOf("core", "std", "alloc") && segNames[1] == "fmt") ||
+            (segNames.size == 2 && segNames[0] == "fmt")
     return isStdFmt
 }
 
@@ -192,6 +195,7 @@ internal fun KotlinJ2KEmitter.usesTaggedCoreResult(): Boolean =
     hasDeclaredResultEnum() || "core" in headerContext.crateNamespaces
 
 internal fun KotlinJ2KEmitter.hasConflictingResultBinding(): Boolean {
+    if (hasDeclaredResultEnum()) return false
     if ("Result" in inspector.declaredTypeNames || "Result" in inspector.typeAliasTargets) {
         return true
     }
@@ -326,9 +330,9 @@ internal fun KotlinJ2KEmitter.renderSourceResultTry(expression: String, returnKe
         }
     val errPayloadExpr =
         if (isUntypedScrutinee && enclosingPair != null && isUsableExplicitResultTypeArg(enclosingPair.second)) {
-            "(tryResult.error as ${enclosingPair.second})"
+            "(tryResult.errValue() as ${enclosingPair.second})"
         } else {
-            "tryResult.error"
+            "tryResult.errValue()"
         }
     val elseBranch =
         if (isUntypedScrutinee) {
@@ -336,7 +340,7 @@ internal fun KotlinJ2KEmitter.renderSourceResultTry(expression: String, returnKe
         } else {
             ""
         }
-    return "when (val tryResult = $expression) { is $result.Ok$starArgs -> tryResult.value; is $result.Err$starArgs -> $returnKeyword $result.Err$errTypeArgs($errPayloadExpr)$elseBranch }"
+    return "when (val tryResult = $expression) { is $result.Ok$starArgs -> tryResult.okValue(); is $result.Err$starArgs -> $returnKeyword $result.Err$errTypeArgs($errPayloadExpr)$elseBranch }"
 }
 
 /** The typed derived-equality method preserves Rust's equality type constraints.

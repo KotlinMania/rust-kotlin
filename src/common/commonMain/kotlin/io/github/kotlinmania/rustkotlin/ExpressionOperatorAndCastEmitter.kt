@@ -285,7 +285,7 @@ internal fun KotlinJ2KEmitter.renderExprBinary(expr: Expr.Binary, indent: String
 internal fun KotlinJ2KEmitter.renderExprUnary(expr: Expr.Unary, indent: String, selfTypeName: String?): String {
     return when (expr.op) {
         is UnOp.NotOp -> {
-            if (isKnownIntegerBitmaskExpr(expr.expr)) {
+            if (isKnownIntegerBitmaskExpr(expr.expr) || inferExprNumericKind(expr.expr, selfTypeName)?.isIntegerNumericKind() == true) {
                 renderBitwiseComplementOperand(expr.expr, indent, selfTypeName)
             } else {
                 val savedKind = currentExpectedNumericKind
@@ -411,10 +411,19 @@ internal fun KotlinJ2KEmitter.renderExprReference(expr: Expr.Reference, indent: 
             when {
                 mutableReferencePointeeType(sourceType) != null -> "($source).reborrow()"
                 rawPointerPointeeType(sourceType) != null -> {
-                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.RustMutableReference")
-                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.MutPtr")
                     val pointeeLayout = resolveRawPointerPointeeLayout(deref.expr, selfTypeName)
-                    "RustMutableReference(MutPtr(($source).rawAddress), $pointeeLayout)"
+                    val expectedTarget = (currentExpectedParseTargetType ?: currentEnclosingReturnRenderedType)?.removeSuffix("?")?.trim()
+                    if (expectedTarget != null &&
+                        expectedTarget != "Unit" &&
+                        mutableReferencePointeeType(expectedTarget) == null &&
+                        expectedTarget in PRIMITIVE_ARRAY_TYPES
+                    ) {
+                        "($pointeeLayout).readNative(($source).rawAddress)"
+                    } else {
+                        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.RustMutableReference")
+                        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.MutPtr")
+                        "RustMutableReference(MutPtr(($source).rawAddress), $pointeeLayout)"
+                    }
                 }
                 else -> renderExpr(expr.expr, indent, selfTypeName)
             }
@@ -505,6 +514,45 @@ internal fun KotlinJ2KEmitter.renderExprAssign(expr: Expr.Assign, indent: String
     val leftExpr = expr.left
     if (leftExpr is Expr.Infer) {
         return if (isSideEffectFreeExpr(expr.right)) "" else renderExpr(expr.right, indent, selfTypeName)
+    }
+    val lhsTuple = unwrapParenOrGroupExpr(leftExpr) as? Expr.Tuple
+    if (lhsTuple != null && lhsTuple.elems.size >= 2) {
+        val rhs = renderExpr(expr.right, indent, selfTypeName)
+        val elems = lhsTuple.elems.toList()
+        if (elems.size in 2..3) {
+            val slots = mutableListOf<String>()
+            val assigns = mutableListOf<String>()
+            for ((idx, elem) in elems.withIndex()) {
+                val u = unwrapParenOrGroupExpr(elem)
+                if (u is Expr.Infer || (u is Expr.Path && u.qself == null && u.path.isIdent("_"))) {
+                    slots += "_"
+                } else {
+                    val tmpName = "destructVal$idx"
+                    slots += tmpName
+                    assigns += "${renderExpr(elem, indent, selfTypeName)} = $tmpName"
+                }
+            }
+            return if (assigns.isEmpty()) {
+                "run { $rhs; Unit }"
+            } else {
+                "run { val (${slots.joinToString(", ")}) = $rhs; ${assigns.joinToString("; ")} }"
+            }
+        } else {
+            val assigns =
+                elems.mapIndexedNotNull { idx, elem ->
+                    val u = unwrapParenOrGroupExpr(elem)
+                    if (u is Expr.Infer || (u is Expr.Path && u.qself == null && u.path.isIdent("_"))) {
+                        null
+                    } else {
+                        "${renderExpr(elem, indent, selfTypeName)} = destructList[$idx]"
+                    }
+                }
+            return if (assigns.isEmpty()) {
+                "run { $rhs; Unit }"
+            } else {
+                "run { val destructList = $rhs; ${assigns.joinToString("; ")} }"
+            }
+        }
     }
     if (leftExpr is Expr.Unary && leftExpr.op is UnOp.Deref) {
         when (classifyDerefPlaceKind(leftExpr.expr, selfTypeName, includeRefCellGuard = false)) {

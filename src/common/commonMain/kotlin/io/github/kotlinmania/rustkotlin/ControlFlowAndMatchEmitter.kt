@@ -9,6 +9,7 @@ import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.GenericArgument
 import io.github.kotlinmania.syn.Item
+import io.github.kotlinmania.syn.Lit
 import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.Pat
 import io.github.kotlinmania.syn.Path
@@ -162,7 +163,7 @@ internal fun KotlinJ2KEmitter.tryRenderSingleEvalIfLet(
                 .toList()
                 .firstOrNull()
                 ?.let { !isDiscriminatingOptionInnerPattern(it) } != false
-    val coreResultInfo = if (unwrappedPat is Pat.TupleStruct) coreResultVariantMatchInfo(unwrappedPat) else null
+    val coreResultInfo = if (unwrappedPat is Pat.TupleStruct) coreResultVariantMatchInfo(unwrappedPat) ?: controlFlowVariantMatchInfo(unwrappedPat) else null
     val requiresBoolCond = !isPlainSome && patRequiresBooleanCondition(unwrappedPat)
     val isSupportedPat =
         isPlainSome ||
@@ -430,7 +431,7 @@ internal fun KotlinJ2KEmitter.recordOptionLetPatternLocalTypes(pat: Pat, expr: E
 }
 
 internal fun KotlinJ2KEmitter.coreResultVariantMatchInfo(pat: Pat.TupleStruct): Pair<String, String>? {
-    if (!usesTaggedCoreResult() || hasDeclaredResultEnum()) return null
+    if (!usesTaggedCoreResult()) return null
     if ("Ok" in inspector.declaredTypeNames || "Err" in inspector.declaredTypeNames) return null
     val segs =
         pat.path.segments
@@ -443,8 +444,60 @@ internal fun KotlinJ2KEmitter.coreResultVariantMatchInfo(pat: Pat.TupleStruct): 
             (segs.size == 2 && segs[0] == "Result") ||
             (segs.size >= 3 && segs[segs.size - 2] == "Result" && segs.dropLast(2).all { it in STDLIB_TYPE_PATH_PREFIXES || it == "result" })
     if (!isCoreResultPath) return null
-    val prop = if (variant == "Ok") "value" else "error"
+    val prop = if (variant == "Ok") "okValue()" else "errValue()"
     return "${sourceResultName()}.$variant" to prop
+}
+
+internal fun KotlinJ2KEmitter.controlFlowVariantMatchInfo(pat: Pat.TupleStruct): Pair<String, String>? {
+    val hasCore =
+        "core" in headerContext.crateNamespaces ||
+            headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.core") == true
+    if (!hasCore) return null
+    if ("Break" in inspector.declaredTypeNames || "Continue" in inspector.declaredTypeNames) return null
+    val segs =
+        pat.path.segments
+            .toList()
+            .map { it.ident.toString().removePrefix("r#") }
+    val variant = segs.lastOrNull() ?: return null
+    if (variant != "Break" && variant != "Continue") return null
+    val isCfPath =
+        segs.size == 1 ||
+            (segs.size == 2 && segs[0] == "ControlFlow") ||
+            (segs.size >= 3 && segs[segs.size - 2] == "ControlFlow")
+    if (!isCfPath) return null
+    if ("ControlFlow" !in inspector.declaredTypeNames) {
+        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ops.controlflow.ControlFlow")
+    }
+    val prop = if (variant == "Break") "cfBreakValue()" else "cfContinueValue()"
+    return "ControlFlow.$variant" to prop
+}
+
+private fun KotlinJ2KEmitter.renderMatchLit(lit: Lit): String {
+    val base = renderLit(lit)
+    if (lit is Lit.Int) {
+        val kind = currentExpectedNumericKind
+        if (kind != null && (kind == NumericKind.U8 || kind == NumericKind.U16 || kind == NumericKind.I8 || kind == NumericKind.I16)) {
+            val suffix = ".${NUMERIC_COERCE_SUFFIX_BY_KIND.getValue(kind)}"
+            if (!base.endsWith(suffix)) {
+                return "$base$suffix"
+            }
+        }
+    }
+    return base
+}
+
+private fun KotlinJ2KEmitter.renderMatchRangeBound(
+    boundExpr: Expr,
+    indent: String,
+    selfTypeName: String?,
+): String {
+    val u = unwrapParenOrGroupExpr(boundExpr)
+    return if (u is Expr.Lit && u.lit is Lit.Int) {
+        renderMatchLit(u.lit)
+    } else {
+        renderExpr(boundExpr, indent, selfTypeName)
+    }
 }
 
 internal fun KotlinJ2KEmitter.renderIfLetPatternAgainstRhs(
@@ -456,7 +509,7 @@ internal fun KotlinJ2KEmitter.renderIfLetPatternAgainstRhs(
 ): String =
     when (pat) {
         is Pat.TupleStruct -> {
-            val coreResultInfo = coreResultVariantMatchInfo(pat)
+            val coreResultInfo = coreResultVariantMatchInfo(pat) ?: controlFlowVariantMatchInfo(pat)
             if (isOptionSomeTupleStructPat(pat)) {
                 val firstSub = pat.elems.toList().firstOrNull()
                 if (firstSub != null && isDiscriminatingOptionInnerPattern(firstSub)) {
@@ -490,7 +543,7 @@ internal fun KotlinJ2KEmitter.renderIfLetPatternAgainstRhs(
                 "$rhs == ${renderPathAsExpression(pat.path, selfTypeName)}"
             }
         }
-        is Pat.Lit -> "$rhs == ${renderLit(pat.lit)}"
+        is Pat.Lit -> "$rhs == ${renderMatchLit(pat.lit)}"
         is Pat.Range -> renderPatternBooleanCondition(pat, rhs, indent, selfTypeName)
         is Pat.Or -> {
             pat.cases.toList().joinToString(" || ") { renderIfLetPatternAgainstRhs(it, rhs, indent, selfTypeName) }
@@ -778,7 +831,12 @@ internal fun KotlinJ2KEmitter.renderExprMatch(expr: Expr.Match, indent: String, 
         val armIndent = "$indent    "
         val patConditions =
             try {
-                currentExpectedNumericKind = null
+                currentExpectedNumericKind =
+                    inferExprNumericKind(expr.expr, selfTypeName)
+                        ?: inferExprRenderedType(expr.expr, selfTypeName)
+                            ?.removeSuffix("?")
+                            ?.trim()
+                            ?.let(this::resolveNumericKind)
                 effectiveArms.mapIndexed { idx, arm ->
                     renderMatchPatternCondition(
                         armPattern(arm),
@@ -831,7 +889,7 @@ internal fun KotlinJ2KEmitter.tryRenderStdlibResultMatch(
     indent: String,
     selfTypeName: String?,
 ): String? {
-    if (hasDeclaredResultEnum() || "Ok" in inspector.declaredTypeNames || "Err" in inspector.declaredTypeNames) return null
+    if ("Ok" in inspector.declaredTypeNames || "Err" in inspector.declaredTypeNames) return null
     val arms = expr.arms
     if (arms.size != 2 || arms.any { armGuardExpr(it) != null }) return null
     val p0 = unwrapTransparentPat(armPattern(arms[0]))
@@ -858,8 +916,8 @@ internal fun KotlinJ2KEmitter.tryRenderStdlibResultMatch(
         val ifIndent = if (wrapInRun) "$indent    " else indent
         val okSubPat = (unwrapTransparentPat(armPattern(okArm)) as Pat.TupleStruct).elems.toList().firstOrNull()
         val errSubPat = (unwrapTransparentPat(armPattern(errArm)) as? Pat.TupleStruct)?.elems?.toList()?.firstOrNull()
-        val okValueExpr = if (taggedCoreResult) "$subjectVar.value" else "$subjectVar.getOrThrow()"
-        val errValueExpr = if (taggedCoreResult) "$subjectVar.error" else "$subjectVar.exceptionOrNull()!!"
+        val okValueExpr = if (taggedCoreResult) "$subjectVar.okValue()" else "$subjectVar.getOrThrow()"
+        val errValueExpr = if (taggedCoreResult) "$subjectVar.errValue()" else "$subjectVar.exceptionOrNull()!!"
 
         val okBranch =
             run {
@@ -1123,6 +1181,12 @@ internal fun KotlinJ2KEmitter.renderBooleanExprMatch(
             sb.append("when {\n")
         }
 
+        val scrutineeNumericKind =
+            inferExprNumericKind(expr.expr, selfTypeName)
+                ?: inferExprRenderedType(expr.expr, selfTypeName)
+                    ?.removeSuffix("?")
+                    ?.trim()
+                    ?.let(this::resolveNumericKind)
         var hasElseArm = false
         for ((idx, arm) in arms.withIndex()) {
             val isLastArm = idx == arms.lastIndex
@@ -1133,6 +1197,7 @@ internal fun KotlinJ2KEmitter.renderBooleanExprMatch(
                     indent = armIndent,
                     selfTypeName = selfTypeName,
                     isLastArm = isLastArm,
+                    scrutineeNumericKind = scrutineeNumericKind,
                 )
             if (isElse) {
                 hasElseArm = true
@@ -1315,6 +1380,7 @@ internal fun KotlinJ2KEmitter.renderBooleanMatchArm(
     indent: String,
     selfTypeName: String?,
     isLastArm: Boolean,
+    scrutineeNumericKind: NumericKind? = null,
 ): Pair<String, Boolean> {
     val triviaPrefix = renderLeadingTriviaForSpan(arm.span(), indent)
     val basePat = armPattern(arm)
@@ -1326,9 +1392,10 @@ internal fun KotlinJ2KEmitter.renderBooleanMatchArm(
     return try {
         val (patCond, guardText) =
             try {
-                currentExpectedNumericKind = null
+                currentExpectedNumericKind = scrutineeNumericKind
                 currentTailExpectsUnitResultOk = false
                 val condPart = renderPatternBooleanCondition(basePat, subjectText, indent, selfTypeName)
+                currentExpectedNumericKind = null
                 val guardExpr = armGuardExpr(arm)
                 val guardPart =
                     if (guardExpr != null) {
@@ -1542,10 +1609,10 @@ internal fun KotlinJ2KEmitter.renderPatternBooleanCondition(
 ): String =
     when (pat) {
         is Pat.Wild, is Pat.Rest -> "true"
-        is Pat.Lit -> "$subjectExpr == ${renderLit(pat.lit)}"
+        is Pat.Lit -> "$subjectExpr == ${renderMatchLit(pat.lit)}"
         is Pat.Range -> {
-            val start = pat.start?.let { renderExpr(it, indent, selfTypeName) }
-            val end = pat.end?.let { renderExpr(it, indent, selfTypeName) }
+            val start = pat.start?.let { renderMatchRangeBound(it, indent, selfTypeName) }
+            val end = pat.end?.let { renderMatchRangeBound(it, indent, selfTypeName) }
             val isHalfOpen = pat.limits is RangeLimits.HalfOpen
             when {
                 start != null && end != null ->
@@ -1587,7 +1654,7 @@ internal fun KotlinJ2KEmitter.renderPatternBooleanCondition(
                     elems.firstOrNull()?.let { renderPatternBooleanCondition(it, subjectExpr, indent, selfTypeName, allowSmartCast) } ?: "true"
                 combineAndConditions(listOf("$subjectExpr != null", innerCond))
             } else {
-                val coreResultInfo = coreResultVariantMatchInfo(pat)
+                val coreResultInfo = coreResultVariantMatchInfo(pat) ?: controlFlowVariantMatchInfo(pat)
                 if (coreResultInfo != null) {
                     val castType = "${coreResultInfo.first}<*, *>"
                     val elemRecv =
@@ -1736,7 +1803,7 @@ internal fun KotlinJ2KEmitter.collectPatternGuardAccessMap(
             if (isOptionSomeTupleStructPat(pat) && elems.size == 1) {
                 collectPatternGuardAccessMap(elems[0], subjectText, selfTypeName, out, allowSmartCast)
             } else {
-                val coreResultInfo = coreResultVariantMatchInfo(pat)
+                val coreResultInfo = coreResultVariantMatchInfo(pat) ?: controlFlowVariantMatchInfo(pat)
                 if (coreResultInfo != null && elems.size == 1 && elems[0] !is Pat.Rest) {
                     val recv =
                         if (allowSmartCast && scopeBuilder.isSmartCastableLocalKotlinName(subjectText)) {
@@ -1894,7 +1961,7 @@ internal fun KotlinJ2KEmitter.extractMatchArmBindings(
                     usedBodyIdents = usedBodyIdents,
                 )
             } else {
-                val coreResultInfo = coreResultVariantMatchInfo(pat)
+                val coreResultInfo = coreResultVariantMatchInfo(pat) ?: controlFlowVariantMatchInfo(pat)
                 if (coreResultInfo != null && pat.elems.size == 1) {
                     val sub = pat.elems.first()!!
                     val rawSubIdent = extractRawParamIdent(sub)
@@ -1917,18 +1984,19 @@ internal fun KotlinJ2KEmitter.extractMatchArmBindings(
                             lines += "${indent}val $boundName = $accessTarget"
                         }
                     } else if (!isUnusedSub && rawSubIdent != "_" && sub !is Pat.Wild && sub !is Pat.Rest) {
-                        val holderRaw = "__res_${coreResultInfo.second}"
+                        val cleanProp = coreResultInfo.second.removeSuffix("()")
+                        val holderRaw = "__res_$cleanProp"
                         val innerHolder =
                             if (bindToScope) {
                                 scopeBuilder
                                     .bindLocal(
                                         rawName = holderRaw,
-                                        baseKotlinName = "${coreResultInfo.second}Val",
+                                        baseKotlinName = "${cleanProp}Val",
                                         span = sub.span(),
                                         assignCount = AssignCount.AtMostOnce,
                                     ).kotlinName
                             } else {
-                                "${coreResultInfo.second}Val"
+                                "${cleanProp}Val"
                             }
                         lines += "${indent}val $innerHolder = $accessTarget"
                         lines +=
@@ -2246,8 +2314,8 @@ internal fun KotlinJ2KEmitter.renderMatchPatternCondition(
             if (nonElse.isEmpty()) "else" else nonElse.joinToString(", ")
         }
         is Pat.Range -> {
-            val start = pat.start?.let { renderExpr(it, indent, selfTypeName) }
-            val end = pat.end?.let { renderExpr(it, indent, selfTypeName) }
+            val start = pat.start?.let { renderMatchRangeBound(it, indent, selfTypeName) }
+            val end = pat.end?.let { renderMatchRangeBound(it, indent, selfTypeName) }
             val op =
                 when (pat.limits) {
                     is RangeLimits.HalfOpen -> " until "
@@ -2260,7 +2328,7 @@ internal fun KotlinJ2KEmitter.renderMatchPatternCondition(
                 else -> "else"
             }
         }
-        is Pat.Lit -> renderLit(pat.lit)
+        is Pat.Lit -> renderMatchLit(pat.lit)
         is Pat.Path -> {
             val segs = pat.path.segments.toList()
             if (segs.size == 1 && segs[0].ident.toString() == "None" && !inspector.hasLocalNoneVariant) {
@@ -2285,7 +2353,7 @@ internal fun KotlinJ2KEmitter.renderMatchPatternCondition(
         }
         is Pat.TupleStruct -> {
             val elemsList = pat.elems.toList()
-            val coreResultInfo = coreResultVariantMatchInfo(pat)
+            val coreResultInfo = coreResultVariantMatchInfo(pat) ?: controlFlowVariantMatchInfo(pat)
             if (isOptionSomeTupleStructPat(pat)) {
                 val firstSub = elemsList.firstOrNull()
                 if (firstSub != null) {

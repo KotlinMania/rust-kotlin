@@ -209,8 +209,8 @@ class StdlibSemanticWaveCTest {
                             ),
                     ),
             )
-        assertContains(output, "val (c) = valueVal as MixedUnit.Char")
-        assertContains(output, "is ControlFlow.Continue<*, *> -> tryResult.value")
+        assertContains(output, "val (c) = okValueVal as MixedUnit.Char")
+        assertContains(output, "is ControlFlow.Continue<*, *> -> tryResult.cfContinueValue()")
         assertContains(output, "ControlFlow.Break<Boolean, UInt>")
         assertContains(output, "var selfMut = this")
         assertContains(output, "selfMut = next")
@@ -547,7 +547,7 @@ class StdlibSemanticWaveCTest {
                             ),
                     ),
             )
-        assertContains(out, "is Result.Ok<*, *> -> tryResult.value")
+        assertContains(out, "is Result.Ok<*, *> -> tryResult.okValue()")
         assertContains(out, "is Cow.Borrowed<*, *> ->")
         assertContains(out, "is Cow.Owned<*, *> ->")
         assertContains(out, "import io.github.kotlinmania.rustlang.core.ops.range.RangeInclusive")
@@ -646,7 +646,7 @@ class StdlibSemanticWaveCTest {
         assertContains(out, "import io.github.kotlinmania.rustlang.core.ffi.primitives.CChar")
         assertContains(out, "import io.github.kotlinmania.rustlang.core.io.error.Error")
         assertContains(out, "import io.github.kotlinmania.rustlang.core.result.Result as RustResult")
-        assertContains(out, "is RustResult.Ok<*, *> -> tryResult.value")
+        assertContains(out, "is RustResult.Ok<*, *> -> tryResult.okValue()")
         assertContains(out, "takeUnit(Unit, 0.toUInt())")
         assertFalse(out.contains("as Unit"), "Unconstrained `as _` must not cast to Unit:\n$out")
         assertContains(out, "strlen(ConstPtr(0L)) + 1uL")
@@ -699,5 +699,138 @@ class StdlibSemanticWaveCTest {
         assertFalse(out.contains("class Boxed<T>\n"), "Extra-bound FnOnce impl should stay standalone, not break class")
         assertContains(out, "public fun <Output, F : FnOnce<Args, Output>, Args> Boxed<F>.callOnce(")
         assertContains(out, "public fun <I : DoubleIterTrait<Char>> ToUpper<I>.nextBack(): Char?")
+    }
+
+    @Test
+    fun waveC3TypedResultUnwrapTupleSelfDestructAssignAndCorearchPaths() {
+        val source =
+            """
+            use crate::core_arch::simd;
+
+            pub enum Result<T, E> {
+                Ok(T),
+                Err(E),
+            }
+
+            pub enum ControlFlow<B, C> {
+                Break(B),
+                Continue(C),
+            }
+
+            pub fn propagate_result(r: Result<u16, i32>) -> Result<u16, i32> {
+                let v = r?;
+                match v {
+                    0 => Result::Ok(1),
+                    1..=3 => Result::Ok(2),
+                    _ => Result::Ok(v),
+                }
+            }
+
+            pub fn propagate_cf(cf: ControlFlow<i32, u32>) -> ControlFlow<i32, u32> {
+                let v = cf?;
+                ControlFlow::Continue(v)
+            }
+
+            pub trait SliceIndex<T> {
+                type Output;
+            }
+
+            pub trait Index<Idx> {
+                type Output;
+                fn index(&self, idx: Idx) -> Self::Output;
+            }
+
+            pub struct MyString(u32);
+
+            impl<I: SliceIndex<str>> Index<I> for MyString {
+                type Output = I::Output;
+                fn index(&self, _idx: I) -> Self::Output {
+                    loop {}
+                }
+            }
+
+            pub fn inspect_pair(p: (u32, u32)) -> u32 {
+                let mut a = 0u32;
+                let mut b = 0u32;
+                (a, b) = p;
+                a + b
+            }
+
+            pub trait Not {
+                type Output;
+                fn not(self) -> Self::Output;
+            }
+
+            impl Not for i32 {
+                type Output = i32;
+                fn not(self) -> i32 {
+                    !self
+                }
+            }
+
+            impl Not for bool {
+                type Output = bool;
+                fn not(self) -> bool {
+                    !self
+                }
+            }
+
+            pub fn invert_byte(x: i8) -> i8 {
+                !x
+            }
+
+            pub struct V4i32([i32; 4]);
+
+            impl V4i32 {
+                pub fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
+                    crate::fmt::debug_simd_finish(f, "v4i32", [self.0[0]])
+                }
+
+                pub fn pair_from(a: simd::u8x16, b: simd::u8x16) -> V4i32 {
+                    simd::sve_tuple_create2(a, b)
+                }
+            }
+            """.trimIndent()
+        val out =
+            translateRustSourceToKotlin(
+                recognizeRust(source),
+                headerContext =
+                    FileHeaderContext(
+                        packageName = "io.github.kotlinmania.rustlang.corearch.sample",
+                        projectNamespace = "io.github.kotlinmania.rustlang.corearch",
+                        crateNamespaces =
+                            mapOf(
+                                "core" to "io.github.kotlinmania.rustlang.core",
+                                "core_arch" to "io.github.kotlinmania.rustlang.corearch",
+                            ),
+                        rootSelfDirModuleAliases = setOf("core_arch"),
+                        rootExternalModuleReexports = mapOf("fmt" to "core::fmt"),
+                    ),
+            )
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(out, "WaveC3Sample.kt")
+        assertContains(out, "public open fun okValue(): T = error(\"not Ok\")")
+        assertContains(out, "public open fun errValue(): E = error(\"not Err\")")
+        assertContains(out, "public override fun okValue(): T = value")
+        assertContains(out, "public override fun errValue(): E = value")
+        assertContains(out, "public open fun cfBreakValue(): B = error(\"not Break\")")
+        assertContains(out, "public open fun cfContinueValue(): C = error(\"not Continue\")")
+        assertContains(out, "public override fun cfBreakValue(): B = value")
+        assertContains(out, "public override fun cfContinueValue(): C = value")
+        assertContains(out, "is Result.Ok<*, *> -> tryResult.okValue()")
+        assertContains(out, "tryResult.cfContinueValue()")
+        assertContains(out, "tryResult.cfBreakValue()")
+        assertContains(out, "public fun <Output, I : SliceIndex<String, Output>> MyString.index(")
+        assertContains(out, "val (destructVal0, destructVal1) = p; a = destructVal0; b = destructVal1")
+        assertContains(out, "0u.toUShort()")
+        assertContains(out, "in 1u.toUShort()..3u.toUShort()")
+        assertContains(out, "public operator fun Int.not(): Int")
+        assertContains(out, "return this.inv()")
+        assertFalse(out.contains("operator fun Boolean.not("), "Boolean.not must not be marked operator:\n$out")
+        assertContains(out, "return (x.toInt().inv()).toByte()")
+        assertContains(out, "public open fun fmt(f: StringBuilder): Result<Unit, Error>")
+        assertContains(out, "val simdDbgArr =")
+        assertContains(out, "Result.Ok<Unit, Error>(Unit)")
+        assertFalse(out.contains("simd.sveTupleCreate2"), "sve_tuple_create2 must lower instead of raw call:\n$out")
+        assertFalse(out.contains("_simdArg"), "Must not emit underscore-prefixed _simdArg locals:\n$out")
     }
 }

@@ -141,21 +141,33 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
             if (enclosingRet == "Unit" || isFmtWriteOrUnitExpr(expr.expr, selfTypeName)) {
                 inner
             } else if (exprBase == "ControlFlow" || (exprBase == null && enclosingBase == "ControlFlow")) {
-                val cfBreakTypeArgs =
+                val cfTypeArgsInner =
                     enclosingRet
                         ?.takeIf { enclosingBase == "ControlFlow" && '<' in it && it.endsWith(">") }
-                        ?.let {
-                            val argsInner = it.substringAfter('<').dropLast(1)
-                            val comma = findTopLevelGenericCommaIndex(argsInner)
-                            if (comma >= 0) {
-                                buildExplicitResultTypeArgsSuffix(argsInner.substring(0, comma), argsInner.substring(comma + 1))
-                            } else {
-                                ""
-                            }
-                        }.orEmpty()
+                        ?.substringAfter('<')
+                        ?.dropLast(1)
+                val cfComma = cfTypeArgsInner?.let(::findTopLevelGenericCommaIndex) ?: -1
+                val cfBreakFirstTypeArg =
+                    if (cfTypeArgsInner != null && cfComma >= 0) {
+                        cfTypeArgsInner.substring(0, cfComma).trim().takeIf(::isUsableExplicitResultTypeArg)
+                    } else {
+                        null
+                    }
+                val cfBreakTypeArgs =
+                    if (cfTypeArgsInner != null && cfComma >= 0) {
+                        buildExplicitResultTypeArgsSuffix(cfTypeArgsInner.substring(0, cfComma), cfTypeArgsInner.substring(cfComma + 1))
+                    } else {
+                        ""
+                    }
                 val isUntypedCf = exprInferredTy != null && exprBase != "ControlFlow"
                 val elseArm = if (isUntypedCf) "; else -> error(\"Unexpected ControlFlow variant: \$tryResult\")" else ""
-                "when (val tryResult = $inner) { is ControlFlow.Continue<*, *> -> tryResult.value; is ControlFlow.Break<*, *> -> $retKw ControlFlow.Break$cfBreakTypeArgs(tryResult.value)$elseArm }"
+                val cfBreakPayload =
+                    if (isUntypedCf && cfBreakFirstTypeArg != null) {
+                        "(tryResult.cfBreakValue() as $cfBreakFirstTypeArg)"
+                    } else {
+                        "tryResult.cfBreakValue()"
+                    }
+                "when (val tryResult = $inner) { is ControlFlow.Continue<*, *> -> tryResult.cfContinueValue(); is ControlFlow.Break<*, *> -> $retKw ControlFlow.Break$cfBreakTypeArgs($cfBreakPayload)$elseArm }"
             } else if (enclosingRet != null &&
                 enclosingRet.endsWith("?") &&
                 !enclosingRet.startsWith("Result<") &&
@@ -192,8 +204,14 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                 is Member.Named -> "$safeBase.${rustFieldIdentToKotlin(m.ident.toString())}"
                 is Member.Unnamed -> {
                     val idx = m.index.index.toInt()
-                    val cleanBaseTy = baseRenderedTy?.removeSuffix("?")?.trim()
-                    if (cleanBaseTy == "List<Any?>" || (idx >= 3 && cleanBaseTy?.startsWith("List<") != false)) {
+                    val effectiveBaseTy =
+                        baseRenderedTy
+                            ?: if ((expr.base as? Expr.Path)?.path?.isIdent("self") == true) selfTypeName else null
+                    val cleanBaseTy = effectiveBaseTy?.removeSuffix("?")?.trim()
+                    if (cleanBaseTy == "List<Any?>" ||
+                        cleanBaseTy?.startsWith("List<") == true ||
+                        (idx >= 3 && cleanBaseTy?.startsWith("List<") != false)
+                    ) {
                         val recv = if (safeBase.any { it == ' ' }) "($safeBase)" else safeBase
                         "$recv[$idx]"
                     } else {
@@ -504,6 +522,14 @@ internal fun KotlinJ2KEmitter.exprReferencesIdent(expr: Expr, identName: String)
 internal fun KotlinJ2KEmitter.tupleAccessMemberName(baseExpr: Expr, index: Int, selfTypeName: String?): String {
     val ownerBase = selfTypeName?.substringBefore('<')?.trim()
     if (baseExpr is Expr.Path && baseExpr.path.isIdent("self")) {
+        if (ownerBase == "Pair") return if (index == 0) "first" else "second"
+        if (ownerBase == "Triple") {
+            return when (index) {
+                0 -> "first"
+                1 -> "second"
+                else -> "third"
+            }
+        }
         val arity = ownerBase?.let { inspector.tupleStructArityByType[it] } ?: 1
         return tupleFieldPropertyName(index, arity)
     }

@@ -100,6 +100,29 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
     }
     val rawArgs = expr.args.toList()
     tryRenderSimdLaneVectorStaticCall(expr, rawArgs, indent, selfTypeName)?.let { return it }
+    if (expr.func is Expr.Path && (expr.func as Expr.Path).qself == null) {
+        val fnLastRaw =
+            (expr.func as Expr.Path)
+                .path
+                .segments
+                .last()
+                ?.ident
+                ?.toString()
+                ?.removePrefix("r#")
+        if (fnLastRaw == "debug_simd_finish" &&
+            "debug_simd_finish" !in inspector.declaredTopLevelFnRawNames &&
+            usesTaggedCoreResult() &&
+            rawArgs.size in 3..4
+        ) {
+            val fExpr = renderExpr(rawArgs[0], indent, selfTypeName)
+            val nameExpr = renderExpr(rawArgs[1], indent, selfTypeName)
+            val arrExpr = renderExpr(rawArgs[2], indent, selfTypeName)
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+            val fmtErr = bindOrQualifyResolvedCrossSymbol("$coreNs.fmt.Error")
+            val resName = sourceResultName()
+            return "run { val simdDbgArr = $arrExpr; ($fExpr).append($nameExpr); $resName.Ok<Unit, $fmtErr>(Unit) }"
+        }
+    }
     val nonUnitArgs = rawArgs.filterNot { it is Expr.Tuple && it.elems.isEmpty() }
     if (nonUnitArgs.size == 1) {
         renderPrimitiveFromBytesCall(expr, nonUnitArgs[0], indent, selfTypeName)?.let { return it }

@@ -1543,8 +1543,21 @@ internal class KotlinJ2KEmitter(
                         "toAsciiLowercase",
                         "toAsciiUppercase",
                     )) {
-                        add(asciiHelper to "$activeCoreNs.char")
+                        add(asciiHelper to "$activeCoreNs.char.methods")
                     }
+                }
+                if ("core" in headerContext.crateNamespaces && !headerContext.rawAbiMode) {
+                    add("unreachableUnchecked" to "$activeCoreNs.hint")
+                    add("assertUnchecked" to "$activeCoreNs.hint")
+                    add("sizeOf" to "$activeCoreNs.mem")
+                    add("alignOf" to "$activeCoreNs.mem")
+                    add("sizeOfVal" to "$activeCoreNs.mem")
+                    add("alignOfVal" to "$activeCoreNs.mem")
+                    add("readUnaligned" to "$activeCoreNs.ptr")
+                    add("writeUnaligned" to "$activeCoreNs.ptr")
+                    add("min" to "$activeCoreNs.cmp")
+                    add("max" to "$activeCoreNs.cmp")
+                    add("clamp" to "$activeCoreNs.cmp")
                 }
             }
         for ((symSimple, symPkg) in autoCoreSymbols) {
@@ -1613,21 +1626,130 @@ internal class KotlinJ2KEmitter(
             }
         }
         if (isInCoreOrUsingExternalCore && !headerContext.rawAbiMode) {
-            val stdlibExts =
+            val mutPtrExts =
                 listOf(
-                    "castConst" to "$activeCoreNs.ptr.mutptr",
-                    "withAddr" to "$activeCoreNs.ptr.mutptr",
-                    "mapAddr" to "$activeCoreNs.ptr.mutptr",
-                    "exposeProvenance" to "$activeCoreNs.ptr.mutptr",
-                    "wrappingByteOffset" to "$activeCoreNs.ptr.mutptr",
-                    "splitFirst" to "$activeCoreNs.slice",
-                    "splitFirstMut" to "$activeCoreNs.slice",
-                    "splitLast" to "$activeCoreNs.slice",
-                    "splitLastMut" to "$activeCoreNs.slice",
-                    "splitAtMut" to "$activeCoreNs.slice",
-                    "chunksExact" to "$activeCoreNs.slice",
-                    "chunksExactMut" to "$activeCoreNs.slice",
+                    "isNull",
+                    "cast",
+                    "add",
+                    "sub",
+                    "offset",
+                    "byteAdd",
+                    "byteSub",
+                    "byteOffset",
+                    "wrappingAdd",
+                    "wrappingSub",
+                    "wrappingOffset",
+                    "wrappingByteAdd",
+                    "wrappingByteSub",
+                    "wrappingByteOffset",
+                    "read",
+                    "readUnaligned",
+                    "readVolatile",
+                    "write",
+                    "writeUnaligned",
+                    "writeVolatile",
+                    "writeBytes",
+                    "copyTo",
+                    "copyToNonoverlapping",
+                    "copyFrom",
+                    "copyFromNonoverlapping",
+                    "asRef",
+                    "asMut",
+                    "asUninitRef",
+                    "asUninitMut",
+                    "asUninitSlice",
+                    "asUninitSliceMut",
+                    "addr",
+                    "withAddr",
+                    "mapAddr",
+                    "exposeProvenance",
+                    "castConst",
+                    "castUninit",
+                    "castInit",
+                    "castSlice",
+                    "offsetFrom",
+                    "offsetFromUnsigned",
+                    "byteOffsetFrom",
+                    "byteOffsetFromUnsigned",
+                    "isAligned",
+                    "isAlignedTo",
+                    "alignOffset",
+                    "dropInPlace",
+                    "replace",
+                    "swap",
+                    "withMetadataOf",
+                    "toRawParts",
+                    "mask",
+                    "splitAtMut",
                 )
+            val constPtrExts =
+                listOf(
+                    "isNull",
+                    "cast",
+                    "add",
+                    "sub",
+                    "offset",
+                    "byteAdd",
+                    "byteSub",
+                    "byteOffset",
+                    "wrappingAdd",
+                    "wrappingSub",
+                    "wrappingOffset",
+                    "wrappingByteAdd",
+                    "wrappingByteSub",
+                    "wrappingByteOffset",
+                    "read",
+                    "readUnaligned",
+                    "readVolatile",
+                    "copyTo",
+                    "copyToNonoverlapping",
+                    "asRef",
+                    "asUninitRef",
+                    "asUninitSlice",
+                    "addr",
+                    "withAddr",
+                    "mapAddr",
+                    "exposeProvenance",
+                    "castMut",
+                    "castUninit",
+                    "castInit",
+                    "castSlice",
+                    "offsetFrom",
+                    "offsetFromUnsigned",
+                    "byteOffsetFrom",
+                    "byteOffsetFromUnsigned",
+                    "isAligned",
+                    "isAlignedTo",
+                    "alignOffset",
+                    "withMetadataOf",
+                    "toRawParts",
+                    "mask",
+                )
+            val stdlibExts =
+                buildList {
+                    add("splitFirst" to "$activeCoreNs.slice")
+                    add("splitFirstMut" to "$activeCoreNs.slice")
+                    add("splitLast" to "$activeCoreNs.slice")
+                    add("splitLastMut" to "$activeCoreNs.slice")
+                    add("splitAtMut" to "$activeCoreNs.slice")
+                    add("chunksExact" to "$activeCoreNs.slice")
+                    add("chunksExactMut" to "$activeCoreNs.slice")
+                    if (containsWholeIdentifier(bodyTextForImports, "MutPtr") ||
+                        containsWholeIdentifier(bodyTextForImports, "asMutPtr") ||
+                        containsWholeIdentifier(bodyTextForImports, "nullMut")
+                    ) {
+                        for (ext in mutPtrExts) {
+                            add(ext to "$activeCoreNs.ptr.mutptr")
+                        }
+                    }
+                    if (containsWholeIdentifier(bodyTextForImports, "ConstPtr") ||
+                        containsWholeIdentifier(bodyTextForImports, "asPtr")
+                    ) {
+                        for (ext in constPtrExts) {
+                            add(ext to "$activeCoreNs.ptr.constptr")
+                        }
+                    }
+                }
             for ((extName, extPkg) in stdlibExts) {
                 if (headerContext.packageName != extPkg &&
                     extName !in inspector.declaredTypeNames &&
@@ -1896,12 +2018,16 @@ internal class KotlinJ2KEmitter(
         scopeItems: List<Item> = file.items,
     ): String? {
         val ownerType = extractDirectOwnerTypeName(impl.selfType, impl.generics, scopeItems) ?: return null
-        if (impl.traitPath == null) return ownerType
         val ownerDeclGenerics =
             findDeclGenericsForOwnerKotlinName(ownerType, scopeItems)
                 ?: findDeclGenericsForOwnerKotlinName(ownerType, file.items)
                 ?: return ownerType
-        if (declaresExtraNonImplicitImplTraitBounds(impl, ownerDeclGenerics, this::isImplicitStdlibSupertraitPath)) {
+        val ownerTypeParamNames = collectGenericTypeParamNames(ownerDeclGenerics).toSet()
+        val implTypeParamNames = collectGenericTypeParamNames(impl.generics)
+        if (implTypeParamNames.any { it !in ownerTypeParamNames }) {
+            return null
+        }
+        if (impl.traitPath != null && declaresExtraNonImplicitImplTraitBounds(impl, ownerDeclGenerics, this::isImplicitStdlibSupertraitPath)) {
             return null
         }
         return ownerType

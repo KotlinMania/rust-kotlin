@@ -2076,6 +2076,37 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
         activeConstParamNames = prevEnumConstParams
         activeTypeParamNames = prevEnumTypeParams
     }
+    val enumTypeParamNamesList = collectGenericTypeParamNames(item.generics).toList()
+    val variantRawNames = variants.map { it.ident.toString().removePrefix("r#") }.toSet()
+    if (enumTypeParamNamesList.size == 2) {
+        if (typeName in setOf("Result", "RustResult") && "Ok" in variantRawNames && "Err" in variantRawNames) {
+            val okTp = enumTypeParamNamesList[0]
+            val errTp = enumTypeParamNamesList[1]
+            sb
+                .append('\n')
+                .append(indent)
+                .append("    public open fun okValue(): ")
+                .append(okTp)
+                .append(" = error(\"not Ok\")\n")
+                .append(indent)
+                .append("    public open fun errValue(): ")
+                .append(errTp)
+                .append(" = error(\"not Err\")\n")
+        } else if (typeName == "ControlFlow" && "Break" in variantRawNames && "Continue" in variantRawNames) {
+            val bTp = enumTypeParamNamesList[0]
+            val cTp = enumTypeParamNamesList[1]
+            sb
+                .append('\n')
+                .append(indent)
+                .append("    public open fun cfBreakValue(): ")
+                .append(bTp)
+                .append(" = error(\"not Break\")\n")
+                .append(indent)
+                .append("    public open fun cfContinueValue(): ")
+                .append(cTp)
+                .append(" = error(\"not Continue\")\n")
+        }
+    }
     val derivesEquality = hasDeriveTrait(item.attrs, "PartialEq")
     if (derivesEquality) {
         sb.append("\n$indent    public fun rustEquals(other: $selfTypeWithGenerics): Boolean = this == other\n")
@@ -2196,11 +2227,32 @@ private fun KotlinJ2KEmitter.appendEnumVariantWithFields(
     specs: List<SwiftSafeFieldSpec>,
     indent: String,
 ) {
-    val addErrAlias =
+    val isResultVariantAlias =
         enumName in setOf("Result", "RustResult") &&
-            vName == "Err" &&
+            typeParamCount == 2 &&
             specs.size == 1 &&
             specs[0].name == "value"
+    val addErrAlias = isResultVariantAlias && vName == "Err"
+    val overrideMethodLine =
+        when {
+            isResultVariantAlias && vName == "Ok" ->
+                "public override fun okValue(): ${specs[0].renderedType} = value"
+            isResultVariantAlias && vName == "Err" ->
+                "public override fun errValue(): ${specs[0].renderedType} = value"
+            enumName == "ControlFlow" &&
+                typeParamCount == 2 &&
+                specs.size == 1 &&
+                specs[0].name == "value" &&
+                vName == "Break" ->
+                "public override fun cfBreakValue(): ${specs[0].renderedType} = value"
+            enumName == "ControlFlow" &&
+                typeParamCount == 2 &&
+                specs.size == 1 &&
+                specs[0].name == "value" &&
+                vName == "Continue" ->
+                "public override fun cfContinueValue(): ${specs[0].renderedType} = value"
+            else -> null
+        }
     if (specs.none { it.isConcreteGenericForSwift }) {
         val params = specs.map { "public var ${it.name}: ${it.renderedType}" }
         sb
@@ -2217,13 +2269,23 @@ private fun KotlinJ2KEmitter.appendEnumVariantWithFields(
             .append("(")
             .append(superCallArgs)
             .append(")")
-        if (addErrAlias) {
+        if (addErrAlias || overrideMethodLine != null) {
+            sb.append(" {\n")
+            if (addErrAlias) {
+                sb
+                    .append(indent)
+                    .append("    public val error: ")
+                    .append(specs[0].renderedType)
+                    .append(" get() = value\n")
+            }
+            if (overrideMethodLine != null) {
+                sb
+                    .append(indent)
+                    .append("    ")
+                    .append(overrideMethodLine)
+                    .append('\n')
+            }
             sb
-                .append(" {\n")
-                .append(indent)
-                .append("    public val error: ")
-                .append(specs[0].renderedType)
-                .append(" get() = value\n")
                 .append(indent)
                 .append("}")
         }
@@ -2272,6 +2334,14 @@ private fun KotlinJ2KEmitter.appendEnumVariantWithFields(
             .append("    public val error: ")
             .append(specs[0].renderedType)
             .append(" get() = value\n")
+    }
+    if (overrideMethodLine != null) {
+        sb
+            .append("\n")
+            .append(indent)
+            .append("    ")
+            .append(overrideMethodLine)
+            .append('\n')
     }
     val syntheticMethods =
         buildSwiftSafeSyntheticDataMethods(

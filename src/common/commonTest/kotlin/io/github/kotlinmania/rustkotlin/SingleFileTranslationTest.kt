@@ -588,7 +588,7 @@ class SingleFileTranslationTest {
         assertContains(kt, "for (unused1 in 0 until 2)")
         assertContains(kt, "48u -> { 0 }")
         assertContains(kt, "in 49u..57u -> {")
-        assertContains(kt, "0xFF -> { return -1 }")
+        assertContains(kt, "0xFFu.toUByte() -> { return -1 }")
         assertContains(kt, "0x1F")
         assertContains(kt, "0xC0")
         assertFalse(kt.contains("0b0001"))
