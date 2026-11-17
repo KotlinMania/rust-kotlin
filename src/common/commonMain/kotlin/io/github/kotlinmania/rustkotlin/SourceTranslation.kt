@@ -802,6 +802,8 @@ internal class KotlinJ2KEmitter(
                 sym.tupleEnumVariantArity.putAll(sharedInsp.tupleEnumVariantArity)
                 sym.enumTypeParamsByVariant.putAll(sharedInsp.enumTypeParamsByVariant)
                 sym.enumVariantFieldTypes.putAll(sharedInsp.enumVariantFieldTypes)
+                sym.collidingInlineForeignFnRenames.putAll(sharedInsp.collidingInlineForeignFnRenames)
+                sym.collidingTopLevelForeignFnRenames.putAll(sharedInsp.collidingTopLevelForeignFnRenames)
                 sym.selfParameterizedTraits.addAll(sharedInsp.selfParameterizedTraits)
                 sym.traitSupertraits.putAll(sharedInsp.traitSupertraits)
                 sym.traitSupertraitBindings.putAll(sharedInsp.traitSupertraitBindings)
@@ -977,6 +979,29 @@ internal class KotlinJ2KEmitter(
     internal fun emitFile(): String {
         val out = StringBuilder()
 
+        val allEnumItemsForVariantArity =
+            sameFileNestedItems(TranslationSession.sharedModuleFile?.items.orEmpty() + file.items)
+                .filterIsInstance<Item.Enum>()
+        for (enumItem in allEnumItemsForVariantArity) {
+            val enumKt = rustTypeIdentToKotlin(enumItem.ident.toString())
+            val explicitParams =
+                enumItem.generics.params
+                    .toList()
+                    .mapNotNull { (it as? GenericParam.TypeParam)?.ident?.toString()?.let(::rustTypeIdentToKotlin) }
+            val assocParams = sourceAssociatedParameters(enumItem.generics).map { it.associated }
+            val fullParams = (explicitParams + assocParams).distinct()
+            if (fullParams.size > explicitParams.size) {
+                for (v in enumItem.variants.toList()) {
+                    val vName = rustTypeIdentToKotlin(v.ident.toString())
+                    inspector.enumTypeParamsByVariant["$enumKt.$vName"] = fullParams
+                    val prevSimple = inspector.enumTypeParamsByVariant[vName]
+                    if (prevSimple == null || prevSimple.size == explicitParams.size) {
+                        inspector.enumTypeParamsByVariant[vName] = fullParams
+                    }
+                }
+            }
+        }
+
         // Partition impl blocks into those belonging to a local type declared in this file
         // vs standalone/external impl blocks, and hoist all `use` imports to the top.
         val localTypeImpls = linkedMapOf<String, MutableList<Item.Impl>>()
@@ -1066,7 +1091,12 @@ internal class KotlinJ2KEmitter(
                         if (foreign is ForeignItem.Fn && !foreignItemHasDocOnlyCfg(foreign)) {
                             val extracted = extractSigParamNumericKinds(foreign.sig, selfTypeName = null)
                             if (extracted != null) {
-                                val (fnName, kinds) = extracted
+                                val rawForeignFn =
+                                    foreign.sig.ident
+                                        .toString()
+                                        .removePrefix("r#")
+                                val fnName = inspector.collidingTopLevelForeignFnRenames[rawForeignFn] ?: extracted.first
+                                val kinds = extracted.second
                                 topLevelFnParamKinds[fnName] = if (fnName in topLevelFnParamKinds) null else kinds
                                 val arityKey = "$fnName#${kinds.size}"
                                 topLevelFnParamKinds[arityKey] = if (arityKey in topLevelFnParamKinds) null else kinds

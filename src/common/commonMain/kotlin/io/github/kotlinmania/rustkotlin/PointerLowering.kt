@@ -555,7 +555,16 @@ internal fun KotlinJ2KEmitter.sourceAssociatedArguments(path: io.github.kotlinma
     val segment = path.segments.last() ?: return emptyList()
     val rawIdent = segment.ident.toString().removePrefix("r#")
     val declaration = transparentDeclaration(rawIdent)
-    if (declaration == null) {
+    val enumDecl =
+        if (declaration == null) {
+            sameFileNestedItems(file.items)
+                .filterIsInstance<Item.Enum>()
+                .singleOrNull { rustTypeIdentToKotlin(it.ident.toString()) == rustTypeIdentToKotlin(rawIdent) }
+        } else {
+            null
+        }
+    val declGenerics = declaration?.generics ?: enumDecl?.generics
+    if (declGenerics == null) {
         val rawFirstArgSyn =
             (segment.arguments as? PathArguments.AngleBracketed)
                 ?.args
@@ -567,7 +576,7 @@ internal fun KotlinJ2KEmitter.sourceAssociatedArguments(path: io.github.kotlinma
         return resolveStdlibAssociatedArgs(rustTypeIdentToKotlin(rawIdent), rawFirstArgSyn, renderedFirst)
     }
     val parameters =
-        declaration.generics.params
+        declGenerics.params
             .toList()
             .filterIsInstance<GenericParam.TypeParam>()
             .map { it.ident.toString() }
@@ -579,10 +588,32 @@ internal fun KotlinJ2KEmitter.sourceAssociatedArguments(path: io.github.kotlinma
             .filterIsInstance<GenericArgument.TypeArg>()
             .map { it.type }
     val substitutions = parameters.zip(arguments).toMap()
-    return sourceAssociatedParameters(declaration.generics).map { parameter ->
+    return sourceAssociatedParameters(declGenerics).map { parameter ->
         val actual = substitutions[parameter.owner]
         val binding = actual?.let { sourceAssociatedBinding(it, parameter.associated, parameter.trait) }
-        if (binding != null) renderType(binding, selfType) else parameter.associated
+        when {
+            binding != null -> renderType(binding, selfType)
+            parameter.trait == "ToOwned" && parameter.associated == "Owned" && actual != null -> {
+                val unwrappedActual = unwrapSynType(actual)
+                val pathIdent =
+                    (unwrappedActual as? SynType.Path)
+                        ?.takeIf { it.qself == null && it.path.segments.len() == 1 }
+                        ?.path
+                        ?.segments
+                        ?.last()
+                        ?.ident
+                        ?.toString()
+                        ?.removePrefix("r#")
+                when {
+                    pathIdent == "str" -> "String"
+                    unwrappedActual is SynType.Slice -> "MutableList<${renderType(unwrappedActual.elem, selfType)}>"
+                    pathIdent != null && rustTypeIdentToKotlin(pathIdent) !in activeTypeParamNames ->
+                        renderType(unwrappedActual, selfType)
+                    else -> parameter.associated
+                }
+            }
+            else -> parameter.associated
+        }
     }
 }
 

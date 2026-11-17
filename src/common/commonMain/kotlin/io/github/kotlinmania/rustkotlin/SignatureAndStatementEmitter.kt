@@ -333,8 +333,15 @@ internal fun KotlinJ2KEmitter.collectTypeParamWitnessSpecs(
                             secondRaw.firstOrNull()?.isLowerCase() == true
                         ) {
                             discovered.getOrPut(firstKt to secondRaw) { firstKt }
-                        } else if (rawFirst == "Default" && secondRaw == "default" && defaultBoundedParams.size == 1) {
-                            discovered.getOrPut("*" to "default") { defaultBoundedParams[0] }
+                        } else if (rawFirst == "Default" && secondRaw == "default") {
+                            if (defaultBoundedParams.size == 1) {
+                                discovered.getOrPut("*" to "default") { defaultBoundedParams[0] }
+                            } else {
+                                val hintedTp = pendingCallReturnHint?.second?.trim()
+                                if (hintedTp != null && hintedTp in defaultBoundedParams) {
+                                    discovered.getOrPut(hintedTp to "default") { hintedTp }
+                                }
+                            }
                         }
                     }
                 }
@@ -1064,9 +1071,14 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
     val receiverKey = computeReceiverSignatureKey(receiverPrefix)
     val baseSigKey = "$receiverKey$effectiveFnName(${baseParamTypeSignatureKeys.joinToString(",")})"
     val baseSeenCount = scopeSignatures[baseSigKey] ?: 0
+    val isErasedRefOpsForwarding =
+        isErasedOpsReferenceForwardingImpl(
+            selfSynType = if (asTopLevelExtension) standaloneSelfSynType else null,
+            traitPath = if (asTopLevelExtension) standaloneTraitPath else attachedTraitPath,
+        )
     if (!asTopLevelExtension && attachedTraitPath != null && !currentAttachedImplIsRefSelf) {
         scopeSignatures[baseSigKey] = baseSeenCount + 1
-        if (baseSeenCount > 0) {
+        if (baseSeenCount > 0 && !isErasedRefOpsForwarding) {
             val disambiguated = disambiguateTraitArgCollisionFnName(effectiveFnName, attachedTraitPath)
             if (disambiguated != effectiveFnName) {
                 effectiveFnName = disambiguated
@@ -1075,7 +1087,7 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
     }
     var sigKey = "$receiverKey$effectiveFnName(${paramTypeSignatureKeys.joinToString(",")})"
     var seenCount = if (sigKey == baseSigKey) baseSeenCount else (scopeSignatures[sigKey] ?: 0)
-    if (seenCount > 0 && asTopLevelExtension && hasReceiver && standaloneTraitPath != null) {
+    if (seenCount > 0 && asTopLevelExtension && hasReceiver && standaloneTraitPath != null && !isErasedRefOpsForwarding) {
         val disambiguated =
             disambiguateReceiverTraitImplFnName(
                 standaloneTraitPath,
@@ -1087,7 +1099,12 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
             sigKey = "$receiverKey$effectiveFnName(${paramTypeSignatureKeys.joinToString(",")})"
             seenCount = scopeSignatures[sigKey] ?: 0
         }
-    } else if (seenCount > 0 && !asTopLevelExtension && attachedTraitPath != null && !currentAttachedImplIsRefSelf) {
+    } else if (seenCount > 0 &&
+        !asTopLevelExtension &&
+        attachedTraitPath != null &&
+        !currentAttachedImplIsRefSelf &&
+        !isErasedRefOpsForwarding
+    ) {
         val disambiguated = disambiguateTraitArgCollisionFnName(effectiveFnName, attachedTraitPath)
         if (disambiguated != effectiveFnName) {
             effectiveFnName = disambiguated
@@ -1245,7 +1262,58 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
         } else {
             params
         }
-    return "${visPrefix}${effectiveOpenPrefix}${operatorPrefix}${inlinePrefix}fun ${typeParamsPart}${receiverPrefix}$effectiveFnName(${finalParams.joinToString(", ")})${retTypeStr}$whereClause"
+    val infixPrefix =
+        if (hasReceiver &&
+            (effectiveFnName == "shl" || effectiveFnName == "shr") &&
+            finalParams.size == 1 &&
+            !finalParams[0].contains('=') &&
+            !finalParams[0].trimStart().startsWith("vararg ") &&
+            !(selfBaseForOp in setOf("Int", "Long", "UInt", "ULong") && baseParamTypeSignatureKeys == listOf("Int"))
+        ) {
+            "infix "
+        } else {
+            ""
+        }
+    return "${visPrefix}${effectiveOpenPrefix}${operatorPrefix}${infixPrefix}${inlinePrefix}fun ${typeParamsPart}${receiverPrefix}$effectiveFnName(${finalParams.joinToString(", ")})${retTypeStr}$whereClause"
+}
+
+private val CORE_OPS_FORWARD_REF_TRAITS =
+    setOf(
+        "Add",
+        "Sub",
+        "Mul",
+        "Div",
+        "Rem",
+        "BitAnd",
+        "BitOr",
+        "BitXor",
+        "Shl",
+        "Shr",
+        "AddAssign",
+        "SubAssign",
+        "MulAssign",
+        "DivAssign",
+        "RemAssign",
+        "BitAndAssign",
+        "BitOrAssign",
+        "BitXorAssign",
+        "ShlAssign",
+        "ShrAssign",
+        "Neg",
+        "Not",
+    )
+
+private fun isErasedOpsReferenceForwardingImpl(
+    selfSynType: SynType?,
+    traitPath: Path?,
+): Boolean {
+    if (traitPath == null) return false
+    val lastSeg = traitPath.segments.last() ?: return false
+    val rawTrait = lastSeg.ident.toString().removePrefix("r#")
+    if (rawTrait !in CORE_OPS_FORWARD_REF_TRAITS) return false
+    if (selfSynType?.let(::unwrapSynType) is SynType.Reference) return true
+    val args = (lastSeg.arguments as? PathArguments.AngleBracketed)?.args?.toList().orEmpty()
+    return args.any { it is GenericArgument.TypeArg && unwrapSynType(it.type) is SynType.Reference }
 }
 
 private fun prefixTopLevelTypeParamWithReified(typeParamsStr: String, tpKt: String): String {

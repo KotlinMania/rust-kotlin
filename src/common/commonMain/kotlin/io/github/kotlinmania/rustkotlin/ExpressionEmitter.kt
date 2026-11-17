@@ -213,7 +213,11 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                         (idx >= 3 && cleanBaseTy?.startsWith("List<") != false)
                     ) {
                         val recv = if (safeBase.any { it == ' ' }) "($safeBase)" else safeBase
-                        "$recv[$idx]"
+                        val elemTy =
+                            resolveUnnamedTupleFieldSynType(expr.base, idx)
+                                ?.let { renderType(it, selfTypeName) }
+                                ?.takeIf { it.isNotEmpty() && it != "Any?" && it != "Any" && '*' !in it }
+                        if (elemTy != null) "($recv[$idx] as $elemTy)" else "$recv[$idx]"
                     } else {
                         "$safeBase.${tupleAccessMemberName(expr.base, idx, selfTypeName)}"
                     }

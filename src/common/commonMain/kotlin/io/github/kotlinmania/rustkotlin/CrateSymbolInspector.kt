@@ -190,9 +190,12 @@ internal class CrateSymbolInspector(
     val fnConstParamNames: MutableMap<String, Pair<Int, List<String>>> = linkedMapOf()
     val methodConstParamNames: MutableMap<String, Pair<Int, List<String>>> = linkedMapOf()
     val collidingInlineForeignFnRenames: MutableMap<Pair<String, String>, String> = linkedMapOf()
+    val collidingTopLevelForeignFnRenames: MutableMap<String, String> = linkedMapOf()
     private val inlineModStack: ArrayDeque<String> = ArrayDeque()
     private val outerTopLevelFnArities: MutableSet<Pair<String, Int>> = linkedSetOf()
     private val inlineModForeignFns: MutableList<Triple<String, String, Int>> = mutableListOf()
+    private val topLevelDefinedFnRawByKtAndArity: MutableMap<Pair<String, Int>, MutableSet<String>> = linkedMapOf()
+    private val topLevelForeignFns: MutableList<Pair<String, Int>> = mutableListOf()
     private val pendingImplMethodConsts: MutableList<QuadImplConstSpec> = mutableListOf()
     val topLevelFnReturnSynTypes: MutableMap<String, SynType> = linkedMapOf()
     val implMethodReturnSynTypes: MutableMap<Pair<String, String>, SynType> = linkedMapOf()
@@ -307,6 +310,14 @@ internal class CrateSymbolInspector(
                     collidingInlineForeignFnRenames[modRaw to rawFn] = rustFunctionIdentToKotlin("${modRaw}_$rawFn")
                 }
             }
+            for ((rawForeign, arity) in topLevelForeignFns) {
+                val ktFn = rustFunctionIdentToKotlin(rawForeign)
+                val definedRaws = topLevelDefinedFnRawByKtAndArity[ktFn to arity]
+                if (definedRaws != null && definedRaws.any { it != rawForeign }) {
+                    val cap = ktFn.replaceFirstChar { it.uppercaseChar() }
+                    collidingTopLevelForeignFnRenames[rawForeign] = "extern$cap"
+                }
+            }
             for ((implItem, spec) in pendingImplChecks) {
                 val ownerDeclGenerics = attachableGenericsByName[spec.ownerName]
                 val direct =
@@ -379,11 +390,13 @@ internal class CrateSymbolInspector(
                             declaredTopLevelFnRawNames += cleanRawFnIdent
                             externFnKotlinNames += rustFunctionIdentToKotlin(rawFnIdent)
                             val activeMod = inlineModStack.lastOrNull()
+                            val foreignArity = foreign.sig.inputs.count { it is FnArg.Typed }
                             if (activeMod != null) {
-                                val foreignArity = foreign.sig.inputs.count { it is FnArg.Typed }
                                 if (foreignArity == 0) {
                                     inlineModForeignFns += Triple(activeMod, cleanRawFnIdent, foreignArity)
                                 }
+                            } else {
+                                topLevelForeignFns += cleanRawFnIdent to foreignArity
                             }
                         }
                         for (arg in foreign.sig.inputs.toList()) {
@@ -465,6 +478,7 @@ internal class CrateSymbolInspector(
             declaredTopLevelFnRawNames += cleanRaw
             if (inlineModStack.isEmpty()) {
                 val arity = i.sig.inputs.count { it is FnArg.Typed }
+                topLevelDefinedFnRawByKtAndArity.getOrPut(ktFn to arity) { linkedSetOf() }.add(cleanRaw)
                 if (arity == 0) {
                     outerTopLevelFnArities += ktFn to arity
                 }

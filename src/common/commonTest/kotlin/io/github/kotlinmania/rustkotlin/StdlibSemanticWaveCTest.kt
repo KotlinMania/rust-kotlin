@@ -833,4 +833,160 @@ class StdlibSemanticWaveCTest {
         assertFalse(out.contains("simd.sveTupleCreate2"), "sve_tuple_create2 must lower instead of raw call:\n$out")
         assertFalse(out.contains("_simdArg"), "Must not emit underscore-prefixed _simdArg locals:\n$out")
     }
+
+    @Test
+    fun `wave c4 fixes foreign fn collision subpkg module import cow arity io result bool inv ops tuple and lowercase types`() {
+        val source =
+            """
+            use crate::core_arch::simd;
+            use crate::fmt::Error;
+            use crate::io::Result;
+
+            unsafe extern "llvm-intrinsic" {
+                fn msa_add_a_b(a: i32, b: i32) -> i32;
+            }
+
+            pub unsafe fn __msa_add_a_b(a: i32, b: i32) -> i32 {
+                msa_add_a_b(a, b)
+            }
+
+            pub fn make_vec(x: simd::u8x16) -> simd::u8x16 {
+                poly8x8_t::splat(255);
+                x
+            }
+
+            pub trait ToOwned {
+                type Owned;
+                fn to_owned(&self) -> Self::Owned;
+            }
+
+            pub enum Cow<'a, B: 'a> where B: ToOwned {
+                Borrowed(&'a B),
+                Owned(<B as ToOwned>::Owned),
+            }
+
+            impl<'a, B: ToOwned> Cow<'a, B> {
+                pub fn inspect_cow(&self) -> bool {
+                    match *self {
+                        Cow::Borrowed(_) => true,
+                        Cow::Owned(_) => false,
+                    }
+                }
+            }
+
+            pub trait SizedTypeProperties {
+                const IS_ZST: bool = false;
+            }
+
+            pub fn check_zst<T: SizedTypeProperties>() -> bool {
+                if !T::IS_ZST {
+                    true
+                } else {
+                    false
+                }
+            }
+
+            pub fn read_io(x: Result<usize>) -> Result<usize> {
+                let y = x?;
+                Ok(y)
+            }
+
+            pub trait Shr<Rhs> {
+                type Output;
+                fn shr(self, rhs: Rhs) -> Self::Output;
+            }
+
+            impl Shr<i32> for i8 {
+                type Output = i8;
+                fn shr(self, other: i32) -> i8 {
+                    self >> other
+                }
+            }
+
+            impl Shr<&i32> for i8 {
+                type Output = <i8 as Shr<i32>>::Output;
+                fn shr(self, other: &i32) -> <i8 as Shr<i32>>::Output {
+                    Shr::shr(self, *other)
+                }
+            }
+
+            pub trait ShrAssign<Rhs> {
+                fn shr_assign(&mut self, rhs: Rhs);
+            }
+
+            impl ShrAssign<u8> for i32 {
+                fn shr_assign(&mut self, other: u8) {
+                    *self >>= other;
+                }
+            }
+
+            impl ShrAssign<&u8> for i32 {
+                fn shr_assign(&mut self, other: &u8) {
+                    ShrAssign::shr_assign(self, *other);
+                }
+            }
+
+            pub trait Default {
+                fn default() -> Self;
+            }
+
+            pub fn cmp_tuple<T, U, V, W, X>(a: &(T, U, V, W, X), b: &(T, U, V, W, X)) -> Ordering {
+                a.4.cmp(&b.4)
+            }
+
+            pub fn pair_defaults<U: Default, T: Default>() -> (U, T) {
+                ({ let x: U = Default::default(); x }, { let x: T = Default::default(); x })
+            }
+            """.trimIndent()
+        val out =
+            translateRustSourceToKotlin(
+                recognizeRust(source),
+                headerContext =
+                    FileHeaderContext(
+                        packageName = "io.github.kotlinmania.rustlang.corearch.wasm32",
+                        projectNamespace = "io.github.kotlinmania.rustlang.corearch",
+                        crateNamespaces =
+                            mapOf(
+                                "core" to "io.github.kotlinmania.rustlang.core",
+                                "core_arch" to "io.github.kotlinmania.rustlang.corearch",
+                            ),
+                        crateSubpackageRawLeafNames =
+                            mapOf(
+                                "simd" to "simd",
+                                "armshared.neon" to "neon",
+                            ),
+                        crateSymbolSubpackages =
+                            mapOf(
+                                "Simd" to listOf("simd"),
+                                "U8x16" to listOf("simd"),
+                                "Poly8x8T" to listOf("armshared.neon"),
+                                "Result" to listOf("io.error"),
+                            ),
+                        crateTraitDefaultlessAssocTypes = mapOf("ToOwned" to listOf("Owned")),
+                        rootSelfDirModuleAliases = setOf("core_arch"),
+                        rootExternalModuleReexports = mapOf("fmt" to "core::fmt", "io" to "core::io"),
+                    ),
+            )
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(out, "WaveC4Sample.kt")
+        assertContains(out, "public expect fun externMsaAddAB(a: Int, b: Int): Int")
+        assertContains(out, "return externMsaAddAB(a, b)")
+        assertContains(out, "import io.github.kotlinmania.rustlang.corearch.simd.U8x16")
+        assertContains(out, "public fun makeVec(x: U8x16): U8x16")
+        assertFalse(out.contains("import io.github.kotlinmania.rustlang.corearch.simd\n"), "Must not emit package import:\n$out")
+        assertContains(out, "Poly8x8T.splat(")
+        assertContains(out, "is Cow.Borrowed<*, *>")
+        assertContains(out, "is Cow.Owned<*, *>")
+        assertContains(out, "io.github.kotlinmania.rustlang.core.io.error.Error")
+        assertFalse(out.contains(".inv()"), "Boolean IS_ZST must not emit .inv():\n$out")
+        assertContains(out, "public infix fun Byte.shr(other: Int): Byte")
+        assertContains(out, "return (this.toInt() shr other).toByte()")
+        assertFalse(out.contains("shrInt("), "Forward ref Shr<&i32> should dedup without mangling:\n$out")
+        assertFalse(out.contains("shrAssignUByte("), "Forward ref ShrAssign<&u8> should dedup without mangling:\n$out")
+        assertFalse(out.contains("this = "), "Must not assign to immutable Kotlin receiver this:\n$out")
+        assertContains(out, "kmCompareValues((a[4] as X), (b[4] as X))")
+        assertContains(out, "defaultUFn: () -> U")
+        assertContains(out, "defaultTFn: () -> T")
+        assertContains(out, "val x: U = defaultUFn()")
+        assertContains(out, "val x1: T = defaultTFn()")
+    }
 }
