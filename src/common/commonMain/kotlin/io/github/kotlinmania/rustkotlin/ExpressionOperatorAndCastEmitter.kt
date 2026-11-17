@@ -221,10 +221,29 @@ internal fun KotlinJ2KEmitter.renderExprBinary(expr: Expr.Binary, indent: String
             is BinOp.ShrAssign -> "shr"
             else -> null
         }
+    val effLeftKind =
+        leftInferredKind
+            ?: if (left == "this") selfTypeName?.let(this::resolveNumericKind) else null
     return if (compoundBitOp != null) {
         val safeRight = if (expr.right is Expr.Binary || expr.right is Expr.Cast) "($right)" else right
         val rhsLeft = left.replace("!!.", ".")
-        "$left = $rhsLeft $compoundBitOp $safeRight"
+        val rhsBitExpr =
+            if (expr.op is BinOp.ShlAssign || expr.op is BinOp.ShrAssign) {
+                when (effLeftKind) {
+                    NumericKind.I8 -> "(($rhsLeft).toInt() $compoundBitOp $safeRight).toByte()"
+                    NumericKind.I16 -> "(($rhsLeft).toInt() $compoundBitOp $safeRight).toShort()"
+                    NumericKind.U8 -> "(($rhsLeft).toUInt() $compoundBitOp $safeRight).toUByte()"
+                    NumericKind.U16 -> "(($rhsLeft).toUInt() $compoundBitOp $safeRight).toUShort()"
+                    else -> "$rhsLeft $compoundBitOp $safeRight"
+                }
+            } else {
+                "$rhsLeft $compoundBitOp $safeRight"
+            }
+        if (left == "this") {
+            "($rhsBitExpr).let {}"
+        } else {
+            "$left = $rhsBitExpr"
+        }
     } else if (isBitwiseOp && (binarySharedKind == NumericKind.I8 || binarySharedKind == NumericKind.I16)) {
         val op = renderBinOp(expr.op)
         val lAtom = if (isAtomicPostfixReceiver(leftOperand, left)) left else "($left)"
@@ -237,6 +256,12 @@ internal fun KotlinJ2KEmitter.renderExprBinary(expr: Expr.Binary, indent: String
         val rAtom = if (isAtomicPostfixReceiver(rightOperand, right)) right else "($right)"
         val conv = if (binarySharedKind == NumericKind.U8) "toUByte()" else "toUShort()"
         "($lAtom.toUInt() $op $rAtom).$conv"
+    } else if (isShiftOp && (binarySharedKind == NumericKind.I8 || binarySharedKind == NumericKind.I16)) {
+        val op = renderBinOp(expr.op)
+        val lAtom = if (isAtomicPostfixReceiver(leftOperand, left)) left else "($left)"
+        val rAtom = if (isAtomicPostfixReceiver(rightOperand, right)) right else "($right)"
+        val conv = if (binarySharedKind == NumericKind.I8) "toByte()" else "toShort()"
+        "($lAtom.toInt() $op $rAtom).$conv"
     } else if (isEqOp &&
         (
             inferExprRenderedType(leftOperand, selfTypeName)?.let { isPrimitiveArrayRenderedType(it) } == true ||
@@ -272,6 +297,9 @@ internal fun KotlinJ2KEmitter.renderExprBinary(expr: Expr.Binary, indent: String
         registerCoreMemberImport("mem", "kmCompareValues")
         val op = renderBinOp(expr.op)
         "(kmCompareValues($left, $right) $op 0)"
+    } else if (left == "this" && isCompoundAssignOp(expr.op)) {
+        val op = renderBinOp(expr.op).removeSuffix("=")
+        "($left $op $right).let {}"
     } else {
         val op = renderBinOp(expr.op)
         if (headerContext.isBatchCrateOutput && right.contains('\n')) {
@@ -285,7 +313,10 @@ internal fun KotlinJ2KEmitter.renderExprBinary(expr: Expr.Binary, indent: String
 internal fun KotlinJ2KEmitter.renderExprUnary(expr: Expr.Unary, indent: String, selfTypeName: String?): String {
     return when (expr.op) {
         is UnOp.NotOp -> {
-            if (isKnownIntegerBitmaskExpr(expr.expr) || inferExprNumericKind(expr.expr, selfTypeName)?.isIntegerNumericKind() == true) {
+            val innerRenderedTy = inferExprRenderedType(expr.expr, selfTypeName)?.removeSuffix("?")?.trim()
+            if (innerRenderedTy != "Boolean" &&
+                (isKnownIntegerBitmaskExpr(expr.expr) || inferExprNumericKind(expr.expr, selfTypeName)?.isIntegerNumericKind() == true)
+            ) {
                 renderBitwiseComplementOperand(expr.expr, indent, selfTypeName)
             } else {
                 val savedKind = currentExpectedNumericKind
@@ -598,6 +629,23 @@ internal fun KotlinJ2KEmitter.renderExprAssign(expr: Expr.Assign, indent: String
         }
     if (left in currentSmartCastNonNullLocals) {
         currentSmartCastNonNullLocals = currentSmartCastNonNullLocals - left
+    }
+    if (left == "this") {
+        val selfBase = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
+        val rightBase =
+            inferExprRenderedType(expr.right, selfTypeName)
+                ?.removeSuffix("?")
+                ?.substringBefore('<')
+                ?.substringAfterLast('.')
+                ?.trim()
+        if (selfBase != null &&
+            inspector.tupleStructArityByType[selfBase] == 1 &&
+            "value" in inspector.structFieldNamesByType[selfBase].orEmpty() &&
+            rightBase == selfBase
+        ) {
+            return "this.value = ($right).value"
+        }
+        return "($right).let {}"
     }
     return "$left = $right"
 }

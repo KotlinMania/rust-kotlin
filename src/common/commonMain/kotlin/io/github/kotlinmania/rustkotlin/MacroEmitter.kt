@@ -774,6 +774,12 @@ internal fun KotlinJ2KEmitter.isKnownIntegerBitmaskExpr(expr: Expr): Boolean =
             last != null &&
                 last != "true" &&
                 last != "false" &&
+                !last.startsWith("IS_") &&
+                !last.startsWith("HAS_") &&
+                !last.startsWith("NEEDS_") &&
+                !last.startsWith("CAN_") &&
+                !last.startsWith("ALLOW_") &&
+                inferExprRenderedType(expr, null)?.removeSuffix("?")?.trim() != "Boolean" &&
                 (isScreamingSnakeIdent(last) || last in inspector.declaredConstNames)
         }
         else -> false
@@ -1612,6 +1618,10 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
         val firstWitnessKey = if (firstRaw == "Self" && selfBaseLookup != null) selfBaseLookup else rustTypeIdentToKotlin(firstRaw)
         currentTypeParamWitnessCalls[firstWitnessKey to cleanSecond]?.let { return it }
         if (firstRaw == "Default" && cleanSecond == "default") {
+            val targetTp = currentExpectedParseTargetType?.trim()
+            if (targetTp != null) {
+                currentTypeParamWitnessCalls[targetTp to "default"]?.let { return it }
+            }
             currentTypeParamWitnessCalls["*" to "default"]?.let { return it }
         }
     }
@@ -1723,7 +1733,8 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
             cleanSingle in inspector.declaredTopLevelFnRawNames &&
             cleanSingle !in inspector.declaredConstNames
         ) {
-            return "::${rustFunctionIdentToKotlin(singleRaw)}"
+            val fnKt = inspector.collidingTopLevelForeignFnRenames[cleanSingle] ?: rustFunctionIdentToKotlin(singleRaw)
+            return "::$fnKt"
         }
         if (!asCallee &&
             cleanSingle == "drop" &&
@@ -1878,7 +1889,7 @@ internal fun KotlinJ2KEmitter.renderPathSegmentInExpr(
                 if (cleanIdent in inspector.declaredTopLevelFnRawNames ||
                     (asCallee && cleanIdent !in inspector.declaredConstNames && cleanIdent !in inspector.declaredTypeNames)
                 ) {
-                    rustFunctionIdentToKotlin(rawIdent)
+                    inspector.collidingTopLevelForeignFnRenames[cleanIdent] ?: rustFunctionIdentToKotlin(rawIdent)
                 } else {
                     inspector.declaredConstNames[cleanIdent] ?: rustConstIdentToKotlin(rawIdent)
                 }
@@ -1924,11 +1935,39 @@ internal fun KotlinJ2KEmitter.renderPathSegmentInExpr(
                 importedTypeKotlinName
             !isLast && scopeBuilder.isImportedModuleInScope(rawIdent) ->
                 scopeBuilder.resolveModuleBinding(rawIdent)?.kotlinName ?: rustModuleIdentToKotlin(rawIdent)
+            (!isLast || asCallee) &&
+                rawIdent.first().isLowerCase() &&
+                rawIdent !in PRIMITIVE_TYPE_NAMES &&
+                rawIdent != "self" &&
+                !scopeBuilder.isImportedModuleInScope(rawIdent) &&
+                scopeBuilder.resolveLocalKotlinName(cleanIdent) == null &&
+                cleanIdent !in inspector.declaredTopLevelFnRawNames &&
+                rustTypeIdentToKotlin(rawIdent).let { candKt ->
+                    candKt in inspector.declaredTypeNames ||
+                        candKt in importedSimpleNameToPkg ||
+                        candKt in headerContext.crateSymbolSubpackages
+                } -> {
+                val candKt = rustTypeIdentToKotlin(rawIdent)
+                if (candKt !in inspector.declaredTypeNames && candKt !in importedSimpleNameToPkg) {
+                    val bestSub = resolveBestSubpackageForSymbol(candKt)
+                    val ns = currentNamespacePrefix()
+                    if (bestSub != null && ns != null) {
+                        val pkg = if (bestSub.isEmpty()) ns else "$ns.$bestSub"
+                        if (pkg != headerContext.packageName) {
+                            importedSimpleNameToPkg[candKt] = pkg
+                            extraTypePathImports += "import $pkg.$candKt"
+                        }
+                    }
+                }
+                candKt
+            }
             isSingleSegment -> {
                 if (arguments is PathArguments.None && cleanIdent in activeGuardBindingSubstitutions) {
                     activeGuardBindingSubstitutions.getValue(cleanIdent)
+                } else if (scopeBuilder.resolveLocalKotlinName(cleanIdent) != null) {
+                    scopeBuilder.resolveLocalKotlinName(cleanIdent)!!
                 } else {
-                    scopeBuilder.resolveLocalKotlinName(cleanIdent) ?: rustValueIdentToKotlin(rawIdent)
+                    inspector.collidingTopLevelForeignFnRenames[cleanIdent] ?: rustValueIdentToKotlin(rawIdent)
                 }
             }
             else -> rustValueIdentToKotlin(rawIdent)

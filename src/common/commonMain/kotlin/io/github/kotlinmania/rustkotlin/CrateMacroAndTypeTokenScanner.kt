@@ -992,6 +992,7 @@ internal fun scanModuleTokenTrees(
                             ktEnum = ktType,
                             rawAbiMode = rawAbiMode,
                             out = enumVariantTypeArity,
+                            traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
                         )
                         if (insideCEnumMacro) {
                             val reprKind = extractEnumReprKindFromAttrs(pendingAttrs, rawAbiMode, defaultKind = "I32")
@@ -1242,6 +1243,7 @@ internal fun scanModuleTokenTrees(
                         ktEnum = ktType,
                         rawAbiMode = rawAbiMode,
                         out = enumVariantTypeArity,
+                        traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
                     )
                 } else if (nonPubKw == "struct" || nonPubKw == "union") {
                     val (genTypeParams, _, afterGenericsIdx) =
@@ -1550,17 +1552,57 @@ private fun extractHeaderGenericTypeParams(
     return HeaderGenericTypeParams(typeParams, typeArity, closeIdx + 1)
 }
 
-private fun findEnumBodyBraceGroup(trees: List<TokenTree>, startIdx: Int): io.github.kotlinmania.procmacro2.Group? {
+private fun findEnumBodyBraceIndex(trees: List<TokenTree>, startIdx: Int): Int? {
     var j = startIdx
     while (j < trees.size) {
         val tt = trees[j]
         if (tt is TokenTree.Punct && tt.value.asChar() == ';') return null
         if (tt is TokenTree.Group && tt.value.delimiter() == Delimiter.Brace) {
-            return tt.value
+            return j
         }
         j++
     }
     return null
+}
+
+private fun countScannerEnumLiftedAssocs(
+    headerTrees: List<TokenTree>,
+    explicitParamNames: Set<String>,
+    traitDefaultlessAssocTypes: Map<String, List<String>>,
+): Int {
+    val lifted = linkedSetOf<String>()
+    var inBound = false
+    var boundAngleDepth = 0
+    var k = 0
+    while (k < headerTrees.size) {
+        val tt = headerTrees[k]
+        when {
+            tt is TokenTree.Punct && !isScannerRArrow(headerTrees, k) && tt.value.asChar() == '<' ->
+                if (inBound) boundAngleDepth++
+            tt is TokenTree.Punct && !isScannerRArrow(headerTrees, k) && tt.value.asChar() == '>' ->
+                if (inBound && boundAngleDepth > 0) boundAngleDepth--
+            tt is TokenTree.Punct && boundAngleDepth == 0 && tt.value.asChar() == ':' -> inBound = true
+            tt is TokenTree.Punct && boundAngleDepth == 0 && tt.value.asChar() == ',' -> inBound = false
+            tt is TokenTree.Ident && inBound && boundAngleDepth == 0 -> {
+                val raw = tt.value.toString().removePrefix("r#")
+                val assocs =
+                    when (raw) {
+                        "ToOwned" -> listOf("Owned")
+                        "Deref", "DerefMut" -> listOf("Target")
+                        "Iterator", "DoubleEndedIterator", "ExactSizeIterator", "FusedIterator", "TrustedLen", "AsyncIterator" ->
+                            listOf("Item")
+                        else -> traitDefaultlessAssocTypes[KotlinNamingPolicy.Default.toTypeIdentifier(raw, allowRawAbi = false)].orEmpty()
+                    }
+                for (a in assocs) {
+                    if (a !in explicitParamNames) {
+                        lifted += a
+                    }
+                }
+            }
+        }
+        k++
+    }
+    return lifted.size
 }
 
 private fun scanEnumVariantTypeArities(
@@ -1570,10 +1612,14 @@ private fun scanEnumVariantTypeArities(
     ktEnum: String,
     rawAbiMode: Boolean,
     out: MutableMap<String, Int>,
+    traitDefaultlessAssocTypes: Map<String, List<String>> = emptyMap(),
 ) {
     val headerParams = extractHeaderGenericTypeParams(trees, afterIdentIdx, rawAbiMode)
-    val braceGrp = findEnumBodyBraceGroup(trees, headerParams.nextIdx) ?: return
-    val typeArity = headerParams.typeArity
+    val braceIdx = findEnumBodyBraceIndex(trees, headerParams.nextIdx) ?: return
+    val braceGrp = (trees[braceIdx] as TokenTree.Group).value
+    val headerSlice = if (braceIdx > afterIdentIdx) trees.subList(afterIdentIdx, braceIdx) else emptyList()
+    val extraLiftedAssocs = countScannerEnumLiftedAssocs(headerSlice, headerParams.paramNames, traitDefaultlessAssocTypes)
+    val typeArity = headerParams.typeArity + extraLiftedAssocs
     for (clause in MacroRulesFileExpander.splitTopLevelCommaClauses(braceGrp.stream().toList())) {
         val stripped = stripLeadingScannerAttrs(clause)
         val rawVar = (stripped.firstOrNull() as? TokenTree.Ident)?.value?.toString()?.removePrefix("r#") ?: continue

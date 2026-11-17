@@ -170,9 +170,23 @@ internal fun KotlinJ2KEmitter.registerUseItemInScope(item: Item.Use) {
             }
         val normalizedImportedPath =
             if (isKnownSubpkgModule) {
-                val pkgPrefix = importedPath.substringBeforeLast('.', missingDelimiterValue = "")
-                val modLeaf = rustModuleIdentToKotlin(lastSeg)
-                if (pkgPrefix.isEmpty()) modLeaf else "$pkgPrefix.$modLeaf"
+                val ns = currentNamespacePrefix()
+                val afterNs = if (ns != null) importedPath.removePrefix("$ns.") else importedPath
+                val cleanRaw = lastSeg.removePrefix("r#")
+                val pascalLeaf = rustTypeIdentToKotlin(cleanRaw)
+                val leafMod = rustModuleIdentToKotlin(cleanRaw.replace('-', '_'))
+                when {
+                    ns != null && headerContext.crateSubpackageRawLeafNames[afterNs] == cleanRaw ->
+                        "$ns.$afterNs"
+                    ns != null &&
+                        afterNs.endsWith(".$pascalLeaf") &&
+                        headerContext.crateSubpackageRawLeafNames[afterNs.removeSuffix(".$pascalLeaf")] == cleanRaw ->
+                        "$ns.${afterNs.removeSuffix(".$pascalLeaf")}"
+                    else -> {
+                        val pkgPrefix = importedPath.substringBeforeLast('.', missingDelimiterValue = "")
+                        if (pkgPrefix.isEmpty()) leafMod else "$pkgPrefix.$leafMod"
+                    }
+                }
             } else {
                 importedPath
             }
@@ -342,11 +356,24 @@ internal fun KotlinJ2KEmitter.isResolvedCrateSubpackageModule(resolvedImportPath
     if (headerContext.crateSubpackageRawLeafNames.isEmpty()) return false
     val nsPrefix = currentNamespacePrefix() ?: return false
     if (!resolvedImportPath.startsWith("$nsPrefix.")) return false
+    val cleanRaw = rawLeafIdent.removePrefix("r#")
+    if (cleanRaw.firstOrNull()?.isLowerCase() != true || isKnownFunctionLeafIdent(cleanRaw)) return false
     val afterNs = resolvedImportPath.removePrefix("$nsPrefix.")
+    if (headerContext.crateSubpackageRawLeafNames[afterNs] == cleanRaw) return true
+    val pascalLeaf = rustTypeIdentToKotlin(cleanRaw)
+    if (afterNs == pascalLeaf || afterNs.endsWith(".$pascalLeaf")) {
+        val stripped = if (afterNs == pascalLeaf) "" else afterNs.removeSuffix(".$pascalLeaf")
+        if (stripped.isNotEmpty() && headerContext.crateSubpackageRawLeafNames[stripped] == cleanRaw) {
+            return true
+        }
+        val leafMod = rustModuleIdentToKotlin(cleanRaw.replace('-', '_'))
+        val candFromStripped = if (stripped.isEmpty()) leafMod else "$stripped.$leafMod"
+        if (headerContext.crateSubpackageRawLeafNames[candFromStripped] == cleanRaw) return true
+    }
     val parentSubpkg = afterNs.substringBeforeLast('.', missingDelimiterValue = "")
-    val leafMod = rustModuleIdentToKotlin(rawLeafIdent.replace('-', '_'))
+    val leafMod = rustModuleIdentToKotlin(cleanRaw.replace('-', '_'))
     val candidateSubpkg = if (parentSubpkg.isEmpty()) leafMod else "$parentSubpkg.$leafMod"
-    return headerContext.crateSubpackageRawLeafNames[candidateSubpkg] == rawLeafIdent.removePrefix("r#")
+    return headerContext.crateSubpackageRawLeafNames[candidateSubpkg] == cleanRaw
 }
 
 internal fun KotlinJ2KEmitter.scopedAbiKeysForRenderedType(renderedType: String): List<String> {
@@ -2520,6 +2547,7 @@ internal fun KotlinJ2KEmitter.renderItemForeignMod(
                     currentModPathPrefix
                         .lastOrNull()
                         ?.let { inspector.collidingInlineForeignFnRenames[it to rawFnName] }
+                        ?: if (currentModPathPrefix.isEmpty()) inspector.collidingTopLevelForeignFnRenames[rawFnName] else null
                 val fnName = collidedRename ?: rustFunctionIdentToKotlin(rawFnName)
                 val interopParams = mutableListOf<InteropParamSpec>()
                 scopeBuilder.enterDef()

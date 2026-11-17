@@ -21,6 +21,39 @@ import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.TraitItem
 import io.github.kotlinmania.syn.UnOp
 import io.github.kotlinmania.syn.gen.Visit
+internal fun KotlinJ2KEmitter.resolveUnnamedTupleFieldSynType(
+    baseExpr: Expr,
+    index: Int,
+): SynType? {
+    val unwrappedBase = unwrapParenOrGroupExpr(baseExpr)
+    val baseSynTy =
+        when (unwrappedBase) {
+            is Expr.Path ->
+                if (unwrappedBase.qself == null && unwrappedBase.path.segments.len() == 1) {
+                    val raw =
+                        unwrappedBase.path.segments
+                            .first()
+                            ?.ident
+                            ?.toString()
+                            ?.removePrefix("r#")
+                    when (raw) {
+                        "self" -> currentStandaloneImplSelfSynType
+                        null -> null
+                        else -> {
+                            val ktLocal = scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
+                            currentSourceParameterTypes[ktLocal] ?: currentSourceParameterTypes[raw]
+                        }
+                    }
+                } else {
+                    null
+                }
+            else -> null
+        } ?: return null
+    val unwrappedRef = unwrapSynType(baseSynTy).let { (it as? SynType.Reference)?.elem ?: it }
+    val tupleTy = unwrapSynType(unwrappedRef) as? SynType.Tuple ?: return null
+    return tupleTy.elems.toList().getOrNull(index)
+}
+
 internal fun KotlinJ2KEmitter.resolveContainerElementTraitCallee(callee: String): String? {
     val standaloneTraitPath = currentStandaloneImplTraitPath ?: return null
     val standaloneSelfSynType = currentStandaloneImplSelfSynType ?: return null
@@ -508,6 +541,10 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
                     }
             }
         is Expr.Field -> {
+            if (expr.member is Member.Unnamed) {
+                resolveUnnamedTupleFieldSynType(expr.base, (expr.member as Member.Unnamed).index.index.toInt())
+                    ?.let { return renderType(it, selfTypeName) }
+            }
             val baseReferenceTy = inferExprRenderedType(expr.base, selfTypeName) ?: return null
             val baseTy =
                 (

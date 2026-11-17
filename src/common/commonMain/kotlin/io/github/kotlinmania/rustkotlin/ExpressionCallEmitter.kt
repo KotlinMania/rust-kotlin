@@ -154,6 +154,9 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
     return when {
         nonUnitArgs.isEmpty() &&
             (calleeBase == "Default.default" || calleeBase.endsWith(".Default.default")) -> {
+            currentExpectedParseTargetType?.trim()?.let { targetTp ->
+                currentTypeParamWitnessCalls[targetTp to "default"]?.let { return "$it()" }
+            }
             currentTypeParamWitnessCalls["*" to "default"]?.let { return "$it()" }
             val targetTy = (currentExpectedParseTargetType ?: currentEnclosingReturnRenderedType)?.removeSuffix("?")?.trim()
             if (!targetTy.isNullOrEmpty()) {

@@ -153,10 +153,22 @@ internal fun KotlinJ2KEmitter.resolveEnclosingResultTypeArguments(rendered: Stri
         }
         val importsIoResult =
             importedSimpleNameToPkg["Result"]?.let { it.endsWith(".io") || it.endsWith(".io.error") } == true ||
-                extraTypePathImports.any { ".io." in it && it.endsWith(".Result") }
+                extraTypePathImports.any { (".io." in it || it.endsWith(".io.Result")) && it.endsWith(".Result") } ||
+                inspector.allUseItems.any { useItem ->
+                    val leaves = mutableListOf<UseLeaf>()
+                    collectUseLeaves(useItem.tree, emptyList(), leaves)
+                    leaves.any { leaf ->
+                        leaf.alias == null &&
+                            !leaf.isSelfImport &&
+                            leaf.segments.lastOrNull()?.removePrefix("r#") == "Result" &&
+                            leaf.segments.dropLast(1).any { it.removePrefix("r#") == "io" }
+                    }
+                }
+        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
         val errName =
             when {
-                importsIoResult -> "Error"
+                importsIoResult ->
+                    if (headerContext.packageName == "$coreNs.io.error") "Error" else "$coreNs.io.error.Error"
                 "Error" in importedSimpleNameToPkg -> "Error"
                 else -> return null
             }
