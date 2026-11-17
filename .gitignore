@@ -92,6 +92,9 @@ maven.properties
 *.keystore
 credentials*.json
 
+# Local Salieri/verification probe artifacts
+probes/
+
 # Java build helpers are source; buildSrc/build remains generated output.
 !buildSrc/
 !buildSrc/src/

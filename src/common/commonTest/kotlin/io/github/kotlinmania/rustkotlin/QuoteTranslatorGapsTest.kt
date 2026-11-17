@@ -385,7 +385,7 @@ class QuoteTranslatorGapsTest {
             isDirectory = { it == "tmp/quote/src" },
             collectRustFiles = { files.keys.toList() },
             report = {},
-            resolveGradleProperties = { null },
+            resolveRustKotlinProperties = { null },
             resolvePackageProperties = { null },
             resolveCrateMacroSources = { emptyList() },
             resolveCrateFlatFileModules = { _, _ -> emptySet() },

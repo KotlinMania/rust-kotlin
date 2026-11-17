@@ -1329,4 +1329,27 @@ class SingleFileTranslationSynAndMacrosTest {
         assertContains(kt, "public fun runPing(): Int")
         assertContains(kt, "return 7")
     }
+
+    @Test
+    fun proseCommentsAvoidLifetimeTicksAndMatchBracesAndSnakeCaseCardIds() {
+        val rustSource =
+            """
+            /// Look for a match at 'ptr' across repeated-{huge,small} cases; bit 'i' stays intact.
+            pub fn scan_probe(x: usize) -> usize {
+                x
+            }
+
+            #[test]
+            fn prop_check() {
+                quickcheck::quickcheck!(fn prop() -> bool { true });
+            }
+            """.trimIndent()
+
+        val kt = renderSingleKotlinFile(rustSource).text
+        assertContains(kt, "`ptr`")
+        assertContains(kt, "`i`")
+        assertContains(kt, "repeated-(huge,small)")
+        assertFalse(kt.contains("'ptr'"))
+        assertFalse(kt.contains("t_19971811"))
+    }
 }

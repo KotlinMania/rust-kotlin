@@ -18,7 +18,7 @@ import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.vfs.VirtualFileVisitor
 import io.github.kotlinmania.io.IOException
 
-private const val GRADLE_PROPERTIES_PATH_KEY = "io.github.kotlinmania.rust-transpiler.gradlePropertiesPath"
+private const val RUSTKOTLIN_PROPERTIES_PATH_KEY = "io.github.kotlinmania.rust-transpiler.rustKotlinPropertiesPath"
 
 private enum class BatchOverwriteDecision {
     OVERWRITE_ONE,
@@ -33,73 +33,73 @@ class RustTranspilerService(
 ) {
     var overwriteConfirmationHandler: ((TargetKotlinFileDetails) -> Boolean)? = null
 
-    fun getConfiguredGradlePropertiesFile(): VirtualFile? {
+    fun getConfiguredRustKotlinPropertiesFile(): VirtualFile? {
         val savedPath =
             PropertiesComponent
                 .getInstance(project)
-                .getValue(GRADLE_PROPERTIES_PATH_KEY)
+                .getValue(RUSTKOTLIN_PROPERTIES_PATH_KEY)
                 ?.trim()
                 ?.takeIf { it.isNotEmpty() }
                 ?: return null
         return LocalFileSystem.getInstance().findFileByPath(savedPath)?.takeIf { it.isValid && !it.isDirectory }
     }
 
-    fun setConfiguredGradlePropertiesPath(path: String) {
-        PropertiesComponent.getInstance(project).setValue(GRADLE_PROPERTIES_PATH_KEY, path)
+    fun setConfiguredRustKotlinPropertiesPath(path: String) {
+        PropertiesComponent.getInstance(project).setValue(RUSTKOTLIN_PROPERTIES_PATH_KEY, path)
     }
 
-    fun promptForGradlePropertiesFile(initialContextFile: VirtualFile? = null): VirtualFile? {
+    fun promptForRustKotlinPropertiesFile(initialContextFile: VirtualFile? = null): VirtualFile? {
         val descriptor =
             FileChooserDescriptorFactory
                 .createSingleFileDescriptor("properties")
-                .withTitle(MyMessageBundle.message("chooser.gradle.properties.title"))
-                .withDescription(MyMessageBundle.message("chooser.gradle.properties.description"))
+                .withTitle(MyMessageBundle.message("chooser.rustkotlin.properties.title"))
+                .withDescription(MyMessageBundle.message("chooser.rustkotlin.properties.description"))
                 .withFileFilter { file ->
-                    file.name.equals("gradle.properties", ignoreCase = true) ||
+                    file.name.equals("rustkotlin.properties", ignoreCase = true) ||
                         file.extension.equals("properties", ignoreCase = true)
                 }
         val initialSelection =
-            getConfiguredGradlePropertiesFile()
-                ?: findNearestGradlePropertiesVirtualFile(initialContextFile)
-                ?: project.guessProjectDir()?.findChild("gradle.properties")
+            getConfiguredRustKotlinPropertiesFile()
+                ?: findNearestRustKotlinPropertiesVirtualFile(initialContextFile)
+                ?: project.guessProjectDir()?.findChild("rustkotlin.properties")
                 ?: project.guessProjectDir()
 
         val chosen = FileChooser.chooseFile(descriptor, project, initialSelection) ?: return null
-        setConfiguredGradlePropertiesPath(chosen.path)
+        setConfiguredRustKotlinPropertiesPath(chosen.path)
         return chosen
     }
 
-    fun ensureGradlePropertiesConfigured(initialContextFile: VirtualFile? = null): GradleProjectProperties? {
-        val existingFile = getConfiguredGradlePropertiesFile()
+    fun ensureRustKotlinPropertiesConfigured(initialContextFile: VirtualFile? = null): RustKotlinProperties? {
+        val existingFile = getConfiguredRustKotlinPropertiesFile()
         val targetFile =
             if (existingFile != null) {
                 existingFile
             } else if (ApplicationManager.getApplication().isUnitTestMode) {
-                findNearestGradlePropertiesVirtualFile(initialContextFile)
-                    ?: project.guessProjectDir()?.findChild("gradle.properties")
+                findNearestRustKotlinPropertiesVirtualFile(initialContextFile)
+                    ?: project.guessProjectDir()?.findChild("rustkotlin.properties")
             } else {
-                promptForGradlePropertiesFile(initialContextFile)
+                promptForRustKotlinPropertiesFile(initialContextFile)
             }
-        return targetFile?.let { loadGradleProperties(it) }
+        return targetFile?.let { loadRustKotlinProperties(it) }
     }
 
-    fun loadGradleProperties(file: VirtualFile): GradleProjectProperties {
+    fun loadRustKotlinProperties(file: VirtualFile): RustKotlinProperties {
         val text = VfsUtilCore.loadText(file)
-        return parseGradleProperties(text)
+        return parseRustKotlinProperties(text)
     }
 
     fun transpileSource(
         source: String,
         sourceFilePath: String? = null,
         targetFilePath: String? = null,
-        gradleProperties: GradleProjectProperties? = ensureGradlePropertiesConfigured(),
+        rustKotlinProperties: RustKotlinProperties? = ensureRustKotlinPropertiesConfigured(),
         packageProperties: FolderPackageProperties? = null,
     ): String {
         val inferred =
             inferFileHeaderContext(
                 inputPath = sourceFilePath,
                 outputPath = targetFilePath,
-                gradleProperties = gradleProperties,
+                rustKotlinProperties = rustKotlinProperties,
                 packageProperties = packageProperties,
             )
         val contextVirtualFile =
@@ -121,9 +121,9 @@ class RustTranspilerService(
         val headerContext =
             FileHeaderContext(
                 portLintSourcePath = inferred.portLintSourcePath ?: sourceFilePath,
-                packageName = inferred.packageName ?: gradleProperties?.projectNamespace,
-                projectGroup = inferred.projectGroup ?: gradleProperties?.projectGroup,
-                projectNamespace = inferred.projectNamespace ?: gradleProperties?.projectNamespace,
+                packageName = inferred.packageName ?: rustKotlinProperties?.projectNamespace,
+                projectGroup = inferred.projectGroup ?: rustKotlinProperties?.projectGroup,
+                projectNamespace = inferred.projectNamespace ?: rustKotlinProperties?.projectNamespace,
                 crateNamespaces = inferred.crateNamespaces,
                 crateMacroSources = macroSources,
                 crateFlatFileModules = flatModules,
@@ -274,23 +274,23 @@ class RustTranspilerService(
 
     fun transpileDirectoryRecursively(
         directory: VirtualFile,
-        gradleProperties: GradleProjectProperties? = ensureGradlePropertiesConfigured(directory),
+        rustKotlinProperties: RustKotlinProperties? = ensureRustKotlinPropertiesConfigured(directory),
     ): List<VirtualFile> {
         require(directory.isDirectory) {
             "Expected a directory for recursive translation: ${directory.path}"
         }
-        return transpileVirtualFiles(arrayOf(directory), gradleProperties)
+        return transpileVirtualFiles(arrayOf(directory), rustKotlinProperties)
     }
 
     fun transpileVirtualFiles(
         selectedFiles: Array<out VirtualFile>,
-        gradleProperties: GradleProjectProperties? = null,
+        rustKotlinProperties: RustKotlinProperties? = null,
     ): List<VirtualFile> {
         val rustFiles = collectTranspilableRustFiles(selectedFiles)
         if (rustFiles.isEmpty()) return emptyList()
-        val resolvedGradleProperties = gradleProperties ?: ensureGradlePropertiesConfigured(rustFiles.first())
+        val resolvedRustKotlinProperties = rustKotlinProperties ?: ensureRustKotlinPropertiesConfigured(rustFiles.first())
         if (rustFiles.size == 1) {
-            return listOfNotNull(transpileVirtualFile(rustFiles.single(), resolvedGradleProperties))
+            return listOfNotNull(transpileVirtualFile(rustFiles.single(), resolvedRustKotlinProperties))
         }
 
         val generatedFiles = mutableListOf<VirtualFile>()
@@ -302,7 +302,7 @@ class RustTranspilerService(
             val generated =
                 transpileVirtualFile(
                     rustFile = rustFile,
-                    gradleProperties = resolvedGradleProperties,
+                    rustKotlinProperties = resolvedRustKotlinProperties,
                     confirmOverwrite = { details ->
                         if (overwriteAll) {
                             true
@@ -331,7 +331,7 @@ class RustTranspilerService(
 
     fun transpileVirtualFile(
         rustFile: VirtualFile,
-        gradleProperties: GradleProjectProperties? = ensureGradlePropertiesConfigured(rustFile),
+        rustKotlinProperties: RustKotlinProperties? = ensureRustKotlinPropertiesConfigured(rustFile),
         confirmOverwrite: (TargetKotlinFileDetails) -> Boolean = ::confirmOverwriteTargetKotlinFile,
     ): VirtualFile? {
         require(isTranspilableRustFile(rustFile)) {
@@ -370,7 +370,7 @@ class RustTranspilerService(
             inferFileHeaderContext(
                 inputPath = rustFile.path,
                 outputPath = targetPath,
-                gradleProperties = gradleProperties,
+                rustKotlinProperties = rustKotlinProperties,
                 packageProperties = packageProperties,
             )
         val vfsMacroSources =
@@ -420,8 +420,8 @@ class RustTranspilerService(
                 val parsed = parsePackageProperties(VfsUtilCore.loadText(pkgCandidate))
                 foundLayers += parsed to traversedDirs.reversed()
             }
-            val gradleCandidate = current.findChild("gradle.properties")
-            if (gradleCandidate != null && !gradleCandidate.isDirectory) {
+            val rustKotlinCandidate = current.findChild("rustkotlin.properties")
+            if (rustKotlinCandidate != null && !rustKotlinCandidate.isDirectory) {
                 break
             }
             val dirName = current.name
@@ -556,10 +556,10 @@ class RustTranspilerService(
         return sources
     }
 
-    private fun findNearestGradlePropertiesVirtualFile(startFile: VirtualFile?): VirtualFile? {
+    private fun findNearestRustKotlinPropertiesVirtualFile(startFile: VirtualFile?): VirtualFile? {
         var current = if (startFile?.isDirectory == true) startFile else startFile?.parent
         while (current != null) {
-            val candidate = current.findChild("gradle.properties")
+            val candidate = current.findChild("rustkotlin.properties")
             if (candidate != null && !candidate.isDirectory) {
                 return candidate
             }

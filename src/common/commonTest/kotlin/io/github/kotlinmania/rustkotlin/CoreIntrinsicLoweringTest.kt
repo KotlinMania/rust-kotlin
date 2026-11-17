@@ -287,7 +287,7 @@ class CoreIntrinsicLoweringTest {
         assertFalse(bindingGyp.contains("KM_NAPI_STANDALONE_MODULE"))
 
         val props =
-            parseGradleProperties(
+            parseRustKotlinProperties(
                 """
                 project.group=io.github.kotlinmania
                 project.namespace=io.github.kotlinmania.rustlang
@@ -678,8 +678,8 @@ class CoreIntrinsicLoweringTest {
             inferFileHeaderContext(
                 inputPath = "tmp/rust/library/core/src/num/uint_macros.rs",
                 outputPath = "src/common/commonMain/kotlin/io/github/kotlinmania/rustlang/core/num/NumFunctions.kt",
-                gradleProperties =
-                    GradleProjectProperties(
+                rustKotlinProperties =
+                    RustKotlinProperties(
                         projectGroup = "io.github.kotlinmania.rustlang",
                         projectNamespace = "io.github.kotlinmania.rustlang",
                         crateNamespaces = mapOf("core" to coreNs),

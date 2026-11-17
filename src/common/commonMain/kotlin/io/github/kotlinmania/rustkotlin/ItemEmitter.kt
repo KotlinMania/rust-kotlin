@@ -127,6 +127,7 @@ internal inline fun <R> KotlinJ2KEmitter.withGenericParamScope(
 ): R {
     val prevTypeParams = activeTypeParamNames
     val prevConstParams = activeConstParamNames
+    val prevTraitAssoc = currentTraitAssocParamNames
     activeTypeParamNames = prevTypeParams + collectGenericTypeParamNames(generics)
     activeConstParamNames = prevConstParams + collectGenericConstParamNames(generics)
     return try {
@@ -134,6 +135,7 @@ internal inline fun <R> KotlinJ2KEmitter.withGenericParamScope(
     } finally {
         activeConstParamNames = prevConstParams
         activeTypeParamNames = prevTypeParams
+        currentTraitAssocParamNames = prevTraitAssoc
     }
 }
 
@@ -164,6 +166,7 @@ internal inline fun <R> KotlinJ2KEmitter.withFunctionRenderScope(
     val prevSmartCastLocals = currentSmartCastNonNullLocals
     val prevTypeParams = activeTypeParamNames
     val prevConstParams = activeConstParamNames
+    val prevTraitAssoc = currentTraitAssocParamNames
     val prevSubst = substitutedTypeParamTypes
     val prevIntoSubstTps = currentIntoSubstitutedTypeParams
     val prevIntoSubstParams = currentIntoSubstitutedParams
@@ -264,6 +267,7 @@ internal inline fun <R> KotlinJ2KEmitter.withFunctionRenderScope(
         currentSmartCastNonNullLocals = prevSmartCastLocals
         activeConstParamNames = prevConstParams
         activeTypeParamNames = prevTypeParams
+        currentTraitAssocParamNames = prevTraitAssoc
         substitutedTypeParamTypes = prevSubst
         currentIntoSubstitutedTypeParams = prevIntoSubstTps
         currentIntoSubstitutedParams = prevIntoSubstParams
@@ -544,7 +548,7 @@ internal fun KotlinJ2KEmitter.renderItemFn(
         val retType = extractReturnSynType(item.sig.output)
         val panicExpectation = if (!isLocalItem && hasTestAttribute(item.attrs)) extractRustPanicExpectation(item.attrs) else null
         val bodyIndent = if (panicExpectation == null) indent else "$indent    "
-        val shadows = computeReassignedParamShadows(item.sig, fnBlock, "$bodyIndent    ")
+        val shadows = computeReassignedParamShadows(item.sig, fnBlock, "$bodyIndent    ", selfTypeName = null)
         val body =
             renderBlock(
                 fnBlock,
@@ -1211,8 +1215,11 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
     val unboundedOwnerTypeParams = collectUnboundedGenericTypeParamNames(item.generics)
     val prevStructTypeParams = activeTypeParamNames
     val prevStructConstParams = activeConstParamNames
+    val prevStructTraitAssoc = currentTraitAssocParamNames
     activeTypeParamNames = activeTypeParamNames + collectGenericTypeParamNames(item.generics)
     activeConstParamNames = activeConstParamNames + collectGenericConstParamNames(item.generics)
+    currentTraitAssocParamNames =
+        currentTraitAssocParamNames + sourceAssociatedParameters(item.generics).map { it.associated }
     val typeParams: String
     val whereClause: String
     val superTraits = mutableListOf<String>()
@@ -1358,196 +1365,197 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
             }
             is Fields.Unit -> {}
         }
+
+        // A repr(transparent) wrapper does not own a detached Kotlin field. Its
+        // constructor receives the field's Rust layout explicitly, and every view
+        // projects the same allocation. Generic erasure is never a layout proof.
+        val liveField = sourceTransparentField(item, selfTypeWithGenerics)
+        val extraCompanionMembers = mutableListOf<String>()
+        var forceInternalPrimaryCtor = false
+        val swiftSafeBodyProps = mutableListOf<String>()
+        val useBodyPropertiesForLargeStruct =
+            liveField == null &&
+                useFinalAbiLayout &&
+                ctorParams.size > 64 &&
+                fieldSpecs.all { it.defaultExpr != null }
+        if (liveField != null) {
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.MutPtr")
+            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.TypeLayout")
+            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.TransparentTypeLayout")
+            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.allocateNativeCell")
+            val (fieldName, fieldType) = liveField
+            val transparentConcreteForSwift =
+                !isLocalItem && vis == "public " && fieldType.trim() !in unboundedOwnerTypeParams
+            val fieldIsConcreteGeneric =
+                !isLocalItem && vis == "public " && isConcreteGenericTypeForSwiftExport(fieldType, unboundedOwnerTypeParams)
+            ctorParams.clear()
+            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
+            ctorParams += "public val fieldStorage: MutPtr<$fieldType>"
+            ctorParams += "public val fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()"
+            bodyFieldProps.clear()
+            val setterPrefix = if (fieldIsConcreteGeneric) "internal set" else "set"
+            extraIterableMembers += "$indent    public var $fieldName: $fieldType\n" +
+                "$indent        get() = fieldLayout.readNative(fieldStorage.rawAddress)\n" +
+                "$indent        $setterPrefix(value) { fieldLayout.writeNative(fieldStorage.rawAddress, value) }"
+            val alignedFieldLayout =
+                sourceStorageAlignment(item)?.let {
+                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.AlignedTypeLayout")
+                    "AlignedTypeLayout(fieldLayout, ${it}L)"
+                } ?: "fieldLayout"
+            val secCtorVis = if (transparentConcreteForSwift) "internal" else "public"
+            extraIterableMembers += "$indent    $secCtorVis constructor($fieldName: $fieldType, fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()) : " +
+                "this(allocateNativeCell($fieldName, $alignedFieldLayout), $alignedFieldLayout)"
+            extraIterableMembers += "$indent    public fun pointerLayout(): TypeLayout<$selfTypeWithGenerics> = " +
+                "TransparentTypeLayout(fieldLayout, " +
+                "{ ptr, layout -> $selfTypeWithGenerics(ptr, layout) }, { it.$fieldName })"
+            if (transparentConcreteForSwift) {
+                forceInternalPrimaryCtor = true
+                val fnTypeParams = if (typeParams.isNotEmpty()) "$typeParams " else ""
+                extraCompanionMembers +=
+                    "$indent        public operator fun ${fnTypeParams}invoke($fieldName: $fieldType, fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()): $selfTypeWithGenerics = " +
+                    "$selfTypeWithGenerics($fieldName, fieldLayout)"
+                extraCompanionMembers +=
+                    "$indent        public fun ${fnTypeParams}fromFieldStorage(fieldStorage: MutPtr<$fieldType>, fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()): $selfTypeWithGenerics = " +
+                    "$selfTypeWithGenerics(fieldStorage, fieldLayout)"
+            }
+        } else if (!headerContext.rawAbiMode && !isLocalItem) {
+            val computedStructLayout = StructLayoutComputer.computeStructLayout(item, this)
+            if (computedStructLayout != null) {
+                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+                extraCompanionMembers +=
+                    StructLayoutComputer.renderStructTypeLayoutMethod(
+                        layout = computedStructLayout,
+                        genericTypeParamsRendered = typeParams,
+                        selfTypeWithGenerics = selfTypeWithGenerics,
+                        coreNamespace = coreNs,
+                        indent = "$indent    ",
+                        emittedFieldTypesByName = fieldNameAndTypes.toMap(),
+                        useBodyPropertiesCtor = useBodyPropertiesForLargeStruct,
+                        emitter = this,
+                    )
+            }
+        }
+        val transparentPtrField = liveField ?: fieldNameAndTypes.singleOrNull()
+        if (typeName == "NonNull" && transparentPtrField != null &&
+            transparentPtrField.second
+                .substringBefore('<')
+                .substringAfterLast('.')
+                .trim() in setOf("ConstPtr", "MutPtr")
+        ) {
+            val ptrFieldName = transparentPtrField.first
+            extraIterableMembers += "$indent    public val rawAddress: Long\n$indent        get() = $ptrFieldName.rawAddress"
+            extraIterableMembers += "$indent    public val rawMeta: Long\n$indent        get() = $ptrFieldName.rawMeta"
+        }
+
+        val needsSwiftSafeStructCtor =
+            liveField == null &&
+                !useBodyPropertiesForLargeStruct &&
+                !isLocalItem &&
+                vis == "public " &&
+                fieldSpecs.any { it.vis == "public " && it.isConcreteGenericForSwift }
+        val wouldHaveBeenDataClass =
+            liveField == null && useFinalAbiLayout &&
+                ctorParams.size in 1..16 &&
+                superTraits.isEmpty() &&
+                extraIterableMembers.isEmpty() &&
+                typeParams.isEmpty()
+
+        if (needsSwiftSafeStructCtor) {
+            forceInternalPrimaryCtor = true
+            populateSwiftSafeCtorAndDataMethods(
+                specs = fieldSpecs,
+                ctorParams = ctorParams,
+                swiftSafePropsOut = swiftSafeBodyProps,
+                extraMembersOut = extraIterableMembers,
+                extraCompanionMembersOut = extraCompanionMembers,
+                attachedImpls = effectiveAttachedImpls,
+                typeName = typeName,
+                typeParamCount = typeParamCount,
+                typeParams = typeParams,
+                selfTypeWithGenerics = selfTypeWithGenerics,
+                wouldHaveBeenDataClass = wouldHaveBeenDataClass,
+                indent = indent,
+            )
+        }
+
+        val isDataClass = wouldHaveBeenDataClass && !needsSwiftSafeStructCtor
+        if (isDataClass && fieldNameAndTypes.any { isPrimitiveArrayRenderedType(it.second) }) {
+            extraIterableMembers.addAll(buildArrayAwareDataClassMethods(typeName, fieldNameAndTypes, "$indent    "))
+        }
+        if (!isDataClass &&
+            !useBodyPropertiesForLargeStruct &&
+            !attachedImplDefinesInstanceMethod(effectiveAttachedImpls, "clone") &&
+            hasDeriveTrait(item.attrs, "Clone")
+        ) {
+            val cloneOpenMod = if (useFinalAbiLayout) "" else "open "
+            if (liveField != null) {
+                extraIterableMembers +=
+                    "$indent    public ${cloneOpenMod}fun clone(): $selfTypeWithGenerics = $selfTypeWithGenerics(${liveField.first}, fieldLayout)"
+            } else {
+                val cloneArgs = fieldNameAndTypes.joinToString(", ") { it.first }
+                extraIterableMembers +=
+                    "$indent    public ${cloneOpenMod}fun clone(): $selfTypeWithGenerics = $typeName($cloneArgs)"
+            }
+        }
+        val classKeyword =
+            when {
+                isDataClass -> "data class "
+                useFinalAbiLayout -> "class "
+                else -> "open class "
+            }
+
+        sb
+            .append(indent)
+            .append(vis)
+            .append(classKeyword)
+            .append(typeName)
+            .append(typeParams)
+        if (ctorParams.isNotEmpty() && !useBodyPropertiesForLargeStruct) {
+            val ctorHeaderPrefix = if (forceInternalPrimaryCtor) " internal constructor" else ""
+            appendFormattedCtorParams(sb, indent, ctorHeaderPrefix, ctorParams)
+        }
+        if (superTraits.isNotEmpty()) {
+            sb.append(" : ").append(superTraits.joinToString(", "))
+        }
+        sb.append(whereClause)
+
+        val extraProps =
+            when {
+                useBodyPropertiesForLargeStruct -> bodyFieldProps + buildTupleStructAliasProperties(item.fields, selfTypeWithGenerics, "$indent    ")
+                swiftSafeBodyProps.isNotEmpty() -> swiftSafeBodyProps + buildTupleStructAliasProperties(item.fields, selfTypeWithGenerics, "$indent    ")
+                else -> buildTupleStructAliasProperties(item.fields, selfTypeWithGenerics, "$indent    ")
+            }
+        val prevOverrideNames = currentStructOverrideMethodNames
+        currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits, ownerIsPublic = (vis == "public "))
+        val memberLines =
+            try {
+                renderAttachedImplMembers(
+                    typeName = selfTypeWithGenerics,
+                    ownerGenerics = item.generics,
+                    attachedImpls = effectiveAttachedImpls,
+                    indent = "$indent    ",
+                    extraProperties = extraProps,
+                    extraMembers = extraIterableMembers,
+                    extraCompanionMembers = extraCompanionMembers,
+                    isLocalClass = isLocalItem,
+                    structFieldNames = fieldNameAndTypes.mapTo(linkedSetOf()) { it.first },
+                )
+            } finally {
+                currentStructOverrideMethodNames = prevOverrideNames
+            }
+        if (memberLines.isNotEmpty()) {
+            sb.append(" {\n")
+            sb.append(memberLines)
+            if (!memberLines.endsWith('\n')) sb.append('\n')
+            sb.append(indent).append("}")
+        }
+        return sb.toString()
     } finally {
+        currentTraitAssocParamNames = prevStructTraitAssoc
         activeConstParamNames = prevStructConstParams
         activeTypeParamNames = prevStructTypeParams
     }
-
-    // A repr(transparent) wrapper does not own a detached Kotlin field. Its
-    // constructor receives the field's Rust layout explicitly, and every view
-    // projects the same allocation. Generic erasure is never a layout proof.
-    val liveField = sourceTransparentField(item, selfTypeWithGenerics)
-    val extraCompanionMembers = mutableListOf<String>()
-    var forceInternalPrimaryCtor = false
-    val swiftSafeBodyProps = mutableListOf<String>()
-    val useBodyPropertiesForLargeStruct =
-        liveField == null &&
-            useFinalAbiLayout &&
-            ctorParams.size > 64 &&
-            fieldSpecs.all { it.defaultExpr != null }
-    if (liveField != null) {
-        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.MutPtr")
-        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.TypeLayout")
-        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.TransparentTypeLayout")
-        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.allocateNativeCell")
-        val (fieldName, fieldType) = liveField
-        val transparentConcreteForSwift =
-            !isLocalItem && vis == "public " && fieldType.trim() !in unboundedOwnerTypeParams
-        val fieldIsConcreteGeneric =
-            !isLocalItem && vis == "public " && isConcreteGenericTypeForSwiftExport(fieldType, unboundedOwnerTypeParams)
-        ctorParams.clear()
-        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
-        ctorParams += "public val fieldStorage: MutPtr<$fieldType>"
-        ctorParams += "public val fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()"
-        bodyFieldProps.clear()
-        val setterPrefix = if (fieldIsConcreteGeneric) "internal set" else "set"
-        extraIterableMembers += "$indent    public var $fieldName: $fieldType\n" +
-            "$indent        get() = fieldLayout.readNative(fieldStorage.rawAddress)\n" +
-            "$indent        $setterPrefix(value) { fieldLayout.writeNative(fieldStorage.rawAddress, value) }"
-        val alignedFieldLayout =
-            sourceStorageAlignment(item)?.let {
-                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.AlignedTypeLayout")
-                "AlignedTypeLayout(fieldLayout, ${it}L)"
-            } ?: "fieldLayout"
-        val secCtorVis = if (transparentConcreteForSwift) "internal" else "public"
-        extraIterableMembers += "$indent    $secCtorVis constructor($fieldName: $fieldType, fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()) : " +
-            "this(allocateNativeCell($fieldName, $alignedFieldLayout), $alignedFieldLayout)"
-        extraIterableMembers += "$indent    public fun pointerLayout(): TypeLayout<$selfTypeWithGenerics> = " +
-            "TransparentTypeLayout(fieldLayout, " +
-            "{ ptr, layout -> $selfTypeWithGenerics(ptr, layout) }, { it.$fieldName })"
-        if (transparentConcreteForSwift) {
-            forceInternalPrimaryCtor = true
-            val fnTypeParams = if (typeParams.isNotEmpty()) "$typeParams " else ""
-            extraCompanionMembers +=
-                "$indent        public operator fun ${fnTypeParams}invoke($fieldName: $fieldType, fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()): $selfTypeWithGenerics = " +
-                "$selfTypeWithGenerics($fieldName, fieldLayout)"
-            extraCompanionMembers +=
-                "$indent        public fun ${fnTypeParams}fromFieldStorage(fieldStorage: MutPtr<$fieldType>, fieldLayout: TypeLayout<$fieldType> = UnresolvedTypeLayout()): $selfTypeWithGenerics = " +
-                "$selfTypeWithGenerics(fieldStorage, fieldLayout)"
-        }
-    } else if (!headerContext.rawAbiMode && !isLocalItem) {
-        val computedStructLayout = StructLayoutComputer.computeStructLayout(item, this)
-        if (computedStructLayout != null) {
-            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-            extraCompanionMembers +=
-                StructLayoutComputer.renderStructTypeLayoutMethod(
-                    layout = computedStructLayout,
-                    genericTypeParamsRendered = typeParams,
-                    selfTypeWithGenerics = selfTypeWithGenerics,
-                    coreNamespace = coreNs,
-                    indent = "$indent    ",
-                    emittedFieldTypesByName = fieldNameAndTypes.toMap(),
-                    useBodyPropertiesCtor = useBodyPropertiesForLargeStruct,
-                    emitter = this,
-                )
-        }
-    }
-    val transparentPtrField = liveField ?: fieldNameAndTypes.singleOrNull()
-    if (typeName == "NonNull" && transparentPtrField != null &&
-        transparentPtrField.second
-            .substringBefore('<')
-            .substringAfterLast('.')
-            .trim() in setOf("ConstPtr", "MutPtr")
-    ) {
-        val ptrFieldName = transparentPtrField.first
-        extraIterableMembers += "$indent    public val rawAddress: Long\n$indent        get() = $ptrFieldName.rawAddress"
-        extraIterableMembers += "$indent    public val rawMeta: Long\n$indent        get() = $ptrFieldName.rawMeta"
-    }
-
-    val needsSwiftSafeStructCtor =
-        liveField == null &&
-            !useBodyPropertiesForLargeStruct &&
-            !isLocalItem &&
-            vis == "public " &&
-            fieldSpecs.any { it.vis == "public " && it.isConcreteGenericForSwift }
-    val wouldHaveBeenDataClass =
-        liveField == null && useFinalAbiLayout &&
-            ctorParams.size in 1..16 &&
-            superTraits.isEmpty() &&
-            extraIterableMembers.isEmpty() &&
-            typeParams.isEmpty()
-
-    if (needsSwiftSafeStructCtor) {
-        forceInternalPrimaryCtor = true
-        populateSwiftSafeCtorAndDataMethods(
-            specs = fieldSpecs,
-            ctorParams = ctorParams,
-            swiftSafePropsOut = swiftSafeBodyProps,
-            extraMembersOut = extraIterableMembers,
-            extraCompanionMembersOut = extraCompanionMembers,
-            attachedImpls = effectiveAttachedImpls,
-            typeName = typeName,
-            typeParamCount = typeParamCount,
-            typeParams = typeParams,
-            selfTypeWithGenerics = selfTypeWithGenerics,
-            wouldHaveBeenDataClass = wouldHaveBeenDataClass,
-            indent = indent,
-        )
-    }
-
-    val isDataClass = wouldHaveBeenDataClass && !needsSwiftSafeStructCtor
-    if (isDataClass && fieldNameAndTypes.any { isPrimitiveArrayRenderedType(it.second) }) {
-        extraIterableMembers.addAll(buildArrayAwareDataClassMethods(typeName, fieldNameAndTypes, "$indent    "))
-    }
-    if (!isDataClass &&
-        !useBodyPropertiesForLargeStruct &&
-        !attachedImplDefinesInstanceMethod(effectiveAttachedImpls, "clone") &&
-        hasDeriveTrait(item.attrs, "Clone")
-    ) {
-        val cloneOpenMod = if (useFinalAbiLayout) "" else "open "
-        if (liveField != null) {
-            extraIterableMembers +=
-                "$indent    public ${cloneOpenMod}fun clone(): $selfTypeWithGenerics = $selfTypeWithGenerics(${liveField.first}, fieldLayout)"
-        } else {
-            val cloneArgs = fieldNameAndTypes.joinToString(", ") { it.first }
-            extraIterableMembers +=
-                "$indent    public ${cloneOpenMod}fun clone(): $selfTypeWithGenerics = $typeName($cloneArgs)"
-        }
-    }
-    val classKeyword =
-        when {
-            isDataClass -> "data class "
-            useFinalAbiLayout -> "class "
-            else -> "open class "
-        }
-
-    sb
-        .append(indent)
-        .append(vis)
-        .append(classKeyword)
-        .append(typeName)
-        .append(typeParams)
-    if (ctorParams.isNotEmpty() && !useBodyPropertiesForLargeStruct) {
-        val ctorHeaderPrefix = if (forceInternalPrimaryCtor) " internal constructor" else ""
-        appendFormattedCtorParams(sb, indent, ctorHeaderPrefix, ctorParams)
-    }
-    if (superTraits.isNotEmpty()) {
-        sb.append(" : ").append(superTraits.joinToString(", "))
-    }
-    sb.append(whereClause)
-
-    val extraProps =
-        when {
-            useBodyPropertiesForLargeStruct -> bodyFieldProps + buildTupleStructAliasProperties(item.fields, selfTypeWithGenerics, "$indent    ")
-            swiftSafeBodyProps.isNotEmpty() -> swiftSafeBodyProps + buildTupleStructAliasProperties(item.fields, selfTypeWithGenerics, "$indent    ")
-            else -> buildTupleStructAliasProperties(item.fields, selfTypeWithGenerics, "$indent    ")
-        }
-    val prevOverrideNames = currentStructOverrideMethodNames
-    currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits, ownerIsPublic = (vis == "public "))
-    val memberLines =
-        try {
-            renderAttachedImplMembers(
-                typeName = selfTypeWithGenerics,
-                ownerGenerics = item.generics,
-                attachedImpls = effectiveAttachedImpls,
-                indent = "$indent    ",
-                extraProperties = extraProps,
-                extraMembers = extraIterableMembers,
-                extraCompanionMembers = extraCompanionMembers,
-                isLocalClass = isLocalItem,
-                structFieldNames = fieldNameAndTypes.mapTo(linkedSetOf()) { it.first },
-            )
-        } finally {
-            currentStructOverrideMethodNames = prevOverrideNames
-        }
-    if (memberLines.isNotEmpty()) {
-        sb.append(" {\n")
-        sb.append(memberLines)
-        if (!memberLines.endsWith('\n')) sb.append('\n')
-        sb.append(indent).append("}")
-    }
-    return sb.toString()
 }
 
 internal fun KotlinJ2KEmitter.renderItemUnion(

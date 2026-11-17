@@ -5,7 +5,7 @@ import io.github.kotlinmania.io.files.SystemFileSystem
 import io.github.kotlinmania.io.readString
 import io.github.kotlinmania.io.files.Path as KmPath
 
-public data class GradleProjectProperties(
+public data class RustKotlinProperties(
     public val projectGroup: String? = null,
     public val projectNamespace: String? = null,
     public val projectName: String? = null,
@@ -64,7 +64,7 @@ private fun extractCrateNamespaceOverrides(map: Map<String, String>): Map<String
     return overrides
 }
 
-public fun parseGradleProperties(content: String): GradleProjectProperties {
+public fun parseRustKotlinProperties(content: String): RustKotlinProperties {
     val (map, _) = parsePropertiesMap(content)
     val group =
         map["project.group"]?.takeIf { it.isNotEmpty() }
@@ -82,7 +82,7 @@ public fun parseGradleProperties(content: String): GradleProjectProperties {
         } else {
             explicitNamespace
         }
-    return GradleProjectProperties(
+    return RustKotlinProperties(
         projectGroup = group,
         projectNamespace = derivedNamespace,
         projectName = name,
@@ -134,12 +134,12 @@ private fun startingDirectoryKmPath(startPath: String?): KmPath? {
     return if (isKmDirectory(resolved)) resolved else (resolved.parent ?: resolved)
 }
 
-public fun findNearestGradleProperties(startPath: String?): GradleProjectProperties? {
+public fun findNearestRustKotlinProperties(startPath: String?): RustKotlinProperties? {
     var current = startingDirectoryKmPath(startPath)
     while (current != null) {
-        val candidate = KmPath(current, "gradle.properties")
+        val candidate = KmPath(current, "rustkotlin.properties")
         if (isKmRegularFile(candidate)) {
-            return parseGradleProperties(readKmFileText(candidate))
+            return parseRustKotlinProperties(readKmFileText(candidate))
         }
         current = current.parent
     }
@@ -157,8 +157,8 @@ public fun findNearestPackageProperties(startPath: String?): FolderPackageProper
             val parsed = parsePackageProperties(readKmFileText(pkgCandidate))
             foundLayers += parsed to traversedDirs.reversed()
         }
-        val gradleCandidate = KmPath(current, "gradle.properties")
-        if (isKmRegularFile(gradleCandidate)) {
+        val rustKotlinCandidate = KmPath(current, "rustkotlin.properties")
+        if (isKmRegularFile(rustKotlinCandidate)) {
             break
         }
         val dirName = current.name
@@ -461,33 +461,33 @@ internal fun discoverCrateMacroSourcesFromDisk(inputPath: String?): List<String>
 public fun inferFileHeaderContext(
     inputPath: String?,
     outputPath: String?,
-    gradleProperties: GradleProjectProperties? = null,
+    rustKotlinProperties: RustKotlinProperties? = null,
     packageProperties: FolderPackageProperties? = null,
 ): FileHeaderContext =
     inferFileHeaderContextWithResolvers(
         inputPath = inputPath,
         outputPath = outputPath,
-        gradleProperties = gradleProperties,
+        rustKotlinProperties = rustKotlinProperties,
         packageProperties = packageProperties,
     )
 
 internal fun inferFileHeaderContextWithResolvers(
     inputPath: String?,
     outputPath: String?,
-    gradleProperties: GradleProjectProperties? = null,
+    rustKotlinProperties: RustKotlinProperties? = null,
     packageProperties: FolderPackageProperties? = null,
     sourceRoot: String? = null,
     fallbackSourceRoot: String? = null,
     portLintDirective: String = "source",
-    resolveGradleProperties: (String?) -> GradleProjectProperties? = ::findNearestGradleProperties,
+    resolveRustKotlinProperties: (String?) -> RustKotlinProperties? = ::findNearestRustKotlinProperties,
     resolvePackageProperties: (String?) -> FolderPackageProperties? = ::findNearestPackageProperties,
     resolveCrateMacroSources: (String?) -> List<String> = ::discoverCrateMacroSourcesFromDisk,
     resolveCrateFlatFileModules: (String?, String?) -> Set<String> = ::discoverCrateFlatFileModulesFromDisk,
 ): FileHeaderContext {
     val resolvedProps =
-        gradleProperties
-            ?: resolveGradleProperties(outputPath)
-            ?: resolveGradleProperties(inputPath)
+        rustKotlinProperties
+            ?: resolveRustKotlinProperties(outputPath)
+            ?: resolveRustKotlinProperties(inputPath)
     val folderOverride =
         packageProperties
             ?: resolvePackageProperties(outputPath)

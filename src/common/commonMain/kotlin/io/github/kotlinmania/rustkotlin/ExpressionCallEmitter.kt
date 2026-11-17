@@ -53,9 +53,6 @@ private val BYTE_SWAP_CALLEE_KIND: Map<String, NumericKind?> =
         "Long.swapBytes" to NumericKind.I64,
     )
 
-private val FMT_TRAIT_NAMES: Set<String> =
-    setOf("Debug", "Display", "Octal", "LowerHex", "UpperHex", "Binary")
-
 private fun isFmtTraitMethodCallee(calleeBase: String): Boolean {
     if (!calleeBase.endsWith(".fmt")) return false
     val owner = calleeBase.removeSuffix(".fmt").substringAfterLast('.')

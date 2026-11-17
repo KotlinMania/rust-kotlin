@@ -166,7 +166,7 @@ Existing `.kt` targets are never overwritten unless you pass `--force`; use
 | `--dry-run` | Print planned `input -> output` actions only |
 | `-f`, `--force`, `--overwrite` | Overwrite existing `.kt` files |
 | `--skip-existing` | Skip targets that already exist |
-| `-g`, `--gradle-properties <file>` | `gradle.properties` used to infer group and namespace |
+| `--rustkotlin-properties <file>` | `rustkotlin.properties` used to infer group, namespace, and crate mappings |
 | `--package-properties <file>` | `package.properties` with package and crate overrides |
 | `-p`, `--package <pkg>` | Explicit Kotlin package (sub-packages appended in recursive mode) |
 | `-n`, `--namespace <ns>` | Kotlin namespace of the crate root |
@@ -200,7 +200,7 @@ The `ide-plugin` module wraps the same translation core for IntelliJ IDEA 2025.3
 - **Convert Rust File to Kotlin File**: available from the *Code* menu, the Project
   view context menu and the editor context menu (search abbreviation `r2k`). Works on a
   single `.rs` file or recursively on a directory, with an overwrite prompt per file.
-- **Rust Transpiler tool window**: pick a `gradle.properties` for package and group
+- **Rust Transpiler tool window**: pick a `rustkotlin.properties` for package, group, and crate mappings
   inference, then translate the active editor file.
 
 Run a sandbox IDE with the plugin loaded:

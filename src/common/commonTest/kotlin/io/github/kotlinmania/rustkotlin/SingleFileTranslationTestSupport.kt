@@ -31,7 +31,7 @@ internal class TestFilesHarness(
                 roots.flatMap { r -> directories[r].orEmpty() }
             },
             report = { messages += it },
-            resolveGradleProperties = { null },
+            resolveRustKotlinProperties = { null },
             resolvePackageProperties = { null },
             resolveCrateMacroSources = { emptyList() },
             resolveCrateFlatFileModules = { _, _ -> emptySet() },
@@ -70,7 +70,7 @@ internal fun runSplitCrateCommand(
         isDirectory = { dirRoot != null && it == dirRoot },
         collectRustFiles = { sources.keys.toList() },
         report = {},
-        resolveGradleProperties = { null },
+        resolveRustKotlinProperties = { null },
         resolvePackageProperties = { null },
         resolveCrateMacroSources = { macroSources },
         resolveCrateFlatFileModules = { _, _ -> flatFileModules },

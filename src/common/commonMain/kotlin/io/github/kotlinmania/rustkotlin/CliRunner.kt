@@ -23,7 +23,7 @@ internal val CLI_USAGE_TEXT: String =
           --dry-run                    Print planned <input.rs> -> <output.kt> actions without writing files
       -f, --force, --overwrite         Overwrite existing target .kt files (default refuses existing files)
           --skip-existing              Skip target .kt files that already exist
-      -g, --gradle-properties <file>   Explicit gradle.properties file for group/namespace inference
+      --rustkotlin-properties <file>   Explicit rustkotlin.properties file for group/namespace/crate inference
           --package-properties <file>  Explicit package.properties file for package/crate overrides
       -p, --package <pkg>              Explicit Kotlin package name (appends relative subpackages in recursive mode)
       -n, --namespace <ns>             Explicit crate root Kotlin namespace (e.g. io.github.kotlinmania.serdejson)
@@ -70,7 +70,7 @@ private data class ParsedCliOptions(
     val dryRun: Boolean = false,
     val forceOverwrite: Boolean = false,
     val skipExisting: Boolean = false,
-    val gradlePropertiesPath: String? = null,
+    val rustKotlinPropertiesPath: String? = null,
     val packagePropertiesPath: String? = null,
     val packageOverride: String? = null,
     val namespaceOverride: String? = null,
@@ -104,7 +104,7 @@ internal fun runSingleFileCommand(
     isDirectory: (String) -> Boolean = { SystemFileSystem.metadataOrNull(KmPath(it))?.isDirectory == true },
     collectRustFiles: ((List<String>) -> List<String>)? = null,
     report: (String) -> Unit = ::println,
-    resolveGradleProperties: (String?) -> GradleProjectProperties? = ::findNearestGradleProperties,
+    resolveRustKotlinProperties: (String?) -> RustKotlinProperties? = ::findNearestRustKotlinProperties,
     resolvePackageProperties: (String?) -> FolderPackageProperties? = ::findNearestPackageProperties,
     resolveCrateMacroSources: (String?) -> List<String> = ::discoverCrateMacroSourcesFromDisk,
     resolveCrateFlatFileModules: (String?, String?) -> Set<String> = ::discoverCrateFlatFileModulesFromDisk,
@@ -170,7 +170,7 @@ internal fun runSingleFileCommand(
                 isDirectory = isDirectory,
                 collectRustFiles = effectiveCollectRustFiles,
                 report = report,
-                resolveGradleProperties = resolveGradleProperties,
+                resolveRustKotlinProperties = resolveRustKotlinProperties,
                 resolvePackageProperties = resolvePackageProperties,
                 resolveCrateMacroSources = resolveCrateMacroSources,
                 resolveCrateFlatFileModules = resolveCrateFlatFileModules,
@@ -202,7 +202,7 @@ private fun parseCliOptions(args: Array<String>): ParsedCliOptions {
     var dryRun = false
     var forceOverwrite = false
     var skipExisting = false
-    var gradlePropertiesPath: String? = null
+    var rustKotlinPropertiesPath: String? = null
     var packagePropertiesPath: String? = null
     var packageOverride: String? = null
     var namespaceOverride: String? = null
@@ -289,7 +289,7 @@ private fun parseCliOptions(args: Array<String>): ParsedCliOptions {
                 require(inlineVal == null) { "$optName does not take a value" }
                 skipExisting = true
             }
-            "-g", "--gradle-properties" -> gradlePropertiesPath = optValue()
+            "--rustkotlin-properties" -> rustKotlinPropertiesPath = optValue()
             "--package-properties" -> packagePropertiesPath = optValue()
             "-p", "--package" -> packageOverride = optValue()
             "-n", "--namespace" -> namespaceOverride = optValue()
@@ -538,7 +538,7 @@ private fun parseCliOptions(args: Array<String>): ParsedCliOptions {
             classicOutputPath = outputPath,
             forceOverwrite = forceOverwrite,
             skipExisting = skipExisting,
-            gradlePropertiesPath = gradlePropertiesPath,
+            rustKotlinPropertiesPath = rustKotlinPropertiesPath,
             packagePropertiesPath = packagePropertiesPath,
             packageOverride = packageOverride,
             namespaceOverride = namespaceOverride,
@@ -589,7 +589,7 @@ private fun parseCliOptions(args: Array<String>): ParsedCliOptions {
         dryRun = dryRun,
         forceOverwrite = forceOverwrite,
         skipExisting = skipExisting,
-        gradlePropertiesPath = gradlePropertiesPath,
+        rustKotlinPropertiesPath = rustKotlinPropertiesPath,
         packagePropertiesPath = packagePropertiesPath,
         packageOverride = packageOverride,
         namespaceOverride = namespaceOverride,
@@ -839,13 +839,13 @@ private fun executeTranslate(
     isDirectory: (String) -> Boolean,
     collectRustFiles: (List<String>) -> List<String>,
     report: (String) -> Unit,
-    resolveGradleProperties: (String?) -> GradleProjectProperties?,
+    resolveRustKotlinProperties: (String?) -> RustKotlinProperties?,
     resolvePackageProperties: (String?) -> FolderPackageProperties?,
     resolveCrateMacroSources: (String?) -> List<String>,
     resolveCrateFlatFileModules: (String?, String?) -> Set<String>,
     resolveCrateRawAbiMetadata: (String?, String?, Boolean, Boolean) -> CrateRawAbiMetadata,
 ) {
-    val explicitGradleProps = parsed.gradlePropertiesPath?.let { parseGradleProperties(read(it)) }
+    val explicitRustKotlinProps = parsed.rustKotlinPropertiesPath?.let { parseRustKotlinProperties(read(it)) }
     val explicitPkgProps = parsed.packagePropertiesPath?.let { parsePackageProperties(read(it)) }
     val discovered = discoverInputs(parsed.inputs, parsed.recursive, parsed.splitModuleRoots, parsed.sourceRoot, isDirectory, collectRustFiles)
     val effectiveCfgProfile =
@@ -913,7 +913,7 @@ private fun executeTranslate(
         } else {
             supportedDiscovered
         }
-    var resolvedProjectNamespaceForScaffold: String? = parsed.namespaceOverride ?: explicitGradleProps?.projectNamespace
+    var resolvedProjectNamespaceForScaffold: String? = parsed.namespaceOverride ?: explicitRustKotlinProps?.projectNamespace
     val isBatchOutput =
         !parsed.toStdout &&
             parsed.classicOutputPath == null &&
@@ -984,12 +984,12 @@ private fun executeTranslate(
             inferFileHeaderContextWithResolvers(
                 inputPath = entry.inputPath,
                 outputPath = outputPath,
-                gradleProperties = explicitGradleProps,
+                rustKotlinProperties = explicitRustKotlinProps,
                 packageProperties = explicitPkgProps,
                 sourceRoot = parsed.sourceRoot,
                 fallbackSourceRoot = entry.discoveryRoot,
                 portLintDirective = if (isModRoot) "none" else parsed.portLintDirective,
-                resolveGradleProperties = resolveGradleProperties,
+                resolveRustKotlinProperties = resolveRustKotlinProperties,
                 resolvePackageProperties = resolvePackageProperties,
                 resolveCrateMacroSources = resolveCrateMacroSources,
                 resolveCrateFlatFileModules = resolveCrateFlatFileModules,

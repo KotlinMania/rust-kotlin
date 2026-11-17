@@ -59,12 +59,27 @@ internal fun KotlinJ2KEmitter.liftDefaultlessAssocTypesFromBounds(
         for (b in bounds) {
             if (b is TypeParamBound.Trait) {
                 val lastSeg = b.path.segments.last() ?: continue
-                if (lastSeg.arguments is PathArguments.None) {
-                    val ktTrait = rustTypeIdentToKotlin(lastSeg.ident.toString())
-                    for (assoc in lookupTraitDefaultlessAssocTypes(ktTrait, b.path)) {
-                        if (assoc !in existingParams && assoc !in lifted) {
-                            lifted += assoc
-                        }
+                val rawIdent = lastSeg.ident.toString().removePrefix("r#")
+                if (rawIdent in IGNORED_TRAIT_BOUNDS) continue
+                val ktTrait = rustTypeIdentToKotlin(rawIdent)
+                if (ktTrait !in inspector.declaredTypeNames &&
+                    (rawIdent in setOf("IntoIterator", "Iterator") || isImplicitStdlibSupertraitPath(b.path))
+                ) {
+                    continue
+                }
+                val boundAssocs =
+                    when (val args = lastSeg.arguments) {
+                        is PathArguments.None -> emptySet()
+                        is PathArguments.AngleBracketed ->
+                            args.args
+                                .toList()
+                                .filterIsInstance<GenericArgument.AssocTypeArg>()
+                                .mapTo(linkedSetOf()) { rustTypeIdentToKotlin(it.assoc.ident.toString()) }
+                        else -> continue
+                    }
+                for (assoc in lookupTraitDefaultlessAssocTypes(ktTrait, b.path)) {
+                    if (assoc !in boundAssocs && assoc !in existingParams && assoc !in lifted) {
+                        lifted += assoc
                     }
                 }
             }
@@ -803,6 +818,7 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
         )
     if (liftedAssocs.isNotEmpty()) {
         activeTypeParamNames = activeTypeParamNames + liftedAssocs
+        currentTraitAssocParamNames = currentTraitAssocParamNames + liftedAssocs
     }
     val baseTypeParamsRendered =
         renderTypeParametersFromParams(
@@ -1340,37 +1356,118 @@ internal fun KotlinJ2KEmitter.isSingleCallExternForwardingWrapper(sig: Signature
     return !derefsParam
 }
 
+private fun KotlinJ2KEmitter.appendDestructuredParamLines(
+    pat: Pat,
+    paramKt: String,
+    innerIndent: String,
+    selfTypeName: String?,
+    block: Block,
+    out: MutableList<String>,
+) {
+    val unwrapped = unwrapTransparentPat(pat)
+    when (unwrapped) {
+        is Pat.Wild, is Pat.Rest -> return
+        is Pat.Ident -> {
+            val raw = unwrapped.ident.toString().removePrefix("r#")
+            if (raw == "_") return
+            val assignCount = if (isMutablePattern(pat) || blockReassignsIdent(block, raw)) AssignCount.Any else AssignCount.AtMostOnce
+            val ktName =
+                scopeBuilder
+                    .bindLocal(
+                        rawName = raw,
+                        baseKotlinName = rustValueIdentToKotlin(raw),
+                        span = unwrapped.ident.span(),
+                        assignCount = assignCount,
+                    ).kotlinName
+            currentTypedLocals[paramKt]?.let { ty ->
+                currentTypedLocals = currentTypedLocals + (ktName to ty)
+                if (ty.endsWith("?")) {
+                    currentNullableLocals = currentNullableLocals + ktName
+                }
+            }
+            val kw = if (assignCount == AssignCount.Any) "var" else "val"
+            out += "$innerIndent$kw $ktName = $paramKt"
+        }
+        is Pat.Tuple -> {
+            val elems = unwrapped.elems.toList()
+            if (elems.size == 1) {
+                appendDestructuredParamLines(elems[0], paramKt, innerIndent, selfTypeName, block, out)
+                return
+            }
+            val (patText, _) = renderLocalPattern(unwrapped, selfTypeName, includeCtorInTupleStruct = false, bindToScope = true)
+            if (patText.isNotEmpty() && patText != "unused") {
+                val kw = if (isMutablePattern(unwrapped)) "var" else "val"
+                out += "$innerIndent$kw $patText = $paramKt"
+            }
+        }
+        is Pat.Struct -> {
+            renderStructDestructuringLocal(unwrapped, paramKt, pat.span(), innerIndent, selfTypeName)
+                .lines()
+                .filter { it.isNotBlank() }
+                .forEach { out += it }
+        }
+        is Pat.TupleStruct -> {
+            val rendered =
+                renderTupleStructDestructuringLocal(unwrapped, initExpr = null, rhs = paramKt, span = pat.span(), indent = innerIndent, selfTypeName = selfTypeName)
+            if (rendered != null) {
+                rendered.lines().filter { it.isNotBlank() }.forEach { out += it }
+            } else {
+                val (patText, _) = renderLocalPattern(unwrapped, selfTypeName, includeCtorInTupleStruct = false, bindToScope = true)
+                if (patText.isNotEmpty() && patText != "unused") {
+                    val kw = if (isMutablePattern(unwrapped)) "var" else "val"
+                    out += "$innerIndent$kw $patText = $paramKt"
+                }
+            }
+        }
+        else -> {
+            val (patText, _) = renderLocalPattern(unwrapped, selfTypeName, includeCtorInTupleStruct = false, bindToScope = true)
+            if (patText.isNotEmpty() && patText != "unused") {
+                val kw = if (isMutablePattern(unwrapped)) "var" else "val"
+                out += "$innerIndent$kw $patText = $paramKt"
+            }
+        }
+    }
+}
+
 internal fun KotlinJ2KEmitter.computeReassignedParamShadows(
     sig: Signature,
     block: Block,
     innerIndent: String,
+    selfTypeName: String? = null,
 ): List<String> {
     val shadows = mutableListOf<String>()
+    var paramIdx = 0
     for (arg in sig.inputs) {
         if (arg is FnArg.Typed) {
             val rawParam = extractRawParamIdent(arg.patType.pat)
-            if (rawParam != null && rawParam != "_" && blockReassignsIdent(block, rawParam)) {
-                val ktName = scopeBuilder.resolveLocalKotlinName(rawParam) ?: rustValueIdentToKotlin(rawParam)
-                val shadowKt =
-                    if (headerContext.isBatchCrateOutput) {
-                        scopeBuilder
-                            .bindLocal(
-                                rawName = rawParam,
-                                baseKotlinName = ktName,
-                                span = arg.patType.pat.span(),
-                                assignCount = AssignCount.Any,
-                            ).kotlinName
-                    } else {
-                        ktName
+            if (rawParam != null && rawParam != "_") {
+                if (blockReassignsIdent(block, rawParam)) {
+                    val ktName = scopeBuilder.resolveLocalKotlinName(rawParam) ?: rustValueIdentToKotlin(rawParam)
+                    val shadowKt =
+                        if (headerContext.isBatchCrateOutput) {
+                            scopeBuilder
+                                .bindLocal(
+                                    rawName = rawParam,
+                                    baseKotlinName = ktName,
+                                    span = arg.patType.pat.span(),
+                                    assignCount = AssignCount.Any,
+                                ).kotlinName
+                        } else {
+                            ktName
+                        }
+                    if (shadowKt != ktName) {
+                        currentTypedLocals[ktName]?.let { currentTypedLocals = currentTypedLocals + (shadowKt to it) }
+                        if (ktName in currentNullableLocals) {
+                            currentNullableLocals = currentNullableLocals + shadowKt
+                        }
                     }
-                if (shadowKt != ktName) {
-                    currentTypedLocals[ktName]?.let { currentTypedLocals = currentTypedLocals + (shadowKt to it) }
-                    if (ktName in currentNullableLocals) {
-                        currentNullableLocals = currentNullableLocals + shadowKt
-                    }
+                    shadows += "${innerIndent}var $shadowKt = $ktName"
                 }
-                shadows += "${innerIndent}var $shadowKt = $ktName"
+            } else if (rawParam == null) {
+                val paramKt = extractParamName(arg.patType.pat, paramIdx)
+                appendDestructuredParamLines(arg.patType.pat, paramKt, innerIndent, selfTypeName, block, shadows)
             }
+            paramIdx++
         }
     }
     return shadows

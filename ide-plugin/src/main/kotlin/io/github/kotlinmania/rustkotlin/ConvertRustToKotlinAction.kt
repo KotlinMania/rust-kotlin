@@ -42,12 +42,12 @@ class ConvertRustToKotlinAction : DumbAwareAction() {
         val rustFiles = service.collectTranspilableRustFiles(selectedFiles)
         if (rustFiles.isEmpty()) return
 
-        val gradleProperties = service.ensureGradlePropertiesConfigured(rustFiles.first())
-        if (gradleProperties == null && !ApplicationManager.getApplication().isUnitTestMode) {
+        val rustKotlinProperties = service.ensureRustKotlinPropertiesConfigured(rustFiles.first())
+        if (rustKotlinProperties == null && !ApplicationManager.getApplication().isUnitTestMode) {
             return
         }
 
-        val generatedKotlinFiles = service.transpileVirtualFiles(selectedFiles, gradleProperties)
+        val generatedKotlinFiles = service.transpileVirtualFiles(selectedFiles, rustKotlinProperties)
         val editorManager = FileEditorManager.getInstance(project)
         generatedKotlinFiles.lastOrNull()?.let { lastFile ->
             editorManager.openFile(lastFile, true)

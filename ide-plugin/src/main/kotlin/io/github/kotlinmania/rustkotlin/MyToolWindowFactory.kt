@@ -48,7 +48,7 @@ class MyToolWindowFactory :
                     JButton(MyMessageBundle.message("toolwindow.MyToolWindow.choose.props.button")).apply {
                         addActionListener {
                             val service = project.getService(RustTranspilerService::class.java)
-                            service.promptForGradlePropertiesFile()
+                            service.promptForRustKotlinPropertiesFile()
                         }
                     }
                 topBar.add(choosePropsButton)
@@ -62,12 +62,12 @@ class MyToolWindowFactory :
                                     .getInstance(project)
                                     .selectedFiles
                                     .firstOrNull { service.isTranspilableRustFile(it) }
-                            val gradleProps = service.ensureGradlePropertiesConfigured(activeRustFile) ?: return@addActionListener
+                            val rustKotlinProps = service.ensureRustKotlinPropertiesConfigured(activeRustFile) ?: return@addActionListener
                             kotlinOutput.text =
                                 service.transpileSource(
                                     source = rustInput.text,
                                     sourceFilePath = activeRustFile?.path ?: "src/example.rs",
-                                    gradleProperties = gradleProps,
+                                    rustKotlinProperties = rustKotlinProps,
                                 )
                         }
                     }

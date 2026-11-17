@@ -6,7 +6,7 @@ import RustKotlin
 struct RustKotlinExportTests {
     @Test("Translates Rust function to idiomatic Kotlin via exported API")
     func testRenderSingleKotlinFile() {
-        let props = parseGradleProperties(
+        let props = parseRustKotlinProperties(
             content: """
             project.group=io.github.kotlinmania
             project.name=sample-kotlin

@@ -79,7 +79,8 @@ private fun KotlinJ2KEmitter.tryRenderStringPrimitiveParse(
     val strTarget = if (refCellGuardPointeeType(parseRecvTy) == "String") "$atom.value" else atom
     return if (usesTaggedCoreResult()) {
         val res = sourceResultName()
-        "($strTarget.$strParseMethod?.let { $res.Ok(it) } ?: $res.Err(\"failed to parse $targetTypeName\"))"
+        val suffix = buildExplicitResultTypeArgsSuffix(targetTypeName, "String")
+        "($strTarget.$strParseMethod?.let { $res.Ok$suffix(it) } ?: $res.Err$suffix(\"failed to parse $targetTypeName\"))"
     } else {
         "($strTarget.$strParseMethod?.let { Result.success(it) } ?: Result.failure(IllegalArgumentException(\"failed to parse $targetTypeName\")))"
     }
@@ -1251,20 +1252,37 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
             rawMethod == "expect" && renderedValueArgs.size == 1 -> return "($receiver ?: error(${renderedValueArgs[0]}))"
             (rawMethod == "clone" || rawMethod == "cloned" || rawMethod == "copied") && renderedValueArgs.isEmpty() ->
                 return receiver
-            rawMethod == "ok_or" && renderedValueArgs.size == 1 ->
+            (rawMethod == "ok_or" || rawMethod == "ok_or_else") && renderedValueArgs.size == 1 -> {
+                val errExprText =
+                    if (rawMethod == "ok_or_else") {
+                        unwrapZeroArgClosureText(renderedValueArgs[0])
+                    } else {
+                        renderedValueArgs[0]
+                    }
                 return if (usesTaggedCoreResult()) {
                     val res = sourceResultName()
-                    "($atomicRecv?.let { $res.Ok(it) } ?: $res.Err(${renderedValueArgs[0]}))"
+                    val expectedRes = rustResultTypeArguments(currentExpectedParseTargetType ?: currentEnclosingReturnRenderedType)
+                    val okTy =
+                        inferExprRenderedType(expr.receiver, selfTypeName)
+                            ?.removeSuffix("?")
+                            ?.trim()
+                            ?.takeIf { it.isNotEmpty() && it != "*" && it != "Nothing" && it != "Any?" }
+                            ?: expectedRes?.first
+                    val rawErrArg =
+                        if (rawMethod == "ok_or_else") {
+                            (unwrapParenOrGroupExpr(nonUnitArgs[0]) as? Expr.Closure)?.body ?: nonUnitArgs[0]
+                        } else {
+                            nonUnitArgs[0]
+                        }
+                    val errTy =
+                        inferExprRenderedType(rawErrArg, selfTypeName)
+                            ?.trim()
+                            ?.takeIf { it.isNotEmpty() && it != "*" && it != "Nothing" && it != "Any?" }
+                            ?: expectedRes?.second
+                    val resSuffix = buildExplicitResultTypeArgsSuffix(okTy, errTy)
+                    "($atomicRecv?.let { $res.Ok$resSuffix(it) } ?: $res.Err$resSuffix($errExprText))"
                 } else {
-                    "($atomicRecv?.let { Result.success(it) } ?: Result.failure(${renderedValueArgs[0]}))"
-                }
-            rawMethod == "ok_or_else" && renderedValueArgs.size == 1 -> {
-                val errExpr = unwrapZeroArgClosureText(renderedValueArgs[0])
-                return if (usesTaggedCoreResult()) {
-                    val res = sourceResultName()
-                    "($atomicRecv?.let { $res.Ok(it) } ?: $res.Err($errExpr))"
-                } else {
-                    "($atomicRecv?.let { Result.success(it) } ?: Result.failure($errExpr))"
+                    "($atomicRecv?.let { Result.success(it) } ?: Result.failure($errExprText))"
                 }
             }
             rawMethod == "into_iter" && renderedValueArgs.isEmpty() -> return "ArrayDeque(listOfNotNull($receiver))"

@@ -792,7 +792,7 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                                 ?.segments
                                 ?.last()
                                 ?.ident
-                                ?.toString() in setOf("Debug", "Display", "Octal", "LowerHex", "UpperHex", "Binary")
+                                ?.toString() in FMT_TRAIT_NAMES
                     )
             )
     if (isStdlibFmtModule) {
@@ -1277,8 +1277,12 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                             if (bounded != null && isSelfParameterizedTraitName(ktBaseIdent)) {
                                 add(bounded)
                             }
-                            if (bounded != null && !suppressTraitAssocPlaceholders) {
-                                repeat(lookupAssocs.size) { add("Any?") }
+                            for (assocKt in lookupAssocs) {
+                                if (assocKt in currentTraitAssocParamNames) {
+                                    add(assocKt)
+                                } else if (bounded != null && !suppressTraitAssocPlaceholders) {
+                                    add("Any?")
+                                }
                             }
                         }
                     if (typeArgs.isEmpty()) mappedBase else "$mappedBase<${typeArgs.joinToString(", ")}>"
@@ -1322,7 +1326,14 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                 }
                 val finalAssocs =
                     lookupAssocs.mapNotNull { assocKt ->
-                        explicitAssocByName[assocKt] ?: if (!suppressTraitAssocPlaceholders && (bounded != null || isKnownCoreOps)) "Any?" else null
+                        explicitAssocByName[assocKt]
+                            ?: if (assocKt in currentTraitAssocParamNames) {
+                                assocKt
+                            } else if (!suppressTraitAssocPlaceholders && (bounded != null || isKnownCoreOps)) {
+                                "Any?"
+                            } else {
+                                null
+                            }
                     }
                 val typeArgs =
                     buildList {

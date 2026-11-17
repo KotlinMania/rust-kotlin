@@ -1402,8 +1402,22 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
                 }
                 if (root in STDLIB_CRATE_ROOTS) return null
             } else if (root in STDLIB_CRATE_ROOTS && mappedLeaf == "*") {
-                val allowedWildcardSubmodules = setOf("cell", "cmp", "ffi", "mem", "num", "ops", "ptr", "result", "sync", "atomic")
-                if (mapped.size != 3 || mapped[1] !in allowedWildcardSubmodules) {
+                val allowedWildcardSubmodules = setOf("alloc", "cell", "cmp", "ffi", "mem", "num", "ops", "ptr", "result", "sync", "atomic")
+                val hasExternalWildcardPkg =
+                    anyCandidateExtPkgs &&
+                        mapped.size >= 3 &&
+                        candidateCrates.any { searchCrate ->
+                            val searchNs =
+                                headerContext.crateNamespaces[searchCrate]
+                                    ?.trim()
+                                    ?.removeSuffix(".")
+                                    ?.takeIf { it.isNotEmpty() } ?: return@any false
+                            val searchExtPkgs = headerContext.externalCrateSymbolPackages[searchCrate] ?: return@any false
+                            val subTail = mapped.drop(1).dropLast(1).joinToString(".")
+                            val candidateSubPkg = if (subTail.isEmpty()) searchNs else "$searchNs.$subTail"
+                            searchExtPkgs.values.any { pkgs -> candidateSubPkg in pkgs }
+                        }
+                if (!hasExternalWildcardPkg && (mapped.size != 3 || mapped[1] !in allowedWildcardSubmodules)) {
                     return null
                 }
             }
@@ -1570,7 +1584,20 @@ internal fun KotlinJ2KEmitter.renderItemUse(
             continue
         }
         if (item.vis is Visibility.Public && localBoundIdent == "*") {
-            continue
+            val symbolsInPkg =
+                headerContext.externalCrateSymbolPackages.values
+                    .flatMap { symMap ->
+                        symMap.entries.mapNotNull { (sym, pkgs) ->
+                            if (importPkg in pkgs) sym else null
+                        }
+                    }
+            val keepStdlibWildcard =
+                root in STDLIB_CRATE_ROOTS &&
+                    !bodyTextForPubUseFilter.isNullOrBlank() &&
+                    (symbolsInPkg.isEmpty() || symbolsInPkg.any { containsWholeIdentifier(bodyTextForPubUseFilter, it) })
+            if (!keepStdlibWildcard) {
+                continue
+            }
         }
         val shouldFilterUnused =
             item.vis is Visibility.Public ||
@@ -1760,7 +1787,7 @@ internal fun KotlinJ2KEmitter.itemDependsOnUnportedQuickcheckOrRand(item: Item):
 }
 
 private const val OMITTED_QUICKCHECK_OR_RAND_COMMENT: String =
-    "// Omitted quickcheck/rand property test items pending quickcheck-kotlin / rand-kotlin port (Hermes Kanban t_19971811)."
+    "// Omitted quickcheck/rand property test items pending quickcheck-kotlin / rand-kotlin port (Hermes Kanban card 19971811)."
 
 private fun KotlinJ2KEmitter.isQuickcheckOrRandTestContext(item: Item? = null): Boolean =
     headerContext.portLintDirective == "tests" ||
@@ -2327,6 +2354,12 @@ internal fun KotlinJ2KEmitter.renderItemForeignMod(
                             val pNames = interopParams.map { it.kotlinName }
                             fun ptrArgToLong(idx: Int): String =
                                 if (TranslationSession.rawAbiMode) pNames[idx] else "${pNames[idx]}.rawAddress"
+                            fun alignArgToLong(idx: Int): String =
+                                if (interopParams.getOrNull(idx)?.kotlinType?.substringAfterLast('.') == "Alignment") {
+                                    "${pNames[idx]}.asUsize().toLong()"
+                                } else {
+                                    "${pNames[idx]}.toLong()"
+                                }
                             fun wrapLongToRet(expr: String): String =
                                 if (TranslationSession.rawAbiMode) {
                                     expr
@@ -2337,19 +2370,19 @@ internal fun KotlinJ2KEmitter.renderItemForeignMod(
                             when (rawFnName) {
                                 "__rust_alloc" -> {
                                     CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.intrinsics.kmAlloc")
-                                    "= ${wrapLongToRet("kmAlloc(${pNames[0]}.toLong(), ${pNames[1]}.toLong())")}"
+                                    "= ${wrapLongToRet("kmAlloc(${pNames[0]}.toLong(), ${alignArgToLong(1)})")}"
                                 }
                                 "__rust_alloc_zeroed" -> {
                                     CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.intrinsics.kmAllocZeroed")
-                                    "= ${wrapLongToRet("kmAllocZeroed(${pNames[0]}.toLong(), ${pNames[1]}.toLong())")}"
+                                    "= ${wrapLongToRet("kmAllocZeroed(${pNames[0]}.toLong(), ${alignArgToLong(1)})")}"
                                 }
                                 "__rust_dealloc" -> {
                                     CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.intrinsics.kmDealloc")
-                                    "= kmDealloc(${ptrArgToLong(0)}, ${pNames[1]}.toLong(), ${pNames[2]}.toLong())"
+                                    "= kmDealloc(${ptrArgToLong(0)}, ${pNames[1]}.toLong(), ${alignArgToLong(2)})"
                                 }
                                 "__rust_realloc" -> {
                                     CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.intrinsics.kmRealloc")
-                                    "= ${wrapLongToRet("kmRealloc(${ptrArgToLong(0)}, ${pNames[1]}.toLong(), ${pNames[2]}.toLong(), ${pNames[3]}.toLong())")}"
+                                    "= ${wrapLongToRet("kmRealloc(${ptrArgToLong(0)}, ${pNames[1]}.toLong(), ${alignArgToLong(2)}, ${pNames[3]}.toLong())")}"
                                 }
                                 else -> "= Unit"
                             }
