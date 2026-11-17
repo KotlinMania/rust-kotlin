@@ -500,7 +500,12 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
                         ?: borrowedPlaceLocalName(expr.expr)?.let { currentTypedLocals[it] }
                         ?: inferExprRenderedType(expr.expr, selfTypeName)?.removeSuffix("?")
                 is UnOp.Neg -> inferExprRenderedType(expr.expr, selfTypeName)
-                is UnOp.NotOp -> if (isKnownIntegerBitmaskExpr(expr.expr)) inferExprRenderedType(expr.expr, selfTypeName) else "Boolean"
+                is UnOp.NotOp ->
+                    if (isKnownIntegerBitmaskExpr(expr.expr) || inferExprNumericKind(expr.expr, selfTypeName)?.isIntegerNumericKind() == true) {
+                        inferExprRenderedType(expr.expr, selfTypeName)
+                    } else {
+                        "Boolean"
+                    }
             }
         is Expr.Field -> {
             val baseReferenceTy = inferExprRenderedType(expr.base, selfTypeName) ?: return null
@@ -541,6 +546,10 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
                             tupleAccessMemberName(expr.base, idx, selfTypeName)
                         }
                     inspector.structFieldSynTypesByType[ownerKt]?.get(primaryField)?.let { return renderType(it, ownerKt) }
+                    if (idx == 0 && primaryField != "value") {
+                        inspector.structFieldSynTypesByType[ownerKt]?.get("value")?.let { return renderType(it, ownerKt) }
+                        inspector.structFieldSynTypesByType[ownerKt]?.get("field0")?.let { return renderType(it, ownerKt) }
+                    }
                     val candidateFields =
                         if (idx == 0 && primaryField != "value") {
                             listOf(primaryField, "value")
@@ -1080,6 +1089,9 @@ internal val NUMERIC_COERCE_SUFFIX_BY_KIND: Map<NumericKind, String> =
         NumericKind.F64 to "toDouble()",
     )
 
+internal fun NumericKind.isIntegerNumericKind(): Boolean =
+    this != NumericKind.F16 && this != NumericKind.F32 && this != NumericKind.F64 && this != NumericKind.F128
+
 internal fun KotlinJ2KEmitter.resolvePointerSizedNumericKind(signed: Boolean): NumericKind =
     if (headerContext.rawAbiMode || inExternAbiSignature) {
         when (activeCfgProfile.pointerWidth) {
@@ -1232,7 +1244,9 @@ internal fun KotlinJ2KEmitter.inferExprNumericKind(expr: Expr, selfTypeName: Str
                         resolveNumericKind(renderType(constTy, selfTypeName))
                     } else {
                         val localKind =
-                            if (segs.size == 1) {
+                            if (segs.size == 1 && raw == "self") {
+                                (currentTypedLocals["this"] ?: selfTypeName)?.let(this::resolveNumericKind)
+                            } else if (segs.size == 1) {
                                 val ktLocal = scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
                                 currentTypedLocals[ktLocal]?.let(this::resolveNumericKind)
                             } else {
@@ -1256,7 +1270,7 @@ internal fun KotlinJ2KEmitter.inferExprNumericKind(expr: Expr, selfTypeName: Str
         }
         is Expr.Unary ->
             when (expr.op) {
-                is UnOp.NotOp -> if (isKnownIntegerBitmaskExpr(expr.expr)) inferExprNumericKind(expr.expr, selfTypeName) else null
+                is UnOp.NotOp -> inferExprNumericKind(expr.expr, selfTypeName)?.takeIf { it.isIntegerNumericKind() }
                 is UnOp.Neg -> inferExprNumericKind(expr.expr, selfTypeName)
                 is UnOp.Deref -> inferExprRenderedType(expr, selfTypeName)?.let(this::resolveNumericKind) ?: inferExprNumericKind(expr.expr, selfTypeName)
             }

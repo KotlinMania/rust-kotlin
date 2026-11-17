@@ -444,6 +444,9 @@ public object CoreIntrinsicLowering {
         return DEFAULT_ALLOC_NAMESPACE
     }
 
+    private fun isSimdIntrinsicName(name: String): Boolean =
+        name in CORE_SIMD_INTRINSIC_NAMES || name.startsWith("sve_tuple_")
+
     public fun layoutConsumingTypeArgIndices(
         intrinsicName: String,
         explicitTypeArgCount: Int,
@@ -451,7 +454,7 @@ public object CoreIntrinsicLowering {
         val canonical = parseLegacyAtomicOrderingSuffix(intrinsicName).baseName
         return when {
             canonical in SIMD_BOOL_RETURN_INTRINSICS || canonical in SIMD_UNIT_RETURN_INTRINSICS -> emptyList()
-            canonical in CORE_SIMD_INTRINSIC_NAMES -> (0 until explicitTypeArgCount).toList()
+            isSimdIntrinsicName(canonical) -> (0 until explicitTypeArgCount).toList()
             canonical in TWO_TYPE_ARG_LAYOUT_INTRINSICS ->
                 if (explicitTypeArgCount >= 2) listOf(0, 1) else listOf(0)
             canonical in FIRST_TYPE_ARG_LAYOUT_INTRINSICS -> listOf(0)
@@ -1128,8 +1131,12 @@ public object CoreIntrinsicLowering {
                 registerCoreImport(emitter, "$memPkg.threeWayCompareWithLayout")
                 "threeWayCompareWithLayout($p0, $p1, $layout0)"
             }
-            in CORE_SIMD_INTRINSIC_NAMES -> renderSynthesizedSimdIntrinsicFnBody(fnItem, canonicalIntrinsicName, typeParams, intrPkg, emitter)
-            else -> null
+            else ->
+                if (isSimdIntrinsicName(canonicalIntrinsicName)) {
+                    renderSynthesizedSimdIntrinsicFnBody(fnItem, canonicalIntrinsicName, typeParams, intrPkg, emitter)
+                } else {
+                    null
+                }
         }
     }
 
@@ -1194,7 +1201,7 @@ public object CoreIntrinsicLowering {
     ): String {
         fun wrapWithSideEffects(resultExpr: String): String {
             if (renderedArgs.isEmpty()) return resultExpr
-            val evalPrefix = renderedArgs.mapIndexed { idx, arg -> "val _simdArg$idx = $arg" }.joinToString("; ")
+            val evalPrefix = renderedArgs.mapIndexed { idx, arg -> "val simdArg$idx = $arg" }.joinToString("; ")
             return "run { $evalPrefix; $resultExpr }"
         }
         if (canonicalName in SIMD_BOOL_RETURN_INTRINSICS) {
@@ -1211,8 +1218,8 @@ public object CoreIntrinsicLowering {
                 else -> -1
             }
         if (sameArgIndex in renderedArgs.indices) {
-            val valBind = renderedArgs.mapIndexed { idx, arg -> "val _simdArg$idx = $arg" }.joinToString("; ")
-            return "run { $valBind; _simdArg$sameArgIndex }"
+            val valBind = renderedArgs.mapIndexed { idx, arg -> "val simdArg$idx = $arg" }.joinToString("; ")
+            return "run { $valBind; simdArg$sameArgIndex }"
         }
         val explicitRetSlot =
             when (canonicalName) {
@@ -1229,7 +1236,7 @@ public object CoreIntrinsicLowering {
             val layoutExpr = resolveTypeLayoutExpression(explicitRetSlot, selfTypeName, emitter)
             return wrapWithSideEffects(renderZeroedLayoutReadExpression(layoutExpr, intrPkg, emitter))
         }
-        val expectedRendered = emitter.currentExpectedParseTargetType?.trim()?.takeIf { it.isNotEmpty() }
+        val expectedRendered = (emitter.currentExpectedParseTargetType ?: emitter.currentEnclosingReturnRenderedType)?.trim()?.takeIf { it.isNotEmpty() && it != "Unit" }
         if (expectedRendered != null) {
             val fallback = emitter.renderFallbackDefaultForRenderedType(expectedRendered)
             if (!fallback.startsWith("null as ") && !fallback.startsWith("error(")) {
@@ -1243,10 +1250,11 @@ public object CoreIntrinsicLowering {
                     return wrapWithSideEffects(renderZeroedLayoutReadExpression("$expectedBase.typeLayout()", intrPkg, emitter))
                 }
             }
+            return wrapWithSideEffects(renderZeroedLayoutReadExpression(resolveRenderedTypeLayoutExpression(expectedRendered, emitter), intrPkg, emitter))
         }
         if (renderedArgs.isNotEmpty()) {
-            val valBind = renderedArgs.mapIndexed { idx, arg -> "val _simdArg$idx = $arg" }.joinToString("; ")
-            return "run { $valBind; _simdArg0 }"
+            val valBind = renderedArgs.mapIndexed { idx, arg -> "val simdArg$idx = $arg" }.joinToString("; ")
+            return "run { $valBind; simdArg0 }"
         }
         return "Unit"
     }
@@ -1257,6 +1265,8 @@ public object CoreIntrinsicLowering {
         val ord0: String?,
         val ord1: String?,
         val isIntrinsicsModuleCall: Boolean,
+        val penultName: String?,
+        val rewrittenSegNames: List<String>,
         val explicitTypes: List<SynType>,
         val explicitConsts: List<Expr>,
         val callArgsList: List<Expr>,
@@ -1293,6 +1303,8 @@ public object CoreIntrinsicLowering {
             ord0 = parsedAtomic.ord0,
             ord1 = parsedAtomic.ord1,
             isIntrinsicsModuleCall = isIntrinsicsModuleCall,
+            penultName = penultName,
+            rewrittenSegNames = rewrittenSegNames,
             explicitTypes = explicitTypes,
             explicitConsts = explicitConsts,
             callArgsList = call.args.toList(),
@@ -1586,6 +1598,9 @@ public object CoreIntrinsicLowering {
                 ?.takeUnless { it is SynType.Infer }
                 ?.let { emitter.renderType(it, selfTypeName) }
         }
+        if (canonical.startsWith("sve_tuple_")) {
+            return null
+        }
         if (canonical in CORE_SIMD_INTRINSIC_NAMES) {
             when (canonical) {
                 "simd_splat" ->
@@ -1722,12 +1737,16 @@ public object CoreIntrinsicLowering {
 
         val isIntrinsicsModuleCall = spec.isIntrinsicsModuleCall
         val isCoreSimdCall =
-            rawName in CORE_SIMD_INTRINSIC_NAMES &&
-                (
-                    isIntrinsicsModuleCall ||
-                        penultName == "simd" ||
-                        (segments.size == 1 && rawName !in emitter.inspector.declaredTopLevelFnRawNames)
-                )
+            (
+                isSimdIntrinsicName(spec.canonicalName) &&
+                    (
+                        isIntrinsicsModuleCall ||
+                            penultName == "simd" ||
+                            penultName == "scalable" ||
+                            (segments.size == 1 && rawName !in emitter.inspector.declaredTopLevelFnRawNames)
+                    )
+            ) ||
+                (isIntrinsicsModuleCall && "simd" in rewrittenSegNames.dropLast(1))
         if (!isIntrinsicsModuleCall && !isCoreSimdCall) {
             return null
         }
@@ -2223,16 +2242,19 @@ public object CoreIntrinsicLowering {
                         emitter = emitter,
                     )
                 }
-            in CORE_SIMD_INTRINSIC_NAMES ->
-                renderSimdCallSiteLowering(
-                    canonicalName = canonicalIntrinsicName,
-                    renderedArgs = renderedArgs,
-                    explicitTypes = explicitTypes,
-                    selfTypeName = selfTypeName,
-                    intrPkg = intrPkg,
-                    emitter = emitter,
-                )
-            else -> null
+            else ->
+                if (isCoreSimdCall) {
+                    renderSimdCallSiteLowering(
+                        canonicalName = canonicalIntrinsicName,
+                        renderedArgs = renderedArgs,
+                        explicitTypes = explicitTypes,
+                        selfTypeName = selfTypeName,
+                        intrPkg = intrPkg,
+                        emitter = emitter,
+                    )
+                } else {
+                    null
+                }
         }
     }
 

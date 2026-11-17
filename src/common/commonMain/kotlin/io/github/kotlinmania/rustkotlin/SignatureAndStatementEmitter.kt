@@ -64,7 +64,7 @@ internal fun KotlinJ2KEmitter.liftDefaultlessAssocTypesFromBounds(
                 if (rawIdent in IGNORED_TRAIT_BOUNDS) continue
                 val ktTrait = rustTypeIdentToKotlin(rawIdent)
                 if (ktTrait !in inspector.declaredTypeNames &&
-                    (rawIdent in setOf("IntoIterator", "Iterator") || isImplicitStdlibSupertraitPath(b.path))
+                    (rawIdent == "IntoIterator" || isImplicitStdlibSupertraitPath(b.path))
                 ) {
                     continue
                 }
@@ -1217,7 +1217,18 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
             }
         }
     val inlinePrefix = if (reifiedFnTypeParams.isNotEmpty()) "inline " else ""
-    val operatorPrefix = if (hasReceiver && effectiveFnName == "compareTo" && renderedReturnType == "Int") "operator " else ""
+    val selfBaseForOp = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
+    val operatorPrefix =
+        if (hasReceiver &&
+            (
+                (effectiveFnName == "compareTo" && renderedReturnType == "Int" && params.size == 1) ||
+                    (effectiveFnName == "not" && params.isEmpty() && selfBaseForOp != "Boolean")
+            )
+        ) {
+            "operator "
+        } else {
+            ""
+        }
     val typeParamsPart = if (effectiveTypeParamsStr.isNotEmpty()) "$effectiveTypeParamsStr " else ""
     val finalParams =
         if (!effectiveOpenPrefix.contains("override") && defaultLayoutParamNames.isNotEmpty()) {
@@ -2566,13 +2577,13 @@ internal fun KotlinJ2KEmitter.tryRenderDeferredLocalResultMatchInit(
                             "err"
                         }
                     val renderedReturn = renderExpr(errBodyUnwrapped, "$innerIndent    ", selfTypeName)
-                    "{ val $errParam = matchResult.error; $renderedReturn }"
+                    "{ val $errParam = matchResult.errValue(); $renderedReturn }"
                 } finally {
                     scopeBuilder.exitCompr()
                 }
             }
         val resultType = sourceResultName()
-        out += "${trivia1}${trivia2}${innerIndent}val $okVar = when (val matchResult = $subjectRendered) { is $resultType.Ok<*, *> -> matchResult.value; is $resultType.Err<*, *> -> $errRender }"
+        out += "${trivia1}${trivia2}${innerIndent}val $okVar = when (val matchResult = $subjectRendered) { is $resultType.Ok<*, *> -> matchResult.okValue(); is $resultType.Err<*, *> -> $errRender }"
     } else {
         val errRender =
             run {
@@ -3146,14 +3157,19 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
     }
     val coreResultLetElseInfo =
         if (divergeBody != null && unwrappedPat is Pat.TupleStruct && !patText.startsWith("(")) {
-            coreResultVariantMatchInfo(unwrappedPat)
+            coreResultVariantMatchInfo(unwrappedPat) ?: controlFlowVariantMatchInfo(unwrappedPat)
         } else {
             null
         }
     val typeSuffix = if (typeAnnotation != null && !patText.startsWith("(")) ": $typeAnnotation" else ""
     return if (coreResultLetElseInfo != null && divergeBody != null) {
-        val isOkVariant = coreResultLetElseInfo.first.endsWith(".Ok")
-        val divergeVariant = if (isOkVariant) "${sourceResultName()}.Err" else "${sourceResultName()}.Ok"
+        val divergeVariant =
+            when {
+                coreResultLetElseInfo.first == "ControlFlow.Break" -> "ControlFlow.Continue"
+                coreResultLetElseInfo.first == "ControlFlow.Continue" -> "ControlFlow.Break"
+                coreResultLetElseInfo.first.endsWith(".Ok") -> "${sourceResultName()}.Err"
+                else -> "${sourceResultName()}.Ok"
+            }
         val tryVar = scopeBuilder.bindLocal("_try", "tryResult", initExpr.span()).kotlinName
         "$indent$keyword $patText$typeSuffix = when (val $tryVar = $rhs) { is ${coreResultLetElseInfo.first}<*, *> -> $tryVar.${coreResultLetElseInfo.second}; is $divergeVariant<*, *> -> $divergeBody }"
     } else if (divergeBody != null) {
@@ -4029,7 +4045,7 @@ private fun KotlinJ2KEmitter.renderTupleStructDestructuringLocal(
     indent: String,
     selfTypeName: String?,
 ): String? {
-    if (isOptionSomeTupleStructPat(pat) || coreResultVariantMatchInfo(pat) != null) return null
+    if (isOptionSomeTupleStructPat(pat) || coreResultVariantMatchInfo(pat) != null || controlFlowVariantMatchInfo(pat) != null) return null
     val elems = pat.elems.toList()
     val bindings = mutableListOf<Triple<Int, Pat.Ident, Boolean>>()
     for ((idx, elemPat) in elems.withIndex()) {

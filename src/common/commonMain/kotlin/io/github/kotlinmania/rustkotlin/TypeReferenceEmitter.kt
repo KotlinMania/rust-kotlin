@@ -775,15 +775,19 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
     if (rawName == "PhantomData" && "PhantomData" !in inspector.declaredTypeNames) {
         return "Unit"
     }
+    val fmtSegNames =
+        rewriteCrateRootAliasAndReexportSegments(
+            rawSegments.map { it.ident.toString().removePrefix("r#") },
+        )
     val isStdlibFmtModule =
         (
-            rawSegments.size >= 3 &&
-                rawSegments[0].ident.toString() in STDLIB_CRATE_ROOTS &&
-                rawSegments[1].ident.toString() == "fmt"
+            fmtSegNames.size >= 3 &&
+                fmtSegNames[0] in STDLIB_CRATE_ROOTS &&
+                fmtSegNames[1] == "fmt"
         ) ||
             (
-                rawSegments.size == 2 &&
-                    rawSegments[0].ident.toString() == "fmt" &&
+                fmtSegNames.size == 2 &&
+                    fmtSegNames[0] == "fmt" &&
                     (
                         scopeBuilder.resolveModuleBinding("fmt") != null ||
                             headerContext.rawAbiMode ||
@@ -881,10 +885,12 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
 
     if (!headerContext.rawAbiMode &&
         rawName == "Result" &&
-        "Ok" !in inspector.declaredTypeNames &&
-        !hasDeclaredResultEnum()
+        "Ok" !in inspector.declaredTypeNames
     ) {
-        val rawSegNames = rawSegments.map { it.ident.toString().removePrefix("r#") }
+        val rawSegNames =
+            rewriteCrateRootAliasAndReexportSegments(
+                rawSegments.map { it.ident.toString().removePrefix("r#") },
+            )
         val modHead = rawSegNames.getOrNull(rawSegNames.size - 2)
         val resolvedModImp =
             if (rawSegNames.size == 2 && modHead != null) {
@@ -919,14 +925,16 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
             val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
             val errRef = bindOrQualifyResolvedCrossSymbol("$coreNs.fmt.Error")
             val resName =
-                if ("Result" in inspector.declaredTypeNames) {
+                if (hasDeclaredResultEnum()) {
+                    "Result"
+                } else if ("Result" in inspector.declaredTypeNames) {
                     "$coreNs.result.Result"
                 } else {
                     sourceResultName()
                 }
             return "$resName<Unit, $errRef>"
         }
-        if (lastSeg.arguments is PathArguments.AngleBracketed) {
+        if (!hasDeclaredResultEnum() && lastSeg.arguments is PathArguments.AngleBracketed) {
             val isStdOrCoreResult =
                 rawSegNames.size == 1 ||
                     matchesStdMod("result") ||
@@ -963,7 +971,10 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                 .toList()
                 .mapNotNull { renderGenericArgument(it, selfTypeName) }
         if (typeArgs.size == 1) {
-            val rawSegNames = rawSegments.map { it.ident.toString().removePrefix("r#") }
+            val rawSegNames =
+                rewriteCrateRootAliasAndReexportSegments(
+                    rawSegments.map { it.ident.toString().removePrefix("r#") },
+                )
             val modHead = rawSegNames.getOrNull(rawSegNames.size - 2)
             val resolvedModImp =
                 if (rawSegNames.size == 2 && modHead != null) {
@@ -1598,6 +1609,8 @@ internal fun KotlinJ2KEmitter.renderTypeParamBound(bound: TypeParamBound, selfTy
                             }
                     if (itemTy != null) {
                         if (last == "IntoIterator") "Iterable<$itemTy>" else "Iterator<$itemTy>"
+                    } else if (last == "Iterator" && "Item" in activeTypeParamNames) {
+                        "Iterator<Item>"
                     } else {
                         null
                     }

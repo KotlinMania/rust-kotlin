@@ -740,7 +740,11 @@ internal fun KotlinJ2KEmitter.renderBitwiseComplementOperand(
 ): String {
     val rendered = renderExpr(operand, indent, selfTypeName)
     val recv = if (isAtomicPostfixReceiver(operand, rendered)) rendered else "($rendered)"
-    return "$recv.inv()"
+    return when (inferExprNumericKind(operand, selfTypeName)) {
+        NumericKind.I8 -> "($recv.toInt().inv()).toByte()"
+        NumericKind.I16 -> "($recv.toInt().inv()).toShort()"
+        else -> "$recv.inv()"
+    }
 }
 
 internal fun KotlinJ2KEmitter.isKnownIntegerBitmaskExpr(expr: Expr): Boolean =

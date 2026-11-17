@@ -121,7 +121,30 @@ internal fun KotlinJ2KEmitter.registerUseItemInScope(item: Item.Use) {
             } else {
                 leaf.segments
             }
-        val importedPath = resolveKotlinImportPath(normalizedLeafSegs, leaf.alias, leaf.isSelfImport) ?: normalizedLeafSegs.joinToString(".")
+        val rewrittenLeafSegs = rewriteCrateRootAliasAndReexportSegments(normalizedLeafSegs)
+        val importedPath =
+            resolveKotlinImportPath(rewrittenLeafSegs, leaf.alias, leaf.isSelfImport) ?: run {
+                val head = rewrittenLeafSegs.firstOrNull()?.removePrefix("r#")
+                when {
+                    head == "crate" && currentNamespacePrefix() != null -> {
+                        val ns = currentNamespacePrefix()!!
+                        val tail =
+                            rewrittenLeafSegs.drop(1).joinToString(".") {
+                                rustModuleIdentToKotlin(it.removePrefix("r#").replace('-', '_'))
+                            }
+                        if (tail.isEmpty()) ns else "$ns.$tail"
+                    }
+                    head == "super" && headerContext.packageName?.contains('.') == true -> {
+                        val parentPkg = headerContext.packageName.substringBeforeLast('.')
+                        val tail =
+                            rewrittenLeafSegs.drop(1).joinToString(".") {
+                                rustModuleIdentToKotlin(it.removePrefix("r#").replace('-', '_'))
+                            }
+                        if (tail.isEmpty()) parentPkg else "$parentPkg.$tail"
+                    }
+                    else -> rewrittenLeafSegs.joinToString(".")
+                }
+            }
         val isKnownSubpkgModule = isResolvedCrateSubpackageModule(importedPath, lastSeg)
         val isStdlibUnloweredModule =
             !leaf.isSelfImport &&
