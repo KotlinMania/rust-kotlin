@@ -162,17 +162,14 @@ internal fun KotlinJ2KEmitter.tryRenderSingleEvalIfLet(
                 .toList()
                 .firstOrNull()
                 ?.let { !isDiscriminatingOptionInnerPattern(it) } != false
+    val coreResultInfo = if (unwrappedPat is Pat.TupleStruct) coreResultVariantMatchInfo(unwrappedPat) else null
     val requiresBoolCond = !isPlainSome && patRequiresBooleanCondition(unwrappedPat)
-    val typeCheckTarget =
-        when {
-            isPlainSome -> null
-            unwrappedPat is Pat.TupleStruct -> renderPathAsType(unwrappedPat.path, selfTypeName)
-            unwrappedPat is Pat.Struct -> {
-                val vt = renderPathAsType(unwrappedPat.path, selfTypeName)
-                if (isPlainStructPattern(unwrappedPat, vt)) null else vt
-            }
-            else -> return null
-        }
+    val isSupportedPat =
+        isPlainSome ||
+            coreResultInfo != null ||
+            unwrappedPat is Pat.TupleStruct ||
+            unwrappedPat is Pat.Struct
+    if (!isSupportedPat) return null
 
     val savedKind = currentExpectedNumericKind
     val savedTailOk = currentTailExpectsUnitResultOk
@@ -208,6 +205,21 @@ internal fun KotlinJ2KEmitter.tryRenderSingleEvalIfLet(
         inferExprRenderedType(cond.expr, selfTypeName)?.let {
             currentTypedLocals = currentTypedLocals + (subjectVar to it)
         }
+        val typeCheckTarget =
+            when {
+                isPlainSome -> null
+                coreResultInfo != null -> {
+                    val starArgs = if (isUntypedResultScrutinee(currentTypedLocals[subjectVar])) "<*, *>" else ""
+                    "${coreResultInfo.first}$starArgs"
+                }
+                unwrappedPat is Pat.TupleStruct ->
+                    qualifyShadowedPatternVariantType(renderPathAsType(unwrappedPat.path, selfTypeName), subjectVar, selfTypeName)
+                unwrappedPat is Pat.Struct -> {
+                    val vt = qualifyShadowedPatternVariantType(renderPathAsType(unwrappedPat.path, selfTypeName), subjectVar, selfTypeName)
+                    if (isPlainStructPattern(unwrappedPat, vt)) null else vt
+                }
+                else -> null
+            }
         val boolCond =
             if (requiresBoolCond) {
                 val savedBoolKind = currentExpectedNumericKind
@@ -317,7 +329,7 @@ internal fun KotlinJ2KEmitter.renderExprWhile(expr: Expr.While, indent: String, 
                     val breakLine =
                         when {
                             condCheck == "$subjectVar != null" -> "${innerIndent}if ($subjectVar == null) break"
-                            condCheck.startsWith("$subjectVar is ") ->
+                            condCheck.startsWith("$subjectVar is ") && !condCheck.contains(" && ") && !condCheck.contains(" || ") ->
                                 "${innerIndent}if ($subjectVar !is ${condCheck.removePrefix("$subjectVar is ")}) break"
                             else -> "${innerIndent}if (!($condCheck)) break"
                         }
@@ -455,12 +467,12 @@ internal fun KotlinJ2KEmitter.renderIfLetPatternAgainstRhs(
                 } else {
                     "$rhs != null"
                 }
+            } else if (patRequiresBooleanCondition(pat)) {
+                renderPatternBooleanCondition(pat, rhs, indent, selfTypeName)
             } else if (coreResultInfo != null) {
                 val scrutineeType = subjectExpr?.let { inferExprRenderedType(it, selfTypeName) } ?: currentTypedLocals[rhs]
                 val starArgs = if (isUntypedResultScrutinee(scrutineeType)) "<*, *>" else ""
                 "$rhs is ${coreResultInfo.first}$starArgs"
-            } else if (patRequiresBooleanCondition(pat)) {
-                renderPatternBooleanCondition(pat, rhs, indent, selfTypeName)
             } else {
                 "$rhs is ${qualifyShadowedPatternVariantType(renderPathAsType(pat.path, selfTypeName), rhs, selfTypeName)}"
             }

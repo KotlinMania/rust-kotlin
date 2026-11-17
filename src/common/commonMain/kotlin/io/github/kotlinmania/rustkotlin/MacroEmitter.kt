@@ -1474,6 +1474,15 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
             else -> 0
         }
     val effectiveRawSegments = if (stdlibFfiDropCount > 0) rawSegments.drop(stdlibFfiDropCount) else rawSegments
+    if (rawSegments.size == 2 &&
+        rawSegments[0].arguments is PathArguments.None &&
+        rawSegments[1].arguments is PathArguments.None
+    ) {
+        val collidedRename = inspector.collidingInlineForeignFnRenames[rawSegNames[0] to rawSegNames[1]]
+        if (collidedRename != null) {
+            return if (asCallee) collidedRename else "::$collidedRename"
+        }
+    }
 
     val filtered =
         effectiveRawSegments.filterIndexed { idx, seg ->
@@ -1685,6 +1694,22 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
             cleanSingle !in inspector.declaredConstNames
         ) {
             return "::${rustFunctionIdentToKotlin(singleRaw)}"
+        }
+        if (!asCallee &&
+            cleanSingle == "drop" &&
+            scopeBuilder.resolveLocalKotlinName("drop") == null &&
+            "drop" !in inspector.declaredTopLevelFnRawNames &&
+            "drop" !in inspector.declaredConstNames &&
+            (
+                "core" in headerContext.crateNamespaces ||
+                    headerContext.packageName?.startsWith(CoreIntrinsicLowering.resolveCoreNamespace(headerContext)) == true
+            )
+        ) {
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+            if (headerContext.packageName != "$coreNs.mem") {
+                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.drop")
+            }
+            return "{ drop(it) }"
         }
     }
 
