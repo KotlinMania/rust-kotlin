@@ -43,9 +43,9 @@ class StdlibSemanticWaveATest {
             """.trimIndent()
 
         val kt = renderSingleKotlinFile(source, stdlibHeader).text
-        assertContains(kt, "is Result.Ok ->")
-        assertContains(kt, "is Result.Err ->")
-        assertFalse(kt.contains("<*, *>"), "Typed tagged Result smart-casts must not use star-projected casts:\n$kt")
+        assertContains(kt, "is Result.Ok<*, *> ->")
+        assertContains(kt, "is Result.Err<*, *> ->")
+        assertFalse(kt.contains("as Result.Ok<*, *>"), "Typed tagged Result smart-casts must not use erased casts:\n$kt")
         assertContains(kt, "Result.Ok<NonNull, AllocError>(")
         assertContains(kt, "Result.Err<NonNull, AllocError>(")
         assertContains(kt, "Result.Ok<Int, AllocError>(")

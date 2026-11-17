@@ -239,6 +239,7 @@ public data class FileHeaderContext(
     public val crateTraitSupertraits: Map<String, List<String>> = emptyMap(),
     public val crateTraitAstRegistryKey: String? = null,
     public val crateFnConstParamNames: Map<String, Pair<Int, List<String>>> = emptyMap(),
+    public val crateEnumVariantTypeArity: Map<String, Int> = emptyMap(),
     public val scalarChar: Boolean = false,
     public val externalCrateSymbolPackages: Map<String, Map<String, List<String>>> = emptyMap(),
     public val externalCrateTwoFieldResultFns: Set<String> = emptySet(),

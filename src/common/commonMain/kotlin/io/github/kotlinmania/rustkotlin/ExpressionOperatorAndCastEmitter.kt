@@ -492,7 +492,9 @@ internal fun KotlinJ2KEmitter.renderExprCast(expr: Expr.Cast, indent: String, se
         } else if (isInferTarget && savedKind != null) {
             numericKindToTypeNameRecordingFlags(savedKind)
         } else if (isInferTarget) {
-            savedParseTarget ?: currentEnclosingReturnRenderedType ?: renderType(expr.ty, selfTypeName)
+            savedParseTarget?.takeIf { it != "Unit" && it != "_" }
+                ?: inferExprRenderedType(expr.expr, selfTypeName)?.takeIf { it != "Unit" && it != "_" }
+                ?: return inner
         } else {
             renderType(expr.ty, selfTypeName)
         }

@@ -11,6 +11,7 @@ import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.FieldValue
 import io.github.kotlinmania.syn.FnArg
+import io.github.kotlinmania.syn.ForeignItem
 import io.github.kotlinmania.syn.GenericArgument
 import io.github.kotlinmania.syn.GenericParam
 import io.github.kotlinmania.syn.Generics
@@ -1844,9 +1845,10 @@ internal fun KotlinJ2KEmitter.renderBlock(
                     else -> null
                 }
             }.toSet()
+    val localScopeItems = stmts.mapNotNull { (it as? Stmt.ItemStmt)?.item }
     for (stmt in stmts) {
         val implItem = (stmt as? Stmt.ItemStmt)?.item as? Item.Impl ?: continue
-        val ownerType = extractDirectOwnerTypeName(implItem.selfType, implItem.generics)
+        val ownerType = extractAttachableDirectOwnerTypeName(implItem, localScopeItems)
         if (ownerType != null && ownerType in localAttachableNames) {
             localBlockImpls.getOrPut(ownerType) { mutableListOf() }.add(implItem)
         }
@@ -1863,32 +1865,73 @@ internal fun KotlinJ2KEmitter.renderBlock(
     val savedBlockLocalFnRawNames = hashSetOf<String>()
     val savedBlockLocalInlineModNames = hashSetOf<String>()
     val prevBlockLocalFnReturnSynTypes = linkedMapOf<String, SynType?>()
+    val prevBlockLocalTypeAliases = linkedMapOf<String, SynType?>()
+    val savedBlockLocalExternFnNames = linkedSetOf<String>()
     currentExpectedNumericKind = null
     currentTailExpectsUnitResultOk = false
     scopeBuilder.enterCompr()
     try {
         for (stmt in stmts) {
-            val fnItem = (stmt as? Stmt.ItemStmt)?.item as? Item.Fn ?: continue
-            if (itemHasDocOnlyCfg(fnItem)) continue
-            val cleanRaw =
-                fnItem.sig.ident
-                    .toString()
-                    .removePrefix("r#")
-            if (cleanRaw !in inspector.declaredTopLevelFnRawNames) {
-                savedBlockLocalFnRawNames += cleanRaw
-                inspector.declaredTopLevelFnRawNames += cleanRaw
-            }
-            val retOut = fnItem.sig.output as? ReturnType.TypeReturn
-            if (retOut != null) {
-                val ktFn = rustFunctionIdentToKotlin(fnItem.sig.ident.toString())
-                if (cleanRaw !in prevBlockLocalFnReturnSynTypes) {
-                    prevBlockLocalFnReturnSynTypes[cleanRaw] = inspector.topLevelFnReturnSynTypes[cleanRaw]
+            val stmtItem = (stmt as? Stmt.ItemStmt)?.item ?: continue
+            if (itemHasDocOnlyCfg(stmtItem)) continue
+            when (stmtItem) {
+                is Item.Fn -> {
+                    val cleanRaw =
+                        stmtItem.sig.ident
+                            .toString()
+                            .removePrefix("r#")
+                    if (cleanRaw !in inspector.declaredTopLevelFnRawNames) {
+                        savedBlockLocalFnRawNames += cleanRaw
+                        inspector.declaredTopLevelFnRawNames += cleanRaw
+                    }
+                    val retOut = stmtItem.sig.output as? ReturnType.TypeReturn
+                    if (retOut != null) {
+                        val ktFn = rustFunctionIdentToKotlin(stmtItem.sig.ident.toString())
+                        if (cleanRaw !in prevBlockLocalFnReturnSynTypes) {
+                            prevBlockLocalFnReturnSynTypes[cleanRaw] = inspector.topLevelFnReturnSynTypes[cleanRaw]
+                        }
+                        if (ktFn !in prevBlockLocalFnReturnSynTypes) {
+                            prevBlockLocalFnReturnSynTypes[ktFn] = inspector.topLevelFnReturnSynTypes[ktFn]
+                        }
+                        inspector.topLevelFnReturnSynTypes[cleanRaw] = retOut.ty
+                        inspector.topLevelFnReturnSynTypes[ktFn] = retOut.ty
+                    }
                 }
-                if (ktFn !in prevBlockLocalFnReturnSynTypes) {
-                    prevBlockLocalFnReturnSynTypes[ktFn] = inspector.topLevelFnReturnSynTypes[ktFn]
+                is Item.ForeignMod -> {
+                    for (foreign in stmtItem.items) {
+                        if (foreignItemHasDocOnlyCfg(foreign)) continue
+                        if (foreign is ForeignItem.Fn) {
+                            val cleanRaw =
+                                foreign.sig.ident
+                                    .toString()
+                                    .removePrefix("r#")
+                            if (cleanRaw !in inspector.declaredTopLevelFnRawNames) {
+                                savedBlockLocalFnRawNames += cleanRaw
+                                inspector.declaredTopLevelFnRawNames += cleanRaw
+                            }
+                            val ktFn = rustFunctionIdentToKotlin(foreign.sig.ident.toString())
+                            if (ktFn !in inspector.externFnKotlinNames) {
+                                savedBlockLocalExternFnNames += ktFn
+                                inspector.externFnKotlinNames += ktFn
+                            }
+                            val retOut = foreign.sig.output as? ReturnType.TypeReturn
+                            if (retOut != null &&
+                                foreign.sig.generics.params
+                                    .isEmpty()
+                            ) {
+                                if (cleanRaw !in prevBlockLocalFnReturnSynTypes) {
+                                    prevBlockLocalFnReturnSynTypes[cleanRaw] = inspector.topLevelFnReturnSynTypes[cleanRaw]
+                                }
+                                if (ktFn !in prevBlockLocalFnReturnSynTypes) {
+                                    prevBlockLocalFnReturnSynTypes[ktFn] = inspector.topLevelFnReturnSynTypes[ktFn]
+                                }
+                                inspector.topLevelFnReturnSynTypes[cleanRaw] = retOut.ty
+                                inspector.topLevelFnReturnSynTypes[ktFn] = retOut.ty
+                            }
+                        }
+                    }
                 }
-                inspector.topLevelFnReturnSynTypes[cleanRaw] = retOut.ty
-                inspector.topLevelFnReturnSynTypes[ktFn] = retOut.ty
+                else -> {}
             }
         }
         val blockFnParamKinds = linkedMapOf<String, List<NumericKind?>?>()
@@ -1920,6 +1963,12 @@ internal fun KotlinJ2KEmitter.renderBlock(
             if (itemHasDocOnlyCfg(itemInStmt)) continue
             if (itemInStmt is Item.Use) {
                 registerUseItemInScope(itemInStmt)
+            } else if (itemInStmt is Item.ItemType) {
+                val ktAlias = rustTypeIdentToKotlin(itemInStmt.ident.toString())
+                if (ktAlias !in prevBlockLocalTypeAliases) {
+                    prevBlockLocalTypeAliases[ktAlias] = inspector.typeAliasTargets[ktAlias]
+                }
+                inspector.typeAliasTargets[ktAlias] = itemInStmt.ty
             } else if (itemInStmt is Item.Mod && itemInStmt.content is ModContent.Inline) {
                 val modRaw = itemInStmt.ident.toString().removePrefix("r#")
                 if (modRaw !in inspector.localInlineModuleNames) {
@@ -1933,7 +1982,7 @@ internal fun KotlinJ2KEmitter.renderBlock(
             val itemInStmt = (stmt as? Stmt.ItemStmt)?.item ?: continue
             if (itemHasDocOnlyCfg(itemInStmt) || itemInStmt is Item.Use) continue
             if (itemInStmt is Item.Impl) {
-                val ownerType = extractDirectOwnerTypeName(itemInStmt.selfType, itemInStmt.generics)
+                val ownerType = extractAttachableDirectOwnerTypeName(itemInStmt, localScopeItems)
                 if (ownerType != null && ownerType in localAttachableNames) {
                     continue
                 }
@@ -2020,12 +2069,20 @@ internal fun KotlinJ2KEmitter.renderBlock(
         }
     } finally {
         inspector.declaredTopLevelFnRawNames.removeAll(savedBlockLocalFnRawNames)
+        inspector.externFnKotlinNames.removeAll(savedBlockLocalExternFnNames)
         inspector.localInlineModuleNames.removeAll(savedBlockLocalInlineModNames)
         for ((fnKey, prevSyn) in prevBlockLocalFnReturnSynTypes) {
             if (prevSyn == null) {
                 inspector.topLevelFnReturnSynTypes.remove(fnKey)
             } else {
                 inspector.topLevelFnReturnSynTypes[fnKey] = prevSyn
+            }
+        }
+        for ((aliasKey, prevSyn) in prevBlockLocalTypeAliases) {
+            if (prevSyn == null) {
+                inspector.typeAliasTargets.remove(aliasKey)
+            } else {
+                inspector.typeAliasTargets[aliasKey] = prevSyn
             }
         }
         currentExpectedNumericKind = blockEntryExpectedKind
@@ -2515,8 +2572,7 @@ internal fun KotlinJ2KEmitter.tryRenderDeferredLocalResultMatchInit(
                 }
             }
         val resultType = sourceResultName()
-        val starArgs = if (isUntypedResultScrutinee(inferExprRenderedType(matchExpr.expr, selfTypeName))) "<*, *>" else ""
-        out += "${trivia1}${trivia2}${innerIndent}val $okVar = when (val matchResult = $subjectRendered) { is $resultType.Ok$starArgs -> matchResult.value; is $resultType.Err$starArgs -> $errRender }"
+        out += "${trivia1}${trivia2}${innerIndent}val $okVar = when (val matchResult = $subjectRendered) { is $resultType.Ok<*, *> -> matchResult.value; is $resultType.Err<*, *> -> $errRender }"
     } else {
         val errRender =
             run {
@@ -2643,13 +2699,22 @@ internal fun KotlinJ2KEmitter.renderStmt(
                 }
             }
             is Stmt.MacroStmt -> {
-                val rawRendered = renderMacroInvocationAsStmtOrExpr(stmt.mac, indent, selfTypeName)
                 val macName =
                     stmt.mac.path.segments
                         .last()
                         ?.ident
                         ?.toString()
                         ?.removePrefix("r#")
+                val savedMacTarget = currentExpectedParseTargetType
+                if (stmt.semiToken == null && isTailReturn && macName == "vec" && currentExpectedParseTargetType == null) {
+                    currentExpectedParseTargetType = currentEnclosingReturnRenderedType
+                }
+                val rawRendered =
+                    try {
+                        renderMacroInvocationAsStmtOrExpr(stmt.mac, indent, selfTypeName)
+                    } finally {
+                        currentExpectedParseTargetType = savedMacTarget
+                    }
                 val isWriteMacTail =
                     stmt.semiToken == null &&
                         macName in setOf("write", "writeln") &&
@@ -2657,7 +2722,7 @@ internal fun KotlinJ2KEmitter.renderStmt(
                         (isTailReturn || (isLastExecutableStmt && currentTailExpectsUnitResultOk))
                 val rendered =
                     if (isWriteMacTail && rawRendered.isNotBlank()) {
-                        val okVal = if (usesTaggedCoreResult()) "${sourceResultName()}.Ok(Unit)" else "Result.success(Unit)"
+                        val okVal = enclosingUnitResultOkExpr() ?: if (usesTaggedCoreResult()) "${sourceResultName()}.Ok(Unit)" else "Result.success(Unit)"
                         if (rawRendered.contains('\n')) "run {\n$rawRendered\n$okVal\n}" else "run { $rawRendered; $okVal }"
                     } else {
                         rawRendered
@@ -2690,12 +2755,17 @@ internal fun KotlinJ2KEmitter.isExplicitControlFlowJump(expr: Expr): Boolean =
 internal fun KotlinJ2KEmitter.renderTailReturnExpr(expr: Expr, indent: String, selfTypeName: String?): String {
     val retNumKind = currentEnclosingReturnRenderedType?.let(this::resolveNumericKind)
     val savedTailOk = currentTailExpectsUnitResultOk
+    val savedParseTarget = currentExpectedParseTargetType
     currentTailExpectsUnitResultOk = (rustResultOkPayloadType(currentEnclosingReturnRenderedType) == "Unit")
+    if (unwrapParenOrGroupExpr(expr) is Expr.Macro && currentExpectedParseTargetType == null) {
+        currentExpectedParseTargetType = currentEnclosingReturnRenderedType
+    }
     val rawRendered =
         try {
             renderTypedNumericInitializer(expr, retNumKind, indent, selfTypeName)
         } finally {
             currentTailExpectsUnitResultOk = savedTailOk
+            currentExpectedParseTargetType = savedParseTarget
         }
     val rendered =
         if (rustResultOkPayloadType(currentEnclosingReturnRenderedType) == "Unit") {
@@ -3084,9 +3154,8 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
     return if (coreResultLetElseInfo != null && divergeBody != null) {
         val isOkVariant = coreResultLetElseInfo.first.endsWith(".Ok")
         val divergeVariant = if (isOkVariant) "${sourceResultName()}.Err" else "${sourceResultName()}.Ok"
-        val starArgs = if (isUntypedResultScrutinee(inferExprRenderedType(initExpr, selfTypeName))) "<*, *>" else ""
         val tryVar = scopeBuilder.bindLocal("_try", "tryResult", initExpr.span()).kotlinName
-        "$indent$keyword $patText$typeSuffix = when (val $tryVar = $rhs) { is ${coreResultLetElseInfo.first}$starArgs -> $tryVar.${coreResultLetElseInfo.second}; is $divergeVariant$starArgs -> $divergeBody }"
+        "$indent$keyword $patText$typeSuffix = when (val $tryVar = $rhs) { is ${coreResultLetElseInfo.first}<*, *> -> $tryVar.${coreResultLetElseInfo.second}; is $divergeVariant<*, *> -> $divergeBody }"
     } else if (divergeBody != null) {
         "$indent$keyword $patText$typeSuffix = $rhs ?: $divergeBody"
     } else if (headerContext.isBatchCrateOutput && rhs.contains('\n')) {

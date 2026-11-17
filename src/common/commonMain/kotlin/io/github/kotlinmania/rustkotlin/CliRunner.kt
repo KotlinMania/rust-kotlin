@@ -1110,6 +1110,7 @@ private fun executeTranslate(
                 crateTraitSupertraits = crateMetadata.traitSupertraits,
                 crateTraitAstRegistryKey = crateMetadata.traitAstRegistryKey,
                 crateFnConstParamNames = crateMetadata.fnConstParamNames,
+                crateEnumVariantTypeArity = crateMetadata.enumVariantTypeArity,
                 scalarChar = parsed.scalarChar,
                 externalCrateSymbolPackages = externalCrateMeta.symbolPackages,
                 externalCrateTwoFieldResultFns = externalCrateMeta.twoFieldResultFns,

@@ -47,6 +47,9 @@ private val STDLIB_DEFAULTLESS_ASSOC_TYPES: Map<String, List<String>> =
     mapOf(
         "Iterator" to listOf("Item"),
         "IntoIterator" to listOf("Item", "IntoIter"),
+        "Fn" to listOf("Output"),
+        "FnMut" to listOf("Output"),
+        "FnOnce" to listOf("Output"),
         "Try" to listOf("Output", "Residual"),
         "Deref" to listOf("Target"),
         "SliceIndex" to listOf("Output"),
@@ -188,9 +191,33 @@ internal fun rustResultOkPayloadType(rendered: String?): String? {
 internal fun KotlinJ2KEmitter.usesTaggedCoreResult(): Boolean =
     hasDeclaredResultEnum() || "core" in headerContext.crateNamespaces
 
+internal fun KotlinJ2KEmitter.hasConflictingResultBinding(): Boolean {
+    if ("Result" in inspector.declaredTypeNames || "Result" in inspector.typeAliasTargets) {
+        return true
+    }
+    importedSimpleNameToPkg["Result"]?.let { pkg ->
+        if (!pkg.endsWith(".result")) return true
+    }
+    for (useItem in inspector.allUseItems) {
+        val leaves = mutableListOf<UseLeaf>()
+        collectUseLeaves(useItem.tree, emptyList(), leaves)
+        for (leaf in leaves) {
+            val bound = (leaf.alias ?: leaf.segments.lastOrNull())?.removePrefix("r#")
+            if (bound == "Result") {
+                val cleanSegs = leaf.segments.map { it.removePrefix("r#") }
+                val tail2 = cleanSegs.takeLast(2)
+                if (tail2 != listOf("result", "Result") && cleanSegs != listOf("Result")) {
+                    return true
+                }
+            }
+        }
+    }
+    return false
+}
+
 internal fun KotlinJ2KEmitter.sourceResultName(): String {
     if (!hasDeclaredResultEnum() && usesTaggedCoreResult()) usesSourceResult = true
-    return if ("Result" in inspector.declaredTypeNames) "RustResult" else "Result"
+    return if (hasConflictingResultBinding()) "RustResult" else "Result"
 }
 
 internal fun KotlinJ2KEmitter.isSourceResultConstructor(expression: Expr): Boolean {
@@ -283,7 +310,8 @@ internal fun KotlinJ2KEmitter.renderSourceResultTry(expression: String, returnKe
         return "$expression.getOrElse { $returnKeyword Result.failure(it) }"
     }
     val result = sourceResultName()
-    val starArgs = if (isUntypedResultScrutinee(sourceType)) "<*, *>" else ""
+    val starArgs = "<*, *>"
+    val isUntypedScrutinee = sourceType != null && isUntypedResultScrutinee(sourceType)
     val enclosingPair =
         if (returnKeyword.startsWith("return")) {
             resolveEnclosingResultTypeArguments(currentEnclosingReturnRenderedType)
@@ -297,13 +325,13 @@ internal fun KotlinJ2KEmitter.renderSourceResultTry(expression: String, returnKe
             ""
         }
     val errPayloadExpr =
-        if (starArgs.isNotEmpty() && enclosingPair != null && isUsableExplicitResultTypeArg(enclosingPair.second)) {
+        if (isUntypedScrutinee && enclosingPair != null && isUsableExplicitResultTypeArg(enclosingPair.second)) {
             "(tryResult.error as ${enclosingPair.second})"
         } else {
             "tryResult.error"
         }
     val elseBranch =
-        if (starArgs.isNotEmpty()) {
+        if (isUntypedScrutinee) {
             "; else -> error(\"Unexpected $result variant: \$tryResult\")"
         } else {
             ""
@@ -438,6 +466,34 @@ private inline fun KotlinJ2KEmitter.withExpectedTargetIfUnconstrained(
     }
 }
 
+private val DEBUG_BUILDER_FACTORIES: Set<String> =
+    setOf("debug_struct", "debug_tuple", "debug_list", "debug_set", "debug_map")
+
+private val DEBUG_BUILDER_TYPES: Set<String> =
+    setOf("DebugStruct", "DebugTuple", "DebugList", "DebugSet", "DebugMap")
+
+private fun KotlinJ2KEmitter.isSynthesizedDebugFinishCall(call: Expr.MethodCall, selfTypeName: String?): Boolean {
+    val rawMethod = call.method.toString().removePrefix("r#")
+    if (rawMethod != "finish" && rawMethod != "finish_non_exhaustive") return false
+    var recv = unwrapParenOrGroupExpr(call.receiver)
+    while (recv is Expr.MethodCall) {
+        if (recv.method.toString().removePrefix("r#") in DEBUG_BUILDER_FACTORIES) {
+            return true
+        }
+        recv = unwrapParenOrGroupExpr(recv.receiver)
+    }
+    if ("DebugTuple" !in inspector.declaredTypeNames) {
+        val recvTypeBase =
+            inferExprRenderedType(call.receiver, selfTypeName)
+                ?.removeSuffix("?")
+                ?.substringBefore('<')
+                ?.substringAfterLast('.')
+                ?.trim()
+        if (recvTypeBase in DEBUG_BUILDER_TYPES) return true
+    }
+    return false
+}
+
 /** True when a Rust expression renders as Unit, Appendable, or StringBuilder in fmt::Write/fmt::Result positions. */
 internal fun KotlinJ2KEmitter.isFmtWriteOrUnitExpr(expr: Expr, selfTypeName: String?): Boolean {
     val core = unwrapParenOrGroupExpr(expr)
@@ -450,6 +506,9 @@ internal fun KotlinJ2KEmitter.isFmtWriteOrUnitExpr(expr: Expr, selfTypeName: Str
     if (core is Expr.MethodCall) {
         val rawMethod = core.method.toString().removePrefix("r#")
         if (rawMethod in setOf("write_str", "write_char", "pad") && core.args.size == 1 && core.turbofish == null) {
+            return true
+        }
+        if (isSynthesizedDebugFinishCall(core, selfTypeName)) {
             return true
         }
     }
@@ -481,15 +540,25 @@ internal fun KotlinJ2KEmitter.isFmtWriteOrUnitExpr(expr: Expr, selfTypeName: Str
     return inferred in setOf("Unit", "Appendable", "StringBuilder")
 }
 
+internal fun KotlinJ2KEmitter.enclosingUnitResultOkExpr(): String? {
+    val enclosingPair = resolveEnclosingResultTypeArguments(currentEnclosingReturnRenderedType)
+    val okPayload = enclosingPair?.first ?: rustResultOkPayloadType(currentEnclosingReturnRenderedType)
+    if (okPayload != "Unit") return null
+    return if (usesTaggedCoreResult()) {
+        val okTypeArgs = buildExplicitResultTypeArgsSuffix("Unit", enclosingPair?.second)
+        "${sourceResultName()}.Ok$okTypeArgs(Unit)"
+    } else {
+        "Result.success(Unit)"
+    }
+}
+
 /** Coerce a Unit/Appendable/StringBuilder tail expression to Result.Ok(Unit) when returning Result<Unit, E>. */
 internal fun KotlinJ2KEmitter.coerceTailFmtUnitToResultOk(
     expr: Expr,
     rendered: String,
     selfTypeName: String?,
 ): String {
-    if (rustResultOkPayloadType(currentEnclosingReturnRenderedType) != "Unit") {
-        return rendered
-    }
+    val okVal = enclosingUnitResultOkExpr() ?: return rendered
     if (isSourceResultConstructor(expr)) {
         return rendered
     }
@@ -500,7 +569,6 @@ internal fun KotlinJ2KEmitter.coerceTailFmtUnitToResultOk(
     if (!isFmtWriteOrUnitExpr(expr, selfTypeName)) {
         return rendered
     }
-    val okVal = if (usesTaggedCoreResult()) "${sourceResultName()}.Ok(Unit)" else "Result.success(Unit)"
     val clean = rendered.trim()
     return when {
         clean == "Unit" || clean == "{}" -> okVal

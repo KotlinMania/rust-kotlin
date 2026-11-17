@@ -99,6 +99,7 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
         return it.toString()
     }
     val rawArgs = expr.args.toList()
+    tryRenderSimdLaneVectorStaticCall(expr, rawArgs, indent, selfTypeName)?.let { return it }
     val nonUnitArgs = rawArgs.filterNot { it is Expr.Tuple && it.elems.isEmpty() }
     if (nonUnitArgs.size == 1) {
         renderPrimitiveFromBytesCall(expr, nonUnitArgs[0], indent, selfTypeName)?.let { return it }
@@ -615,8 +616,8 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                 } else {
                     calleeLookupKeys
                         .firstNotNullOfOrNull { k ->
-                            currentFunctionParamNumericKinds["$k#${nonUnitArgs.size}"]
-                                ?: currentFunctionParamNumericKinds[k]?.takeIf { it.size == nonUnitArgs.size }
+                            currentFunctionParamNumericKinds["$k#${rawArgs.size}"]
+                                ?: currentFunctionParamNumericKinds[k]?.takeIf { it.size == rawArgs.size }
                         }
                 }
             val subslicePreStmts = mutableListOf<String>()
@@ -627,7 +628,7 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
             currentExpectedParseTargetType = null
             val renderedArgList =
                 try {
-                    nonUnitArgs.mapIndexed { argIdx, argExpr ->
+                    rawArgs.mapIndexed { argIdx, argExpr ->
                         val subsliceSpec =
                             tryExtractMutableArraySubsliceArg(
                                 argExpr = argExpr,
@@ -671,15 +672,21 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                                             .removeSuffix("?")
                                             .trim()
                                             .takeIf {
+                                                val unwrappedArg = unwrapParenOrGroupExpr(argExpr)
+                                                val castTy = (unwrappedArg as? Expr.Cast)?.ty
+                                                val isInferCastArg =
+                                                    castTy is SynType.Infer || (castTy is SynType.Ptr && castTy.elem is SynType.Infer)
                                                 it.startsWith("List<") ||
                                                     it.startsWith("MutableList<") ||
-                                                    it in PRIMITIVE_ARRAY_TYPES
+                                                    it in PRIMITIVE_ARRAY_TYPES ||
+                                                    it.startsWith("RangeInclusive<") ||
+                                                    (it != "Unit" && isInferCastArg)
                                             }
                                     }
                                     ?: resolveCallArgExpectedCollectionOrArrayType(
                                         func = expr.func,
                                         argIdx = argIdx,
-                                        totalArgs = nonUnitArgs.size,
+                                        totalArgs = rawArgs.size,
                                         selfTypeName = selfTypeName,
                                     )
                             currentExpectedParseTargetType = paramParseTarget
@@ -752,7 +759,7 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                         }
                         else -> {
                             val arg0Ty =
-                                inferExprRenderedType(nonUnitArgs[0], selfTypeName)
+                                inferExprRenderedType(rawArgs[0], selfTypeName)
                                     ?.let { mutableReferencePointeeType(it) ?: it }
                                     ?.removeSuffix("?")
                                     ?.trim()
@@ -764,7 +771,7 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                         }
                     }
                 if (isUfcsTraitReceiverCall) {
-                    val recvAtom = if (isAtomicPostfixReceiver(nonUnitArgs[0], renderedArgList[0])) renderedArgList[0] else "(${renderedArgList[0]})"
+                    val recvAtom = if (isAtomicPostfixReceiver(rawArgs[0], renderedArgList[0])) renderedArgList[0] else "(${renderedArgList[0]})"
                     val restArgs = renderedArgList.drop(1).joinToString(", ")
                     return "$recvAtom.$methodPart($restArgs)"
                 }
@@ -814,7 +821,7 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                                 ?: inspector.fnConstParamNames[calleeSimple]
                                 ?: headerContext.crateFnConstParamNames[calleeBase]
                                 ?: headerContext.crateFnConstParamNames[calleeSimple]
-                        )?.takeIf { (arity, consts) -> arity == nonUnitArgs.size && consts.all { it in activeConstParamNames } }
+                        )?.takeIf { (arity, consts) -> arity == rawArgs.size && consts.all { it in activeConstParamNames } }
                             ?.second
                     sameFileOrCrateConsts
                         ?: run {
@@ -835,7 +842,7 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                             extKeys
                                 .firstNotNullOfOrNull { key ->
                                     val shape = headerContext.externalCrateFnConstParams[key] ?: return@firstNotNullOfOrNull null
-                                    val needed = shape.first - nonUnitArgs.size
+                                    val needed = shape.first - rawArgs.size
                                     if (needed <= 0 || needed > shape.second.size) return@firstNotNullOfOrNull null
                                     val tailConsts = shape.second.takeLast(needed)
                                     tailConsts.takeIf { it.all { c -> c in activeConstParamNames } }
@@ -880,17 +887,17 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                 if (rewrittenTraitElemCallee == null &&
                     explicitGenericArgs.isEmpty() &&
                     '<' !in callee &&
-                    nonUnitArgs.size == 1 &&
+                    rawArgs.size == 1 &&
                     nonZeroTail in setOf("NonZero.new", "NonZero.newUnchecked")
                 ) {
-                    resolveNonZeroNewExplicitTypeArgs(nonZeroTail, nonUnitArgs, selfTypeName)
+                    resolveNonZeroNewExplicitTypeArgs(nonZeroTail, rawArgs, selfTypeName)
                 } else {
                     null
                 }
             val callExpr =
                 if (rewrittenTraitElemCallee != null) {
                     "$rewrittenTraitElemCallee($fullArgs)"
-                } else if (callee.endsWith(".default()") && nonUnitArgs.isNotEmpty()) {
+                } else if (callee.endsWith(".default()") && rawArgs.isNotEmpty()) {
                     "${callee.removeSuffix(".default()")}.from($fullArgs)"
                 } else if (nonZeroTypeArgs != null) {
                     "$callee<${nonZeroTypeArgs.first}, ${nonZeroTypeArgs.second}>($fullArgs)"
@@ -1225,4 +1232,188 @@ internal fun KotlinJ2KEmitter.coerceNumericArgIfNeeded(
 ): String {
     if (inferExprNumericKind(argExpr, selfTypeName) == targetKind) return renderedArg
     return coerceRenderedNumericExpr(argExpr, renderedArg, targetKind)
+}
+
+internal data class SimdLaneVectorSpec(
+    val wrapperName: String,
+    val elemTy: String,
+    val elemKind: NumericKind?,
+    val lanes: Int,
+)
+
+private val SIMD_LANE_NAME_REGEX = Regex("^([iufm])(8|16|32|64|128|size)x(\\d+)$", RegexOption.IGNORE_CASE)
+
+internal fun parseSimdLaneVectorSpec(
+    rawOwner: String,
+    emitter: KotlinJ2KEmitter,
+    visited: MutableSet<String> = hashSetOf(),
+): SimdLaneVectorSpec? {
+    val clean = rawOwner.removePrefix("r#").trim()
+    val direct = SIMD_LANE_NAME_REGEX.matchEntire(clean)
+    if (direct != null) {
+        val kindCh = direct.groupValues[1].lowercase()[0]
+        val bits = direct.groupValues[2].lowercase()
+        val lanes = direct.groupValues[3].toIntOrNull()?.takeIf { it > 0 } ?: return null
+        val wrapperName = if (kindCh == 'm') "SimdM" else "Simd"
+        val elemKind =
+            when (kindCh) {
+                'f' ->
+                    when (bits) {
+                        "16" -> NumericKind.F16
+                        "32" -> NumericKind.F32
+                        "64" -> NumericKind.F64
+                        "128" -> NumericKind.F128
+                        else -> null
+                    }
+                'u' ->
+                    when (bits) {
+                        "8" -> NumericKind.U8
+                        "16" -> NumericKind.U16
+                        "32" -> NumericKind.U32
+                        "64" -> NumericKind.U64
+                        "128" -> NumericKind.U128
+                        "size" -> emitter.resolvePointerSizedNumericKind(signed = false)
+                        else -> null
+                    }
+                else ->
+                    when (bits) {
+                        "8" -> NumericKind.I8
+                        "16" -> NumericKind.I16
+                        "32" -> NumericKind.I32
+                        "64" -> NumericKind.I64
+                        "128" -> NumericKind.I128
+                        "size" -> emitter.resolvePointerSizedNumericKind(signed = true)
+                        else -> null
+                    }
+            } ?: return null
+        val elemTy = emitter.numericKindToTypeNameRecordingFlags(elemKind)
+        return SimdLaneVectorSpec(wrapperName = wrapperName, elemTy = elemTy, elemKind = elemKind, lanes = lanes)
+    }
+    if (!visited.add(clean)) return null
+    val kt = rustTypeIdentToKotlin(clean)
+    val aliasTarget = emitter.inspector.typeAliasTargets[kt] ?: emitter.inspector.typeAliasTargets[clean] ?: return null
+    val pathTy = unwrapSynType(aliasTarget) as? SynType.Path ?: return null
+    val lastSeg = pathTy.path.segments.last() ?: return null
+    val segRaw = lastSeg.ident.toString().removePrefix("r#")
+    if ((segRaw == "Simd" || segRaw == "SimdM") && lastSeg.arguments is PathArguments.AngleBracketed) {
+        val args = (lastSeg.arguments as PathArguments.AngleBracketed).args.toList()
+        if (args.size >= 2) {
+            val elemSyn = (args[0] as? GenericArgument.TypeArg)?.type ?: return null
+            val laneLit = ((args[1] as? GenericArgument.ConstArg)?.expr as? Expr.Lit)?.lit as? Lit.Int ?: return null
+            val lanes =
+                laneLit.value
+                    .base10Digits()
+                    .toIntOrNull()
+                    ?.takeIf { it > 0 } ?: return null
+            val elemTy = emitter.renderType(elemSyn, null)
+            return SimdLaneVectorSpec(
+                wrapperName = segRaw,
+                elemTy = elemTy,
+                elemKind = emitter.resolveNumericKind(elemTy),
+                lanes = lanes,
+            )
+        }
+    }
+    if (lastSeg.arguments is PathArguments.None) {
+        return parseSimdLaneVectorSpec(segRaw, emitter, visited)
+    }
+    return null
+}
+
+internal fun registerSimdWrapperImport(emitter: KotlinJ2KEmitter, wrapperName: String) {
+    if (wrapperName in emitter.inspector.declaredTypeNames) return
+    if (emitter.resolveBestSubpackageForSymbol(wrapperName) != "simd") return
+    val ns = emitter.currentNamespacePrefix() ?: return
+    val targetPkg = "$ns.simd"
+    if (emitter.headerContext.packageName != targetPkg && wrapperName !in emitter.importedSimpleNameToPkg) {
+        emitter.importedSimpleNameToPkg[wrapperName] = targetPkg
+        emitter.extraTypePathImports += "import $targetPkg.$wrapperName"
+    }
+}
+
+internal fun simdZeroLiteralExpr(elemTy: String, elemKind: NumericKind?, emitter: KotlinJ2KEmitter): String =
+    when (elemKind) {
+        NumericKind.I8 -> "0.toByte()"
+        NumericKind.U8 -> "0u.toUByte()"
+        NumericKind.I16 -> "0.toShort()"
+        NumericKind.U16 -> "0u.toUShort()"
+        NumericKind.I32 -> "0"
+        NumericKind.U32 -> "0u"
+        NumericKind.I64 -> "0L"
+        NumericKind.U64 -> "0uL"
+        NumericKind.I128 -> {
+            emitter.usesI128 = true
+            "I128.ZERO"
+        }
+        NumericKind.U128 -> {
+            emitter.usesU128 = true
+            "U128.ZERO"
+        }
+        NumericKind.F16 -> {
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
+            CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.F16")
+            "F16.fromFloat(0.0f)"
+        }
+        NumericKind.F32 -> "0.0f"
+        NumericKind.F64 -> "0.0"
+        NumericKind.F128 -> {
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
+            CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.F128")
+            "F128.fromFloat(0.0f)"
+        }
+        null -> defaultInitializerForType(elemTy)
+    }
+
+private fun simdMaskAllOnesLiteral(elemKind: NumericKind?): String =
+    when (elemKind) {
+        NumericKind.I8 -> "(-1).toByte()"
+        NumericKind.I16 -> "(-1).toShort()"
+        NumericKind.I64 -> "-1L"
+        else -> "-1"
+    }
+
+private fun KotlinJ2KEmitter.tryRenderSimdLaneVectorStaticCall(
+    expr: Expr.Call,
+    rawArgs: List<Expr>,
+    indent: String,
+    selfTypeName: String?,
+): String? {
+    val fnPath = (expr.func as? Expr.Path)?.takeIf { it.qself == null } ?: return null
+    val segs =
+        fnPath.path.segments
+            .toList()
+            .map { it.ident.toString().removePrefix("r#") }
+    if (segs.size < 2) return null
+    val methodName = segs.last()
+    if (methodName !in setOf("new", "splat", "from_array")) return null
+    val ownerRaw = segs[segs.lastIndex - 1]
+    val spec = parseSimdLaneVectorSpec(ownerRaw, this) ?: return null
+    registerSimdWrapperImport(this, spec.wrapperName)
+    fun renderElem(argExpr: Expr): String {
+        val kind = spec.elemKind ?: return renderExpr(argExpr, indent, selfTypeName)
+        val rawRendered = renderTypedNumericInitializer(argExpr, kind, indent, selfTypeName)
+        return coerceNumericArgIfNeeded(argExpr, rawRendered, kind, selfTypeName)
+    }
+    return when {
+        methodName == "new" && rawArgs.isNotEmpty() -> {
+            val argsText = rawArgs.joinToString(", ") { renderElem(it) }
+            "${spec.wrapperName}<${spec.elemTy}>(listOf($argsText))"
+        }
+        methodName == "splat" && rawArgs.size == 1 -> {
+            if (spec.wrapperName == "SimdM") {
+                val cond = renderExpr(rawArgs[0], indent, selfTypeName)
+                val ones = simdMaskAllOnesLiteral(spec.elemKind)
+                val zero = simdZeroLiteralExpr(spec.elemTy, spec.elemKind, this)
+                "SimdM<${spec.elemTy}>(List(${spec.lanes}) { if ($cond) $ones else $zero })"
+            } else {
+                val elem = renderElem(rawArgs[0])
+                "Simd<${spec.elemTy}>(List(${spec.lanes}) { $elem })"
+            }
+        }
+        methodName == "from_array" && rawArgs.size == 1 -> {
+            val arr = renderExpr(rawArgs[0], indent, selfTypeName)
+            "${spec.wrapperName}<${spec.elemTy}>(($arr).toList())"
+        }
+        else -> null
+    }
 }

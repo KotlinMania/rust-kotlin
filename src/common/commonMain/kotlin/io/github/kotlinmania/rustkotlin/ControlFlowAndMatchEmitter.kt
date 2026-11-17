@@ -44,7 +44,7 @@ internal fun KotlinJ2KEmitter.renderExprIf(expr: Expr.If, indent: String, selfTy
         val isSimpleSmartCast =
             !patHeader.contains(" || ") &&
                 patHeader.startsWith("$rhsText is ") &&
-                '<' !in patHeader.removePrefix("$rhsText is ").substringBefore(" && ") &&
+                isStarProjectedOrPlainCheckType(patHeader.removePrefix("$rhsText is ").substringBefore(" && ").trim()) &&
                 ((!rhsText.contains('.') && !patHeader.contains(" && ")) || scopeBuilder.isSmartCastableLocalKotlinName(rhsText))
         val usedInThen = collectUsedRawIdentsInBlock(expr.thenBranch)
         val thenBlock =
@@ -208,15 +208,12 @@ internal fun KotlinJ2KEmitter.tryRenderSingleEvalIfLet(
         val typeCheckTarget =
             when {
                 isPlainSome -> null
-                coreResultInfo != null -> {
-                    val starArgs = if (isUntypedResultScrutinee(currentTypedLocals[subjectVar])) "<*, *>" else ""
-                    "${coreResultInfo.first}$starArgs"
-                }
+                coreResultInfo != null -> "${coreResultInfo.first}<*, *>"
                 unwrappedPat is Pat.TupleStruct ->
-                    qualifyShadowedPatternVariantType(renderPathAsType(unwrappedPat.path, selfTypeName), subjectVar, selfTypeName)
+                    starProjectedVariantIsType(qualifyShadowedPatternVariantType(renderPathAsType(unwrappedPat.path, selfTypeName), subjectVar, selfTypeName))
                 unwrappedPat is Pat.Struct -> {
                     val vt = qualifyShadowedPatternVariantType(renderPathAsType(unwrappedPat.path, selfTypeName), subjectVar, selfTypeName)
-                    if (isPlainStructPattern(unwrappedPat, vt)) null else vt
+                    if (isPlainStructPattern(unwrappedPat, vt)) null else starProjectedVariantIsType(vt)
                 }
                 else -> null
             }
@@ -234,7 +231,7 @@ internal fun KotlinJ2KEmitter.tryRenderSingleEvalIfLet(
             }
         val smartCastInThen =
             typeCheckTarget != null &&
-                '<' !in typeCheckTarget &&
+                isStarProjectedOrPlainCheckType(typeCheckTarget) &&
                 (boolCond == null || !boolCond.contains(" || "))
         val thenBlock =
             run {
@@ -470,11 +467,9 @@ internal fun KotlinJ2KEmitter.renderIfLetPatternAgainstRhs(
             } else if (patRequiresBooleanCondition(pat)) {
                 renderPatternBooleanCondition(pat, rhs, indent, selfTypeName)
             } else if (coreResultInfo != null) {
-                val scrutineeType = subjectExpr?.let { inferExprRenderedType(it, selfTypeName) } ?: currentTypedLocals[rhs]
-                val starArgs = if (isUntypedResultScrutinee(scrutineeType)) "<*, *>" else ""
-                "$rhs is ${coreResultInfo.first}$starArgs"
+                "$rhs is ${coreResultInfo.first}<*, *>"
             } else {
-                "$rhs is ${qualifyShadowedPatternVariantType(renderPathAsType(pat.path, selfTypeName), rhs, selfTypeName)}"
+                "$rhs is ${starProjectedVariantIsType(qualifyShadowedPatternVariantType(renderPathAsType(pat.path, selfTypeName), rhs, selfTypeName))}"
             }
         }
         is Pat.Struct -> {
@@ -484,7 +479,7 @@ internal fun KotlinJ2KEmitter.renderIfLetPatternAgainstRhs(
             } else if (isPlainStructPattern(pat, variantType)) {
                 "true"
             } else {
-                "$rhs is $variantType"
+                "$rhs is ${starProjectedVariantIsType(variantType)}"
             }
         }
         is Pat.Path -> {
@@ -904,8 +899,7 @@ internal fun KotlinJ2KEmitter.tryRenderStdlibResultMatch(
         val ifText =
             if (taggedCoreResult) {
                 val result = sourceResultName()
-                val starArgs = if (isUntypedResultScrutinee(inferExprRenderedType(expr.expr, selfTypeName))) "<*, *>" else ""
-                "when ($subjectVar) { is $result.Ok$starArgs -> $okBranch; is $result.Err$starArgs -> $errBranch }"
+                "when ($subjectVar) { is $result.Ok<*, *> -> $okBranch; is $result.Err<*, *> -> $errBranch }"
             } else {
                 "if ($subjectVar.isSuccess) $okBranch else $errBranch"
             }
@@ -1182,20 +1176,88 @@ internal fun KotlinJ2KEmitter.armReferencesSubject(pat: Pat): Boolean =
         else -> false
     }
 
+internal fun isStarProjectedOrPlainCheckType(typeTarget: String): Boolean {
+    val lt = typeTarget.indexOf('<')
+    if (lt < 0) return true
+    if (!typeTarget.endsWith('>')) return false
+    val inner = typeTarget.substring(lt + 1, typeTarget.length - 1).trim()
+    if (inner.isEmpty()) return false
+    return inner.split(',').all { it.trim() == "*" }
+}
+
+private fun hasTopLevelCommaOutsideGenerics(text: String): Boolean {
+    var angleDepth = 0
+    var parenDepth = 0
+    for (ch in text) {
+        when (ch) {
+            '<' -> angleDepth++
+            '>' -> if (angleDepth > 0) angleDepth--
+            '(' -> parenDepth++
+            ')' -> if (parenDepth > 0) parenDepth--
+            ',' -> if (angleDepth == 0 && parenDepth == 0) return true
+        }
+    }
+    return false
+}
+
+private fun KotlinJ2KEmitter.lookupEnumVariantTypeArity(variantType: String): Int {
+    if ('<' in variantType) return 0
+    inspector.enumTypeParamsByVariant[variantType]
+        ?.size
+        ?.takeIf { it > 0 }
+        ?.let { return it }
+    val simple = variantType.substringAfterLast('.')
+    if ('.' in variantType) {
+        val parts = variantType.split('.')
+        val enumSimple = parts[parts.size - 2]
+        val lastTwo = "$enumSimple.$simple"
+        inspector.enumTypeParamsByVariant[lastTwo]
+            ?.size
+            ?.takeIf { it > 0 }
+            ?.let { return it }
+        importedSimpleNameToPkg[enumSimple]?.let { pkg ->
+            val ns = currentNamespacePrefix()
+            val sub = if (ns != null && pkg.startsWith("$ns.")) pkg.removePrefix("$ns.") else pkg.substringAfterLast('.')
+            if (sub.isNotEmpty()) {
+                headerContext.crateEnumVariantTypeArity["$sub.$lastTwo"]?.takeIf { it > 0 }?.let { return it }
+            }
+        }
+        headerContext.crateEnumVariantTypeArity[lastTwo]?.takeIf { it > 0 }?.let { return it }
+        for (scoped in scopedAbiKeysForRenderedType(lastTwo)) {
+            headerContext.crateEnumVariantTypeArity[scoped]?.takeIf { it > 0 }?.let { return it }
+        }
+    } else {
+        inspector.enumTypeParamsByVariant[simple]
+            ?.size
+            ?.takeIf { it > 0 }
+            ?.let { return it }
+        headerContext.crateEnumVariantTypeArity[simple]?.takeIf { it > 0 }?.let { return it }
+    }
+    return 0
+}
+
+internal fun KotlinJ2KEmitter.starProjectedVariantIsType(variantType: String): String {
+    if ('<' in variantType) return variantType
+    val arity = lookupEnumVariantTypeArity(variantType)
+    if (arity <= 0) return variantType
+    return "$variantType<${List(arity) { "*" }.joinToString(", ")}>"
+}
+
 internal fun KotlinJ2KEmitter.parameterizedVariantCastType(variantType: String): String {
     if ('<' in variantType) return variantType
     val tps =
         inspector.enumTypeParamsByVariant[variantType]
             ?: inspector.enumTypeParamsByVariant[variantType.substringAfterLast('.')]
-            ?: return variantType
-    if (tps.isEmpty()) return variantType
-    val args =
-        if (tps.all { it in activeTypeParamNames }) {
-            tps.joinToString(", ")
-        } else {
-            tps.joinToString(", ") { "*" }
-        }
-    return "$variantType<$args>"
+    if (tps != null && tps.isNotEmpty()) {
+        val args =
+            if (tps.all { it in activeTypeParamNames }) {
+                tps.joinToString(", ")
+            } else {
+                tps.joinToString(", ") { "*" }
+            }
+        return "$variantType<$args>"
+    }
+    return starProjectedVariantIsType(variantType)
 }
 
 internal fun KotlinJ2KEmitter.renderSubjectMatchArm(
@@ -1208,7 +1270,11 @@ internal fun KotlinJ2KEmitter.renderSubjectMatchArm(
     mutRefWritebackTarget: String? = null,
 ): String {
     val triviaPrefix = renderLeadingTriviaForSpan(arm.span(), indent)
-    val isSingleSmartCast = patCond.startsWith("is ") && !patCond.contains(", ")
+    val isSingleSmartCast =
+        patCond.startsWith("is ") &&
+            !hasTopLevelCommaOutsideGenerics(patCond) &&
+            isStarProjectedOrPlainCheckType(patCond.removePrefix("is ").trim()) &&
+            scopeBuilder.isSmartCastableLocalKotlinName(subjectText)
     val usedIdents = collectUsedRawIdentsInExpr(arm.body)
     val prevTyped = currentTypedLocals
     val needsWriteback = mutRefWritebackTarget != null && matchArmMutatesTupleVariantBinding(arm)
@@ -1284,10 +1350,11 @@ internal fun KotlinJ2KEmitter.renderBooleanMatchArm(
                 currentTailExpectsUnitResultOk = savedTailOk
             }
         val isSingleSmartCast =
-            guardText?.contains(" || ") != true &&
+            !(isLastArm && guardText == null) &&
+                guardText?.contains(" || ") != true &&
                 !patCond.contains(" || ") &&
                 patCond.startsWith("$subjectText is ") &&
-                '<' !in patCond.removePrefix("$subjectText is ").substringBefore(" && ") &&
+                isStarProjectedOrPlainCheckType(patCond.removePrefix("$subjectText is ").substringBefore(" && ").trim()) &&
                 ((guardText == null && !patCond.contains(" && ")) || scopeBuilder.isSmartCastableLocalKotlinName(subjectText))
         val bindings =
             extractMatchArmBindings(
@@ -1471,6 +1538,7 @@ internal fun KotlinJ2KEmitter.renderPatternBooleanCondition(
     subjectExpr: String,
     indent: String,
     selfTypeName: String?,
+    allowSmartCast: Boolean = true,
 ): String =
     when (pat) {
         is Pat.Wild, is Pat.Rest -> "true"
@@ -1509,22 +1577,21 @@ internal fun KotlinJ2KEmitter.renderPatternBooleanCondition(
                     }
                     else -> "true"
                 }
-            val subCond = pat.subpat?.let { renderPatternBooleanCondition(it, subjectExpr, indent, selfTypeName) } ?: "true"
+            val subCond = pat.subpat?.let { renderPatternBooleanCondition(it, subjectExpr, indent, selfTypeName, allowSmartCast) } ?: "true"
             combineAndConditions(listOf(selfCond, subCond))
         }
         is Pat.TupleStruct -> {
             val elems = pat.elems.toList()
             if (isOptionSomeTupleStructPat(pat)) {
                 val innerCond =
-                    elems.firstOrNull()?.let { renderPatternBooleanCondition(it, subjectExpr, indent, selfTypeName) } ?: "true"
+                    elems.firstOrNull()?.let { renderPatternBooleanCondition(it, subjectExpr, indent, selfTypeName, allowSmartCast) } ?: "true"
                 combineAndConditions(listOf("$subjectExpr != null", innerCond))
             } else {
                 val coreResultInfo = coreResultVariantMatchInfo(pat)
                 if (coreResultInfo != null) {
-                    val starArgs = if (isUntypedResultScrutinee(currentTypedLocals[subjectExpr])) "<*, *>" else ""
-                    val castType = "${coreResultInfo.first}$starArgs"
+                    val castType = "${coreResultInfo.first}<*, *>"
                     val elemRecv =
-                        if (scopeBuilder.isSmartCastableLocalKotlinName(subjectExpr)) {
+                        if (allowSmartCast && scopeBuilder.isSmartCastableLocalKotlinName(subjectExpr)) {
                             subjectExpr
                         } else {
                             "($subjectExpr as $castType)"
@@ -1532,24 +1599,25 @@ internal fun KotlinJ2KEmitter.renderPatternBooleanCondition(
                     val parts = mutableListOf("$subjectExpr is $castType")
                     elems.firstOrNull()?.let { sub ->
                         if (sub !is Pat.Rest) {
-                            parts += renderPatternBooleanCondition(sub, "$elemRecv.${coreResultInfo.second}", indent, selfTypeName)
+                            parts += renderPatternBooleanCondition(sub, "$elemRecv.${coreResultInfo.second}", indent, selfTypeName, allowSmartCast)
                         }
                     }
                     combineAndConditions(parts)
                 } else {
                     val variantType = qualifyShadowedPatternVariantType(renderPathAsType(pat.path, selfTypeName), subjectExpr, selfTypeName)
+                    val isVariantType = starProjectedVariantIsType(variantType)
                     val castVariantType = parameterizedVariantCastType(variantType)
                     val elemRecv =
-                        if ('<' !in variantType && scopeBuilder.isSmartCastableLocalKotlinName(subjectExpr)) {
+                        if (allowSmartCast && isStarProjectedOrPlainCheckType(isVariantType) && scopeBuilder.isSmartCastableLocalKotlinName(subjectExpr)) {
                             subjectExpr
                         } else {
                             "($subjectExpr as $castVariantType)"
                         }
-                    val parts = mutableListOf("$subjectExpr is $variantType")
+                    val parts = mutableListOf("$subjectExpr is $isVariantType")
                     for ((idx, sub) in elems.withIndex()) {
                         if (sub is Pat.Rest) break
                         val propName = tupleFieldPropertyName(idx, elems.size)
-                        parts += renderPatternBooleanCondition(sub, "$elemRecv.$propName", indent, selfTypeName)
+                        parts += renderPatternBooleanCondition(sub, "$elemRecv.$propName", indent, selfTypeName, allowSmartCast)
                     }
                     combineAndConditions(parts)
                 }
@@ -1558,16 +1626,17 @@ internal fun KotlinJ2KEmitter.renderPatternBooleanCondition(
         is Pat.Struct -> {
             val variantType = qualifyShadowedPatternVariantType(renderPathAsType(pat.path, selfTypeName), subjectExpr, selfTypeName)
             val isPlainStruct = isPlainStructPattern(pat, variantType)
-            val parts = if (isPlainStruct) mutableListOf() else mutableListOf("$subjectExpr is $variantType")
+            val isVariantType = if (isPlainStruct) variantType else starProjectedVariantIsType(variantType)
+            val parts = if (isPlainStruct) mutableListOf() else mutableListOf("$subjectExpr is $isVariantType")
             val structRecv =
                 when {
                     isPlainStruct -> subjectExpr
-                    '<' !in variantType && scopeBuilder.isSmartCastableLocalKotlinName(subjectExpr) -> subjectExpr
+                    allowSmartCast && isStarProjectedOrPlainCheckType(isVariantType) && scopeBuilder.isSmartCastableLocalKotlinName(subjectExpr) -> subjectExpr
                     else -> "($subjectExpr as ${parameterizedVariantCastType(variantType)})"
                 }
             for (fp in pat.fields.toList()) {
                 val fieldName = renderMemberName(fp.member)
-                parts += renderPatternBooleanCondition(fp.pat, "$structRecv.$fieldName", indent, selfTypeName)
+                parts += renderPatternBooleanCondition(fp.pat, "$structRecv.$fieldName", indent, selfTypeName, allowSmartCast)
             }
             combineAndConditions(parts)
         }
@@ -1577,7 +1646,7 @@ internal fun KotlinJ2KEmitter.renderPatternBooleanCondition(
             for ((idx, sub) in elems.withIndex()) {
                 if (sub is Pat.Rest) break
                 val elemAccess = tupleIndexExpr(subjectExpr, idx, elems.size)
-                parts += renderPatternBooleanCondition(sub, elemAccess, indent, selfTypeName)
+                parts += renderPatternBooleanCondition(sub, elemAccess, indent, selfTypeName, allowSmartCast)
             }
             combineAndConditions(parts)
         }
@@ -1588,7 +1657,7 @@ internal fun KotlinJ2KEmitter.renderPatternBooleanCondition(
             if (restIdx < 0) {
                 parts += if (elems.isEmpty()) "$subjectExpr.isEmpty()" else "$subjectExpr.size == ${elems.size}"
                 for ((idx, sub) in elems.withIndex()) {
-                    parts += renderPatternBooleanCondition(sub, "$subjectExpr[$idx]", indent, selfTypeName)
+                    parts += renderPatternBooleanCondition(sub, "$subjectExpr[$idx]", indent, selfTypeName, allowSmartCast)
                 }
             } else {
                 val suffix = elems.subList(restIdx + 1, elems.size)
@@ -1597,30 +1666,30 @@ internal fun KotlinJ2KEmitter.renderPatternBooleanCondition(
                     parts += "$subjectExpr.size >= $minLen"
                 }
                 for (idx in 0 until restIdx) {
-                    parts += renderPatternBooleanCondition(elems[idx], "$subjectExpr[$idx]", indent, selfTypeName)
+                    parts += renderPatternBooleanCondition(elems[idx], "$subjectExpr[$idx]", indent, selfTypeName, allowSmartCast)
                 }
                 for ((offset, sub) in suffix.withIndex()) {
                     val tailOffset = suffix.size - offset
-                    parts += renderPatternBooleanCondition(sub, "$subjectExpr[$subjectExpr.size - $tailOffset]", indent, selfTypeName)
+                    parts += renderPatternBooleanCondition(sub, "$subjectExpr[$subjectExpr.size - $tailOffset]", indent, selfTypeName, allowSmartCast)
                 }
             }
             combineAndConditions(parts)
         }
         is Pat.Or -> {
-            val cases = pat.cases.toList().map { renderPatternBooleanCondition(it, subjectExpr, indent, selfTypeName) }
+            val cases = pat.cases.toList().map { renderPatternBooleanCondition(it, subjectExpr, indent, selfTypeName, allowSmartCast = false) }
             if (cases.any { it == "true" }) {
                 "true"
             } else {
                 cases.joinToString(" || ") { if (it.contains(" && ")) "($it)" else it }
             }
         }
-        is Pat.Reference -> renderPatternBooleanCondition(pat.pat, subjectExpr, indent, selfTypeName)
-        is Pat.PatParen -> renderPatternBooleanCondition(pat.pat, subjectExpr, indent, selfTypeName)
-        is Pat.TypeAscription -> renderPatternBooleanCondition(pat.pat, subjectExpr, indent, selfTypeName)
+        is Pat.Reference -> renderPatternBooleanCondition(pat.pat, subjectExpr, indent, selfTypeName, allowSmartCast)
+        is Pat.PatParen -> renderPatternBooleanCondition(pat.pat, subjectExpr, indent, selfTypeName, allowSmartCast)
+        is Pat.TypeAscription -> renderPatternBooleanCondition(pat.pat, subjectExpr, indent, selfTypeName, allowSmartCast)
         is Pat.Guard -> {
-            val baseCond = renderPatternBooleanCondition(pat.pat, subjectExpr, indent, selfTypeName)
+            val baseCond = renderPatternBooleanCondition(pat.pat, subjectExpr, indent, selfTypeName, allowSmartCast)
             val guardAccess = linkedMapOf<String, String>()
-            collectPatternGuardAccessMap(pat.pat, subjectExpr, selfTypeName, guardAccess)
+            collectPatternGuardAccessMap(pat.pat, subjectExpr, selfTypeName, guardAccess, allowSmartCast)
             val prevSubstitutions = activeGuardBindingSubstitutions
             activeGuardBindingSubstitutions = prevSubstitutions + guardAccess
             val guardCond =
@@ -1646,6 +1715,7 @@ internal fun KotlinJ2KEmitter.collectPatternGuardAccessMap(
     subjectText: String,
     selfTypeName: String?,
     out: MutableMap<String, String>,
+    allowSmartCast: Boolean = true,
 ) {
     when (pat) {
         is Pat.Ident -> {
@@ -1659,23 +1729,35 @@ internal fun KotlinJ2KEmitter.collectPatternGuardAccessMap(
             if (isBinding) {
                 out[raw] = subjectText
             }
-            pat.subpat?.let { collectPatternGuardAccessMap(it, subjectText, selfTypeName, out) }
+            pat.subpat?.let { collectPatternGuardAccessMap(it, subjectText, selfTypeName, out, allowSmartCast) }
         }
         is Pat.TupleStruct -> {
             val elems = pat.elems.toList()
             if (isOptionSomeTupleStructPat(pat) && elems.size == 1) {
-                collectPatternGuardAccessMap(elems[0], subjectText, selfTypeName, out)
+                collectPatternGuardAccessMap(elems[0], subjectText, selfTypeName, out, allowSmartCast)
             } else {
                 val coreResultInfo = coreResultVariantMatchInfo(pat)
                 if (coreResultInfo != null && elems.size == 1 && elems[0] !is Pat.Rest) {
-                    val starArgs = if (isUntypedResultScrutinee(currentTypedLocals[subjectText])) "<*, *>" else ""
-                    collectPatternGuardAccessMap(elems[0], "($subjectText as ${coreResultInfo.first}$starArgs).${coreResultInfo.second}", selfTypeName, out)
+                    val recv =
+                        if (allowSmartCast && scopeBuilder.isSmartCastableLocalKotlinName(subjectText)) {
+                            subjectText
+                        } else {
+                            "($subjectText as ${coreResultInfo.first}<*, *>)"
+                        }
+                    collectPatternGuardAccessMap(elems[0], "$recv.${coreResultInfo.second}", selfTypeName, out, allowSmartCast)
                 } else {
                     val variantType = qualifyShadowedPatternVariantType(renderPathAsType(pat.path, selfTypeName), subjectText, selfTypeName)
+                    val isVariantType = starProjectedVariantIsType(variantType)
+                    val recv =
+                        if (allowSmartCast && isStarProjectedOrPlainCheckType(isVariantType) && scopeBuilder.isSmartCastableLocalKotlinName(subjectText)) {
+                            subjectText
+                        } else {
+                            "($subjectText as ${parameterizedVariantCastType(variantType)})"
+                        }
                     for ((idx, sub) in elems.withIndex()) {
                         if (sub is Pat.Rest) break
                         val propName = tupleFieldPropertyName(idx, elems.size)
-                        collectPatternGuardAccessMap(sub, "($subjectText as $variantType).$propName", selfTypeName, out)
+                        collectPatternGuardAccessMap(sub, "$recv.$propName", selfTypeName, out, allowSmartCast)
                     }
                 }
             }
@@ -1683,15 +1765,16 @@ internal fun KotlinJ2KEmitter.collectPatternGuardAccessMap(
         is Pat.Struct -> {
             val variantType = qualifyShadowedPatternVariantType(renderPathAsType(pat.path, selfTypeName), subjectText, selfTypeName)
             val isPlainStruct = isPlainStructPattern(pat, variantType)
+            val isVariantType = if (isPlainStruct) variantType else starProjectedVariantIsType(variantType)
             val structRecv =
-                if (isPlainStruct) {
+                if (isPlainStruct || (allowSmartCast && isStarProjectedOrPlainCheckType(isVariantType) && scopeBuilder.isSmartCastableLocalKotlinName(subjectText))) {
                     subjectText
                 } else {
                     "($subjectText as ${parameterizedVariantCastType(variantType)})"
                 }
             for (fp in pat.fields.toList()) {
                 val fieldName = renderMemberName(fp.member)
-                collectPatternGuardAccessMap(fp.pat, "$structRecv.$fieldName", selfTypeName, out)
+                collectPatternGuardAccessMap(fp.pat, "$structRecv.$fieldName", selfTypeName, out, allowSmartCast)
             }
         }
         is Pat.Tuple -> {
@@ -1699,7 +1782,7 @@ internal fun KotlinJ2KEmitter.collectPatternGuardAccessMap(
             for ((idx, sub) in elems.withIndex()) {
                 if (sub is Pat.Rest) break
                 val elemAccess = tupleIndexExpr(subjectText, idx, elems.size)
-                collectPatternGuardAccessMap(sub, elemAccess, selfTypeName, out)
+                collectPatternGuardAccessMap(sub, elemAccess, selfTypeName, out, allowSmartCast)
             }
         }
         is Pat.Slice -> {
@@ -1707,12 +1790,12 @@ internal fun KotlinJ2KEmitter.collectPatternGuardAccessMap(
             val restIdx = elems.indexOfFirst { it is Pat.Rest || (it is Pat.Ident && it.subpat is Pat.Rest) }
             if (restIdx < 0) {
                 for ((idx, sub) in elems.withIndex()) {
-                    collectPatternGuardAccessMap(sub, "$subjectText[$idx]", selfTypeName, out)
+                    collectPatternGuardAccessMap(sub, "$subjectText[$idx]", selfTypeName, out, allowSmartCast)
                 }
             } else {
                 val suffix = elems.subList(restIdx + 1, elems.size)
                 for (idx in 0 until restIdx) {
-                    collectPatternGuardAccessMap(elems[idx], "$subjectText[$idx]", selfTypeName, out)
+                    collectPatternGuardAccessMap(elems[idx], "$subjectText[$idx]", selfTypeName, out, allowSmartCast)
                 }
                 val restPat = elems[restIdx]
                 if (restPat is Pat.Ident) {
@@ -1722,24 +1805,24 @@ internal fun KotlinJ2KEmitter.collectPatternGuardAccessMap(
                             suffix.isEmpty() -> "$subjectText.subList($restIdx, $subjectText.size)"
                             else -> "$subjectText.subList($restIdx, $subjectText.size - ${suffix.size})"
                         }
-                    collectPatternGuardAccessMap(restPat, restAccess, selfTypeName, out)
+                    collectPatternGuardAccessMap(restPat, restAccess, selfTypeName, out, allowSmartCast)
                 }
                 for ((offset, sub) in suffix.withIndex()) {
                     val tailOffset = suffix.size - offset
-                    collectPatternGuardAccessMap(sub, "$subjectText[$subjectText.size - $tailOffset]", selfTypeName, out)
+                    collectPatternGuardAccessMap(sub, "$subjectText[$subjectText.size - $tailOffset]", selfTypeName, out, allowSmartCast)
                 }
             }
         }
         is Pat.Or -> {
             val firstCase = pat.cases.toList().firstOrNull()
             if (firstCase != null) {
-                collectPatternGuardAccessMap(firstCase, subjectText, selfTypeName, out)
+                collectPatternGuardAccessMap(firstCase, subjectText, selfTypeName, out, allowSmartCast = false)
             }
         }
-        is Pat.Reference -> collectPatternGuardAccessMap(pat.pat, subjectText, selfTypeName, out)
-        is Pat.PatParen -> collectPatternGuardAccessMap(pat.pat, subjectText, selfTypeName, out)
-        is Pat.TypeAscription -> collectPatternGuardAccessMap(pat.pat, subjectText, selfTypeName, out)
-        is Pat.Guard -> collectPatternGuardAccessMap(pat.pat, subjectText, selfTypeName, out)
+        is Pat.Reference -> collectPatternGuardAccessMap(pat.pat, subjectText, selfTypeName, out, allowSmartCast)
+        is Pat.PatParen -> collectPatternGuardAccessMap(pat.pat, subjectText, selfTypeName, out, allowSmartCast)
+        is Pat.TypeAscription -> collectPatternGuardAccessMap(pat.pat, subjectText, selfTypeName, out, allowSmartCast)
+        is Pat.Guard -> collectPatternGuardAccessMap(pat.pat, subjectText, selfTypeName, out, allowSmartCast)
         else -> {}
     }
 }
@@ -1821,12 +1904,11 @@ internal fun KotlinJ2KEmitter.extractMatchArmBindings(
                             usedBodyIdents != null &&
                             rawSubIdent !in usedBodyIdents
                     val lines = mutableListOf<String>()
-                    val starArgs = if (isUntypedResultScrutinee(currentTypedLocals[subjectText])) "<*, *>" else ""
                     val accessTarget =
                         if (subjectAlreadySmartCast) {
                             "$subjectText.${coreResultInfo.second}"
                         } else {
-                            "($subjectText as ${coreResultInfo.first}$starArgs).${coreResultInfo.second}"
+                            "($subjectText as ${coreResultInfo.first}<*, *>).${coreResultInfo.second}"
                         }
                     if (!isUnusedSub && rawSubIdent != null && rawSubIdent != "_" && (sub is Pat.Ident || sub is Pat.Reference || sub is Pat.TypeAscription)) {
                         val subNames = extractPatternBindingNames(sub, selfTypeName, includeCtorInTupleStruct = false, bindToScope = bindToScope)
@@ -2217,15 +2299,14 @@ internal fun KotlinJ2KEmitter.renderMatchPatternCondition(
                     "else"
                 }
             } else if (coreResultInfo != null) {
-                val starArgs = if (isUntypedResultScrutinee(currentTypedLocals[subjectText])) "<*, *>" else ""
-                "is ${coreResultInfo.first}$starArgs"
+                "is ${coreResultInfo.first}<*, *>"
             } else {
-                "is ${qualifyShadowedPatternVariantType(renderPathAsType(pat.path, selfTypeName), subjectText, selfTypeName)}"
+                "is ${starProjectedVariantIsType(qualifyShadowedPatternVariantType(renderPathAsType(pat.path, selfTypeName), subjectText, selfTypeName))}"
             }
         }
         is Pat.Struct -> {
             val variantType = qualifyShadowedPatternVariantType(renderPathAsType(pat.path, selfTypeName), subjectText, selfTypeName)
-            if (isPlainStructPattern(pat, variantType)) "else" else "is $variantType"
+            if (isPlainStructPattern(pat, variantType)) "else" else "is ${starProjectedVariantIsType(variantType)}"
         }
         is Pat.Tuple -> "else"
         is Pat.Slice -> "else"

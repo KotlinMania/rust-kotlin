@@ -2600,14 +2600,33 @@ internal class MacroRulesFileExpander(
                 val nextPunct = (trees[openIdx + 1] as? TokenTree.Punct)?.value?.asChar()
                 if (nextPunct == '=' || nextPunct == '<' || nextPunct == '-') return false
             }
+            val isTurbofish =
+                openIdx >= 2 &&
+                    (trees[openIdx - 1] as? TokenTree.Punct)?.value?.asChar() == ':' &&
+                    (trees[openIdx - 2] as? TokenTree.Punct)?.value?.asChar() == ':'
+            val afterUpperIdent =
+                (trees.getOrNull(openIdx - 1) as? TokenTree.Ident)
+                    ?.value
+                    ?.toString()
+                    ?.firstOrNull()
+                    ?.isUpperCase() == true
+            val allowLiterals = isTurbofish || afterUpperIdent
             var depth = 1
             for (j in (openIdx + 1) until trees.size) {
                 when (val t = trees[j]) {
-                    is TokenTree.Literal -> return false
+                    is TokenTree.Literal -> if (!allowLiterals) return false
                     is TokenTree.Punct -> {
                         val ch = t.value.asChar()
                         if (ch == ';') return false
-                        if (ch == '=' && (trees.getOrNull(j + 1) as? TokenTree.Punct)?.value?.asChar() == '>') {
+                        val nextCh = (trees.getOrNull(j + 1) as? TokenTree.Punct)?.value?.asChar()
+                        if ((ch == '=' && nextCh == '>') ||
+                            (ch == '&' && nextCh == '&') ||
+                            (ch == '|' && nextCh == '|') ||
+                            (ch == '=' && nextCh == '=') ||
+                            (ch == '!' && nextCh == '=') ||
+                            (ch == '<' && nextCh == '=') ||
+                            (ch == '>' && nextCh == '=')
+                        ) {
                             return false
                         }
                         if (ch == '<') {

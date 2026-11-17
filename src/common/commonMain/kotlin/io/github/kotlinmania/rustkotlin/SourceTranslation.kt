@@ -1003,7 +1003,7 @@ internal class KotlinJ2KEmitter(
         for (item in file.items) {
             if (itemHasDocOnlyCfg(item) || item is Item.Use) continue
             if (item is Item.Impl && !shouldOmitItemForUnportedQuickcheckOrRand(item)) {
-                val ownerType = extractDirectOwnerTypeName(item.selfType, item.generics)
+                val ownerType = extractAttachableDirectOwnerTypeName(item)
                 if (ownerType != null && ownerType in inspector.attachableTypeNames) {
                     localTypeImpls.getOrPut(ownerType) { mutableListOf() }.add(item)
                     continue
@@ -1426,7 +1426,7 @@ internal class KotlinJ2KEmitter(
         val extraImports = mutableListOf<String>()
         if (usesSourceResult && usesTaggedCoreResult() && !hasDeclaredResultEnum()) {
             extraImports +=
-                if ("Result" in inspector.declaredTypeNames) {
+                if (hasConflictingResultBinding()) {
                     "import $activeCoreNs.result.Result as RustResult"
                 } else {
                     "import $activeCoreNs.result.Result"
@@ -1493,6 +1493,29 @@ internal class KotlinJ2KEmitter(
                     add("transmuteUnchecked" to "$activeCoreNs.mem")
                     add("sizeOf" to "$activeCoreNs.mem")
                     add("alignOf" to "$activeCoreNs.mem")
+                }
+                if (usesExternalRustLangCore ||
+                    "core" in headerContext.crateNamespaces ||
+                    headerContext.packageName == activeCoreNs ||
+                    headerContext.packageName?.startsWith("$activeCoreNs.") == true
+                ) {
+                    for (ptrFn in listOf(
+                        "nullMut",
+                        "nullVal",
+                        "withoutProvenance",
+                        "withoutProvenanceMut",
+                        "dangling",
+                        "danglingMut",
+                        "fromRef",
+                        "fromMut",
+                        "sliceFromRawParts",
+                        "sliceFromRawPartsMut",
+                        "copyNonoverlapping",
+                        "writeBytes",
+                        "dropInPlace",
+                    )) {
+                        add(ptrFn to "$activeCoreNs.ptr")
+                    }
                 }
                 if ("core" in headerContext.crateNamespaces || headerContext.scalarChar) {
                     add("Cell" to "$activeCoreNs.cell")
@@ -1585,6 +1608,68 @@ internal class KotlinJ2KEmitter(
                     val imp = "import $activeCoreNs.result.$resultExt"
                     if (imp !in combinedExtraTypeImports) {
                         combinedExtraTypeImports += imp
+                    }
+                }
+            }
+        }
+        if (isInCoreOrUsingExternalCore && !headerContext.rawAbiMode) {
+            val stdlibExts =
+                listOf(
+                    "castConst" to "$activeCoreNs.ptr.mutptr",
+                    "withAddr" to "$activeCoreNs.ptr.mutptr",
+                    "mapAddr" to "$activeCoreNs.ptr.mutptr",
+                    "exposeProvenance" to "$activeCoreNs.ptr.mutptr",
+                    "wrappingByteOffset" to "$activeCoreNs.ptr.mutptr",
+                    "splitFirst" to "$activeCoreNs.slice",
+                    "splitFirstMut" to "$activeCoreNs.slice",
+                    "splitLast" to "$activeCoreNs.slice",
+                    "splitLastMut" to "$activeCoreNs.slice",
+                    "splitAtMut" to "$activeCoreNs.slice",
+                    "chunksExact" to "$activeCoreNs.slice",
+                    "chunksExactMut" to "$activeCoreNs.slice",
+                )
+            for ((extName, extPkg) in stdlibExts) {
+                if (headerContext.packageName != extPkg &&
+                    extName !in inspector.declaredTypeNames &&
+                    extName !in inspector.declaredConstNames.values &&
+                    extName !in importedSimpleNameToPkg &&
+                    !isDeclaredTopLevelFnKotlinName(extName) &&
+                    Regex("\\.\\s*$extName\\s*[({<]").containsMatchIn(bodyTextForImports)
+                ) {
+                    val imp = "import $extPkg.$extName"
+                    if (imp !in combinedExtraTypeImports) {
+                        combinedExtraTypeImports += imp
+                    }
+                }
+            }
+        }
+        val nsPrefixForExt = currentNamespacePrefix()
+        for ((symSimple, symPkg) in importedSimpleNameToPkg.toList()) {
+            if (symSimple.firstOrNull()?.isUpperCase() == true && symPkg != headerContext.packageName) {
+                val camelFn = symSimple.replaceFirstChar { it.lowercaseChar() }
+                if (camelFn !in inspector.declaredTypeNames &&
+                    camelFn !in inspector.declaredConstNames.values &&
+                    camelFn !in importedSimpleNameToPkg &&
+                    !isDeclaredTopLevelFnKotlinName(camelFn) &&
+                    Regex("\\.\\s*$camelFn\\s*[({<]").containsMatchIn(bodyTextForImports)
+                ) {
+                    val relSub =
+                        when {
+                            nsPrefixForExt == null -> null
+                            symPkg == nsPrefixForExt -> ""
+                            symPkg.startsWith("$nsPrefixForExt.") -> symPkg.removePrefix("$nsPrefixForExt.")
+                            else -> null
+                        }
+                    val existsInPkg =
+                        (relSub != null && relSub in headerContext.crateSymbolSubpackages[camelFn].orEmpty()) ||
+                            headerContext.externalCrateSymbolPackages.values.any { symMap ->
+                                symPkg in symMap[camelFn].orEmpty()
+                            }
+                    if (existsInPkg) {
+                        val imp = "import $symPkg.$camelFn"
+                        if (imp !in combinedExtraTypeImports) {
+                            combinedExtraTypeImports += imp
+                        }
                     }
                 }
             }
@@ -1769,7 +1854,11 @@ internal class KotlinJ2KEmitter(
         return ensureBlankLineBeforeKDocAfterLineComment(out.toString())
     }
 
-    internal fun extractDirectOwnerTypeName(selfTy: SynType, generics: Generics): String? {
+    internal fun extractDirectOwnerTypeName(
+        selfTy: SynType,
+        generics: Generics,
+        scopeItems: List<Item> = file.items,
+    ): String? {
         val typeParamNames =
             generics.params
                 .toList()
@@ -1785,54 +1874,58 @@ internal class KotlinJ2KEmitter(
                 if (rawSeg == "Box" && "Box" !in inspector.declaredTypeNames) {
                     val args = (segments[0].arguments as? PathArguments.AngleBracketed)?.args?.toList().orEmpty()
                     val firstTypeArg = args.filterIsInstance<GenericArgument.TypeArg>().firstOrNull()
-                    return if (firstTypeArg != null) extractDirectOwnerTypeName(firstTypeArg.type, generics) else null
+                    return if (firstTypeArg != null) extractDirectOwnerTypeName(firstTypeArg.type, generics, scopeItems) else null
                 }
                 if (rawSeg in PRIMITIVE_TYPE_NAMES) return null
                 val name = rustTypeIdentToKotlin(rawSeg)
-                val declarationGenerics =
-                    file.items.firstNotNullOfOrNull { declaration ->
-                        when (declaration) {
-                            is Item.Struct -> declaration.generics.takeIf { declaration.ident.toString() == rawSeg }
-                            is Item.Enum -> declaration.generics.takeIf { declaration.ident.toString() == rawSeg }
-                            is Item.Union -> declaration.generics.takeIf { declaration.ident.toString() == rawSeg }
-                            else -> null
-                        }
-                    }
-                val ownerParameters =
-                    declarationGenerics
-                        ?.params
-                        ?.toList()
-                        .orEmpty()
-                        .filterIsInstance<GenericParam.TypeParam>()
-                        .map { it.ident.toString() }
-                if (ownerParameters.isNotEmpty()) {
-                    val arguments =
-                        (segments[0].arguments as? PathArguments.AngleBracketed)
-                            ?.args
-                            ?.toList()
-                            .orEmpty()
-                            .filterIsInstance<GenericArgument.TypeArg>()
-                            .map { argument ->
-                                (argument.type as? SynType.Path)
-                                    ?.takeIf { it.qself == null && it.path.segments.size == 1 }
-                                    ?.path
-                                    ?.segments
-                                    ?.last()
-                                    ?.ident
-                                    ?.toString()
-                            }
-                    // A specialized impl belongs on its exact receiver, not on
-                    // every instantiation of the generic source declaration.
-                    if (arguments != ownerParameters) return null
+                val declarationGenerics = findDeclGenericsForOwnerRawName(rawSeg, scopeItems) ?: findDeclGenericsForOwnerRawName(rawSeg, file.items)
+                if (declarationGenerics != null && !matchesUnspecializedOwnerGenerics(segments[0].arguments, declarationGenerics)) {
+                    return null
                 }
                 if (name in typeParamNames) null else name
             }
-            is SynType.Reference -> extractDirectOwnerTypeName(selfTy.elem, generics)
-            is SynType.Group -> extractDirectOwnerTypeName(selfTy.elem, generics)
-            is SynType.Paren -> extractDirectOwnerTypeName(selfTy.elem, generics)
+            is SynType.Reference -> extractDirectOwnerTypeName(selfTy.elem, generics, scopeItems)
+            is SynType.Group -> extractDirectOwnerTypeName(selfTy.elem, generics, scopeItems)
+            is SynType.Paren -> extractDirectOwnerTypeName(selfTy.elem, generics, scopeItems)
             else -> null
         }
     }
+
+    internal fun extractAttachableDirectOwnerTypeName(
+        impl: Item.Impl,
+        scopeItems: List<Item> = file.items,
+    ): String? {
+        val ownerType = extractDirectOwnerTypeName(impl.selfType, impl.generics, scopeItems) ?: return null
+        if (impl.traitPath == null) return ownerType
+        val ownerDeclGenerics =
+            findDeclGenericsForOwnerKotlinName(ownerType, scopeItems)
+                ?: findDeclGenericsForOwnerKotlinName(ownerType, file.items)
+                ?: return ownerType
+        if (declaresExtraNonImplicitImplTraitBounds(impl, ownerDeclGenerics, this::isImplicitStdlibSupertraitPath)) {
+            return null
+        }
+        return ownerType
+    }
+
+    private fun findDeclGenericsForOwnerRawName(rawSeg: String, items: List<Item>): Generics? =
+        items.firstNotNullOfOrNull { declaration ->
+            when (declaration) {
+                is Item.Struct -> declaration.generics.takeIf { declaration.ident.toString() == rawSeg }
+                is Item.Enum -> declaration.generics.takeIf { declaration.ident.toString() == rawSeg }
+                is Item.Union -> declaration.generics.takeIf { declaration.ident.toString() == rawSeg }
+                else -> null
+            }
+        }
+
+    private fun findDeclGenericsForOwnerKotlinName(ownerType: String, items: List<Item>): Generics? =
+        items.firstNotNullOfOrNull { declaration ->
+            when (declaration) {
+                is Item.Struct -> declaration.generics.takeIf { rustTypeIdentToKotlin(declaration.ident.toString()) == ownerType }
+                is Item.Enum -> declaration.generics.takeIf { rustTypeIdentToKotlin(declaration.ident.toString()) == ownerType }
+                is Item.Union -> declaration.generics.takeIf { rustTypeIdentToKotlin(declaration.ident.toString()) == ownerType }
+                else -> null
+            }
+        }
 
     internal fun classifySynRefKind(ty: SynType): String =
         when (val u = unwrapSynType(ty)) {
@@ -2366,6 +2459,143 @@ internal val STDLIB_TRAIT_SUBMODULES =
 
 internal val STDLIB_EXPLICIT_SUPERTRAITS =
     RUST_STD_IMPLICIT_SUPERTRAITS + setOf("Error", "Borrow")
+
+internal fun matchesUnspecializedOwnerGenerics(
+    selfArgs: PathArguments,
+    declarationGenerics: Generics,
+): Boolean {
+    val declParams = declarationGenerics.params.toList()
+    val ownerParameters = declParams.filterIsInstance<GenericParam.TypeParam>().map { it.ident.toString() }
+    val ownerConstParameters = declParams.filterIsInstance<GenericParam.ConstParam>().map { it.ident.toString() }
+    val rawArgsList = (selfArgs as? PathArguments.AngleBracketed)?.args?.toList().orEmpty()
+    if (ownerParameters.isNotEmpty()) {
+        val suppliedTypeArgs =
+            rawArgsList
+                .filterIsInstance<GenericArgument.TypeArg>()
+                .take(ownerParameters.size)
+                .map { argument ->
+                    (argument.type as? SynType.Path)
+                        ?.takeIf { it.qself == null && it.path.segments.size == 1 }
+                        ?.path
+                        ?.segments
+                        ?.last()
+                        ?.ident
+                        ?.toString()
+                }
+        // A specialized impl belongs on its exact receiver, not on
+        // every instantiation of the generic source declaration.
+        if (suppliedTypeArgs != ownerParameters) return false
+    }
+    if (ownerConstParameters.isNotEmpty() && rawArgsList.isNotEmpty()) {
+        val suppliedConstIdents =
+            rawArgsList.filterIsInstance<GenericArgument.ConstArg>().map { ca ->
+                (ca.expr as? io.github.kotlinmania.syn.Expr.Path)
+                    ?.takeIf { it.qself == null && it.path.segments.size == 1 }
+                    ?.path
+                    ?.segments
+                    ?.last()
+                    ?.ident
+                    ?.toString()
+            }
+        if (suppliedConstIdents.isNotEmpty() && suppliedConstIdents != ownerConstParameters) {
+            return false
+        }
+        val extraTypeIdents =
+            rawArgsList.filterIsInstance<GenericArgument.TypeArg>().drop(ownerParameters.size).map { argument ->
+                (argument.type as? SynType.Path)
+                    ?.takeIf { it.qself == null && it.path.segments.size == 1 }
+                    ?.path
+                    ?.segments
+                    ?.last()
+                    ?.ident
+                    ?.toString()
+            }
+        if (extraTypeIdents.isNotEmpty() && extraTypeIdents != ownerConstParameters) {
+            return false
+        }
+    }
+    return true
+}
+
+internal fun declaresExtraNonImplicitImplTraitBounds(
+    impl: Item.Impl,
+    ownerDeclGenerics: Generics,
+    isImplicitTraitPath: (io.github.kotlinmania.syn.Path) -> Boolean,
+): Boolean {
+    fun hasNonImplicitBound(bounds: List<TypeParamBound>): Boolean =
+        bounds.any { b ->
+            if (b !is TypeParamBound.Trait || b.maybe != null) return@any false
+            val rawName =
+                b.path.segments
+                    .last()
+                    ?.ident
+                    ?.toString()
+                    ?.removePrefix("r#") ?: return@any false
+            if (rawName in IGNORED_TRAIT_BOUNDS) return@any false
+            !isImplicitTraitPath(b.path)
+        }
+
+    val ownerDeclTypeParams = ownerDeclGenerics.params.toList().filterIsInstance<GenericParam.TypeParam>()
+    if (ownerDeclTypeParams.isEmpty()) return false
+    val boundedOwnerParams = hashSetOf<String>()
+    for (gp in ownerDeclTypeParams) {
+        if (hasNonImplicitBound(gp.bounds.toList())) {
+            boundedOwnerParams += rustTypeIdentToKotlin(gp.ident.toString())
+        }
+    }
+    for (pred in ownerDeclGenerics.whereClause
+        ?.predicates
+        ?.toList()
+        .orEmpty()) {
+        if (pred is WherePredicate.TypePredicate) {
+            val boundedPath = (unwrapSynType(pred.boundedTy) as? SynType.Path)?.takeIf { it.qself == null && it.path.segments.size == 1 }
+            val tpKt =
+                boundedPath
+                    ?.path
+                    ?.segments
+                    ?.first()
+                    ?.ident
+                    ?.toString()
+                    ?.let(::rustTypeIdentToKotlin)
+            if (tpKt != null && hasNonImplicitBound(pred.bounds.toList())) {
+                boundedOwnerParams += tpKt
+            }
+        }
+    }
+    val unboundedOwnerParams =
+        ownerDeclTypeParams
+            .map { rustTypeIdentToKotlin(it.ident.toString()) }
+            .toSet() - boundedOwnerParams
+    if (unboundedOwnerParams.isEmpty()) return false
+    for (gp in impl.generics.params.toList()) {
+        if (gp is GenericParam.TypeParam) {
+            val tpKt = rustTypeIdentToKotlin(gp.ident.toString())
+            if (tpKt in unboundedOwnerParams && hasNonImplicitBound(gp.bounds.toList())) {
+                return true
+            }
+        }
+    }
+    for (pred in impl.generics.whereClause
+        ?.predicates
+        ?.toList()
+        .orEmpty()) {
+        if (pred is WherePredicate.TypePredicate) {
+            val boundedPath = (unwrapSynType(pred.boundedTy) as? SynType.Path)?.takeIf { it.qself == null && it.path.segments.size == 1 }
+            val tpKt =
+                boundedPath
+                    ?.path
+                    ?.segments
+                    ?.first()
+                    ?.ident
+                    ?.toString()
+                    ?.let(::rustTypeIdentToKotlin)
+            if (tpKt in unboundedOwnerParams && hasNonImplicitBound(pred.bounds.toList())) {
+                return true
+            }
+        }
+    }
+    return false
+}
 
 internal fun KotlinJ2KEmitter.isImplicitStdlibSupertraitPath(path: io.github.kotlinmania.syn.Path): Boolean {
     val segs = path.segments.toList().map { it.ident.toString().removePrefix("r#") }

@@ -1007,7 +1007,7 @@ class SingleFileTranslationTypesAndLoweringTest {
                     portLintDirective = "none",
                 ),
             ).text
-        assertContains(kt, "import io.github.kotlinmania.rustlang.std.io.error.Error")
+        assertContains(kt, "import io.github.kotlinmania.rustlang.core.io.error.Error")
         assertContains(kt, "r: Result<Unit, Error>")
         assertContains(kt, "res.map({ Unit })")
         assertContains(kt, "public companion object {")

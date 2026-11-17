@@ -170,13 +170,13 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
         } finally {
             currentExpectedParseTargetType = prevRecvParseTarget
         }
-    val nonUnitArgs =
+    val allMethodArgs =
         expr.args
             .toList()
-            .filterNot { it is Expr.Tuple && it.elems.isEmpty() }
             .map { arg ->
                 if (cleanMethod == "zip") unwrapIndexedCollectionIterReceiver(arg, selfTypeName) else arg
             }
+    val nonUnitArgs = allMethodArgs.filterNot { it is Expr.Tuple && it.elems.isEmpty() }
     val recvRawPtrRenderedTy = inferExprRenderedType(expr.receiver, selfTypeName)
     if (rawPointerPointeeType(recvRawPtrRenderedTy) != null) {
         val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
@@ -800,7 +800,7 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
         }
     val wrappingNumericKind =
         if (rawMethod in setOf("wrapping_add", "wrapping_sub", "wrapping_mul") &&
-            nonUnitArgs.size == 1 &&
+            allMethodArgs.size == 1 &&
             typeArgs.isEmpty()
         ) {
             recvNumericKindForMethod?.takeUnless {
@@ -840,7 +840,7 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
             ?.trim()
     val renderedValueArgs =
         try {
-            nonUnitArgs.mapIndexed { argIdx, argExpr ->
+            allMethodArgs.mapIndexed { argIdx, argExpr ->
                 val subsliceSpec =
                     tryExtractMutableArraySubsliceArg(
                         argExpr = argExpr,
@@ -881,8 +881,8 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                 "wrapping_sub" -> "-"
                 else -> "*"
             }
-        val coercedRhs = coerceRenderedNumericExpr(nonUnitArgs[0], renderedValueArgs[0], wrappingNumericKind)
-        val rhs = if (isAtomicPostfixReceiver(nonUnitArgs[0], coercedRhs)) coercedRhs else "($coercedRhs)"
+        val coercedRhs = coerceRenderedNumericExpr(allMethodArgs[0], renderedValueArgs[0], wrappingNumericKind)
+        val rhs = if (isAtomicPostfixReceiver(allMethodArgs[0], coercedRhs)) coercedRhs else "($coercedRhs)"
         val lhs = if (isAtomicPostfixReceiver(expr.receiver, receiver)) receiver else "($receiver)"
         val arithmetic = "($lhs $op $rhs)"
         // Kotlin promotes byte/short arithmetic; explicitly truncate back to Rust's width.
@@ -939,7 +939,7 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                 if (headerContext.packageName != "$coreNs.char.methods") {
                     CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.char.methods.toDigit")
                 }
-                val radixArg = coerceNumericArgIfNeeded(nonUnitArgs[0], renderedValueArgs[0], NumericKind.U32, selfTypeName)
+                val radixArg = coerceNumericArgIfNeeded(allMethodArgs[0], renderedValueArgs[0], NumericKind.U32, selfTypeName)
                 return "$atomicRecv.toDigit($radixArg)"
             }
         }
@@ -948,7 +948,7 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
         expr = expr,
         receiver = receiver,
         rawMethod = rawMethod,
-        nonUnitArgs = nonUnitArgs,
+        nonUnitArgs = allMethodArgs,
         renderedValueArgs = renderedValueArgs,
         typeArgs = typeArgs,
         indent = indent,
@@ -1061,8 +1061,8 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                 "+"
             }
         val deltaArg = renderedValueArgs[0]
-        val deltaRecv = if (isAtomicPostfixReceiver(nonUnitArgs[0], deltaArg)) deltaArg else "($deltaArg)"
-        val deltaExpr = convertNumericReceiver(deltaRecv, "Long", inferExprNumericKind(nonUnitArgs[0], selfTypeName))
+        val deltaRecv = if (isAtomicPostfixReceiver(allMethodArgs[0], deltaArg)) deltaArg else "($deltaArg)"
+        val deltaExpr = convertNumericReceiver(deltaRecv, "Long", inferExprNumericKind(allMethodArgs[0], selfTypeName))
         if (headerContext.rawAbiMode) {
             return "($receiver $deltaSign $deltaExpr)"
         }
@@ -1105,7 +1105,8 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
     if (isSetRenderedType(recvCollectionTy) && typeArgs.isEmpty()) {
         val recvAtom = if (isAtomicPostfixReceiver(expr.receiver, receiver)) receiver else "($receiver)"
         when {
-            rawMethod == "insert" && renderedValueArgs.size == 1 ->
+            rawMethod == "insert" &&
+                (renderedValueArgs.size == 1 || (renderedValueArgs.size == 2 && renderedValueArgs[1] == "Unit")) ->
                 return "$recvAtom.add(${renderedValueArgs[0]})"
             rawMethod == "clone" && renderedValueArgs.isEmpty() ->
                 return "$recvAtom.toMutableSet()"
@@ -1133,12 +1134,12 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
             return "$receiver.$method(${renderedValueArgs[0]}, $defaultWitness)"
         }
     }
-    if (rawMethod == "map" && nonUnitArgs.size == 1 && renderedValueArgs.size == 1) {
-        if (isTransparentWrapperOrIdentityMapArg(nonUnitArgs[0])) {
+    if (rawMethod == "map" && allMethodArgs.size == 1 && renderedValueArgs.size == 1) {
+        if (isTransparentWrapperOrIdentityMapArg(allMethodArgs[0])) {
             return receiver
         }
         if (typeArgs.isEmpty() && (receiver.startsWith("ArrayDeque(") || isDequeIterReceiver)) {
-            val mappedArg = wrapMapCallbackArg(nonUnitArgs[0], renderedValueArgs[0])
+            val mappedArg = wrapMapCallbackArg(allMethodArgs[0], renderedValueArgs[0])
             return "ArrayDeque(($receiver).map($mappedArg))"
         }
     }
@@ -1166,7 +1167,7 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
             val atomicRecv = if (isAtomicPostfixReceiver(expr.receiver, receiver)) receiver else "($receiver)"
             val strExpr = if (refCellGuardPointeeType(recvTy) == "String") "$atomicRecv.value" else atomicRecv
             val findFn = if (rawMethod == "split_once") "indexOf" else "lastIndexOf"
-            val argExpr = nonUnitArgs[0]
+            val argExpr = allMethodArgs[0]
             val unwrappedArg = unwrapParenOrGroupExpr(argExpr)
             val argTy = inferExprRenderedType(argExpr, selfTypeName)?.removeSuffix("?")?.trim()
             val isCharPat = (unwrappedArg as? Expr.Lit)?.lit is Lit.Char || argTy in setOf("Char", "RustChar")
@@ -1205,7 +1206,7 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
         inspector.instanceMethodsByType.values.none { "filterMap" in it }
     ) {
         val atomicRecv = if (isAtomicPostfixReceiver(expr.receiver, receiver)) receiver else "($receiver)"
-        val mappedArg = wrapMapCallbackArg(nonUnitArgs[0], renderedValueArgs[0])
+        val mappedArg = wrapMapCallbackArg(allMethodArgs[0], renderedValueArgs[0])
         return "$atomicRecv.mapNotNull($mappedArg)"
     }
     val inferredMethodRecvTy = inferExprRenderedType(expr.receiver, selfTypeName)?.removeSuffix("?")?.trim()
@@ -1262,7 +1263,7 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
         }
     }
     if (rawMethod == "take" &&
-        nonUnitArgs.isEmpty() &&
+        renderedValueArgs.isEmpty() &&
         typeArgs.isEmpty() &&
         receiver.all { it.isLetterOrDigit() || it == '_' || it == '.' } &&
         (expr.receiver is Expr.Field || (expr.receiver is Expr.Path && receiver != "cell"))
@@ -1294,9 +1295,9 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                             ?: expectedRes?.first
                     val rawErrArg =
                         if (rawMethod == "ok_or_else") {
-                            (unwrapParenOrGroupExpr(nonUnitArgs[0]) as? Expr.Closure)?.body ?: nonUnitArgs[0]
+                            (unwrapParenOrGroupExpr(allMethodArgs[0]) as? Expr.Closure)?.body ?: allMethodArgs[0]
                         } else {
-                            nonUnitArgs[0]
+                            allMethodArgs[0]
                         }
                     val errTy =
                         inferExprRenderedType(rawErrArg, selfTypeName)
@@ -1312,11 +1313,11 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
             rawMethod == "into_iter" && renderedValueArgs.isEmpty() -> return "ArrayDeque(listOfNotNull($receiver))"
             rawMethod == "flatten" && renderedValueArgs.isEmpty() -> return receiver
             (rawMethod == "map" || rawMethod == "and_then") && renderedValueArgs.size == 1 ->
-                return "$atomicRecv?.let(${wrapMapCallbackArg(nonUnitArgs[0], renderedValueArgs[0])})"
+                return "$atomicRecv?.let(${wrapMapCallbackArg(allMethodArgs[0], renderedValueArgs[0])})"
             rawMethod == "map_or" && renderedValueArgs.size == 2 ->
-                return "($atomicRecv?.let(${wrapMapCallbackArg(nonUnitArgs[1], renderedValueArgs[1])}) ?: ${renderedValueArgs[0]})"
+                return "($atomicRecv?.let(${wrapMapCallbackArg(allMethodArgs[1], renderedValueArgs[1])}) ?: ${renderedValueArgs[0]})"
             rawMethod == "map_or_else" && renderedValueArgs.size == 2 ->
-                return "($atomicRecv?.let(${wrapMapCallbackArg(nonUnitArgs[1], renderedValueArgs[1])}) ?: ${unwrapZeroArgClosureText(renderedValueArgs[0])})"
+                return "($atomicRecv?.let(${wrapMapCallbackArg(allMethodArgs[1], renderedValueArgs[1])}) ?: ${unwrapZeroArgClosureText(renderedValueArgs[0])})"
             (rawMethod == "or_else" || rawMethod == "unwrap_or_else") && renderedValueArgs.size == 1 -> {
                 val optionElemKind = inferredMethodRecvTy?.let(this::resolveNumericKind)
                 val renderedClosure =
@@ -1324,7 +1325,7 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                         val prevKind = currentExpectedNumericKind
                         currentExpectedNumericKind = optionElemKind
                         try {
-                            renderExpr(nonUnitArgs[0], indent, selfTypeName)
+                            renderExpr(allMethodArgs[0], indent, selfTypeName)
                         } finally {
                             currentExpectedNumericKind = prevKind
                         }
@@ -1337,7 +1338,7 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                 val optionElemKind = inferredMethodRecvTy?.let(this::resolveNumericKind)
                 val fallbackArg =
                     if (optionElemKind != null) {
-                        renderTypedNumericInitializer(nonUnitArgs[0], optionElemKind, indent, selfTypeName)
+                        renderTypedNumericInitializer(allMethodArgs[0], optionElemKind, indent, selfTypeName)
                     } else {
                         renderedValueArgs[0]
                     }
@@ -1350,7 +1351,7 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                         val prevKind = currentExpectedNumericKind
                         currentExpectedNumericKind = optionElemKind
                         try {
-                            renderExpr(nonUnitArgs[0], indent, selfTypeName)
+                            renderExpr(allMethodArgs[0], indent, selfTypeName)
                         } finally {
                             currentExpectedNumericKind = prevKind
                         }
@@ -1363,12 +1364,12 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
     }
     if ((cleanMethod == "fold" || cleanMethod == "rfold") &&
         typeArgs.isEmpty() &&
-        nonUnitArgs.size == 2 &&
+        allMethodArgs.size == 2 &&
         renderedValueArgs.size == 2 &&
         renderedValueArgs[0] == "null"
     ) {
         val atomicRecv = if (isAtomicPostfixReceiver(expr.receiver, receiver)) receiver else "($receiver)"
-        val closureExpr = nonUnitArgs[1] as? Expr.Closure
+        val closureExpr = allMethodArgs[1] as? Expr.Closure
         val inferredBodyTy =
             closureExpr
                 ?.let { inferExprRenderedType(it.body, selfTypeName) }
@@ -1417,16 +1418,16 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
     }
     val adjustedRenderedValueArgs =
         if ((rawMethod == "peek" || rawMethod == "peek2" || rawMethod == "peek3") &&
-            nonUnitArgs.size == 1 &&
-            nonUnitArgs[0] is Expr.Macro &&
+            allMethodArgs.size == 1 &&
+            allMethodArgs[0] is Expr.Macro &&
             renderedValueArgs.size == 1
         ) {
             listOf(renderedValueArgs[0].removeSuffix(".default()"))
         } else if (rawMethod in setOf("map", "map_err", "and_then", "or_else") &&
-            nonUnitArgs.size == 1 &&
+            allMethodArgs.size == 1 &&
             renderedValueArgs.size == 1
         ) {
-            listOf(wrapMapCallbackArg(nonUnitArgs[0], renderedValueArgs[0]))
+            listOf(wrapMapCallbackArg(allMethodArgs[0], renderedValueArgs[0]))
         } else {
             renderedValueArgs
         }
@@ -1441,7 +1442,7 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
         if (explicitMethodConstArgs.isEmpty() &&
             activeConstParamNames.isNotEmpty() &&
             methodConstEntry != null &&
-            methodConstEntry.first == nonUnitArgs.size &&
+            methodConstEntry.first == allMethodArgs.size &&
             methodConstEntry.second.all { it in activeConstParamNames }
         ) {
             methodConstEntry.second

@@ -377,26 +377,41 @@ internal data class StaticPrimitiveCallSpec(
     val turbofishType: SynType?,
 )
 
-internal fun KotlinJ2KEmitter.rustPrimitivePathNameToKind(raw: String): NumericKind? =
-    when (raw.removePrefix("r#")) {
-        "i8" -> NumericKind.I8
-        "u8" -> NumericKind.U8
-        "i16" -> NumericKind.I16
-        "u16" -> NumericKind.U16
-        "i32" -> NumericKind.I32
-        "u32" -> NumericKind.U32
-        "i64" -> NumericKind.I64
-        "u64" -> NumericKind.U64
-        "i128" -> NumericKind.I128
-        "u128" -> NumericKind.U128
-        "f16" -> NumericKind.F16
-        "f32" -> NumericKind.F32
-        "f64" -> NumericKind.F64
-        "f128" -> NumericKind.F128
-        "isize" -> resolvePointerSizedNumericKind(signed = true)
-        "usize" -> resolvePointerSizedNumericKind(signed = false)
-        else -> null
+internal fun KotlinJ2KEmitter.rustPrimitivePathNameToKind(raw: String): NumericKind? {
+    var cur = raw.removePrefix("r#")
+    val visited = hashSetOf<String>()
+    repeat(5) {
+        when (cur) {
+            "i8" -> return NumericKind.I8
+            "u8" -> return NumericKind.U8
+            "i16" -> return NumericKind.I16
+            "u16" -> return NumericKind.U16
+            "i32" -> return NumericKind.I32
+            "u32" -> return NumericKind.U32
+            "i64" -> return NumericKind.I64
+            "u64" -> return NumericKind.U64
+            "i128" -> return NumericKind.I128
+            "u128" -> return NumericKind.U128
+            "f16" -> return NumericKind.F16
+            "f32" -> return NumericKind.F32
+            "f64" -> return NumericKind.F64
+            "f128" -> return NumericKind.F128
+            "isize" -> return resolvePointerSizedNumericKind(signed = true)
+            "usize" -> return resolvePointerSizedNumericKind(signed = false)
+        }
+        if (!visited.add(cur)) return null
+        val aliasSyn =
+            inspector.typeAliasTargets[cur]
+                ?: inspector.typeAliasTargets[rustTypeIdentToKotlin(cur)]
+                ?: return null
+        val pathTy = unwrapSynType(aliasSyn) as? SynType.Path ?: return null
+        if (pathTy.qself != null || pathTy.path.segments.len() != 1) return null
+        val nextSeg = pathTy.path.segments.first() ?: return null
+        if (nextSeg.arguments !is PathArguments.None) return null
+        cur = nextSeg.ident.toString().removePrefix("r#")
     }
+    return null
+}
 
 internal fun KotlinJ2KEmitter.resolvePrimitiveAssociatedConstKind(
     path: Path,

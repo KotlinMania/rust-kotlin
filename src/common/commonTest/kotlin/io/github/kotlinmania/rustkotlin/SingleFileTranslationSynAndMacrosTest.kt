@@ -1251,8 +1251,8 @@ class SingleFileTranslationSynAndMacrosTest {
         val kt = renderSingleKotlinFile(rustSource).text
         assertContains(kt, "internal interface BytewiseEq")
         assertContains(kt, "public interface ScoreBound : BytewiseEq")
-        assertContains(kt, "public open class BoxVal<T>(public var inner: T) : ScoreBound")
-        assertContains(kt, "override fun score(): Int")
+        assertContains(kt, "public open class BoxVal<T>(public var inner: T)")
+        assertContains(kt, "public fun <T : BytewiseEq> BoxVal<T>.score(): Int")
         assertContains(kt, "public fun <T : ScoreBound> readScore(item: T): Int")
         assertContains(kt, "total += 0 + 3")
         assertContains(kt, "total += 1 + 3")
