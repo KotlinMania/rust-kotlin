@@ -543,14 +543,59 @@ internal fun KotlinJ2KEmitter.tupleAccessMemberName(baseExpr: Expr, index: Int, 
             ?.substringBefore('<')
             ?.substringAfterLast('.')
             ?.trim()
+    val effectiveBaseTy =
+        baseTy?.let { bt ->
+            inspector.typeAliasTargets[bt]
+                ?.let {
+                    renderType(it, null)
+                        .removeSuffix("?")
+                        .substringBefore('<')
+                        .substringAfterLast('.')
+                        .trim()
+                }?.takeIf { it.isNotEmpty() }
+                ?: bt
+        }
+    if (effectiveBaseTy == "Pair" || effectiveBaseTy == "Triple") {
+        return when (index) {
+            0 -> "first"
+            1 -> "second"
+            2 -> "third"
+            else -> "field$index"
+        }
+    }
+    val knownArity =
+        effectiveBaseTy?.let {
+            inspector.tupleStructArityByType[it] ?: headerContext.externalCrateTupleStructArity[it]
+        }
+    if (knownArity != null) {
+        return tupleFieldPropertyName(index, knownArity)
+    }
     val hasExternalSingleTupleValueField =
-        baseTy != null &&
-            scopedAbiKeysForRenderedType(baseTy).any { key ->
-                "$key.value" in headerContext.crateStructFieldTypes &&
-                    "$key.field1" !in headerContext.crateStructFieldTypes
-            }
-    if (baseTy == "Wrapping" ||
-        (baseTy != null && inspector.tupleStructArityByType[baseTy] == 1) ||
+        effectiveBaseTy != null &&
+            (
+                scopedAbiKeysForRenderedType(effectiveBaseTy).any { key ->
+                    "$key.value" in headerContext.crateStructFieldTypes &&
+                        "$key.field1" !in headerContext.crateStructFieldTypes
+                } ||
+                    headerContext.crateStructFieldTypes.keys.any { k ->
+                        (k == "$effectiveBaseTy.value" || k.endsWith(".$effectiveBaseTy.value"))
+                    }
+            )
+    val hasExternalMultiField =
+        effectiveBaseTy != null &&
+            (
+                scopedAbiKeysForRenderedType(effectiveBaseTy).any { key ->
+                    "$key.field$index" in headerContext.crateStructFieldTypes ||
+                        "$key.field1" in headerContext.crateStructFieldTypes
+                } ||
+                    headerContext.crateStructFieldTypes.keys.any { k ->
+                        k == "$effectiveBaseTy.field$index" || k.endsWith(".$effectiveBaseTy.field$index")
+                    }
+            )
+    if (hasExternalMultiField) {
+        return "field$index"
+    }
+    if (effectiveBaseTy == "Wrapping" ||
         hasExternalSingleTupleValueField ||
         (
             ownerBase != null &&
@@ -561,6 +606,13 @@ internal fun KotlinJ2KEmitter.tupleAccessMemberName(baseExpr: Expr, index: Int, 
         )
     ) {
         return if (index == 0) "value" else "field$index"
+    }
+    if (index >= 1 &&
+        effectiveBaseTy != null &&
+        effectiveBaseTy !in setOf("Any", "List", "MutableList", "ArrayList") &&
+        effectiveBaseTy !in activeTypeParamNames
+    ) {
+        return "field$index"
     }
     return when (index) {
         0 -> "first"

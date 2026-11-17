@@ -1676,7 +1676,23 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
                             isSingleSegment = false,
                         )
                     }
-                val fullParts = listOf(boundHead) + renderedTail
+                val fullParts = (listOf(boundHead) + renderedTail).toMutableList()
+                if (fullParts.size >= 2) {
+                    val lastRaw = tailSegs.last().ident.toString()
+                    val prevRaw = if (tailSegs.size >= 2) tailSegs[tailSegs.size - 2].ident.toString() else headSeg.ident.toString()
+                    if (isKnownEnumVariantPair(prevRaw, lastRaw, selfTypeName)) {
+                        fullParts[fullParts.lastIndex] = rustTypeIdentToKotlin(lastRaw)
+                        if (!asCallee && prevRaw.first().isUpperCase()) {
+                            val enumKt = rustTypeIdentToKotlin(prevRaw)
+                            val varKt = fullParts[fullParts.lastIndex]
+                            val arity = inspector.tupleEnumVariantArity[enumKt to varKt]
+                            if (arity != null && arity > 0) {
+                                return renderTupleVariantConstructorLambda(fullParts.joinToString("."), arity)
+                            }
+                        }
+                        return fullParts.joinToString(".")
+                    }
+                }
                 if (!asCallee && fullParts.size >= 2) {
                     val lastRaw = tailSegs.last().ident.toString()
                     val prevRaw = if (tailSegs.size >= 2) tailSegs[tailSegs.size - 2].ident.toString() else headSeg.ident.toString()
@@ -1718,7 +1734,8 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
             return "{ it }"
         }
         if (singleRaw.first().isUpperCase() && !isScreamingSnakeIdent(singleRaw)) {
-            val singleTypeIdent = rustTypeIdentToKotlin(singleRaw)
+            val rawKt = rustTypeIdentToKotlin(singleRaw)
+            val singleTypeIdent = samePackageUseRenames[rawKt] ?: rawKt
             if (singleTypeIdent in inspector.unitStructNames) {
                 return "$singleTypeIdent()"
             }
@@ -1838,6 +1855,22 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
             }
         }
     }
+    if (parts.size >= 2) {
+        val lastRaw = filtered.last().ident.toString()
+        val prevRaw = filtered[filtered.size - 2].ident.toString()
+        if (isKnownEnumVariantPair(prevRaw, lastRaw, selfTypeName)) {
+            parts[parts.lastIndex] = rustTypeIdentToKotlin(lastRaw)
+            if (!asCallee && prevRaw.first().isUpperCase()) {
+                val enumKt = if (prevRaw == "Self") selfTypeName?.substringBefore('<')?.trim().orEmpty() else rustTypeIdentToKotlin(prevRaw)
+                val varKt = parts[parts.lastIndex]
+                val arity = inspector.tupleEnumVariantArity[enumKt to varKt]
+                if (arity != null && arity > 0) {
+                    return renderTupleVariantConstructorLambda(parts.joinToString("."), arity)
+                }
+            }
+            return parts.joinToString(".")
+        }
+    }
     if (!asCallee && parts.size >= 2) {
         val lastRaw = filtered.last().ident.toString()
         val prevRaw = filtered[filtered.size - 2].ident.toString()
@@ -1902,7 +1935,8 @@ internal fun KotlinJ2KEmitter.renderPathSegmentInExpr(
             !isLast && rawIdent in PRIMITIVE_TYPE_NAMES ->
                 if (rawIdent == "f32") kotlinF32TypeName() else rustTypeIdentToKotlin(rawIdent)
             rawIdent.first().isUpperCase() -> {
-                val ktSym = rustTypeIdentToKotlin(rawIdent)
+                val rawKt = rustTypeIdentToKotlin(rawIdent)
+                val ktSym = if (isSingleSegment) (samePackageUseRenames[rawKt] ?: rawKt) else rawKt
                 if (isSingleSegment && ktSym in activeTypeParamNames && ktSym in inspector.enumVariantSimpleNames) {
                     val selfBase = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
                     val ownerEnum =
@@ -1919,7 +1953,8 @@ internal fun KotlinJ2KEmitter.renderPathSegmentInExpr(
                 rustTypeIdentToKotlin(rawIdent) in inspector.declaredTypeNames &&
                 rustTypeIdentToKotlin(rawIdent) !in inspector.typeAliasTargets ->
                 rustTypeIdentToKotlin(rawIdent)
-            isLast &&
+            isSingleSegment &&
+                isLast &&
                 asCallee &&
                 cleanIdent !in inspector.declaredTopLevelFnRawNames &&
                 scopeBuilder.resolveLocalKotlinName(cleanIdent) == null &&
@@ -1927,7 +1962,8 @@ internal fun KotlinJ2KEmitter.renderPathSegmentInExpr(
                 rustTypeIdentToKotlin(rawIdent) !in inspector.typeAliasTargets ->
                 rustTypeIdentToKotlin(rawIdent)
             !isLast && importedTypeKotlinName != null -> importedTypeKotlinName
-            isLast &&
+            isSingleSegment &&
+                isLast &&
                 asCallee &&
                 cleanIdent !in inspector.declaredTopLevelFnRawNames &&
                 scopeBuilder.resolveLocalKotlinName(cleanIdent) == null &&
@@ -1935,7 +1971,7 @@ internal fun KotlinJ2KEmitter.renderPathSegmentInExpr(
                 importedTypeKotlinName
             !isLast && scopeBuilder.isImportedModuleInScope(rawIdent) ->
                 scopeBuilder.resolveModuleBinding(rawIdent)?.kotlinName ?: rustModuleIdentToKotlin(rawIdent)
-            (!isLast || asCallee) &&
+            (!isLast || (asCallee && isSingleSegment)) &&
                 rawIdent.first().isLowerCase() &&
                 rawIdent !in PRIMITIVE_TYPE_NAMES &&
                 rawIdent != "self" &&
@@ -2140,4 +2176,44 @@ private fun renderTupleVariantConstructorLambda(ctorRef: String, arity: Int): St
     if (arity == 1) return "{ $ctorRef(it) }"
     val pNames = (0 until arity).joinToString(", ") { "p$it" }
     return "{ $pNames -> $ctorRef($pNames) }"
+}
+
+private fun KotlinJ2KEmitter.isKnownEnumVariantPair(
+    prevRaw: String,
+    lastRaw: String,
+    selfTypeName: String?,
+): Boolean {
+    val cleanPrev = prevRaw.removePrefix("r#")
+    val cleanLast = lastRaw.removePrefix("r#")
+    if (cleanLast.isEmpty() || cleanLast == "new" || cleanLast == "default") return false
+    if (cleanPrev != "Self" && cleanPrev.firstOrNull()?.isUpperCase() != true) return false
+    val enumKt =
+        if (cleanPrev == "Self") {
+            selfTypeName
+                ?.substringBefore('<')
+                ?.substringAfterLast('.')
+                ?.trim()
+                .orEmpty()
+        } else {
+            rustTypeIdentToKotlin(cleanPrev)
+        }
+    if (enumKt.isEmpty()) return false
+    val varKt = rustTypeIdentToKotlin(cleanLast)
+    if (varKt.isEmpty()) return false
+    val directKey = "$enumKt.$varKt"
+    if (directKey in headerContext.crateEnumVariantTypeArity ||
+        directKey in inspector.enumVariantFieldTypes ||
+        (enumKt to varKt) in inspector.tupleEnumVariantArity ||
+        (enumKt in inspector.enumTypeNames && varKt in inspector.enumVariantSimpleNames)
+    ) {
+        return true
+    }
+    importedSimpleNameToPkg[enumKt]?.let { pkg ->
+        val ns = currentNamespacePrefix()
+        val sub = if (ns != null && pkg.startsWith("$ns.")) pkg.removePrefix("$ns.") else pkg.substringAfterLast('.')
+        if (sub.isNotEmpty() && "$sub.$directKey" in headerContext.crateEnumVariantTypeArity) {
+            return true
+        }
+    }
+    return scopedAbiKeysForRenderedType(enumKt).any { "$it.$varKt" in headerContext.crateEnumVariantTypeArity }
 }

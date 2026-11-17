@@ -1939,6 +1939,7 @@ internal fun KotlinJ2KEmitter.renderBlock(
     val prevArrayElementTypes = currentAddressableArrayElementTypes
     val prevSourceParameterTypes = currentSourceParameterTypes
     val prevFnParamNumericKinds = currentFunctionParamNumericKinds
+    val prevLocalBlockItems = activeLocalBlockItems
     val blockEntryExpectedKind = currentExpectedNumericKind
     val blockEntryTailExpectsUnitResultOk = currentTailExpectsUnitResultOk
     val savedBlockLocalFnRawNames = hashSetOf<String>()
@@ -1948,6 +1949,7 @@ internal fun KotlinJ2KEmitter.renderBlock(
     val savedBlockLocalExternFnNames = linkedSetOf<String>()
     currentExpectedNumericKind = null
     currentTailExpectsUnitResultOk = false
+    activeLocalBlockItems = localScopeItems + prevLocalBlockItems
     scopeBuilder.enterCompr()
     try {
         for (stmt in stmts) {
@@ -2171,6 +2173,7 @@ internal fun KotlinJ2KEmitter.renderBlock(
         currentAddressableArrayElementTypes = prevArrayElementTypes
         currentSourceParameterTypes = prevSourceParameterTypes
         currentFunctionParamNumericKinds = prevFnParamNumericKinds
+        activeLocalBlockItems = prevLocalBlockItems
         scopeBuilder.exitCompr()
     }
 

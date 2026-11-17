@@ -760,6 +760,8 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                 "wrapping_rem",
                 "wrapping_shl",
                 "wrapping_shr",
+                "unchecked_shl",
+                "unchecked_shr",
                 "checked_add",
                 "checked_sub",
                 "checked_mul",
@@ -820,7 +822,7 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
             recvNumericKindForMethod == null -> null
             rawMethod in setOf("wrapping_shl", "wrapping_shr", "checked_shl", "checked_shr", "overflowing_shl", "overflowing_shr", "rotate_left", "rotate_right", "pow", "checked_pow") ->
                 NumericKind.U32
-            rawMethod == "powi" -> NumericKind.I32
+            rawMethod == "powi" || rawMethod == "unchecked_shl" || rawMethod == "unchecked_shr" -> NumericKind.I32
             else -> recvNumericKindForMethod
         }
     currentExpectedParseTargetType =
@@ -1264,56 +1266,53 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
     }
     val cleanRecvForCmp =
         inferredMethodRecvTy ?: inferExprRenderedType(effectiveReceiverExpr, selfTypeName)?.removeSuffix("?")?.trim()
-    val recvBaseForCmp = cleanRecvForCmp?.substringBefore('<')?.substringAfterLast('.')?.trim()
-    val coreNsForCmp = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    val isCoreRuntimeActiveForCmp =
-        "core" in headerContext.crateNamespaces ||
-            headerContext.packageName == coreNsForCmp ||
-            headerContext.packageName?.startsWith("$coreNsForCmp.") == true
-    if (isCoreRuntimeActiveForCmp &&
+    if ((rawMethod == "unchecked_shl" || rawMethod == "unchecked_shr") &&
         renderedValueArgs.size == 1 &&
-        typeArgs.isEmpty() &&
-        rawMethod in setOf("partial_cmp", "cmp", "lt", "le", "gt", "ge", "__chaining_less", "__chaining_greater") &&
-        "PartialOrd" !in inspector.declaredTypeNames &&
-        "Ord" !in inspector.declaredTypeNames &&
-        (
-            (
-                recvBaseForCmp != null &&
-                    recvBaseForCmp in activeTypeParamNames &&
-                    currentTypeParamWitnessCalls.none { it.key.first == recvBaseForCmp }
-            ) || cleanRecvForCmp == "Any"
-        )
+        typeArgs.isEmpty()
     ) {
-        val argRendered = renderedValueArgs[0]
-        when (rawMethod) {
-            "partial_cmp" -> {
-                CoreIntrinsicLowering.registerCoreImport(this, "$coreNsForCmp.mem.kmPartialCompareValues")
-                val ordRef = bindOrQualifyResolvedCrossSymbol("$coreNsForCmp.cmp.Ordering")
-                return "kmPartialCompareValues($receiver, $argRendered)?.let { cmpSign -> when { cmpSign < 0 -> $ordRef.Less; cmpSign > 0 -> $ordRef.Greater; else -> $ordRef.Equal } }"
-            }
-            "cmp" -> {
-                CoreIntrinsicLowering.registerCoreImport(this, "$coreNsForCmp.mem.kmCompareValues")
-                val ordRef = bindOrQualifyResolvedCrossSymbol("$coreNsForCmp.cmp.Ordering")
-                return "kmCompareValues($receiver, $argRendered).let { cmpSign -> when { cmpSign < 0 -> $ordRef.Less; cmpSign > 0 -> $ordRef.Greater; else -> $ordRef.Equal } }"
-            }
-            "lt", "le", "gt", "ge" -> {
-                CoreIntrinsicLowering.registerCoreImport(this, "$coreNsForCmp.mem.kmPartialCompareValues")
-                val cmpOp =
-                    when (rawMethod) {
-                        "lt" -> "< 0"
-                        "le" -> "<= 0"
-                        "gt" -> "> 0"
-                        else -> ">= 0"
-                    }
-                return "(kmPartialCompareValues($receiver, $argRendered)?.let { cmpSign -> cmpSign $cmpOp } == true)"
-            }
-            "__chaining_less", "__chaining_greater" -> {
-                CoreIntrinsicLowering.registerCoreImport(this, "$coreNsForCmp.mem.kmPartialCompareValues")
-                val cfRef = bindOrQualifyResolvedCrossSymbol("$coreNsForCmp.ops.controlflow.ControlFlow")
-                val cmpOp = if (rawMethod == "__chaining_less") "< 0" else "> 0"
-                return "kmPartialCompareValues($receiver, $argRendered).let { cmpSign -> if (cmpSign == 0) $cfRef.Continue<Boolean, Unit>(Unit) else $cfRef.Break<Boolean, Unit>(cmpSign != null && cmpSign $cmpOp) }"
+        val intKind =
+            recvNumericKindForMethod
+                ?: cleanRecvForCmp?.let(this::resolveNumericKind)
+                ?: inferExprNumericKind(effectiveReceiverExpr, selfTypeName)
+        if (intKind in
+            setOf(
+                NumericKind.I8,
+                NumericKind.I16,
+                NumericKind.I32,
+                NumericKind.I64,
+                NumericKind.U8,
+                NumericKind.U16,
+                NumericKind.U32,
+                NumericKind.U64,
+            )
+        ) {
+            val atomicRecv = if (isAtomicPostfixReceiver(expr.receiver, receiver)) receiver else "($receiver)"
+            val op = if (rawMethod == "unchecked_shl") "shl" else "shr"
+            val argKind = inferExprNumericKind(allMethodArgs[0], selfTypeName)
+            val argText = renderedValueArgs[0].trim()
+            val shiftAmt =
+                if (argKind == NumericKind.I32 || isDecimalOrHexLiteralDigits(argText)) {
+                    argText
+                } else {
+                    val argAtom = if (isAtomicPostfixReceiver(allMethodArgs[0], argText)) argText else "($argText)"
+                    "$argAtom.toInt()"
+                }
+            return when (intKind) {
+                NumericKind.I8 -> "(($atomicRecv).toInt() $op $shiftAmt).toByte()"
+                NumericKind.I16 -> "(($atomicRecv).toInt() $op $shiftAmt).toShort()"
+                NumericKind.U8 -> "(($atomicRecv).toUInt() $op $shiftAmt).toUByte()"
+                NumericKind.U16 -> "(($atomicRecv).toUInt() $op $shiftAmt).toUShort()"
+                else -> "($atomicRecv $op $shiftAmt)"
             }
         }
+    }
+    if (renderedValueArgs.size == 1 && typeArgs.isEmpty()) {
+        tryRenderUnconstrainedCmpLowering(
+            rawMethod = rawMethod,
+            cleanRecvTy = cleanRecvForCmp,
+            recvRendered = receiver,
+            argRendered = renderedValueArgs[0],
+        )?.let { return it }
     }
     if (rawMethod == "take" &&
         renderedValueArgs.isEmpty() &&
@@ -1939,4 +1938,81 @@ private fun KotlinJ2KEmitter.renderCopyFromSliceCall(
         return "run { val $dstVar = $dstAtom; val $srcVar = $srcAtom; for ($idxVar in $srcVar.indices) $dstVar[$idxVar] = $srcVar[$idxVar] }"
     }
     return null
+}
+
+internal fun KotlinJ2KEmitter.tryRenderUnconstrainedCmpLowering(
+    rawMethod: String,
+    cleanRecvTy: String?,
+    recvRendered: String,
+    argRendered: String,
+    allowWhenRecvUninferred: Boolean = false,
+): String? {
+    val recvBase = cleanRecvTy?.substringBefore('<')?.substringAfterLast('.')?.trim()
+    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+    val isCoreRuntimeActive =
+        "core" in headerContext.crateNamespaces ||
+            headerContext.packageName == coreNs ||
+            headerContext.packageName?.startsWith("$coreNs.") == true
+    val isCmpMethod =
+        rawMethod in
+            setOf(
+                "partial_cmp",
+                "partialCmp",
+                "cmp",
+                "lt",
+                "le",
+                "gt",
+                "ge",
+                "__chaining_less",
+                "chainingLess",
+                "__chaining_greater",
+                "chainingGreater",
+            )
+    if (!isCoreRuntimeActive ||
+        !isCmpMethod ||
+        "PartialOrd" in inspector.declaredTypeNames ||
+        "Ord" in inspector.declaredTypeNames
+    ) {
+        return null
+    }
+    val isEligibleRecv =
+        (
+            recvBase != null &&
+                recvBase in activeTypeParamNames &&
+                currentTypeParamWitnessCalls.none { it.key.first == recvBase }
+        ) ||
+            cleanRecvTy == "Any" ||
+            (allowWhenRecvUninferred && cleanRecvTy == null)
+    if (!isEligibleRecv) return null
+
+    return when (rawMethod) {
+        "partial_cmp", "partialCmp" -> {
+            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.kmPartialCompareValues")
+            val ordRef = bindOrQualifyResolvedCrossSymbol("$coreNs.cmp.Ordering")
+            "kmPartialCompareValues($recvRendered, $argRendered)?.let { cmpSign -> when { cmpSign < 0 -> $ordRef.Less; cmpSign > 0 -> $ordRef.Greater; else -> $ordRef.Equal } }"
+        }
+        "cmp" -> {
+            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.kmCompareValues")
+            val ordRef = bindOrQualifyResolvedCrossSymbol("$coreNs.cmp.Ordering")
+            "kmCompareValues($recvRendered, $argRendered).let { cmpSign -> when { cmpSign < 0 -> $ordRef.Less; cmpSign > 0 -> $ordRef.Greater; else -> $ordRef.Equal } }"
+        }
+        "lt", "le", "gt", "ge" -> {
+            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.kmPartialCompareValues")
+            val cmpOp =
+                when (rawMethod) {
+                    "lt" -> "< 0"
+                    "le" -> "<= 0"
+                    "gt" -> "> 0"
+                    else -> ">= 0"
+                }
+            "(kmPartialCompareValues($recvRendered, $argRendered)?.let { cmpSign -> cmpSign $cmpOp } == true)"
+        }
+        "__chaining_less", "chainingLess", "__chaining_greater", "chainingGreater" -> {
+            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.kmPartialCompareValues")
+            val cfRef = bindOrQualifyResolvedCrossSymbol("$coreNs.ops.controlflow.ControlFlow")
+            val cmpOp = if (rawMethod == "__chaining_less" || rawMethod == "chainingLess") "< 0" else "> 0"
+            "kmPartialCompareValues($recvRendered, $argRendered).let { cmpSign -> if (cmpSign == 0) $cfRef.Continue<Boolean, Unit>(Unit) else $cfRef.Break<Boolean, Unit>(cmpSign != null && cmpSign $cmpOp) }"
+        }
+        else -> null
+    }
 }

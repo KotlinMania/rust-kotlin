@@ -1116,6 +1116,7 @@ private fun executeTranslate(
                 externalCrateTwoFieldResultFns = externalCrateMeta.twoFieldResultFns,
                 externalCrateNullableReturnFns = externalCrateMeta.nullableReturnFns,
                 externalCrateFnConstParams = externalCrateMeta.fnConstParams,
+                externalCrateTupleStructArity = externalCrateMeta.tupleStructArity,
                 cfgTargetProfile =
                     if (parsed.portLintDirective != "tests") {
                         parsed.cfgTargetProfile.copy(

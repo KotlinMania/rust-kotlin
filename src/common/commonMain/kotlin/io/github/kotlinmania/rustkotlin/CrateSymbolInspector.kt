@@ -152,6 +152,7 @@ internal class CrateSymbolInspector(
     val declaredTypeNames: MutableSet<String> = linkedSetOf()
     val attachableTypeNames: MutableSet<String> = linkedSetOf()
     val unitStructNames: MutableSet<String> = linkedSetOf()
+    val enumTypeNames: MutableSet<String> = linkedSetOf()
     val unionTypeNames: MutableSet<String> = linkedSetOf()
     val associatedTypeDecls: MutableMap<String, AssocTypeDecl> = linkedMapOf()
     val ownerAssocTypes: MutableMap<String, MutableMap<String, SynType>> = linkedMapOf()
@@ -194,7 +195,7 @@ internal class CrateSymbolInspector(
     private val inlineModStack: ArrayDeque<String> = ArrayDeque()
     private val outerTopLevelFnArities: MutableSet<Pair<String, Int>> = linkedSetOf()
     private val inlineModForeignFns: MutableList<Triple<String, String, Int>> = mutableListOf()
-    private val topLevelDefinedFnRawByKtAndArity: MutableMap<Pair<String, Int>, MutableSet<String>> = linkedMapOf()
+    private val topLevelDefinedFnRawsByKt: MutableMap<String, MutableSet<String>> = linkedMapOf()
     private val topLevelForeignFns: MutableList<Pair<String, Int>> = mutableListOf()
     private val pendingImplMethodConsts: MutableList<QuadImplConstSpec> = mutableListOf()
     val topLevelFnReturnSynTypes: MutableMap<String, SynType> = linkedMapOf()
@@ -310,10 +311,10 @@ internal class CrateSymbolInspector(
                     collidingInlineForeignFnRenames[modRaw to rawFn] = rustFunctionIdentToKotlin("${modRaw}_$rawFn")
                 }
             }
-            for ((rawForeign, arity) in topLevelForeignFns) {
+            for ((rawForeign, _) in topLevelForeignFns) {
                 val ktFn = rustFunctionIdentToKotlin(rawForeign)
-                val definedRaws = topLevelDefinedFnRawByKtAndArity[ktFn to arity]
-                if (definedRaws != null && definedRaws.any { it != rawForeign }) {
+                val definedRaws = topLevelDefinedFnRawsByKt[ktFn]
+                if (!definedRaws.isNullOrEmpty()) {
                     val cap = ktFn.replaceFirstChar { it.uppercaseChar() }
                     collidingTopLevelForeignFnRenames[rawForeign] = "extern$cap"
                 }
@@ -478,7 +479,7 @@ internal class CrateSymbolInspector(
             declaredTopLevelFnRawNames += cleanRaw
             if (inlineModStack.isEmpty()) {
                 val arity = i.sig.inputs.count { it is FnArg.Typed }
-                topLevelDefinedFnRawByKtAndArity.getOrPut(ktFn to arity) { linkedSetOf() }.add(cleanRaw)
+                topLevelDefinedFnRawsByKt.getOrPut(ktFn) { linkedSetOf() }.add(cleanRaw)
                 if (arity == 0) {
                     outerTopLevelFnArities += ktFn to arity
                 }
@@ -719,6 +720,7 @@ internal class CrateSymbolInspector(
 
     override fun visitItemEnum(i: Item.Enum) {
         val name = rustTypeIdentToKotlin(i.ident.toString())
+        enumTypeNames += name
         if (blockDepth == 0) {
             declaredTypeNames += name
             attachableTypeNames += name

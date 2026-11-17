@@ -1426,7 +1426,13 @@ public object CoreIntrinsicLowering {
         val dstExplicitSyn = explicitTypes.getOrNull(1)?.takeUnless { it is SynType.Infer }
         val expectedTarget = emitter.currentExpectedParseTargetType?.trim()?.takeIf { it.isNotEmpty() }
         val srcSyn = srcExplicitSyn ?: emitter.sourceInitializerType(argExpr)
-        val dstSyn = dstExplicitSyn ?: if (expectedTarget == null) emitter.currentEnclosingReturnSynType else null
+        val dstSyn =
+            dstExplicitSyn
+                ?: if (expectedTarget == null && emitter.callArgumentNestingDepth == 0) {
+                    emitter.currentEnclosingReturnSynType
+                } else {
+                    null
+                }
         val prevParseTarget = emitter.currentExpectedParseTargetType
         emitter.currentExpectedParseTargetType = srcExplicitSyn?.let { emitter.renderType(it, selfTypeName) }
         val renderedArg =
@@ -1444,7 +1450,7 @@ public object CoreIntrinsicLowering {
             (
                 dstSyn?.let { emitter.renderType(it, selfTypeName) }
                     ?: expectedTarget
-                    ?: emitter.currentEnclosingReturnRenderedType
+                    ?: if (emitter.callArgumentNestingDepth == 0) emitter.currentEnclosingReturnRenderedType else null
             )?.takeIf(::isUsableRenderedTypeArg)
         if (srcRendered != null && dstRendered != null) {
             if (srcRendered == dstRendered && srcRendered != "Unit") {
@@ -1789,30 +1795,37 @@ public object CoreIntrinsicLowering {
             } else {
                 null
             }
+        emitter.callArgumentNestingDepth++
         val renderedArgs =
-            if (simdExpectedArgTarget != null) {
-                callArgsList.mapIndexed { argIdx, argExpr ->
-                    val shouldPropagate =
-                        when (spec.canonicalName) {
-                            "simd_shuffle" -> argIdx < 2
-                            "simd_extract" -> argIdx == 0
-                            "simd_insert" -> argIdx == 0
-                            else -> true
-                        }
-                    if (shouldPropagate) {
+            try {
+                if (simdExpectedArgTarget != null) {
+                    callArgsList.mapIndexed { argIdx, argExpr ->
+                        val shouldPropagate =
+                            when (spec.canonicalName) {
+                                "simd_shuffle" -> argIdx < 2
+                                "simd_extract" -> argIdx == 0
+                                "simd_insert" -> argIdx == 0
+                                else -> true
+                            }
                         val prevTarget = emitter.currentExpectedParseTargetType
-                        emitter.currentExpectedParseTargetType = simdExpectedArgTarget
+                        emitter.currentExpectedParseTargetType = if (shouldPropagate) simdExpectedArgTarget else null
                         try {
                             emitter.renderExpr(argExpr, indent, selfTypeName)
                         } finally {
                             emitter.currentExpectedParseTargetType = prevTarget
                         }
-                    } else {
-                        emitter.renderExpr(argExpr, indent, selfTypeName)
+                    }
+                } else {
+                    val prevTarget = emitter.currentExpectedParseTargetType
+                    emitter.currentExpectedParseTargetType = null
+                    try {
+                        callArgsList.map { emitter.renderExpr(it, indent, selfTypeName) }
+                    } finally {
+                        emitter.currentExpectedParseTargetType = prevTarget
                     }
                 }
-            } else {
-                callArgsList.map { emitter.renderExpr(it, indent, selfTypeName) }
+            } finally {
+                emitter.callArgumentNestingDepth--
             }
 
         val canonicalIntrinsicName = spec.canonicalName

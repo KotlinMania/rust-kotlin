@@ -1624,12 +1624,20 @@ private fun scanEnumVariantTypeArities(
         val stripped = stripLeadingScannerAttrs(clause)
         val rawVar = (stripped.firstOrNull() as? TokenTree.Ident)?.value?.toString()?.removePrefix("r#") ?: continue
         val afterVar = stripped.getOrNull(1)
+        val ktVar = KotlinNamingPolicy.Default.toTypeIdentifier(rawVar, allowRawAbi = rawAbiMode)
+        if (ktVar.isEmpty()) continue
         val hasPayload =
             afterVar is TokenTree.Group &&
                 (afterVar.value.delimiter() == Delimiter.Parenthesis || afterVar.value.delimiter() == Delimiter.Brace)
-        if (!hasPayload) continue
-        val ktVar = KotlinNamingPolicy.Default.toTypeIdentifier(rawVar, allowRawAbi = rawAbiMode)
-        if (ktVar.isEmpty()) continue
+        if (!hasPayload) {
+            if (typeArity == 0) {
+                out.putIfMissing("$ktEnum.$ktVar", 0)
+                if (subpkg.isNotEmpty()) {
+                    out.putIfMissing("$subpkg.$ktEnum.$ktVar", 0)
+                }
+            }
+            continue
+        }
         if (typeArity > 0) {
             out.putIfMissing("$ktEnum.$ktVar", typeArity)
             if (subpkg.isNotEmpty()) {

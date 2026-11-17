@@ -5,6 +5,7 @@ import io.github.kotlinmania.syn.BinOp
 import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.Fields
 import io.github.kotlinmania.syn.FnArg
+import io.github.kotlinmania.syn.ForeignItem
 import io.github.kotlinmania.syn.GenericArgument
 import io.github.kotlinmania.syn.ImplItem
 import io.github.kotlinmania.syn.Item
@@ -575,6 +576,17 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
                 }
                 is Member.Unnamed -> {
                     val idx = member.index.index.toInt()
+                    if (ownerKt == "Pair" || ownerKt == "Triple") {
+                        val ltIdx = baseTy.indexOf('<')
+                        val gtIdx = baseTy.lastIndexOf('>')
+                        if (ltIdx >= 0 && gtIdx > ltIdx) {
+                            val typeArgs =
+                                PhantomRawPointerTypeStripper
+                                    .splitTopLevelCommaList(baseTy.substring(ltIdx + 1, gtIdx))
+                                    .map { it.trim() }
+                            typeArgs.getOrNull(idx)?.let { return it }
+                        }
+                    }
                     val arity = inspector.tupleStructArityByType[ownerKt]
                     val primaryField =
                         if (arity != null) {
@@ -1763,20 +1775,54 @@ internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
                 .removePrefix("r#"),
         )
     if (segs.size == 1) {
+        val rawCalleeIdent =
+            segs[0]
+                .ident
+                .toString()
+                .removePrefix("r#")
         val allFnItems =
             buildList {
+                addAll(activeLocalBlockItems)
                 TranslationSession.sharedModuleFile?.items?.let { addAll(it) }
                 if (TranslationSession.sharedModuleFile !== file) {
                     addAll(file.items)
                 }
             }
+        fun matchesFnIdent(rawDeclIdent: String, ktCallee: String, isForeign: Boolean): Boolean {
+            val cleanDecl = rawDeclIdent.removePrefix("r#")
+            if (cleanDecl == rawCalleeIdent) return true
+            if (rustFunctionIdentToKotlin(cleanDecl) == ktCallee) return true
+            if (isForeign) {
+                val renamed =
+                    inspector.collidingTopLevelForeignFnRenames[cleanDecl]
+                        ?: currentModPathPrefix.lastOrNull()?.let { modRaw ->
+                            inspector.collidingInlineForeignFnRenames[modRaw to cleanDecl]
+                        }
+                if (renamed == ktCallee) return true
+            }
+            return false
+        }
         for (item in allFnItems) {
-            if (item is Item.Fn && !itemHasDocOnlyCfg(item) && rustFunctionIdentToKotlin(item.sig.ident.toString()) == methodKt) {
+            if (item is Item.Fn && !itemHasDocOnlyCfg(item) && matchesFnIdent(item.sig.ident.toString(), methodKt, isForeign = false)) {
                 val typedParams =
                     item.sig.inputs
                         .toList()
                         .filterIsInstance<FnArg.Typed>()
                 typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
+            }
+            if (item is Item.ForeignMod && !itemHasDocOnlyCfg(item)) {
+                for (foreign in item.items) {
+                    if (foreign is ForeignItem.Fn &&
+                        !foreignItemHasDocOnlyCfg(foreign) &&
+                        matchesFnIdent(foreign.sig.ident.toString(), methodKt, isForeign = true)
+                    ) {
+                        val typedParams =
+                            foreign.sig.inputs
+                                .toList()
+                                .filterIsInstance<FnArg.Typed>()
+                        typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
+                    }
+                }
             }
         }
         return null
