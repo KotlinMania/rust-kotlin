@@ -190,6 +190,7 @@ internal fun KotlinJ2KEmitter.collectLocalSupertraitMethodNames(
         }
         for (bound in traitDecl.supertraits) {
             val boundPath = (bound as? TypeParamBound.Trait)?.path ?: continue
+            if (isImplicitStdlibSupertraitPath(boundPath)) continue
             val boundBase =
                 boundPath.segments
                     .last()
@@ -1340,9 +1341,21 @@ internal fun KotlinJ2KEmitter.renderStandaloneItemImpl(
     }
     currentStandaloneImplTraitPath = item.traitPath?.path
     currentStandaloneImplSelfSynType = item.selfType
+    val ownerAssocKey =
+        (unwrapSynType(item.selfType) as? SynType.Path)
+            ?.takeIf { it.qself == null }
+            ?.path
+            ?.segments
+            ?.last()
+            ?.ident
+            ?.toString()
+            ?.let(::rustTypeIdentToKotlin)
     currentImplAssocTypes =
         buildMap {
             putAll(prevAssocTypes)
+            if (ownerAssocKey != null) {
+                putAll(inspector.ownerAssocTypes[ownerAssocKey].orEmpty())
+            }
             for (implItem in item.items) {
                 if (implItem is ImplItem.AssocType) {
                     put(implItem.ident.toString(), implItem.ty)

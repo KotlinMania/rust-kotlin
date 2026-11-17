@@ -210,7 +210,7 @@ class StdlibSemanticWaveCTest {
                     ),
             )
         assertContains(output, "val (c) = valueVal as MixedUnit.Char")
-        assertContains(output, "is ControlFlow.Continue -> tryResult.value")
+        assertContains(output, "is ControlFlow.Continue<*, *> -> tryResult.value")
         assertContains(output, "ControlFlow.Break<Boolean, UInt>")
         assertContains(output, "var selfMut = this")
         assertContains(output, "selfMut = next")
@@ -319,11 +319,11 @@ class StdlibSemanticWaveCTest {
                             ),
                     ),
             )
-        assertContains(output, "if (res is Result.Ok)")
-        assertContains(output, "is Result.Ok ->")
+        assertContains(output, "if (res is Result.Ok<*, *>)")
+        assertContains(output, "is Result.Ok<*, *> ->")
         assertFalse(output.contains("is Ok ->"), "Unqualified Ok variant match:\n$output")
-        assertContains(output, "is Result.Err &&")
-        assertFalse(output.contains("!is Result.Err &&"), "Broken compound !is in while-let:\n$output")
+        assertContains(output, "is Result.Err<*, *> &&")
+        assertFalse(output.contains("!is Result.Err<*, *> &&"), "Broken compound !is in while-let:\n$output")
     }
 
     @Test
@@ -496,5 +496,208 @@ class StdlibSemanticWaveCTest {
         assertContains(wasiOut, "public fun schedYield(): Int")
         assertContains(wasiOut, "wasiSnapshotPreview1SchedYield()")
         assertContains(wasiOut, "public expect fun wasiSnapshotPreview1SchedYield(): Int")
+    }
+
+    @Test
+    fun waveC2ResultAndGenericEnumStarProjectionsWithRangeInclusive() {
+        val source =
+            """
+            use crate::borrow::Cow;
+
+            pub fn call_local_try<F>(f: F) -> Result<i32, i32>
+            where
+                F: FnOnce() -> Result<i32, i32>,
+            {
+                let x = f()?;
+                Ok(x)
+            }
+
+            pub fn match_cow(c: Cow<'_, str>) -> usize {
+                match c {
+                    Cow::Borrowed(s) => s.len(),
+                    Cow::Owned(o) => o.len(),
+                }
+            }
+
+            pub fn check_ranges(r: core::ops::RangeInclusive<u16>) -> Vec<core::ops::RangeInclusive<u16>> {
+                let _ = take_range(0x00C0..=0x00D6);
+                vec![r, 0x0100..=0x017E]
+            }
+
+            pub fn take_range(r: core::ops::RangeInclusive<u16>) -> u16 {
+                *r.start()
+            }
+            """.trimIndent()
+        val out =
+            translateRustSourceToKotlin(
+                recognizeRust(source),
+                headerContext =
+                    FileHeaderContext(
+                        packageName = "io.github.kotlinmania.rustlang.alloc.test",
+                        projectNamespace = "io.github.kotlinmania.rustlang.alloc",
+                        crateNamespaces =
+                            mapOf(
+                                "core" to "io.github.kotlinmania.rustlang.core",
+                                "alloc" to "io.github.kotlinmania.rustlang.alloc",
+                            ),
+                        crateEnumVariantTypeArity =
+                            mapOf(
+                                "Cow.Borrowed" to 2,
+                                "Cow.Owned" to 2,
+                            ),
+                    ),
+            )
+        assertContains(out, "is Result.Ok<*, *> -> tryResult.value")
+        assertContains(out, "is Cow.Borrowed<*, *> ->")
+        assertContains(out, "is Cow.Owned<*, *> ->")
+        assertContains(out, "import io.github.kotlinmania.rustlang.core.ops.range.RangeInclusive")
+        assertContains(out, "takeRange(RangeInclusive(0x00C0u.toUShort(), 0x00D6u.toUShort(), false))")
+        assertContains(out, "RangeInclusive(0x0100u.toUShort(), 0x017Eu.toUShort(), false)")
+    }
+
+    @Test
+    fun waveC2SimdLaneAliasesBlockLocalTypesAndConstArrayDefaults() {
+        val source =
+            """
+            #[repr(simd)]
+            pub(crate) struct ShuffleBuf<const LEN: usize>(pub(crate) [u32; LEN]);
+
+            pub fn make_simd(a: f32) -> f32x4 {
+                type V = f32x4;
+                type Lane = u16;
+                let _bits = Lane::BITS;
+                let _z = V::ZERO;
+                let _s = V::splat(a);
+                i32x2::new(1, 2);
+                f32x4::splat(a)
+            }
+            """.trimIndent()
+        val out =
+            translateRustSourceToKotlin(
+                recognizeRust(source),
+                headerContext =
+                    FileHeaderContext(
+                        packageName = "io.github.kotlinmania.rustlang.corearch.wasm32",
+                        projectNamespace = "io.github.kotlinmania.rustlang.corearch",
+                        crateNamespaces = mapOf("core" to "io.github.kotlinmania.rustlang.core"),
+                        crateSymbolSubpackages = mapOf("Simd" to listOf("simd")),
+                    ),
+            )
+        assertContains(out, "import io.github.kotlinmania.rustlang.corearch.simd.Simd")
+        assertFalse(out.contains("UIntArray(len)"), "Erased struct const param leaked into default:\n$out")
+        assertContains(out, "UIntArray(0)")
+        assertContains(out, "16u")
+        assertContains(out, "Simd<Float>(List(4) { 0.0f })")
+        assertContains(out, "Simd<Float>(List(4) { a })")
+        assertContains(out, "Simd<Int>(listOf(1, 2))")
+    }
+
+    @Test
+    fun waveC2InferCastUnitArgsBlockForeignFnAndIoErrorResultConflict() {
+        val source =
+            """
+            use libc::c_char;
+            use core::fmt::{self, Debug};
+
+            pub type Result<T> = std::io::Result<T>;
+
+            pub fn wrap_io<E>(v: Result<i32>, slot: &mut () ) -> Result<i32> {
+                let _ = take_unit((), 0 as _);
+                drop_void(0 as _);
+                let _f = v?;
+                unsafe {
+                    extern "C" {
+                        fn strlen(s: *const c_char) -> usize;
+                    }
+                    let _n = strlen(0 as *const c_char) + 1;
+                }
+                let _ = slot;
+                v
+            }
+
+            pub fn take_unit(u: (), x: u32) -> u32 {
+                x
+            }
+
+            pub fn drop_void(_: u32) {}
+
+            pub struct ItemWrap;
+            impl Debug for ItemWrap {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.debug_tuple("ItemWrap").finish()
+                }
+            }
+            """.trimIndent()
+        val out =
+            translateRustSourceToKotlin(
+                recognizeRust(source),
+                headerContext =
+                    FileHeaderContext(
+                        packageName = "io.github.kotlinmania.rustlang.std.sample",
+                        projectNamespace = "io.github.kotlinmania.rustlang.std",
+                        crateNamespaces =
+                            mapOf(
+                                "core" to "io.github.kotlinmania.rustlang.core",
+                                "alloc" to "io.github.kotlinmania.rustlang.alloc",
+                                "std" to "io.github.kotlinmania.rustlang.std",
+                            ),
+                    ),
+            )
+        assertContains(out, "import io.github.kotlinmania.rustlang.core.ffi.primitives.CChar")
+        assertContains(out, "import io.github.kotlinmania.rustlang.core.io.error.Error")
+        assertContains(out, "import io.github.kotlinmania.rustlang.core.result.Result as RustResult")
+        assertContains(out, "is RustResult.Ok<*, *> -> tryResult.value")
+        assertContains(out, "takeUnit(Unit, 0.toUInt())")
+        assertFalse(out.contains("as Unit"), "Unconstrained `as _` must not cast to Unit:\n$out")
+        assertContains(out, "strlen(ConstPtr(0L)) + 1uL")
+        assertContains(out, "RustResult.Ok<Unit, io.github.kotlinmania.rustlang.core.fmt.Error>(Unit)")
+    }
+
+    @Test
+    fun waveC2FnOnceOutputLiftingStandaloneAssocInheritanceAndExtraBounds() {
+        val source =
+            """
+            pub struct Boxed<T>(T);
+
+            pub trait FnOnce<Args> {
+                type Output;
+                fn call_once(self, args: Args) -> Self::Output;
+            }
+
+            impl<F: FnOnce<Args>, Args> FnOnce<Args> for Boxed<F> {
+                type Output = F::Output;
+                fn call_once(self, args: Args) -> F::Output {
+                    (self.0).call_once(args)
+                }
+            }
+
+            pub trait IterTrait {
+                type Item;
+                fn next(&mut self) -> Option<Self::Item>;
+            }
+
+            pub trait DoubleIterTrait: IterTrait {
+                fn next_back(&mut self) -> Option<Self::Item>;
+            }
+
+            pub struct ToUpper<I>(I);
+
+            impl<I: IterTrait<Item = char>> IterTrait for ToUpper<I> {
+                type Item = char;
+                fn next(&mut self) -> Option<Self::Item> {
+                    None
+                }
+            }
+
+            impl<I: DoubleIterTrait<Item = char>> DoubleIterTrait for ToUpper<I> {
+                fn next_back(&mut self) -> Option<Self::Item> {
+                    None
+                }
+            }
+            """.trimIndent()
+        val out = translateRustSourceToKotlin(recognizeRust(source))
+        assertFalse(out.contains("class Boxed<T>\n"), "Extra-bound FnOnce impl should stay standalone, not break class")
+        assertContains(out, "public fun <Output, F : FnOnce<Args, Output>, Args> Boxed<F>.callOnce(")
+        assertContains(out, "public fun <I : DoubleIterTrait<Char>> ToUpper<I>.nextBack(): Char?")
     }
 }

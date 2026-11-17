@@ -96,7 +96,28 @@ internal fun KotlinJ2KEmitter.renderMacroInvocationAsStmtOrExpr(
             "print($msg)"
         }
         "vec" -> {
-            val args = parseCommaSeparatedExprsFromTokens(tokens, indent, selfTypeName)
+            val outerListTarget = currentExpectedParseTargetType?.removeSuffix("?")?.trim()
+            val elemTarget =
+                when {
+                    outerListTarget != null && outerListTarget.startsWith("MutableList<") && outerListTarget.endsWith(">") ->
+                        outerListTarget.removePrefix("MutableList<").dropLast(1).trim()
+                    outerListTarget != null && outerListTarget.startsWith("List<") && outerListTarget.endsWith(">") ->
+                        outerListTarget.removePrefix("List<").dropLast(1).trim()
+                    else -> null
+                }
+            val savedParseTarget = currentExpectedParseTargetType
+            val savedKind = currentExpectedNumericKind
+            val args =
+                try {
+                    if (elemTarget != null) {
+                        currentExpectedParseTargetType = elemTarget
+                        resolveNumericKind(elemTarget)?.let { currentExpectedNumericKind = it }
+                    }
+                    parseCommaSeparatedExprsFromTokens(tokens, indent, selfTypeName)
+                } finally {
+                    currentExpectedParseTargetType = savedParseTarget
+                    currentExpectedNumericKind = savedKind
+                }
             "mutableListOf(${args.joinToString(", ")})"
         }
         "assert", "debug_assert" -> {
@@ -1358,8 +1379,13 @@ internal fun KotlinJ2KEmitter.renderPrimitiveAssociatedConst(
                 }
             }
         }
-        if (prim.firstOrNull()?.isLowerCase() == true && (c == "MIN" || c == "MAX" || c == "BITS")) {
-            val kind = resolveNumericKind(rustTypeIdentToKotlin(prim))
+        val primKt = rustTypeIdentToKotlin(prim)
+        val isPrimitiveAliasOrLower =
+            prim.firstOrNull()?.isLowerCase() == true ||
+                primKt in inspector.typeAliasTargets ||
+                scopedAbiKeysForRenderedType(primKt).any { it in headerContext.crateNumericTypeKinds }
+        if (isPrimitiveAliasOrLower && primKt !in activeTypeParamNames && (c == "MIN" || c == "MAX" || c == "BITS")) {
+            val kind = resolveNumericKind(primKt)
             val mapped = resolvedPrimOwnerAndBits(kind)
             if (mapped != null) {
                 val (ktOwner, bitsStr) = mapped
@@ -1714,6 +1740,20 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
     }
 
     val isSingleSegment = (rawSegments.size == 1)
+    if (filtered.size >= 2 && !asCallee && filtered
+            .last()
+            .ident
+            .toString()
+            .removePrefix("r#") == "ZERO"
+    ) {
+        val ownerRaw = filtered[filtered.size - 2].ident.toString().removePrefix("r#")
+        val simdSpec = parseSimdLaneVectorSpec(ownerRaw, this)
+        if (simdSpec != null) {
+            registerSimdWrapperImport(this, simdSpec.wrapperName)
+            val zeroLit = simdZeroLiteralExpr(simdSpec.elemTy, simdSpec.elemKind, this)
+            return "${simdSpec.wrapperName}<${simdSpec.elemTy}>(List(${simdSpec.lanes}) { $zeroLit })"
+        }
+    }
     if (filtered.size == 2) {
         val ownerRaw = filtered[0].ident.toString()
         val memberRaw = filtered[1].ident.toString()
@@ -1742,16 +1782,47 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
         }
     }
     val parts =
-        filtered.mapIndexed { idx, seg ->
-            renderPathSegmentInExpr(
-                rawIdent = seg.ident.toString(),
-                arguments = seg.arguments,
-                selfTypeName = selfTypeName,
-                isLast = (idx == filtered.lastIndex),
-                isSingleSegment = isSingleSegment,
-                asCallee = asCallee,
-            )
+        filtered
+            .mapIndexed { idx, seg ->
+                renderPathSegmentInExpr(
+                    rawIdent = seg.ident.toString(),
+                    arguments = seg.arguments,
+                    selfTypeName = selfTypeName,
+                    isLast = (idx == filtered.lastIndex),
+                    isSingleSegment = isSingleSegment,
+                    asCallee = asCallee,
+                )
+            }.toMutableList()
+    if (parts.size >= 2 && filtered.size >= 2) {
+        val ownerIdx = parts.size - 2
+        val ownerRaw = filtered[ownerIdx].ident.toString().removePrefix("r#")
+        if (ownerRaw != "Self" && ownerRaw !in PRIMITIVE_TYPE_NAMES) {
+            val ownerKt = rustTypeIdentToKotlin(ownerRaw)
+            if (ownerKt in inspector.typeAliasTargets) {
+                val resolvedOwner = resolveTypeAliasOwnerName(ownerKt)
+                if (resolvedOwner != ownerKt &&
+                    (
+                        resolvedOwner in inspector.declaredTypeNames ||
+                            resolvedOwner in headerContext.crateSymbolSubpackages ||
+                            headerContext.externalCrateSymbolPackages.values.any { resolvedOwner in it }
+                    )
+                ) {
+                    if (resolvedOwner !in inspector.declaredTypeNames && resolvedOwner !in importedSimpleNameToPkg) {
+                        val sub = resolveBestSubpackageForSymbol(resolvedOwner)
+                        val ns = currentNamespacePrefix()
+                        if (sub != null && ns != null) {
+                            val pkg = if (sub.isEmpty()) ns else "$ns.$sub"
+                            if (pkg != headerContext.packageName) {
+                                importedSimpleNameToPkg[resolvedOwner] = pkg
+                                extraTypePathImports += "import $pkg.$resolvedOwner"
+                            }
+                        }
+                    }
+                    parts[ownerIdx] = resolvedOwner
+                }
+            }
         }
+    }
     if (!asCallee && parts.size >= 2) {
         val lastRaw = filtered.last().ident.toString()
         val prevRaw = filtered[filtered.size - 2].ident.toString()

@@ -71,7 +71,7 @@ class EnvieAndScalarLoweringTest {
         assertContains(kt, "cell.borrowMut().useMut")
         assertContains(kt, "public fun writeFmtUnit(f: StringBuilder)")
         assertContains(kt, "public fun writeFmtTagged(f: StringBuilder): Result<Unit, Unit>")
-        assertContains(kt, "Result.Ok(Unit)")
+        assertContains(kt, "Result.Ok<Unit, Unit>(Unit)")
     }
 
     @Test

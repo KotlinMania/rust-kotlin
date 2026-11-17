@@ -154,6 +154,7 @@ internal class CrateSymbolInspector(
     val unitStructNames: MutableSet<String> = linkedSetOf()
     val unionTypeNames: MutableSet<String> = linkedSetOf()
     val associatedTypeDecls: MutableMap<String, AssocTypeDecl> = linkedMapOf()
+    val ownerAssocTypes: MutableMap<String, MutableMap<String, SynType>> = linkedMapOf()
     val typeAliasTargets: MutableMap<String, SynType> = linkedMapOf()
     val declaredConstNames: MutableMap<String, String> = linkedMapOf()
     val declaredConstTypes: MutableMap<String, SynType> = linkedMapOf()
@@ -275,17 +276,26 @@ internal class CrateSymbolInspector(
         super.visitExprPath(e)
     }
 
+    private val attachableGenericsByName: MutableMap<String, Generics> = linkedMapOf()
+    private val pendingImplChecks: MutableList<Pair<Item.Impl, QuadImplConstSpec>> = mutableListOf()
+
     override fun visitFile(f: File) {
         if (blockDepth == 0) {
             for (item in f.items) {
                 if (itemHasDocOnlyCfg(item)) continue
-                if (item is Item.Mod) {
-                    val modRaw = item.ident.toString().removePrefix("r#")
-                    if (item.content is ModContent.Inline) {
-                        localInlineModuleNames += modRaw
-                    } else if (item.content == null) {
-                        localExternalModuleNames += modRaw
+                when (item) {
+                    is Item.Struct -> attachableGenericsByName[rustTypeIdentToKotlin(item.ident.toString())] = item.generics
+                    is Item.Enum -> attachableGenericsByName[rustTypeIdentToKotlin(item.ident.toString())] = item.generics
+                    is Item.Union -> attachableGenericsByName[rustTypeIdentToKotlin(item.ident.toString())] = item.generics
+                    is Item.Mod -> {
+                        val modRaw = item.ident.toString().removePrefix("r#")
+                        if (item.content is ModContent.Inline) {
+                            localInlineModuleNames += modRaw
+                        } else if (item.content == null) {
+                            localExternalModuleNames += modRaw
+                        }
                     }
+                    else -> {}
                 }
             }
         }
@@ -297,9 +307,32 @@ internal class CrateSymbolInspector(
                     collidingInlineForeignFnRenames[modRaw to rawFn] = rustFunctionIdentToKotlin("${modRaw}_$rawFn")
                 }
             }
-            for (spec in pendingImplMethodConsts) {
+            for ((implItem, spec) in pendingImplChecks) {
+                val ownerDeclGenerics = attachableGenericsByName[spec.ownerName]
+                val direct =
+                    spec.ownerName in attachableTypeNames &&
+                        (
+                            ownerDeclGenerics == null ||
+                                (
+                                    matchesInspectorDirectImplSelf(implItem.selfType, ownerDeclGenerics) &&
+                                        !(
+                                            implItem.traitPath != null &&
+                                                declaresExtraNonImplicitImplTraitBounds(implItem, ownerDeclGenerics) { path ->
+                                                    val raw =
+                                                        path.segments
+                                                            .last()
+                                                            ?.ident
+                                                            ?.toString()
+                                                            ?.removePrefix("r#") ?: return@declaresExtraNonImplicitImplTraitBounds false
+                                                    val kt = rustTypeIdentToKotlin(raw)
+                                                    (kt in RUST_STD_IMPLICIT_SUPERTRAITS && kt !in declaredTypeNames) ||
+                                                        (kt == "Error" && kt !in declaredTraitsByName)
+                                                }
+                                        )
+                                )
+                        )
                 val combinedConsts =
-                    if (spec.ownerName in attachableTypeNames) {
+                    if (direct) {
                         spec.fnConsts
                     } else {
                         (spec.implConsts + spec.fnConsts).distinct()
@@ -311,8 +344,19 @@ internal class CrateSymbolInspector(
                     }
                 }
             }
+            pendingImplMethodConsts.clear()
         }
     }
+
+    private fun matchesInspectorDirectImplSelf(selfTy: SynType, ownerDeclGenerics: Generics): Boolean =
+        when (val u = unwrapSynType(selfTy)) {
+            is SynType.Reference -> matchesInspectorDirectImplSelf(u.elem, ownerDeclGenerics)
+            is SynType.Path -> {
+                val seg = u.path.segments.last() ?: return true
+                matchesUnspecializedOwnerGenerics(seg.arguments, ownerDeclGenerics)
+            }
+            else -> true
+        }
 
     private data class QuadImplConstSpec(
         val ownerName: String,
@@ -844,6 +888,13 @@ internal class CrateSymbolInspector(
         for (implItem in i.items) {
             if (implItem is ImplItem.AssocType) {
                 val assocName = rustTypeIdentToKotlin(implItem.ident.toString())
+                if (ownerName != null) {
+                    val assocMap = ownerAssocTypes.getOrPut(ownerName) { linkedMapOf() }
+                    val assocKey = implItem.ident.toString()
+                    if (assocKey !in assocMap) {
+                        assocMap[assocKey] = implItem.ty
+                    }
+                }
                 val traitName =
                     i.traitPath
                         ?.path
@@ -881,7 +932,9 @@ internal class CrateSymbolInspector(
                 if (implItem.sig.inputs.firstOrNull() is FnArg.Receiver) {
                     instanceMethodsByType.getOrPut(ownerName) { linkedSetOf() }.add(fnKt)
                     if (fnConsts.isNotEmpty() || implConsts.isNotEmpty()) {
-                        pendingImplMethodConsts += QuadImplConstSpec(ownerName, fnKt, valueArity, fnConsts, implConsts)
+                        val spec = QuadImplConstSpec(ownerName, fnKt, valueArity, fnConsts, implConsts)
+                        pendingImplMethodConsts += spec
+                        pendingImplChecks += i to spec
                     }
                 } else {
                     companionMethodsByType.getOrPut(ownerName) { linkedSetOf() }.add(fnKt)

@@ -730,6 +730,21 @@ internal fun KotlinJ2KEmitter.renderStructFieldDefault(
     val cleanType = renderedType.trim()
     val unwrapped = unwrapPaddingSynType(fieldSynTy)
     if (unwrapped is SynType.Array) {
+        val useFinalAbiLayout = headerContext.rawAbiMode || headerContext.finalClasses
+        val usesErasedConstParam =
+            !useFinalAbiLayout &&
+                activeConstParamNames.isNotEmpty() &&
+                collectUsedRawIdentsInExpr(unwrapped.len).any {
+                    it in activeConstParamNames || rustValueIdentToKotlin(it) in activeConstParamNames
+                }
+        if (usesErasedConstParam) {
+            if (cleanType in PRIMITIVE_ARRAY_TYPES) {
+                return "$cleanType(0)"
+            }
+            if (cleanType.startsWith("List<") && cleanType.endsWith(">")) {
+                return "emptyList()"
+            }
+        }
         val rawLen = renderTypedNumericInitializer(unwrapped.len, NumericKind.I32, "", selfTypeName)
         val lenInt = normalizeArrayLengthToIntExpr(rawLen, unwrapped.len, selfTypeName)
         if (cleanType in PRIMITIVE_ARRAY_TYPES) {
@@ -765,7 +780,14 @@ internal fun KotlinJ2KEmitter.renderStructFieldDefaultOrNull(
         if (prefix in activeTypeParamNames || prefix == "Self") return null
     }
     val unwrapped = unwrapPaddingSynType(fieldSynTy)
-    if (unwrapped is SynType.Array && cleanType.startsWith("List<") && cleanType.endsWith(">")) {
+    val usesErasedConstParamArray =
+        unwrapped is SynType.Array &&
+            !(headerContext.rawAbiMode || headerContext.finalClasses) &&
+            activeConstParamNames.isNotEmpty() &&
+            collectUsedRawIdentsInExpr(unwrapped.len).any {
+                it in activeConstParamNames || rustValueIdentToKotlin(it) in activeConstParamNames
+            }
+    if (unwrapped is SynType.Array && !usesErasedConstParamArray && cleanType.startsWith("List<") && cleanType.endsWith(">")) {
         val elemTy = cleanType.removePrefix("List<").removeSuffix(">").trim()
         val unwrappedElem = unwrapSynType(unwrapped.elem)
         val isFnPtrArray =

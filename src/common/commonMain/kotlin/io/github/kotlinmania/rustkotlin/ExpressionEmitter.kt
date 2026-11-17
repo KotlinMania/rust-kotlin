@@ -153,10 +153,9 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                                 ""
                             }
                         }.orEmpty()
-                val isUntypedCf = exprBase != "ControlFlow"
-                val starArgs = if (isUntypedCf) "<*, *>" else ""
+                val isUntypedCf = exprInferredTy != null && exprBase != "ControlFlow"
                 val elseArm = if (isUntypedCf) "; else -> error(\"Unexpected ControlFlow variant: \$tryResult\")" else ""
-                "when (val tryResult = $inner) { is ControlFlow.Continue$starArgs -> tryResult.value; is ControlFlow.Break$starArgs -> $retKw ControlFlow.Break$cfBreakTypeArgs(tryResult.value)$elseArm }"
+                "when (val tryResult = $inner) { is ControlFlow.Continue<*, *> -> tryResult.value; is ControlFlow.Break<*, *> -> $retKw ControlFlow.Break$cfBreakTypeArgs(tryResult.value)$elseArm }"
             } else if (enclosingRet != null &&
                 enclosingRet.endsWith("?") &&
                 !enclosingRet.startsWith("Result<") &&
@@ -286,18 +285,68 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
         is Expr.Struct -> renderExprStruct(expr, indent, selfTypeName)
         is Expr.Assign -> renderExprAssign(expr, indent, selfTypeName)
         is Expr.Range -> {
-            val start = expr.start?.let { renderExpr(it, indent, selfTypeName) }
-            val end = expr.end?.let { renderExpr(it, indent, selfTypeName) }
-            val op =
-                when (expr.limits) {
-                    is RangeLimits.HalfOpen -> " until "
-                    is RangeLimits.Closed -> ".."
+            val expectedRangeTarget =
+                (currentExpectedParseTargetType ?: currentEnclosingReturnRenderedType)
+                    ?.removeSuffix("?")
+                    ?.trim()
+            val rangeBase = expectedRangeTarget?.substringBefore('<')?.substringAfterLast('.')?.trim()
+            val exprStart = expr.start
+            val exprEnd = expr.end
+            if (expr.limits is RangeLimits.Closed &&
+                rangeBase == "RangeInclusive" &&
+                '<' in expectedRangeTarget &&
+                expectedRangeTarget.endsWith('>') &&
+                exprStart != null &&
+                exprEnd != null
+            ) {
+                val elemTy = expectedRangeTarget.substringAfter('<').dropLast(1).trim()
+                val elemKind = resolveNumericKind(elemTy)
+                val savedKind = currentExpectedNumericKind
+                val savedParseTarget = currentExpectedParseTargetType
+                fun renderRangeBound(boundExpr: Expr): String {
+                    if (elemKind == null) return renderExpr(boundExpr, indent, selfTypeName)
+                    val renderedBound = renderTypedNumericInitializer(boundExpr, elemKind, indent, selfTypeName)
+                    val expectedSuffix = NUMERIC_COERCE_SUFFIX_BY_KIND[elemKind]
+                    val alreadyConverted =
+                        expectedSuffix == null ||
+                            elemKind !in NARROW_INTEGER_KINDS ||
+                            renderedBound.endsWith(".$expectedSuffix")
+                    return if (!alreadyConverted && inferExprNumericKind(boundExpr, selfTypeName) != elemKind) {
+                        coerceRenderedNumericExpr(boundExpr, renderedBound, elemKind)
+                    } else {
+                        renderedBound
+                    }
                 }
-            when {
-                start != null && end != null -> "$start$op$end"
-                start != null -> "$start${op}Int.MAX_VALUE"
-                end != null -> "0$op$end"
-                else -> "0 until 0"
+                val (startRendered, endRendered) =
+                    try {
+                        currentExpectedNumericKind = elemKind
+                        currentExpectedParseTargetType = elemTy
+                        renderRangeBound(exprStart) to renderRangeBound(exprEnd)
+                    } finally {
+                        currentExpectedNumericKind = savedKind
+                        currentExpectedParseTargetType = savedParseTarget
+                    }
+                if ("RangeInclusive" !in inspector.declaredTypeNames &&
+                    ("core" in headerContext.crateNamespaces || headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true)
+                ) {
+                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ops.range.RangeInclusive")
+                }
+                "RangeInclusive($startRendered, $endRendered, false)"
+            } else {
+                val start = exprStart?.let { renderExpr(it, indent, selfTypeName) }
+                val end = exprEnd?.let { renderExpr(it, indent, selfTypeName) }
+                val op =
+                    when (expr.limits) {
+                        is RangeLimits.HalfOpen -> " until "
+                        is RangeLimits.Closed -> ".."
+                    }
+                when {
+                    start != null && end != null -> "$start$op$end"
+                    start != null -> "$start${op}Int.MAX_VALUE"
+                    end != null -> "0$op$end"
+                    else -> "0 until 0"
+                }
             }
         }
         is Expr.Closure -> renderExprClosure(expr, indent, selfTypeName)
@@ -325,7 +374,16 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
             val retNumKind = currentEnclosingReturnRenderedType?.let(this::resolveNumericKind)
             val valExpr =
                 expr.expr?.let { retArg ->
-                    val rawRendered = renderTypedNumericInitializer(retArg, retNumKind, indent, selfTypeName)
+                    val savedRetTarget = currentExpectedParseTargetType
+                    if (unwrapParenOrGroupExpr(retArg) is Expr.Macro && currentExpectedParseTargetType == null) {
+                        currentExpectedParseTargetType = currentEnclosingReturnRenderedType
+                    }
+                    val rawRendered =
+                        try {
+                            renderTypedNumericInitializer(retArg, retNumKind, indent, selfTypeName)
+                        } finally {
+                            currentExpectedParseTargetType = savedRetTarget
+                        }
                     coerceTailFmtUnitToResultOk(retArg, rawRendered, selfTypeName)
                 }
             val retKw = currentClosureLabel?.let { "return@$it" } ?: "return"

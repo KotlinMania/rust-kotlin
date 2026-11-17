@@ -999,9 +999,13 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                         ?: "io.github.kotlinmania.rustlang.std".takeIf {
                             headerContext.packageName?.startsWith(it) == true
                         }
+                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
                 val ioErr =
-                    if (stdNs != null) {
-                        bindOrQualifyResolvedCrossSymbol("$stdNs.io.error.Error")
+                    if (stdNs != null ||
+                        "core" in headerContext.crateNamespaces ||
+                        headerContext.packageName?.startsWith("$coreNs.") == true
+                    ) {
+                        bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.Error")
                     } else {
                         "Error"
                     }
@@ -1356,8 +1360,15 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                     }
                 val rawSegNames = rawSegments.map { it.ident.toString().removePrefix("r#") }
                 val explicitArgs = filteredArgs.mapNotNull { renderGenericArgument(it, selfTypeName) }
+                val explicitAssocNames =
+                    rawArgList
+                        .filterIsInstance<GenericArgument.AssocTypeArg>()
+                        .mapTo(hashSetOf()) { rustTypeIdentToKotlin(it.assoc.ident.toString()) }
                 val defaultedArgs = appendStdlibDefaultTypeArgsIfNeeded(mappedBase, rawName, rawSegNames, explicitArgs, selfTypeName)
-                val typeArgs = defaultedArgs + sourceAssociatedArguments(path, selfTypeName)
+                val lookupAssocs =
+                    lookupTraitDefaultlessAssocTypes(ktBaseIdent, path)
+                        .filter { it in currentTraitAssocParamNames && it !in explicitAssocNames && it !in explicitArgs }
+                val typeArgs = defaultedArgs + lookupAssocs + sourceAssociatedArguments(path, selfTypeName)
                 if (typeArgs.isEmpty()) mappedBase else "$mappedBase<${typeArgs.joinToString(", ")}>"
             }
         }

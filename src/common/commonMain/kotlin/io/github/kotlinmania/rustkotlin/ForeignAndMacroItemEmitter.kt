@@ -48,6 +48,15 @@ internal fun KotlinJ2KEmitter.isImportedTypeLeaf(lastSeg: String, boundRawAlias:
         return false
     }
     if (effectiveBound in inspector.referencedUnqualifiedTypeIdents) return true
+    if (boundRawAlias == null &&
+        effectiveBound.firstOrNull()?.isLowerCase() == true &&
+        (
+            effectiveBoundModKt in headerContext.crateSubpackageRawLeafNames ||
+                effectiveBound in headerContext.crateSubpackageRawLeafNames.values
+        )
+    ) {
+        return false
+    }
     if (boundRawAlias != null && boundRawAlias.first().isUpperCase() && boundRawAlias.any(Char::isLowerCase)) {
         return true
     }
@@ -105,7 +114,14 @@ internal fun KotlinJ2KEmitter.registerUseItemInScope(item: Item.Use) {
         val boundRawName = leaf.alias ?: lastSeg
         val importedAsType = isImportedTypeLeaf(lastSeg, leaf.alias, leaf.isSelfImport)
         val importedAsConst = !importedAsType && isImportedScreamingConstLeaf(lastSeg, leaf.alias, leaf.isSelfImport)
-        val importedPath = resolveKotlinImportPath(leaf.segments, leaf.alias, leaf.isSelfImport) ?: leaf.segments.joinToString(".")
+        val libcNs = FfiInteropCollector.resolveLibcNamespace(headerContext)
+        val normalizedLeafSegs =
+            if (libcNs != null && leaf.segments.firstOrNull()?.removePrefix("r#") == "netc") {
+                listOf("libc") + leaf.segments.drop(1)
+            } else {
+                leaf.segments
+            }
+        val importedPath = resolveKotlinImportPath(normalizedLeafSegs, leaf.alias, leaf.isSelfImport) ?: normalizedLeafSegs.joinToString(".")
         val isKnownSubpkgModule = isResolvedCrateSubpackageModule(importedPath, lastSeg)
         val isStdlibUnloweredModule =
             !leaf.isSelfImport &&
@@ -937,8 +953,16 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
     isSelfImport: Boolean = false,
     forceTypeLeaf: Boolean = false,
 ): String? {
-    val segs = rewriteCrateRootAliasAndReexportSegments(rawSegsInput)
-    if (segs.isEmpty()) return null
+    val rewrittenSegs = rewriteCrateRootAliasAndReexportSegments(rawSegsInput)
+    if (rewrittenSegs.isEmpty()) return null
+    val segs =
+        if (rewrittenSegs.first().removePrefix("r#") == "netc" &&
+            FfiInteropCollector.resolveLibcNamespace(headerContext) != null
+        ) {
+            listOf("libc") + rewrittenSegs.drop(1)
+        } else {
+            rewrittenSegs
+        }
     val root = segs.first()
     if (root in PRIMITIVE_TYPE_NAMES) return null
     // A same-file type or an imported type's members retain type casing.
@@ -1210,6 +1234,24 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
     if (root in IGNORED_USE_ROOTS) return null
     if (root in STDLIB_CRATE_ROOTS && segs.getOrNull(1) in STDLIB_MACRO_OR_PRIMITIVE_MODULES) {
         return null
+    }
+    val cleanSegsEarly = segs.map { it.removePrefix("r#") }
+    if (!isSelfImport &&
+        !headerContext.rawAbiMode &&
+        cleanSegsEarly.size == 2 &&
+        cleanSegsEarly[0] == "libc" &&
+        cleanSegsEarly[1] in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS
+    ) {
+        resolveStdlibFfiSymbolImport(cleanSegsEarly[1])?.let { return it }
+    }
+    if (!isSelfImport &&
+        cleanSegsEarly.size == 3 &&
+        cleanSegsEarly[0] in setOf("core", "std") &&
+        cleanSegsEarly[1] == "intrinsics" &&
+        cleanSegsEarly[2] in
+        setOf("transmute", "transmute_unchecked", "size_of", "size_of_val", "align_of", "align_of_val", "needs_drop", "forget")
+    ) {
+        return "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.mem.${rustFunctionIdentToKotlin(cleanSegsEarly[2])}"
     }
     if (root == "libc" && FfiInteropCollector.resolveLibcNamespace(headerContext) == null) {
         return null

@@ -720,10 +720,14 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
                                 ?: headerContext.crateFnReturnTypes[ktFn]
                         }
                     } else {
-                        val ktFn = rustFunctionIdentToKotlin(raw)
-                        renderTopLevelFnRet(ktFn, raw)
-                            ?: scopedAbiKeysForRenderedType(ktFn).firstNotNullOfOrNull { headerContext.crateFnReturnTypes[it] }
-                            ?: headerContext.crateFnReturnTypes[ktFn]
+                        val localKt = scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
+                        extractCallableReturnRenderedType(currentTypedLocals[localKt])
+                            ?: run {
+                                val ktFn = rustFunctionIdentToKotlin(raw)
+                                renderTopLevelFnRet(ktFn, raw)
+                                    ?: scopedAbiKeysForRenderedType(ktFn).firstNotNullOfOrNull { headerContext.crateFnReturnTypes[it] }
+                                    ?: headerContext.crateFnReturnTypes[ktFn]
+                            }
                     }
                 }
                 segs.size >= 2 -> {
@@ -1958,6 +1962,46 @@ internal fun KotlinJ2KEmitter.primitiveArrayTypeForElementRenderedType(elemTy: S
         "Double" -> "DoubleArray"
         else -> null
     }
+
+private fun extractCallableReturnRenderedType(renderedCallableType: String?): String? {
+    val raw = renderedCallableType?.trim() ?: return null
+    val unwrapped =
+        if (raw.startsWith('(') && raw.endsWith(")?") && " -> " in raw) {
+            raw.substring(1, raw.length - 2).trim()
+        } else {
+            raw
+        }
+    if (unwrapped.startsWith('(')) {
+        var parenDepth = 0
+        var angleDepth = 0
+        for (idx in unwrapped.indices) {
+            when (unwrapped[idx]) {
+                '(' -> parenDepth++
+                ')' -> {
+                    parenDepth--
+                    if (parenDepth == 0 && angleDepth == 0) {
+                        val afterParen = unwrapped.substring(idx + 1).trimStart()
+                        if (afterParen.startsWith("->")) {
+                            return afterParen.removePrefix("->").trim().takeIf { it.isNotEmpty() }
+                        }
+                        return null
+                    }
+                }
+                '<' -> angleDepth++
+                '>' -> if (angleDepth > 0) angleDepth--
+            }
+        }
+    }
+    val base = unwrapped.substringBefore('<').substringAfterLast('.').trim()
+    if (base in setOf("Fn", "FnMut", "FnOnce") && '<' in unwrapped && unwrapped.endsWith('>')) {
+        val argsInner = unwrapped.substringAfter('<').dropLast(1)
+        val comma = findTopLevelGenericCommaIndex(argsInner)
+        if (comma >= 0) {
+            return argsInner.substring(comma + 1).trim().takeIf { it.isNotEmpty() }
+        }
+    }
+    return null
+}
 
 internal fun KotlinJ2KEmitter.inferExplicitArrayElementRenderedType(
     elem: Expr,

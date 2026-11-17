@@ -55,6 +55,7 @@ internal data class CrateRawAbiMetadata(
     val traitSupertraits: Map<String, List<String>> = emptyMap(),
     val traitAstRegistryKey: String? = null,
     val fnConstParamNames: Map<String, Pair<Int, List<String>>> = emptyMap(),
+    val enumVariantTypeArity: Map<String, Int> = emptyMap(),
 )
 
 internal data class ExternalCrateAbiMetadata(
@@ -393,6 +394,7 @@ private fun scanSourcesWithActiveSession(
     val traitSupertraitBindings = linkedMapOf<String, List<Pair<String, Set<String>>>>()
     val traitResultMethods = linkedMapOf<String, List<String>>()
     val fnConstParamNames = linkedMapOf<String, Pair<Int, List<String>>>()
+    val enumVariantTypeArity = linkedMapOf<String, Int>()
 
     fun registerFnConstParams(
         subpkg: String,
@@ -558,6 +560,7 @@ private fun scanSourcesWithActiveSession(
             traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
             traitResultMethods = traitResultMethods,
             registerFnConstParams = ::registerFnConstParams,
+            enumVariantTypeArity = enumVariantTypeArity,
         )
     }
 
@@ -1128,6 +1131,7 @@ private fun scanSourcesWithActiveSession(
         traitSupertraits = traitSupertraits,
         traitAstRegistryKey = traitRegistryKey,
         fnConstParamNames = fnConstParamNames,
+        enumVariantTypeArity = enumVariantTypeArity,
     )
 }
 
