@@ -754,6 +754,12 @@ private val UNSIGNED_ARRAY_IDENTS =
         "ulongArrayOf",
     )
 
+internal class EmitterFnLookupIndex(
+    val sharedModFile: File?,
+    val fnsByName: Map<String, List<Item.Fn>>,
+    val foreignFnsByName: Map<String, List<ForeignItem.Fn>>,
+)
+
 internal class KotlinJ2KEmitter(
     internal val source: String,
     internal val originalFile: File,
@@ -973,6 +979,7 @@ internal class KotlinJ2KEmitter(
     internal val computedStructLayoutCache: MutableMap<String, ComputedStructLayout?> = linkedMapOf()
     internal val requiredTypeLayoutParamsCache: MutableMap<String, List<Pair<String, String>>> = linkedMapOf()
     internal val inferExprRenderedTypeCache: MutableMap<InferExprCacheKey, String?> = hashMapOf()
+    internal var cachedFnLookupIndex: EmitterFnLookupIndex? = null
     internal val activeCfgProfile: CfgTargetProfile
         get() = headerContext.cfgTargetProfile ?: TranslationSession.cfgTargetProfile
 

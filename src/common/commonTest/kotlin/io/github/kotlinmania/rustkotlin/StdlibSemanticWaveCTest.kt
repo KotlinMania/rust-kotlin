@@ -1683,4 +1683,175 @@ class StdlibSemanticWaveCTest {
         assertContains(bitOpsOut, "public infix fun or(rhs: Rhs): Output = bitor(rhs)")
         assertContains(bitOpsOut, "public infix fun xor(rhs: Rhs): Output = bitxor(rhs)")
     }
+
+    @Test
+    fun waveC11ManagedStructGateSlicePtrDistanceResourceCleanerAndAutoCloseableDrop() {
+        val plainManagedSrc =
+            """
+            pub struct ManagedPair {
+                pub x: i32,
+                pub y: i32,
+            }
+
+            #[repr(transparent)]
+            pub struct ManagedTransparent(u64);
+
+            pub fn slice_span(whole: &[u8], sub: &[u8]) -> usize {
+                (sub.as_ptr() as usize) - (whole.as_ptr() as usize)
+            }
+
+            pub fn slice_checked_span(whole: &[u8], sub: &[u8]) -> Option<usize> {
+                (sub.as_ptr() as usize).checked_sub(whole.as_ptr() as usize)
+            }
+            """.trimIndent()
+        val plainManagedOut = translateRustSourceToKotlin(recognizeRust(plainManagedSrc))
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(plainManagedOut, "WaveC11Managed.kt")
+        assertFalse(plainManagedOut.contains("fun typeLayout("), plainManagedOut)
+        assertFalse(plainManagedOut.contains("fieldStorage"), plainManagedOut)
+        assertFalse(plainManagedOut.contains(".asPtr()"), plainManagedOut)
+
+        val ffiLayoutSrc =
+            """
+            #[repr(C)]
+            pub struct NativeHeader {
+                pub magic: u32,
+                pub len: u32,
+            }
+
+            #[repr(transparent)]
+            pub struct RawHandle(pub u64);
+
+            unsafe extern "C" {
+                fn take_header(ptr: *const NativeHeader) -> RawHandle;
+            }
+            """.trimIndent()
+        val ffiLayoutOut = translateRustSourceToKotlin(recognizeRust(ffiLayoutSrc))
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(ffiLayoutOut, "WaveC11FfiHeader.kt")
+        assertContains(ffiLayoutOut, "fun typeLayout(")
+        assertContains(ffiLayoutOut, "fieldStorage: MutPtr")
+
+        val dropTraitSrc =
+            """
+            pub trait Drop {
+                fn drop(&mut self);
+            }
+            """.trimIndent()
+        val dropTraitOut =
+            translateRustSourceToKotlin(
+                recognizeRust(dropTraitSrc),
+                headerContext =
+                    FileHeaderContext(
+                        packageName = "io.github.kotlinmania.rustlang.core.ops.drop",
+                        projectNamespace = "io.github.kotlinmania.rustlang.core",
+                        crateNamespaces = mapOf("core" to "io.github.kotlinmania.rustlang.core"),
+                    ),
+            )
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(dropTraitOut, "WaveC11Drop.kt")
+        assertContains(dropTraitOut, "public interface Drop : AutoCloseable")
+        assertContains(dropTraitOut, "public override fun close(): Unit = drop()")
+
+        val memFnSrc =
+            """
+            pub const fn drop<T>(_x: T) {}
+            pub const fn forget<T>(_t: T) {}
+            """.trimIndent()
+        val memFnOut =
+            translateRustSourceToKotlin(
+                recognizeRust(memFnSrc),
+                headerContext =
+                    FileHeaderContext(
+                        packageName = "io.github.kotlinmania.rustlang.core.mem",
+                        projectNamespace = "io.github.kotlinmania.rustlang.core",
+                        crateNamespaces = mapOf("core" to "io.github.kotlinmania.rustlang.core"),
+                    ),
+            )
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(memFnOut, "WaveC11Mem.kt")
+        assertContains(memFnOut, "if (x is AutoCloseable) x.close()")
+        assertContains(memFnOut, "if (t is KmForgettableResource) t.disarmCleaner()")
+
+        val ownedVecSrc =
+            """
+            pub struct RawVec<T> {
+                pub cap: usize,
+                marker: core::marker::PhantomData<T>,
+            }
+
+            pub struct MyVec<T> {
+                pub buf: RawVec<T>,
+                pub len: usize,
+            }
+
+            impl<T> Drop for MyVec<T> {
+                fn drop(&mut self) {
+                    self.len = 0;
+                }
+            }
+            """.trimIndent()
+        val ownedVecOut =
+            translateRustSourceToKotlin(
+                recognizeRust(ownedVecSrc),
+                headerContext =
+                    FileHeaderContext(
+                        packageName = "io.github.kotlinmania.rustlang.alloc.vec",
+                        projectNamespace = "io.github.kotlinmania.rustlang.alloc",
+                        crateNamespaces =
+                            mapOf(
+                                "core" to "io.github.kotlinmania.rustlang.core",
+                                "alloc" to "io.github.kotlinmania.rustlang.alloc",
+                            ),
+                    ),
+            )
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(ownedVecOut, "WaveC11MyVec.kt")
+        assertContains(ownedVecOut, "public open class MyVec<T>")
+        assertContains(ownedVecOut, ": AutoCloseable")
+        assertContains(ownedVecOut, "override fun close() {\n        this.drop()\n    }")
+        assertContains(ownedVecOut, "this.buf.close()")
+
+        val expectBridge = CoreIntrinsicFfiArtifacts.renderKmCoreIntrinsicsExpectKotlin("demo.core")
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(expectBridge, "KmCoreIntrinsicsExpect.kt")
+        assertContains(expectBridge, "public interface KmForgettableResource : AutoCloseable")
+        assertContains(expectBridge, "public fun disarmCleaner()")
+        assertContains(expectBridge, "public expect class KmResourceCleaner internal constructor() : KmForgettableResource")
+        assertContains(expectBridge, "public expect fun kmRegisterResourceCleaner(owner: Any, cleanup: () -> Unit): KmResourceCleaner")
+
+        val nativeBridge = CoreIntrinsicFfiArtifacts.renderKmCoreNativeActualsKotlin("demo.core", "demo.cinterop")
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(nativeBridge, "KmCoreNativeActuals.kt")
+        assertContains(nativeBridge, "ExperimentalNativeApi::class")
+        assertContains(nativeBridge, "kotlin.native.ref.createCleaner")
+        assertContains(nativeBridge, "public actual class KmResourceCleaner")
+        assertContains(nativeBridge, "public actual override fun disarmCleaner(): Unit = disarm()")
+
+        val jvmBridge = CoreIntrinsicFfiArtifacts.renderKmCoreJvmActualsKotlin("demo.core", "DemoJni")
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(jvmBridge, "KmCoreJvmActuals.kt")
+        assertContains(jvmBridge, "java.lang.ref.PhantomReference")
+        assertContains(jvmBridge, "java.util.concurrent.ConcurrentHashMap")
+        assertContains(jvmBridge, "public actual override fun disarmCleaner(): Unit = disarm()")
+        assertFalse(jvmBridge.contains("java.lang.ref.Cleaner"), jvmBridge)
+
+        val androidBridge = CoreIntrinsicFfiArtifacts.renderKmCoreAndroidActualsKotlin("demo.core", "DemoJni")
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(androidBridge, "KmCoreAndroidActuals.kt")
+        assertContains(androidBridge, "java.lang.ref.PhantomReference")
+        assertContains(androidBridge, "public actual override fun disarmCleaner(): Unit = disarm()")
+        assertFalse(androidBridge.contains("java.lang.ref.Cleaner"), androidBridge)
+
+        val jsBridge = CoreIntrinsicFfiArtifacts.renderKmCoreJsActualsKotlin("demo.core")
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(jsBridge, "KmCoreJsActuals.kt")
+        assertContains(jsBridge, "KmJsFinalizationRegistry")
+        assertContains(jsBridge, "public actual class KmResourceCleaner")
+        assertContains(jsBridge, "public actual override fun disarmCleaner(): Unit = disarm()")
+
+        val wasmJsBridge = CoreIntrinsicFfiArtifacts.renderKmCoreWasmJsActualsKotlin("demo.core")
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(wasmJsBridge, "KmCoreWasmJsActuals.kt")
+        assertContains(wasmJsBridge, "FinalizationRegistry")
+        assertContains(wasmJsBridge, "toJsReference()")
+        assertContains(wasmJsBridge, "KmWasmCleanToken")
+        assertContains(wasmJsBridge, "public actual override fun disarmCleaner(): Unit = disarm()")
+        assertFalse(wasmJsBridge.contains("import kotlin.js.JsAny"), wasmJsBridge)
+
+        val wasmWasiBridge = CoreIntrinsicFfiArtifacts.renderKmCoreWasmWasiActualsKotlin("demo.core")
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(wasmWasiBridge, "KmCoreWasmWasiActuals.kt")
+        assertContains(wasmWasiBridge, "KmWasmWasiCleanState")
+        assertContains(wasmWasiBridge, "public actual class KmResourceCleaner")
+        assertContains(wasmWasiBridge, "public actual override fun disarmCleaner(): Unit = disarm()")
+    }
 }

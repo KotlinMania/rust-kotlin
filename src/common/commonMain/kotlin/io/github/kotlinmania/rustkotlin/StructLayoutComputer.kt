@@ -193,12 +193,25 @@ public object StructLayoutComputer {
             "DoubleArray",
         )
 
+    internal fun shouldEmitStructTypeLayout(
+        item: Item.Struct,
+        emitter: KotlinJ2KEmitter,
+    ): Boolean {
+        val repr = parseStructRepr(item.attrs)
+        return repr.isReprC ||
+            repr.packedAlign != null ||
+            emitter.hasReprSimdAttr(item.attrs) ||
+            emitter.headerContext.finalClasses ||
+            emitter.sameFileLayoutIndex().hasRawMemoryOrFfiUsage
+    }
+
     private fun computeStructLayoutUncached(
         item: Item.Struct,
         structKtName: String,
         emitter: KotlinJ2KEmitter,
         visiting: Set<String>,
     ): ComputedStructLayout? {
+        if (!shouldEmitStructTypeLayout(item, emitter)) return null
         val repr = parseStructRepr(item.attrs)
         val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
         val memPkg = "$coreNs.mem"

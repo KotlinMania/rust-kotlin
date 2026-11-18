@@ -1836,6 +1836,56 @@ internal fun KotlinJ2KEmitter.resolveMethodSignatureForOwner(
     return null
 }
 
+internal fun KotlinJ2KEmitter.getFnLookupIndex(): EmitterFnLookupIndex {
+    val sharedMod = TranslationSession.sharedModuleFile
+    val existing = cachedFnLookupIndex
+    if (existing != null && existing.sharedModFile === sharedMod) {
+        return existing
+    }
+    val fnsByName = hashMapOf<String, MutableList<Item.Fn>>()
+    val foreignFnsByName = hashMapOf<String, MutableList<ForeignItem.Fn>>()
+    fun scanItems(items: List<Item>) {
+        for (item in items) {
+            if (item is Item.Fn && !itemHasDocOnlyCfg(item)) {
+                val cleanDecl =
+                    item.sig.ident
+                        .toString()
+                        .removePrefix("r#")
+                val ktDecl = rustFunctionIdentToKotlin(cleanDecl)
+                fnsByName.getOrPut(cleanDecl) { mutableListOf() }.add(item)
+                if (ktDecl != cleanDecl) {
+                    fnsByName.getOrPut(ktDecl) { mutableListOf() }.add(item)
+                }
+            } else if (item is Item.ForeignMod && !itemHasDocOnlyCfg(item)) {
+                for (foreign in item.items) {
+                    if (foreign is ForeignItem.Fn && !foreignItemHasDocOnlyCfg(foreign)) {
+                        val cleanDecl =
+                            foreign.sig.ident
+                                .toString()
+                                .removePrefix("r#")
+                        val ktDecl = rustFunctionIdentToKotlin(cleanDecl)
+                        foreignFnsByName.getOrPut(cleanDecl) { mutableListOf() }.add(foreign)
+                        if (ktDecl != cleanDecl) {
+                            foreignFnsByName.getOrPut(ktDecl) { mutableListOf() }.add(foreign)
+                        }
+                        val renamed = inspector.collidingTopLevelForeignFnRenames[cleanDecl]
+                        if (renamed != null && renamed != cleanDecl && renamed != ktDecl) {
+                            foreignFnsByName.getOrPut(renamed) { mutableListOf() }.add(foreign)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    sharedMod?.items?.let { scanItems(it) }
+    if (sharedMod !== file) {
+        scanItems(file.items)
+    }
+    return EmitterFnLookupIndex(sharedMod, fnsByName, foreignFnsByName).also {
+        cachedFnLookupIndex = it
+    }
+}
+
 internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
     calleeExpr: Expr,
     argIdx: Int,
@@ -1859,14 +1909,6 @@ internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
                 .ident
                 .toString()
                 .removePrefix("r#")
-        val allFnItems =
-            buildList {
-                addAll(activeLocalBlockItems)
-                TranslationSession.sharedModuleFile?.items?.let { addAll(it) }
-                if (TranslationSession.sharedModuleFile !== file) {
-                    addAll(file.items)
-                }
-            }
         val preferLocalForeign = rawCalleeIdent in activeLocalForeignFnRenames
         fun matchesFnIdent(rawDeclIdent: String, ktCallee: String, isForeign: Boolean): Boolean {
             val cleanDecl = rawDeclIdent.removePrefix("r#")
@@ -1883,7 +1925,7 @@ internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
             }
             return false
         }
-        for (item in allFnItems) {
+        for (item in activeLocalBlockItems) {
             if (!preferLocalForeign && item is Item.Fn && !itemHasDocOnlyCfg(item) && matchesFnIdent(item.sig.ident.toString(), methodKt, isForeign = false)) {
                 val typedParams =
                     item.sig.inputs
@@ -1906,8 +1948,49 @@ internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
                 }
             }
         }
+        val fnIndex = getFnLookupIndex()
+        fun lookupIndexedFn(): SynType? {
+            val candidates =
+                fnIndex.fnsByName[rawCalleeIdent]
+                    ?: fnIndex.fnsByName[methodKt]
+                    ?: return null
+            for (item in candidates) {
+                val typedParams =
+                    item.sig.inputs
+                        .toList()
+                        .filterIsInstance<FnArg.Typed>()
+                typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
+            }
+            return null
+        }
+        fun lookupIndexedForeignFn(): SynType? {
+            val candidates =
+                fnIndex.foreignFnsByName[rawCalleeIdent]
+                    ?: fnIndex.foreignFnsByName[methodKt]
+                    ?: currentModPathPrefix.lastOrNull()?.let { modRaw ->
+                        inspector.collidingInlineForeignFnRenames.entries
+                            .firstOrNull { (k, v) -> k.first == modRaw && v == methodKt }
+                            ?.key
+                            ?.second
+                            ?.let { fnIndex.foreignFnsByName[it] }
+                    }
+                    ?: activeLocalForeignFnRenames.entries
+                        .firstOrNull { it.value == methodKt }
+                        ?.key
+                        ?.let { fnIndex.foreignFnsByName[it] }
+                    ?: return null
+            for (foreign in candidates) {
+                val typedParams =
+                    foreign.sig.inputs
+                        .toList()
+                        .filterIsInstance<FnArg.Typed>()
+                typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
+            }
+            return null
+        }
         if (preferLocalForeign) {
-            for (item in allFnItems) {
+            lookupIndexedForeignFn()?.let { return it }
+            for (item in activeLocalBlockItems) {
                 if (item is Item.Fn && !itemHasDocOnlyCfg(item) && matchesFnIdent(item.sig.ident.toString(), methodKt, isForeign = false)) {
                     val typedParams =
                         item.sig.inputs
@@ -1916,8 +1999,10 @@ internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
                     typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
                 }
             }
+            return lookupIndexedFn()
         }
-        return null
+        lookupIndexedFn()?.let { return it }
+        return lookupIndexedForeignFn()
     }
     val penultRaw = segs[segs.size - 2].ident.toString().removePrefix("r#")
     val ownerKt =
@@ -2056,22 +2141,13 @@ internal fun KotlinJ2KEmitter.calleeExpectsMutableListSliceParam(calleeBase: Str
     val simpleFn = calleeBase.substringAfterLast('.').trim()
     val ownerPrefix = calleeBase.substringBeforeLast('.', missingDelimiterValue = "").substringAfterLast('.').trim()
     if (ownerPrefix.isEmpty()) {
-        val allFnItems =
-            buildList {
-                TranslationSession.sharedModuleFile?.items?.let { addAll(it) }
-                if (TranslationSession.sharedModuleFile !== file) {
-                    addAll(file.items)
-                }
-            }
-        for (item in allFnItems) {
-            if (item is Item.Fn && !itemHasDocOnlyCfg(item) && rustFunctionIdentToKotlin(item.sig.ident.toString()) == simpleFn) {
-                val typedParams =
-                    item.sig.inputs
-                        .toList()
-                        .filterIsInstance<FnArg.Typed>()
-                val param = typedParams.getOrNull(argIdx) ?: continue
-                if (isMutSliceSynType(param.patType.ty)) return true
-            }
+        for (item in getFnLookupIndex().fnsByName[simpleFn].orEmpty()) {
+            val typedParams =
+                item.sig.inputs
+                    .toList()
+                    .filterIsInstance<FnArg.Typed>()
+            val param = typedParams.getOrNull(argIdx) ?: continue
+            if (isMutSliceSynType(param.patType.ty)) return true
         }
         return false
     }

@@ -56,6 +56,9 @@ internal fun KotlinJ2KEmitter.renderExprBinary(expr: Expr.Binary, indent: String
     ) {
         return renderSourceEquality(expr.left, expr.right, expr.op is BinOp.Ne, indent, selfTypeName)
     }
+    if (expr.op is BinOp.Sub) {
+        tryRenderManagedSlicePointerDistance(expr.left, expr.right, "sub", indent, selfTypeName)?.let { return it }
+    }
     val leftPointer = rawPointerPointeeType(inferExprRenderedType(expr.left, selfTypeName))
     val rightPointer = rawPointerPointeeType(inferExprRenderedType(expr.right, selfTypeName))
     val pointerComparison =

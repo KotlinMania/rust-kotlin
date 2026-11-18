@@ -149,12 +149,25 @@ public fun kmInternWideStr(literal: String): ConstPtr {
     internedWideStrPool[literal] = addr
     return ConstPtr(addr)
 }
+
+public interface KmForgettableResource : AutoCloseable {
+    public fun disarmCleaner()
+}
+
+public expect class KmResourceCleaner internal constructor() : KmForgettableResource {
+    public fun cleanNow()
+    public fun disarm()
+    public override fun disarmCleaner()
+    public override fun close()
+}
+
+public expect fun kmRegisterResourceCleaner(owner: Any, cleanup: () -> Unit): KmResourceCleaner
 """.trimStart()
     }
 
     public fun renderKmCoreNativeActualsKotlin(coreNamespace: String, cinteropPackage: String): String =
         """
-@file:OptIn(ExperimentalForeignApi::class)
+@file:OptIn(ExperimentalForeignApi::class, kotlin.experimental.ExperimentalNativeApi::class)
 
 package $coreNamespace.intrinsics
 
@@ -295,6 +308,58 @@ public actual inline fun kmSimdDotF32(aAddr: Long, bAddr: Long, len: Long): Floa
     $cinteropPackage.kmSimdDotF32(aAddr, bAddr, len)
 
 ${CoreIntrinsicMathAndBitSpecs.renderNativeActuals(cinteropPackage).trimEnd()}
+
+private class KmNativeCleanState(
+    private val cleanup: () -> Unit,
+) {
+    private val state = kotlin.concurrent.atomics.AtomicInt(0)
+
+    fun disarm() {
+        state.compareAndSet(0, 1)
+    }
+
+    fun clean() {
+        if (state.compareAndSet(0, 2)) {
+            cleanup()
+        }
+    }
+}
+
+public actual class KmResourceCleaner internal constructor() : KmForgettableResource {
+    private var cleanState: KmNativeCleanState? = null
+    private var nativeCleaner: kotlin.native.ref.Cleaner? = null
+
+    internal fun attach(state: KmNativeCleanState, cleaner: kotlin.native.ref.Cleaner) {
+        this.cleanState = state
+        this.nativeCleaner = cleaner
+    }
+
+    public actual fun disarm() {
+        if (nativeCleaner == null) return
+        val target = cleanState
+        nativeCleaner = null
+        cleanState = null
+        target?.disarm()
+    }
+
+    public actual fun cleanNow() {
+        if (nativeCleaner == null) return
+        val target = cleanState
+        nativeCleaner = null
+        cleanState = null
+        target?.clean()
+    }
+
+    public actual override fun disarmCleaner(): Unit = disarm()
+
+    public actual override fun close(): Unit = cleanNow()
+}
+
+public actual fun kmRegisterResourceCleaner(owner: Any, cleanup: () -> Unit): KmResourceCleaner {
+    val state = KmNativeCleanState(cleanup)
+    val cleaner = kotlin.native.ref.createCleaner(state) { it.clean() }
+    return KmResourceCleaner().apply { attach(state, cleaner) }
+}
 """.trimStart()
 
     private fun jniMangleSegment(segment: String): String =
@@ -869,6 +934,89 @@ public actual fun kmSimdDotF32(aAddr: Long, bAddr: Long, len: Long): Float =
     $jniObjectName.kmSimdDotF32(aAddr, bAddr, len)
 
 ${CoreIntrinsicMathAndBitSpecs.renderJvmActuals(jniObjectName).trimEnd()}
+
+private class KmJvmCleanRef(
+    referent: Any,
+    queue: java.lang.ref.ReferenceQueue<Any>,
+    private val activeRefs: java.util.concurrent.ConcurrentHashMap<KmJvmCleanRef, Boolean>,
+    private val cleanup: () -> Unit,
+) : java.lang.ref.PhantomReference<Any>(referent, queue) {
+    private val state = java.util.concurrent.atomic.AtomicInteger(0)
+
+    fun disarm() {
+        if (state.compareAndSet(0, 1)) {
+            activeRefs.remove(this)
+            clear()
+        }
+    }
+
+    fun clean() {
+        if (state.compareAndSet(0, 2)) {
+            activeRefs.remove(this)
+            clear()
+            cleanup()
+        }
+    }
+}
+
+private object KmJvmCleanerRegistry {
+    private val queue = java.lang.ref.ReferenceQueue<Any>()
+    private val activeRefs = java.util.concurrent.ConcurrentHashMap<KmJvmCleanRef, Boolean>()
+    private val started = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun ensureStarted() {
+        if (started.compareAndSet(false, true)) {
+            val worker =
+                java.lang.Thread(
+                    {
+                        while (true) {
+                            val ref = queue.remove()
+                            if (ref is KmJvmCleanRef) {
+                                ref.clean()
+                            }
+                        }
+                    },
+                    "km-resource-cleaner",
+                )
+            worker.isDaemon = true
+            worker.start()
+        }
+    }
+
+    fun register(owner: Any, cleanup: () -> Unit): KmResourceCleaner {
+        ensureStarted()
+        val ref = KmJvmCleanRef(owner, queue, activeRefs, cleanup)
+        activeRefs[ref] = true
+        return KmResourceCleaner().apply { attach(ref) }
+    }
+}
+
+public actual class KmResourceCleaner internal constructor() : KmForgettableResource {
+    private var cleanRef: KmJvmCleanRef? = null
+
+    internal fun attach(ref: KmJvmCleanRef) {
+        cleanRef = ref
+    }
+
+    public actual fun disarm() {
+        val ref = cleanRef
+        cleanRef = null
+        ref?.disarm()
+    }
+
+    public actual fun cleanNow() {
+        val ref = cleanRef
+        cleanRef = null
+        ref?.clean()
+    }
+
+    public actual override fun disarmCleaner(): Unit = disarm()
+
+    public actual override fun close(): Unit = cleanNow()
+}
+
+public actual fun kmRegisterResourceCleaner(owner: Any, cleanup: () -> Unit): KmResourceCleaner =
+    KmJvmCleanerRegistry.register(owner, cleanup)
 """.trimEnd()
 
     public fun renderKmCoreJvmActualsKotlin(

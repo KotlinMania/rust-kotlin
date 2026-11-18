@@ -148,7 +148,7 @@ private fun renderPrimitiveByteSwapBody(v: String, kind: NumericKind): String =
 internal fun KotlinJ2KEmitter.tryExtractMutableArraySubsliceArg(
     argExpr: Expr,
     argIndex: Int,
-    expectMutableList: Boolean,
+    expectMutableList: () -> Boolean,
     indent: String,
     selfTypeName: String?,
 ): Triple<String, String, String>? {
@@ -164,6 +164,7 @@ internal fun KotlinJ2KEmitter.tryExtractMutableArraySubsliceArg(
             baseTy == "CharArray" ||
             baseTy.startsWith("Array<")
     if (!isKotlinArray) return null
+    val needsMutableList = expectMutableList()
     val base = renderExpr(place.expr, indent, selfTypeName)
     val baseAtom = if (isAtomicPostfixReceiver(place.expr, base)) base else "($base)"
     val start = rangeExpr.start?.let { renderTypedNumericInitializer(it, NumericKind.I32, indent, selfTypeName) }
@@ -177,7 +178,7 @@ internal fun KotlinJ2KEmitter.tryExtractMutableArraySubsliceArg(
         }
     val startOffset = start ?: "0"
     val subVar = "subSlice$argIndex"
-    return if (expectMutableList) {
+    return if (needsMutableList) {
         val idxVar = "subIdx$argIndex"
         val destIdx = if (startOffset == "0") idxVar else "($startOffset) + $idxVar"
         Triple(

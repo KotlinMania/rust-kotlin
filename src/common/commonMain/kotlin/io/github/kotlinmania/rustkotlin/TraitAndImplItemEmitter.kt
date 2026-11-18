@@ -907,6 +907,7 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
             } else {
                 "<${combinedTraitParams.joinToString(", ")}>"
             }
+        val coreNsForOps = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
         val prevBounded = currentBoundedTypeName
         currentBoundedTypeName = memberSelfType
         val (superBounds, whereClause) =
@@ -916,6 +917,16 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
                         .toList()
                         .mapNotNull { renderTypeParamBound(it, selfTypeName = memberSelfType) }
                         .distinctBy { it.substringBefore('<').substringAfterLast('.').trim() }
+                val withDropSuper =
+                    if (!headerContext.rawAbiMode &&
+                        headerContext.packageName == "$coreNsForOps.ops.drop" &&
+                        traitName == "Drop" &&
+                        "AutoCloseable" !in sbList
+                    ) {
+                        sbList + "AutoCloseable"
+                    } else {
+                        sbList
+                    }
                 val wc =
                     renderWhereClause(
                         item.generics.whereClause,
@@ -923,7 +934,7 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
                         ownerGenerics = item.generics,
                         extraDeclaredNames = setOfNotNull(selfParamName) + assocTypeNames,
                     )
-                sbList to wc
+                withDropSuper to wc
             } finally {
                 currentBoundedTypeName = prevBounded
             }
@@ -1039,7 +1050,6 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
                 is TraitItem.Verbatim -> {}
             }
         }
-        val coreNsForOps = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
         if (!headerContext.rawAbiMode &&
             (headerContext.packageName == "$coreNsForOps.ops.arith" || headerContext.packageName == "$coreNsForOps.ops.bit")
         ) {
@@ -1073,6 +1083,14 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
                 traitSignatures["xor($rhsParamType)"] = 1
                 members += "$indent    public infix fun xor(rhs: $rhsParamType): $outAssocType = bitxor(rhs)"
             }
+        }
+        if (!headerContext.rawAbiMode &&
+            headerContext.packageName == "$coreNsForOps.ops.drop" &&
+            traitName == "Drop" &&
+            "close()" !in traitSignatures
+        ) {
+            traitSignatures["close()"] = 1
+            members += "$indent    public override fun close(): Unit = drop()"
         }
         val iterSuperSpec = extractIteratorSupertraitSpec(item.supertraits.toList(), memberSelfType)
         if (iterSuperSpec != null) {
@@ -1718,14 +1736,60 @@ internal fun KotlinJ2KEmitter.renderImplItemFn(
                 val owner = "this" + accessorFields.dropLast(1).joinToString("") { ".$it" }
                 "{\n$bodyIndent    return $owner::${accessorFields.last()}\n$bodyIndent}"
             } else {
-                renderBlock(
-                    item.block,
-                    bodyIndent,
-                    selfTypeName = selfTypeName,
-                    returnType = retType,
-                    leadingInjectedLines = shadows,
-                    allowExpressionBody = panicExpectation == null,
-                )
+                val dropCascadeLines =
+                    if (activeTraitLast == "Drop" &&
+                        item.sig.ident
+                            .toString()
+                            .removePrefix("r#") == "drop" &&
+                        !asTopLevelExtension &&
+                        !isCompanionMember &&
+                        selfTypeName != null
+                    ) {
+                        val ownerName = selfTypeName.substringBefore('<')
+                        val ownerStruct =
+                            file.items.filterIsInstance<Item.Struct>().singleOrNull {
+                                rustTypeIdentToKotlin(it.ident.toString()) == ownerName
+                            }
+                        val ownerFields = ownerStruct?.fields as? Fields.Named
+                        ownerFields
+                            ?.fields
+                            ?.named
+                            ?.toList()
+                            .orEmpty()
+                            .filterNot { isDocOnlyCfgAttribute(it.attrs) }
+                            .mapNotNull { field ->
+                                val fName = field.ident?.let { rustFieldIdentToKotlin(it.toString()) } ?: return@mapNotNull null
+                                val baseTy =
+                                    renderType(field.ty, selfTypeName = selfTypeName)
+                                        .substringBefore('<')
+                                        .substringAfterLast('.')
+                                        .trim()
+                                if (baseTy == "RawVec") "$bodyIndent    this.$fName.close()" else null
+                            }
+                    } else {
+                        emptyList()
+                    }
+                val rendered =
+                    renderBlock(
+                        item.block,
+                        bodyIndent,
+                        selfTypeName = selfTypeName,
+                        returnType = retType,
+                        leadingInjectedLines = shadows,
+                        allowExpressionBody = panicExpectation == null && dropCascadeLines.isEmpty(),
+                    )
+                if (dropCascadeLines.isEmpty()) {
+                    rendered
+                } else {
+                    val cascadeSuffix = dropCascadeLines.joinToString("\n")
+                    when {
+                        rendered == "{}" -> "{\n$cascadeSuffix\n$bodyIndent}"
+                        rendered.endsWith("\n$bodyIndent}") ->
+                            rendered.substring(0, rendered.length - "\n$bodyIndent}".length) +
+                                "\n$cascadeSuffix\n$bodyIndent}"
+                        else -> rendered
+                    }
+                }
             }
         sb
             .append(indent)
