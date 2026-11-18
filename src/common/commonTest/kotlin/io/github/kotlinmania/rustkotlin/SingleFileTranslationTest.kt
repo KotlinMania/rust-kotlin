@@ -365,7 +365,7 @@ class SingleFileTranslationTest {
         assertContains(result.text, "val c = next")
         assertContains(result.text, "val other = next")
         assertContains(result.text, "val matchVal = selfPeek.getOrElse { return Result.failure(it) }")
-        assertContains(result.text, "matchVal != null && (matchVal == 32u.toUByte() || matchVal == 10u.toUByte() || matchVal == 9u.toUByte() || matchVal == 13u.toUByte()) -> Result.success(0u)")
+        assertContains(result.text, "matchVal != null && (matchVal == 32u.toUByte() || matchVal == 10u.toUByte() || matchVal == 9u.toUByte() || matchVal == 13u.toUByte()) -> Result.success(0u.toUByte())")
     }
 
     @Test fun cliRichOptionsSupportRecursiveBatchStdoutDryRunForceSkipAndHeaderOverrides() {
@@ -583,7 +583,7 @@ class SingleFileTranslationTest {
         assertFalse(kt.contains("public fun localStep"))
 
         assertContains(kt, "val tailRange = 3 until Int.MAX_VALUE")
-        assertContains(kt, "code.toInt() + (code - 1u).toInt()")
+        assertContains(kt, "code.toInt() + (code - 1u.toUByte()).toInt()")
         assertContains(kt, "for (unused in 0 until 4)")
         assertContains(kt, "for (unused1 in 0 until 2)")
         assertContains(kt, "48u.toUByte() -> { 0 }")

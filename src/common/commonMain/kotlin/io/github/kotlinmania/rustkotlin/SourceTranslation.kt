@@ -1348,11 +1348,35 @@ internal class KotlinJ2KEmitter(
         if (usesCurrentThreadToken && topLevelSignatureCounts["currentThreadBoundToken()"] == null) {
             renderedItems.add(0, "internal expect fun currentThreadBoundToken(): Any")
         }
+        val isMultiFileCrate = headerContext.isBatchCrateOutput || headerContext.crateSymbolSubpackages.isNotEmpty()
+        val renderedSigLines by lazy(LazyThreadSafetyMode.NONE) {
+            renderedItems
+                .asSequence()
+                .flatMap { it.lineSequence() }
+                .map { it.trim() }
+                .filter { it.startsWith("public ") || it.startsWith("internal ") }
+                .map { it.substringBefore('=').substringBefore('{') }
+                .toList()
+        }
         if (usesDebugTuple && "DebugTuple" !in inspector.declaredTypeNames) {
-            renderedItems.add(0, SYNTHESIZED_DEBUG_TUPLE_DECLARATION)
+            val exposedInSig = renderedSigLines.any { containsWholeIdentifier(it, "DebugTuple") }
+            val decl =
+                if (isMultiFileCrate && !exposedInSig) {
+                    SYNTHESIZED_DEBUG_TUPLE_DECLARATION.replaceFirst("public class DebugTuple(", "private class DebugTuple(")
+                } else {
+                    SYNTHESIZED_DEBUG_TUPLE_DECLARATION
+                }
+            renderedItems.add(0, decl)
         }
         if (!headerContext.isDocExample && usesDebugStruct && "DebugStruct" !in inspector.declaredTypeNames) {
-            renderedItems.add(0, SYNTHESIZED_DEBUG_STRUCT_DECLARATION)
+            val exposedInSig = renderedSigLines.any { containsWholeIdentifier(it, "DebugStruct") }
+            val decl =
+                if (isMultiFileCrate && !exposedInSig) {
+                    SYNTHESIZED_DEBUG_STRUCT_DECLARATION.replaceFirst("public class DebugStruct(", "private class DebugStruct(")
+                } else {
+                    SYNTHESIZED_DEBUG_STRUCT_DECLARATION
+                }
+            renderedItems.add(0, decl)
         }
         val usesExternalRustLangCore =
             "core" in headerContext.crateNamespaces ||
@@ -1599,21 +1623,24 @@ internal class KotlinJ2KEmitter(
                     add("clamp" to "$activeCoreNs.cmp")
                 }
             }
+        val stdlibOverloadExtImports = hashSetOf<String>()
         for ((symSimple, symPkg) in autoCoreSymbols) {
             if (headerContext.packageName != symPkg &&
                 symSimple !in inspector.declaredTypeNames &&
                 symSimple !in inspector.declaredConstNames.values &&
                 symSimple !in importedSimpleNameToPkg &&
-                !isDeclaredTopLevelFnKotlinName(symSimple) &&
+                (!isDeclaredTopLevelFnKotlinName(symSimple) || (symPkg == "$activeCoreNs.mem" && symSimple == "get")) &&
                 containsWholeIdentifier(bodyTextForImports, symSimple)
             ) {
                 val imp = "import $symPkg.$symSimple"
+                if (symPkg == "$activeCoreNs.mem" && symSimple == "get") {
+                    stdlibOverloadExtImports += imp
+                }
                 if (imp !in combinedExtraTypeImports) {
                     combinedExtraTypeImports += imp
                 }
             }
         }
-        val stdlibOverloadExtImports = hashSetOf<String>()
         val isInCoreOrUsingExternalCore =
             usesExternalRustLangCore ||
                 "core" in headerContext.crateNamespaces ||
@@ -1663,21 +1690,6 @@ internal class KotlinJ2KEmitter(
             val rustCharImport = "import $activeCoreNs.char.RustChar"
             if (rustCharImport !in combinedExtraTypeImports) {
                 combinedExtraTypeImports += rustCharImport
-            }
-        }
-        if (usesTaggedCoreResult() && !hasDeclaredResultEnum() && headerContext.packageName != "$activeCoreNs.result") {
-            for (resultExt in listOf("andThen", "unwrapOr", "unwrapOrElse", "orElse", "and", "or")) {
-                if (resultExt !in inspector.declaredTypeNames &&
-                    resultExt !in inspector.declaredConstNames.values &&
-                    resultExt !in importedSimpleNameToPkg &&
-                    !isDeclaredTopLevelFnKotlinName(resultExt) &&
-                    Regex("\\.\\s*$resultExt\\s*[({<]").containsMatchIn(bodyTextForImports)
-                ) {
-                    val imp = "import $activeCoreNs.result.$resultExt"
-                    if (imp !in combinedExtraTypeImports) {
-                        combinedExtraTypeImports += imp
-                    }
-                }
             }
         }
         if (isInCoreOrUsingExternalCore && !headerContext.rawAbiMode) {

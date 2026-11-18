@@ -132,7 +132,8 @@ class EnvieAndScalarLoweringTest {
 
         val kt = translateRustSourceToKotlin(recognizeRust(rust), coreTaggedHeader)
         assertContains(kt, "import io.github.kotlinmania.rustlang.core.result.Result")
-        assertContains(kt, "import io.github.kotlinmania.rustlang.core.result.andThen")
+        assertFalse(kt.contains("import io.github.kotlinmania.rustlang.core.result.andThen"))
+        assertContains(kt, ".andThen(")
         assertContains(kt, "MutableMap<String, String>")
         assertContains(kt, "mutableMapOf()")
         assertContains(kt, "m.put(\"K\", \"v\")")

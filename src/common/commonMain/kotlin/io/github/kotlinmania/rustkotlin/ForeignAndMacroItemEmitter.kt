@@ -241,7 +241,7 @@ internal fun KotlinJ2KEmitter.resolveExternalDepReexportPkg(
     symKt: String,
     nsPrefix: String?,
 ): String? {
-    for (depCrate in listOf("core", "alloc")) {
+    for (depCrate in listOf("core", "alloc", "libm")) {
         val depNs =
             headerContext.crateNamespaces[depCrate]
                 ?.trim()
@@ -249,17 +249,26 @@ internal fun KotlinJ2KEmitter.resolveExternalDepReexportPkg(
                 ?.takeIf { it.isNotEmpty() } ?: continue
         if (depNs == nsPrefix) continue
         val extCandidates = headerContext.externalCrateSymbolPackages[depCrate]?.get(symKt) ?: continue
-        val exactPkg = if (explicitModule.isEmpty()) depNs else "$depNs.$explicitModule"
-        val matchedPkg =
-            when {
-                exactPkg in extCandidates -> exactPkg
-                else ->
-                    extCandidates
-                        .filter { it.startsWith("$exactPkg.") }
-                        .minByOrNull { it.count { ch -> ch == '.' } }
+        val candidateModules =
+            buildList {
+                add(explicitModule)
+                if (depCrate == "libm" && (explicitModule == "support" || explicitModule.startsWith("support."))) {
+                    add("math.$explicitModule")
+                }
             }
-        if (matchedPkg != null) {
-            return "$matchedPkg.$symKt"
+        for (modPath in candidateModules) {
+            val exactPkg = if (modPath.isEmpty()) depNs else "$depNs.$modPath"
+            val matchedPkg =
+                when {
+                    exactPkg in extCandidates -> exactPkg
+                    else ->
+                        extCandidates
+                            .filter { it.startsWith("$exactPkg.") }
+                            .minByOrNull { it.count { ch -> ch == '.' } }
+                }
+            if (matchedPkg != null) {
+                return "$matchedPkg.$symKt"
+            }
         }
     }
     return null
@@ -417,7 +426,12 @@ internal fun KotlinJ2KEmitter.isResolvedCrateSubpackageModule(resolvedImportPath
 }
 
 internal fun KotlinJ2KEmitter.scopedAbiKeysForRenderedType(renderedType: String): List<String> {
-    val clean = renderedType.trim().removeSuffix("?")
+    val clean =
+        renderedType
+            .substringBefore('<')
+            .trim()
+            .removeSuffix("?")
+            .trim()
     if (clean.isEmpty()) return emptyList()
     val keys = mutableListOf<String>()
     val nsPrefix = currentNamespacePrefix()
@@ -455,6 +469,11 @@ internal fun KotlinJ2KEmitter.scopedAbiKeysForRenderedType(renderedType: String)
         } else if (importedPkg.startsWith("$nsPrefix.")) {
             val sub = importedPkg.removePrefix("$nsPrefix.")
             addSubpkgAndAncestors(sub, clean)
+        }
+    } else if (importedPkg == null) {
+        val bestSub = resolveBestSubpackageForSymbol(clean)
+        if (!bestSub.isNullOrEmpty()) {
+            addSubpkgAndAncestors(bestSub, clean)
         }
     }
     val curSub = currentSubpackageString()
@@ -655,10 +674,13 @@ internal fun KotlinJ2KEmitter.resolveStdlibFfiSymbolImport(
             CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS[rustLeaf] ?: return null
         }
     if (ktSym in inspector.declaredTypeNames) return null
-    val bestLocal = resolveBestSubpackageForSymbol(ktSym)
-    if (bestLocal != null) {
-        val nsPrefix = currentNamespacePrefix()
-        if (nsPrefix != null) {
+    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+    val allocNs = CoreIntrinsicLowering.resolveAllocNamespace(headerContext)
+    val nsPrefix = currentNamespacePrefix()
+    val ownerNs = if (ktSym == "CString") allocNs else coreNs
+    if (nsPrefix != null && nsPrefix == ownerNs) {
+        val bestLocal = resolveBestSubpackageForSymbol(ktSym)
+        if (bestLocal != null) {
             return if (bestLocal.isEmpty()) "$nsPrefix.$ktSym" else "$nsPrefix.$bestLocal.$ktSym"
         }
     }
@@ -672,8 +694,6 @@ internal fun KotlinJ2KEmitter.resolveStdlibFfiSymbolImport(
                 ?: extCandidates.minByOrNull { it.length }
         if (ffiMatch != null) return "$ffiMatch.$ktSym"
     }
-    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    val allocNs = CoreIntrinsicLowering.resolveAllocNamespace(headerContext)
     return "${CoreIntrinsicLowering.defaultStdlibFfiSymbolPackage(ktSym, coreNs, allocNs)}.$ktSym"
 }
 
@@ -715,6 +735,25 @@ internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
         thirdCleanEarly in coreMemIntrinsics
     ) {
         return "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.mem.${rustFunctionIdentToKotlin(thirdCleanEarly)}" to emptyList()
+    }
+    if (!headerContext.rawAbiMode &&
+        headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true &&
+        rawSegStrings.size in 3..4 &&
+        firstRaw in setOf("alloc", "std", "crate") &&
+        (
+            firstRaw != "crate" ||
+                headerContext.packageName.startsWith("io.github.kotlinmania.rustlang.std") ||
+                headerContext.packageName.startsWith("io.github.kotlinmania.rustlang.alloc")
+        )
+    ) {
+        val symSeg = rawSegStrings[2].removePrefix("r#")
+        val allocNs = CoreIntrinsicLowering.resolveAllocNamespace(headerContext)
+        if (secondCleanEarly == "sync" && symSeg in setOf("Arc", "Weak") && symSeg !in inspector.declaredTypeNames) {
+            return "$allocNs.rcs.arc.$symSeg" to rawSegStrings.drop(3)
+        }
+        if (secondCleanEarly == "rc" && symSeg in setOf("Rc", "Weak") && symSeg !in inspector.declaredTypeNames) {
+            return "$allocNs.rcs.rc.$symSeg" to rawSegStrings.drop(3)
+        }
     }
     if (firstRaw == "std" || firstRaw == "alloc" || firstRaw == "Self" || firstRaw in PRIMITIVE_TYPE_NAMES) return null
     if (rawSegStrings.dropLast(1).any { it.removePrefix("r#") in STDLIB_PRELUDE_REEXPORT_MODULES }) {
@@ -1444,6 +1483,18 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
                 }
             }
         }
+        if (baseSegs.isEmpty() && rem.isNotEmpty()) {
+            val flatHeadRaw = rem[0].removePrefix("r#")
+            if (flatHeadRaw in headerContext.crateFlatFileModules) {
+                return if (rem.size == 1 && isSelfImport) {
+                    nsPrefix
+                } else if (rem.size >= 2) {
+                    "$nsPrefix.${mappedRem.drop(1).joinToString(".")}"
+                } else {
+                    nsPrefix
+                }
+            }
+        }
         val combined = baseSegs + mappedRem
         return "$nsPrefix.${combined.joinToString(".")}"
     }
@@ -1611,6 +1662,26 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
         }
         if (cleanSegs.size == 3 && cleanSegs[0] == "alloc" && cleanSegs[1] == "ffi" && cleanSegs[2] == "CString") {
             resolveStdlibFfiSymbolImport("CString", isAllocCString = true)?.let { return it }
+        }
+        if (cleanSegs.size == 3 &&
+            headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true &&
+            cleanSegs[0] in setOf("alloc", "std", "crate") &&
+            (
+                cleanSegs[0] != "crate" ||
+                    headerContext.packageName.startsWith("io.github.kotlinmania.rustlang.std") ||
+                    headerContext.packageName.startsWith("io.github.kotlinmania.rustlang.alloc")
+            )
+        ) {
+            val cleanLeaf = cleanSegs[2]
+            val allocNs = CoreIntrinsicLowering.resolveAllocNamespace(headerContext)
+            if (cleanLeaf !in inspector.declaredTypeNames) {
+                if (cleanSegs[1] == "sync" && cleanLeaf in setOf("Arc", "Weak")) {
+                    return "$allocNs.rcs.arc.$cleanLeaf"
+                }
+                if (cleanSegs[1] == "rc" && cleanLeaf in setOf("Rc", "Weak")) {
+                    return "$allocNs.rcs.rc.$cleanLeaf"
+                }
+            }
         }
     }
     if (!isSelfImport && headerContext.rawAbiMode && lastRaw.removePrefix("r#") == "c_void") {
@@ -1940,17 +2011,26 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
                     val searchExtPkgs = headerContext.externalCrateSymbolPackages[searchCrate] ?: continue
                     val candidates = searchExtPkgs[mappedLeaf]
                     if (!candidates.isNullOrEmpty()) {
-                        val exactPkg = if (midPath.isEmpty()) searchNs else "$searchNs.$midPath"
-                        val resolvedPkg =
-                            when {
-                                exactPkg in candidates -> exactPkg
-                                else ->
-                                    candidates
-                                        .filter { it.startsWith("$exactPkg.") }
-                                        .minByOrNull { it.count { ch -> ch == '.' } }
+                        val candidateMidPaths =
+                            buildList {
+                                add(midPath)
+                                if (searchCrate == "libm" && (midPath == "support" || midPath.startsWith("support."))) {
+                                    add("math.$midPath")
+                                }
                             }
-                        if (resolvedPkg != null) {
-                            return "$resolvedPkg.$mappedLeaf"
+                        for (candMidPath in candidateMidPaths) {
+                            val exactPkg = if (candMidPath.isEmpty()) searchNs else "$searchNs.$candMidPath"
+                            val resolvedPkg =
+                                when {
+                                    exactPkg in candidates -> exactPkg
+                                    else ->
+                                        candidates
+                                            .filter { it.startsWith("$exactPkg.") }
+                                            .minByOrNull { it.count { ch -> ch == '.' } }
+                                }
+                            if (resolvedPkg != null) {
+                                return "$resolvedPkg.$mappedLeaf"
+                            }
                         }
                     }
                 }

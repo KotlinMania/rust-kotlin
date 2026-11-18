@@ -1039,6 +1039,41 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
                 is TraitItem.Verbatim -> {}
             }
         }
+        val coreNsForOps = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+        if (!headerContext.rawAbiMode &&
+            (headerContext.packageName == "$coreNsForOps.ops.arith" || headerContext.packageName == "$coreNsForOps.ops.bit")
+        ) {
+            val rhsParamType = collectGenericTypeParamNames(item.generics).firstOrNull()
+            val outAssocType = assocTypeNames.firstOrNull { it == "Output" }
+            if (traitName == "Add" && rhsParamType != null && outAssocType != null && "add" in currentTraitMethodRawNames && "plus($rhsParamType)" !in traitSignatures) {
+                traitSignatures["plus($rhsParamType)"] = 1
+                members += "$indent    public operator fun plus(rhs: $rhsParamType): $outAssocType = add(rhs)"
+            }
+            if (traitName == "Sub" && rhsParamType != null && outAssocType != null && "sub" in currentTraitMethodRawNames && "minus($rhsParamType)" !in traitSignatures) {
+                traitSignatures["minus($rhsParamType)"] = 1
+                members += "$indent    public operator fun minus(rhs: $rhsParamType): $outAssocType = sub(rhs)"
+            }
+            if (traitName == "Mul" && rhsParamType != null && outAssocType != null && "mul" in currentTraitMethodRawNames && "times($rhsParamType)" !in traitSignatures) {
+                traitSignatures["times($rhsParamType)"] = 1
+                members += "$indent    public operator fun times(rhs: $rhsParamType): $outAssocType = mul(rhs)"
+            }
+            if (traitName == "Neg" && outAssocType != null && "neg" in currentTraitMethodRawNames && "unaryMinus()" !in traitSignatures) {
+                traitSignatures["unaryMinus()"] = 1
+                members += "$indent    public operator fun unaryMinus(): $outAssocType = neg()"
+            }
+            if (traitName == "BitAnd" && rhsParamType != null && outAssocType != null && "bitand" in currentTraitMethodRawNames && "and($rhsParamType)" !in traitSignatures) {
+                traitSignatures["and($rhsParamType)"] = 1
+                members += "$indent    public infix fun and(rhs: $rhsParamType): $outAssocType = bitand(rhs)"
+            }
+            if (traitName == "BitOr" && rhsParamType != null && outAssocType != null && "bitor" in currentTraitMethodRawNames && "or($rhsParamType)" !in traitSignatures) {
+                traitSignatures["or($rhsParamType)"] = 1
+                members += "$indent    public infix fun or(rhs: $rhsParamType): $outAssocType = bitor(rhs)"
+            }
+            if (traitName == "BitXor" && rhsParamType != null && outAssocType != null && "bitxor" in currentTraitMethodRawNames && "xor($rhsParamType)" !in traitSignatures) {
+                traitSignatures["xor($rhsParamType)"] = 1
+                members += "$indent    public infix fun xor(rhs: $rhsParamType): $outAssocType = bitxor(rhs)"
+            }
+        }
         val iterSuperSpec = extractIteratorSupertraitSpec(item.supertraits.toList(), memberSelfType)
         if (iterSuperSpec != null) {
             if ("next()" !in traitSignatures) {

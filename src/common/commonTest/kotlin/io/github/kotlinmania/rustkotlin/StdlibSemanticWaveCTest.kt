@@ -1550,4 +1550,137 @@ class StdlibSemanticWaveCTest {
         assertFalse(out.contains(" as Result.Ok<*, *>"), "Result.Ok must not erase payload via star cast:\n$out")
         assertFalse(out.contains(" as RustResult.Ok<*, *>"), "RustResult.Ok must not erase payload via star cast:\n$out")
     }
+
+    @Test
+    fun waveC10ConcreteAtomicOpsForwardingCharBoolCastTypeParamConstAndFmtLowering() {
+        val atomicAndFmtSrc =
+            """
+            use core::fmt::{self, Display};
+            use core::sync::atomic::{Atomic, Ordering};
+
+            pub trait Float {
+                const BITS: u32;
+            }
+
+            pub struct Counter {
+                pub inner: Atomic<usize>,
+                pub total: Atomic<u64>,
+            }
+
+            impl Counter {
+                pub fn bump(&self, c: char, flag: bool) -> bool {
+                    let fresh = AtomicU64::new(0);
+                    self.total.store(0, Ordering::Relaxed);
+                    let bits = c as u32 + (flag as usize) as u32;
+                    self.total.load(Ordering::Relaxed) == 0 && fresh.load(Ordering::Relaxed) == 0 && bits > 0
+                }
+            }
+
+            pub fn read_bits<F: Float>(a: F) -> u32 {
+                F::BITS
+            }
+
+            pub struct Holder {
+                pub val_u32: u32,
+            }
+
+            impl Display for Holder {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    if self.val_u32 == 0 {
+                        return "bad input".fmt(f);
+                    }
+                    f.debug_struct("Holder").field("val_u32", &self.val_u32).finish()
+                }
+            }
+            """.trimIndent()
+        val coreNs = "io.github.kotlinmania.rustlang.core"
+        val out =
+            renderSingleKotlinFile(
+                atomicAndFmtSrc,
+                FileHeaderContext(
+                    portLintSourcePath = "probe/wave10.rs",
+                    packageName = "$coreNs.probe",
+                    projectGroup = "io.github.kotlinmania",
+                    projectNamespace = coreNs,
+                    crateNamespaces = mapOf("core" to coreNs),
+                    scalarChar = false,
+                    rawAbiMode = false,
+                    isBatchCrateOutput = true,
+                ),
+            ).text
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(out, "WaveC10Sample.kt")
+        assertContains(out, "public var inner: AtomicUsize")
+        assertContains(out, "public var total: AtomicU64")
+        assertContains(out, "AtomicU64.new(0uL)")
+        assertContains(out, "this.total.store(0uL, Ordering.Relaxed)")
+        assertContains(out, "this.total.load(Ordering.Relaxed) == 0uL")
+        assertContains(out, "c.code.toUInt()")
+        assertContains(out, "(if (flag) 1 else 0)")
+        assertContains(out, "public fun <F : Float> readBits(a: F): UInt = a.BITS")
+        assertContains(out, "return run { f.append(\"bad input\"); Result.Ok<Unit, Error>(Unit) }")
+        assertContains(out, "private class DebugStruct(")
+
+        val arithOpsOut =
+            renderSingleKotlinFile(
+                """
+                pub trait Add<Rhs = Self> {
+                    type Output;
+                    fn add(self, rhs: Rhs) -> Self::Output;
+                }
+                pub trait Sub<Rhs = Self> {
+                    type Output;
+                    fn sub(self, rhs: Rhs) -> Self::Output;
+                }
+                pub trait Mul<Rhs = Self> {
+                    type Output;
+                    fn mul(self, rhs: Rhs) -> Self::Output;
+                }
+                pub trait Neg {
+                    type Output;
+                    fn neg(self) -> Self::Output;
+                }
+                """.trimIndent(),
+                FileHeaderContext(
+                    portLintSourcePath = "ops/arith.rs",
+                    packageName = "$coreNs.ops.arith",
+                    projectGroup = "io.github.kotlinmania",
+                    projectNamespace = coreNs,
+                    crateNamespaces = mapOf("core" to coreNs),
+                    rawAbiMode = false,
+                ),
+            ).text
+        assertContains(arithOpsOut, "public operator fun plus(rhs: Rhs): Output = add(rhs)")
+        assertContains(arithOpsOut, "public operator fun minus(rhs: Rhs): Output = sub(rhs)")
+        assertContains(arithOpsOut, "public operator fun times(rhs: Rhs): Output = mul(rhs)")
+        assertContains(arithOpsOut, "public operator fun unaryMinus(): Output = neg()")
+
+        val bitOpsOut =
+            renderSingleKotlinFile(
+                """
+                pub trait BitAnd<Rhs = Self> {
+                    type Output;
+                    fn bitand(self, rhs: Rhs) -> Self::Output;
+                }
+                pub trait BitOr<Rhs = Self> {
+                    type Output;
+                    fn bitor(self, rhs: Rhs) -> Self::Output;
+                }
+                pub trait BitXor<Rhs = Self> {
+                    type Output;
+                    fn bitxor(self, rhs: Rhs) -> Self::Output;
+                }
+                """.trimIndent(),
+                FileHeaderContext(
+                    portLintSourcePath = "ops/bit.rs",
+                    packageName = "$coreNs.ops.bit",
+                    projectGroup = "io.github.kotlinmania",
+                    projectNamespace = coreNs,
+                    crateNamespaces = mapOf("core" to coreNs),
+                    rawAbiMode = false,
+                ),
+            ).text
+        assertContains(bitOpsOut, "public infix fun and(rhs: Rhs): Output = bitand(rhs)")
+        assertContains(bitOpsOut, "public infix fun or(rhs: Rhs): Output = bitor(rhs)")
+        assertContains(bitOpsOut, "public infix fun xor(rhs: Rhs): Output = bitxor(rhs)")
+    }
 }

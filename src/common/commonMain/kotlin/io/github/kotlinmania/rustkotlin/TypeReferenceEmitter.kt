@@ -211,7 +211,7 @@ internal fun KotlinJ2KEmitter.renderCastExpression(
         val recv = if (isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
         return convertNumericReceiver("$recv.pointer.rawAddress", canonicalNumericTarget, NumericKind.I64)
     }
-    if (canonicalNumericTarget != null && isKnownBooleanCastSource(sourceExpr)) {
+    if (canonicalNumericTarget != null && (isKnownBooleanCastSource(sourceExpr) || sourceInferredForNum?.removeSuffix("?")?.trim() == "Boolean")) {
         val cleanCond =
             if (hasOuterBalancedParens(inner)) {
                 inner.substring(1, inner.length - 1)
@@ -277,15 +277,17 @@ internal fun KotlinJ2KEmitter.renderCastExpression(
                 error("Cannot expose an address for $inner ($fieldTy): the Rust field requires address-bearing storage")
             }
         }
-        val inferredRustCharSource =
-            headerContext.scalarChar &&
-                inferExprRenderedType(sourceExpr, selfTypeName)?.removeSuffix("?")?.trim() == "RustChar"
-        if ((unwrappedSource as? Expr.Lit)?.lit is Lit.Char || inferredRustCharSource) {
-            if (canonicalNumericTarget == "RustChar") {
+        val cleanSourceCharTy = sourceInferredForNum?.removeSuffix("?")?.trim()
+        val inferredRustCharSource = headerContext.scalarChar && cleanSourceCharTy == "RustChar"
+        val inferredKtCharSource = !headerContext.scalarChar && cleanSourceCharTy == "Char"
+        if ((unwrappedSource as? Expr.Lit)?.lit is Lit.Char || inferredRustCharSource || inferredKtCharSource) {
+            if ((inferredRustCharSource && canonicalNumericTarget == "RustChar") ||
+                (inferredKtCharSource && canonicalNumericTarget == "Char")
+            ) {
                 return inner
             }
             val recv = if (isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
-            val charCodeKind = if (headerContext.scalarChar) NumericKind.U32 else NumericKind.I32
+            val charCodeKind = if (headerContext.scalarChar && !inferredKtCharSource) NumericKind.U32 else NumericKind.I32
             return convertNumericReceiver("$recv.code", canonicalNumericTarget, charCodeKind)
         }
         val sourceKind = inferExprNumericKind(sourceExpr, selfTypeName)
@@ -1519,6 +1521,18 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                     }
                 val rawSegNames = rawSegments.map { it.ident.toString().removePrefix("r#") }
                 val explicitArgs = filteredArgs.mapNotNull { renderGenericArgument(it, selfTypeName) }
+                val rawTypeArgs = rawArgList.filterIsInstance<GenericArgument.TypeArg>()
+                if (ktBaseIdent == "Atomic" &&
+                    "Atomic" !in inspector.declaredTypeNames &&
+                    !headerContext.rawAbiMode &&
+                    "core" in headerContext.crateNamespaces &&
+                    rawTypeArgs.size == 1
+                ) {
+                    val concreteAtomic = resolveConcreteStdlibAtomicSimpleName(rawTypeArgs[0].type, explicitArgs.firstOrNull())
+                    if (concreteAtomic != null) {
+                        return bindOrQualifyResolvedCrossSymbol("$coreNs.sync.atomic.$concreteAtomic")
+                    }
+                }
                 val explicitAssocNames =
                     rawArgList
                         .filterIsInstance<GenericArgument.AssocTypeArg>()

@@ -174,7 +174,7 @@ internal fun KotlinJ2KEmitter.resolveEnclosingResultTypeArguments(rendered: Stri
             when {
                 importsIoResult ->
                     if (headerContext.packageName == "$coreNs.io.error") "Error" else "$coreNs.io.error.Error"
-                "Error" in importedSimpleNameToPkg -> "Error"
+                "Error" in importedSimpleNameToPkg || "Error" in inspector.declaredTypeNames -> "Error"
                 else -> return null
             }
         return singleOk to errName
@@ -182,7 +182,7 @@ internal fun KotlinJ2KEmitter.resolveEnclosingResultTypeArguments(rendered: Stri
     if (type == "Result") {
         val aliasTarget = inspector.typeAliasTargets["Result"]?.let { renderType(it, null) }
         rustResultTypeArguments(aliasTarget)?.let { return it }
-        if ("Error" in importedSimpleNameToPkg) return "Unit" to "Error"
+        if ("Error" in importedSimpleNameToPkg || "Error" in inspector.declaredTypeNames) return "Unit" to "Error"
     }
     return null
 }
@@ -288,7 +288,9 @@ internal fun KotlinJ2KEmitter.renderSourceResultConstructor(call: Expr.Call, var
             .orEmpty()
             .filterIsInstance<GenericArgument.TypeArg>()
             .map { renderType(it.type, selfType) }
-    val expected = rustResultTypeArguments(currentExpectedParseTargetType) ?: rustResultTypeArguments(currentEnclosingReturnRenderedType)
+    val expected =
+        resolveEnclosingResultTypeArguments(currentExpectedParseTargetType)
+            ?: resolveEnclosingResultTypeArguments(currentEnclosingReturnRenderedType)
     val typeArguments =
         when {
             explicit.size == 2 ->
@@ -503,16 +505,13 @@ private fun KotlinJ2KEmitter.isSynthesizedDebugFinishCall(call: Expr.MethodCall,
         }
         recv = unwrapParenOrGroupExpr(recv.receiver)
     }
-    if ("DebugTuple" !in inspector.declaredTypeNames) {
-        val recvTypeBase =
-            inferExprRenderedType(call.receiver, selfTypeName)
-                ?.removeSuffix("?")
-                ?.substringBefore('<')
-                ?.substringAfterLast('.')
-                ?.trim()
-        if (recvTypeBase in DEBUG_BUILDER_TYPES) return true
-    }
-    return false
+    val recvTypeBase =
+        inferExprRenderedType(call.receiver, selfTypeName)
+            ?.removeSuffix("?")
+            ?.substringBefore('<')
+            ?.substringAfterLast('.')
+            ?.trim()
+    return recvTypeBase in DEBUG_BUILDER_TYPES
 }
 
 /** True when a Rust expression renders as Unit, Appendable, or StringBuilder in fmt::Write/fmt::Result positions. */
@@ -541,6 +540,26 @@ internal fun KotlinJ2KEmitter.isFmtWriteOrUnitExpr(expr: Expr, selfTypeName: Str
                     ?.removePrefix("r#")
             if (isFmtStringBuilderReceiver(core.receiver, recvPathIdent.orEmpty(), selfTypeName)) {
                 return true
+            }
+        }
+        if (rawMethod == "fmt" && core.args.size == 1 && core.turbofish == null) {
+            val isStrRecv =
+                unwrapParenOrGroupExpr(core.receiver).let { it is Expr.Lit && it.lit is Lit.Str } ||
+                    inferExprRenderedType(core.receiver, selfTypeName)?.removeSuffix("?")?.trim() == "String"
+            if (isStrRecv) {
+                val arg0 = core.args[0]
+                val arg0Ident =
+                    (unwrapParenOrGroupExpr(arg0) as? Expr.Path)
+                        ?.takeIf { it.qself == null && it.path.segments.len() == 1 }
+                        ?.path
+                        ?.segments
+                        ?.first()
+                        ?.ident
+                        ?.toString()
+                        ?.removePrefix("r#")
+                if (isFmtStringBuilderReceiver(arg0, arg0Ident.orEmpty(), selfTypeName)) {
+                    return true
+                }
             }
         }
         if (isSynthesizedDebugFinishCall(core, selfTypeName)) {

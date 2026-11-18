@@ -1009,10 +1009,8 @@ internal fun KotlinJ2KEmitter.renderIntLiteral(digits: String, suffix: String): 
         }
     if (suffix.isEmpty()) {
         return when (currentExpectedNumericKind) {
-            NumericKind.U8 ->
-                if (low64 != null && low64 > 0xFFuL) "${clean}u.toUByte()" else "${clean}u"
-            NumericKind.U16 ->
-                if (low64 != null && low64 > 0xFFFFuL) "${clean}u.toUShort()" else "${clean}u"
+            NumericKind.U8 -> "${clean}u.toUByte()"
+            NumericKind.U16 -> "${clean}u.toUShort()"
             NumericKind.U32 ->
                 if (low64 != null && low64 > 0xFFFFFFFFuL) "${clean}uL.toUInt()" else "${clean}u"
             NumericKind.U64 -> "${clean}uL"
@@ -1269,9 +1267,32 @@ internal fun KotlinJ2KEmitter.renderExprPath(exprPath: Expr.Path, selfTypeName: 
                 )
             }
         val receiverBase = baseTy.substringBefore('<').trim()
+        if (receiverBase in activeTypeParamNames &&
+            tailRawSegs.size == 1 &&
+            tailRawSegs[0].arguments is PathArguments.None
+        ) {
+            val constRaw = tailRawSegs[0].ident.toString().removePrefix("r#")
+            if (isScreamingSnakeIdent(constRaw) && constRaw !in SIZED_TYPE_PROPERTY_NAMES) {
+                resolveTypeParamWitnessExpr(receiverBase, selfTypeName)?.let { witnessExpr ->
+                    return "$witnessExpr.${rustConstIdentToKotlin(constRaw)}"
+                }
+            }
+        }
         return (listOf(receiverBase) + tailSegs).joinToString(".")
     }
     return renderPathAsExpression(path, selfTypeName, asCallee = false)
+}
+
+internal fun KotlinJ2KEmitter.resolveTypeParamWitnessExpr(
+    typeParamName: String,
+    selfTypeName: String?,
+): String? {
+    if (selfTypeName == typeParamName || currentTypedLocals["this"] == typeParamName) {
+        return "this"
+    }
+    return currentTypedLocals.entries
+        .firstOrNull { (k, v) -> v == typeParamName && k !in currentNullableLocals && k != "_" && k != "this" }
+        ?.key
 }
 
 internal fun KotlinJ2KEmitter.isKotlinFloatShadowed(): Boolean =
@@ -1537,6 +1558,21 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
         hasTrailingArgs = rawSegments.last().arguments !is PathArguments.None,
         selfTypeName = selfTypeName,
     )?.let { return it }
+    if (rawSegNames.size == 2 &&
+        rawSegments[0].arguments is PathArguments.None &&
+        rawSegments[1].arguments is PathArguments.None
+    ) {
+        val ownerKt = rustTypeIdentToKotlin(rawSegNames[0])
+        val constRaw = rawSegNames[1]
+        if (ownerKt in activeTypeParamNames &&
+            isScreamingSnakeIdent(constRaw) &&
+            constRaw !in SIZED_TYPE_PROPERTY_NAMES
+        ) {
+            resolveTypeParamWitnessExpr(ownerKt, selfTypeName)?.let { witnessExpr ->
+                return "$witnessExpr.${rustConstIdentToKotlin(constRaw)}"
+            }
+        }
+    }
     val stdlibFfiDropCount =
         when {
             !headerContext.rawAbiMode &&

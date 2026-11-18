@@ -664,6 +664,10 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
                                 return "NonZero<${resolvedArgs.second}, ${resolvedArgs.first}>$suffix"
                             }
                         }
+                        resolvedOwner != null && atomicOwnerValueRenderedType(resolvedOwner) != null && method == "new" -> {
+                            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.sync.atomic.$resolvedOwner")
+                            return resolvedOwner
+                        }
                     }
                 }
             }
@@ -820,6 +824,10 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
                             lastRaw in setOf("new", "with_capacity", "from") &&
                             penultRaw !in inspector.declaredTypeNames ->
                             return if (penultTypeArgs.isNotEmpty()) "MutableSet<${penultTypeArgs[0]}>" else "MutableSet<*>"
+                        atomicOwnerValueRenderedType(penultRaw) != null &&
+                            lastRaw == "new" &&
+                            penultRaw !in inspector.declaredTypeNames ->
+                            return penultRaw
                         headerContext.scalarChar &&
                             (penultRaw == "char" || penultRaw == "RustChar") &&
                             "Char" !in inspector.declaredTypeNames ->
@@ -987,6 +995,23 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
                         expr.args.size == 1 &&
                         (recvRendered == "Char" || (unwrapParenOrGroupExpr(expr.receiver) as? Expr.Lit)?.lit is Lit.Char) ->
                         return "UInt?"
+                }
+                val recvSimple = recvRendered?.substringBefore('<')?.substringAfterLast('.')?.trim()
+                if (recvSimple != null) {
+                    atomicOwnerValueRenderedType(recvSimple)?.let { valTy ->
+                        if (rawMethod in setOf("load", "swap", "into_inner", "fetch_add", "fetch_sub", "fetch_and", "fetch_or", "fetch_xor", "fetch_max", "fetch_min")) {
+                            return valTy
+                        }
+                    }
+                }
+                if (isFmtStringBuilderReceiver(expr.receiver, "", selfTypeName)) {
+                    when (rawMethod) {
+                        "debug_struct" -> return "DebugStruct"
+                        "debug_tuple" -> return "DebugTuple"
+                        "debug_list" -> return "DebugList"
+                        "debug_set" -> return "DebugSet"
+                        "debug_map" -> return "DebugMap"
+                    }
                 }
             }
             val recvNumericKind =

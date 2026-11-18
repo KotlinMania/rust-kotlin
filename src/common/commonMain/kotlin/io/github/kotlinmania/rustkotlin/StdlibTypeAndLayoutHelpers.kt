@@ -369,3 +369,82 @@ internal fun coerceMutPtrArgToConstPtr(renderedArg: String, inferredArgType: Str
     if (trimmed.endsWith(".asConstPtr()") || trimmed.startsWith("ConstPtr(")) return renderedArg
     return "($trimmed).asConstPtr()"
 }
+
+internal fun resolveConcreteStdlibAtomicSimpleName(
+    rawFirstArgSyn: SynType?,
+    renderedFirstArg: String?,
+): String? {
+    val unwrapped = rawFirstArgSyn?.let(::unwrapSynType)
+    if (unwrapped is SynType.Ptr) return "AtomicPtr"
+    val rawPrimIdent =
+        (unwrapped as? SynType.Path)
+            ?.takeIf { it.qself == null && it.path.segments.size == 1 }
+            ?.path
+            ?.segments
+            ?.first()
+            ?.ident
+            ?.toString()
+            ?.removePrefix("r#")
+    when (rawPrimIdent) {
+        "bool" -> return "AtomicBool"
+        "u8" -> return "AtomicU8"
+        "i8" -> return "AtomicI8"
+        "u16" -> return "AtomicU16"
+        "i16" -> return "AtomicI16"
+        "u32" -> return "AtomicU32"
+        "i32" -> return "AtomicI32"
+        "u64" -> return "AtomicU64"
+        "i64" -> return "AtomicI64"
+        "u128" -> return "AtomicU128"
+        "i128" -> return "AtomicI128"
+        "usize" -> return "AtomicUsize"
+        "isize" -> return "AtomicIsize"
+    }
+    return when (renderedFirstArg?.removeSuffix("?")?.trim()) {
+        "Boolean" -> "AtomicBool"
+        "UByte" -> "AtomicU8"
+        "Byte" -> "AtomicI8"
+        "UShort" -> "AtomicU16"
+        "Short" -> "AtomicI16"
+        "UInt" -> "AtomicU32"
+        "ULong" -> "AtomicU64"
+        "Long" -> "AtomicI64"
+        "U128" -> "AtomicU128"
+        "I128" -> "AtomicI128"
+        "MutPtr", "ConstPtr" -> "AtomicPtr"
+        "Int" -> if (rawPrimIdent == null) "AtomicUsize" else null
+        else -> null
+    }
+}
+
+internal fun atomicOwnerValueRenderedType(ownerSimple: String): String? =
+    when (ownerSimple) {
+        "AtomicBool" -> "Boolean"
+        "AtomicPtr" -> "MutPtr"
+        "AtomicU8" -> "UByte"
+        "AtomicI8" -> "Byte"
+        "AtomicU16" -> "UShort"
+        "AtomicI16" -> "Short"
+        "AtomicU32" -> "UInt"
+        "AtomicI32", "AtomicUsize", "AtomicIsize" -> "Int"
+        "AtomicU64" -> "ULong"
+        "AtomicI64" -> "Long"
+        "AtomicU128" -> "U128"
+        "AtomicI128" -> "I128"
+        else -> null
+    }
+
+internal fun atomicOwnerValueNumericKind(ownerSimple: String): NumericKind? =
+    when (ownerSimple) {
+        "AtomicU8" -> NumericKind.U8
+        "AtomicI8" -> NumericKind.I8
+        "AtomicU16" -> NumericKind.U16
+        "AtomicI16" -> NumericKind.I16
+        "AtomicU32" -> NumericKind.U32
+        "AtomicI32", "AtomicUsize", "AtomicIsize" -> NumericKind.I32
+        "AtomicU64" -> NumericKind.U64
+        "AtomicI64" -> NumericKind.I64
+        "AtomicU128" -> NumericKind.U128
+        "AtomicI128" -> NumericKind.I128
+        else -> null
+    }
