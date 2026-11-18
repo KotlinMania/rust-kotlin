@@ -361,11 +361,11 @@ class SingleFileTranslationTest {
         assertContains(result.text, "check(shift < 64) { \"shift overflow\" }")
         assertContains(result.text, "val scale = F64_POW10[0]")
         assertContains(result.text, "val limit = ULong.MAX_VALUE")
-        assertContains(result.text, "in 49u..57u ->")
+        assertContains(result.text, "in 49u.toUByte()..57u.toUByte() ->")
         assertContains(result.text, "val c = next")
         assertContains(result.text, "val other = next")
         assertContains(result.text, "val matchVal = selfPeek.getOrElse { return Result.failure(it) }")
-        assertContains(result.text, "matchVal != null && (matchVal == 32u || matchVal == 10u || matchVal == 9u || matchVal == 13u) -> Result.success(0u)")
+        assertContains(result.text, "matchVal != null && (matchVal == 32u.toUByte() || matchVal == 10u.toUByte() || matchVal == 9u.toUByte() || matchVal == 13u.toUByte()) -> Result.success(0u)")
     }
 
     @Test fun cliRichOptionsSupportRecursiveBatchStdoutDryRunForceSkipAndHeaderOverrides() {
@@ -586,8 +586,8 @@ class SingleFileTranslationTest {
         assertContains(kt, "code.toInt() + (code - 1u).toInt()")
         assertContains(kt, "for (unused in 0 until 4)")
         assertContains(kt, "for (unused1 in 0 until 2)")
-        assertContains(kt, "48u -> { 0 }")
-        assertContains(kt, "in 49u..57u -> {")
+        assertContains(kt, "48u.toUByte() -> { 0 }")
+        assertContains(kt, "in 49u.toUByte()..57u.toUByte() -> {")
         assertContains(kt, "0xFFu.toUByte() -> { return -1 }")
         assertContains(kt, "0x1F")
         assertContains(kt, "0xC0")

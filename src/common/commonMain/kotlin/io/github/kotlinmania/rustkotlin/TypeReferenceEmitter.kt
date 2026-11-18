@@ -631,9 +631,38 @@ internal fun KotlinJ2KEmitter.hasNoTopLevelSpacesOrColons(text: String): Boolean
 
 internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): String =
     when (ty) {
-        is SynType.Reference ->
-            if (ty.mutability != null && unwrapSynType(ty.elem) is SynType.Slice) {
-                "MutableList<${renderType((unwrapSynType(ty.elem) as SynType.Slice).elem, selfTypeName)}>"
+        is SynType.Reference -> {
+            val mutElem = if (ty.mutability != null) unwrapSynType(ty.elem) else null
+            val mutVecElemType =
+                if (mutElem is SynType.Path &&
+                    mutElem.qself == null &&
+                    "Vec" !in inspector.declaredTypeNames
+                ) {
+                    val segs = mutElem.path.segments.toList()
+                    val lastSeg = segs.lastOrNull()
+                    val prefixOk =
+                        segs.dropLast(1).all { seg ->
+                            val raw = seg.ident.toString().removePrefix("r#")
+                            raw in STDLIB_TYPE_PATH_PREFIXES || raw == "vec"
+                        }
+                    if (prefixOk && lastSeg?.ident?.toString()?.removePrefix("r#") == "Vec") {
+                        (lastSeg.arguments as? PathArguments.AngleBracketed)
+                            ?.args
+                            ?.toList()
+                            .orEmpty()
+                            .filterIsInstance<GenericArgument.TypeArg>()
+                            .firstOrNull()
+                            ?.type
+                    } else {
+                        null
+                    }
+                } else {
+                    null
+                }
+            if (mutElem is SynType.Slice) {
+                "MutableList<${renderType(mutElem.elem, selfTypeName)}>"
+            } else if (mutVecElemType != null) {
+                "MutableList<${renderType(mutVecElemType, selfTypeName)}>"
             } else if (ty.mutability != null && shouldUseAddressBackedMutableReference(ty.elem, selfTypeName)) {
                 val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
                 CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.RustMutableReference")
@@ -641,6 +670,7 @@ internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): St
             } else {
                 renderType(ty.elem, selfTypeName)
             }
+        }
         is SynType.Ptr -> renderPointerType(ty, selfTypeName)
         is SynType.Slice -> "List<${renderType(ty.elem, selfTypeName)}>"
         is SynType.Array -> {

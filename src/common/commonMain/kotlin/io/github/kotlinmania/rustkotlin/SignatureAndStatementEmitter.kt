@@ -1119,8 +1119,7 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
                 val defaultSuffix =
                     if (gp.default?.expr != null) {
                         " = ${renderExpr(gp.default!!.expr, "", selfTypeName)}"
-                    } else if (!isInterfaceMethod &&
-                        "override" !in openPrefix &&
+                    } else if ("override" !in openPrefix &&
                         "actual" !in openPrefix &&
                         "expect" !in visPrefix &&
                         (
@@ -1362,6 +1361,38 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
             excludeNames = excludedParams,
             extraDeclaredNames = liftedAssocNames,
         )
+    val attachedTraitBase =
+        currentAttachedImplTraitPath
+            ?.segments
+            ?.last()
+            ?.ident
+            ?.toString()
+            ?.removePrefix("r#")
+            ?.let(::rustTypeIdentToKotlin)
+    val externalOverridableStdlibTraits =
+        setOf(
+            "Read",
+            "Write",
+            "BufRead",
+            "Seek",
+            "Clone",
+            "Iterator",
+            "DoubleEndedIterator",
+            "ExactSizeIterator",
+            "BitOr",
+            "BitAnd",
+            "BitXor",
+            "Not",
+            "Add",
+            "Sub",
+            "Mul",
+            "Div",
+            "Rem",
+            "Neg",
+            "Shl",
+            "Shr",
+            "PanicPayload",
+        )
     val isKotlinAnyOverride =
         !asTopLevelExtension &&
             !isCompanionMember &&
@@ -1370,6 +1401,12 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
             (hasReceiver || currentAttachedImplIsObjectOwner) &&
             (
                 effectiveFnName in currentStructOverrideMethodNames ||
+                    (
+                        hasReceiver &&
+                            attachedTraitBase != null &&
+                            attachedTraitBase in currentAttachedStructSuperTraitBaseNames &&
+                            attachedTraitBase in externalOverridableStdlibTraits
+                    ) ||
                     (effectiveFnName == "toString" && params.isEmpty()) ||
                     (effectiveFnName == "hashCode" && params.isEmpty()) ||
                     (effectiveFnName == "equals" && params.size == 1 && params[0].endsWith(": Any?"))
@@ -1407,11 +1444,20 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
         }
     val inlinePrefix = if (reifiedFnTypeParams.isNotEmpty()) "inline " else ""
     val selfBaseForOp = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
+    val kotlinBuiltinArithTypes =
+        setOf("Byte", "Short", "Int", "Long", "UByte", "UShort", "UInt", "ULong", "Float", "Double")
     val operatorPrefix =
         if (hasReceiver &&
             (
                 (effectiveFnName == "compareTo" && renderedReturnType == "Int" && params.size == 1) ||
-                    (effectiveFnName == "not" && params.isEmpty() && selfBaseForOp != "Boolean")
+                    (effectiveFnName == "not" && params.isEmpty() && selfBaseForOp != "Boolean") ||
+                    (
+                        (effectiveFnName == "div" || effectiveFnName == "rem") &&
+                            params.size == 1 &&
+                            !params[0].contains('=') &&
+                            !params[0].trimStart().startsWith("vararg ") &&
+                            !(selfBaseForOp in kotlinBuiltinArithTypes && baseParamTypeSignatureKeys.singleOrNull() in kotlinBuiltinArithTypes)
+                    )
             )
         ) {
             "operator "
@@ -3095,6 +3141,21 @@ internal fun KotlinJ2KEmitter.recordLocalInferredType(
                     currentTypedLocals = currentTypedLocals + (ktName to elemTy)
                 }
             }
+        } else if (unwrappedPat is Pat.Tuple) {
+            val tupTy = inferExprRenderedType(initExpr, selfTypeName)?.removeSuffix("?")?.trim()
+            if (tupTy != null && (tupTy.startsWith("Pair<") || tupTy.startsWith("Triple<")) && tupTy.endsWith(">")) {
+                val elemTypes = PhantomRawPointerTypeStripper.splitTopLevelCommaList(tupTy.substringAfter('<').dropLast(1))
+                val patElems = unwrappedPat.elems.toList()
+                val count = minOf(patElems.size, elemTypes.size)
+                for (idx in 0 until count) {
+                    val pIdent = (unwrapTransparentPat(patElems[idx]) as? Pat.Ident)?.ident?.toString()?.removePrefix("r#") ?: continue
+                    val ktName = scopeBuilder.resolveLocalKotlinName(pIdent) ?: rustValueIdentToKotlin(pIdent)
+                    val elemTy = elemTypes[idx].trim()
+                    if (elemTy.isNotEmpty()) {
+                        currentTypedLocals = currentTypedLocals + (ktName to elemTy)
+                    }
+                }
+            }
         }
         return
     }
@@ -3418,6 +3479,28 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
         } else {
             null
         }
+    if (divergeBody != null && !patText.startsWith("(")) {
+        if (coreResultLetElseInfo == null) {
+            val prevLocalTy = currentTypedLocals[patText]
+            if (prevLocalTy != null && prevLocalTy.endsWith("?")) {
+                currentTypedLocals = currentTypedLocals + (patText to prevLocalTy.removeSuffix("?"))
+            }
+            currentNullableLocals = currentNullableLocals - patText
+        } else {
+            val resTy = inferExprRenderedType(initExpr, selfTypeName)?.removeSuffix("?")?.trim()
+            val payloadTy =
+                if (coreResultLetElseInfo.first.endsWith(".Ok")) {
+                    rustResultOkPayloadType(resTy)
+                } else if (coreResultLetElseInfo.first.endsWith(".Err")) {
+                    resolveEnclosingResultTypeArguments(resTy)?.second
+                } else {
+                    null
+                }
+            if (isUsableExplicitResultTypeArg(payloadTy)) {
+                currentTypedLocals = currentTypedLocals + (patText to payloadTy!!)
+            }
+        }
+    }
     val typeSuffix = if (typeAnnotation != null && !patText.startsWith("(")) ": $typeAnnotation" else ""
     return if (coreResultLetElseInfo != null && divergeBody != null) {
         val divergeVariant =

@@ -889,10 +889,39 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
                 }
                 val recvRendered = lazyRecvType
                 val recvBase = recvRendered?.removeSuffix("?")?.substringBefore('<')?.trim()
-                if (recvBase == "NonNull" || recvBase?.endsWith(".NonNull") == true) {
+                val mutPtrBaseSet = setOf("NonNull", "Unique", "BoxRaw")
+                if (recvBase != null &&
+                    (recvBase in mutPtrBaseSet || mutPtrBaseSet.any { recvBase.endsWith(".$it") })
+                ) {
                     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
                     CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.MutPtr")
                     return "MutPtr"
+                }
+                if (rawMethod in
+                    setOf(
+                        "add",
+                        "sub",
+                        "offset",
+                        "byte_add",
+                        "byte_sub",
+                        "byte_offset",
+                        "wrapping_add",
+                        "wrapping_sub",
+                        "wrapping_offset",
+                        "wrapping_byte_add",
+                        "wrapping_byte_sub",
+                        "wrapping_byte_offset",
+                        "cast",
+                        "with_addr",
+                        "map_addr",
+                    )
+                ) {
+                    if (recvBase == "MutPtr" || recvBase?.endsWith(".MutPtr") == true) {
+                        return "MutPtr"
+                    }
+                    if (recvBase == "ConstPtr" || recvBase?.endsWith(".ConstPtr") == true) {
+                        return "ConstPtr"
+                    }
                 }
                 val elemRendered = recvRendered?.let { extractIndexedElementRenderedType(it, selfTypeName) }
                 if (elemRendered != null) {

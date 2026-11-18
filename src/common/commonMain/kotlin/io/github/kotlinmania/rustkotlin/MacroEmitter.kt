@@ -912,7 +912,14 @@ internal fun KotlinJ2KEmitter.renderLit(lit: Lit): String =
             val text = lit.value.value().decodeToString()
             renderKotlinDoubleQuotedString(text)
         }
-        is Lit.Byte -> "${lit.value.value()}u"
+        is Lit.Byte ->
+            when (currentExpectedNumericKind) {
+                NumericKind.U32 -> "${lit.value.value()}u"
+                NumericKind.U64 -> "${lit.value.value()}uL"
+                NumericKind.I32 -> "${lit.value.value()}"
+                NumericKind.I64 -> "${lit.value.value()}L"
+                else -> "${lit.value.value()}u.toUByte()"
+            }
         is Lit.Char -> renderKotlinCharLiteral(lit.value.value())
         is Lit.Int -> {
             val suffix = lit.value.suffix()

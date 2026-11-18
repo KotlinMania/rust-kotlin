@@ -912,7 +912,7 @@ class SingleFileTranslationSynAndMacrosTest {
         assertFalse(kt.contains("\\uf63b"))
         assertFalse(kt.contains("\\uf680"))
         assertFalse(kt.contains("&mut"))
-        assertContains(kt, "checkByte(\"\\\\x5a\", 90u)")
+        assertContains(kt, "checkByte(\"\\\\x5a\", 90u.toUByte())")
         assertContains(kt, "checkByte(\"\\\\x7f\", 127u)")
         assertContains(kt, "checkByte(\"\\\\xff\", 255u)")
     }

@@ -14,6 +14,7 @@ import io.github.kotlinmania.syn.Lit
 import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.Pat
 import io.github.kotlinmania.syn.PathArguments
+import io.github.kotlinmania.syn.ReceiverKind
 import io.github.kotlinmania.syn.Signature
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.UnOp
@@ -941,7 +942,8 @@ internal fun KotlinJ2KEmitter.computeRequiredTypeLayoutParameters(
     }.visitBlock(block)
 
     val paramSynTypes = linkedMapOf<String, SynType>()
-    if (sig.inputs.firstOrNull() is FnArg.Receiver && currentStandaloneImplSelfSynType != null) {
+    val recvArg = sig.inputs.firstOrNull() as? FnArg.Receiver
+    if (recvArg != null && recvArg.kind !is ReceiverKind.Reference && currentStandaloneImplSelfSynType != null) {
         paramSynTypes["self"] = requireNotNull(currentStandaloneImplSelfSynType)
     }
     for (input in sig.inputs.toList()) {
@@ -985,6 +987,26 @@ internal fun KotlinJ2KEmitter.computeRequiredTypeLayoutParameters(
                     ?.toString()
                     ?.removePrefix("r#")
             paramSynTypes[raw]?.let { return it }
+        }
+        if (unwrapped is Expr.Unary && unwrapped.op is UnOp.Deref) {
+            val innerPath = unwrapParenOrGroupExpr(unwrapped.expr) as? Expr.Path
+            if (recvArg != null &&
+                recvArg.kind is ReceiverKind.Reference &&
+                currentStandaloneImplSelfSynType != null &&
+                innerPath != null &&
+                innerPath.qself == null &&
+                innerPath.path.segments.size == 1 &&
+                innerPath.path.segments
+                    .first()
+                    ?.ident
+                    ?.toString() == "self"
+            ) {
+                return currentStandaloneImplSelfSynType
+            }
+            val refTy = inferLocalSynType(unwrapped.expr)
+            if (refTy is SynType.Reference) {
+                return refTy.elem
+            }
         }
         if (unwrapped is Expr.Cast) return unwrapped.ty
         return null

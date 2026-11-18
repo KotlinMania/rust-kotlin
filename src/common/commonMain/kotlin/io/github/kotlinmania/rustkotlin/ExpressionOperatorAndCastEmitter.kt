@@ -19,6 +19,23 @@ private fun KotlinJ2KEmitter.classifyDerefPlaceKind(
     selfTypeName: String?,
     includeRefCellGuard: Boolean,
 ): DerefPlaceKind? {
+    val unwrapped = unwrapParenOrGroupExpr(expr)
+    if (unwrapped is Expr.Path && unwrapped.qself == null && unwrapped.path.segments.size == 1) {
+        val raw =
+            unwrapped.path.segments
+                .first()!!
+                .ident
+                .toString()
+                .removePrefix("r#")
+        if (raw == "self" && currentReceiverIsSharedBorrow) {
+            return null
+        }
+        val ktLocal = scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
+        val srcTy = currentSourceParameterTypes[ktLocal] ?: currentSourceParameterTypes[raw]
+        if (srcTy is SynType.Reference && srcTy.mutability == null) {
+            return null
+        }
+    }
     val renderedTy = inferExprRenderedType(expr, selfTypeName)
     return when {
         rawPointerPointeeType(renderedTy) != null -> DerefPlaceKind.RAW_POINTER

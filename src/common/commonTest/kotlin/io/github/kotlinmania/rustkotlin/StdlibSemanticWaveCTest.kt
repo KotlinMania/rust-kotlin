@@ -808,14 +808,14 @@ class StdlibSemanticWaveCTest {
                     ),
             )
         ZeroUnderscoreIdentifierValidator.requireZeroViolations(out, "WaveC3Sample.kt")
-        assertContains(out, "public open fun okValue(): T = error(\"not Ok\")")
-        assertContains(out, "public open fun errValue(): E = error(\"not Err\")")
-        assertContains(out, "public override fun okValue(): T = value")
-        assertContains(out, "public override fun errValue(): E = value")
-        assertContains(out, "public open fun cfBreakValue(): B = error(\"not Break\")")
-        assertContains(out, "public open fun cfContinueValue(): C = error(\"not Continue\")")
-        assertContains(out, "public override fun cfBreakValue(): B = value")
-        assertContains(out, "public override fun cfContinueValue(): C = value")
+        assertContains(out, "public fun okValue(): T = when (this) { is Ok -> value; is Err -> error(\"not Ok\") }")
+        assertContains(out, "public fun errValue(): E = when (this) { is Err -> value; is Ok -> error(\"not Err\") }")
+        assertFalse(out.contains("override fun okValue"), "Result.Ok must not override okValue():\n$out")
+        assertFalse(out.contains("override fun errValue"), "Result.Err must not override errValue():\n$out")
+        assertContains(out, "public fun cfBreakValue(): B = when (this) { is Break -> value; is Continue -> error(\"not Break\") }")
+        assertContains(out, "public fun cfContinueValue(): C = when (this) { is Continue -> value; is Break -> error(\"not Continue\") }")
+        assertFalse(out.contains("override fun cfBreakValue"), "ControlFlow.Break must not override cfBreakValue():\n$out")
+        assertFalse(out.contains("override fun cfContinueValue"), "ControlFlow.Continue must not override cfContinueValue():\n$out")
         assertContains(out, "is Result.Ok<*, *> -> tryResult.okValue()")
         assertContains(out, "tryResult.cfContinueValue()")
         assertContains(out, "tryResult.cfBreakValue()")
@@ -1429,5 +1429,116 @@ class StdlibSemanticWaveCTest {
         assertContains(out, "public typealias CmpResult = Int")
         assertContains(out, "Pair(transmuteWithLayouts<PairArg, VectorUnsignedChar>(x")
         assertFalse(out.contains("Pair<VectorUnsignedChar, Int>>("), "Tuple transmute must target element type:\n$out")
+    }
+
+    @Test
+    fun waveC9ResultNonErasingOkValueRawPtrSharedBorrowAtomicSliceCloneAndMutVec() {
+        val rustSource =
+            """
+            use alloc::vec::Vec;
+            use core::fmt::Write;
+            use core::ptr::NonNull;
+            use core::ptr::is_dangling;
+            use crate::os::raw as raw_mod;
+
+            pub struct Holder<T>(T);
+
+            pub trait MyClone {
+                fn my_clone(&self) -> Self;
+            }
+
+            impl<T: ?Sized> MyClone for *const T {
+                fn my_clone(&self) -> *const T {
+                    *self
+                }
+            }
+
+            pub trait ArrayReader {
+                fn read_bytes<const N: usize>(&mut self) -> [u8; N];
+            }
+
+            pub struct MyReader;
+
+            impl core::io::Read for MyReader {
+                fn read(&mut self, buf: &mut [u8]) -> core::io::Result<usize> {
+                    let _ = buf.len();
+                    Ok(0)
+                }
+            }
+
+            pub struct MyWrap(pub i32);
+
+            impl MyWrap {
+                pub fn div(self, rhs: Self) -> Self {
+                    MyWrap(self.0 / rhs.0)
+                }
+            }
+
+            pub fn push_and_check(
+                buf: &mut Vec<u8>,
+                s: &str,
+                flag: &core::sync::atomic::AtomicBool,
+                ptr: NonNull<u8>,
+                f: &mut core::fmt::Formatter,
+                iter: &mut dyn Iterator<Item = Result<Holder<i32>, core::fmt::Error>>,
+            ) -> i32 {
+                let empty = String::new();
+                let _n = empty.len() + s.len() + buf.len() + iter.len();
+                let _b = flag.load(std::sync::atomic::Ordering::Acquire);
+                let c: raw_mod::c_int = 0;
+                let _cloned = ptr.clone();
+                let _ = is_dangling(ptr.as_ptr());
+                let _ = Write::write_fmt(f, format_args!("ok"));
+                let opt: Option<u16> = Some(7);
+                let Some(val_u16) = opt else { return 0; };
+                while let Some(res) = iter.next() {
+                    while let Ok(inner) = res {
+                        let _h: Holder<i32> = inner;
+                        break;
+                    }
+                    break;
+                }
+                let ch: u8 = b'a';
+                if ch == 97 { val_u16 as i32 } else { 0 }
+            }
+            """
+        val out =
+            translateRustSourceToKotlin(
+                recognizeRust(rustSource.trimIndent()),
+                headerContext =
+                    FileHeaderContext(
+                        packageName = "io.github.kotlinmania.rustlang.std.sample",
+                        projectNamespace = "io.github.kotlinmania.rustlang.std",
+                        crateNamespaces =
+                            mapOf(
+                                "core" to "io.github.kotlinmania.rustlang.core",
+                                "alloc" to "io.github.kotlinmania.rustlang.alloc",
+                                "std" to "io.github.kotlinmania.rustlang.std",
+                            ),
+                    ),
+            )
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(out, "WaveC9Sample.kt")
+        assertContains(out, "import io.github.kotlinmania.rustlang.core.clone.clone")
+        assertContains(out, "import io.github.kotlinmania.rustlang.core.ffi.primitives.CInt")
+        assertContains(out, "import io.github.kotlinmania.rustlang.core.slice.len")
+        assertContains(out, "import io.github.kotlinmania.rustlang.core.str.len")
+        assertContains(out, "import io.github.kotlinmania.rustlang.core.sync.atomic.Ordering")
+        assertContains(out, "import io.github.kotlinmania.rustlang.core.sync.atomic.load")
+        assertContains(out, "buf: MutableList<UByte>")
+        assertContains(out, "public fun ConstPtr.myClone(): ConstPtr {\n    return this\n}")
+        assertFalse(out.contains("readNative((this).rawAddress)"), "Shared-borrow *self on raw ptr must not deref:\n$out")
+        assertContains(out, "public fun readBytes(n: Int = 0)")
+        assertContains(out, "public override fun read(buf: MutableList<UByte>)")
+        assertContains(out, "public open operator fun div(rhs: MyWrap): MyWrap")
+        assertContains(out, "val empty = \"\"")
+        assertContains(out, "f.append(")
+        assertContains(out, "Ordering.Acquire")
+        assertContains(out, "val c: CInt = 0")
+        assertFalse(out.contains("import io.github.kotlinmania.rustlang.std.os.raw"), "os.raw module alias import must be stripped:\n$out")
+        assertContains(out, "isDangling((ptr.asPtr()).asConstPtr())")
+        assertContains(out, "val ch: UByte = 97u.toUByte()")
+        assertContains(out, "ch == 97u.toUByte()")
+        assertFalse(out.contains(" as Result.Ok<*, *>"), "Result.Ok must not erase payload via star cast:\n$out")
+        assertFalse(out.contains(" as RustResult.Ok<*, *>"), "RustResult.Ok must not erase payload via star cast:\n$out")
     }
 }
