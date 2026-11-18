@@ -685,6 +685,37 @@ internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
     if (rawSegStrings.size < 2) return null
     val firstRaw = rawSegStrings.first().removePrefix("r#")
     if (firstRaw in inspector.localInlineModuleNames) return null
+    val secondCleanEarly = rawSegStrings.getOrNull(1)?.removePrefix("r#")
+    val thirdCleanEarly = rawSegStrings.getOrNull(2)?.removePrefix("r#")
+    if (!headerContext.rawAbiMode &&
+        headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true &&
+        rawSegStrings.size in 4..5 &&
+        firstRaw in setOf("core", "std", "crate") &&
+        secondCleanEarly == "sync" &&
+        thirdCleanEarly == "atomic"
+    ) {
+        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+        if (rawSegStrings.size == 5) {
+            val ownerSym = rawSegStrings[3].removePrefix("r#")
+            if (ownerSym.firstOrNull()?.isUpperCase() == true) {
+                return "$coreNs.sync.atomic.${rustTypeIdentToKotlin(ownerSym)}" to listOf(rawSegStrings[4])
+            }
+        } else {
+            val sym = rawSegStrings[3].removePrefix("r#")
+            val ktSym = if (sym.firstOrNull()?.isUpperCase() == true) rustTypeIdentToKotlin(sym) else rustFunctionIdentToKotlin(sym)
+            return "$coreNs.sync.atomic.$ktSym" to emptyList()
+        }
+    }
+    val coreMemIntrinsics =
+        setOf("transmute", "transmute_unchecked", "size_of", "size_of_val", "align_of", "align_of_val", "needs_drop", "forget")
+    if (rawSegStrings.size == 3 &&
+        firstRaw in setOf("core", "std", "crate") &&
+        secondCleanEarly == "intrinsics" &&
+        thirdCleanEarly != null &&
+        thirdCleanEarly in coreMemIntrinsics
+    ) {
+        return "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.mem.${rustFunctionIdentToKotlin(thirdCleanEarly)}" to emptyList()
+    }
     if (firstRaw == "std" || firstRaw == "alloc" || firstRaw == "Self" || firstRaw in PRIMITIVE_TYPE_NAMES) return null
     if (rawSegStrings.dropLast(1).any { it.removePrefix("r#") in STDLIB_PRELUDE_REEXPORT_MODULES }) {
         return null
@@ -706,16 +737,6 @@ internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
         )
     ) {
         return null
-    }
-    val coreMemIntrinsics =
-        setOf("transmute", "transmute_unchecked", "size_of", "size_of_val", "align_of", "align_of_val", "needs_drop", "forget")
-    if (rawSegStrings.size == 3 &&
-        firstRaw in setOf("core", "std", "crate") &&
-        secondClean == "intrinsics" &&
-        thirdClean != null &&
-        thirdClean in coreMemIntrinsics
-    ) {
-        return "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.mem.${rustFunctionIdentToKotlin(thirdClean)}" to emptyList()
     }
     if (firstRaw == "core") {
         val isCrateCoreModule =
@@ -819,6 +840,18 @@ internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
             (importedPath == "core.intrinsics" || importedPath == "std.intrinsics" || importedPath == "$coreNs.intrinsics")
         ) {
             return "$coreNs.mem.${rustFunctionIdentToKotlin(rest[0].removePrefix("r#"))}" to emptyList()
+        }
+        if (rest.size == 1 &&
+            !headerContext.rawAbiMode &&
+            (importedPath.endsWith(".os.raw") || importedPath.endsWith(".ffi"))
+        ) {
+            val cLeaf = rest[0].removePrefix("r#")
+            if (cLeaf == "CString") {
+                resolveStdlibFfiSymbolImport("CString", isAllocCString = true)?.let { return it to emptyList() }
+            }
+            if (cLeaf in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS) {
+                resolveStdlibFfiSymbolImport(cLeaf)?.let { return it to emptyList() }
+            }
         }
         val isSameCrateImport =
             nsPrefix != null && (importedPath == nsPrefix || importedPath.startsWith("$nsPrefix."))
@@ -1521,6 +1554,29 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
         setOf("transmute", "transmute_unchecked", "size_of", "size_of_val", "align_of", "align_of_val", "needs_drop", "forget")
     ) {
         return "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.mem.${rustFunctionIdentToKotlin(cleanSegsEarly[2])}"
+    }
+    if (!isSelfImport &&
+        !headerContext.rawAbiMode &&
+        headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true &&
+        cleanSegsEarly.size in 4..5 &&
+        cleanSegsEarly[0] in setOf("core", "std", "crate") &&
+        cleanSegsEarly[1] == "sync" &&
+        cleanSegsEarly[2] == "atomic"
+    ) {
+        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+        if (cleanSegsEarly.size == 5 && cleanSegsEarly[3] == "Ordering") {
+            return "$coreNs.sync.atomic.Ordering.${rustTypeIdentToKotlin(cleanSegsEarly[4])}"
+        }
+        if (cleanSegsEarly.size == 4 && cleanSegsEarly[3] != "*") {
+            val s = cleanSegsEarly[3]
+            val ktSym =
+                when {
+                    forceTypeLeaf || s.firstOrNull()?.isUpperCase() == true -> rustTypeIdentToKotlin(s)
+                    isKnownFunctionLeafIdent(s) -> rustFunctionIdentToKotlin(s)
+                    else -> rustValueIdentToKotlin(s)
+                }
+            return "$coreNs.sync.atomic.$ktSym"
+        }
     }
     if (root == "libc" && FfiInteropCollector.resolveLibcNamespace(headerContext) == null) {
         return null

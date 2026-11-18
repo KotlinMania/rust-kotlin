@@ -570,6 +570,21 @@ internal fun KotlinJ2KEmitter.isFmtWriteOrUnitExpr(expr: Expr, selfTypeName: Str
         ) {
             return true
         }
+        if (tailPair == "Write.write_fmt" && core.args.size == 2) {
+            val targetArg = core.args[0]
+            val targetIdent =
+                (unwrapParenOrGroupExpr(targetArg) as? Expr.Path)
+                    ?.takeIf { it.qself == null && it.path.segments.len() == 1 }
+                    ?.path
+                    ?.segments
+                    ?.first()
+                    ?.ident
+                    ?.toString()
+                    ?.removePrefix("r#")
+            if (isFmtStringBuilderReceiver(targetArg, targetIdent.orEmpty(), selfTypeName)) {
+                return true
+            }
+        }
     }
     val inferred = inferExprRenderedType(core, selfTypeName)?.removeSuffix("?")?.trim()
     return inferred in setOf("Unit", "Appendable", "StringBuilder")

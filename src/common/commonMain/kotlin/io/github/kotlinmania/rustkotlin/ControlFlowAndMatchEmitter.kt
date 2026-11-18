@@ -331,9 +331,21 @@ internal fun KotlinJ2KEmitter.renderExprWhile(expr: Expr.While, indent: String, 
                                 "${innerIndent}if ($subjectVar !is ${condCheck.removePrefix("$subjectVar is ")}) break"
                             else -> "${innerIndent}if (!($condCheck)) break"
                         }
+                    val isWhileSmartCast =
+                        condCheck.startsWith("$subjectVar is ") &&
+                            !condCheck.contains(" && ") &&
+                            !condCheck.contains(" || ") &&
+                            isStarProjectedOrPlainCheckType(condCheck.removePrefix("$subjectVar is ").trim())
                     val bindingLines =
                         listOf("${innerIndent}val $subjectVar = $rhsText", breakLine) +
-                            extractMatchArmBindings(cond.pat, subjectVar, innerIndent, selfTypeName, bindToScope = true)
+                            extractMatchArmBindings(
+                                cond.pat,
+                                subjectVar,
+                                innerIndent,
+                                selfTypeName,
+                                bindToScope = true,
+                                subjectAlreadySmartCast = isWhileSmartCast,
+                            )
                     recordOptionLetPatternLocalTypes(cond.pat, cond.expr, selfTypeName)
                     renderBlock(
                         block = expr.body,
@@ -1859,11 +1871,20 @@ internal fun KotlinJ2KEmitter.collectPatternGuardAccessMap(
             } else {
                 val coreResultInfo = coreResultVariantMatchInfo(pat) ?: controlFlowVariantMatchInfo(pat)
                 if (coreResultInfo != null && elems.size == 1 && elems[0] !is Pat.Rest) {
-                    val recv =
-                        if (allowSmartCast && scopeBuilder.isSmartCastableLocalKotlinName(subjectText)) {
+                    val scrutineeTy = resolveScrutineeRenderedType(subjectText, selfTypeName, fallbackToSelf = false)
+                    val isCf = coreResultInfo.first.startsWith("ControlFlow.")
+                    val isSmartCastSubject = allowSmartCast && scopeBuilder.isSmartCastableLocalKotlinName(subjectText)
+                    val subjectAtom =
+                        if (subjectText.all { it.isLetterOrDigit() || it == '_' || it == '.' }) {
                             subjectText
                         } else {
+                            "($subjectText)"
+                        }
+                    val recv =
+                        if (!isSmartCastSubject && isErasedResultOrControlFlowScrutinee(scrutineeTy, isCf)) {
                             "($subjectText as ${coreResultInfo.first}<*, *>)"
+                        } else {
+                            subjectAtom
                         }
                     collectPatternGuardAccessMap(elems[0], "$recv.${coreResultInfo.second}", selfTypeName, out, allowSmartCast)
                 } else {
@@ -2025,9 +2046,17 @@ internal fun KotlinJ2KEmitter.extractMatchArmBindings(
                             usedBodyIdents != null &&
                             rawSubIdent !in usedBodyIdents
                     val lines = mutableListOf<String>()
+                    val scrutineeTy = resolveScrutineeRenderedType(subjectText, selfTypeName, fallbackToSelf = false)
+                    val isCf = coreResultInfo.first.startsWith("ControlFlow.")
+                    val subjectAtom =
+                        if (subjectText.all { it.isLetterOrDigit() || it == '_' || it == '.' }) {
+                            subjectText
+                        } else {
+                            "($subjectText)"
+                        }
                     val accessTarget =
-                        if (subjectAlreadySmartCast) {
-                            "$subjectText.${coreResultInfo.second}"
+                        if (subjectAlreadySmartCast || !isErasedResultOrControlFlowScrutinee(scrutineeTy, isCf)) {
+                            "$subjectAtom.${coreResultInfo.second}"
                         } else {
                             "($subjectText as ${coreResultInfo.first}<*, *>).${coreResultInfo.second}"
                         }
@@ -2330,9 +2359,21 @@ internal fun KotlinJ2KEmitter.tupleIndexExpr(subjectText: String, idx: Int, arit
         else -> "$subjectText[$idx]"
     }
 
+private fun isErasedResultOrControlFlowScrutinee(
+    renderedType: String?,
+    isControlFlow: Boolean,
+): Boolean {
+    val clean = renderedType?.removeSuffix("?")?.trim() ?: return false
+    if (clean in setOf("Any", "RustAny", "*", "Nothing")) return true
+    if (clean.length == 1 && clean[0] in 'A'..'Z') return true
+    val base = clean.substringBefore('<').substringAfterLast('.').trim()
+    return if (isControlFlow) base != "ControlFlow" else base != "Result" && base != "RustResult"
+}
+
 private fun KotlinJ2KEmitter.resolveScrutineeRenderedType(
     subjectText: String,
     selfTypeName: String?,
+    fallbackToSelf: Boolean = true,
 ): String? {
     currentTypedLocals[subjectText]?.let { return it }
     val dotIdx = subjectText.lastIndexOf('.')
@@ -2359,7 +2400,10 @@ private fun KotlinJ2KEmitter.resolveScrutineeRenderedType(
             }
         }
     }
-    return selfTypeName
+    if (subjectText == "this") {
+        return currentTypedLocals["this"] ?: selfTypeName
+    }
+    return if (fallbackToSelf) selfTypeName else null
 }
 
 private fun KotlinJ2KEmitter.qualifyShadowedPatternVariantType(

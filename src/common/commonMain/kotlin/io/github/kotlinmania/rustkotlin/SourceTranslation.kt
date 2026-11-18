@@ -930,6 +930,7 @@ internal class KotlinJ2KEmitter(
     internal var currentWitnessedTraitBounds: Map<String, Set<String>> = emptyMap()
     internal var currentTypeParamTraitBounds: Map<String, Set<String>> = emptyMap()
     internal var currentStructOverrideMethodNames: Set<String> = emptySet()
+    internal var currentAttachedStructSuperTraitBaseNames: Set<String> = emptySet()
     internal var currentAttachedImplIsObjectOwner: Boolean = false
     internal var inTraitDefaultMethodBody: Boolean = false
     internal var currentTraitMethodRawNames: Set<String> = emptySet()
@@ -1612,6 +1613,7 @@ internal class KotlinJ2KEmitter(
                 }
             }
         }
+        val stdlibOverloadExtImports = hashSetOf<String>()
         val isInCoreOrUsingExternalCore =
             usesExternalRustLangCore ||
                 "core" in headerContext.crateNamespaces ||
@@ -1733,6 +1735,7 @@ internal class KotlinJ2KEmitter(
                     "withMetadataOf",
                     "toRawParts",
                     "mask",
+                    "len",
                     "splitAtMut",
                 )
             val constPtrExts =
@@ -1777,6 +1780,7 @@ internal class KotlinJ2KEmitter(
                     "withMetadataOf",
                     "toRawParts",
                     "mask",
+                    "len",
                 )
             val numExts =
                 listOf(
@@ -1821,9 +1825,29 @@ internal class KotlinJ2KEmitter(
                     "midpoint",
                     "castSigned",
                     "castUnsigned",
+                    "isPowerOfTwo",
+                    "nextPowerOfTwo",
+                    "checkedNextPowerOfTwo",
+                    "wrappingNextPowerOfTwo",
+                    "ilog",
+                    "ilog2",
+                    "ilog10",
+                    "checkedIlog",
+                    "checkedIlog2",
+                    "checkedIlog10",
+                    "isqrt",
+                    "checkedIsqrt",
                 )
             val stdlibExts =
                 buildList {
+                    add("clone" to "$activeCoreNs.clone")
+                    add("len" to "$activeCoreNs.slice")
+                    add("iter" to "$activeCoreNs.slice")
+                    add("iterMut" to "$activeCoreNs.slice")
+                    add("splitAt" to "$activeCoreNs.slice")
+                    add("len" to "$activeCoreNs.str")
+                    add("isCharBoundary" to "$activeCoreNs.str")
+                    add("splitAt" to "$activeCoreNs.str")
                     add("splitFirst" to "$activeCoreNs.slice")
                     add("splitFirstMut" to "$activeCoreNs.slice")
                     add("splitLast" to "$activeCoreNs.slice")
@@ -1831,6 +1855,31 @@ internal class KotlinJ2KEmitter(
                     add("splitAtMut" to "$activeCoreNs.slice")
                     add("chunksExact" to "$activeCoreNs.slice")
                     add("chunksExactMut" to "$activeCoreNs.slice")
+                    if (Regex("""\bAtomic(?:Bool|Ptr|I8|U8|I16|U16|I32|U32|I64|U64|I128|U128|Isize|Usize)?\b""")
+                            .containsMatchIn(bodyTextForImports)
+                    ) {
+                        for (atomicExt in listOf(
+                            "load",
+                            "store",
+                            "swap",
+                            "compareExchange",
+                            "compareExchangeWeak",
+                            "fetchAdd",
+                            "fetchSub",
+                            "fetchAnd",
+                            "fetchOr",
+                            "fetchXor",
+                            "fetchNand",
+                            "fetchMax",
+                            "fetchMin",
+                            "fetchUpdate",
+                            "intoInner",
+                            "getMut",
+                            "asPtr",
+                        )) {
+                            add(atomicExt to "$activeCoreNs.sync.atomic")
+                        }
+                    }
                     for (ext in numExts) {
                         add(ext to "$activeCoreNs.num")
                     }
@@ -1855,10 +1904,11 @@ internal class KotlinJ2KEmitter(
                     extName !in inspector.declaredTypeNames &&
                     extName !in inspector.declaredConstNames.values &&
                     extName !in importedSimpleNameToPkg &&
-                    !isDeclaredTopLevelFnKotlinName(extName) &&
+                    (!isDeclaredTopLevelFnKotlinName(extName) || extName == "clone") &&
                     Regex("\\.\\s*$extName\\s*[({<]").containsMatchIn(bodyTextForImports)
                 ) {
                     val imp = "import $extPkg.$extName"
+                    stdlibOverloadExtImports += imp
                     if (imp !in combinedExtraTypeImports) {
                         combinedExtraTypeImports += imp
                     }
@@ -2015,6 +2065,12 @@ internal class KotlinJ2KEmitter(
                 .filter { it.isNotEmpty() }
                 .distinct()
                 .filter { line ->
+                    if (!headerContext.rawAbiMode && headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true) {
+                        val impTarget = line.removePrefix("import ").substringBefore(" as ").trim()
+                        if (impTarget.endsWith(".os.raw") || impTarget.endsWith(".ffi")) {
+                            return@filter false
+                        }
+                    }
                     if (line.endsWith(".*")) {
                         true
                     } else {
@@ -2025,7 +2081,8 @@ internal class KotlinJ2KEmitter(
                             } else {
                                 afterImport.substringAfterLast('.').trim()
                             }
-                        seenImportedSimpleNames.add(boundName)
+                        val firstSeen = seenImportedSimpleNames.add(boundName)
+                        firstSeen || line in stdlibOverloadExtImports
                     }
                 }.let { filtered ->
                     if (headerContext.isBatchCrateOutput || TranslationSession.finalStructs) {

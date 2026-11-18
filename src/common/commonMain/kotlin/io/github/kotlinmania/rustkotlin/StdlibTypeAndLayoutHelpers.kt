@@ -99,6 +99,15 @@ private val STDLIB_CONST_PTR_CALL_PARAM_INDICES: Map<String, Set<Int>> =
         "read_volatile" to setOf(0),
         "slice_from_raw_parts" to setOf(0),
         "align_offset" to setOf(0),
+        "for_value_raw" to setOf(0),
+        "is_dangling" to setOf(0),
+        "Arc::from_raw" to setOf(0),
+        "Arc::from_raw_in" to setOf(0),
+        "Rc::from_raw" to setOf(0),
+        "Rc::from_raw_in" to setOf(0),
+        "Weak::from_raw" to setOf(0),
+        "Weak::from_raw_in" to setOf(0),
+        "UniqueArc::from_raw_with_allocator" to setOf(0),
         "ptr::eq" to setOf(0, 1),
         "ptr::addr_eq" to setOf(0, 1),
         "ptr::hash" to setOf(0),
@@ -338,10 +347,10 @@ internal fun isStdlibConstPtrCallParam(rawSegs: List<String>, paramSyn: SynType?
     val unwrapped = paramSyn?.let(::unwrapSynType)
     if (unwrapped is SynType.Ptr && unwrapped.mutability is PointerMutability.Const) return true
     val leaf = rawSegs.lastOrNull() ?: return false
-    val key = if (rawSegs.size >= 2 && rawSegs[rawSegs.lastIndex - 1] == "ptr") "ptr::$leaf" else leaf
+    val qualKey = if (rawSegs.size >= 2) "${rawSegs[rawSegs.lastIndex - 1]}::$leaf" else leaf
     val indices =
-        STDLIB_CONST_PTR_CALL_PARAM_INDICES[key]
-            ?: if (rawSegs.size >= 2 && rawSegs[rawSegs.lastIndex - 1] == "ptr") STDLIB_CONST_PTR_CALL_PARAM_INDICES[leaf] else null
+        STDLIB_CONST_PTR_CALL_PARAM_INDICES[qualKey]
+            ?: if ('<' !in leaf) STDLIB_CONST_PTR_CALL_PARAM_INDICES[leaf] else null
     return argIdx in indices.orEmpty()
 }
 

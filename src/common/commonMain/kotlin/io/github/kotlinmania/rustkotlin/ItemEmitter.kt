@@ -1607,7 +1607,10 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                 else -> buildTupleStructAliasProperties(item.fields, selfTypeWithGenerics, "$indent    ")
             } + constGenericProps
         val prevOverrideNames = currentStructOverrideMethodNames
+        val prevSuperTraitBases = currentAttachedStructSuperTraitBaseNames
         currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits, ownerIsPublic = (vis == "public "))
+        currentAttachedStructSuperTraitBaseNames =
+            superTraits.mapTo(linkedSetOf()) { it.substringBefore('<').substringAfterLast('.').trim() }
         val memberLines =
             try {
                 renderAttachedImplMembers(
@@ -1624,6 +1627,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                 )
             } finally {
                 currentStructOverrideMethodNames = prevOverrideNames
+                currentAttachedStructSuperTraitBaseNames = prevSuperTraitBases
             }
         if (memberLines.isNotEmpty()) {
             sb.append(" {\n")
@@ -1927,12 +1931,15 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
         }
         if (variants.isEmpty() && typeParams.isEmpty()) {
             val prevOverrideNames = currentStructOverrideMethodNames
+            val prevSuperTraitBases = currentAttachedStructSuperTraitBaseNames
             currentStructOverrideMethodNames =
                 collectLocalSupertraitMethodNames(
                     superTraits,
                     includeReceiverlessMethods = true,
                     ownerIsPublic = (vis == "public "),
                 )
+            currentAttachedStructSuperTraitBaseNames =
+                superTraits.mapTo(linkedSetOf()) { it.substringBefore('<').substringAfterLast('.').trim() }
             val attachedMembers =
                 try {
                     renderAttachedImplMembers(
@@ -1945,6 +1952,7 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
                     )
                 } finally {
                     currentStructOverrideMethodNames = prevOverrideNames
+                    currentAttachedStructSuperTraitBaseNames = prevSuperTraitBases
                 }
             sb
                 .append(indent)
@@ -1982,7 +1990,9 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
                     traitIdent == "Clone" || traitIdent == "Default"
                 }
             val prevOverrideNames = currentStructOverrideMethodNames
+            val prevSuperTraitBases = currentAttachedStructSuperTraitBaseNames
             currentStructOverrideMethodNames = emptySet()
+            currentAttachedStructSuperTraitBaseNames = emptySet()
             val attachedMembers =
                 try {
                     renderAttachedImplMembers(
@@ -1995,6 +2005,7 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
                     )
                 } finally {
                     currentStructOverrideMethodNames = prevOverrideNames
+                    currentAttachedStructSuperTraitBaseNames = prevSuperTraitBases
                 }
             if (useFinalAbiLayout || headerContext.isBatchCrateOutput) {
                 sb
@@ -2061,7 +2072,10 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
 
         val enumAssocTypeParamNames = sourceAssociatedParameters(item.generics).map { it.associated }
         val prevOverrideNames = currentStructOverrideMethodNames
+        val prevSuperTraitBases = currentAttachedStructSuperTraitBaseNames
         currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits, ownerIsPublic = (vis == "public "))
+        currentAttachedStructSuperTraitBaseNames =
+            superTraits.mapTo(linkedSetOf()) { it.substringBefore('<').substringAfterLast('.').trim() }
         activeTypeParamNames = prevEnumTypeParams + declaredEnumTpNames + enumParamRenames.values + enumAssocTypeParamNames
         activeConstParamNames = prevEnumConstParams + collectGenericConstParamNames(item.generics)
         val attachedMembers =
@@ -2078,6 +2092,7 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
                 activeConstParamNames = prevEnumConstParams
                 activeTypeParamNames = prevEnumTypeParams
                 currentStructOverrideMethodNames = prevOverrideNames
+                currentAttachedStructSuperTraitBaseNames = prevSuperTraitBases
             }
         val hasDiscriminants = isSimpleEnum && typeParams.isEmpty() && variants.any { it.discriminant != null }
         val reprKotlinType = if (hasDiscriminants) (extractEnumReprKotlinType(item.attrs) ?: "Int") else null
@@ -2168,26 +2183,26 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
                 sb
                     .append('\n')
                     .append(indent)
-                    .append("    public open fun okValue(): ")
+                    .append("    public fun okValue(): ")
                     .append(okTp)
-                    .append(" = error(\"not Ok\")\n")
+                    .append(" = when (this) { is Ok -> value; is Err -> error(\"not Ok\") }\n")
                     .append(indent)
-                    .append("    public open fun errValue(): ")
+                    .append("    public fun errValue(): ")
                     .append(errTp)
-                    .append(" = error(\"not Err\")\n")
+                    .append(" = when (this) { is Err -> value; is Ok -> error(\"not Err\") }\n")
             } else if (typeName == "ControlFlow" && "Break" in variantRawNames && "Continue" in variantRawNames) {
                 val bTp = enumTypeParamNamesList[0]
                 val cTp = enumTypeParamNamesList[1]
                 sb
                     .append('\n')
                     .append(indent)
-                    .append("    public open fun cfBreakValue(): ")
+                    .append("    public fun cfBreakValue(): ")
                     .append(bTp)
-                    .append(" = error(\"not Break\")\n")
+                    .append(" = when (this) { is Break -> value; is Continue -> error(\"not Break\") }\n")
                     .append(indent)
-                    .append("    public open fun cfContinueValue(): ")
+                    .append("    public fun cfContinueValue(): ")
                     .append(cTp)
-                    .append(" = error(\"not Continue\")\n")
+                    .append(" = when (this) { is Continue -> value; is Break -> error(\"not Continue\") }\n")
             }
         }
         val derivesEquality = hasDeriveTrait(item.attrs, "PartialEq")
@@ -2359,26 +2374,7 @@ private fun KotlinJ2KEmitter.appendEnumVariantWithFields(
             specs.size == 1 &&
             specs[0].name == "value"
     val addErrAlias = isResultVariantAlias && vName == "Err"
-    val overrideMethodLine =
-        when {
-            isResultVariantAlias && vName == "Ok" ->
-                "public override fun okValue(): ${specs[0].renderedType} = value"
-            isResultVariantAlias && vName == "Err" ->
-                "public override fun errValue(): ${specs[0].renderedType} = value"
-            enumName == "ControlFlow" &&
-                typeParamCount == 2 &&
-                specs.size == 1 &&
-                specs[0].name == "value" &&
-                vName == "Break" ->
-                "public override fun cfBreakValue(): ${specs[0].renderedType} = value"
-            enumName == "ControlFlow" &&
-                typeParamCount == 2 &&
-                specs.size == 1 &&
-                specs[0].name == "value" &&
-                vName == "Continue" ->
-                "public override fun cfContinueValue(): ${specs[0].renderedType} = value"
-            else -> null
-        }
+    val overrideMethodLine: String? = null
     if (specs.none { it.isConcreteGenericForSwift }) {
         val params = specs.map { "public var ${it.name}: ${it.renderedType}" }
         sb

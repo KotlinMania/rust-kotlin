@@ -147,6 +147,56 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
         }
     }
     val nonUnitArgs = rawArgs.filterNot { it is Expr.Tuple && it.elems.isEmpty() }
+    if (expr.func is Expr.Path && (expr.func as Expr.Path).qself == null) {
+        val rawCallPathSegs =
+            (expr.func as Expr.Path)
+                .path
+                .segments
+                .toList()
+                .map { it.ident.toString().removePrefix("r#") }
+        if (nonUnitArgs.isEmpty() &&
+            "String" !in inspector.declaredTypeNames &&
+            (
+                rawCallPathSegs == listOf("String", "new") ||
+                    (rawCallPathSegs.size == 4 && rawCallPathSegs[0] in setOf("alloc", "std", "crate") && rawCallPathSegs[1] == "string" && rawCallPathSegs[2] == "String" && rawCallPathSegs[3] == "new")
+            )
+        ) {
+            return "\"\""
+        }
+        if (nonUnitArgs.size == 2 &&
+            "Write" !in inspector.declaredTypeNames &&
+            rawCallPathSegs.size >= 2 &&
+            rawCallPathSegs[rawCallPathSegs.size - 2] == "Write" &&
+            rawCallPathSegs.last() == "write_fmt"
+        ) {
+            val savedKind = currentExpectedNumericKind
+            val savedParseTarget = currentExpectedParseTargetType
+            currentExpectedNumericKind = null
+            currentExpectedParseTargetType = null
+            val target =
+                try {
+                    renderExpr(nonUnitArgs[0], indent, selfTypeName)
+                } finally {
+                    currentExpectedNumericKind = savedKind
+                    currentExpectedParseTargetType = savedParseTarget
+                }
+            currentExpectedNumericKind = null
+            currentExpectedParseTargetType = null
+            val fmt =
+                try {
+                    renderExpr(nonUnitArgs[1], indent, selfTypeName)
+                } finally {
+                    currentExpectedNumericKind = savedKind
+                    currentExpectedParseTargetType = savedParseTarget
+                }
+            val targetAtom = if (isAtomicPostfixReceiver(nonUnitArgs[0], target)) target else "($target)"
+            return if (isFmtStringBuilderReceiver(nonUnitArgs[0], target, selfTypeName)) {
+                "$targetAtom.append($fmt)"
+            } else {
+                "$targetAtom.writeFmt($fmt)"
+            }
+        }
+    }
     if (nonUnitArgs.size == 1) {
         renderPrimitiveFromBytesCall(expr, nonUnitArgs[0], indent, selfTypeName)?.let { return it }
     }
@@ -891,7 +941,31 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                                     } == true
                                 }
                             val isKnownStdReceiverMethod =
-                                methodBase in setOf("clone", "cmp", "partialCmp", "eq", "ne", "hash", "fmt", "deref", "derefMut", "asRef", "borrow", "borrowMut", "toString", "toOwned")
+                                methodBase in
+                                    setOf(
+                                        "clone",
+                                        "cmp",
+                                        "partialCmp",
+                                        "eq",
+                                        "ne",
+                                        "hash",
+                                        "fmt",
+                                        "deref",
+                                        "derefMut",
+                                        "asRef",
+                                        "borrow",
+                                        "borrowMut",
+                                        "toString",
+                                        "toOwned",
+                                        "writeFmt",
+                                        "write",
+                                        "writeAll",
+                                        "flush",
+                                        "read",
+                                        "readExact",
+                                        "readToEnd",
+                                        "readToString",
+                                    )
                             (traitHasReceiverMethod || isKnownStdReceiverMethod) &&
                                 currentTypeParamWitnessCalls.none {
                                     it.key.first == ownerSimple && rustFunctionIdentToKotlin(it.key.second) == methodBase
