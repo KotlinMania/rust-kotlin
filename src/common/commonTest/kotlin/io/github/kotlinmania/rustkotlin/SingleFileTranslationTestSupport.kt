@@ -4,6 +4,7 @@ internal class TestFilesHarness(
     val source: String = "",
     val extraFiles: Map<String, String> = emptyMap(),
     val existingOutputs: Set<String> = emptySet(),
+    val existingOutputContents: Map<String, String> = emptyMap(),
     val directories: Map<String, List<String>> = emptyMap(),
 ) {
     val reads = mutableListOf<String>()
@@ -18,14 +19,15 @@ internal class TestFilesHarness(
                 reads += it
                 extraFiles[it] ?: source
             },
+            readExistingOrNull = { path -> writes[path] ?: existingOutputContents[path] },
             write = { path, text ->
-                check(path !in existingOutputs && writes.put(path, text) == null)
+                check(path !in existingOutputs && path !in existingOutputContents && writes.put(path, text) == null)
             },
             writeForce = { path, text ->
                 forcedWrites[path] = text
                 writes[path] = text
             },
-            exists = { path -> path in existingOutputs || path in writes },
+            exists = { path -> path in existingOutputs || path in existingOutputContents || path in writes },
             isDirectory = { path -> path in directories },
             collectRustFiles = { roots ->
                 roots.flatMap { r -> directories[r].orEmpty() }
@@ -64,6 +66,7 @@ internal fun runSplitCrateCommand(
     runSingleFileCommand(
         args = args,
         read = { path -> sources[path] ?: error("missing $path") },
+        readExistingOrNull = { path -> written[path] },
         write = { path, text -> written[path] = text },
         writeForce = { path, text -> written[path] = text },
         exists = { path -> path in written },
