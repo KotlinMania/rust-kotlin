@@ -1842,8 +1842,15 @@ internal fun KotlinJ2KEmitter.getFnLookupIndex(): EmitterFnLookupIndex {
     if (existing != null && existing.sharedModFile === sharedMod) {
         return existing
     }
-    val fnsByName = hashMapOf<String, MutableList<Item.Fn>>()
-    val foreignFnsByName = hashMapOf<String, MutableList<ForeignItem.Fn>>()
+    val entriesByKey = hashMapOf<String, MutableList<IndexedFnEntry>>()
+    val nonForeignByKtName = hashMapOf<String, MutableList<IndexedFnEntry>>()
+    var nextOrder = 0
+    fun addKey(key: String, entry: IndexedFnEntry) {
+        val list = entriesByKey.getOrPut(key) { mutableListOf() }
+        if (list.lastOrNull() !== entry) {
+            list.add(entry)
+        }
+    }
     fun scanItems(items: List<Item>) {
         for (item in items) {
             if (item is Item.Fn && !itemHasDocOnlyCfg(item)) {
@@ -1852,10 +1859,14 @@ internal fun KotlinJ2KEmitter.getFnLookupIndex(): EmitterFnLookupIndex {
                         .toString()
                         .removePrefix("r#")
                 val ktDecl = rustFunctionIdentToKotlin(cleanDecl)
-                fnsByName.getOrPut(cleanDecl) { mutableListOf() }.add(item)
-                if (ktDecl != cleanDecl) {
-                    fnsByName.getOrPut(ktDecl) { mutableListOf() }.add(item)
-                }
+                val typedParams =
+                    item.sig.inputs
+                        .toList()
+                        .filterIsInstance<FnArg.Typed>()
+                val entry = IndexedFnEntry(nextOrder++, cleanDecl, ktDecl, isForeign = false, typedParams = typedParams)
+                addKey(cleanDecl, entry)
+                addKey(ktDecl, entry)
+                nonForeignByKtName.getOrPut(ktDecl) { mutableListOf() }.add(entry)
             } else if (item is Item.ForeignMod && !itemHasDocOnlyCfg(item)) {
                 for (foreign in item.items) {
                     if (foreign is ForeignItem.Fn && !foreignItemHasDocOnlyCfg(foreign)) {
@@ -1864,13 +1875,18 @@ internal fun KotlinJ2KEmitter.getFnLookupIndex(): EmitterFnLookupIndex {
                                 .toString()
                                 .removePrefix("r#")
                         val ktDecl = rustFunctionIdentToKotlin(cleanDecl)
-                        foreignFnsByName.getOrPut(cleanDecl) { mutableListOf() }.add(foreign)
-                        if (ktDecl != cleanDecl) {
-                            foreignFnsByName.getOrPut(ktDecl) { mutableListOf() }.add(foreign)
-                        }
-                        val renamed = inspector.collidingTopLevelForeignFnRenames[cleanDecl]
-                        if (renamed != null && renamed != cleanDecl && renamed != ktDecl) {
-                            foreignFnsByName.getOrPut(renamed) { mutableListOf() }.add(foreign)
+                        val typedParams =
+                            foreign.sig.inputs
+                                .toList()
+                                .filterIsInstance<FnArg.Typed>()
+                        val entry = IndexedFnEntry(nextOrder++, cleanDecl, ktDecl, isForeign = true, typedParams = typedParams)
+                        addKey(cleanDecl, entry)
+                        addKey(ktDecl, entry)
+                        inspector.collidingTopLevelForeignFnRenames[cleanDecl]?.let { addKey(it, entry) }
+                        for ((inlineKey, renamed) in inspector.collidingInlineForeignFnRenames) {
+                            if (inlineKey.second == cleanDecl) {
+                                addKey(renamed, entry)
+                            }
                         }
                     }
                 }
@@ -1881,7 +1897,7 @@ internal fun KotlinJ2KEmitter.getFnLookupIndex(): EmitterFnLookupIndex {
     if (sharedMod !== file) {
         scanItems(file.items)
     }
-    return EmitterFnLookupIndex(sharedMod, fnsByName, foreignFnsByName).also {
+    return EmitterFnLookupIndex(sharedMod, entriesByKey, nonForeignByKtName).also {
         cachedFnLookupIndex = it
     }
 }
@@ -1949,47 +1965,28 @@ internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
             }
         }
         val fnIndex = getFnLookupIndex()
-        fun lookupIndexedFn(): SynType? {
-            val candidates =
-                fnIndex.fnsByName[rawCalleeIdent]
-                    ?: fnIndex.fnsByName[methodKt]
-                    ?: return null
-            for (item in candidates) {
-                val typedParams =
-                    item.sig.inputs
-                        .toList()
-                        .filterIsInstance<FnArg.Typed>()
-                typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
+        val candidateSet = linkedSetOf<IndexedFnEntry>()
+        fnIndex.entriesByKey[rawCalleeIdent]?.let { candidateSet.addAll(it) }
+        fnIndex.entriesByKey[methodKt]?.let { candidateSet.addAll(it) }
+        activeLocalForeignFnRenames.entries
+            .firstOrNull { it.value == methodKt }
+            ?.key
+            ?.let { fnIndex.entriesByKey[it] }
+            ?.let { candidateSet.addAll(it) }
+        val orderedCandidates =
+            if (candidateSet.size <= 1) {
+                candidateSet.toList()
+            } else {
+                candidateSet.sortedBy { it.order }
             }
-            return null
-        }
-        fun lookupIndexedForeignFn(): SynType? {
-            val candidates =
-                fnIndex.foreignFnsByName[rawCalleeIdent]
-                    ?: fnIndex.foreignFnsByName[methodKt]
-                    ?: currentModPathPrefix.lastOrNull()?.let { modRaw ->
-                        inspector.collidingInlineForeignFnRenames.entries
-                            .firstOrNull { (k, v) -> k.first == modRaw && v == methodKt }
-                            ?.key
-                            ?.second
-                            ?.let { fnIndex.foreignFnsByName[it] }
-                    }
-                    ?: activeLocalForeignFnRenames.entries
-                        .firstOrNull { it.value == methodKt }
-                        ?.key
-                        ?.let { fnIndex.foreignFnsByName[it] }
-                    ?: return null
-            for (foreign in candidates) {
-                val typedParams =
-                    foreign.sig.inputs
-                        .toList()
-                        .filterIsInstance<FnArg.Typed>()
-                typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
+        for (entry in orderedCandidates) {
+            if ((!preferLocalForeign || entry.isForeign) &&
+                matchesFnIdent(entry.cleanDecl, methodKt, isForeign = entry.isForeign)
+            ) {
+                entry.typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
             }
-            return null
         }
         if (preferLocalForeign) {
-            lookupIndexedForeignFn()?.let { return it }
             for (item in activeLocalBlockItems) {
                 if (item is Item.Fn && !itemHasDocOnlyCfg(item) && matchesFnIdent(item.sig.ident.toString(), methodKt, isForeign = false)) {
                     val typedParams =
@@ -1999,10 +1996,13 @@ internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
                     typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
                 }
             }
-            return lookupIndexedFn()
+            for (entry in orderedCandidates) {
+                if (!entry.isForeign && matchesFnIdent(entry.cleanDecl, methodKt, isForeign = false)) {
+                    entry.typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
+                }
+            }
         }
-        lookupIndexedFn()?.let { return it }
-        return lookupIndexedForeignFn()
+        return null
     }
     val penultRaw = segs[segs.size - 2].ident.toString().removePrefix("r#")
     val ownerKt =
@@ -2141,12 +2141,8 @@ internal fun KotlinJ2KEmitter.calleeExpectsMutableListSliceParam(calleeBase: Str
     val simpleFn = calleeBase.substringAfterLast('.').trim()
     val ownerPrefix = calleeBase.substringBeforeLast('.', missingDelimiterValue = "").substringAfterLast('.').trim()
     if (ownerPrefix.isEmpty()) {
-        for (item in getFnLookupIndex().fnsByName[simpleFn].orEmpty()) {
-            val typedParams =
-                item.sig.inputs
-                    .toList()
-                    .filterIsInstance<FnArg.Typed>()
-            val param = typedParams.getOrNull(argIdx) ?: continue
+        for (entry in getFnLookupIndex().nonForeignByKtName[simpleFn].orEmpty()) {
+            val param = entry.typedParams.getOrNull(argIdx) ?: continue
             if (isMutSliceSynType(param.patType.ty)) return true
         }
         return false

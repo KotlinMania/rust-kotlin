@@ -754,10 +754,18 @@ private val UNSIGNED_ARRAY_IDENTS =
         "ulongArrayOf",
     )
 
+internal class IndexedFnEntry(
+    val order: Int,
+    val cleanDecl: String,
+    val ktDecl: String,
+    val isForeign: Boolean,
+    val typedParams: List<FnArg.Typed>,
+)
+
 internal class EmitterFnLookupIndex(
     val sharedModFile: File?,
-    val fnsByName: Map<String, List<Item.Fn>>,
-    val foreignFnsByName: Map<String, List<ForeignItem.Fn>>,
+    val entriesByKey: Map<String, List<IndexedFnEntry>>,
+    val nonForeignByKtName: Map<String, List<IndexedFnEntry>>,
 )
 
 internal class KotlinJ2KEmitter(

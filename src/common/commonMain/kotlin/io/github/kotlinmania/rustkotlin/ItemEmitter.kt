@@ -1703,6 +1703,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
         currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits, ownerIsPublic = (vis == "public "))
         currentAttachedStructSuperTraitBaseNames =
             superTraits.mapTo(linkedSetOf()) { it.substringBefore('<').substringAfterLast('.').trim() }
+        val isMultiFileCrate = headerContext.isBatchCrateOutput || headerContext.crateSymbolSubpackages.isNotEmpty()
         val memberLines =
             try {
                 renderAttachedImplMembers(
@@ -1715,7 +1716,9 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                     extraCompanionMembers = extraCompanionMembers,
                     isLocalClass = isLocalItem,
                     structFieldNames = fieldNameAndTypes.mapTo(linkedSetOf()) { it.first },
-                    emitEmptyCompanion = hasStandaloneCompanionExtensionImpl(typeName),
+                    emitEmptyCompanion =
+                        (!isLocalItem && !isDataClass && !useFinalAbiLayout && vis != "private " && isMultiFileCrate) ||
+                            hasStandaloneCompanionExtensionImpl(typeName),
                 )
             } finally {
                 currentStructOverrideMethodNames = prevOverrideNames
