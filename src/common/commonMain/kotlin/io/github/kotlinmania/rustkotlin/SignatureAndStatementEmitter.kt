@@ -3124,6 +3124,14 @@ internal fun KotlinJ2KEmitter.recordLocalInferredType(
     pat: Pat? = null,
 ) {
     if (patText.startsWith("(")) {
+        fun isConcreteTupleElemType(ty: String?): Boolean =
+            !ty.isNullOrEmpty() &&
+                ty != "Any?" &&
+                ty != "Any" &&
+                ty != "*" &&
+                ty != "Nothing" &&
+                ty != "Nothing?" &&
+                !ty.contains("uninferred", ignoreCase = true)
         val unwrappedPat = pat?.let(this::unwrapTransparentPat)
         val unwrappedInit = unwrapParenOrGroupExpr(initExpr)
         if (unwrappedPat is Pat.Tuple && unwrappedInit is Expr.Tuple) {
@@ -3137,8 +3145,8 @@ internal fun KotlinJ2KEmitter.recordLocalInferredType(
                 val elemTy =
                     inferExprRenderedType(elemExpr, selfTypeName)
                         ?: inferExprNumericKind(elemExpr, selfTypeName)?.let(this::numericKindToPureTypeName)
-                if (elemTy != null) {
-                    currentTypedLocals = currentTypedLocals + (ktName to elemTy)
+                if (isConcreteTupleElemType(elemTy)) {
+                    currentTypedLocals = currentTypedLocals + (ktName to elemTy!!)
                 }
             }
         } else if (unwrappedPat is Pat.Tuple) {
@@ -3151,7 +3159,7 @@ internal fun KotlinJ2KEmitter.recordLocalInferredType(
                     val pIdent = (unwrapTransparentPat(patElems[idx]) as? Pat.Ident)?.ident?.toString()?.removePrefix("r#") ?: continue
                     val ktName = scopeBuilder.resolveLocalKotlinName(pIdent) ?: rustValueIdentToKotlin(pIdent)
                     val elemTy = elemTypes[idx].trim()
-                    if (elemTy.isNotEmpty()) {
+                    if (isConcreteTupleElemType(elemTy)) {
                         currentTypedLocals = currentTypedLocals + (ktName to elemTy)
                     }
                 }

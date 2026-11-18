@@ -1499,6 +1499,14 @@ class StdlibSemanticWaveCTest {
                     break;
                 }
                 let ch: u8 = b'a';
+                let (len, max_len, out_ptr) = if s.is_empty() {
+                    (0, 2, ptr.as_ptr())
+                } else {
+                    let len = s.len();
+                    (len * 2, 4, ptr.as_ptr())
+                };
+                let _len_u16: u16 = len as _;
+                let _ = (max_len, out_ptr);
                 if ch == 97 { val_u16 as i32 } else { 0 }
             }
             """
@@ -1538,6 +1546,7 @@ class StdlibSemanticWaveCTest {
         assertContains(out, "isDangling((ptr.asPtr()).asConstPtr())")
         assertContains(out, "val ch: UByte = 97u.toUByte()")
         assertContains(out, "ch == 97u.toUByte()")
+        assertContains(out, "len1.toUShort()")
         assertFalse(out.contains(" as Result.Ok<*, *>"), "Result.Ok must not erase payload via star cast:\n$out")
         assertFalse(out.contains(" as RustResult.Ok<*, *>"), "RustResult.Ok must not erase payload via star cast:\n$out")
     }
