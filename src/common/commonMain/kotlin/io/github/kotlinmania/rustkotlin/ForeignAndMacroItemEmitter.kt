@@ -270,6 +270,12 @@ internal fun KotlinJ2KEmitter.resolveBestSubpackageForSymbol(ktSymbol: String): 
     if (nsPrefix?.endsWith(".core") == true && ktSymbol in setOf("U128", "I128", "F16", "F128")) {
         return ""
     }
+    if (nsPrefix?.endsWith(".core") == true &&
+        ktSymbol in setOf("sizeOf", "sizeOfVal", "alignOf", "alignOfVal", "transmute", "transmuteUnchecked", "needsDrop", "forget", "drop") &&
+        "mem" in headerContext.crateSymbolSubpackages[ktSymbol].orEmpty()
+    ) {
+        return "mem"
+    }
     val candidates = headerContext.crateSymbolSubpackages[ktSymbol] ?: return null
     return resolveBestSubpackageAmong(candidates)
 }
@@ -1131,7 +1137,12 @@ private fun KotlinJ2KEmitter.isIntermediateTypeSegmentInUsePath(
         }
     }
     val kt = rustTypeIdentToKotlin(segment)
-    if (kt in inspector.declaredTypeNames || kt in headerContext.crateSymbolSubpackages) return true
+    if (kt in inspector.declaredTypeNames ||
+        kt in headerContext.crateSymbolSubpackages ||
+        headerContext.externalCrateSymbolPackages.values.any { kt in it }
+    ) {
+        return true
+    }
     if (headerContext.crateSymbolSubpackages.isNotEmpty()) return false
     return idx == segments.lastIndex - 1 && segments.last() == "*"
 }
@@ -1384,6 +1395,22 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
                 resolveExternalDepReexportPkg(explicitModule, leafSym, nsPrefix)?.let { return it }
             }
         }
+        if (!isSelfImport &&
+            !headerContext.rawAbiMode &&
+            headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true &&
+            rem.isNotEmpty()
+        ) {
+            val resolvedModSegs = baseSegs + rem.dropLast(1).map { rustModuleIdentToKotlin(it.removePrefix("r#")) }
+            val superLeaf = rem.last().removePrefix("r#")
+            if (resolvedModSegs == listOf("os", "raw") || resolvedModSegs == listOf("ffi")) {
+                if (superLeaf == "CString") {
+                    resolveStdlibFfiSymbolImport("CString", isAllocCString = true)?.let { return it }
+                }
+                if (superLeaf in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS) {
+                    resolveStdlibFfiSymbolImport(superLeaf)?.let { return it }
+                }
+            }
+        }
         val combined = baseSegs + mappedRem
         return "$nsPrefix.${combined.joinToString(".")}"
     }
@@ -1501,9 +1528,23 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
     val lastRaw = segs.last()
     if (!isSelfImport && !headerContext.rawAbiMode) {
         val cleanSegs = segs.map { it.removePrefix("r#") }
-        if ((cleanSegs.size == 3 && cleanSegs[0] in setOf("core", "std") && cleanSegs[1] == "ffi") ||
-            (cleanSegs.size == 4 && cleanSegs[0] == "std" && cleanSegs[1] == "os" && cleanSegs[2] == "raw")
-        ) {
+        val isStdOrCrateFfi =
+            (cleanSegs.size == 3 && cleanSegs[0] in setOf("core", "std") && cleanSegs[1] == "ffi") ||
+                (cleanSegs.size == 4 && cleanSegs[0] == "std" && cleanSegs[1] == "os" && cleanSegs[2] == "raw") ||
+                (
+                    cleanSegs.size == 3 &&
+                        cleanSegs[0] == "crate" &&
+                        cleanSegs[1] == "ffi" &&
+                        headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true
+                ) ||
+                (
+                    cleanSegs.size == 4 &&
+                        cleanSegs[0] == "crate" &&
+                        cleanSegs[1] == "os" &&
+                        cleanSegs[2] == "raw" &&
+                        headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.std") == true
+                )
+        if (isStdOrCrateFfi) {
             val leaf = cleanSegs.last()
             if (leaf == "CString") {
                 resolveStdlibFfiSymbolImport("CString", isAllocCString = true)?.let { return it }
@@ -1802,6 +1843,36 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
                 return null
             }
             val mappedLeaf = mapped.lastOrNull()
+            fun resolveExternalPenultOwnerType(): String? {
+                if (mappedLeaf == null || mapped.size < 3 || mapped[mapped.size - 2].firstOrNull()?.isUpperCase() != true) {
+                    return null
+                }
+                val penultType = mapped[mapped.size - 2]
+                val ownerMidPath = mapped.drop(1).dropLast(2).joinToString(".")
+                for (searchCrate in candidateCrates) {
+                    val searchNs =
+                        headerContext.crateNamespaces[searchCrate]
+                            ?.trim()
+                            ?.removeSuffix(".")
+                            ?.takeIf { it.isNotEmpty() } ?: continue
+                    val searchExtPkgs = headerContext.externalCrateSymbolPackages[searchCrate] ?: continue
+                    val ownerCandidates = searchExtPkgs[penultType] ?: continue
+                    val exactOwnerPkg = if (ownerMidPath.isEmpty()) searchNs else "$searchNs.$ownerMidPath"
+                    val resolvedOwnerPkg =
+                        when {
+                            exactOwnerPkg in ownerCandidates -> exactOwnerPkg
+                            else ->
+                                ownerCandidates
+                                    .filter { it.startsWith("$exactOwnerPkg.") }
+                                    .minByOrNull { it.count { ch -> ch == '.' } }
+                                    ?: ownerCandidates.firstOrNull()
+                        }
+                    if (resolvedOwnerPkg != null) {
+                        return "$resolvedOwnerPkg.$penultType.$mappedLeaf"
+                    }
+                }
+                return null
+            }
             if (anyCandidateExtPkgs && mappedLeaf != null && mappedLeaf != "*") {
                 val midPath = mapped.drop(1).dropLast(1).joinToString(".")
                 for (searchCrate in candidateCrates) {
@@ -1853,9 +1924,13 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
                         return "${candidates.first()}.$mappedLeaf"
                     }
                 }
+                resolveExternalPenultOwnerType()?.let { return it }
                 if (root in STDLIB_CRATE_ROOTS) return null
             } else if (root in STDLIB_CRATE_ROOTS && mappedLeaf == "*") {
                 val allowedWildcardSubmodules = setOf("alloc", "cell", "cmp", "ffi", "mem", "num", "ops", "ptr", "result", "sync", "atomic")
+                if (anyCandidateExtPkgs && mapped.size >= 4) {
+                    resolveExternalPenultOwnerType()?.let { return it }
+                }
                 val hasExternalWildcardPkg =
                     anyCandidateExtPkgs &&
                         mapped.size >= 3 &&
@@ -1992,7 +2067,11 @@ internal fun KotlinJ2KEmitter.renderItemUse(
             continue
         }
         val fullImport = resolveKotlinImportPath(leaf.segments, leaf.alias, leaf.isSelfImport) ?: continue
-        if (fullImport.endsWith(".panic.constPanic") || fullImport.endsWith(".panic.constAssert")) {
+        if (fullImport.endsWith(".panic.constPanic") ||
+            fullImport.endsWith(".panic.constAssert") ||
+            fullImport.endsWith(".io.constError") ||
+            fullImport.endsWith(".error.constError")
+        ) {
             continue
         }
         if (isResolvedCrateSubpackageModule(fullImport, leaf.segments.last())) {

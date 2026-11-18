@@ -294,11 +294,55 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
             val elems = expr.elems.toList()
             val pairCtor = if ("Pair" in inspector.declaredTypeNames) "kotlin.Pair" else "Pair"
             val tripleCtor = if ("Triple" in inspector.declaredTypeNames) "kotlin.Triple" else "Triple"
+            val hasTransmuteElem =
+                elems.any { e ->
+                    val unwrapped = unwrapParenOrGroupExpr(e)
+                    unwrapped is Expr.Call &&
+                        (unwrapped.func as? Expr.Path)
+                            ?.path
+                            ?.segments
+                            ?.last()
+                            ?.ident
+                            ?.toString() in setOf("transmute", "transmute_unchecked")
+                }
+            val expectedTupleTarget =
+                (
+                    currentExpectedParseTargetType
+                        ?: if (hasTransmuteElem) currentEnclosingReturnRenderedType else null
+                )?.removeSuffix("?")?.trim()
+            val expectedElemTypes =
+                if (expectedTupleTarget != null &&
+                    elems.size in 2..3 &&
+                    (
+                        (elems.size == 2 && (expectedTupleTarget.startsWith("Pair<") || expectedTupleTarget.startsWith("kotlin.Pair<"))) ||
+                            (elems.size == 3 && (expectedTupleTarget.startsWith("Triple<") || expectedTupleTarget.startsWith("kotlin.Triple<")))
+                    ) &&
+                    expectedTupleTarget.endsWith(">")
+                ) {
+                    val inner = expectedTupleTarget.substringAfter('<').dropLast(1)
+                    PhantomRawPointerTypeStripper.splitTopLevelCommaList(inner).takeIf { it.size == elems.size }
+                } else {
+                    null
+                }
+            fun renderTupleElem(idx: Int): String {
+                val elemTarget = expectedElemTypes?.get(idx)?.trim()?.takeIf { it.isNotEmpty() }
+                if (elemTarget == null) return renderExpr(elems[idx], indent, selfTypeName)
+                val savedParseTarget = currentExpectedParseTargetType
+                val savedReturnTarget = currentEnclosingReturnRenderedType
+                currentExpectedParseTargetType = elemTarget
+                currentEnclosingReturnRenderedType = elemTarget
+                return try {
+                    renderExpr(elems[idx], indent, selfTypeName)
+                } finally {
+                    currentExpectedParseTargetType = savedParseTarget
+                    currentEnclosingReturnRenderedType = savedReturnTarget
+                }
+            }
             when (elems.size) {
                 0 -> "Unit"
                 1 -> renderExpr(elems[0], indent, selfTypeName)
-                2 -> "$pairCtor(${renderExpr(elems[0], indent, selfTypeName)}, ${renderExpr(elems[1], indent, selfTypeName)})"
-                3 -> "$tripleCtor(${renderExpr(elems[0], indent, selfTypeName)}, ${renderExpr(elems[1], indent, selfTypeName)}, ${renderExpr(elems[2], indent, selfTypeName)})"
+                2 -> "$pairCtor(${renderTupleElem(0)}, ${renderTupleElem(1)})"
+                3 -> "$tripleCtor(${renderTupleElem(0)}, ${renderTupleElem(1)}, ${renderTupleElem(2)})"
                 else -> "listOf(${elems.joinToString(", ") { renderExpr(it, indent, selfTypeName) }})"
             }
         }

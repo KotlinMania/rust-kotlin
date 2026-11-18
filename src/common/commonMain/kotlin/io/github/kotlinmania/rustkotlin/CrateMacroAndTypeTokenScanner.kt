@@ -472,13 +472,13 @@ internal fun collectCfgDisabledChildModuleRelPrefixes(
                 }
                 val curIdent = (cur as? TokenTree.Ident)?.value?.toString()
                 val nextGrp = (trees.getOrNull(idx + 2) as? TokenTree.Group)?.value
-                if ((curIdent == "cfg_if" || curIdent == "cfg_select") &&
+                if ((curIdent == "cfg_if" || curIdent == "cfg_select" || curIdent == "cfg_select_nofmt") &&
                     (trees.getOrNull(idx + 1) as? TokenTree.Punct)?.value?.asChar() == '!' &&
                     (nextGrp?.delimiter() == Delimiter.Brace || nextGrp?.delimiter() == Delimiter.Parenthesis)
                 ) {
                     val innerTrees = nextGrp.stream().toList()
                     val branchBodies =
-                        if (curIdent == "cfg_select") {
+                        if (curIdent == "cfg_select" || curIdent == "cfg_select_nofmt") {
                             partitionCfgSelectBranchBodies(innerTrees)
                         } else {
                             partitionCfgIfBranchBodies(innerTrees)
@@ -685,6 +685,7 @@ internal fun scanModuleTokenTrees(
     rawAbiMode: Boolean,
     finalStructs: Boolean,
     splitModuleRoots: Boolean = false,
+    topLevelSplitInlineMods: Set<String> = emptySet(),
     registerSymbol: (String, String) -> Unit,
     registerFnSig: (String, String, List<List<TokenTree>>?, String?, Boolean) -> Unit,
     subpkgToRawLeaf: MutableMap<String, String>,
@@ -801,6 +802,8 @@ internal fun scanModuleTokenTrees(
                                 subpkg = subpkg,
                                 rawAbiMode = rawAbiMode,
                                 finalStructs = finalStructs,
+                                splitModuleRoots = splitModuleRoots,
+                                topLevelSplitInlineMods = topLevelSplitInlineMods,
                                 registerSymbol = registerSymbol,
                                 registerFnSig = registerFnSig,
                                 subpkgToRawLeaf = subpkgToRawLeaf,
@@ -833,6 +836,8 @@ internal fun scanModuleTokenTrees(
                             subpkg = subpkg,
                             rawAbiMode = rawAbiMode,
                             finalStructs = finalStructs,
+                            splitModuleRoots = splitModuleRoots,
+                            topLevelSplitInlineMods = topLevelSplitInlineMods,
                             registerSymbol = registerSymbol,
                             registerFnSig = registerFnSig,
                             subpkgToRawLeaf = subpkgToRawLeaf,
@@ -885,7 +890,12 @@ internal fun scanModuleTokenTrees(
                     if (rawMod != null && !skippedByCfg) {
                         val modKt = rustModuleIdentToKotlin(rawMod.replace('-', '_'))
                         val childSub = if (subpkg.isEmpty()) modKt else "$subpkg.$modKt"
-                        if (inlineGrp == null && modKt.isNotEmpty() && rawMod !in setOf("tests", "test", "private", "sealed")) {
+                        val isSplitInlineMod =
+                            splitModuleRoots &&
+                                inlineGrp != null &&
+                                inlineGrp.delimiter() == Delimiter.Brace &&
+                                rawMod in topLevelSplitInlineMods
+                        if ((inlineGrp == null || isSplitInlineMod) && modKt.isNotEmpty() && rawMod !in setOf("tests", "test", "private", "sealed")) {
                             subpkgToRawLeaf.putIfMissing(childSub, rawMod)
                         }
                         if (inlineGrp != null &&
@@ -894,7 +904,7 @@ internal fun scanModuleTokenTrees(
                         ) {
                             scanModuleTokenTrees(
                                 trees = inlineGrp.stream().toList(),
-                                subpkg = subpkg,
+                                subpkg = if (isSplitInlineMod && modKt.isNotEmpty()) childSub else subpkg,
                                 rawAbiMode = rawAbiMode,
                                 finalStructs = finalStructs,
                                 splitModuleRoots = splitModuleRoots,
@@ -1146,12 +1156,17 @@ internal fun scanModuleTokenTrees(
         if (nonPubKw == "mod" && trees.getOrNull(i + 1) is TokenTree.Ident) {
             val rawMod = (trees[i + 1] as TokenTree.Ident).value.toString().removePrefix("r#")
             val inlineGrp = (trees.getOrNull(i + 2) as? TokenTree.Group)?.value
+            val modKt = rustModuleIdentToKotlin(rawMod.replace('-', '_'))
+            val childSub = if (subpkg.isEmpty()) modKt else "$subpkg.$modKt"
+            val isSplitInlineMod =
+                splitModuleRoots &&
+                    inlineGrp != null &&
+                    inlineGrp.delimiter() == Delimiter.Brace &&
+                    rawMod in topLevelSplitInlineMods
             if (!skippedByCfg &&
-                inlineGrp == null &&
+                (inlineGrp == null || isSplitInlineMod) &&
                 rawMod !in setOf("tests", "test", "private", "sealed")
             ) {
-                val modKt = rustModuleIdentToKotlin(rawMod.replace('-', '_'))
-                val childSub = if (subpkg.isEmpty()) modKt else "$subpkg.$modKt"
                 if (modKt.isNotEmpty()) {
                     subpkgToRawLeaf.putIfMissing(childSub, rawMod)
                 }
@@ -1163,7 +1178,7 @@ internal fun scanModuleTokenTrees(
             ) {
                 scanModuleTokenTrees(
                     trees = inlineGrp.stream().toList(),
-                    subpkg = subpkg,
+                    subpkg = if (isSplitInlineMod && modKt.isNotEmpty()) childSub else subpkg,
                     rawAbiMode = rawAbiMode,
                     finalStructs = finalStructs,
                     splitModuleRoots = splitModuleRoots,

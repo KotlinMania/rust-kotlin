@@ -97,6 +97,20 @@ internal fun KotlinJ2KEmitter.renderMacroInvocationAsStmtOrExpr(
                 }
             "error($firstMsg)"
         }
+        "const_error" -> {
+            val parts = MacroRulesFileExpander.splitMacroArguments(tokens)
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+            val errType = bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.Error")
+            val msgType = bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.SimpleMessage")
+            if (parts.size >= 2) {
+                val kindExpr = parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(parts[0]), indent, selfTypeName)
+                val msgExpr = parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(parts[1]), indent, selfTypeName)
+                "$errType.fromStaticMessage($msgType(kind = $kindExpr, message = $msgExpr))"
+            } else {
+                val kindType = bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.ErrorKind")
+                "$errType.fromStaticMessage($msgType(kind = $kindType.Other, message = \"const_error\"))"
+            }
+        }
         "println", "eprintln" -> {
             val msg = renderFormatMacroInvocation(tokens, indent, selfTypeName)
             "println($msg)"

@@ -104,6 +104,17 @@ private fun KotlinJ2KEmitter.tryRenderStringAppendMethod(
     }
 }
 
+internal fun KotlinJ2KEmitter.isFmtStringBuilderReceiver(
+    recvExpr: Expr,
+    renderedRecv: String,
+    selfTypeName: String?,
+): Boolean {
+    if (renderedRecv in setOf("f", "fmt", "formatter")) return true
+    if (renderedRecv.isNotEmpty() && currentTypedLocals[renderedRecv] == "StringBuilder") return true
+    val inferred = inferExprRenderedType(recvExpr, selfTypeName)?.removeSuffix("?")?.trim()
+    return inferred == "StringBuilder"
+}
+
 internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent: String, selfTypeName: String?): String {
     val methodEntryParseTarget = currentExpectedParseTargetType
     val prevRecvParseTarget = currentExpectedParseTargetType
@@ -1113,6 +1124,13 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
     if ((rawMethod == "write_str" || rawMethod == "write_char" || rawMethod == "pad") &&
         renderedValueArgs.size == 1 &&
         typeArgs.isEmpty()
+    ) {
+        return "$receiver.append(${renderedValueArgs[0]})"
+    }
+    if (rawMethod == "write_fmt" &&
+        renderedValueArgs.size == 1 &&
+        typeArgs.isEmpty() &&
+        isFmtStringBuilderReceiver(expr.receiver, receiver, selfTypeName)
     ) {
         return "$receiver.append(${renderedValueArgs[0]})"
     }

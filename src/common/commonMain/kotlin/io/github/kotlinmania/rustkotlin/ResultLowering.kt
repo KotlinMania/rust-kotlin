@@ -35,10 +35,15 @@ internal fun KotlinJ2KEmitter.lookupDeclaredTraitAst(ktTrait: String, traitPath:
     return registry[ktTrait]
 }
 
-internal fun KotlinJ2KEmitter.isSelfParameterizedTraitName(ktTrait: String): Boolean =
-    ktTrait in inspector.selfParameterizedTraits ||
+internal fun KotlinJ2KEmitter.isSelfParameterizedTraitName(ktTrait: String): Boolean {
+    if (ktTrait in inspector.declaredTraitsByName) {
+        return ktTrait in inspector.selfParameterizedTraits
+    }
+    if (ktTrait in inspector.declaredTypeNames) return false
+    return ktTrait in inspector.selfParameterizedTraits ||
         ktTrait in headerContext.crateSelfParameterizedTraits ||
         ktTrait in KNOWN_SELF_PARAMETERIZED_TRAITS
+}
 
 private val CORE_OPS_OUTPUT_ASSOC_TRAITS =
     setOf("Add", "Sub", "Mul", "Div", "Rem", "BitAnd", "BitOr", "BitXor", "Shl", "Shr", "Neg", "Not")
@@ -59,6 +64,7 @@ private val STDLIB_DEFAULTLESS_ASSOC_TYPES: Map<String, List<String>> =
         "TryFrom" to listOf("Error"),
         "TryInto" to listOf("Error"),
         "Pattern" to listOf("Searcher"),
+        "BuildHasher" to listOf("Hasher"),
         "DoubleEndedIterator" to listOf("Item"),
         "ExactSizeIterator" to listOf("Item"),
         "FusedIterator" to listOf("Item"),
@@ -522,6 +528,20 @@ internal fun KotlinJ2KEmitter.isFmtWriteOrUnitExpr(expr: Expr, selfTypeName: Str
         val rawMethod = core.method.toString().removePrefix("r#")
         if (rawMethod in setOf("write_str", "write_char", "pad") && core.args.size == 1 && core.turbofish == null) {
             return true
+        }
+        if (rawMethod == "write_fmt" && core.args.size == 1 && core.turbofish == null) {
+            val recvPathIdent =
+                (unwrapParenOrGroupExpr(core.receiver) as? Expr.Path)
+                    ?.takeIf { it.qself == null && it.path.segments.len() == 1 }
+                    ?.path
+                    ?.segments
+                    ?.first()
+                    ?.ident
+                    ?.toString()
+                    ?.removePrefix("r#")
+            if (isFmtStringBuilderReceiver(core.receiver, recvPathIdent.orEmpty(), selfTypeName)) {
+                return true
+            }
         }
         if (isSynthesizedDebugFinishCall(core, selfTypeName)) {
             return true

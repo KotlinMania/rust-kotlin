@@ -990,11 +990,11 @@ internal class MacroRulesFileExpander(
         return when {
             macName == "cfg_if" &&
                 (segs.size == 1 || (segs.size == 2 && (firstName == "cfg_if" || isStdMacroRoot))) -> "cfg_if"
-            macName == "cfg_select" &&
+            macName in setOf("cfg_select", "cfg_select_nofmt") &&
                 (
                     segs.size == 1 ||
                         (segs.size == 2 && isStdMacroRoot) ||
-                        (segs.size == 3 && isStdMacroRoot && middleName == "macros")
+                        (segs.size == 3 && isStdMacroRoot && middleName in setOf("macros", "support"))
                 ) -> "cfg_select"
             else -> null
         }
