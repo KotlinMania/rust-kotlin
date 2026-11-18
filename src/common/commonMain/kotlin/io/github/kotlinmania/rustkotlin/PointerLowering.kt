@@ -487,7 +487,10 @@ internal data class SourceAssociatedParameter(
     val associated: String,
 )
 
-internal fun KotlinJ2KEmitter.sourceAssociatedParameters(generics: Generics): List<SourceAssociatedParameter> {
+internal fun KotlinJ2KEmitter.sourceAssociatedParameters(
+    generics: Generics,
+    ownerTypeSimpleName: String? = null,
+): List<SourceAssociatedParameter> {
     val declaredTypeParams =
         generics.params
             .toList()
@@ -521,10 +524,12 @@ internal fun KotlinJ2KEmitter.sourceAssociatedParameters(generics: Generics): Li
                 .orEmpty()
                 .filterIsInstance<TypeParamBound.Trait>()
                 .filter { bound ->
-                    bound.path.segments
-                        .last()
-                        ?.ident
-                        ?.toString() != "SimdElement"
+                    val bIdent =
+                        bound.path.segments
+                            .last()
+                            ?.ident
+                            ?.toString()
+                    bIdent != "SimdElement" && bIdent != "MaskElement"
                 }.flatMap { bound ->
                     val trait =
                         bound.path.segments
@@ -544,9 +549,12 @@ internal fun KotlinJ2KEmitter.sourceAssociatedParameters(generics: Generics): Li
                         sameFileAssocs.ifEmpty {
                             lookupTraitDefaultlessAssocTypes(rustTypeIdentToKotlin(trait), bound.path)
                         }
-                    assocNames.map { assocKt ->
-                        SourceAssociatedParameter(rawParamIdent, trait, assocKt)
-                    }
+                    val ownerSimple = ownerTypeSimpleName ?: currentBoundedTypeName?.substringBefore('<')?.trim()
+                    assocNames
+                        .filter { assocKt -> assocKt != ownerSimple }
+                        .map { assocKt ->
+                            SourceAssociatedParameter(rawParamIdent, trait, assocKt)
+                        }
                 }
         }.distinct()
 }

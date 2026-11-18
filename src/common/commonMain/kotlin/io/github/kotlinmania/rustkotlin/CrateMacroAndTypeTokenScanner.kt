@@ -2446,8 +2446,14 @@ internal fun discoverSharedInlineModuleRelFiles(byRelPath: Map<String, String>):
             val macroRel = "$dirPrefix$macroStem.rs"
             val macroSubMod = "$dirPrefix$macroStem/mod.rs"
             if (macroRel in byRelPath && macroSubMod !in byRelPath) {
-                result += macroRel
                 val macroTrees = lexScannerTokens(byRelPath.getValue(macroRel))
+                val shouldInlineMacroMod =
+                    macroStem == "macros" ||
+                        macroStem.endsWith("_macros") ||
+                        (macroUseStems.size == 1 && !containsTopLevelTypeDeclTokens(macroTrees))
+                if (shouldInlineMacroMod) {
+                    result += macroRel
+                }
                 val macroDefs = LinkedHashMap<String, MacroRulesDef>()
                 collectMacroRulesFromTokenTrees(macroTrees, macroDefs)
                 for ((mName, mDef) in macroDefs) {
@@ -2487,6 +2493,39 @@ internal fun discoverSharedInlineModuleRelFiles(byRelPath: Map<String, String>):
         }
     }
     return result
+}
+
+private fun containsTopLevelTypeDeclTokens(trees: List<TokenTree>): Boolean {
+    var i = 0
+    while (i < trees.size) {
+        val tt = trees[i]
+        if (tt is TokenTree.Group) {
+            if (containsTopLevelTypeDeclTokens(tt.value.stream().toList())) return true
+            i++
+            continue
+        }
+        val id = (tt as? TokenTree.Ident)?.value?.toString()
+        if (id == "macro_rules" &&
+            (trees.getOrNull(i + 1) as? TokenTree.Punct)?.value?.asChar() == '!'
+        ) {
+            var k = i + 2
+            if (trees.getOrNull(k) is TokenTree.Ident) k++
+            if (trees.getOrNull(k) is TokenTree.Group) k++
+            if ((trees.getOrNull(k) as? TokenTree.Punct)?.value?.asChar() == ';') k++
+            i = k
+            continue
+        }
+        if (id in setOf("struct", "enum", "union", "trait")) {
+            return true
+        }
+        if (id == "features" &&
+            (trees.getOrNull(i + 1) as? TokenTree.Punct)?.value?.asChar() == '!'
+        ) {
+            return true
+        }
+        i++
+    }
+    return false
 }
 
 private fun scanInlineModulePatternsInTokens(

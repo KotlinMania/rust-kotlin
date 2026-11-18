@@ -269,6 +269,12 @@ internal fun KotlinJ2KEmitter.renderMacroInvocationAsStmtOrExpr(
             // including field/index places rather than only simple identifiers.
             val place = parseAndRenderTokenStreamAsExpr(tokens, indent, selfTypeName)
             val callee = rustFunctionIdentToKotlin(macroName)
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+            if (("core" in headerContext.crateNamespaces || headerContext.packageName?.startsWith(coreNs) == true) &&
+                headerContext.packageName != "$coreNs.mem"
+            ) {
+                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.$callee")
+            }
             "$callee($place)"
         }
         "asm", "naked_asm", "global_asm" -> "Unit"
@@ -1574,10 +1580,11 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
             if (firstRaw == "u128") usesU128 = true
             if (firstRaw == "i128") usesI128 = true
             val kind = resolveNumericKind(firstKtType)
+            val boundOwner = if (firstRaw in PRIMITIVE_TYPE_NAMES) kotlinBuiltinTypeName(firstKtType) else firstKtType
             if (secondRaw == "MIN" && (kind == NumericKind.F32 || kind == NumericKind.F64)) {
-                return "(-$firstKtType.MAX_VALUE)"
+                return "(-$boundOwner.MAX_VALUE)"
             }
-            return "$firstKtType.${secondRaw}_VALUE"
+            return "$boundOwner.${secondRaw}_VALUE"
         }
         if (filtered[1].arguments is PathArguments.None && (firstRaw == "u128" || firstRaw == "i128" || firstRaw == "f16" || firstRaw == "f128")) {
             val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
@@ -1858,6 +1865,27 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
     if (parts.size >= 2) {
         val lastRaw = filtered.last().ident.toString()
         val prevRaw = filtered[filtered.size - 2].ident.toString()
+        if (prevRaw != "Self" &&
+            prevRaw.first().isUpperCase() &&
+            !isScreamingSnakeIdent(prevRaw)
+        ) {
+            val ownerKt = rustTypeIdentToKotlin(prevRaw)
+            if (ownerKt !in inspector.declaredTypeNames &&
+                ownerKt !in activeTypeParamNames &&
+                ownerKt !in importedSimpleNameToPkg &&
+                ownerKt !in KOTLIN_STDLIB_SHADOWED_IMPORTS
+            ) {
+                val sub = resolveBestSubpackageForSymbol(ownerKt)
+                val ns = currentNamespacePrefix()
+                if (sub != null && ns != null) {
+                    val pkg = if (sub.isEmpty()) ns else "$ns.$sub"
+                    if (pkg != headerContext.packageName) {
+                        importedSimpleNameToPkg[ownerKt] = pkg
+                        extraTypePathImports += "import $pkg.$ownerKt"
+                    }
+                }
+            }
+        }
         if (isKnownEnumVariantPair(prevRaw, lastRaw, selfTypeName)) {
             parts[parts.lastIndex] = rustTypeIdentToKotlin(lastRaw)
             if (!asCallee && prevRaw.first().isUpperCase()) {
@@ -1998,7 +2026,9 @@ internal fun KotlinJ2KEmitter.renderPathSegmentInExpr(
                 candKt
             }
             isSingleSegment -> {
-                if (arguments is PathArguments.None && cleanIdent in activeGuardBindingSubstitutions) {
+                if (asCallee && activeLocalForeignFnRenames[cleanIdent] != null) {
+                    activeLocalForeignFnRenames.getValue(cleanIdent)
+                } else if (arguments is PathArguments.None && cleanIdent in activeGuardBindingSubstitutions) {
                     activeGuardBindingSubstitutions.getValue(cleanIdent)
                 } else if (scopeBuilder.resolveLocalKotlinName(cleanIdent) != null) {
                     scopeBuilder.resolveLocalKotlinName(cleanIdent)!!
@@ -2185,8 +2215,7 @@ private fun KotlinJ2KEmitter.isKnownEnumVariantPair(
 ): Boolean {
     val cleanPrev = prevRaw.removePrefix("r#")
     val cleanLast = lastRaw.removePrefix("r#")
-    if (cleanLast.isEmpty() || cleanLast == "new" || cleanLast == "default") return false
-    if (cleanPrev != "Self" && cleanPrev.firstOrNull()?.isUpperCase() != true) return false
+    if (cleanPrev.isEmpty() || cleanLast.isEmpty() || cleanLast == "new" || cleanLast == "default") return false
     val enumKt =
         if (cleanPrev == "Self") {
             selfTypeName

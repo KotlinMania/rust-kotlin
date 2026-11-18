@@ -1125,4 +1125,134 @@ class StdlibSemanticWaveCTest {
         assertContains(out, "public fun emitTok(t: HasIterator): HasIterator")
         assertContains(out, "this.addAssign(rhs)")
     }
+
+    @Test
+    fun `wave c6 fixes tokenTree outer qualification forceResult typeParam rename maskElement Exclusion intShadow localForeignRename sveInto maybeUninit default and primitiveTryInto`() {
+        val rustSource =
+            """
+            pub struct Group(u32);
+            pub struct Punct(char);
+
+            pub enum TokenTree {
+                Group(Group),
+                Punct(Punct),
+            }
+
+            pub fn check_tt(t: TokenTree) -> bool {
+                match t {
+                    TokenTree::Group(_) => true,
+                    TokenTree::Punct(_) => false,
+                }
+            }
+
+            pub enum ForceResult<Leaf, Internal> {
+                Leaf(Leaf),
+                Internal(Internal),
+            }
+
+            pub trait MaskElement {
+                type Mask;
+                type Unsigned;
+            }
+
+            pub struct Mask<T, const N: usize>(T)
+            where
+                T: MaskElement;
+
+            pub trait Shl<Rhs = Self> {
+                type Output;
+            }
+
+            pub trait Int: Shl<i32, Output = Self> {
+                fn checked_val(&self, x: i32) -> i32;
+            }
+
+            pub struct SvboolT(bool);
+            pub struct Svbool2T(bool);
+            pub struct Svbool4T(bool);
+            pub struct Svfloat32T(f32);
+            pub trait SveInto<T> {
+                fn sve_into(self) -> T;
+            }
+            impl SveInto<Svbool2T> for SvboolT {
+                fn sve_into(self) -> Svbool2T { Svbool2T(self.0) }
+            }
+            impl SveInto<Svbool4T> for SvboolT {
+                fn sve_into(self) -> Svbool4T { Svbool4T(self.0) }
+            }
+
+            pub unsafe fn svabd_f32_m(pg: SvboolT) -> Svfloat32T {
+                extern "C" {
+                    fn svabd_f32_m(pg: Svbool4T) -> Svfloat32T;
+                }
+                unsafe { svabd_f32_m(pg.sve_into()) }
+            }
+
+            pub struct MaybeUninit<T>(T);
+            impl<T> MaybeUninit<T> {
+                pub fn uninit() -> MaybeUninit<T> {
+                    loop {}
+                }
+            }
+
+            pub struct TryFromIntError(u8);
+            pub trait TryFrom<T> {
+                type Error;
+                fn try_from(value: T) -> Result<Self, Self::Error>;
+            }
+
+            impl TryFrom<u16> for u8 {
+                type Error = TryFromIntError;
+                fn try_from(u: u16) -> Result<Self, TryFromIntError> {
+                    Ok(u as u8)
+                }
+            }
+
+            pub fn narrow_u8(value: u16) -> Option<u8> {
+                value.try_into().ok()
+            }
+
+            pub fn widen_u16(value: u8) -> u16 {
+                value.try_into().unwrap()
+            }
+            """
+        val out =
+            translateRustSourceToKotlin(
+                recognizeRust(rustSource.trimIndent()),
+                headerContext =
+                    FileHeaderContext(
+                        packageName = "io.github.kotlinmania.rustlang.procmacro",
+                        projectNamespace = "io.github.kotlinmania.rustlang.procmacro",
+                        crateNamespaces =
+                            mapOf(
+                                "core" to "io.github.kotlinmania.rustlang.core",
+                                "proc_macro" to "io.github.kotlinmania.rustlang.procmacro",
+                            ),
+                        crateEnumVariantTypeArity =
+                            mapOf(
+                                "TokenTree.Group" to 0,
+                                "Group" to 2,
+                            ),
+                    ),
+            )
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(out, "WaveC6Sample.kt")
+        assertContains(out, "public var value: io.github.kotlinmania.rustlang.procmacro.Group")
+        assertContains(out, "is TokenTree.Group -> true")
+        assertFalse(out.contains("is TokenTree.Group<*"), "Non-generic TokenTree.Group must not receive star projections:\n$out")
+        assertContains(out, "public sealed class ForceResult<LeafParam, InternalParam>")
+        assertContains(out, "public data class Leaf<LeafParam, InternalParam>(public var value: LeafParam) : ForceResult<LeafParam, InternalParam>()")
+        assertContains(out, "public open class Mask<T>(")
+        assertContains(out, "where T : MaskElement<Any?, Any?>")
+        assertFalse(out.contains("class Mask<T, Mask"), "MaskElement Mask associated type must not collide with struct Mask:\n$out")
+        assertContains(out, "public interface Int : Shl<kotlin.Int, Int>")
+        assertFalse(out.contains("Shl<Int,"))
+        assertContains(out, "public fun checkedVal(x: kotlin.Int): kotlin.Int")
+        assertContains(out, "public open fun sveIntoSvbool4T(): Svbool4T")
+        assertContains(out, "fun externSvabdF32M(pg1: Svbool4T): Svfloat32T")
+        assertContains(out, "externSvabdF32M(pg.sveIntoSvbool4T())")
+        assertContains(out, "public fun <T> uninit(typeLayoutT: TypeLayout<T> = UnresolvedTypeLayout()): MaybeUninit<T>")
+        assertContains(out, "public fun UByte.Companion.tryFrom(u: UShort): Result<UByte, TryFromIntError>")
+        assertContains(out, "UByte.tryFrom(value).ok()")
+        assertContains(out, "Result.Ok<UShort, kotlin.Nothing>(UShort.from(value)).unwrap()")
+    }
 }

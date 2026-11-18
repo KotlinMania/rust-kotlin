@@ -1269,7 +1269,6 @@ private fun KotlinJ2KEmitter.lookupEnumVariantTypeArity(variantType: String): In
     if ('<' in variantType) return 0
     inspector.enumTypeParamsByVariant[variantType]
         ?.size
-        ?.takeIf { it > 0 }
         ?.let { return it }
     val simple = variantType.substringAfterLast('.')
     if ('.' in variantType) {
@@ -1278,25 +1277,27 @@ private fun KotlinJ2KEmitter.lookupEnumVariantTypeArity(variantType: String): In
         val lastTwo = "$enumSimple.$simple"
         inspector.enumTypeParamsByVariant[lastTwo]
             ?.size
-            ?.takeIf { it > 0 }
             ?.let { return it }
         importedSimpleNameToPkg[enumSimple]?.let { pkg ->
             val ns = currentNamespacePrefix()
             val sub = if (ns != null && pkg.startsWith("$ns.")) pkg.removePrefix("$ns.") else pkg.substringAfterLast('.')
             if (sub.isNotEmpty()) {
-                headerContext.crateEnumVariantTypeArity["$sub.$lastTwo"]?.takeIf { it > 0 }?.let { return it }
+                headerContext.crateEnumVariantTypeArity["$sub.$lastTwo"]?.let { return it }
             }
         }
-        headerContext.crateEnumVariantTypeArity[lastTwo]?.takeIf { it > 0 }?.let { return it }
+        headerContext.crateEnumVariantTypeArity[lastTwo]?.let { return it }
         for (scoped in scopedAbiKeysForRenderedType(lastTwo)) {
-            headerContext.crateEnumVariantTypeArity[scoped]?.takeIf { it > 0 }?.let { return it }
+            headerContext.crateEnumVariantTypeArity[scoped]?.let { return it }
         }
+        if (enumSimple in inspector.enumTypeNames) {
+            return inspector.enumTypeParamsByVariant[lastTwo]?.size ?: 0
+        }
+        return 0
     } else {
         inspector.enumTypeParamsByVariant[simple]
             ?.size
-            ?.takeIf { it > 0 }
             ?.let { return it }
-        headerContext.crateEnumVariantTypeArity[simple]?.takeIf { it > 0 }?.let { return it }
+        headerContext.crateEnumVariantTypeArity[simple]?.let { return it }
     }
     return 0
 }

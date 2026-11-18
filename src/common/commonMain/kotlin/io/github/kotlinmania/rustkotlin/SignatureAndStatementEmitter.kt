@@ -45,11 +45,47 @@ internal data class TypeParamWitnessSpec(
     val defaultExpr: String? = null,
 )
 
+internal val COMPANION_CAPABLE_VALUE_TYPES: Set<String> =
+    setOf(
+        "Byte",
+        "Short",
+        "Int",
+        "Long",
+        "UByte",
+        "UShort",
+        "UInt",
+        "ULong",
+        "Float",
+        "Double",
+        "Boolean",
+        "Char",
+        "String",
+        "kotlin.Byte",
+        "kotlin.Short",
+        "kotlin.Int",
+        "kotlin.Long",
+        "kotlin.UByte",
+        "kotlin.UShort",
+        "kotlin.UInt",
+        "kotlin.ULong",
+        "kotlin.Float",
+        "kotlin.Double",
+        "kotlin.Boolean",
+        "kotlin.Char",
+        "kotlin.String",
+        "I128",
+        "U128",
+        "F16",
+        "F128",
+        "RustChar",
+    )
+
 internal fun KotlinJ2KEmitter.liftDefaultlessAssocTypesFromBounds(
     combinedParams: List<GenericParam>,
     ownerWhere: WhereClause?,
     fnWhere: WhereClause?,
     implWhere: WhereClause? = null,
+    ownerTypeSimpleName: String? = null,
 ): List<String> {
     val existingParams =
         combinedParams
@@ -61,7 +97,7 @@ internal fun KotlinJ2KEmitter.liftDefaultlessAssocTypesFromBounds(
             if (b is TypeParamBound.Trait) {
                 val lastSeg = b.path.segments.last() ?: continue
                 val rawIdent = lastSeg.ident.toString().removePrefix("r#")
-                if (rawIdent in IGNORED_TRAIT_BOUNDS) continue
+                if (rawIdent in IGNORED_TRAIT_BOUNDS || rawIdent == "MaskElement") continue
                 val ktTrait = rustTypeIdentToKotlin(rawIdent)
                 if (ktTrait !in inspector.declaredTypeNames &&
                     (rawIdent == "IntoIterator" || isImplicitStdlibSupertraitPath(b.path))
@@ -78,8 +114,9 @@ internal fun KotlinJ2KEmitter.liftDefaultlessAssocTypesFromBounds(
                                 .mapTo(linkedSetOf()) { rustTypeIdentToKotlin(it.assoc.ident.toString()) }
                         else -> continue
                     }
+                val ownerSimple = ownerTypeSimpleName ?: currentBoundedTypeName?.substringBefore('<')?.trim()
                 for (assoc in lookupTraitDefaultlessAssocTypes(ktTrait, b.path)) {
-                    if (assoc !in boundAssocs && assoc !in existingParams && assoc !in lifted) {
+                    if (assoc !in boundAssocs && assoc != ownerSimple && assoc !in existingParams && assoc !in lifted) {
                         lifted += assoc
                     }
                 }
@@ -823,6 +860,7 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
             ownerWhere = if (includeOwner) ownerGenerics?.whereClause else null,
             fnWhere = sig.generics.whereClause,
             implWhere = if (includeOwner && implGenerics !== ownerGenerics) implGenerics?.whereClause else null,
+            ownerTypeSimpleName = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim(),
         )
     if (liftedAssocs.isNotEmpty()) {
         activeTypeParamNames = activeTypeParamNames + liftedAssocs
@@ -962,6 +1000,27 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
             paramTypeSignatureKeys += eraseTypeForSignatureKey(layoutType)
             currentTypedLocals = currentTypedLocals + ("fieldLayout" to layoutType)
         }
+        if (isCompanionMember &&
+            selfTypeName?.startsWith("MaybeUninit<") == true &&
+            selfTypeName.endsWith(">") &&
+            rawFnName in setOf("new", "uninit", "zeroed") &&
+            params.none { it.startsWith("typeLayoutT:") }
+        ) {
+            val muElem = selfTypeName.substringAfter('<').removeSuffix(">").trim()
+            val hasMuTypeParam =
+                combinedParams.any {
+                    (it as? GenericParam.TypeParam)?.ident?.toString()?.let(::rustTypeIdentToKotlin) == muElem
+                }
+            if (muElem.isNotEmpty() && hasMuTypeParam) {
+                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.TypeLayout")
+                val layoutType = "TypeLayout<$muElem>"
+                params += "typeLayoutT: $layoutType"
+                defaultLayoutParamNames += "typeLayoutT"
+                paramTypeSignatureKeys += eraseTypeForSignatureKey(layoutType)
+                currentTypedLocals = currentTypedLocals + ("typeLayoutT" to layoutType)
+            }
+        }
     }
 
     for (gp in combinedParams) {
@@ -1046,13 +1105,28 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
                 }
                 "$selfTypeName."
             } else if (standaloneTraitPath != null) {
-                effectiveFnName =
-                    disambiguateReceiverlessTraitImplFnName(
-                        standaloneTraitPath,
-                        fnName,
-                        standaloneSelfSynType,
-                    )
-                ""
+                val baseType = selfTypeName.substringBefore('<').trim()
+                val rawStandaloneTrait =
+                    standaloneTraitPath.segments
+                        .toList()
+                        .lastOrNull()
+                        ?.ident
+                        ?.toString()
+                        ?.removePrefix("r#")
+                if (baseType in COMPANION_CAPABLE_VALUE_TYPES &&
+                    rawStandaloneTrait in setOf("From", "TryFrom", "Step") &&
+                    inputs.isNotEmpty()
+                ) {
+                    "$baseType.Companion."
+                } else {
+                    effectiveFnName =
+                        disambiguateReceiverlessTraitImplFnName(
+                            standaloneTraitPath,
+                            fnName,
+                            standaloneSelfSynType,
+                        )
+                    ""
+                }
             } else {
                 val baseType = selfTypeName.substringBefore('<').trim()
                 if (baseType.isNotEmpty() &&
@@ -1940,6 +2014,7 @@ internal fun KotlinJ2KEmitter.renderBlock(
     val prevSourceParameterTypes = currentSourceParameterTypes
     val prevFnParamNumericKinds = currentFunctionParamNumericKinds
     val prevLocalBlockItems = activeLocalBlockItems
+    val prevLocalForeignRenames = activeLocalForeignFnRenames
     val blockEntryExpectedKind = currentExpectedNumericKind
     val blockEntryTailExpectsUnitResultOk = currentTailExpectsUnitResultOk
     val savedBlockLocalFnRawNames = hashSetOf<String>()
@@ -1947,6 +2022,7 @@ internal fun KotlinJ2KEmitter.renderBlock(
     val prevBlockLocalFnReturnSynTypes = linkedMapOf<String, SynType?>()
     val prevBlockLocalTypeAliases = linkedMapOf<String, SynType?>()
     val savedBlockLocalExternFnNames = linkedSetOf<String>()
+    val blockLocalForeignRenames = linkedMapOf<String, String>()
     currentExpectedNumericKind = null
     currentTailExpectsUnitResultOk = false
     activeLocalBlockItems = localScopeItems + prevLocalBlockItems
@@ -1991,9 +2067,17 @@ internal fun KotlinJ2KEmitter.renderBlock(
                                 inspector.declaredTopLevelFnRawNames += cleanRaw
                             }
                             val ktFn = rustFunctionIdentToKotlin(foreign.sig.ident.toString())
-                            if (ktFn !in inspector.externFnKotlinNames) {
-                                savedBlockLocalExternFnNames += ktFn
-                                inspector.externFnKotlinNames += ktFn
+                            val effectiveLocalKt =
+                                if (ktFn == currentEnclosingFunctionName) {
+                                    "extern${ktFn.replaceFirstChar { c -> c.uppercase() }}".also { renamed ->
+                                        blockLocalForeignRenames[cleanRaw] = renamed
+                                    }
+                                } else {
+                                    ktFn
+                                }
+                            if (effectiveLocalKt !in inspector.externFnKotlinNames) {
+                                savedBlockLocalExternFnNames += effectiveLocalKt
+                                inspector.externFnKotlinNames += effectiveLocalKt
                             }
                             val retOut = foreign.sig.output as? ReturnType.TypeReturn
                             if (retOut != null &&
@@ -2003,17 +2087,20 @@ internal fun KotlinJ2KEmitter.renderBlock(
                                 if (cleanRaw !in prevBlockLocalFnReturnSynTypes) {
                                     prevBlockLocalFnReturnSynTypes[cleanRaw] = inspector.topLevelFnReturnSynTypes[cleanRaw]
                                 }
-                                if (ktFn !in prevBlockLocalFnReturnSynTypes) {
-                                    prevBlockLocalFnReturnSynTypes[ktFn] = inspector.topLevelFnReturnSynTypes[ktFn]
+                                if (effectiveLocalKt !in prevBlockLocalFnReturnSynTypes) {
+                                    prevBlockLocalFnReturnSynTypes[effectiveLocalKt] = inspector.topLevelFnReturnSynTypes[effectiveLocalKt]
                                 }
                                 inspector.topLevelFnReturnSynTypes[cleanRaw] = retOut.ty
-                                inspector.topLevelFnReturnSynTypes[ktFn] = retOut.ty
+                                inspector.topLevelFnReturnSynTypes[effectiveLocalKt] = retOut.ty
                             }
                         }
                     }
                 }
                 else -> {}
             }
+        }
+        if (blockLocalForeignRenames.isNotEmpty()) {
+            activeLocalForeignFnRenames = prevLocalForeignRenames + blockLocalForeignRenames
         }
         val blockFnParamKinds = linkedMapOf<String, List<NumericKind?>?>()
         for (stmt in stmts) {
@@ -2174,6 +2261,7 @@ internal fun KotlinJ2KEmitter.renderBlock(
         currentSourceParameterTypes = prevSourceParameterTypes
         currentFunctionParamNumericKinds = prevFnParamNumericKinds
         activeLocalBlockItems = prevLocalBlockItems
+        activeLocalForeignFnRenames = prevLocalForeignRenames
         scopeBuilder.exitCompr()
     }
 

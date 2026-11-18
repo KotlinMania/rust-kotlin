@@ -1143,8 +1143,23 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
                                     }
                                         ?: return@mapNotNull null
                                 val ktFnName = rustFunctionIdentToKotlin(implFn.sig.ident.toString())
+                                val rawImplTrait =
+                                    implTraitPath.segments
+                                        .toList()
+                                        .lastOrNull()
+                                        ?.ident
+                                        ?.toString()
+                                        ?.removePrefix("r#")
                                 val targetCall =
-                                    if (isLocalAttached) {
+                                    if (isLocalAttached ||
+                                        (
+                                            concreteSelfType.substringBefore('<').trim() in COMPANION_CAPABLE_VALUE_TYPES &&
+                                                rawImplTrait in setOf("From", "TryFrom", "Step") &&
+                                                implFn.sig.inputs
+                                                    .toList()
+                                                    .isNotEmpty()
+                                        )
+                                    ) {
                                         "$concreteSelfType.$ktFnName"
                                     } else {
                                         disambiguateReceiverlessTraitImplFnName(implTraitPath, ktFnName, uniqueImpl.selfType)

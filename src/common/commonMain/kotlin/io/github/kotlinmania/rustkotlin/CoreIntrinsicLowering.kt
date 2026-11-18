@@ -1482,9 +1482,17 @@ public object CoreIntrinsicLowering {
         if ("transmute" !in emitter.inspector.declaredTopLevelFnRawNames &&
             "transmute_unchecked" !in emitter.inspector.declaredTopLevelFnRawNames
         ) {
-            val fnName = if (rawTransmuteIdent == "transmute_unchecked") "transmuteUnchecked" else "transmute"
             val coreNs = resolveCoreNamespace(emitter.headerContext)
             val memPkg = "$coreNs.mem"
+            if (srcRendered == null && dstRendered != null) {
+                val dstLayout =
+                    dstSyn?.let { resolveTypeLayoutExpression(it, selfTypeName, emitter) }
+                        ?: resolveRenderedTypeLayoutExpression(dstRendered, emitter)
+                registerCoreImport(emitter, "$memPkg.transmuteWithLayouts")
+                registerCoreImport(emitter, "$memPkg.UnresolvedTypeLayout")
+                return "transmuteWithLayouts<Any?, $dstRendered>($renderedArg, UnresolvedTypeLayout<Any?>(), $dstLayout)"
+            }
+            val fnName = if (rawTransmuteIdent == "transmute_unchecked") "transmuteUnchecked" else "transmute"
             if (emitter.headerContext.packageName != memPkg) {
                 registerCoreImport(emitter, "$memPkg.$fnName")
             }
@@ -1502,7 +1510,15 @@ public object CoreIntrinsicLowering {
         if (spec.rawName in setOf("__rust_alloc", "__rust_alloc_zeroed", "__rust_realloc")) {
             return "MutPtr"
         }
-        if (!spec.isIntrinsicsModuleCall) return null
+        val isCoreSimdCall =
+            isSimdIntrinsicName(spec.canonicalName) &&
+                (
+                    spec.isIntrinsicsModuleCall ||
+                        spec.penultName == "simd" ||
+                        spec.penultName == "scalable" ||
+                        ((call.func as? Expr.Path)?.path?.segments?.size == 1 && spec.rawName !in emitter.inspector.declaredTopLevelFnRawNames)
+                )
+        if (!spec.isIntrinsicsModuleCall && !isCoreSimdCall) return null
         val canonical = spec.canonicalName
         if (canonical in setOf("ctpop", "ctlz", "ctlz_nonzero", "cttz", "cttz_nonzero")) {
             return "UInt"
@@ -1637,7 +1653,25 @@ public object CoreIntrinsicLowering {
                         .firstOrNull()
                         ?.takeUnless { it is SynType.Infer }
                         ?.let { emitter.renderType(it, selfTypeName) }
-                        ?: spec.callArgsList.firstOrNull()?.let { emitter.inferExprRenderedType(it, selfTypeName) }
+                        ?: spec.callArgsList.firstOrNull()?.let { arg0 ->
+                            emitter.inferExprRenderedType(arg0, selfTypeName)
+                                ?: run {
+                                    val callArg = emitter.unwrapParenOrGroupExpr(arg0) as? Expr.Call
+                                    val callPath = (callArg?.func as? Expr.Path)?.takeIf { it.qself == null }?.path
+                                    val callName =
+                                        callPath
+                                            ?.segments
+                                            ?.last()
+                                            ?.ident
+                                            ?.toString()
+                                            ?.removePrefix("r#")
+                                    if (callName in setOf("transmute", "transmute_unchecked") && callArg?.args?.len() == 1) {
+                                        emitter.inferExprRenderedType(callArg.args.first()!!, selfTypeName)
+                                    } else {
+                                        null
+                                    }
+                                }
+                        }
                 in SIMD_SAME_ARG1_INTRINSICS ->
                     return spec.callArgsList.getOrNull(1)?.let { emitter.inferExprRenderedType(it, selfTypeName) }
                 in SIMD_SAME_ARG2_INTRINSICS ->
@@ -1765,12 +1799,15 @@ public object CoreIntrinsicLowering {
         val explicitConsts = spec.explicitConsts
         val simdExpectedArgTarget =
             if (isCoreSimdCall) {
+                val canInferFromPeerArgs =
+                    spec.canonicalName !in
+                        setOf("simd_select_bitmask", "simd_gather", "simd_scatter", "simd_masked_load", "simd_masked_store")
                 explicitTypes
                     .firstOrNull()
                     ?.takeUnless { it is SynType.Infer }
                     ?.let { emitter.renderType(it, selfTypeName) }
                     ?.takeIf(::isUsableRenderedTypeArg)
-                    ?: if (spec.canonicalName !in setOf("simd_select_bitmask", "simd_gather", "simd_scatter", "simd_masked_load", "simd_masked_store")) {
+                    ?: if (canInferFromPeerArgs) {
                         callArgsList.firstNotNullOfOrNull { argExpr ->
                             val rawCallName =
                                 ((argExpr as? Expr.Call)?.func as? Expr.Path)
@@ -1787,6 +1824,40 @@ public object CoreIntrinsicLowering {
                                 emitter
                                     .inferExprRenderedType(argExpr, selfTypeName)
                                     ?.takeIf(::isUsableRenderedTypeArg)
+                            }
+                        }
+                    } else {
+                        null
+                    }
+                    ?: if (spec.canonicalName in SIMD_SAME_ARG0_INTRINSICS &&
+                        spec.canonicalName !in setOf("simd_insert", "simd_insert_dyn", "simd_gather", "simd_arith_offset")
+                    ) {
+                        (
+                            emitter.currentExpectedParseTargetType
+                                ?: if (emitter.callArgumentNestingDepth == 0) emitter.currentEnclosingReturnRenderedType else null
+                        )?.takeIf(::isUsableRenderedTypeArg)
+                    } else {
+                        null
+                    }
+                    ?: if (canInferFromPeerArgs) {
+                        callArgsList.firstNotNullOfOrNull { argExpr ->
+                            val callArg = emitter.unwrapParenOrGroupExpr(argExpr) as? Expr.Call
+                            val rawCallName =
+                                (callArg?.func as? Expr.Path)
+                                    ?.takeIf { it.qself == null }
+                                    ?.path
+                                    ?.segments
+                                    ?.toList()
+                                    ?.lastOrNull()
+                                    ?.ident
+                                    ?.toString()
+                                    ?.removePrefix("r#")
+                            if (rawCallName in setOf("transmute", "transmute_unchecked") && callArg?.args?.len() == 1) {
+                                emitter
+                                    .inferExprRenderedType(callArg.args.first()!!, selfTypeName)
+                                    ?.takeIf(::isUsableRenderedTypeArg)
+                            } else {
+                                null
                             }
                         }
                     } else {

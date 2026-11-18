@@ -137,7 +137,30 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
     }
     currentExpectedParseTargetType =
         when (cleanMethod) {
-            "map_err", "or_else", "or", "unwrap", "expect", "ok", "assume_init", "assume_init_read" ->
+            "unwrap", "unwrap_unchecked", "expect", "ok" -> {
+                val outerTarget =
+                    methodEntryParseTarget
+                        ?: if (callArgumentNestingDepth == 0) currentEnclosingReturnRenderedType else null
+                val cleanOuter = outerTarget?.trim()
+                if (usesTaggedCoreResult() &&
+                    cleanOuter != null &&
+                    cleanOuter.isNotEmpty() &&
+                    cleanOuter != "Unit" &&
+                    !cleanOuter.startsWith("${sourceResultName()}<") &&
+                    !cleanOuter.startsWith("Result<") &&
+                    !cleanOuter.startsWith("kotlin.Result<")
+                ) {
+                    val okPayload = if (cleanMethod == "ok") cleanOuter.removeSuffix("?").trim() else cleanOuter
+                    if (okPayload.isNotEmpty() && okPayload != "Any?" && '*' !in okPayload) {
+                        "${sourceResultName()}<$okPayload, Any?>"
+                    } else {
+                        outerTarget
+                    }
+                } else {
+                    outerTarget
+                }
+            }
+            "map_err", "or_else", "or", "assume_init", "assume_init_read" ->
                 methodEntryParseTarget ?: currentEnclosingReturnRenderedType
             else -> null
         }
@@ -548,6 +571,134 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
     }
     if (rawMethod == "into" && nonUnitArgs.isEmpty() && expr.turbofish == null && receiver in currentIntoSubstitutedParams) {
         return receiver
+    }
+    if (rawMethod == "sve_into" && nonUnitArgs.isEmpty() && expr.turbofish == null) {
+        val recvSimple =
+            inferExprRenderedType(expr.receiver, selfTypeName)
+                ?.removeSuffix("?")
+                ?.substringBefore('<')
+                ?.substringAfterLast('.')
+                ?.trim()
+        val targetSimple =
+            (
+                methodEntryParseTarget
+                    ?: if (callArgumentNestingDepth == 0) currentEnclosingReturnRenderedType else null
+            )?.removeSuffix("?")
+                ?.substringBefore('<')
+                ?.substringAfterLast('.')
+                ?.trim()
+        if (recvSimple != null && targetSimple != null) {
+            if (recvSimple == targetSimple) return receiver
+            if (recvSimple == "SvboolT" && targetSimple in setOf("Svbool4T", "Svbool8T")) {
+                return "$receiver.sveInto$targetSimple()"
+            }
+        }
+    }
+    if (cleanMethod == "try_into" &&
+        nonUnitArgs.isEmpty() &&
+        usesTaggedCoreResult() &&
+        ("core" in headerContext.crateNamespaces || headerContext.packageName?.startsWith(CoreIntrinsicLowering.resolveCoreNamespace(headerContext)) == true)
+    ) {
+        val stdlibIntTypes = setOf("Byte", "Short", "Int", "Long", "I128", "UByte", "UShort", "UInt", "ULong", "U128")
+        val srcSimple =
+            inferExprRenderedType(expr.receiver, selfTypeName)
+                ?.removeSuffix("?")
+                ?.removePrefix("kotlin.")
+                ?.trim()
+        val explicitDst =
+            (
+                expr.turbofish
+                    ?.args
+                    ?.toList()
+                    ?.firstOrNull() as? GenericArgument.TypeArg
+            )?.type
+                ?.let { renderType(it, selfTypeName).removeSuffix("?").removePrefix("kotlin.").trim() }
+        val dstSimple =
+            explicitDst
+                ?: rustResultTypeArguments(methodEntryParseTarget)
+                    ?.first
+                    ?.removeSuffix("?")
+                    ?.removePrefix("kotlin.")
+                    ?.trim()
+                ?: if (methodEntryParseTarget == null && callArgumentNestingDepth == 0) {
+                    currentEnclosingReturnRenderedType
+                        ?.let { rustResultTypeArguments(it)?.first ?: it }
+                        ?.removeSuffix("?")
+                        ?.removePrefix("kotlin.")
+                        ?.trim()
+                } else {
+                    null
+                }
+        if (srcSimple != null && dstSimple != null && srcSimple in stdlibIntTypes && dstSimple in stdlibIntTypes) {
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+            if (dstSimple == "I128") usesI128 = true
+            if (dstSimple == "U128") usesU128 = true
+            val dstOwner = if (dstSimple == "I128" || dstSimple == "U128") dstSimple else kotlinBuiltinTypeName(dstSimple)
+            val fromOnlyPairs =
+                setOf(
+                    "Byte" to "Short",
+                    "Byte" to "Long",
+                    "Byte" to "I128",
+                    "Short" to "Long",
+                    "Short" to "I128",
+                    "Long" to "I128",
+                    "UByte" to "Short",
+                    "UByte" to "Int",
+                    "UByte" to "Long",
+                    "UByte" to "I128",
+                    "UByte" to "UShort",
+                    "UByte" to "UInt",
+                    "UByte" to "ULong",
+                    "UByte" to "U128",
+                    "UShort" to "Long",
+                    "UShort" to "I128",
+                    "UShort" to "UInt",
+                    "UShort" to "ULong",
+                    "UShort" to "U128",
+                    "UInt" to "Long",
+                    "UInt" to "I128",
+                    "UInt" to "ULong",
+                    "UInt" to "U128",
+                    "ULong" to "I128",
+                    "ULong" to "U128",
+                )
+            val resName = sourceResultName()
+            if ((srcSimple to dstSimple) in fromOnlyPairs) {
+                if (headerContext.packageName != "$coreNs.convert.num") {
+                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.convert.num.from")
+                }
+                return "$resName.Ok<$dstOwner, kotlin.Nothing>($dstOwner.from($receiver))"
+            }
+            if (srcSimple == dstSimple) {
+                val srcRaw =
+                    (sourceInitializerType(expr.receiver)?.let(::unwrapSynType) as? SynType.Path)
+                        ?.path
+                        ?.segments
+                        ?.last()
+                        ?.ident
+                        ?.toString()
+                val dstRaw =
+                    (currentEnclosingReturnSynType?.let(::unwrapSynType) as? SynType.Path)
+                        ?.path
+                        ?.segments
+                        ?.last()
+                        ?.ident
+                        ?.toString()
+                if (srcSimple == "Int" &&
+                    ((srcRaw == "usize" && dstRaw in setOf("i32", "isize")) || (dstRaw == "usize" && srcRaw in setOf("i32", "isize")))
+                ) {
+                    if (headerContext.packageName != "$coreNs.convert.num") {
+                        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.convert.num.tryFrom")
+                    }
+                    return "$dstOwner.tryFrom($receiver)"
+                }
+                return "$resName.Ok<$dstOwner, kotlin.Nothing>($receiver)"
+            }
+            if (headerContext.packageName != "$coreNs.convert.num") {
+                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.convert.num.tryFrom")
+            }
+            return "$dstOwner.tryFrom($receiver)"
+        }
     }
     if (rawMethod == "into_iter" && nonUnitArgs.isEmpty() && expr.turbofish == null && receiver in currentIterableLocals) {
         return "$receiver.iterator()"

@@ -620,6 +620,45 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
         else -> {
             renderStaticPrimitiveCall(expr, nonUnitArgs, indent, selfTypeName)?.let { return it }
             val calleeBase = callee.substringBefore('<')
+            if (nonUnitArgs.size == 1 &&
+                ("core" in headerContext.crateNamespaces || headerContext.packageName?.startsWith(CoreIntrinsicLowering.resolveCoreNamespace(headerContext)) == true)
+            ) {
+                val cbParts = calleeBase.split('.')
+                val matchedPrimParts =
+                    when {
+                        cbParts.size == 2 -> cbParts[0] to cbParts[1]
+                        cbParts.size == 3 && cbParts[0] == "kotlin" -> cbParts[1] to cbParts[2]
+                        else -> null
+                    }
+                val companionConvertPrims =
+                    setOf(
+                        "Byte",
+                        "Short",
+                        "Int",
+                        "Long",
+                        "UByte",
+                        "UShort",
+                        "UInt",
+                        "ULong",
+                        "I128",
+                        "U128",
+                        "Boolean",
+                        "Float",
+                        "Double",
+                        "F16",
+                        "F128",
+                    )
+                if (matchedPrimParts != null &&
+                    matchedPrimParts.first in companionConvertPrims &&
+                    matchedPrimParts.second in setOf("from", "tryFrom") &&
+                    (cbParts.size == 3 || matchedPrimParts.first !in inspector.declaredTypeNames)
+                ) {
+                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+                    if (headerContext.packageName != "$coreNs.convert.num") {
+                        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.convert.num.${matchedPrimParts.second}")
+                    }
+                }
+            }
             val calleeLookupKeys =
                 buildList {
                     for (cand in listOf(callee, calleeBase).distinct()) {
@@ -736,7 +775,7 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                                         ?.removePrefix("r#") in setOf("transmute", "transmute_unchecked", "default")
                             val isConversionMethodArg =
                                 unwrappedArg is Expr.MethodCall &&
-                                    unwrappedArg.method.toString().removePrefix("r#") in setOf("into", "try_into")
+                                    unwrappedArg.method.toString().removePrefix("r#") in setOf("into", "try_into", "sve_into")
                             val isTransmuteOrConversionArg = isTransmuteOrDefaultCall || isConversionMethodArg
                             val paramParseTarget =
                                 paramSynTy
