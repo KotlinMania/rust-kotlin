@@ -3082,7 +3082,7 @@ internal fun KotlinJ2KEmitter.renderTailReturnExpr(expr: Expr, indent: String, s
             currentExpectedParseTargetType = savedParseTarget
         }
     val rendered =
-        if (rustResultOkPayloadType(currentEnclosingReturnRenderedType) == "Unit") {
+        if (enclosingUnitResultOkExpr() != null) {
             coerceTailFmtUnitToResultOk(expr, rawRendered, selfTypeName)
         } else {
             rawRendered

@@ -781,7 +781,13 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                             subslicePostStmts += subsliceSpec.third
                             return@mapIndexed subsliceSpec.second
                         }
-                        val paramKind = calleeParamNumericKinds?.get(argIdx)
+                        val paramKind =
+                            calleeParamNumericKinds?.get(argIdx)
+                                ?: if (argIdx == 0 && rawArgs.size == 1 && calleeBase.substringAfterLast('.') == "new") {
+                                    atomicOwnerValueNumericKind(calleeBase.substringBeforeLast('.').substringAfterLast('.').trim())
+                                } else {
+                                    null
+                                }
                         if ((callee == "ioctl" || callee.endsWith(".ioctl")) && argIdx >= 2) {
                             renderVariadicI64OrPtrArg(
                                 argExpr = argExpr,

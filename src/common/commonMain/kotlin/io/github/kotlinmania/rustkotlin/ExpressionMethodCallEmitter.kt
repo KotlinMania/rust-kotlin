@@ -1018,7 +1018,19 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                     methodSubslicePost += subsliceSpec.third
                     subsliceSpec.second
                 } else {
-                    val renderedArg = renderExpr(argExpr, indent, selfTypeName)
+                    val atomicArgKind = recvOwnerSimple?.let(::atomicOwnerValueNumericKind)
+                    val expectsAtomicArg =
+                        atomicArgKind != null &&
+                            (
+                                (rawMethod in setOf("store", "swap", "fetch_add", "fetch_sub", "fetch_and", "fetch_or", "fetch_xor", "fetch_max", "fetch_min") && argIdx == 0) ||
+                                    (rawMethod in setOf("compare_exchange", "compare_exchange_weak") && argIdx in 0..1)
+                            )
+                    val renderedArg =
+                        if (expectsAtomicArg) {
+                            renderTypedNumericInitializer(argExpr, atomicArgKind, indent, selfTypeName)
+                        } else {
+                            renderExpr(argExpr, indent, selfTypeName)
+                        }
                     val isRawPtrRecv =
                         recvOwnerSimple in setOf("MutPtr", "ConstPtr") ||
                             inferExprRenderedType(expr.receiver, selfTypeName)
@@ -1133,6 +1145,16 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
         isFmtStringBuilderReceiver(expr.receiver, receiver, selfTypeName)
     ) {
         return "$receiver.append(${renderedValueArgs[0]})"
+    }
+    val inferredRecvTyForFmt = inferExprRenderedType(expr.receiver, selfTypeName)?.removeSuffix("?")?.trim()
+    val isStringLitRecv = unwrapParenOrGroupExpr(expr.receiver).let { it is Expr.Lit && it.lit is Lit.Str }
+    if (rawMethod == "fmt" &&
+        renderedValueArgs.size == 1 &&
+        typeArgs.isEmpty() &&
+        (inferredRecvTyForFmt == "String" || isStringLitRecv) &&
+        isFmtStringBuilderReceiver(allMethodArgs[0], renderedValueArgs[0], selfTypeName)
+    ) {
+        return "${renderedValueArgs[0]}.append($receiver)"
     }
     if (rawMethod == "find" && renderedValueArgs.size == 1 && typeArgs.isEmpty()) {
         return "$receiver.indexOf(${renderedValueArgs[0]}).takeIf { it >= 0 }"

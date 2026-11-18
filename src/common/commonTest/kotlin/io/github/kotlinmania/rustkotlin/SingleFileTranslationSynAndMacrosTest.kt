@@ -913,8 +913,8 @@ class SingleFileTranslationSynAndMacrosTest {
         assertFalse(kt.contains("\\uf680"))
         assertFalse(kt.contains("&mut"))
         assertContains(kt, "checkByte(\"\\\\x5a\", 90u.toUByte())")
-        assertContains(kt, "checkByte(\"\\\\x7f\", 127u)")
-        assertContains(kt, "checkByte(\"\\\\xff\", 255u)")
+        assertContains(kt, "checkByte(\"\\\\x7f\", 127u.toUByte())")
+        assertContains(kt, "checkByte(\"\\\\xff\", 255u.toUByte())")
     }
 
     @Test fun builtinMacrosDebugBuildersComplementaryMatchArmsAndExternUsizeAbi() {
