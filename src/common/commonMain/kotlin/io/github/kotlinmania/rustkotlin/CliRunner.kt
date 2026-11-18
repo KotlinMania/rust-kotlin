@@ -21,7 +21,7 @@ internal val CLI_USAGE_TEXT: String =
           --in-place                   Write sibling <PascalCase>.kt next to each input .rs file
           --stdout                     Print translated Kotlin source to stdout without writing disk files
           --dry-run                    Print planned <input.rs> -> <output.kt> actions without writing files
-      -f, --force, --overwrite         Overwrite existing target .kt files (default refuses existing files)
+      -f, --force, --overwrite         Overwrite existing target .kt files (default refuses existing; skips // rust-kotlin: manual files)
           --skip-existing              Skip target .kt files that already exist
       --rustkotlin-properties <file>   Explicit rustkotlin.properties file for group/namespace/crate inference
           --package-properties <file>  Explicit package.properties file for package/crate overrides
@@ -94,10 +94,28 @@ private data class DiscoveredRustInput(
     val discoveryRoot: String?,
 )
 
+internal fun readExistingFileOrNull(path: String): String? {
+    val kmPath = KmPath(path)
+    if (SystemFileSystem.metadataOrNull(kmPath)?.isRegularFile != true) {
+        return null
+    }
+    return readInput(path)
+}
+
+internal fun isManualProtectedContent(content: String): Boolean =
+    content
+        .lineSequence()
+        .take(10)
+        .any { line ->
+            val trimmed = line.trimStart()
+            trimmed.startsWith("// rust-kotlin: manual") || trimmed.startsWith("# rust-kotlin: manual")
+        }
+
 /** IO is injected for focused invariant tests; renderers receive source text, never a writer. */
 internal fun runSingleFileCommand(
     args: Array<String>,
     read: (String) -> String = ::readInput,
+    readExistingOrNull: (String) -> String? = ::readExistingFileOrNull,
     write: (String, String) -> Unit = ::writeNew,
     writeForce: (String, String) -> Unit = ::writeOverwrite,
     exists: (String) -> Boolean = { probeTargetKotlinFile(it).exists },
@@ -164,6 +182,7 @@ internal fun runSingleFileCommand(
             executeTranslate(
                 parsed = parsed,
                 read = read,
+                readExistingOrNull = readExistingOrNull,
                 write = write,
                 writeForce = writeForce,
                 exists = exists,
@@ -833,6 +852,7 @@ private fun computeModuleRootPascalName(
 private fun executeTranslate(
     parsed: ParsedCliOptions,
     read: (String) -> String,
+    readExistingOrNull: (String) -> String?,
     write: (String, String) -> Unit,
     writeForce: (String, String) -> Unit,
     exists: (String) -> Boolean,
@@ -926,6 +946,36 @@ private fun executeTranslate(
     var cachedMetadata = CrateRawAbiMetadata()
     val emittedNapiModules = linkedSetOf<String>()
     val batchFailures = mutableListOf<String>()
+
+    fun isManualProtected(path: String): Boolean {
+        val existing = readExistingOrNull(path) ?: return false
+        return isManualProtectedContent(existing)
+    }
+
+    fun writeOutputFile(
+        path: String,
+        content: String,
+        quietSkipExisting: Boolean = false,
+    ): Boolean {
+        if (isManualProtected(path)) {
+            if (!parsed.quiet) {
+                report("skip manual $path")
+            }
+            return false
+        }
+        if (parsed.skipExisting && exists(path)) {
+            if (!quietSkipExisting && !parsed.quiet) {
+                report("skip existing $path")
+            }
+            return false
+        }
+        if (parsed.forceOverwrite) {
+            writeForce(path, content)
+        } else {
+            write(path, content)
+        }
+        return true
+    }
 
     fun translateDiscoveredEntry(entry: DiscoveredRustInput) {
         val metadataRoot = entry.discoveryRoot ?: parsed.sourceRoot
@@ -1182,18 +1232,25 @@ private fun executeTranslate(
             val testPath = listOf(testRoot, testRelDir, testName).filter { it.isNotEmpty() }.joinToString("/")
             require(testPath != outputPath) { "inline tests and product output must have distinct paths" }
             if (parsed.dryRun) {
-                if (!parsed.quiet) report("dry-run: ${entry.inputPath} inline tests -> $testPath")
-            } else if (!(parsed.skipExisting && exists(testPath))) {
-                if (parsed.forceOverwrite) writeForce(testPath, inlineTests.text) else write(testPath, inlineTests.text)
+                if (!parsed.quiet) {
+                    if (isManualProtected(testPath)) {
+                        report("dry-run: skip manual $testPath")
+                    } else {
+                        report("dry-run: ${entry.inputPath} inline tests -> $testPath")
+                    }
+                }
+            } else {
+                val wroteInline = writeOutputFile(testPath, inlineTests.text)
                 for (companion in inlineTests.companionFiles) {
                     if (companion.kind is CompanionInteropKind.NapiCppSource) {
                         emittedNapiModules += companion.ffiModuleName.ifEmpty { "ffi" }
                     }
                     val companionPath = resolveCompanionOutputPath(testPath, companion)
-                    if (parsed.skipExisting && exists(companionPath)) continue
-                    if (parsed.forceOverwrite) writeForce(companionPath, companion.content) else write(companionPath, companion.content)
+                    writeOutputFile(companionPath, companion.content, quietSkipExisting = true)
                 }
-                if (!parsed.quiet) report("${entry.inputPath} inline tests -> $testPath; ${inlineTests.summary}")
+                if (wroteInline && !parsed.quiet) {
+                    report("${entry.inputPath} inline tests -> $testPath; ${inlineTests.summary}")
+                }
             }
         }
 
@@ -1221,35 +1278,25 @@ private fun executeTranslate(
                     }
                     parsed.dryRun -> {
                         if (!parsed.quiet) {
-                            report("dry-run: ${entry.inputPath} -> $chunkPath; ${chunk.itemCount} items translated")
+                            val targetOut = chunkPath
+                            if (targetOut != null && isManualProtected(targetOut)) {
+                                report("dry-run: skip manual $targetOut")
+                            } else {
+                                report("dry-run: ${entry.inputPath} -> $chunkPath; ${chunk.itemCount} items translated")
+                            }
                         }
                     }
                     else -> {
                         val targetOut = requireNotNull(chunkPath)
-                        if (parsed.skipExisting && exists(targetOut)) {
-                            if (!parsed.quiet) {
-                                report("skip existing $targetOut")
-                            }
-                            continue
-                        }
-                        if (parsed.forceOverwrite) {
-                            writeForce(targetOut, chunk.text)
-                        } else {
-                            write(targetOut, chunk.text)
-                        }
+                        val wroteChunk = writeOutputFile(targetOut, chunk.text)
                         for (companion in chunk.companionFiles) {
                             if (companion.kind is CompanionInteropKind.NapiCppSource) {
                                 emittedNapiModules += companion.ffiModuleName.ifEmpty { "ffi" }
                             }
                             val companionOutPath = resolveCompanionOutputPath(targetOut, companion)
-                            if (parsed.skipExisting && exists(companionOutPath)) continue
-                            if (parsed.forceOverwrite) {
-                                writeForce(companionOutPath, companion.content)
-                            } else {
-                                write(companionOutPath, companion.content)
-                            }
+                            writeOutputFile(companionOutPath, companion.content, quietSkipExisting = true)
                         }
-                        if (!parsed.quiet) {
+                        if (wroteChunk && !parsed.quiet) {
                             report("${entry.inputPath} -> $targetOut; ${chunk.itemCount} items translated")
                         }
                     }
@@ -1273,29 +1320,25 @@ private fun executeTranslate(
             }
             parsed.dryRun -> {
                 if (!parsed.quiet) {
-                    report("dry-run: ${entry.inputPath} -> $outputPath; ${result.summary}")
+                    val targetOut = outputPath
+                    if (targetOut != null && isManualProtected(targetOut)) {
+                        report("dry-run: skip manual $targetOut")
+                    } else {
+                        report("dry-run: ${entry.inputPath} -> $outputPath; ${result.summary}")
+                    }
                 }
             }
             else -> {
                 val targetOut = requireNotNull(outputPath)
-                if (parsed.forceOverwrite) {
-                    writeForce(targetOut, result.text)
-                } else {
-                    write(targetOut, result.text)
-                }
+                val wroteTarget = writeOutputFile(targetOut, result.text)
                 for (companion in result.companionFiles) {
                     if (companion.kind is CompanionInteropKind.NapiCppSource) {
                         emittedNapiModules += companion.ffiModuleName.ifEmpty { "ffi" }
                     }
                     val companionOutPath = resolveCompanionOutputPath(targetOut, companion)
-                    if (parsed.skipExisting && exists(companionOutPath)) continue
-                    if (parsed.forceOverwrite) {
-                        writeForce(companionOutPath, companion.content)
-                    } else {
-                        write(companionOutPath, companion.content)
-                    }
+                    writeOutputFile(companionOutPath, companion.content, quietSkipExisting = true)
                 }
-                if (!parsed.quiet) {
+                if (wroteTarget && !parsed.quiet) {
                     report("${entry.inputPath} -> $targetOut; ${result.summary}")
                 }
             }
@@ -1340,15 +1383,15 @@ private fun executeTranslate(
         val supportContent = renderSynthesizedInt128SupportFile(supportPkg)
         if (parsed.dryRun) {
             if (!parsed.quiet) {
-                report("dry-run: int128-support -> $supportOutPath")
+                if (isManualProtected(supportOutPath)) {
+                    report("dry-run: skip manual $supportOutPath")
+                } else {
+                    report("dry-run: int128-support -> $supportOutPath")
+                }
             }
-        } else if (!(parsed.skipExisting && exists(supportOutPath))) {
-            if (parsed.forceOverwrite) {
-                writeForce(supportOutPath, supportContent)
-            } else {
-                write(supportOutPath, supportContent)
-            }
-            if (!parsed.quiet) {
+        } else {
+            val wroteSupport = writeOutputFile(supportOutPath, supportContent, quietSkipExisting = true)
+            if (wroteSupport && !parsed.quiet) {
                 report("int128-support -> $supportOutPath")
             }
         }
@@ -1411,69 +1454,45 @@ private fun executeTranslate(
                     }
                 }
             } else {
-                if (!(parsed.skipExisting && exists(typeLayoutPath))) {
-                    if (parsed.forceOverwrite) {
-                        writeForce(typeLayoutPath, typeLayoutContent)
-                    } else {
-                        write(typeLayoutPath, typeLayoutContent)
-                    }
+                var writtenScaffoldCount = 0
+                if (writeOutputFile(typeLayoutPath, typeLayoutContent, quietSkipExisting = true)) {
+                    writtenScaffoldCount++
                 }
                 for ((supPath, supContent) in supportFiles) {
-                    if (parsed.skipExisting && exists(supPath)) continue
-                    if (parsed.forceOverwrite) {
-                        writeForce(supPath, supContent)
-                    } else {
-                        write(supPath, supContent)
+                    if (writeOutputFile(supPath, supContent, quietSkipExisting = true)) {
+                        writtenScaffoldCount++
                     }
                 }
                 if (parsed.splitModuleRoots) {
                     for ((ptrPath, ptrContent) in listOf(constPtrPath to constPtrContent, mutPtrPath to mutPtrContent)) {
-                        if (parsed.skipExisting && exists(ptrPath)) continue
-                        if (parsed.forceOverwrite) {
-                            writeForce(ptrPath, ptrContent)
-                        } else {
-                            write(ptrPath, ptrContent)
+                        if (writeOutputFile(ptrPath, ptrContent, quietSkipExisting = true)) {
+                            writtenScaffoldCount++
                         }
                     }
                 }
                 for (comp in kmCoreCompanions) {
                     val compOut = resolveCompanionOutputPath(intrinsicsAnchor, comp)
-                    if (parsed.skipExisting && exists(compOut)) continue
-                    if (parsed.forceOverwrite) {
-                        writeForce(compOut, comp.content)
-                    } else {
-                        write(compOut, comp.content)
+                    if (writeOutputFile(compOut, comp.content, quietSkipExisting = true)) {
+                        writtenScaffoldCount++
                     }
                 }
                 if (!parsed.quiet) {
-                    val ptrCount = if (parsed.splitModuleRoots) 2 else 0
-                    report("core-intrinsic-artifacts -> $projRootPrefix (${kmCoreCompanions.size + 1 + supportFiles.size + ptrCount} files)")
+                    report("core-intrinsic-artifacts -> $projRootPrefix ($writtenScaffoldCount files)")
                 }
             }
         } else if (markerIdx >= 0 && emittedNapiModules.isNotEmpty() && !parsed.dryRun) {
             val projRootPrefix = normOutRoot.substring(0, markerIdx)
             val inlineHeaderPath = "${projRootPrefix}src/native/interop/cinterop/km_core_intrinsics_inline.h"
-            if (!(parsed.skipExisting && exists(inlineHeaderPath))) {
-                val inlineHeaderContent = CoreIntrinsicFfiArtifacts.renderKmCoreInlineHeader()
-                if (parsed.forceOverwrite) {
-                    writeForce(inlineHeaderPath, inlineHeaderContent)
-                } else {
-                    write(inlineHeaderPath, inlineHeaderContent)
-                }
-            }
+            val inlineHeaderContent = CoreIntrinsicFfiArtifacts.renderKmCoreInlineHeader()
+            writeOutputFile(inlineHeaderPath, inlineHeaderContent, quietSkipExisting = true)
             for (ffiMod in emittedNapiModules) {
                 if (ffiMod == "kmcore" && exists("${projRootPrefix}src/js/node-kmcore/src/kmcore_bindings.cpp")) {
                     continue
                 }
                 val stem = "${ffiMod}_kmcore_intrinsics"
                 val napiBridgePath = "${projRootPrefix}src/js/node-$ffiMod/src/${stem}_bindings.cpp"
-                if (parsed.skipExisting && exists(napiBridgePath)) continue
                 val napiBridgeContent = CoreIntrinsicFfiArtifacts.renderKmCoreNapiCpp(stem)
-                if (parsed.forceOverwrite) {
-                    writeForce(napiBridgePath, napiBridgeContent)
-                } else {
-                    write(napiBridgePath, napiBridgeContent)
-                }
+                writeOutputFile(napiBridgePath, napiBridgeContent, quietSkipExisting = true)
             }
         }
     }
@@ -1501,15 +1520,15 @@ private fun executeTranslate(
         val supportContent = renderSynthesizedAnySupportFile(supportPkg)
         if (parsed.dryRun) {
             if (!parsed.quiet) {
-                report("dry-run: rust-any-support -> $supportOutPath")
+                if (isManualProtected(supportOutPath)) {
+                    report("dry-run: skip manual $supportOutPath")
+                } else {
+                    report("dry-run: rust-any-support -> $supportOutPath")
+                }
             }
-        } else if (!(parsed.skipExisting && exists(supportOutPath))) {
-            if (parsed.forceOverwrite) {
-                writeForce(supportOutPath, supportContent)
-            } else {
-                write(supportOutPath, supportContent)
-            }
-            if (!parsed.quiet) {
+        } else {
+            val wroteAnySupport = writeOutputFile(supportOutPath, supportContent, quietSkipExisting = true)
+            if (wroteAnySupport && !parsed.quiet) {
                 report("rust-any-support -> $supportOutPath")
             }
         }

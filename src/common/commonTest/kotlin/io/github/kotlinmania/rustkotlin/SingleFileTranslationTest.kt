@@ -735,4 +735,57 @@ class SingleFileTranslationTest {
         val taggedKt = renderSingleKotlinFile(source, header(mapOf("core" to "org.rustlang.core"))).text
         assertContains(taggedKt, "typealias Result<T> = org.rustlang.core.result.Result<T, Error>")
     }
+
+    @Test fun forceOverwriteSkipsManualProtectedKotlinFile() {
+        val protectedFirstLine =
+            "// rust-kotlin: manual\npackage io.github.kotlinmania.sample\npublic fun kept(): Int = 1\n"
+        val protectedSecondLine =
+            "// port-lint: source second.rs\n// rust-kotlin: manual\npackage io.github.kotlinmania.sample\npublic fun keptSecond(): Int = 2\n"
+        val files =
+            TestFilesHarness(
+                extraFiles =
+                    mapOf(
+                        "crate/src/first.rs" to "pub fn first() -> i32 { 10 }",
+                        "crate/src/second.rs" to "pub fn second() -> i32 { 20 }",
+                        "crate/src/third.rs" to "pub fn third() -> i32 { 30 }",
+                    ),
+                existingOutputContents =
+                    mapOf(
+                        "out/First.kt" to protectedFirstLine,
+                        "out/Second.kt" to protectedSecondLine,
+                        "out/Third.kt" to "package io.github.kotlinmania.sample\npublic fun oldThird(): Int = 3\n",
+                    ),
+                directories =
+                    mapOf(
+                        "crate/src" to
+                            listOf(
+                                "crate/src/first.rs",
+                                "crate/src/second.rs",
+                                "crate/src/third.rs",
+                            ),
+                    ),
+            )
+        files.run("translate", "-r", "--force", "-o", "out", "crate/src")
+        assertEquals(setOf("out/Third.kt"), files.forcedWrites.keys)
+        assertFalse("out/First.kt" in files.writes)
+        assertFalse("out/Second.kt" in files.writes)
+        assertTrue(files.messages.any { it == "skip manual out/First.kt" }, files.messages.toString())
+        assertTrue(files.messages.any { it == "skip manual out/Second.kt" }, files.messages.toString())
+        assertTrue(isManualProtectedContent("# rust-kotlin: manual\nCFLAGS=-O2\n"))
+        assertFalse(isManualProtectedContent("package demo\n// port-lint: source foo.rs\n"))
+    }
+
+    @Test fun forceOverwriteReplacesUnmarkedExistingFile() {
+        val forceRun =
+            TestFilesHarness(
+                source = "pub fn replace_me() -> i32 { 9 }",
+                existingOutputs = setOf("Existing.kt"),
+                existingOutputContents = mapOf("Unmarked.kt" to "package sample\npublic fun stale(): Int = 0\n"),
+            )
+        forceRun.run("translate", "-f", "-o", "Unmarked.kt", "replace_me.rs")
+        assertEquals(setOf("Unmarked.kt"), forceRun.forcedWrites.keys)
+        val replaced = forceRun.forcedWrites.getValue("Unmarked.kt")
+        assertContains(replaced, "public fun replaceMe(): Int")
+        assertContains(replaced, "return 9")
+    }
 }
