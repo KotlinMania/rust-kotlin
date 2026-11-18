@@ -678,7 +678,7 @@ internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): St
             val pairType = if ("Pair" in inspector.declaredTypeNames) "kotlin.Pair" else "Pair"
             val tripleType = if ("Triple" in inspector.declaredTypeNames) "kotlin.Triple" else "Triple"
             when (elems.size) {
-                0 -> "Unit"
+                0 -> kotlinBuiltinTypeName("Unit")
                 1 -> renderType(elems[0], selfTypeName)
                 2 -> "$pairType<${renderType(elems[0], selfTypeName)}, ${renderType(elems[1], selfTypeName)}>"
                 3 -> "$tripleType<${renderType(elems[0], selfTypeName)}, ${renderType(elems[1], selfTypeName)}, ${renderType(elems[2], selfTypeName)}>"
@@ -743,6 +743,37 @@ internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): St
         is SynType.Verbatim -> "Any"
     }
 
+private val KOTLIN_BUILTIN_VALUE_TYPE_NAMES: Set<String> =
+    setOf(
+        "Byte",
+        "Short",
+        "Int",
+        "Long",
+        "UByte",
+        "UShort",
+        "UInt",
+        "ULong",
+        "Float",
+        "Double",
+        "Boolean",
+        "Char",
+        "String",
+        "Unit",
+        "Any",
+    )
+
+internal fun KotlinJ2KEmitter.kotlinBuiltinTypeName(simpleType: String): String {
+    if (simpleType !in KOTLIN_BUILTIN_VALUE_TYPE_NAMES) return simpleType
+    val shadowed =
+        simpleType in inspector.declaredTypeNames ||
+            simpleType in headerContext.moduleDeclaredTypeNames ||
+            simpleType in activeTypeParamNames ||
+            simpleType in activeEnclosingEnumVariantNames ||
+            importedSimpleNameToPkg[simpleType]?.let { !it.startsWith("kotlin") } == true ||
+            extraTypePathImports.any { it.endsWith(".$simpleType") || it.endsWith(" as $simpleType") }
+    return if (shadowed) "kotlin.$simpleType" else simpleType
+}
+
 internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?): String {
     val rawSegments = path.segments.toList()
     if (rawSegments.isEmpty()) return "Any"
@@ -763,6 +794,7 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
     if (rawSegments.size == 1 && rawSegments[0].arguments is PathArguments.None) {
         val singleKt = rustTypeIdentToKotlin(rawSegments[0].ident.toString())
         substitutedTypeParamTypes[singleKt]?.let { return it }
+        renamedTypeParamIdentifiers[singleKt]?.let { return it }
     }
     if (rawSegments.size == 2 &&
         rawSegments[0].arguments is PathArguments.None &&
@@ -1194,6 +1226,22 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
             usesRustChar = true
             return "RustChar"
         }
+        when (rawName) {
+            "i8" -> return kotlinBuiltinTypeName("Byte")
+            "i16" -> return kotlinBuiltinTypeName("Short")
+            "i32" -> return kotlinBuiltinTypeName("Int")
+            "i64" -> return kotlinBuiltinTypeName("Long")
+            "isize" -> return kotlinBuiltinTypeName("Int")
+            "u8" -> return kotlinBuiltinTypeName("UByte")
+            "u16" -> return kotlinBuiltinTypeName("UShort")
+            "u32" -> return kotlinBuiltinTypeName("UInt")
+            "u64" -> return kotlinBuiltinTypeName("ULong")
+            "usize" -> return kotlinBuiltinTypeName("Int")
+            "f64" -> return kotlinBuiltinTypeName("Double")
+            "bool" -> return kotlinBuiltinTypeName("Boolean")
+            "str" -> return kotlinBuiltinTypeName("String")
+            "char" -> return kotlinBuiltinTypeName("Char")
+        }
         if (rawName == "c_void" &&
             !headerContext.rawAbiMode &&
             "CVoid" !in inspector.declaredTypeNames &&
@@ -1212,6 +1260,31 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
         } else {
             mappedRawBaseIdent
         }
+    if (rawSegments.size == 1 &&
+        prefixQualifier.isEmpty() &&
+        externalQualifiedOverride == null &&
+        rawName != "Self" &&
+        ktBaseIdent != selfTypeName?.substringBefore('<')?.trim() &&
+        ktBaseIdent in activeEnclosingEnumVariantNames &&
+        ktBaseIdent !in activeTypeParamNames &&
+        rawName !in PRIMITIVE_TYPE_NAMES
+    ) {
+        val outerPkg =
+            importedSimpleNameToPkg[ktBaseIdent]
+                ?: headerContext.packageName
+                    ?.takeIf {
+                        it.isNotEmpty() &&
+                            (ktBaseIdent in inspector.declaredTypeNames || ktBaseIdent in headerContext.moduleDeclaredTypeNames)
+                    }
+                ?: resolveBestSubpackageForSymbol(ktBaseIdent)?.let { sub ->
+                    currentNamespacePrefix()?.let { ns ->
+                        if (sub.isEmpty()) ns else "$ns.$sub"
+                    }
+                }
+        if (!outerPkg.isNullOrEmpty()) {
+            externalQualifiedOverride = "$outerPkg.$ktBaseIdent"
+        }
+    }
     if (prefixQualifier.isEmpty() &&
         externalQualifiedOverride == null &&
         rawSegments.size <= 2 &&
@@ -1459,8 +1532,13 @@ internal fun KotlinJ2KEmitter.renderTypeParameters(
     selfTypeName: String?,
     excludeNames: Set<String> = emptySet(),
 ): String {
+    val ownerSimple = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
     val declared = renderTypeParametersFromParams(generics.params.toList(), selfTypeName, excludeNames).removePrefix("<").removeSuffix(">")
-    val associated = sourceAssociatedParameters(generics).map { it.associated }.distinct().filter { it !in excludeNames }
+    val associated =
+        sourceAssociatedParameters(generics, ownerSimple)
+            .map { it.associated }
+            .distinct()
+            .filter { it !in excludeNames }
     val parts = listOf(declared).filter(String::isNotEmpty) + associated
     return if (parts.isEmpty()) "" else "<${parts.joinToString(", ")}>"
 }
@@ -1476,8 +1554,9 @@ internal fun KotlinJ2KEmitter.renderTypeParametersFromParams(
         when (param) {
             is GenericParam.LifetimeParam -> {}
             is GenericParam.TypeParam -> {
-                val name = rustTypeIdentToKotlin(param.ident.toString())
-                if (name in excludeNames || !seenNames.add(name)) continue
+                val rawTpName = rustTypeIdentToKotlin(param.ident.toString())
+                val name = renamedTypeParamIdentifiers[rawTpName] ?: rawTpName
+                if (rawTpName in excludeNames || name in excludeNames || !seenNames.add(name)) continue
                 val prevBounded = currentBoundedTypeName
                 currentBoundedTypeName = name
                 val bounds =
@@ -1501,12 +1580,18 @@ internal fun KotlinJ2KEmitter.renderTypeParametersFromParams(
     return if (rendered.isEmpty()) "" else "<${rendered.joinToString(", ")}>"
 }
 
-internal fun KotlinJ2KEmitter.renderTypeArgumentsFromGenerics(generics: Generics): String {
+internal fun KotlinJ2KEmitter.renderTypeArgumentsFromGenerics(
+    generics: Generics,
+    ownerTypeSimpleName: String? = null,
+): String {
     val names =
         generics.params.toList().mapNotNull { param ->
-            (param as? GenericParam.TypeParam)?.ident?.toString()?.let { rustTypeIdentToKotlin(it) }
+            (param as? GenericParam.TypeParam)?.ident?.toString()?.let { rawIdent ->
+                val rawTp = rustTypeIdentToKotlin(rawIdent)
+                renamedTypeParamIdentifiers[rawTp] ?: rawTp
+            }
         }
-    val allNames = (names + sourceAssociatedParameters(generics).map { it.associated }).distinct()
+    val allNames = (names + sourceAssociatedParameters(generics, ownerTypeSimpleName).map { it.associated }).distinct()
     return if (allNames.isEmpty()) "" else "<${allNames.joinToString(", ")}>"
 }
 
@@ -1516,7 +1601,8 @@ internal fun KotlinJ2KEmitter.renderWhereClause(
     ownerGenerics: Generics? = null,
     extraDeclaredNames: Set<String> = emptySet(),
 ): String {
-    val assocDeclared = ownerGenerics?.let { sourceAssociatedParameters(it).map { a -> a.associated } }.orEmpty()
+    val ownerSimple = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
+    val assocDeclared = ownerGenerics?.let { sourceAssociatedParameters(it, ownerSimple).map { a -> a.associated } }.orEmpty()
     return renderCombinedWhereClause(
         ownerWhere = null,
         fnWhere = whereClause,
@@ -1538,6 +1624,8 @@ internal fun KotlinJ2KEmitter.renderCombinedWhereClause(
         (
             params
                 .mapNotNull { (it as? GenericParam.TypeParam)?.ident?.toString()?.let(::rustTypeIdentToKotlin) }
+                .filter { it !in excludeNames }
+                .map { renamedTypeParamIdentifiers[it] ?: it }
                 .filter { it !in excludeNames } +
                 extraDeclaredNames.filter { it !in excludeNames }
         ).toSet()
@@ -1546,8 +1634,9 @@ internal fun KotlinJ2KEmitter.renderCombinedWhereClause(
     val seenParamNames = hashSetOf<String>()
     for (param in params) {
         if (param is GenericParam.TypeParam) {
-            val name = rustTypeIdentToKotlin(param.ident.toString())
-            if (name in excludeNames || !seenParamNames.add(name)) continue
+            val rawTpName = rustTypeIdentToKotlin(param.ident.toString())
+            val name = renamedTypeParamIdentifiers[rawTpName] ?: rawTpName
+            if (rawTpName in excludeNames || name in excludeNames || !seenParamNames.add(name)) continue
             val prevBounded = currentBoundedTypeName
             currentBoundedTypeName = name
             val bounds =

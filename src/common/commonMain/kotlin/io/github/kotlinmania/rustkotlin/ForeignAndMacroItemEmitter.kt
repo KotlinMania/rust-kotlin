@@ -700,6 +700,54 @@ internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
                 "error",
             )
         if (!isCrateCoreModule || secondRaw in STDLIB_MACRO_OR_PRIMITIVE_MODULES || secondRaw in stdlibCoreSubmodules) {
+            val inCoreCrate = currentNamespacePrefix() == CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+            val leafClean = rawSegStrings.last().removePrefix("r#")
+            val coreIntrinsicOrPreludeLeaves =
+                setOf(
+                    "Option",
+                    "Some",
+                    "None",
+                    "Result",
+                    "Ok",
+                    "Err",
+                    "Vec",
+                    "Box",
+                    "Rc",
+                    "Arc",
+                    "Cow",
+                    "PhantomData",
+                    "ManuallyDrop",
+                    "MaybeUninit",
+                    "Cell",
+                    "RefCell",
+                    "OnceCell",
+                    "Iter",
+                    "IterMut",
+                    "IntoIter",
+                    "Range",
+                    "RangeInclusive",
+                    "min",
+                    "max",
+                    "once",
+                    "empty",
+                    "drop",
+                    "transmute",
+                    "transmute_unchecked",
+                    "size_of",
+                    "size_of_val",
+                    "align_of",
+                    "align_of_val",
+                    "needs_drop",
+                    "forget",
+                )
+            if (inCoreCrate &&
+                rawSegStrings.size >= 3 &&
+                secondRaw !in setOf("intrinsics", "ffi") &&
+                secondRaw !in STDLIB_MACRO_OR_PRIMITIVE_MODULES &&
+                leafClean !in coreIntrinsicOrPreludeLeaves
+            ) {
+                return resolveCrossModulePathTarget(listOf("crate") + rawSegStrings.drop(1), inTypePosition)
+            }
             return null
         }
     }
@@ -1344,7 +1392,10 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
     }
     if (!isSelfImport &&
         cleanSegsEarly.size == 3 &&
-        cleanSegsEarly[0] in setOf("core", "std") &&
+        (
+            cleanSegsEarly[0] in setOf("core", "std") ||
+                (cleanSegsEarly[0] == "crate" && currentNamespacePrefix() == CoreIntrinsicLowering.resolveCoreNamespace(headerContext))
+        ) &&
         cleanSegsEarly[1] == "intrinsics" &&
         cleanSegsEarly[2] in
         setOf("transmute", "transmute_unchecked", "size_of", "size_of_val", "align_of", "align_of_val", "needs_drop", "forget")
@@ -1400,6 +1451,21 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
     if (mapped.size < 2) return null
     return if (root == "crate" || root in headerContext.selfCrateAliases) {
         val nsPrefix = currentNamespacePrefix()
+        val curPkg = headerContext.packageName.orEmpty()
+        if (nsPrefix != null &&
+            ".detect.os." in curPkg &&
+            mapped.last() == "Feature" &&
+            "detect" in segs
+        ) {
+            val osTailSegs = curPkg.substringAfter(".detect.os.").split('.').filter { it.isNotEmpty() }
+            val archSub =
+                osTailSegs.firstOrNull { cand ->
+                    "detect.arch.$cand" in headerContext.crateSubpackageRawLeafNames
+                }
+            if (archSub != null) {
+                return "$nsPrefix.detect.arch.$archSub.Feature"
+            }
+        }
         val afterRoot = segs.drop(1)
         if (afterRoot.last() == "*" && headerContext.crateSymbolSubpackages.isNotEmpty()) {
             val isRootOrPreludeGlob =
@@ -2619,6 +2685,7 @@ internal fun KotlinJ2KEmitter.renderItemForeignMod(
         (renderLeadingTrivia(item, indent) + renderKDocFromAttributes(item.attrs, indent))
             .trimEnd()
     val out = mutableListOf<String>()
+    val localForeignSignatures = linkedMapOf<String, Int>()
     for (foreign in item.items) {
         if (foreignItemHasDocOnlyCfg(foreign)) continue
         when (foreign) {
@@ -2628,12 +2695,24 @@ internal fun KotlinJ2KEmitter.renderItemForeignMod(
                     foreign.sig.ident
                         .toString()
                         .removePrefix("r#")
-                val collidedRename =
-                    currentModPathPrefix
-                        .lastOrNull()
-                        ?.let { inspector.collidingInlineForeignFnRenames[it to rawFnName] }
-                        ?: if (currentModPathPrefix.isEmpty()) inspector.collidingTopLevelForeignFnRenames[rawFnName] else null
-                val fnName = collidedRename ?: rustFunctionIdentToKotlin(rawFnName)
+                val fnName =
+                    if (isLocalItem) {
+                        activeLocalForeignFnRenames[rawFnName]
+                            ?: rustFunctionIdentToKotlin(rawFnName).let { kt ->
+                                if (kt == currentEnclosingFunctionName) {
+                                    "extern${kt.replaceFirstChar { c -> c.uppercase() }}"
+                                } else {
+                                    kt
+                                }
+                            }
+                    } else {
+                        val collidedRename =
+                            currentModPathPrefix
+                                .lastOrNull()
+                                ?.let { inspector.collidingInlineForeignFnRenames[it to rawFnName] }
+                                ?: if (currentModPathPrefix.isEmpty()) inspector.collidingTopLevelForeignFnRenames[rawFnName] else null
+                        collidedRename ?: rustFunctionIdentToKotlin(rawFnName)
+                    }
                 val interopParams = mutableListOf<InteropParamSpec>()
                 scopeBuilder.enterDef()
                 val (sig, retRendered) =
@@ -2642,7 +2721,7 @@ internal fun KotlinJ2KEmitter.renderItemForeignMod(
                             sig = foreign.sig,
                             visPrefix = vis,
                             fnName = fnName,
-                            scopeSignatures = topLevelSignatureCounts,
+                            scopeSignatures = if (isLocalItem) localForeignSignatures else topLevelSignatureCounts,
                             interopParamsOut = interopParams,
                         )
                     } finally {

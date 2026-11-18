@@ -503,6 +503,12 @@ internal fun KotlinJ2KEmitter.renderExprRawAddr(expr: Expr.RawAddr, indent: Stri
         // Keep raw address-taking distinct from evaluating a place's
         // value, just as for the addr_of!/addr_of_mut! macro forms.
         val callee = if (expr.mutability is PointerMutability.Mut) "addrOfMut" else "addrOf"
+        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+        if (("core" in headerContext.crateNamespaces || headerContext.packageName?.startsWith(coreNs) == true) &&
+            headerContext.packageName != "$coreNs.mem"
+        ) {
+            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.$callee")
+        }
         "$callee(${renderExpr(expr.expr, indent, selfTypeName)})"
     }
 }

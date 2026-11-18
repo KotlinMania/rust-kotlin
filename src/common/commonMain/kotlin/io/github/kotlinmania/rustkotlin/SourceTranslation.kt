@@ -897,6 +897,9 @@ internal class KotlinJ2KEmitter(
     internal val witnessedSuppressedTraitNames = linkedSetOf<String>()
     internal var callArgumentNestingDepth: Int = 0
     internal var activeLocalBlockItems: List<Item> = emptyList()
+    internal var activeEnclosingEnumVariantNames: Set<String> = emptySet()
+    internal var activeLocalForeignFnRenames: Map<String, String> = emptyMap()
+    internal var renamedTypeParamIdentifiers: Map<String, String> = emptyMap()
     internal var currentImplAssocTypes: Map<String, SynType> = emptyMap()
     internal var currentTraitAssocParamNames: Set<String> = emptySet()
     internal var currentTypeParamWitnessCalls: Map<Pair<String, String>, String> = emptyMap()

@@ -781,7 +781,7 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
                         val localKt = scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
                         extractCallableReturnRenderedType(currentTypedLocals[localKt])
                             ?: run {
-                                val ktFn = rustFunctionIdentToKotlin(raw)
+                                val ktFn = activeLocalForeignFnRenames[raw] ?: rustFunctionIdentToKotlin(raw)
                                 renderTopLevelFnRet(ktFn, raw)
                                     ?: scopedAbiKeysForRenderedType(ktFn).firstNotNullOfOrNull { headerContext.crateFnReturnTypes[it] }
                                     ?: headerContext.crateFnReturnTypes[ktFn]
@@ -1788,13 +1788,15 @@ internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
                     addAll(file.items)
                 }
             }
+        val preferLocalForeign = rawCalleeIdent in activeLocalForeignFnRenames
         fun matchesFnIdent(rawDeclIdent: String, ktCallee: String, isForeign: Boolean): Boolean {
             val cleanDecl = rawDeclIdent.removePrefix("r#")
             if (cleanDecl == rawCalleeIdent) return true
             if (rustFunctionIdentToKotlin(cleanDecl) == ktCallee) return true
             if (isForeign) {
                 val renamed =
-                    inspector.collidingTopLevelForeignFnRenames[cleanDecl]
+                    activeLocalForeignFnRenames[cleanDecl]
+                        ?: inspector.collidingTopLevelForeignFnRenames[cleanDecl]
                         ?: currentModPathPrefix.lastOrNull()?.let { modRaw ->
                             inspector.collidingInlineForeignFnRenames[modRaw to cleanDecl]
                         }
@@ -1803,7 +1805,7 @@ internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
             return false
         }
         for (item in allFnItems) {
-            if (item is Item.Fn && !itemHasDocOnlyCfg(item) && matchesFnIdent(item.sig.ident.toString(), methodKt, isForeign = false)) {
+            if (!preferLocalForeign && item is Item.Fn && !itemHasDocOnlyCfg(item) && matchesFnIdent(item.sig.ident.toString(), methodKt, isForeign = false)) {
                 val typedParams =
                     item.sig.inputs
                         .toList()
@@ -1822,6 +1824,17 @@ internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
                                 .filterIsInstance<FnArg.Typed>()
                         typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
                     }
+                }
+            }
+        }
+        if (preferLocalForeign) {
+            for (item in allFnItems) {
+                if (item is Item.Fn && !itemHasDocOnlyCfg(item) && matchesFnIdent(item.sig.ident.toString(), methodKt, isForeign = false)) {
+                    val typedParams =
+                        item.sig.inputs
+                            .toList()
+                            .filterIsInstance<FnArg.Typed>()
+                    typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
                 }
             }
         }

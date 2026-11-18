@@ -886,7 +886,10 @@ internal fun hasEmittedKotlinTraitBound(bounds: List<TypeParamBound>): Boolean =
                 ?.toString() !in IGNORED_TRAIT_BOUNDS
     }
 
-internal fun collectUnboundedGenericTypeParamNames(generics: Generics): Set<String> {
+internal fun collectUnboundedGenericTypeParamNames(
+    generics: Generics,
+    renamedParams: Map<String, String> = emptyMap(),
+): Set<String> {
     val boundedInWhere = hashSetOf<String>()
     generics.whereClause?.predicates?.toList()?.forEach { pred ->
         if (pred is WherePredicate.TypePredicate && hasEmittedKotlinTraitBound(pred.bounds.toList())) {
@@ -896,7 +899,10 @@ internal fun collectUnboundedGenericTypeParamNames(generics: Generics): Set<Stri
                     .first()
                     ?.ident
                     ?.toString()
-                    ?.let { boundedInWhere += rustTypeIdentToKotlin(it) }
+                    ?.let {
+                        val ktName = rustTypeIdentToKotlin(it)
+                        boundedInWhere += (renamedParams[ktName] ?: ktName)
+                    }
             }
         }
     }
@@ -904,7 +910,8 @@ internal fun collectUnboundedGenericTypeParamNames(generics: Generics): Set<Stri
         .toList()
         .mapNotNull { gp ->
             if (gp is GenericParam.TypeParam && !hasEmittedKotlinTraitBound(gp.bounds.toList())) {
-                val ktName = rustTypeIdentToKotlin(gp.ident.toString())
+                val rawKtName = rustTypeIdentToKotlin(gp.ident.toString())
+                val ktName = renamedParams[rawKtName] ?: rawKtName
                 if (ktName !in boundedInWhere) ktName else null
             } else {
                 null
@@ -1233,7 +1240,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
             attachedImpls
         }
     val (sb, vis) = beginItemHeaderAndVisibility(renderLeadingTrivia(item, indent), item.attrs, item.vis, indent, isLocalItem)
-    val selfTypeWithGenerics = typeName + renderTypeArgumentsFromGenerics(item.generics)
+    val selfTypeWithGenerics = typeName + renderTypeArgumentsFromGenerics(item.generics, ownerTypeSimpleName = typeName)
     val unboundedOwnerTypeParams = collectUnboundedGenericTypeParamNames(item.generics)
     val prevStructTypeParams = activeTypeParamNames
     val prevStructConstParams = activeConstParamNames
@@ -1241,7 +1248,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
     activeTypeParamNames = activeTypeParamNames + collectGenericTypeParamNames(item.generics)
     activeConstParamNames = activeConstParamNames + collectGenericConstParamNames(item.generics)
     currentTraitAssocParamNames =
-        currentTraitAssocParamNames + sourceAssociatedParameters(item.generics).map { it.associated }
+        currentTraitAssocParamNames + sourceAssociatedParameters(item.generics, typeName).map { it.associated }
     val typeParams: String
     val whereClause: String
     val superTraits = mutableListOf<String>()
@@ -1818,343 +1825,367 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
     }
     val useFinalAbiLayout = headerContext.rawAbiMode || headerContext.finalClasses
     val (sb, vis) = beginItemHeaderAndVisibility(renderLeadingTrivia(item, indent), item.attrs, item.vis, indent, isLocalItem)
-    val typeArgsUse = renderTypeArgumentsFromGenerics(item.generics)
-    val selfTypeWithGenerics = typeName + typeArgsUse
-    val prevEnumTypeParams = activeTypeParamNames
-    val prevEnumConstParams = activeConstParamNames
-    activeTypeParamNames =
-        activeTypeParamNames +
-        collectGenericTypeParamNames(item.generics) +
-        sourceAssociatedParameters(item.generics).map { it.associated }
-    activeConstParamNames = activeConstParamNames + collectGenericConstParamNames(item.generics)
-    val typeParams: String
-    val superTraits: List<String>
-    try {
-        typeParams = renderTypeParameters(item.generics, selfTypeName = selfTypeWithGenerics)
-        superTraits = renderDistinctSuperTraits(attachedImpls, selfTypeWithGenerics, ownerIsPublic = (vis == "public "))
-    } finally {
-        activeConstParamNames = prevEnumConstParams
-        activeTypeParamNames = prevEnumTypeParams
-    }
     val variants = item.variants.toList().filterNot { isDocOnlyCfgAttribute(it.attrs) }
-    if (variants.isEmpty() && typeParams.isEmpty() && superTraits.isEmpty() && attachedImpls.isEmpty()) {
-        val emptyClassKw = if (useFinalAbiLayout) "class " else "open class "
-        if (useFinalAbiLayout || headerContext.isBatchCrateOutput) {
-            sb.append(
-                "${indent}${vis}${emptyClassKw}$typeName(\n" +
-                    "$indent    public val handle: Long = -1L,\n" +
-                    "$indent) {\n" +
-                    "$indent    public val ptr: Long get() = handle\n" +
-                    "$indent}",
-            )
-        } else {
-            sb.append(
-                "${indent}${vis}${emptyClassKw}$typeName(public val handle: Long = -1L) {\n" +
-                    "$indent    public val ptr: Long get() = handle\n" +
-                    "$indent}",
-            )
-        }
-        return sb.toString()
-    }
-    if (variants.isEmpty() && typeParams.isEmpty()) {
-        val prevOverrideNames = currentStructOverrideMethodNames
-        currentStructOverrideMethodNames =
-            collectLocalSupertraitMethodNames(
-                superTraits,
-                includeReceiverlessMethods = true,
-                ownerIsPublic = (vis == "public "),
-            )
-        val attachedMembers =
-            try {
-                renderAttachedImplMembers(
-                    typeName = selfTypeWithGenerics,
-                    ownerGenerics = item.generics,
-                    attachedImpls = attachedImpls,
-                    indent = "$indent    ",
-                    isLocalClass = isLocalItem,
-                    isObjectOwner = true,
-                )
-            } finally {
-                currentStructOverrideMethodNames = prevOverrideNames
+    val variantKotlinNames = variants.mapTo(linkedSetOf()) { rustTypeIdentToKotlin(it.ident.toString()) }
+    val declaredEnumTpNames = collectGenericTypeParamNames(item.generics)
+    val usedTpNames = (declaredEnumTpNames + variantKotlinNames + typeName).toMutableSet()
+    val enumParamRenames = linkedMapOf<String, String>()
+    for (tp in declaredEnumTpNames) {
+        if (tp in variantKotlinNames || tp == typeName) {
+            var candidate = "${tp}Param"
+            var suffix = 0
+            while (!usedTpNames.add(candidate)) {
+                candidate = "${tp}Param${suffix++}"
             }
-        sb
-            .append(indent)
-            .append(vis)
-            .append("object ")
-            .append(typeName)
-        if (superTraits.isNotEmpty()) {
-            sb.append(" : ").append(superTraits.joinToString(", "))
+            enumParamRenames[tp] = candidate
         }
-        if (attachedMembers.isNotBlank()) {
-            sb
-                .append(" {\n")
-                .append(attachedMembers)
-                .append('\n')
-                .append(indent)
-                .append('}')
-        }
-        return sb.toString()
     }
-    val isSimpleEnum = variants.isNotEmpty() && variants.all { it.fields is Fields.Unit }
-    val hasVariantCollidingWithTypeName =
-        isSimpleEnum && variants.any { rustTypeIdentToKotlin(it.ident.toString()) == typeName }
-    if ((useFinalAbiLayout || hasVariantCollidingWithTypeName) && isSimpleEnum && typeParams.isEmpty() && superTraits.isEmpty()) {
-        val reprKotlinType = extractEnumReprKotlinType(item.attrs) ?: "UInt"
-        val reprNumKind = resolveNumericKind(reprKotlinType) ?: NumericKind.U32
-        val enumFilteredImpls =
-            attachedImpls.filterNot { impl ->
-                val traitIdent =
-                    impl.traitPath
-                        ?.path
-                        ?.segments
-                        ?.last()
-                        ?.ident
-                        ?.toString()
-                traitIdent == "Clone" || traitIdent == "Default"
-            }
-        val prevOverrideNames = currentStructOverrideMethodNames
-        currentStructOverrideMethodNames = emptySet()
-        val attachedMembers =
-            try {
-                renderAttachedImplMembers(selfTypeWithGenerics, item.generics, enumFilteredImpls, "$indent    ", isLocalClass = isLocalItem)
-            } finally {
-                currentStructOverrideMethodNames = prevOverrideNames
-            }
-        if (useFinalAbiLayout || headerContext.isBatchCrateOutput) {
-            sb
-                .append(indent)
-                .append(vis)
-                .append("enum class ")
-                .append(typeName)
-                .append("(\n")
-                .append(indent)
-                .append("    public val value: ")
-                .append(reprKotlinType)
-                .append(",\n")
-                .append(indent)
-                .append(") {\n")
-        } else {
-            sb
-                .append(indent)
-                .append(vis)
-                .append("enum class ")
-                .append(typeName)
-                .append("(public val value: ")
-                .append(reprKotlinType)
-                .append(") {\n")
-        }
-        var baseDiscExpr: String? = null
-        var stepOffset = 0
-        val seenEntryNames = hashSetOf<String>()
-        val entryLines = mutableListOf<String>()
-        for (v in variants) {
-            val rawVar = v.ident.toString().removePrefix("r#")
-            val rawEntryName =
-                if (isScreamingSnakeIdent(rawVar)) {
-                    rustConstIdentToKotlin(v.ident.toString())
-                } else {
-                    rustTypeIdentToKotlin(v.ident.toString())
-                }
-            val entryName = if (rawEntryName == typeName) "${rawEntryName}Variant" else rawEntryName
-            if (!seenEntryNames.add(entryName)) continue
-            val vTrivia = renderLeadingTrivia(v, "$indent    ")
-            val vDoc = renderKDocFromAttributes(v.attrs, "$indent    ")
-            val explicitExpr = v.discriminant?.expr
-            val discArg =
-                if (explicitExpr != null) {
-                    val rendered = renderTypedNumericInitializer(explicitExpr, reprNumKind, "$indent    ", selfTypeName = selfTypeWithGenerics)
-                    baseDiscExpr = rendered
-                    stepOffset = 1
-                    rendered
-                } else {
-                    val rendered = formatEnumSteppedDiscriminant(baseDiscExpr, stepOffset, reprNumKind)
-                    stepOffset += 1
-                    rendered
-                }
-            entryLines += "${vTrivia}${vDoc}$indent    $entryName($discArg)"
-        }
-        if (attachedMembers.isNotEmpty()) {
-            sb.append(entryLines.joinToString(",\n")).append(";\n\n")
-            sb.append(attachedMembers).append('\n')
-        } else {
-            sb.append(entryLines.joinToString(",\n")).append(",\n")
-        }
-        sb.append(indent).append("}")
-        return sb.toString()
-    }
-
-    val enumAssocTypeParamNames = sourceAssociatedParameters(item.generics).map { it.associated }
-    val prevOverrideNames = currentStructOverrideMethodNames
-    currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits, ownerIsPublic = (vis == "public "))
-    activeTypeParamNames = prevEnumTypeParams + collectGenericTypeParamNames(item.generics) + enumAssocTypeParamNames + enumAssocTypeParamNames
-    activeConstParamNames = prevEnumConstParams + collectGenericConstParamNames(item.generics)
-    val attachedMembers =
+    val prevRenamedParams = renamedTypeParamIdentifiers
+    val prevEnclosingVariants = activeEnclosingEnumVariantNames
+    renamedTypeParamIdentifiers = prevRenamedParams + enumParamRenames
+    activeEnclosingEnumVariantNames = prevEnclosingVariants + variantKotlinNames
+    return try {
+        val typeArgsUse = renderTypeArgumentsFromGenerics(item.generics, ownerTypeSimpleName = typeName)
+        val selfTypeWithGenerics = typeName + typeArgsUse
+        val prevEnumTypeParams = activeTypeParamNames
+        val prevEnumConstParams = activeConstParamNames
+        activeTypeParamNames =
+            activeTypeParamNames +
+            declaredEnumTpNames +
+            enumParamRenames.values +
+            sourceAssociatedParameters(item.generics, typeName).map { it.associated }
+        activeConstParamNames = activeConstParamNames + collectGenericConstParamNames(item.generics)
+        val typeParams: String
+        val superTraits: List<String>
         try {
-            renderAttachedImplMembers(selfTypeWithGenerics, item.generics, attachedImpls, "$indent    ", isLocalClass = isLocalItem)
+            typeParams = renderTypeParameters(item.generics, selfTypeName = selfTypeWithGenerics)
+            superTraits = renderDistinctSuperTraits(attachedImpls, selfTypeWithGenerics, ownerIsPublic = (vis == "public "))
         } finally {
             activeConstParamNames = prevEnumConstParams
             activeTypeParamNames = prevEnumTypeParams
-            currentStructOverrideMethodNames = prevOverrideNames
         }
-    val hasDiscriminants = isSimpleEnum && typeParams.isEmpty() && variants.any { it.discriminant != null }
-    val reprKotlinType = if (hasDiscriminants) (extractEnumReprKotlinType(item.attrs) ?: "Int") else null
-    val reprNumKind = reprKotlinType?.let(this::resolveNumericKind)
-
-    sb
-        .append(indent)
-        .append(vis)
-        .append("sealed class ")
-        .append(typeName)
-        .append(typeParams)
-    if (reprKotlinType != null) {
-        if (useFinalAbiLayout || headerContext.isBatchCrateOutput) {
+        if (variants.isEmpty() && typeParams.isEmpty() && superTraits.isEmpty() && attachedImpls.isEmpty()) {
+            val emptyClassKw = if (useFinalAbiLayout) "class " else "open class "
+            if (useFinalAbiLayout || headerContext.isBatchCrateOutput) {
+                sb.append(
+                    "${indent}${vis}${emptyClassKw}$typeName(\n" +
+                        "$indent    public val handle: Long = -1L,\n" +
+                        "$indent) {\n" +
+                        "$indent    public val ptr: Long get() = handle\n" +
+                        "$indent}",
+                )
+            } else {
+                sb.append(
+                    "${indent}${vis}${emptyClassKw}$typeName(public val handle: Long = -1L) {\n" +
+                        "$indent    public val ptr: Long get() = handle\n" +
+                        "$indent}",
+                )
+            }
+            return sb.toString()
+        }
+        if (variants.isEmpty() && typeParams.isEmpty()) {
+            val prevOverrideNames = currentStructOverrideMethodNames
+            currentStructOverrideMethodNames =
+                collectLocalSupertraitMethodNames(
+                    superTraits,
+                    includeReceiverlessMethods = true,
+                    ownerIsPublic = (vis == "public "),
+                )
+            val attachedMembers =
+                try {
+                    renderAttachedImplMembers(
+                        typeName = selfTypeWithGenerics,
+                        ownerGenerics = item.generics,
+                        attachedImpls = attachedImpls,
+                        indent = "$indent    ",
+                        isLocalClass = isLocalItem,
+                        isObjectOwner = true,
+                    )
+                } finally {
+                    currentStructOverrideMethodNames = prevOverrideNames
+                }
             sb
-                .append("(\n")
                 .append(indent)
-                .append("    public val value: ")
-                .append(reprKotlinType)
-                .append(",\n")
-                .append(indent)
-                .append(')')
-        } else {
-            sb.append("(public val value: ").append(reprKotlinType).append(')')
+                .append(vis)
+                .append("object ")
+                .append(typeName)
+            if (superTraits.isNotEmpty()) {
+                sb.append(" : ").append(superTraits.joinToString(", "))
+            }
+            if (attachedMembers.isNotBlank()) {
+                sb
+                    .append(" {\n")
+                    .append(attachedMembers)
+                    .append('\n')
+                    .append(indent)
+                    .append('}')
+            }
+            return sb.toString()
         }
-    }
-    if (superTraits.isNotEmpty()) {
-        sb.append(" : ").append(superTraits.joinToString(", "))
-    }
-    sb.append(" {\n")
-    var prevVariantName: String? = null
-    activeTypeParamNames = prevEnumTypeParams + collectGenericTypeParamNames(item.generics) + enumAssocTypeParamNames
-    activeConstParamNames = prevEnumConstParams + collectGenericConstParamNames(item.generics)
-    try {
-        for (v in variants) {
-            val vName = rustTypeIdentToKotlin(v.ident.toString())
-            val discArg =
-                if (reprKotlinType != null) {
-                    val explicitExpr = v.discriminant?.expr
+        val isSimpleEnum = variants.isNotEmpty() && variants.all { it.fields is Fields.Unit }
+        val hasVariantCollidingWithTypeName =
+            isSimpleEnum && variants.any { rustTypeIdentToKotlin(it.ident.toString()) == typeName }
+        if ((useFinalAbiLayout || hasVariantCollidingWithTypeName) && isSimpleEnum && typeParams.isEmpty() && superTraits.isEmpty()) {
+            val reprKotlinType = extractEnumReprKotlinType(item.attrs) ?: "UInt"
+            val reprNumKind = resolveNumericKind(reprKotlinType) ?: NumericKind.U32
+            val enumFilteredImpls =
+                attachedImpls.filterNot { impl ->
+                    val traitIdent =
+                        impl.traitPath
+                            ?.path
+                            ?.segments
+                            ?.last()
+                            ?.ident
+                            ?.toString()
+                    traitIdent == "Clone" || traitIdent == "Default"
+                }
+            val prevOverrideNames = currentStructOverrideMethodNames
+            currentStructOverrideMethodNames = emptySet()
+            val attachedMembers =
+                try {
+                    renderAttachedImplMembers(selfTypeWithGenerics, item.generics, enumFilteredImpls, "$indent    ", isLocalClass = isLocalItem)
+                } finally {
+                    currentStructOverrideMethodNames = prevOverrideNames
+                }
+            if (useFinalAbiLayout || headerContext.isBatchCrateOutput) {
+                sb
+                    .append(indent)
+                    .append(vis)
+                    .append("enum class ")
+                    .append(typeName)
+                    .append("(\n")
+                    .append(indent)
+                    .append("    public val value: ")
+                    .append(reprKotlinType)
+                    .append(",\n")
+                    .append(indent)
+                    .append(") {\n")
+            } else {
+                sb
+                    .append(indent)
+                    .append(vis)
+                    .append("enum class ")
+                    .append(typeName)
+                    .append("(public val value: ")
+                    .append(reprKotlinType)
+                    .append(") {\n")
+            }
+            var baseDiscExpr: String? = null
+            var stepOffset = 0
+            val seenEntryNames = hashSetOf<String>()
+            val entryLines = mutableListOf<String>()
+            for (v in variants) {
+                val rawVar = v.ident.toString().removePrefix("r#")
+                val rawEntryName =
+                    if (isScreamingSnakeIdent(rawVar)) {
+                        rustConstIdentToKotlin(v.ident.toString())
+                    } else {
+                        rustTypeIdentToKotlin(v.ident.toString())
+                    }
+                val entryName = if (rawEntryName == typeName) "${rawEntryName}Variant" else rawEntryName
+                if (!seenEntryNames.add(entryName)) continue
+                val vTrivia = renderLeadingTrivia(v, "$indent    ")
+                val vDoc = renderKDocFromAttributes(v.attrs, "$indent    ")
+                val explicitExpr = v.discriminant?.expr
+                val discArg =
                     if (explicitExpr != null) {
-                        renderTypedNumericInitializer(explicitExpr, reprNumKind, "$indent    ", selfTypeName = selfTypeWithGenerics)
-                    } else if (prevVariantName != null) {
-                        val stepOne =
+                        val rendered = renderTypedNumericInitializer(explicitExpr, reprNumKind, "$indent    ", selfTypeName = selfTypeWithGenerics)
+                        baseDiscExpr = rendered
+                        stepOffset = 1
+                        rendered
+                    } else {
+                        val rendered = formatEnumSteppedDiscriminant(baseDiscExpr, stepOffset, reprNumKind)
+                        stepOffset += 1
+                        rendered
+                    }
+                entryLines += "${vTrivia}${vDoc}$indent    $entryName($discArg)"
+            }
+            if (attachedMembers.isNotEmpty()) {
+                sb.append(entryLines.joinToString(",\n")).append(";\n\n")
+                sb.append(attachedMembers).append('\n')
+            } else {
+                sb.append(entryLines.joinToString(",\n")).append(",\n")
+            }
+            sb.append(indent).append("}")
+            return sb.toString()
+        }
+
+        val enumAssocTypeParamNames = sourceAssociatedParameters(item.generics).map { it.associated }
+        val prevOverrideNames = currentStructOverrideMethodNames
+        currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits, ownerIsPublic = (vis == "public "))
+        activeTypeParamNames = prevEnumTypeParams + declaredEnumTpNames + enumParamRenames.values + enumAssocTypeParamNames
+        activeConstParamNames = prevEnumConstParams + collectGenericConstParamNames(item.generics)
+        val attachedMembers =
+            try {
+                renderAttachedImplMembers(selfTypeWithGenerics, item.generics, attachedImpls, "$indent    ", isLocalClass = isLocalItem)
+            } finally {
+                activeConstParamNames = prevEnumConstParams
+                activeTypeParamNames = prevEnumTypeParams
+                currentStructOverrideMethodNames = prevOverrideNames
+            }
+        val hasDiscriminants = isSimpleEnum && typeParams.isEmpty() && variants.any { it.discriminant != null }
+        val reprKotlinType = if (hasDiscriminants) (extractEnumReprKotlinType(item.attrs) ?: "Int") else null
+        val reprNumKind = reprKotlinType?.let(this::resolveNumericKind)
+
+        sb
+            .append(indent)
+            .append(vis)
+            .append("sealed class ")
+            .append(typeName)
+            .append(typeParams)
+        if (reprKotlinType != null) {
+            if (useFinalAbiLayout || headerContext.isBatchCrateOutput) {
+                sb
+                    .append("(\n")
+                    .append(indent)
+                    .append("    public val value: ")
+                    .append(reprKotlinType)
+                    .append(",\n")
+                    .append(indent)
+                    .append(')')
+            } else {
+                sb.append("(public val value: ").append(reprKotlinType).append(')')
+            }
+        }
+        if (superTraits.isNotEmpty()) {
+            sb.append(" : ").append(superTraits.joinToString(", "))
+        }
+        sb.append(" {\n")
+        var prevVariantName: String? = null
+        activeTypeParamNames = prevEnumTypeParams + declaredEnumTpNames + enumParamRenames.values + enumAssocTypeParamNames
+        activeConstParamNames = prevEnumConstParams + collectGenericConstParamNames(item.generics)
+        try {
+            for (v in variants) {
+                val vName = rustTypeIdentToKotlin(v.ident.toString())
+                val discArg =
+                    if (reprKotlinType != null) {
+                        val explicitExpr = v.discriminant?.expr
+                        if (explicitExpr != null) {
+                            renderTypedNumericInitializer(explicitExpr, reprNumKind, "$indent    ", selfTypeName = selfTypeWithGenerics)
+                        } else if (prevVariantName != null) {
+                            val stepOne =
+                                when (reprNumKind) {
+                                    NumericKind.U8, NumericKind.U16, NumericKind.U32 -> "1u"
+                                    NumericKind.U64 -> "1uL"
+                                    NumericKind.I64 -> "1L"
+                                    else -> "1"
+                                }
+                            val rawStep = "$prevVariantName.value + $stepOne"
                             when (reprNumKind) {
-                                NumericKind.U8, NumericKind.U16, NumericKind.U32 -> "1u"
-                                NumericKind.U64 -> "1uL"
-                                NumericKind.I64 -> "1L"
-                                else -> "1"
+                                NumericKind.U8 -> "($rawStep).toUByte()"
+                                NumericKind.U16 -> "($rawStep).toUShort()"
+                                NumericKind.I8 -> "($rawStep).toByte()"
+                                NumericKind.I16 -> "($rawStep).toShort()"
+                                else -> rawStep
                             }
-                        val rawStep = "$prevVariantName.value + $stepOne"
-                        when (reprNumKind) {
-                            NumericKind.U8 -> "($rawStep).toUByte()"
-                            NumericKind.U16 -> "($rawStep).toUShort()"
-                            NumericKind.I8 -> "($rawStep).toByte()"
-                            NumericKind.I16 -> "($rawStep).toShort()"
-                            else -> rawStep
+                        } else {
+                            defaultInitializerForType(reprKotlinType)
                         }
                     } else {
-                        defaultInitializerForType(reprKotlinType)
+                        null
                     }
-                } else {
-                    null
-                }
-            sb.append(
-                renderEnumVariantClass(
-                    variant = v,
-                    enumName = typeName,
-                    enumGenerics = item.generics,
-                    enumTypeParams = typeParams,
-                    enumTypeArgsUse = typeArgsUse,
-                    indent = "$indent    ",
-                    discriminantArg = discArg,
-                    isPublicEnum = !isLocalItem && vis == "public ",
-                ),
-            )
-            sb.append('\n')
-            prevVariantName = vName
+                sb.append(
+                    renderEnumVariantClass(
+                        variant = v,
+                        enumName = typeName,
+                        enumGenerics = item.generics,
+                        enumTypeParams = typeParams,
+                        enumTypeArgsUse = typeArgsUse,
+                        indent = "$indent    ",
+                        discriminantArg = discArg,
+                        isPublicEnum = !isLocalItem && vis == "public ",
+                    ),
+                )
+                sb.append('\n')
+                prevVariantName = vName
+            }
+        } finally {
+            activeConstParamNames = prevEnumConstParams
+            activeTypeParamNames = prevEnumTypeParams
         }
+        val enumTypeParamNamesList = declaredEnumTpNames.map { enumParamRenames[it] ?: it }.toList()
+        val variantRawNames = variants.map { it.ident.toString().removePrefix("r#") }.toSet()
+        if (enumTypeParamNamesList.size == 2) {
+            if (typeName in setOf("Result", "RustResult") && "Ok" in variantRawNames && "Err" in variantRawNames) {
+                val okTp = enumTypeParamNamesList[0]
+                val errTp = enumTypeParamNamesList[1]
+                sb
+                    .append('\n')
+                    .append(indent)
+                    .append("    public open fun okValue(): ")
+                    .append(okTp)
+                    .append(" = error(\"not Ok\")\n")
+                    .append(indent)
+                    .append("    public open fun errValue(): ")
+                    .append(errTp)
+                    .append(" = error(\"not Err\")\n")
+            } else if (typeName == "ControlFlow" && "Break" in variantRawNames && "Continue" in variantRawNames) {
+                val bTp = enumTypeParamNamesList[0]
+                val cTp = enumTypeParamNamesList[1]
+                sb
+                    .append('\n')
+                    .append(indent)
+                    .append("    public open fun cfBreakValue(): ")
+                    .append(bTp)
+                    .append(" = error(\"not Break\")\n")
+                    .append(indent)
+                    .append("    public open fun cfContinueValue(): ")
+                    .append(cTp)
+                    .append(" = error(\"not Continue\")\n")
+            }
+        }
+        val derivesEquality = hasDeriveTrait(item.attrs, "PartialEq")
+        if (derivesEquality) {
+            sb.append("\n$indent    public fun rustEquals(other: $selfTypeWithGenerics): Boolean = this == other\n")
+        }
+        if (isSimpleEnum && typeParams.isEmpty() && variants.isNotEmpty()) {
+            val convSpecs =
+                listOf(
+                    "toByte" to "Byte",
+                    "toUByte" to "UByte",
+                    "toShort" to "Short",
+                    "toUShort" to "UShort",
+                    "toInt" to "Int",
+                    "toUInt" to "UInt",
+                    "toLong" to "Long",
+                    "toULong" to "ULong",
+                )
+            if (reprKotlinType != null) {
+                for ((fnName, retType) in convSpecs) {
+                    if (!containsWholeIdentifier(attachedMembers, "fun $fnName(")) {
+                        val bodyExpr = if (retType == reprKotlinType) "value" else "value.$fnName()"
+                        sb.append("\n$indent    public fun $fnName(): $retType = $bodyExpr\n")
+                    }
+                }
+            } else {
+                val variantBranches =
+                    variants.mapIndexed { idx, v ->
+                        val vName = rustTypeIdentToKotlin(v.ident.toString())
+                        "$indent        $vName -> $idx"
+                    }
+                sb
+                    .append("\n$indent    private fun kmDiscriminant(): Int =\n")
+                    .append("$indent        when (this) {\n")
+                    .append(variantBranches.joinToString("\n"))
+                    .append('\n')
+                    .append("$indent        }\n")
+                for ((fnName, retType) in convSpecs) {
+                    if (!containsWholeIdentifier(attachedMembers, "fun $fnName(")) {
+                        val bodyExpr = if (retType == "Int") "kmDiscriminant()" else "kmDiscriminant().$fnName()"
+                        sb.append("\n$indent    public fun $fnName(): $retType = $bodyExpr\n")
+                    }
+                }
+            }
+        }
+        if (attachedMembers.isNotEmpty()) {
+            sb.append('\n').append(attachedMembers).append('\n')
+        }
+        sb.append(indent).append("}")
+        sb.toString()
     } finally {
-        activeConstParamNames = prevEnumConstParams
-        activeTypeParamNames = prevEnumTypeParams
+        activeEnclosingEnumVariantNames = prevEnclosingVariants
+        renamedTypeParamIdentifiers = prevRenamedParams
     }
-    val enumTypeParamNamesList = collectGenericTypeParamNames(item.generics).toList()
-    val variantRawNames = variants.map { it.ident.toString().removePrefix("r#") }.toSet()
-    if (enumTypeParamNamesList.size == 2) {
-        if (typeName in setOf("Result", "RustResult") && "Ok" in variantRawNames && "Err" in variantRawNames) {
-            val okTp = enumTypeParamNamesList[0]
-            val errTp = enumTypeParamNamesList[1]
-            sb
-                .append('\n')
-                .append(indent)
-                .append("    public open fun okValue(): ")
-                .append(okTp)
-                .append(" = error(\"not Ok\")\n")
-                .append(indent)
-                .append("    public open fun errValue(): ")
-                .append(errTp)
-                .append(" = error(\"not Err\")\n")
-        } else if (typeName == "ControlFlow" && "Break" in variantRawNames && "Continue" in variantRawNames) {
-            val bTp = enumTypeParamNamesList[0]
-            val cTp = enumTypeParamNamesList[1]
-            sb
-                .append('\n')
-                .append(indent)
-                .append("    public open fun cfBreakValue(): ")
-                .append(bTp)
-                .append(" = error(\"not Break\")\n")
-                .append(indent)
-                .append("    public open fun cfContinueValue(): ")
-                .append(cTp)
-                .append(" = error(\"not Continue\")\n")
-        }
-    }
-    val derivesEquality = hasDeriveTrait(item.attrs, "PartialEq")
-    if (derivesEquality) {
-        sb.append("\n$indent    public fun rustEquals(other: $selfTypeWithGenerics): Boolean = this == other\n")
-    }
-    if (isSimpleEnum && typeParams.isEmpty() && variants.isNotEmpty()) {
-        val convSpecs =
-            listOf(
-                "toByte" to "Byte",
-                "toUByte" to "UByte",
-                "toShort" to "Short",
-                "toUShort" to "UShort",
-                "toInt" to "Int",
-                "toUInt" to "UInt",
-                "toLong" to "Long",
-                "toULong" to "ULong",
-            )
-        if (reprKotlinType != null) {
-            for ((fnName, retType) in convSpecs) {
-                if (!containsWholeIdentifier(attachedMembers, "fun $fnName(")) {
-                    val bodyExpr = if (retType == reprKotlinType) "value" else "value.$fnName()"
-                    sb.append("\n$indent    public fun $fnName(): $retType = $bodyExpr\n")
-                }
-            }
-        } else {
-            val variantBranches =
-                variants.mapIndexed { idx, v ->
-                    val vName = rustTypeIdentToKotlin(v.ident.toString())
-                    "$indent        $vName -> $idx"
-                }
-            sb
-                .append("\n$indent    private fun kmDiscriminant(): Int =\n")
-                .append("$indent        when (this) {\n")
-                .append(variantBranches.joinToString("\n"))
-                .append('\n')
-                .append("$indent        }\n")
-            for ((fnName, retType) in convSpecs) {
-                if (!containsWholeIdentifier(attachedMembers, "fun $fnName(")) {
-                    val bodyExpr = if (retType == "Int") "kmDiscriminant()" else "kmDiscriminant().$fnName()"
-                    sb.append("\n$indent    public fun $fnName(): $retType = $bodyExpr\n")
-                }
-            }
-        }
-    }
-    if (attachedMembers.isNotEmpty()) {
-        sb.append('\n').append(attachedMembers).append('\n')
-    }
-    sb.append(indent).append("}")
-    return sb.toString()
 }
 
 internal fun KotlinJ2KEmitter.renderEnumVariantClass(
@@ -2173,7 +2204,7 @@ internal fun KotlinJ2KEmitter.renderEnumVariantClass(
     val vName = rustTypeIdentToKotlin(variant.ident.toString())
     val enumSelfType = enumName + enumTypeArgsUse
     val variantSelfType = vName + enumTypeArgsUse
-    val unboundedEnumTypeParams = collectUnboundedGenericTypeParamNames(enumGenerics)
+    val unboundedEnumTypeParams = collectUnboundedGenericTypeParamNames(enumGenerics, renamedTypeParamIdentifiers)
     val typeParamCount = enumGenerics.params.toList().count { it is GenericParam.TypeParam }
     val superCallArgs = discriminantArg.orEmpty()
     when (val fields = variant.fields) {

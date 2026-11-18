@@ -62,7 +62,6 @@ private val STDLIB_DEFAULTLESS_ASSOC_TYPES: Map<String, List<String>> =
         "DoubleEndedIterator" to listOf("Item"),
         "ExactSizeIterator" to listOf("Item"),
         "FusedIterator" to listOf("Item"),
-        "TrustedLen" to listOf("Item"),
         "AsyncIterator" to listOf("Item"),
     )
 
