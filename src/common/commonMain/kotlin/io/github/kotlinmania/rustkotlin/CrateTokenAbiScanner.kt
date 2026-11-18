@@ -540,12 +540,23 @@ private fun scanSourcesWithActiveSession(
         TranslationSession.currentRelativeSourceDir = relDir
         val tokens = lexScannerTokens(text)
         if (tokens.isEmpty()) continue
+        val topLevelSplitInlineMods =
+            if (splitModuleRoots && "mod" in text && "{" in text) {
+                recognizeRustOrNull(text)
+                    ?.let { rec ->
+                        selectSplitCandidateInlineModsForFile(rec.file)
+                            .mapTo(linkedSetOf()) { it.ident.toString().removePrefix("r#") }
+                    }.orEmpty()
+            } else {
+                emptySet()
+            }
         scanModuleTokenTrees(
             trees = tokens,
             subpkg = subpkg,
             rawAbiMode = rawAbiMode,
             finalStructs = finalStructs,
             splitModuleRoots = splitModuleRoots,
+            topLevelSplitInlineMods = topLevelSplitInlineMods,
             registerSymbol = ::registerSymbolInSubpkg,
             registerFnSig = ::registerFnSignatureTokens,
             subpkgToRawLeaf = subpkgToRawLeaf,

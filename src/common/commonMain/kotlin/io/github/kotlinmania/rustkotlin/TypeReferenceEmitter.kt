@@ -1401,6 +1401,14 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                             addAll(defaultedParams)
                             if (bounded != null && isSelfParameterizedTraitName(ktBaseIdent)) {
                                 add(bounded)
+                            } else if (bounded == null &&
+                                !suppressTraitAssocPlaceholders &&
+                                isSelfParameterizedTraitName(ktBaseIdent) &&
+                                defaultedParams.isEmpty() &&
+                                effectiveLookupAssocs.isEmpty() &&
+                                ktBaseIdent !in activeTypeParamNames
+                            ) {
+                                add("*")
                             }
                             for (assocKt in effectiveLookupAssocs) {
                                 if (assocKt in currentTraitAssocParamNames) {

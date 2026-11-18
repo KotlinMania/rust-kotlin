@@ -3015,7 +3015,7 @@ internal val STDLIB_ERASED_OR_BUILTIN_IMPORTS =
         )
 internal val FMT_TRAIT_NAMES: Set<String> =
     setOf("Debug", "Display", "Octal", "LowerHex", "UpperHex", "Binary", "LowerExp", "UpperExp", "Pointer")
-internal val KNOWN_SELF_PARAMETERIZED_TRAITS = setOf("Parse", "ParseQuote")
+internal val KNOWN_SELF_PARAMETERIZED_TRAITS = setOf("Parse", "ParseQuote", "Read", "Write")
 internal val KOTLIN_COLLECTION_INTERFACES = setOf("List", "MutableList", "Map", "MutableMap", "Set", "MutableSet", "ArrayDeque")
 internal val MUTATING_VEC_METHODS =
     setOf("push", "pop", "clear", "insert", "remove", "truncate", "retain", "extend", "extend_from_slice", "append", "drain", "swap_remove")

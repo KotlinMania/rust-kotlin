@@ -1361,4 +1361,73 @@ class StdlibSemanticWaveCTest {
         assertContains(out, "simdAdd(transmuteWithLayouts<I32x4, U32x4>(a, I32x4.typeLayout(), U32x4.typeLayout()), b)")
         assertFalse(out.contains("Iterator<Any?, Any?>"), "Sibling Iterator + DoubleEndedIterator must not duplicate Item:\n$out")
     }
+
+    @Test
+    fun waveC8SelfParameterizedTraitsCfgSelectNofmtConstErrorWriteFmtAndTupleTransmute() {
+        val rustSource =
+            """
+            #![allow(unused)]
+
+            use core::sync::atomic::Ordering::Relaxed;
+
+            pub struct VectorSignedChar(i32);
+            pub struct VectorUnsignedChar(u32);
+
+            pub fn vec_sel_pair(x: PairArg, y: i32) -> (VectorUnsignedChar, i32) {
+                (core::intrinsics::transmute(x), y)
+            }
+
+            pub struct PairArg(i32);
+
+            pub fn read_all_dyn(r: &mut dyn Read) -> i32 {
+                0
+            }
+
+            pub fn make_err(f: &mut Formatter) -> core::fmt::Result {
+                let _ord = Relaxed;
+                f.write_fmt(format_args!("hello"))?;
+                let _e = const_error!(ErrorKind::OutOfMemory, "oom");
+                Ok(())
+            }
+
+            cfg_select_nofmt! {
+                _ => {
+                    pub type CmpResult = i32;
+                }
+            }
+
+            pub fn use_cmp_result(x: CmpResult) -> CmpResult {
+                x
+            }
+            """
+        val out =
+            translateRustSourceToKotlin(
+                recognizeRust(rustSource.trimIndent()),
+                headerContext =
+                    FileHeaderContext(
+                        packageName = "io.github.kotlinmania.rustlang.alloc.io",
+                        projectNamespace = "io.github.kotlinmania.rustlang.alloc",
+                        crateNamespaces =
+                            mapOf(
+                                "core" to "io.github.kotlinmania.rustlang.core",
+                                "alloc" to "io.github.kotlinmania.rustlang.alloc",
+                            ),
+                        externalCrateSymbolPackages =
+                            mapOf(
+                                "core" to
+                                    mapOf(
+                                        "Ordering" to listOf("io.github.kotlinmania.rustlang.core.sync.atomic"),
+                                    ),
+                            ),
+                    ),
+            )
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(out, "WaveC8Sample.kt")
+        assertContains(out, "import io.github.kotlinmania.rustlang.core.sync.atomic.Ordering.Relaxed")
+        assertContains(out, "r: Read<*>")
+        assertContains(out, "f.append(")
+        assertContains(out, "Error.fromStaticMessage(SimpleMessage(kind = ErrorKind.OutOfMemory, message = \"oom\"))")
+        assertContains(out, "public typealias CmpResult = Int")
+        assertContains(out, "Pair(transmuteWithLayouts<PairArg, VectorUnsignedChar>(x")
+        assertFalse(out.contains("Pair<VectorUnsignedChar, Int>>("), "Tuple transmute must target element type:\n$out")
+    }
 }
