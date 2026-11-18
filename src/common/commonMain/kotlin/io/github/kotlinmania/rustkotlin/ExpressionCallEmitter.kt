@@ -772,7 +772,7 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
                             tryExtractMutableArraySubsliceArg(
                                 argExpr = argExpr,
                                 argIndex = argIdx,
-                                expectMutableList = calleeExpectsMutableListSliceParam(calleeBase, argIdx),
+                                expectMutableList = { calleeExpectsMutableListSliceParam(calleeBase, argIdx) },
                                 indent = indent,
                                 selfTypeName = selfTypeName,
                             )

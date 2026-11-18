@@ -1024,6 +1024,80 @@ public actual fun kmSimdDotF32(aAddr: Long, bAddr: Long, len: Long): Float =
     }
 
 ${CoreIntrinsicMathAndBitSpecs.renderJsActuals().trimEnd()}
+
+@JsName("FinalizationRegistry")
+private external class KmJsFinalizationRegistry(callback: (Int) -> Unit) {
+    fun register(target: Any, heldValue: Int, unregisterToken: Any)
+    fun unregister(unregisterToken: Any): Boolean
+}
+
+private class KmJsCleanToken
+
+private object KmJsCleanerRegistry {
+    private var nextTokenId: Int = 1
+    private val pendingCleanups = hashMapOf<Int, () -> Unit>()
+    private val registry =
+        KmJsFinalizationRegistry { tokenId ->
+            val action = pendingCleanups.remove(tokenId)
+            if (action != null) {
+                action()
+            }
+        }
+
+    fun register(owner: Any, cleanup: () -> Unit): KmResourceCleaner {
+        val id = nextTokenId++
+        val token = KmJsCleanToken()
+        pendingCleanups[id] = cleanup
+        registry.register(owner, id, token)
+        return KmResourceCleaner().apply { attach(id, token) }
+    }
+
+    fun disarm(id: Int, token: KmJsCleanToken) {
+        pendingCleanups.remove(id)
+        registry.unregister(token)
+    }
+
+    fun clean(id: Int, token: KmJsCleanToken) {
+        registry.unregister(token)
+        val action = pendingCleanups.remove(id)
+        if (action != null) {
+            action()
+        }
+    }
+}
+
+public actual class KmResourceCleaner internal constructor() : KmForgettableResource {
+    private var tokenId: Int = 0
+    private var token: KmJsCleanToken? = null
+
+    internal fun attach(id: Int, cleanToken: KmJsCleanToken) {
+        tokenId = id
+        token = cleanToken
+    }
+
+    public actual fun disarm() {
+        val activeToken = token ?: return
+        val activeId = tokenId
+        token = null
+        tokenId = 0
+        KmJsCleanerRegistry.disarm(activeId, activeToken)
+    }
+
+    public actual fun cleanNow() {
+        val activeToken = token ?: return
+        val activeId = tokenId
+        token = null
+        tokenId = 0
+        KmJsCleanerRegistry.clean(activeId, activeToken)
+    }
+
+    public actual override fun disarmCleaner(): Unit = disarm()
+
+    public actual override fun close(): Unit = cleanNow()
+}
+
+public actual fun kmRegisterResourceCleaner(owner: Any, cleanup: () -> Unit): KmResourceCleaner =
+    KmJsCleanerRegistry.register(owner, cleanup)
 """.trimStart()
     }
 
@@ -1595,6 +1669,83 @@ public actual fun kmSimdDotF32(aAddr: Long, bAddr: Long, len: Long): Float =
     if (kmCoreNapiAvailable) wasmKmSimdDotF32(lo32(aAddr), hi32(aAddr), lo32(bAddr), hi32(bAddr), lo32(len), hi32(len)).toFloat() else KmLinearMemoryArena.simdDotF32(aAddr, bAddr, len)
 
 ${CoreIntrinsicMathAndBitSpecs.renderWasmJsActuals().trimEnd()}
+
+private class KmWasmCleanToken
+
+@JsFun("(cb) => new FinalizationRegistry(cb)")
+private external fun kmWasmCreateFinalizationRegistry(cb: (Int) -> Unit): JsAny
+
+@JsFun("(reg, target, heldValue, token) => { reg.register(target, heldValue, token); }")
+private external fun kmWasmRegisterCleaner(reg: JsAny, target: JsAny, heldValue: Int, token: JsAny)
+
+@JsFun("(reg, token) => { reg.unregister(token); }")
+private external fun kmWasmUnregisterCleaner(reg: JsAny, token: JsAny)
+
+private object KmWasmCleanerRegistry {
+    private var nextTokenId: Int = 1
+    private val pendingCleanups = hashMapOf<Int, () -> Unit>()
+    private val registry: JsAny =
+        kmWasmCreateFinalizationRegistry { tokenId ->
+            val action = pendingCleanups.remove(tokenId)
+            if (action != null) {
+                action()
+            }
+        }
+
+    fun register(owner: Any, cleanup: () -> Unit): KmResourceCleaner {
+        val id = nextTokenId++
+        val token = KmWasmCleanToken().toJsReference()
+        pendingCleanups[id] = cleanup
+        kmWasmRegisterCleaner(registry, owner.toJsReference(), id, token)
+        return KmResourceCleaner().apply { attach(id, token) }
+    }
+
+    fun disarm(id: Int, token: JsAny) {
+        pendingCleanups.remove(id)
+        kmWasmUnregisterCleaner(registry, token)
+    }
+
+    fun clean(id: Int, token: JsAny) {
+        kmWasmUnregisterCleaner(registry, token)
+        val action = pendingCleanups.remove(id)
+        if (action != null) {
+            action()
+        }
+    }
+}
+
+public actual class KmResourceCleaner internal constructor() : KmForgettableResource {
+    private var tokenId: Int = 0
+    private var token: JsAny? = null
+
+    internal fun attach(id: Int, cleanToken: JsAny) {
+        tokenId = id
+        token = cleanToken
+    }
+
+    public actual fun disarm() {
+        val activeToken = token ?: return
+        val activeId = tokenId
+        token = null
+        tokenId = 0
+        KmWasmCleanerRegistry.disarm(activeId, activeToken)
+    }
+
+    public actual fun cleanNow() {
+        val activeToken = token ?: return
+        val activeId = tokenId
+        token = null
+        tokenId = 0
+        KmWasmCleanerRegistry.clean(activeId, activeToken)
+    }
+
+    public actual override fun disarmCleaner(): Unit = disarm()
+
+    public actual override fun close(): Unit = cleanNow()
+}
+
+public actual fun kmRegisterResourceCleaner(owner: Any, cleanup: () -> Unit): KmResourceCleaner =
+    KmWasmCleanerRegistry.register(owner, cleanup)
 """.trimStart()
     }
 
@@ -1702,5 +1853,56 @@ public actual fun kmSimdDotF32(aAddr: Long, bAddr: Long, len: Long): Float =
     KmLinearMemoryArena.simdDotF32(aAddr, bAddr, len)
 
 ${CoreIntrinsicMathAndBitSpecs.renderWasmWasiActuals().trimEnd()}
+
+private class KmWasmWasiCleanState(
+    private var cleanup: (() -> Unit)?,
+) {
+    private var state: Int = 0
+
+    fun disarm() {
+        if (state == 0) {
+            state = 1
+            cleanup = null
+        }
+    }
+
+    fun clean() {
+        if (state == 0) {
+            state = 2
+            val action = cleanup
+            cleanup = null
+            action?.invoke()
+        }
+    }
+}
+
+public actual class KmResourceCleaner internal constructor() : KmForgettableResource {
+    private var cleanState: KmWasmWasiCleanState? = null
+
+    internal fun attach(state: KmWasmWasiCleanState) {
+        cleanState = state
+    }
+
+    public actual fun disarm() {
+        val target = cleanState
+        cleanState = null
+        target?.disarm()
+    }
+
+    public actual fun cleanNow() {
+        val target = cleanState
+        cleanState = null
+        target?.clean()
+    }
+
+    public actual override fun disarmCleaner(): Unit = disarm()
+
+    public actual override fun close(): Unit = cleanNow()
+}
+
+public actual fun kmRegisterResourceCleaner(owner: Any, cleanup: () -> Unit): KmResourceCleaner {
+    val state = KmWasmWasiCleanState(cleanup)
+    return KmResourceCleaner().apply { attach(state) }
+}
 """.trimStart()
 }

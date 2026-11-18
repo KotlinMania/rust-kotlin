@@ -120,6 +120,28 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
     val prevRecvParseTarget = currentExpectedParseTargetType
     val rawMethod = expr.method.toString()
     val cleanMethod = rawMethod.removePrefix("r#")
+    if (expr.turbofish == null &&
+        expr.args.len() == 1 &&
+        cleanMethod in
+        setOf(
+            "checked_sub",
+            "wrapping_sub",
+            "unchecked_sub",
+            "saturating_sub",
+            "offset_from",
+            "offset_from_unsigned",
+            "sub_ptr",
+            "byte_offset_from",
+        )
+    ) {
+        tryRenderManagedSlicePointerDistance(
+            subPtrExpr = expr.receiver,
+            basePtrExpr = expr.args.toList().first(),
+            mode = cleanMethod,
+            indent = indent,
+            selfTypeName = selfTypeName,
+        )?.let { return it }
+    }
     unwrapTryIntoUnwrapExpr(expr)?.let { innerTryRecv ->
         val tryIntoTargetTy =
             (methodEntryParseTarget ?: currentEnclosingReturnRenderedType)
@@ -1009,7 +1031,7 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                     tryExtractMutableArraySubsliceArg(
                         argExpr = argExpr,
                         argIndex = argIdx,
-                        expectMutableList = methodExpectsMutableListSliceParam(recvOwnerSimple, method, argIdx),
+                        expectMutableList = { methodExpectsMutableListSliceParam(recvOwnerSimple, method, argIdx) },
                         indent = indent,
                         selfTypeName = selfTypeName,
                     )

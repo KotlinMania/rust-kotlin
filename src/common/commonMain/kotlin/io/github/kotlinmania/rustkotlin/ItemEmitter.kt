@@ -571,16 +571,44 @@ internal fun KotlinJ2KEmitter.renderItemFn(
         val retType = extractReturnSynType(item.sig.output)
         val panicExpectation = if (!isLocalItem && hasTestAttribute(item.attrs)) extractRustPanicExpectation(item.attrs) else null
         val bodyIndent = if (panicExpectation == null) indent else "$indent    "
-        val shadows = computeReassignedParamShadows(item.sig, fnBlock, "$bodyIndent    ", selfTypeName = null)
+        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+        val rawFnIdent =
+            item.sig.ident
+                .toString()
+                .removePrefix("r#")
+        val memHookParam =
+            if (!isLocalItem &&
+                !headerContext.rawAbiMode &&
+                headerContext.packageName == "$coreNs.mem" &&
+                item.sig.inputs.len() == 1 &&
+                retType == null &&
+                rawFnIdent in setOf("drop", "forget")
+            ) {
+                sigHeader.substringAfterLast('(').substringBefore(':').trim().takeIf {
+                    it.isNotEmpty() && it.all { ch -> ch.isLetterOrDigit() || ch == '_' }
+                }
+            } else {
+                null
+            }
         val body =
-            renderBlock(
-                fnBlock,
-                bodyIndent,
-                selfTypeName = null,
-                returnType = retType,
-                leadingInjectedLines = shadows,
-                allowExpressionBody = panicExpectation == null,
-            )
+            if (memHookParam != null) {
+                if (rawFnIdent == "drop") {
+                    "{\n$bodyIndent    if ($memHookParam is AutoCloseable) $memHookParam.close()\n$bodyIndent}"
+                } else {
+                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.intrinsics.KmForgettableResource")
+                    "{\n$bodyIndent    if ($memHookParam is KmForgettableResource) $memHookParam.disarmCleaner()\n$bodyIndent}"
+                }
+            } else {
+                val shadows = computeReassignedParamShadows(item.sig, fnBlock, "$bodyIndent    ", selfTypeName = null)
+                renderBlock(
+                    fnBlock,
+                    bodyIndent,
+                    selfTypeName = null,
+                    returnType = retType,
+                    leadingInjectedLines = shadows,
+                    allowExpressionBody = panicExpectation == null,
+                )
+            }
         sb.append(" ")
         sb.append(if (panicExpectation == null) body else wrapRustPanicTestBody(body, indent, panicExpectation))
         sb.toString()
@@ -1559,6 +1587,70 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                 extraIterableMembers +=
                     "$indent    public ${cloneOpenMod}fun clone(): $selfTypeWithGenerics = $typeName($cloneArgs)"
             }
+        }
+        val dropImplEntry =
+            effectiveAttachedImpls.firstNotNullOfOrNull { impl ->
+                if (isDocOnlyCfgAttribute(impl.attrs)) return@firstNotNullOfOrNull null
+                val traitLast =
+                    impl.traitPath
+                        ?.path
+                        ?.segments
+                        ?.last()
+                        ?.ident
+                        ?.toString()
+                        ?.removePrefix("r#")
+                if (traitLast != "Drop") return@firstNotNullOfOrNull null
+                val dropFn =
+                    impl.items.filterIsInstance<ImplItem.Fn>().firstOrNull { fn ->
+                        if (isDocOnlyCfgAttribute(fn.attrs)) return@firstOrNull false
+                        val firstArg =
+                            fn.sig.inputs
+                                .toList()
+                                .firstOrNull()
+                        firstArg is FnArg.Receiver &&
+                            fn.sig.inputs.len() == 1 &&
+                            fn.sig.generics.params
+                                .len() == 0 &&
+                            rustFunctionIdentToKotlin(fn.sig.ident.toString()) == "drop"
+                    } ?: return@firstNotNullOfOrNull null
+                impl to dropFn
+            }
+        val hasWitnessedOwnerOrImplBounds =
+            if (dropImplEntry != null) {
+                val (dropImpl, dropFn) = dropImplEntry
+                val allParamsForDrop =
+                    buildList {
+                        addAll(mergeGenericParams(item.generics, dropFn.sig.generics, includeOwnerParams = true))
+                        if (dropImpl.generics !== item.generics) {
+                            addAll(dropImpl.generics.params.toList())
+                        }
+                    }
+                collectTypeParamWitnessSpecs(
+                    sig = dropFn.sig,
+                    combinedParams = allParamsForDrop,
+                    ownerWhere = item.generics.whereClause,
+                    implWhere = if (dropImpl.generics !== item.generics) dropImpl.generics.whereClause else null,
+                    fnWhere = dropFn.sig.generics.whereClause,
+                    block = dropFn.block,
+                    selfTypeName = selfTypeWithGenerics,
+                    suppressedBoundsOut = linkedMapOf(),
+                ).isNotEmpty()
+            } else {
+                false
+            }
+        if (dropImplEntry != null &&
+            !hasWitnessedOwnerOrImplBounds &&
+            !isLocalItem &&
+            liveField == null &&
+            !useFinalAbiLayout &&
+            !isDataClass &&
+            !useBodyPropertiesForLargeStruct &&
+            fieldNameAndTypes.none { it.first == "close" } &&
+            !attachedImplDefinesInstanceMethod(effectiveAttachedImpls, "close") &&
+            superTraits.none { it.substringBefore('<').substringAfterLast('.').trim() == "AutoCloseable" }
+        ) {
+            superTraits += "AutoCloseable"
+            extraIterableMembers += "$indent    override fun close() {\n$indent        this.drop()\n$indent    }"
         }
         val classKeyword =
             when {

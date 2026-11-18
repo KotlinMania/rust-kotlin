@@ -199,9 +199,12 @@ internal fun KotlinJ2KEmitter.sourceTransparentField(
                     .singleOrNull()
             is Fields.Unit -> null
         } ?: return null
-    val isAddressCellCWrapper =
-        cLayout && (runtimeCellField(field.ty) != null || sourceAssociatedParameters(item.generics).isNotEmpty())
-    if (!transparent && !isAddressCellCWrapper && sourceStorageAlignment(item) == null) return null
+    val needsCellOrAssocWrapper =
+        runtimeCellField(field.ty) != null || sourceAssociatedParameters(item.generics).isNotEmpty()
+    val hasExplicitWrapperRepr = transparent || (cLayout && sourceStorageAlignment(item) != null)
+    if (!needsCellOrAssocWrapper && !(hasExplicitWrapperRepr && sameFileLayoutIndex().hasRawMemoryOrFfiUsage)) {
+        return null
+    }
     // Pointer-valued wrappers already preserve their address as a RustPointer
     // field. They must not allocate an unrelated pointer-sized storage object.
     if (field.ty is SynType.Ptr || field.ty is SynType.Reference) return null
@@ -237,6 +240,121 @@ internal fun KotlinJ2KEmitter.sourceTransparentField(
     return name to renderType(fieldType, selfType)
 }
 
+private val RAW_MEMORY_AND_LAYOUT_IDENTS: Set<String> =
+    setOf(
+        "size_of",
+        "size_of_val",
+        "align_of",
+        "align_of_val",
+        "offset_of",
+        "transmute",
+        "transmute_copy",
+        "transmute_unchecked",
+        "zeroed",
+        "MaybeUninit",
+        "ManuallyDrop",
+        "UnsafeCell",
+        "SyncUnsafeCell",
+        "from_raw_parts",
+        "from_raw_parts_mut",
+        "read_unaligned",
+        "write_unaligned",
+        "read_volatile",
+        "write_volatile",
+        "addr_of",
+        "addr_of_mut",
+        "copy_nonoverlapping",
+        "NonNull",
+        "TypeLayout",
+        "PrimitiveLayouts",
+    )
+
+private fun KotlinJ2KEmitter.extractManagedSliceAsPtrTarget(
+    expr: Expr,
+    selfTypeName: String?,
+): Pair<Expr, String>? {
+    var cur = unwrapParenOrGroupExpr(expr)
+    if (cur is Expr.Cast) {
+        val targetTy = unwrapSynType(cur.ty)
+        val seg =
+            (targetTy as? SynType.Path)
+                ?.takeIf { it.qself == null }
+                ?.path
+                ?.segments
+                ?.toList()
+                ?.singleOrNull()
+        val rawCast = seg?.ident?.toString()?.removePrefix("r#")
+        if (rawCast !in setOf("usize", "isize")) return null
+        cur = unwrapParenOrGroupExpr(cur.expr)
+    } else if (cur is Expr.MethodCall &&
+        cur.method.toString().removePrefix("r#") == "addr" &&
+        cur.args.isEmpty() &&
+        cur.turbofish == null
+    ) {
+        cur = unwrapParenOrGroupExpr(cur.receiver)
+    }
+    val mc = cur as? Expr.MethodCall ?: return null
+    if (mc.method.toString().removePrefix("r#") !in setOf("as_ptr", "as_mut_ptr") ||
+        !mc.args.isEmpty() ||
+        mc.turbofish != null
+    ) {
+        return null
+    }
+    val recvTy = inferExprRenderedType(mc.receiver, selfTypeName)?.removeSuffix("?")?.trim() ?: return null
+    val rawBase = recvTy.substringBefore('<').substringAfterLast('.').trim()
+    val isManagedSlice =
+        rawBase in
+            setOf(
+                "List",
+                "MutableList",
+                "ArrayList",
+                "String",
+                "CharSequence",
+                "LinearSliceView",
+                "LinearMutSliceView",
+                "ByteSlice",
+                "MutByteSlice",
+            ) ||
+            isPrimitiveArrayRenderedType(recvTy) ||
+            (rawBase.endsWith("Slice") && rawBase != "Slice")
+    if (!isManagedSlice) return null
+    return mc.receiver to rawBase
+}
+
+internal fun KotlinJ2KEmitter.tryRenderManagedSlicePointerDistance(
+    subPtrExpr: Expr,
+    basePtrExpr: Expr,
+    mode: String,
+    indent: String,
+    selfTypeName: String?,
+): String? {
+    val (subSliceExpr, subBase) = extractManagedSliceAsPtrTarget(subPtrExpr, selfTypeName) ?: return null
+    val (baseSliceExpr, baseBase) = extractManagedSliceAsPtrTarget(basePtrExpr, selfTypeName) ?: return null
+    val subRendered = renderExpr(subSliceExpr, indent, selfTypeName)
+    val baseRendered = renderExpr(baseSliceExpr, indent, selfTypeName)
+    val isViewOffsetType =
+        subBase in setOf("LinearSliceView", "LinearMutSliceView", "ByteSlice", "MutByteSlice") ||
+            (subBase.endsWith("Slice") && subBase != "Slice")
+    val diffExpr =
+        when {
+            isViewOffsetType && baseBase == subBase ->
+                "(($subRendered).offset - ($baseRendered).offset)"
+            subBase in setOf("String", "CharSequence") ->
+                "(($baseRendered).length - ($subRendered).length)"
+            else ->
+                "(($baseRendered).size - ($subRendered).size)"
+        }
+    return when (mode) {
+        "sub", "wrapping_sub", "unchecked_sub", "offset_from", "offset_from_unsigned", "sub_ptr", "byte_offset_from" ->
+            diffExpr
+        "saturating_sub" ->
+            "($diffExpr).coerceAtLeast(0)"
+        "checked_sub" ->
+            "run { val kmSliceDiff = $diffExpr; if (kmSliceDiff >= 0) kmSliceDiff else null }"
+        else -> null
+    }
+}
+
 internal fun sameFileNestedItems(items: List<Item>): List<Item> =
     items.flatMap { item ->
         listOf(item) + if (item is Item.Mod) (item.content as? ModContent.Inline)?.let { sameFileNestedItems(it.items) }.orEmpty() else emptyList()
@@ -246,6 +364,7 @@ internal class SameFileLayoutIndex(
     root: io.github.kotlinmania.syn.File,
 ) {
     val items: List<Item>
+    val hasRawMemoryOrFfiUsage: Boolean
     val structsByKtName: Map<String, List<Item.Struct>>
     val simpleStructsByKtName: Map<String, Item.Struct?>
     val topFnsByRawName: Map<String, Item.Fn?>
@@ -259,6 +378,7 @@ internal class SameFileLayoutIndex(
 
     init {
         val collected = mutableListOf<Item>()
+        var foundRawMemoryOrFfi = false
         val visitor =
             object : Visit() {
                 override fun visitItem(i: Item) {
@@ -266,9 +386,27 @@ internal class SameFileLayoutIndex(
                     collected.add(i)
                     super.visitItem(i)
                 }
+
+                override fun visitItemForeignMod(i: Item.ForeignMod) {
+                    foundRawMemoryOrFfi = true
+                    super.visitItemForeignMod(i)
+                }
+
+                override fun visitTypePtr(t: SynType.Ptr) {
+                    foundRawMemoryOrFfi = true
+                    super.visitTypePtr(t)
+                }
+
+                override fun visitPath(p: Path) {
+                    if (p.segments.toList().any { it.ident.toString().removePrefix("r#") in RAW_MEMORY_AND_LAYOUT_IDENTS }) {
+                        foundRawMemoryOrFfi = true
+                    }
+                    super.visitPath(p)
+                }
             }
         visitor.visitFile(root)
         items = collected
+        hasRawMemoryOrFfiUsage = foundRawMemoryOrFfi
 
         val structs = linkedMapOf<String, MutableList<Item.Struct>>()
         val simpleStructs = linkedMapOf<String, Item.Struct?>()
