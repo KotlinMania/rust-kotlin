@@ -1853,5 +1853,45 @@ class StdlibSemanticWaveCTest {
         assertContains(wasmWasiBridge, "KmWasmWasiCleanState")
         assertContains(wasmWasiBridge, "public actual class KmResourceCleaner")
         assertContains(wasmWasiBridge, "public actual override fun disarmCleaner(): Unit = disarm()")
+
+        val lasxCollidingSrc =
+            """
+            #[repr(simd)]
+            #[derive(Copy, Clone)]
+            pub struct v32i8([i8; 32]);
+
+            #[repr(simd)]
+            #[derive(Copy, Clone)]
+            pub struct m256i([i64; 4]);
+
+            extern "unadjusted" {
+                fn __lasx_xvsrar_b(a: v32i8, b: v32i8) -> v32i8;
+            }
+
+            pub unsafe fn lasx_xvsrar_b(a: m256i, b: m256i) -> m256i {
+                unsafe { core::mem::transmute(__lasx_xvsrar_b(core::mem::transmute(a), core::mem::transmute(b))) }
+            }
+            """.trimIndent()
+        val lasxCollidingOut =
+            translateRustSourceToKotlin(
+                recognizeRust(lasxCollidingSrc),
+                headerContext =
+                    FileHeaderContext(
+                        packageName = "io.github.kotlinmania.rustlang.corearch.loongarch64.lasx",
+                        projectNamespace = "io.github.kotlinmania.rustlang.corearch",
+                        crateNamespaces = mapOf("core" to "io.github.kotlinmania.rustlang.core"),
+                    ),
+            )
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(lasxCollidingOut, "WaveC11LasxColliding.kt")
+        assertContains(lasxCollidingOut, "externLasxXvsrarB(transmuteWithLayouts<M256i, V32i8>(")
+
+        val batchMethodsOut =
+            translateRustSourceToKotlin(
+                recognizeRust("pub struct Methods;"),
+                headerContext = FileHeaderContext(isBatchCrateOutput = true),
+            )
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(batchMethodsOut, "WaveC11BatchMethods.kt")
+        assertContains(batchMethodsOut, "public companion object")
+        assertFalse(batchMethodsOut.contains("fun typeLayout("), batchMethodsOut)
     }
 }
