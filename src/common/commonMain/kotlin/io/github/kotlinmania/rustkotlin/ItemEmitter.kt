@@ -107,6 +107,29 @@ internal fun hasDeriveTrait(
                 .any { it is TokenTree.Ident && it.value.toString() == traitName }
     }
 
+private fun KotlinJ2KEmitter.hasStandaloneCompanionExtensionImpl(typeName: String): Boolean {
+    val itemsToCheck = TranslationSession.sharedModuleFile?.items.orEmpty() + file.items
+    for (item in itemsToCheck) {
+        if (item !is Item.Impl || itemHasDocOnlyCfg(item) || item.traitPath != null) continue
+        if (extractAttachableDirectOwnerTypeName(item, itemsToCheck) != null) continue
+        val selfTy = unwrapSynType(item.selfType)
+        val selfBase =
+            (selfTy as? SynType.Path)
+                ?.takeIf { it.qself == null && it.path.segments.len() == 1 }
+                ?.path
+                ?.segments
+                ?.first()
+                ?.ident
+                ?.toString()
+                ?.let(::rustTypeIdentToKotlin)
+        if (selfBase != typeName) continue
+        if (item.items.any { m -> m is ImplItem.Fn && !implItemHasDocOnlyCfg(m) && m.sig.inputs.firstOrNull() !is FnArg.Receiver }) {
+            return true
+        }
+    }
+    return false
+}
+
 internal fun KotlinJ2KEmitter.beginItemHeaderAndVisibility(
     leadingTrivia: String,
     attrs: List<Attribute>,
@@ -1559,12 +1582,30 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
         }
         sb.append(whereClause)
 
+        val constGenericProps =
+            if (!isLocalItem) {
+                buildList {
+                    val seenConstProps = fieldNameAndTypes.mapTo(hashSetOf()) { it.first }
+                    for (gp in item.generics.params.toList()) {
+                        if (gp !is GenericParam.ConstParam) continue
+                        val cName = rustValueIdentToKotlin(gp.ident.toString().removePrefix("r#"))
+                        if (!seenConstProps.add(cName)) continue
+                        val cType = renderType(gp.ty, selfTypeWithGenerics)
+                        val defVal =
+                            gp.default?.expr?.let { renderExpr(it, "", selfTypeWithGenerics) }
+                                ?: defaultInitializerForType(cType)
+                        add("$indent    public val $cName: $cType = $defVal")
+                    }
+                }
+            } else {
+                emptyList()
+            }
         val extraProps =
             when {
                 useBodyPropertiesForLargeStruct -> bodyFieldProps + buildTupleStructAliasProperties(item.fields, selfTypeWithGenerics, "$indent    ")
                 swiftSafeBodyProps.isNotEmpty() -> swiftSafeBodyProps + buildTupleStructAliasProperties(item.fields, selfTypeWithGenerics, "$indent    ")
                 else -> buildTupleStructAliasProperties(item.fields, selfTypeWithGenerics, "$indent    ")
-            }
+            } + constGenericProps
         val prevOverrideNames = currentStructOverrideMethodNames
         currentStructOverrideMethodNames = collectLocalSupertraitMethodNames(superTraits, ownerIsPublic = (vis == "public "))
         val memberLines =
@@ -1579,6 +1620,7 @@ internal fun KotlinJ2KEmitter.renderItemStruct(
                     extraCompanionMembers = extraCompanionMembers,
                     isLocalClass = isLocalItem,
                     structFieldNames = fieldNameAndTypes.mapTo(linkedSetOf()) { it.first },
+                    emitEmptyCompanion = hasStandaloneCompanionExtensionImpl(typeName),
                 )
             } finally {
                 currentStructOverrideMethodNames = prevOverrideNames
@@ -1943,7 +1985,14 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
             currentStructOverrideMethodNames = emptySet()
             val attachedMembers =
                 try {
-                    renderAttachedImplMembers(selfTypeWithGenerics, item.generics, enumFilteredImpls, "$indent    ", isLocalClass = isLocalItem)
+                    renderAttachedImplMembers(
+                        selfTypeWithGenerics,
+                        item.generics,
+                        enumFilteredImpls,
+                        "$indent    ",
+                        isLocalClass = isLocalItem,
+                        emitEmptyCompanion = hasStandaloneCompanionExtensionImpl(typeName),
+                    )
                 } finally {
                     currentStructOverrideMethodNames = prevOverrideNames
                 }
@@ -2017,7 +2066,14 @@ internal fun KotlinJ2KEmitter.renderItemEnum(
         activeConstParamNames = prevEnumConstParams + collectGenericConstParamNames(item.generics)
         val attachedMembers =
             try {
-                renderAttachedImplMembers(selfTypeWithGenerics, item.generics, attachedImpls, "$indent    ", isLocalClass = isLocalItem)
+                renderAttachedImplMembers(
+                    selfTypeWithGenerics,
+                    item.generics,
+                    attachedImpls,
+                    "$indent    ",
+                    isLocalClass = isLocalItem,
+                    emitEmptyCompanion = hasStandaloneCompanionExtensionImpl(typeName),
+                )
             } finally {
                 activeConstParamNames = prevEnumConstParams
                 activeTypeParamNames = prevEnumTypeParams

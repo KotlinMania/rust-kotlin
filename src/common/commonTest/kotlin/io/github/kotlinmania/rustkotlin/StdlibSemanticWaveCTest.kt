@@ -1255,4 +1255,110 @@ class StdlibSemanticWaveCTest {
         assertContains(out, "UByte.tryFrom(value).ok()")
         assertContains(out, "Result.Ok<UShort, kotlin.Nothing>(UShort.from(value)).unwrap()")
     }
+
+    @Test
+    fun waveC7SimdPeerInferenceGenericUnitVariantsConstParamsAndExperimentalBitwise() {
+        val rustSource =
+            """
+            #![allow(unused)]
+
+            pub struct I32x4(i32, i32, i32, i32);
+            pub struct U32x4(u32, u32, u32, u32);
+            extern "C" {
+                fn simd_add(a: U32x4, b: U32x4) -> U32x4;
+                fn _mm512_mask_cmp_epu16_mask<const IMM: i32>(k: u16, a: U32x4, b: U32x4) -> u16;
+            }
+            pub const _MM_CMPINT_LT: i32 = 1;
+
+            pub unsafe fn va_sc_bc(a: I32x4, b: U32x4) -> U32x4 {
+                core::intrinsics::transmute(simd_add(core::intrinsics::transmute(a), b))
+            }
+
+            pub unsafe fn call_cmp(k: u16, a: U32x4, b: U32x4) -> u16 {
+                _mm512_mask_cmp_epu16_mask::<_MM_CMPINT_LT>(k, a, b)
+            }
+
+            pub enum Bound<T> {
+                Included(T),
+                Excluded(T),
+                Unbounded,
+            }
+
+            pub fn check_bound(b: Bound<i32>) -> Bound<i32> {
+                match b {
+                    Bound::Unbounded => Bound::Unbounded,
+                    Bound::Included(_) => Bound::Unbounded,
+                    Bound::Excluded(_) => b,
+                }
+            }
+
+            pub trait Iterator {
+                type Item;
+                fn next(&mut self) -> Option<Self::Item>;
+            }
+
+            pub trait DoubleEndedIterator: Iterator {
+                fn next_back(&mut self) -> Option<Self::Item>;
+            }
+
+            pub fn iterate_back<I: DoubleEndedIterator<Item = i32>>(it: &mut I) -> Option<i32> {
+                it.next_back()
+            }
+
+            pub struct Libm<T>(core::marker::PhantomData<T>);
+
+            impl Libm<f32> {
+                pub fn acos(x: f32) -> f32 { x }
+            }
+
+            pub struct Simd<T, const N: usize> {
+                data: [T; N],
+            }
+
+            impl<T, const N: usize> Simd<T, N> {
+                pub fn splat(value: T) -> Simd<T, N> {
+                    loop {}
+                }
+
+                pub fn next_chunk<const M: usize>(&self) -> usize {
+                    M
+                }
+            }
+
+            pub fn make_simd(x: i32, b: i8) -> i8 {
+                let s = Simd::<i32, 4>::splat(x);
+                let _c = s.next_chunk::<4>();
+                if !(!b == 0) {
+                    const_assert!(b != 0, "non-zero");
+                } else {
+                    const_panic!("zero");
+                }
+                !b
+            }
+            """
+        val out =
+            translateRustSourceToKotlin(
+                recognizeRust(rustSource.trimIndent()),
+                headerContext =
+                    FileHeaderContext(
+                        packageName = "io.github.kotlinmania.rustlang.core",
+                        projectNamespace = "io.github.kotlinmania.rustlang.core",
+                        crateNamespaces = mapOf("core" to "io.github.kotlinmania.rustlang.core"),
+                    ),
+            )
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(out, "WaveC7Sample.kt")
+        assertContains(out, "import kotlin.experimental.inv")
+        assertContains(out, "is Bound.Unbounded<*> -> Bound.Unbounded()")
+        assertContains(out, "public open class Libm<T>(public var value: Unit)")
+        assertContains(out, "public companion object")
+        assertContains(out, "public fun Libm.Companion.acos(x: Float): Float")
+        assertContains(out, "public val n: Int = 0")
+        assertContains(out, "public fun <T> splat(value: T, n: Int = 0): Simd<T>")
+        assertContains(out, "s.nextChunk(4)")
+        assertContains(out, "check(b != 0.toByte()) { \"non-zero\" }")
+        assertContains(out, "error(\"zero\")")
+        assertContains(out, "mm512MaskCmpEpu16Mask(k, a, b, MM_CMPINT_LT)")
+        assertContains(out, "simdAdd(transmuteWithLayouts<I32x4, U32x4>(a, I32x4.typeLayout(), U32x4.typeLayout()), b)")
+        assertFalse(out.contains("Iterator<Any?, Any?>"), "Sibling Iterator + DoubleEndedIterator must not duplicate Item:\n$out")
+    }
 }

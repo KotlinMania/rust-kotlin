@@ -364,6 +364,22 @@ internal fun KotlinJ2KEmitter.resolveBestSubpackageAmong(candidates: List<String
     return candidates.maxByOrNull(::score)
 }
 
+private fun KotlinJ2KEmitter.resolveFlattenedInlineModuleSubpackage(
+    explicitModule: String,
+    candidates: List<String>,
+): String? {
+    if (explicitModule.isEmpty() || explicitModule in headerContext.crateSubpackageRawLeafNames) return null
+    var curMod = explicitModule
+    while ('.' in curMod) {
+        val parentMod = curMod.substringBeforeLast('.')
+        if (parentMod in candidates) return parentMod
+        if (parentMod in headerContext.crateSubpackageRawLeafNames) break
+        curMod = parentMod
+    }
+    if ("" in candidates && headerContext.crateSubpackageRawLeafNames.isNotEmpty()) return ""
+    return null
+}
+
 internal fun KotlinJ2KEmitter.isResolvedCrateSubpackageModule(resolvedImportPath: String, rawLeafIdent: String): Boolean {
     if (headerContext.crateSubpackageRawLeafNames.isEmpty()) return false
     val nsPrefix = currentNamespacePrefix() ?: return false
@@ -385,7 +401,13 @@ internal fun KotlinJ2KEmitter.isResolvedCrateSubpackageModule(resolvedImportPath
     val parentSubpkg = afterNs.substringBeforeLast('.', missingDelimiterValue = "")
     val leafMod = rustModuleIdentToKotlin(cleanRaw.replace('-', '_'))
     val candidateSubpkg = if (parentSubpkg.isEmpty()) leafMod else "$parentSubpkg.$leafMod"
-    return headerContext.crateSubpackageRawLeafNames[candidateSubpkg] == cleanRaw
+    if (headerContext.crateSubpackageRawLeafNames[candidateSubpkg] == cleanRaw) return true
+    return afterNs.substringAfterLast('.') == leafMod &&
+        (parentSubpkg.isEmpty() || parentSubpkg in headerContext.crateSubpackageRawLeafNames) &&
+        parentSubpkg !in headerContext.crateSymbolSubpackages[rustValueIdentToKotlin(cleanRaw)].orEmpty() &&
+        parentSubpkg !in headerContext.crateSymbolSubpackages[rustFunctionIdentToKotlin(cleanRaw)].orEmpty() &&
+        parentSubpkg !in headerContext.crateSymbolSubpackages[rustConstIdentToKotlin(cleanRaw)].orEmpty() &&
+        parentSubpkg !in headerContext.crateSymbolSubpackages[rustTypeIdentToKotlin(cleanRaw)].orEmpty()
 }
 
 internal fun KotlinJ2KEmitter.scopedAbiKeysForRenderedType(renderedType: String): List<String> {
@@ -544,6 +566,23 @@ internal fun KotlinJ2KEmitter.bindOrQualifyResolvedCrossSymbol(resolvedFullImpor
             isDeclaredTopLevelFnKotlinName(simpleName) ->
             if (resolvedPkg.isNotEmpty() && resolvedPkg != headerContext.packageName) rawTarget else simpleName
         collidedPkg != null && collidedPkg != resolvedPkg -> rawTarget
+        explicitAlias == null &&
+            resolvedPkg.isNotEmpty() &&
+            resolvedPkg != headerContext.packageName &&
+            !rawTarget.endsWith(".Result.$simpleName") &&
+            !rawTarget.endsWith(".Option.$simpleName") &&
+            (
+                simpleName in inspector.enumVariantSimpleNames ||
+                    simpleName in inspector.importedEnumVariantSimpleNames ||
+                    (
+                        inspector.hasImportedEnumGlob &&
+                            (
+                                headerContext.crateEnumVariantTypeArity.containsKey(simpleName) ||
+                                    headerContext.crateEnumVariantTypeArity.keys.any { it.endsWith(".$simpleName") } ||
+                                    headerContext.externalEnumVariantTypeArity.containsKey(simpleName)
+                            )
+                    )
+            ) -> rawTarget
         resolvedPkg.isNotEmpty() && resolvedPkg != headerContext.packageName -> {
             importedSimpleNameToPkg[simpleName] = resolvedPkg
             val importLine = if (explicitAlias != null) "import $rawTarget as $explicitAlias" else "import $rawTarget"
@@ -662,6 +701,16 @@ internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
     ) {
         return null
     }
+    val coreMemIntrinsics =
+        setOf("transmute", "transmute_unchecked", "size_of", "size_of_val", "align_of", "align_of_val", "needs_drop", "forget")
+    if (rawSegStrings.size == 3 &&
+        firstRaw in setOf("core", "std", "crate") &&
+        secondClean == "intrinsics" &&
+        thirdClean != null &&
+        thirdClean in coreMemIntrinsics
+    ) {
+        return "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.mem.${rustFunctionIdentToKotlin(thirdClean)}" to emptyList()
+    }
     if (firstRaw == "core") {
         val isCrateCoreModule =
             headerContext.crateSubpackageRawLeafNames["core"] == "core" ||
@@ -757,6 +806,14 @@ internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
         val modBinding = scopeBuilder.resolveModuleBinding(firstRaw) ?: return null
         val importedPath = modBinding.importedPath ?: return null
         val rest = rawSegStrings.drop(1)
+        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+        if (firstRaw == "intrinsics" &&
+            rest.size == 1 &&
+            rest[0].removePrefix("r#") in coreMemIntrinsics &&
+            (importedPath == "core.intrinsics" || importedPath == "std.intrinsics" || importedPath == "$coreNs.intrinsics")
+        ) {
+            return "$coreNs.mem.${rustFunctionIdentToKotlin(rest[0].removePrefix("r#"))}" to emptyList()
+        }
         val isSameCrateImport =
             nsPrefix != null && (importedPath == nsPrefix || importedPath.startsWith("$nsPrefix."))
         if (isSameCrateImport && rest.isNotEmpty()) {
@@ -785,8 +842,25 @@ internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
                     headerContext.crateSymbolSubpackages.values.any { pkgs ->
                         pkgs.any { it == boundSubpkg || it.startsWith("$boundSubpkg.") }
                     }
-            if (!boundExistsInCrate) return null
-            var modSubpkg = boundSubpkg
+            var resolvedBoundSubpkg: String? = if (boundExistsInCrate) boundSubpkg else null
+            if (resolvedBoundSubpkg == null) {
+                var anc = boundSubpkg
+                while ('.' in anc) {
+                    anc = anc.substringBeforeLast('.')
+                    val ancExists =
+                        anc in headerContext.crateSubpackageRawLeafNames ||
+                            headerContext.crateSymbolSubpackages.values.any { anc in it }
+                    if (ancExists) {
+                        resolvedBoundSubpkg = anc
+                        break
+                    }
+                }
+                if (resolvedBoundSubpkg == null && headerContext.crateSymbolSubpackages.values.any { "" in it }) {
+                    resolvedBoundSubpkg = ""
+                }
+            }
+            if (resolvedBoundSubpkg == null) return null
+            var modSubpkg = resolvedBoundSubpkg
             var idx = 0
             while (idx < rest.lastIndex) {
                 val segClean = rest[idx].removePrefix("r#")
@@ -825,18 +899,23 @@ internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
             for (candSymKt in candidateSymKts) {
                 val symCandidates = headerContext.crateSymbolSubpackages[candSymKt].orEmpty()
                 val scopedCandidates =
-                    if (modSubpkg in symCandidates) {
-                        listOf(modSubpkg)
-                    } else {
-                        symCandidates.filter { it.startsWith("$modSubpkg.") }
+                    when {
+                        modSubpkg in symCandidates -> listOf(modSubpkg)
+                        modSubpkg.isEmpty() -> symCandidates
+                        else -> symCandidates.filter { it.startsWith("$modSubpkg.") }
                     }
                 val finalSubpkg = resolveBestSubpackageAmong(scopedCandidates)
                 if (finalSubpkg != null) {
-                    return "$nsPrefix.$finalSubpkg.$candSymKt" to trailing
+                    return (if (finalSubpkg.isEmpty()) "$nsPrefix.$candSymKt" else "$nsPrefix.$finalSubpkg.$candSymKt") to trailing
                 }
             }
             if (trailing.isEmpty() && !inTypePosition) {
-                val childModSubpkg = "$modSubpkg.${rustModuleIdentToKotlin(symRaw.removePrefix("r#").replace('-', '_'))}"
+                val childModSubpkg =
+                    if (modSubpkg.isEmpty()) {
+                        rustModuleIdentToKotlin(symRaw.removePrefix("r#").replace('-', '_'))
+                    } else {
+                        "$modSubpkg.${rustModuleIdentToKotlin(symRaw.removePrefix("r#").replace('-', '_'))}"
+                    }
                 if (childModSubpkg in headerContext.crateSubpackageRawLeafNames &&
                     headerContext.crateSymbolSubpackages["call"]?.contains(childModSubpkg) == true
                 ) {
@@ -846,7 +925,7 @@ internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
             resolveExternalDepReexportPkg(modSubpkg, symKt, nsPrefix)?.let { resolvedExt ->
                 return resolvedExt to trailing
             }
-            return "$nsPrefix.$modSubpkg.$symKt" to trailing
+            return (if (modSubpkg.isEmpty()) "$nsPrefix.$symKt" else "$nsPrefix.$modSubpkg.$symKt") to trailing
         }
         val matchedExtCrate: Pair<String, List<String>>? =
             if (importedPath in headerContext.crateNamespaces) {
@@ -1181,15 +1260,22 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
                 }
             }
         }
-        if (nsPrefix != null && afterSelf.size == 1 && mappedTail[0] != "*" && headerContext.crateSymbolSubpackages.isNotEmpty()) {
-            val candidates = headerContext.crateSymbolSubpackages[mappedTail[0]]
-            if (candidates != null && curSubpkg !in candidates) {
+        if (nsPrefix != null && afterSelf.isNotEmpty() && mappedTail.last() != "*" && headerContext.crateSymbolSubpackages.isNotEmpty()) {
+            val explicitModule = (curSubSegs + mappedTail.dropLast(1)).joinToString(".")
+            val leafSym = mappedTail.last()
+            val candidates = headerContext.crateSymbolSubpackages[leafSym]
+            if (candidates != null && explicitModule !in candidates) {
+                val flattenedSub = resolveFlattenedInlineModuleSubpackage(explicitModule, candidates)
+                if (flattenedSub != null) {
+                    return if (flattenedSub.isEmpty()) "$nsPrefix.$leafSym" else "$nsPrefix.$flattenedSub.$leafSym"
+                }
+                val prefixDot = if (explicitModule.isEmpty()) "" else "$explicitModule."
                 val childSub =
                     resolveBestSubpackageAmong(
-                        candidates.filter { curSubpkg.isEmpty() || it.startsWith("$curSubpkg.") },
+                        candidates.filter { prefixDot.isEmpty() || it.startsWith(prefixDot) },
                     )
                 if (childSub != null) {
-                    return if (childSub.isEmpty()) "$nsPrefix.${mappedTail[0]}" else "$nsPrefix.$childSub.${mappedTail[0]}"
+                    return if (childSub.isEmpty()) "$nsPrefix.$leafSym" else "$nsPrefix.$childSub.$leafSym"
                 }
             }
         }
@@ -1271,24 +1357,31 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
                 }
             }
         }
-        if (rem.size == 1 && mappedRem[0] != "*" && headerContext.crateSymbolSubpackages.isNotEmpty()) {
-            val targetPrefix = baseSegs.joinToString(".")
-            val candidates = headerContext.crateSymbolSubpackages[mappedRem[0]]
-            if (candidates != null && targetPrefix !in candidates) {
+        if (rem.isNotEmpty() && mappedRem.last() != "*" && headerContext.crateSymbolSubpackages.isNotEmpty()) {
+            val explicitModule = (baseSegs + mappedRem.dropLast(1)).joinToString(".")
+            val leafSym = mappedRem.last()
+            val candidates = headerContext.crateSymbolSubpackages[leafSym]
+            if (candidates != null && explicitModule !in candidates) {
+                val flattenedSub = resolveFlattenedInlineModuleSubpackage(explicitModule, candidates)
+                if (flattenedSub != null) {
+                    return if (flattenedSub.isEmpty()) "$nsPrefix.$leafSym" else "$nsPrefix.$flattenedSub.$leafSym"
+                }
                 val childSub =
                     resolveBestSubpackageAmong(
-                        candidates.filter { it.startsWith("$targetPrefix.") },
+                        candidates.filter { explicitModule.isEmpty() || it.startsWith("$explicitModule.") },
                     )
                 if (childSub != null) {
-                    return "$nsPrefix.$childSub.${mappedRem[0]}"
+                    return if (childSub.isEmpty()) "$nsPrefix.$leafSym" else "$nsPrefix.$childSub.$leafSym"
                 }
-                resolveExternalDepReexportPkg(targetPrefix, mappedRem[0], nsPrefix)?.let { return it }
-                val best = resolveBestSubpackageForSymbol(mappedRem[0])
-                if (best != null) {
-                    return if (best.isEmpty()) "$nsPrefix.${mappedRem[0]}" else "$nsPrefix.$best.${mappedRem[0]}"
+                if (rem.size == 1) {
+                    resolveExternalDepReexportPkg(explicitModule, leafSym, nsPrefix)?.let { return it }
+                    val best = resolveBestSubpackageForSymbol(leafSym)
+                    if (best != null) {
+                        return if (best.isEmpty()) "$nsPrefix.$leafSym" else "$nsPrefix.$best.$leafSym"
+                    }
                 }
-            } else if (candidates == null) {
-                resolveExternalDepReexportPkg(targetPrefix, mappedRem[0], nsPrefix)?.let { return it }
+            } else if (candidates == null && rem.size == 1) {
+                resolveExternalDepReexportPkg(explicitModule, leafSym, nsPrefix)?.let { return it }
             }
         }
         val combined = baseSegs + mappedRem
@@ -1574,9 +1667,11 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
                         explicitModule in candidates -> explicitModule
                         normalizedExplicitModule in candidates -> normalizedExplicitModule
                         else ->
-                            resolveBestSubpackageAmong(
-                                candidates.filter { it.startsWith("$explicitModule.") },
-                            )
+                            resolveFlattenedInlineModuleSubpackage(explicitModule, candidates)
+                                ?: resolveFlattenedInlineModuleSubpackage(normalizedExplicitModule, candidates)
+                                ?: resolveBestSubpackageAmong(
+                                    candidates.filter { it.startsWith("$explicitModule.") },
+                                )
                                 ?: resolveBestSubpackageAmong(
                                     candidates.filter { it.startsWith("$normalizedExplicitModule.") },
                                 )
@@ -1897,6 +1992,9 @@ internal fun KotlinJ2KEmitter.renderItemUse(
             continue
         }
         val fullImport = resolveKotlinImportPath(leaf.segments, leaf.alias, leaf.isSelfImport) ?: continue
+        if (fullImport.endsWith(".panic.constPanic") || fullImport.endsWith(".panic.constAssert")) {
+            continue
+        }
         if (isResolvedCrateSubpackageModule(fullImport, leaf.segments.last())) {
             continue
         }

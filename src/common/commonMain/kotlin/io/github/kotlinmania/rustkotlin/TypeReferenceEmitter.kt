@@ -1514,7 +1514,27 @@ internal fun KotlinJ2KEmitter.runtimeConstTypeArgument(arg: GenericArgument.Type
     if (raw in activeConstParamNames || rustValueIdentToKotlin(raw) in activeConstParamNames) {
         return rustValueIdentToKotlin(raw)
     }
-    return scopeBuilder.resolveLocalKotlinName(raw) ?: inspector.declaredConstNames[raw]
+    scopeBuilder.resolveLocalKotlinName(raw)?.let { return it }
+    inspector.declaredConstNames[raw]?.let { return it }
+    if (raw.length >= 2 && isScreamingSnakeIdent(raw)) {
+        val constKt = rustConstIdentToKotlin(raw)
+        if (constKt !in inspector.declaredTypeNames &&
+            constKt !in importedSimpleNameToPkg &&
+            headerContext.crateSymbolSubpackages.isNotEmpty()
+        ) {
+            val sub = resolveBestSubpackageForSymbol(constKt)
+            val ns = currentNamespacePrefix()
+            if (sub != null && ns != null) {
+                val pkg = if (sub.isEmpty()) ns else "$ns.$sub"
+                if (pkg != headerContext.packageName) {
+                    importedSimpleNameToPkg[constKt] = pkg
+                    extraTypePathImports += "import $pkg.$constKt"
+                }
+            }
+        }
+        return constKt
+    }
+    return null
 }
 
 internal fun KotlinJ2KEmitter.renderGenericArgument(arg: GenericArgument, selfTypeName: String?): String? =
@@ -1720,7 +1740,10 @@ internal fun KotlinJ2KEmitter.renderTypeParamBound(bound: TypeParamBound, selfTy
                     (boundedTp != null && ktTrait != null && ktTrait in currentWitnessedTraitBounds[boundedTp].orEmpty())
                 ) {
                     null
-                } else if (boundedTp != null && (last == "IntoIterator" || last == "Iterator") && ktTrait !in inspector.declaredTypeNames) {
+                } else if (boundedTp != null &&
+                    (last == "IntoIterator" || last in setOf("Iterator", "DoubleEndedIterator", "ExactSizeIterator", "FusedIterator")) &&
+                    ktTrait !in inspector.declaredTypeNames
+                ) {
                     val angle = lastSeg.arguments as? PathArguments.AngleBracketed
                     val itemTy =
                         angle
@@ -1735,7 +1758,7 @@ internal fun KotlinJ2KEmitter.renderTypeParamBound(bound: TypeParamBound, selfTy
                             }
                     if (itemTy != null) {
                         if (last == "IntoIterator") "Iterable<$itemTy>" else "Iterator<$itemTy>"
-                    } else if (last == "Iterator" && "Item" in activeTypeParamNames) {
+                    } else if (last != "IntoIterator" && "Item" in activeTypeParamNames) {
                         "Iterator<Item>"
                     } else {
                         null

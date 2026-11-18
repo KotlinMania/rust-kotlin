@@ -801,6 +801,7 @@ internal class KotlinJ2KEmitter(
                 sym.typeDefaultArgsByType.putAll(sharedInsp.typeDefaultArgsByType)
                 sym.tupleStructArityByType.putAll(sharedInsp.tupleStructArityByType)
                 sym.tupleEnumVariantArity.putAll(sharedInsp.tupleEnumVariantArity)
+                sym.genericUnitEnumVariants.addAll(sharedInsp.genericUnitEnumVariants)
                 sym.enumTypeParamsByVariant.putAll(sharedInsp.enumTypeParamsByVariant)
                 sym.enumVariantFieldTypes.putAll(sharedInsp.enumVariantFieldTypes)
                 sym.collidingInlineForeignFnRenames.putAll(sharedInsp.collidingInlineForeignFnRenames)
@@ -1777,6 +1778,50 @@ internal class KotlinJ2KEmitter(
                     "toRawParts",
                     "mask",
                 )
+            val numExts =
+                listOf(
+                    "uncheckedAdd",
+                    "uncheckedSub",
+                    "uncheckedMul",
+                    "checkedAdd",
+                    "checkedSub",
+                    "checkedMul",
+                    "checkedDiv",
+                    "checkedRem",
+                    "checkedAddUnsigned",
+                    "checkedSubUnsigned",
+                    "checkedAddSigned",
+                    "checkedSubSigned",
+                    "overflowingAdd",
+                    "overflowingSub",
+                    "overflowingMul",
+                    "overflowingAddUnsigned",
+                    "overflowingSubUnsigned",
+                    "overflowingAddSigned",
+                    "overflowingSubSigned",
+                    "wrappingAddUnsigned",
+                    "wrappingSubUnsigned",
+                    "wrappingAddSigned",
+                    "wrappingSubSigned",
+                    "saturatingAdd",
+                    "saturatingSub",
+                    "saturatingMul",
+                    "saturatingAddUnsigned",
+                    "saturatingSubUnsigned",
+                    "carryingAdd",
+                    "borrowingSub",
+                    "carryingMul",
+                    "carryingMulAdd",
+                    "wideningMul",
+                    "absDiff",
+                    "divCeil",
+                    "nextMultipleOf",
+                    "checkedNextMultipleOf",
+                    "isMultipleOf",
+                    "midpoint",
+                    "castSigned",
+                    "castUnsigned",
+                )
             val stdlibExts =
                 buildList {
                     add("splitFirst" to "$activeCoreNs.slice")
@@ -1786,6 +1831,9 @@ internal class KotlinJ2KEmitter(
                     add("splitAtMut" to "$activeCoreNs.slice")
                     add("chunksExact" to "$activeCoreNs.slice")
                     add("chunksExactMut" to "$activeCoreNs.slice")
+                    for (ext in numExts) {
+                        add(ext to "$activeCoreNs.num")
+                    }
                     if (containsWholeIdentifier(bodyTextForImports, "MutPtr") ||
                         containsWholeIdentifier(bodyTextForImports, "asMutPtr") ||
                         containsWholeIdentifier(bodyTextForImports, "nullMut")
@@ -1811,6 +1859,25 @@ internal class KotlinJ2KEmitter(
                     Regex("\\.\\s*$extName\\s*[({<]").containsMatchIn(bodyTextForImports)
                 ) {
                     val imp = "import $extPkg.$extName"
+                    if (imp !in combinedExtraTypeImports) {
+                        combinedExtraTypeImports += imp
+                    }
+                }
+            }
+        }
+        if (containsWholeIdentifier(bodyTextForImports, "Byte") ||
+            containsWholeIdentifier(bodyTextForImports, "Short")
+        ) {
+            val expOps =
+                buildList {
+                    if (Regex("\\.\\s*inv\\s*\\(\\s*\\)").containsMatchIn(bodyTextForImports)) add("inv")
+                    if (Regex("\\band\\b").containsMatchIn(bodyTextForImports)) add("and")
+                    if (Regex("\\bor\\b").containsMatchIn(bodyTextForImports)) add("or")
+                    if (Regex("\\bxor\\b").containsMatchIn(bodyTextForImports)) add("xor")
+                }
+            for (op in expOps) {
+                if (!isDeclaredTopLevelFnKotlinName(op) && op !in importedSimpleNameToPkg) {
+                    val imp = "import kotlin.experimental.$op"
                     if (imp !in combinedExtraTypeImports) {
                         combinedExtraTypeImports += imp
                     }

@@ -362,6 +362,7 @@ internal fun KotlinJ2KEmitter.renderAttachedImplMembers(
     isLocalClass: Boolean = false,
     structFieldNames: Set<String> = emptySet(),
     isObjectOwner: Boolean = false,
+    emitEmptyCompanion: Boolean = false,
 ): String {
     val prevObjectOwner = currentAttachedImplIsObjectOwner
     currentAttachedImplIsObjectOwner = isObjectOwner
@@ -530,6 +531,8 @@ internal fun KotlinJ2KEmitter.renderAttachedImplMembers(
             compSb.append(companionMembers.joinToString("\n\n"))
             compSb.append('\n').append(indent).append("}")
             instanceMembers += compSb.toString()
+        } else if (emitEmptyCompanion && !isLocalClass && !isObjectOwner) {
+            instanceMembers += "${indent}public companion object"
         }
 
         return instanceMembers.filter { it.isNotBlank() }.joinToString("\n\n")

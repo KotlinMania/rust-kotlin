@@ -707,6 +707,7 @@ internal fun scanModuleTokenTrees(
     traitResultMethods: MutableMap<String, List<String>> = linkedMapOf(),
     registerFnConstParams: (String, String, Int, List<String>) -> Unit = { _, _, _, _ -> },
     enumVariantTypeArity: MutableMap<String, Int> = linkedMapOf(),
+    unitEnumVariants: MutableSet<String> = linkedSetOf(),
 ) {
     val pendingAttrs = mutableListOf<List<TokenTree>>()
     var i = 0
@@ -767,6 +768,7 @@ internal fun scanModuleTokenTrees(
                     insideExternBlock = true,
                     registerFnConstParams = registerFnConstParams,
                     enumVariantTypeArity = enumVariantTypeArity,
+                    unitEnumVariants = unitEnumVariants,
                 )
             }
             i = externBraceIdx + 1
@@ -821,6 +823,7 @@ internal fun scanModuleTokenTrees(
                                 traitResultMethods = traitResultMethods,
                                 registerFnConstParams = registerFnConstParams,
                                 enumVariantTypeArity = enumVariantTypeArity,
+                                unitEnumVariants = unitEnumVariants,
                             )
                         }
                     } else if (innerTrees.any { (it as? TokenTree.Ident)?.value?.toString() == "pub" }) {
@@ -850,6 +853,7 @@ internal fun scanModuleTokenTrees(
                             insideExternBlock = insideExternBlock,
                             registerFnConstParams = registerFnConstParams,
                             enumVariantTypeArity = enumVariantTypeArity,
+                            unitEnumVariants = unitEnumVariants,
                         )
                     }
                 }
@@ -881,7 +885,7 @@ internal fun scanModuleTokenTrees(
                     if (rawMod != null && !skippedByCfg) {
                         val modKt = rustModuleIdentToKotlin(rawMod.replace('-', '_'))
                         val childSub = if (subpkg.isEmpty()) modKt else "$subpkg.$modKt"
-                        if (modKt.isNotEmpty() && rawMod !in setOf("tests", "test", "private", "sealed")) {
+                        if (inlineGrp == null && modKt.isNotEmpty() && rawMod !in setOf("tests", "test", "private", "sealed")) {
                             subpkgToRawLeaf.putIfMissing(childSub, rawMod)
                         }
                         if (inlineGrp != null &&
@@ -890,7 +894,7 @@ internal fun scanModuleTokenTrees(
                         ) {
                             scanModuleTokenTrees(
                                 trees = inlineGrp.stream().toList(),
-                                subpkg = if (splitModuleRoots && modKt.isNotEmpty()) childSub else subpkg,
+                                subpkg = subpkg,
                                 rawAbiMode = rawAbiMode,
                                 finalStructs = finalStructs,
                                 splitModuleRoots = splitModuleRoots,
@@ -916,6 +920,7 @@ internal fun scanModuleTokenTrees(
                                 traitResultMethods = traitResultMethods,
                                 registerFnConstParams = registerFnConstParams,
                                 enumVariantTypeArity = enumVariantTypeArity,
+                                unitEnumVariants = unitEnumVariants,
                             )
                         }
                     }
@@ -992,6 +997,7 @@ internal fun scanModuleTokenTrees(
                             ktEnum = ktType,
                             rawAbiMode = rawAbiMode,
                             out = enumVariantTypeArity,
+                            unitEnumVariants = unitEnumVariants,
                             traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
                         )
                         if (insideCEnumMacro) {
@@ -1141,18 +1147,23 @@ internal fun scanModuleTokenTrees(
             val rawMod = (trees[i + 1] as TokenTree.Ident).value.toString().removePrefix("r#")
             val inlineGrp = (trees.getOrNull(i + 2) as? TokenTree.Group)?.value
             if (!skippedByCfg &&
-                inlineGrp != null &&
-                inlineGrp.delimiter() == Delimiter.Brace &&
+                inlineGrp == null &&
                 rawMod !in setOf("tests", "test", "private", "sealed")
             ) {
                 val modKt = rustModuleIdentToKotlin(rawMod.replace('-', '_'))
                 val childSub = if (subpkg.isEmpty()) modKt else "$subpkg.$modKt"
-                if (splitModuleRoots && modKt.isNotEmpty()) {
+                if (modKt.isNotEmpty()) {
                     subpkgToRawLeaf.putIfMissing(childSub, rawMod)
                 }
+            }
+            if (!skippedByCfg &&
+                inlineGrp != null &&
+                inlineGrp.delimiter() == Delimiter.Brace &&
+                rawMod !in setOf("tests", "test", "private", "sealed")
+            ) {
                 scanModuleTokenTrees(
                     trees = inlineGrp.stream().toList(),
-                    subpkg = if (splitModuleRoots && modKt.isNotEmpty()) childSub else subpkg,
+                    subpkg = subpkg,
                     rawAbiMode = rawAbiMode,
                     finalStructs = finalStructs,
                     splitModuleRoots = splitModuleRoots,
@@ -1178,6 +1189,7 @@ internal fun scanModuleTokenTrees(
                     traitResultMethods = traitResultMethods,
                     registerFnConstParams = registerFnConstParams,
                     enumVariantTypeArity = enumVariantTypeArity,
+                    unitEnumVariants = unitEnumVariants,
                 )
             }
             i = skipItemAfterHeader(trees, i + 1)
@@ -1243,6 +1255,7 @@ internal fun scanModuleTokenTrees(
                         ktEnum = ktType,
                         rawAbiMode = rawAbiMode,
                         out = enumVariantTypeArity,
+                        unitEnumVariants = unitEnumVariants,
                         traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
                     )
                 } else if (nonPubKw == "struct" || nonPubKw == "union") {
@@ -1612,6 +1625,7 @@ private fun scanEnumVariantTypeArities(
     ktEnum: String,
     rawAbiMode: Boolean,
     out: MutableMap<String, Int>,
+    unitEnumVariants: MutableSet<String> = linkedSetOf(),
     traitDefaultlessAssocTypes: Map<String, List<String>> = emptyMap(),
 ) {
     val headerParams = extractHeaderGenericTypeParams(trees, afterIdentIdx, rawAbiMode)
@@ -1630,10 +1644,28 @@ private fun scanEnumVariantTypeArities(
             afterVar is TokenTree.Group &&
                 (afterVar.value.delimiter() == Delimiter.Parenthesis || afterVar.value.delimiter() == Delimiter.Brace)
         if (!hasPayload) {
-            if (typeArity == 0) {
-                out.putIfMissing("$ktEnum.$ktVar", 0)
+            out.putIfMissing("$ktEnum.$ktVar", typeArity)
+            if (subpkg.isNotEmpty()) {
+                out.putIfMissing("$subpkg.$ktEnum.$ktVar", typeArity)
+            }
+            if (typeArity > 0) {
+                unitEnumVariants += "$ktEnum.$ktVar"
                 if (subpkg.isNotEmpty()) {
-                    out.putIfMissing("$subpkg.$ktEnum.$ktVar", 0)
+                    unitEnumVariants += "$subpkg.$ktEnum.$ktVar"
+                }
+                unitEnumVariants += ktVar
+                val prevSimple = out[ktVar]
+                if (prevSimple == null) {
+                    out[ktVar] = typeArity
+                } else if (prevSimple != typeArity) {
+                    out[ktVar] = -1
+                }
+            } else {
+                val prevSimple = out[ktVar]
+                if (prevSimple == null) {
+                    out[ktVar] = 0
+                } else if (prevSimple > 0) {
+                    out[ktVar] = -1
                 }
             }
             continue

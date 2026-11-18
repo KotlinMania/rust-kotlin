@@ -1117,6 +1117,31 @@ private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName:
             val elemTy = inferExplicitArrayElementRenderedType(expr.expr, selfTypeName)
             primitiveArrayTypeForElementRenderedType(elemTy) ?: elemTy?.let { "List<$it>" }
         }
+        is Expr.Tuple -> {
+            val elems = expr.elems.toList()
+            val pairType = if ("Pair" in inspector.declaredTypeNames) "kotlin.Pair" else "Pair"
+            val tripleType = if ("Triple" in inspector.declaredTypeNames) "kotlin.Triple" else "Triple"
+            when (elems.size) {
+                0 -> "Unit"
+                1 -> inferExprRenderedType(elems[0], selfTypeName)
+                2 -> {
+                    val t0 = inferExprRenderedType(elems[0], selfTypeName)
+                    val t1 = inferExprRenderedType(elems[1], selfTypeName)
+                    if (t0 != null || t1 != null) "$pairType<${t0 ?: "Any?"}, ${t1 ?: "Any?"}>" else null
+                }
+                3 -> {
+                    val t0 = inferExprRenderedType(elems[0], selfTypeName)
+                    val t1 = inferExprRenderedType(elems[1], selfTypeName)
+                    val t2 = inferExprRenderedType(elems[2], selfTypeName)
+                    if (t0 != null || t1 != null || t2 != null) {
+                        "$tripleType<${t0 ?: "Any?"}, ${t1 ?: "Any?"}, ${t2 ?: "Any?"}>"
+                    } else {
+                        null
+                    }
+                }
+                else -> "List<Any?>"
+            }
+        }
         is Expr.Array -> {
             val elemTy = expr.elems.toList().firstNotNullOfOrNull { inferExplicitArrayElementRenderedType(it, selfTypeName) }
             primitiveArrayTypeForElementRenderedType(elemTy) ?: elemTy?.let { "List<$it>" }

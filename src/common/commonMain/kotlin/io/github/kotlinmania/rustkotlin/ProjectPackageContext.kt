@@ -240,12 +240,15 @@ public data class FileHeaderContext(
     public val crateTraitAstRegistryKey: String? = null,
     public val crateFnConstParamNames: Map<String, Pair<Int, List<String>>> = emptyMap(),
     public val crateEnumVariantTypeArity: Map<String, Int> = emptyMap(),
+    public val crateUnitEnumVariants: Set<String> = emptySet(),
     public val scalarChar: Boolean = false,
     public val externalCrateSymbolPackages: Map<String, Map<String, List<String>>> = emptyMap(),
     public val externalCrateTwoFieldResultFns: Set<String> = emptySet(),
     public val externalCrateNullableReturnFns: Set<String> = emptySet(),
     public val externalCrateFnConstParams: Map<String, Pair<Int, List<String>>> = emptyMap(),
     public val externalCrateTupleStructArity: Map<String, Int> = emptyMap(),
+    public val externalEnumVariantTypeArity: Map<String, Int> = emptyMap(),
+    public val externalUnitEnumVariants: Set<String> = emptySet(),
     public val testClassName: String? = null,
 ) {
     public constructor(
