@@ -1111,12 +1111,15 @@ private fun executeTranslate(
                 crateTraitAstRegistryKey = crateMetadata.traitAstRegistryKey,
                 crateFnConstParamNames = crateMetadata.fnConstParamNames,
                 crateEnumVariantTypeArity = crateMetadata.enumVariantTypeArity,
+                crateUnitEnumVariants = crateMetadata.unitEnumVariants,
                 scalarChar = parsed.scalarChar,
                 externalCrateSymbolPackages = externalCrateMeta.symbolPackages,
                 externalCrateTwoFieldResultFns = externalCrateMeta.twoFieldResultFns,
                 externalCrateNullableReturnFns = externalCrateMeta.nullableReturnFns,
                 externalCrateFnConstParams = externalCrateMeta.fnConstParams,
                 externalCrateTupleStructArity = externalCrateMeta.tupleStructArity,
+                externalEnumVariantTypeArity = externalCrateMeta.enumVariantTypeArity,
+                externalUnitEnumVariants = externalCrateMeta.unitEnumVariants,
                 cfgTargetProfile =
                     if (parsed.portLintDirective != "tests") {
                         parsed.cfgTargetProfile.copy(

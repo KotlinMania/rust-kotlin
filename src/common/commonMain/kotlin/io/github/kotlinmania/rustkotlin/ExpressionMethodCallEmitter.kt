@@ -1640,7 +1640,14 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
         } else {
             currentTypedLocals[receiver] ?: inferExprRenderedType(expr.receiver, selfTypeName)
         }?.removeSuffix("?")?.substringBefore('<')?.substringAfterLast('.')?.trim()
-    val methodConstEntry = inferredRecvOwnerSimple?.let { inspector.methodConstParamNames["$it.$method"] }
+    val methodConstEntry =
+        inferredRecvOwnerSimple?.let { owner ->
+            inspector.methodConstParamNames["$owner.$method"]
+                ?: headerContext.crateFnConstParamNames["$owner.$method"]
+                ?: scopedAbiKeysForRenderedType("$owner.$method")
+                    .firstNotNullOfOrNull { headerContext.crateFnConstParamNames[it] }
+                ?: headerContext.externalCrateFnConstParams["$owner.$method"]
+        }
     val forwardedMethodConstArgs =
         if (explicitMethodConstArgs.isEmpty() &&
             activeConstParamNames.isNotEmpty() &&
@@ -1652,7 +1659,7 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
         } else {
             emptyList()
         }
-    val valueArgs = macroTypeArgs + adjustedRenderedValueArgs + forwardedMethodConstArgs
+    val valueArgs = macroTypeArgs + adjustedRenderedValueArgs + explicitMethodConstArgs.ifEmpty { forwardedMethodConstArgs }
     val args = valueArgs.joinToString(", ")
     if ("core" in headerContext.crateNamespaces &&
         typeArgs.isEmpty() &&

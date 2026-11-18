@@ -1653,8 +1653,46 @@ public object CoreIntrinsicLowering {
                         .firstOrNull()
                         ?.takeUnless { it is SynType.Infer }
                         ?.let { emitter.renderType(it, selfTypeName) }
+                        ?.takeIf(::isUsableRenderedTypeArg)
+                        ?: run {
+                            val canInferFromPeerArgs =
+                                canonical !in
+                                    setOf(
+                                        "simd_insert",
+                                        "simd_insert_dyn",
+                                        "simd_gather",
+                                        "simd_arith_offset",
+                                        "simd_select_bitmask",
+                                        "simd_scatter",
+                                        "simd_masked_load",
+                                        "simd_masked_store",
+                                    )
+                            if (canInferFromPeerArgs) {
+                                spec.callArgsList.firstNotNullOfOrNull { argExpr ->
+                                    val callArg = emitter.unwrapParenOrGroupExpr(argExpr) as? Expr.Call
+                                    val rawCallName =
+                                        (callArg?.func as? Expr.Path)
+                                            ?.path
+                                            ?.segments
+                                            ?.toList()
+                                            ?.lastOrNull()
+                                            ?.ident
+                                            ?.toString()
+                                            ?.removePrefix("r#")
+                                    if (rawCallName in setOf("transmute", "transmute_unchecked")) {
+                                        null
+                                    } else {
+                                        emitter
+                                            .inferExprRenderedType(argExpr, selfTypeName)
+                                            ?.takeIf(::isUsableRenderedTypeArg)
+                                    }
+                                }
+                            } else {
+                                null
+                            }
+                        }
                         ?: spec.callArgsList.firstOrNull()?.let { arg0 ->
-                            emitter.inferExprRenderedType(arg0, selfTypeName)
+                            emitter.inferExprRenderedType(arg0, selfTypeName)?.takeIf(::isUsableRenderedTypeArg)
                                 ?: run {
                                     val callArg = emitter.unwrapParenOrGroupExpr(arg0) as? Expr.Call
                                     val callPath = (callArg?.func as? Expr.Path)?.takeIf { it.qself == null }?.path
@@ -1666,7 +1704,9 @@ public object CoreIntrinsicLowering {
                                             ?.toString()
                                             ?.removePrefix("r#")
                                     if (callName in setOf("transmute", "transmute_unchecked") && callArg?.args?.len() == 1) {
-                                        emitter.inferExprRenderedType(callArg.args.first()!!, selfTypeName)
+                                        emitter
+                                            .inferExprRenderedType(callArg.args.first()!!, selfTypeName)
+                                            ?.takeIf(::isUsableRenderedTypeArg)
                                     } else {
                                         null
                                     }

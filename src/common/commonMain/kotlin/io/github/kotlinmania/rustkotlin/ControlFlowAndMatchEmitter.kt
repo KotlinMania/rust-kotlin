@@ -540,7 +540,12 @@ internal fun KotlinJ2KEmitter.renderIfLetPatternAgainstRhs(
             if (segs.size == 1 && segs[0].ident.toString() == "None" && !inspector.hasLocalNoneVariant) {
                 "$rhs == null"
             } else {
-                "$rhs == ${renderPathAsExpression(pat.path, selfTypeName)}"
+                val patType = qualifyShadowedPatternVariantType(renderPathAsType(pat.path, selfTypeName), rhs, selfTypeName)
+                if (lookupEnumVariantTypeArity(patType) > 0) {
+                    "$rhs is ${starProjectedVariantIsType(patType)}"
+                } else {
+                    "$rhs == ${renderPathAsExpression(pat.path, selfTypeName)}"
+                }
             }
         }
         is Pat.Lit -> "$rhs == ${renderMatchLit(pat.lit)}"
@@ -550,13 +555,22 @@ internal fun KotlinJ2KEmitter.renderIfLetPatternAgainstRhs(
         }
         is Pat.Ident -> {
             val raw = pat.ident.toString()
+            val cleanRaw = raw.removePrefix("r#")
             val subpat = pat.subpat
-            if (subpat != null) {
-                renderIfLetPatternAgainstRhs(subpat, rhs, indent, selfTypeName)
-            } else if (raw == "None") {
-                "$rhs == null"
-            } else {
-                "$rhs != null"
+            when {
+                subpat != null -> renderIfLetPatternAgainstRhs(subpat, rhs, indent, selfTypeName, subjectExpr)
+                raw == "None" && !inspector.hasLocalNoneVariant -> "$rhs == null"
+                cleanRaw.firstOrNull()?.isUpperCase() == true &&
+                    !isScreamingSnakeIdent(cleanRaw) &&
+                    cleanRaw !in inspector.declaredConstNames -> {
+                    val ktVar = qualifyShadowedPatternVariantType(rustTypeIdentToKotlin(cleanRaw), rhs, selfTypeName)
+                    if (isGenericUnitEnumVariant(ktVar)) {
+                        "$rhs is ${starProjectedVariantIsType(ktVar)}"
+                    } else {
+                        "$rhs != null"
+                    }
+                }
+                else -> "$rhs != null"
             }
         }
         is Pat.Reference -> renderIfLetPatternAgainstRhs(pat.pat, rhs, indent, selfTypeName)
@@ -1285,10 +1299,11 @@ private fun KotlinJ2KEmitter.lookupEnumVariantTypeArity(variantType: String): In
                 headerContext.crateEnumVariantTypeArity["$sub.$lastTwo"]?.let { return it }
             }
         }
-        headerContext.crateEnumVariantTypeArity[lastTwo]?.let { return it }
+        headerContext.crateEnumVariantTypeArity[lastTwo]?.takeIf { it >= 0 }?.let { return it }
         for (scoped in scopedAbiKeysForRenderedType(lastTwo)) {
-            headerContext.crateEnumVariantTypeArity[scoped]?.let { return it }
+            headerContext.crateEnumVariantTypeArity[scoped]?.takeIf { it >= 0 }?.let { return it }
         }
+        headerContext.externalEnumVariantTypeArity[lastTwo]?.takeIf { it >= 0 }?.let { return it }
         if (enumSimple in inspector.enumTypeNames) {
             return inspector.enumTypeParamsByVariant[lastTwo]?.size ?: 0
         }
@@ -1297,9 +1312,38 @@ private fun KotlinJ2KEmitter.lookupEnumVariantTypeArity(variantType: String): In
         inspector.enumTypeParamsByVariant[simple]
             ?.size
             ?.let { return it }
-        headerContext.crateEnumVariantTypeArity[simple]?.let { return it }
+        headerContext.crateEnumVariantTypeArity[simple]?.takeIf { it >= 0 }?.let { return it }
+        headerContext.externalEnumVariantTypeArity[simple]?.takeIf { it > 0 }?.let { return it }
     }
     return 0
+}
+
+internal fun KotlinJ2KEmitter.isGenericUnitEnumVariant(variantType: String): Boolean {
+    if ('<' in variantType) {
+        return isGenericUnitEnumVariant(variantType.substringBefore('<').trim())
+    }
+    if (lookupEnumVariantTypeArity(variantType) <= 0) return false
+    if ('.' in variantType) {
+        val parts = variantType.split('.')
+        if (parts.size < 2) return false
+        val enumSimple = parts[parts.size - 2]
+        val simple = parts.last()
+        val lastTwo = "$enumSimple.$simple"
+        return lastTwo in inspector.genericUnitEnumVariants ||
+            lastTwo in headerContext.crateUnitEnumVariants ||
+            lastTwo in headerContext.externalUnitEnumVariants ||
+            scopedAbiKeysForRenderedType(lastTwo).any { it in headerContext.crateUnitEnumVariants }
+    }
+    if (variantType in activeTypeParamNames) return false
+    return variantType in inspector.genericUnitEnumVariants ||
+        (
+            variantType in headerContext.crateUnitEnumVariants &&
+                (headerContext.crateEnumVariantTypeArity[variantType] ?: 0) > 0
+        ) ||
+        (
+            variantType in headerContext.externalUnitEnumVariants &&
+                (headerContext.externalEnumVariantTypeArity[variantType] ?: 0) > 0
+        )
 }
 
 internal fun KotlinJ2KEmitter.starProjectedVariantIsType(variantType: String): String {
@@ -1628,7 +1672,12 @@ internal fun KotlinJ2KEmitter.renderPatternBooleanCondition(
             if (segs.size == 1 && segs[0].ident.toString() == "None" && !inspector.hasLocalNoneVariant) {
                 "$subjectExpr == null"
             } else {
-                "$subjectExpr == ${renderPathAsExpression(pat.path, selfTypeName, asCallee = false)}"
+                val patType = qualifyShadowedPatternVariantType(renderPathAsType(pat.path, selfTypeName), subjectExpr, selfTypeName)
+                if (lookupEnumVariantTypeArity(patType) > 0) {
+                    "$subjectExpr is ${starProjectedVariantIsType(patType)}"
+                } else {
+                    "$subjectExpr == ${renderPathAsExpression(pat.path, selfTypeName, asCallee = false)}"
+                }
             }
         }
         is Pat.Ident -> {
@@ -1640,8 +1689,12 @@ internal fun KotlinJ2KEmitter.renderPatternBooleanCondition(
                     raw in inspector.declaredConstNames -> "$subjectExpr == ${inspector.declaredConstNames.getValue(raw)}"
                     isScreamingSnakeIdent(raw) -> "$subjectExpr == ${rustConstIdentToKotlin(raw)}"
                     raw.first().isUpperCase() && pat.subpat == null -> {
-                        val ktType = rustTypeIdentToKotlin(raw)
-                        if (ktType in inspector.unitStructNames) "$subjectExpr is $ktType" else "$subjectExpr == $ktType"
+                        val ktType = qualifyShadowedPatternVariantType(rustTypeIdentToKotlin(raw), subjectExpr, selfTypeName)
+                        when {
+                            ktType in inspector.unitStructNames -> "$subjectExpr is $ktType"
+                            isGenericUnitEnumVariant(ktType) -> "$subjectExpr is ${starProjectedVariantIsType(ktType)}"
+                            else -> "$subjectExpr == $ktType"
+                        }
                     }
                     else -> "true"
                 }
@@ -2277,26 +2330,94 @@ internal fun KotlinJ2KEmitter.tupleIndexExpr(subjectText: String, idx: Int, arit
         else -> "$subjectText[$idx]"
     }
 
+private fun KotlinJ2KEmitter.resolveScrutineeRenderedType(
+    subjectText: String,
+    selfTypeName: String?,
+): String? {
+    currentTypedLocals[subjectText]?.let { return it }
+    val dotIdx = subjectText.lastIndexOf('.')
+    if (dotIdx > 0) {
+        val baseName = subjectText.substring(0, dotIdx)
+        val memberName = subjectText.substring(dotIdx + 1)
+        val compIdx =
+            when (memberName) {
+                "first" -> 0
+                "second" -> 1
+                "third" -> 2
+                else -> -1
+            }
+        if (compIdx >= 0) {
+            val baseType = currentTypedLocals[baseName]?.removeSuffix("?")?.trim()
+            if (baseType != null && (baseType.startsWith("Pair<") || baseType.startsWith("Triple<")) && baseType.endsWith(">")) {
+                val argsInner = baseType.substringAfter('<').dropLast(1)
+                val args = PhantomRawPointerTypeStripper.splitTopLevelCommaList(argsInner)
+                args
+                    .getOrNull(compIdx)
+                    ?.trim()
+                    ?.takeIf { it.isNotEmpty() }
+                    ?.let { return it }
+            }
+        }
+    }
+    return selfTypeName
+}
+
 private fun KotlinJ2KEmitter.qualifyShadowedPatternVariantType(
     variantType: String,
     subjectText: String,
     selfTypeName: String?,
 ): String {
-    if ('.' in variantType || variantType !in activeTypeParamNames) return variantType
+    if ('.' in variantType) return variantType
     val scrutineeBase =
-        (currentTypedLocals[subjectText] ?: selfTypeName)
+        resolveScrutineeRenderedType(subjectText, selfTypeName)
+            ?.removeSuffix("?")
             ?.substringBefore('<')
             ?.substringAfterLast('.')
             ?.trim()
             ?.takeIf { it.isNotEmpty() && it !in activeTypeParamNames }
-    val ownerEnum =
-        scrutineeBase?.takeIf {
-            "$it.$variantType" in inspector.enumVariantFieldTypes || variantType in inspector.enumVariantSimpleNames
+    if (variantType in activeTypeParamNames) {
+        val ownerEnum =
+            scrutineeBase?.takeIf {
+                "$it.$variantType" in inspector.enumVariantFieldTypes || variantType in inspector.enumVariantSimpleNames
+            }
+                ?: inspector.enumVariantFieldTypes.keys
+                    .firstOrNull { it.endsWith(".$variantType") && '.' in it }
+                    ?.substringBeforeLast('.')
+        return if (ownerEnum != null) "$ownerEnum.$variantType" else variantType
+    }
+    if (scrutineeBase != null &&
+        scrutineeBase !in inspector.enumTypeNames &&
+        (variantType in inspector.enumVariantSimpleNames || variantType in inspector.importedEnumVariantSimpleNames)
+    ) {
+        val qualifiedPair = "$scrutineeBase.$variantType"
+        val existsInKnownEnums =
+            qualifiedPair in headerContext.crateEnumVariantTypeArity ||
+                scopedAbiKeysForRenderedType(qualifiedPair).any { it in headerContext.crateEnumVariantTypeArity } ||
+                qualifiedPair in headerContext.externalEnumVariantTypeArity
+        if (existsInKnownEnums) {
+            val resolvedOwner =
+                if (scrutineeBase in importedSimpleNameToPkg) {
+                    scrutineeBase
+                } else {
+                    val sub = resolveBestSubpackageForSymbol(scrutineeBase)
+                    val ns = currentNamespacePrefix()
+                    val pkg =
+                        if (sub != null && ns != null) {
+                            if (sub.isEmpty()) ns else "$ns.$sub"
+                        } else {
+                            headerContext.externalCrateSymbolPackages.values
+                                .firstNotNullOfOrNull { it[scrutineeBase]?.firstOrNull() }
+                        }
+                    if (pkg != null) {
+                        bindOrQualifyResolvedCrossSymbol("$pkg.$scrutineeBase")
+                    } else {
+                        scrutineeBase
+                    }
+                }
+            return "$resolvedOwner.$variantType"
         }
-            ?: inspector.enumVariantFieldTypes.keys
-                .firstOrNull { it.endsWith(".$variantType") && '.' in it }
-                ?.substringBeforeLast('.')
-    return if (ownerEnum != null) "$ownerEnum.$variantType" else variantType
+    }
+    return variantType
 }
 
 internal fun KotlinJ2KEmitter.renderMatchPatternCondition(
@@ -2335,7 +2456,12 @@ internal fun KotlinJ2KEmitter.renderMatchPatternCondition(
             if (segs.size == 1 && segs[0].ident.toString() == "None" && !inspector.hasLocalNoneVariant) {
                 "null"
             } else {
-                renderPathAsExpression(pat.path, selfTypeName)
+                val patType = qualifyShadowedPatternVariantType(renderPathAsType(pat.path, selfTypeName), subjectText, selfTypeName)
+                if (lookupEnumVariantTypeArity(patType) > 0) {
+                    "is ${starProjectedVariantIsType(patType)}"
+                } else {
+                    renderPathAsExpression(pat.path, selfTypeName)
+                }
             }
         }
         is Pat.Ident -> {
@@ -2348,7 +2474,14 @@ internal fun KotlinJ2KEmitter.renderMatchPatternCondition(
                 raw == "None" && !inspector.hasLocalNoneVariant -> "null"
                 cleanRaw in inspector.declaredConstNames -> inspector.declaredConstNames.getValue(cleanRaw)
                 isScreamingSnakeIdent(raw) -> rustConstIdentToKotlin(raw)
-                raw.first().isUpperCase() -> rustTypeIdentToKotlin(raw)
+                raw.first().isUpperCase() -> {
+                    val ktVar = qualifyShadowedPatternVariantType(rustTypeIdentToKotlin(raw), subjectText, selfTypeName)
+                    if (isGenericUnitEnumVariant(ktVar)) {
+                        "is ${starProjectedVariantIsType(ktVar)}"
+                    } else {
+                        ktVar
+                    }
+                }
                 else -> "else"
             }
         }

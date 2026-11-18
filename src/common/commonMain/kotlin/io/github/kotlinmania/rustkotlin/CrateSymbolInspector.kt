@@ -161,6 +161,7 @@ internal class CrateSymbolInspector(
     val declaredConstTypes: MutableMap<String, SynType> = linkedMapOf()
     val tupleStructArityByType: MutableMap<String, Int> = linkedMapOf()
     val tupleEnumVariantArity: MutableMap<Pair<String, String>, Int> = linkedMapOf()
+    val genericUnitEnumVariants: MutableSet<String> = linkedSetOf()
     val enumTypeParamsByVariant: MutableMap<String, List<String>> = linkedMapOf()
     val enumVariantFieldTypes: MutableMap<String, List<SynType>> = linkedMapOf()
     val structFieldNamesByType: MutableMap<String, List<String>> = linkedMapOf()
@@ -738,6 +739,10 @@ internal class CrateSymbolInspector(
                 enumTypeParamsByVariant[vName] = enumTypeParams
             }
             val vFields = v.fields
+            if (vFields is Fields.Unit && enumTypeParams.isNotEmpty()) {
+                genericUnitEnumVariants += "$name.$vName"
+                genericUnitEnumVariants += vName
+            }
             if (vFields is Fields.Unnamed) {
                 val fieldTys =
                     vFields.fields.unnamed

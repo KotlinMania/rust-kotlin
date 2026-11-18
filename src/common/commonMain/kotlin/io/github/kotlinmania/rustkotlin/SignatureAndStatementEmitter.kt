@@ -92,7 +92,24 @@ internal fun KotlinJ2KEmitter.liftDefaultlessAssocTypesFromBounds(
             .mapNotNull { (it as? GenericParam.TypeParam)?.ident?.toString()?.let(::rustTypeIdentToKotlin) }
             .toSet()
     val lifted = mutableListOf<String>()
+    val iteratorAssocTraits =
+        setOf("Iterator", "DoubleEndedIterator", "ExactSizeIterator", "FusedIterator", "AsyncIterator")
     fun inspectBounds(bounds: List<TypeParamBound>) {
+        val allBoundAssocs = linkedSetOf<String>()
+        for (b in bounds) {
+            if (b is TypeParamBound.Trait) {
+                val args =
+                    b.path.segments
+                        .last()
+                        ?.arguments
+                if (args is PathArguments.AngleBracketed) {
+                    args.args
+                        .toList()
+                        .filterIsInstance<GenericArgument.AssocTypeArg>()
+                        .forEach { allBoundAssocs += rustTypeIdentToKotlin(it.assoc.ident.toString()) }
+                }
+            }
+        }
         for (b in bounds) {
             if (b is TypeParamBound.Trait) {
                 val lastSeg = b.path.segments.last() ?: continue
@@ -100,18 +117,20 @@ internal fun KotlinJ2KEmitter.liftDefaultlessAssocTypesFromBounds(
                 if (rawIdent in IGNORED_TRAIT_BOUNDS || rawIdent == "MaskElement") continue
                 val ktTrait = rustTypeIdentToKotlin(rawIdent)
                 if (ktTrait !in inspector.declaredTypeNames &&
+                    rawIdent !in iteratorAssocTraits &&
                     (rawIdent == "IntoIterator" || isImplicitStdlibSupertraitPath(b.path))
                 ) {
                     continue
                 }
                 val boundAssocs =
                     when (val args = lastSeg.arguments) {
-                        is PathArguments.None -> emptySet()
+                        is PathArguments.None -> allBoundAssocs
                         is PathArguments.AngleBracketed ->
-                            args.args
-                                .toList()
-                                .filterIsInstance<GenericArgument.AssocTypeArg>()
-                                .mapTo(linkedSetOf()) { rustTypeIdentToKotlin(it.assoc.ident.toString()) }
+                            allBoundAssocs +
+                                args.args
+                                    .toList()
+                                    .filterIsInstance<GenericArgument.AssocTypeArg>()
+                                    .map { rustTypeIdentToKotlin(it.assoc.ident.toString()) }
                         else -> continue
                     }
                 val ownerSimple = ownerTypeSimpleName ?: currentBoundedTypeName?.substringBefore('<')?.trim()
@@ -787,6 +806,71 @@ private fun KotlinJ2KEmitter.blockCallsSameAritySelfMethod(
     return found
 }
 
+private fun visitMatchesRawIdent(
+    rawIdent: String,
+    drive: (Visit) -> Unit,
+): Boolean {
+    var found = false
+    val visitor =
+        object : Visit() {
+            override fun visitTypePath(t: SynType.Path) {
+                if (t.path.segments
+                        .toList()
+                        .any { it.ident.toString().removePrefix("r#") == rawIdent }
+                ) {
+                    found = true
+                    return
+                }
+                super.visitTypePath(t)
+            }
+
+            override fun visitExprPath(e: Expr.Path) {
+                if (e.path.segments
+                        .toList()
+                        .any { it.ident.toString().removePrefix("r#") == rawIdent }
+                ) {
+                    found = true
+                    return
+                }
+                super.visitExprPath(e)
+            }
+        }
+    drive(visitor)
+    return found
+}
+
+private fun synTypeMentionsIdent(
+    ty: SynType?,
+    rawIdent: String,
+): Boolean = ty != null && visitMatchesRawIdent(rawIdent) { it.visitType(ty) }
+
+private fun genericsMentionIdent(
+    generics: Generics?,
+    rawIdent: String,
+): Boolean {
+    if (generics == null) return false
+    for (gp in generics.params.toList()) {
+        if (gp is GenericParam.TypeParam) {
+            if (visitMatchesRawIdent(rawIdent) { v -> gp.bounds.toList().forEach(v::visitTypeParamBound) }) {
+                return true
+            }
+            if (synTypeMentionsIdent(gp.default?.type, rawIdent)) return true
+        }
+    }
+    for (pred in generics.whereClause
+        ?.predicates
+        ?.toList()
+        .orEmpty()) {
+        if (pred is WherePredicate.TypePredicate) {
+            if (synTypeMentionsIdent(pred.boundedTy, rawIdent)) return true
+            if (visitMatchesRawIdent(rawIdent) { v -> pred.bounds.toList().forEach(v::visitTypeParamBound) }) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
 internal fun KotlinJ2KEmitter.renderFunctionSignature(
     sig: Signature,
     visPrefix: String,
@@ -1023,6 +1107,7 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
         }
     }
 
+    val rawReturnSynType = extractReturnSynType(sig.output)
     for (gp in combinedParams) {
         if (gp is GenericParam.ConstParam) {
             val rawConst = gp.ident.toString().removePrefix("r#")
@@ -1032,10 +1117,23 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
                 scopeBuilder.bindLocal(rawConst, cName, gp.ident.span())
                 currentTypedLocals = currentTypedLocals + (cName to cType)
                 val defaultSuffix =
-                    gp.default
-                        ?.expr
-                        ?.let { " = ${renderExpr(it, "", selfTypeName)}" }
-                        .orEmpty()
+                    if (gp.default?.expr != null) {
+                        " = ${renderExpr(gp.default!!.expr, "", selfTypeName)}"
+                    } else if (!isInterfaceMethod &&
+                        "override" !in openPrefix &&
+                        "actual" !in openPrefix &&
+                        "expect" !in visPrefix &&
+                        (
+                            inputs.any { it is FnArg.Typed && synTypeMentionsIdent(it.patType.ty, rawConst) } ||
+                                synTypeMentionsIdent(rawReturnSynType, rawConst) ||
+                                synTypeMentionsIdent(currentStandaloneImplSelfSynType, rawConst) ||
+                                genericsMentionIdent(ownerGenerics ?: implGenerics, rawConst)
+                        )
+                    ) {
+                        " = ${defaultInitializerForType(cType)}"
+                    } else {
+                        ""
+                    }
                 params += "$cName: $cType$defaultSuffix"
                 paramTypeSignatureKeys += eraseTypeForSignatureKey(cType)
             }

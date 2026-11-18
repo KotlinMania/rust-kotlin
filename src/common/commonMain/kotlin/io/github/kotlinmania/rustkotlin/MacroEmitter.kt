@@ -87,6 +87,16 @@ internal fun KotlinJ2KEmitter.renderMacroInvocationAsStmtOrExpr(
                 }
             "error($msg)"
         }
+        "const_panic" -> {
+            val parts = MacroRulesFileExpander.splitMacroArguments(tokens)
+            val firstMsg =
+                if (parts.isEmpty()) {
+                    "\"const_panic\""
+                } else {
+                    parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(parts[0]), indent, selfTypeName)
+                }
+            "error($firstMsg)"
+        }
         "println", "eprintln" -> {
             val msg = renderFormatMacroInvocation(tokens, indent, selfTypeName)
             "println($msg)"
@@ -119,6 +129,20 @@ internal fun KotlinJ2KEmitter.renderMacroInvocationAsStmtOrExpr(
                     currentExpectedNumericKind = savedKind
                 }
             "mutableListOf(${args.joinToString(", ")})"
+        }
+        "const_assert" -> {
+            val parts = MacroRulesFileExpander.splitMacroArguments(tokens)
+            if (parts.isEmpty()) {
+                "check(true)"
+            } else {
+                val cond = parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(parts[0]), indent, selfTypeName)
+                if (parts.size >= 2) {
+                    val firstMsg = parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(parts[1]), indent, selfTypeName)
+                    "check($cond) { $firstMsg }"
+                } else {
+                    "check($cond)"
+                }
+            }
         }
         "assert", "debug_assert" -> {
             val parts = MacroRulesFileExpander.splitMacroArguments(tokens)
@@ -1656,7 +1680,10 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
                     val lastRaw = headSeg.ident.toString()
                     val cleanLast = lastRaw.removePrefix("r#")
                     if (!asCallee && headSeg.arguments is PathArguments.None) {
-                        if (lastRaw.first().isUpperCase() && !isScreamingSnakeIdent(lastRaw) && boundHead in inspector.unitStructNames) {
+                        if (lastRaw.first().isUpperCase() &&
+                            !isScreamingSnakeIdent(lastRaw) &&
+                            (boundHead in inspector.unitStructNames || isGenericUnitEnumVariant(boundHead))
+                        ) {
                             return "$boundHead()"
                         }
                         if (lastRaw.first().isUpperCase() && !isScreamingSnakeIdent(lastRaw)) {
@@ -1688,13 +1715,23 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
                     val lastRaw = tailSegs.last().ident.toString()
                     val prevRaw = if (tailSegs.size >= 2) tailSegs[tailSegs.size - 2].ident.toString() else headSeg.ident.toString()
                     if (isKnownEnumVariantPair(prevRaw, lastRaw, selfTypeName)) {
-                        fullParts[fullParts.lastIndex] = rustTypeIdentToKotlin(lastRaw)
+                        val varKt = rustTypeIdentToKotlin(lastRaw)
+                        val prevRendered = fullParts[fullParts.lastIndex]
+                        val typeArgSuffix = prevRendered.indexOf('<').let { if (it >= 0) prevRendered.substring(it) else "" }
+                        fullParts[fullParts.lastIndex] = varKt + typeArgSuffix
                         if (!asCallee && prevRaw.first().isUpperCase()) {
-                            val enumKt = rustTypeIdentToKotlin(prevRaw)
-                            val varKt = fullParts[fullParts.lastIndex]
+                            val enumKt =
+                                if (prevRaw == "Self") {
+                                    selfTypeName?.substringBefore('<')?.trim().orEmpty()
+                                } else {
+                                    rustTypeIdentToKotlin(prevRaw)
+                                }
                             val arity = inspector.tupleEnumVariantArity[enumKt to varKt]
                             if (arity != null && arity > 0) {
                                 return renderTupleVariantConstructorLambda(fullParts.joinToString("."), arity)
+                            }
+                            if (enumKt.isNotEmpty() && isGenericUnitEnumVariant("$enumKt.$varKt")) {
+                                return "${fullParts.joinToString(".")}()"
                             }
                         }
                         return fullParts.joinToString(".")
@@ -1743,7 +1780,7 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
         if (singleRaw.first().isUpperCase() && !isScreamingSnakeIdent(singleRaw)) {
             val rawKt = rustTypeIdentToKotlin(singleRaw)
             val singleTypeIdent = samePackageUseRenames[rawKt] ?: rawKt
-            if (singleTypeIdent in inspector.unitStructNames) {
+            if (singleTypeIdent in inspector.unitStructNames || isGenericUnitEnumVariant(singleTypeIdent)) {
                 return "$singleTypeIdent()"
             }
             if (!asCallee) {
@@ -1887,13 +1924,18 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
             }
         }
         if (isKnownEnumVariantPair(prevRaw, lastRaw, selfTypeName)) {
-            parts[parts.lastIndex] = rustTypeIdentToKotlin(lastRaw)
+            val varKt = rustTypeIdentToKotlin(lastRaw)
+            val prevRendered = parts[parts.lastIndex]
+            val typeArgSuffix = prevRendered.indexOf('<').let { if (it >= 0) prevRendered.substring(it) else "" }
+            parts[parts.lastIndex] = varKt + typeArgSuffix
             if (!asCallee && prevRaw.first().isUpperCase()) {
                 val enumKt = if (prevRaw == "Self") selfTypeName?.substringBefore('<')?.trim().orEmpty() else rustTypeIdentToKotlin(prevRaw)
-                val varKt = parts[parts.lastIndex]
                 val arity = inspector.tupleEnumVariantArity[enumKt to varKt]
                 if (arity != null && arity > 0) {
                     return renderTupleVariantConstructorLambda(parts.joinToString("."), arity)
+                }
+                if (enumKt.isNotEmpty() && isGenericUnitEnumVariant("$enumKt.$varKt")) {
+                    return "${parts.joinToString(".")}()"
                 }
             }
             return parts.joinToString(".")
@@ -2227,10 +2269,21 @@ private fun KotlinJ2KEmitter.isKnownEnumVariantPair(
             rustTypeIdentToKotlin(cleanPrev)
         }
     if (enumKt.isEmpty()) return false
+    if (enumKt == "Feature" &&
+        cleanLast !in setOf("to_str", "from_str") &&
+        !isScreamingSnakeIdent(cleanLast) &&
+        (
+            headerContext.packageName?.contains(".stddetect.") == true ||
+                importedSimpleNameToPkg["Feature"]?.contains(".detect.arch.") == true
+        )
+    ) {
+        return true
+    }
     val varKt = rustTypeIdentToKotlin(cleanLast)
     if (varKt.isEmpty()) return false
     val directKey = "$enumKt.$varKt"
     if (directKey in headerContext.crateEnumVariantTypeArity ||
+        directKey in headerContext.externalEnumVariantTypeArity ||
         directKey in inspector.enumVariantFieldTypes ||
         (enumKt to varKt) in inspector.tupleEnumVariantArity ||
         (enumKt in inspector.enumTypeNames && varKt in inspector.enumVariantSimpleNames)

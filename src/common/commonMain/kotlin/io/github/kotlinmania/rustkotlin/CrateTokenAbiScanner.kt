@@ -56,6 +56,7 @@ internal data class CrateRawAbiMetadata(
     val traitAstRegistryKey: String? = null,
     val fnConstParamNames: Map<String, Pair<Int, List<String>>> = emptyMap(),
     val enumVariantTypeArity: Map<String, Int> = emptyMap(),
+    val unitEnumVariants: Set<String> = emptySet(),
 )
 
 internal data class ExternalCrateAbiMetadata(
@@ -64,6 +65,8 @@ internal data class ExternalCrateAbiMetadata(
     val nullableReturnFns: Set<String> = emptySet(),
     val fnConstParams: Map<String, Pair<Int, List<String>>> = emptyMap(),
     val tupleStructArity: Map<String, Int> = emptyMap(),
+    val enumVariantTypeArity: Map<String, Int> = emptyMap(),
+    val unitEnumVariants: Set<String> = emptySet(),
 )
 
 private var diskCrateRawAbiMetadataCache: Map<String, CrateRawAbiMetadata> = emptyMap()
@@ -396,6 +399,7 @@ private fun scanSourcesWithActiveSession(
     val traitResultMethods = linkedMapOf<String, List<String>>()
     val fnConstParamNames = linkedMapOf<String, Pair<Int, List<String>>>()
     val enumVariantTypeArity = linkedMapOf<String, Int>()
+    val unitEnumVariants = linkedSetOf<String>()
 
     fun registerFnConstParams(
         subpkg: String,
@@ -562,6 +566,7 @@ private fun scanSourcesWithActiveSession(
             traitResultMethods = traitResultMethods,
             registerFnConstParams = ::registerFnConstParams,
             enumVariantTypeArity = enumVariantTypeArity,
+            unitEnumVariants = unitEnumVariants,
         )
     }
 
@@ -1133,6 +1138,7 @@ private fun scanSourcesWithActiveSession(
         traitAstRegistryKey = traitRegistryKey,
         fnConstParamNames = fnConstParamNames,
         enumVariantTypeArity = enumVariantTypeArity,
+        unitEnumVariants = unitEnumVariants,
     )
 }
 
@@ -1785,6 +1791,8 @@ internal fun discoverExternalCrateAbiFromDisk(
     val nullableReturnFns = linkedSetOf<String>()
     val fnConstParams = linkedMapOf<String, Pair<Int, List<String>>>()
     val tupleStructArity = linkedMapOf<String, Int>()
+    val enumVariantTypeArity = linkedMapOf<String, Int>()
+    val unitEnumVariants = linkedSetOf<String>()
 
     for (matched in matchedCrates) {
         val crateKey = matched.crateKey
@@ -1799,6 +1807,8 @@ internal fun discoverExternalCrateAbiFromDisk(
                 nullableReturnFns = nullableReturnFns,
                 fnConstParams = fnConstParams,
                 tupleStructArity = tupleStructArity,
+                enumVariantTypeArity = enumVariantTypeArity,
+                unitEnumVariants = unitEnumVariants,
             )
         }
         if (pkgMapBySym.isNotEmpty()) {
@@ -1823,6 +1833,8 @@ internal fun discoverExternalCrateAbiFromDisk(
             nullableReturnFns = nullableReturnFns,
             fnConstParams = fnConstParams,
             tupleStructArity = tupleStructArity,
+            enumVariantTypeArity = enumVariantTypeArity,
+            unitEnumVariants = unitEnumVariants,
         )
     if (symbolPackages.isNotEmpty()) {
         if (diskExternalCrateAbiCache.size >= 32) {
@@ -1842,7 +1854,27 @@ private fun scanExternalKotlinFileSymbols(
     nullableReturnFns: MutableSet<String>,
     fnConstParams: MutableMap<String, Pair<Int, List<String>>>,
     tupleStructArity: MutableMap<String, Int>,
+    enumVariantTypeArity: MutableMap<String, Int>,
+    unitEnumVariants: MutableSet<String>,
 ) {
+    fun recordExternalVariantArity(
+        owner: String,
+        variant: String,
+        arity: Int,
+        isUnit: Boolean,
+    ) {
+        enumVariantTypeArity.putIfMissing("$owner.$variant", arity)
+        val prev = enumVariantTypeArity[variant]
+        if (prev == null) {
+            enumVariantTypeArity[variant] = arity
+        } else if (prev != arity) {
+            enumVariantTypeArity[variant] = -1
+        }
+        if (isUnit && arity > 0) {
+            unitEnumVariants += "$owner.$variant"
+            unitEnumVariants += variant
+        }
+    }
     val lines = sourceText.lines()
     var pkg: String? = null
     for (line in lines) {
@@ -1982,6 +2014,75 @@ private fun scanExternalKotlinFileSymbols(
                         val fieldIdx = fieldIdxStr.toIntOrNull()
                         if (fieldIdx != null && fieldIdx >= 1) {
                             tupleStructArity[ownerCls] = maxOf(tupleStructArity[ownerCls] ?: 0, fieldIdx + 1)
+                        }
+                    }
+                }
+                if (header.startsWith("public data object ")) {
+                    val afterObj = header.removePrefix("public data object ").trimStart()
+                    val vName = afterObj.takeWhile { it.isLetterOrDigit() || it == '_' }
+                    val afterVar = afterObj.drop(vName.length).trimStart()
+                    if (vName.isNotEmpty() && afterVar.startsWith(":")) {
+                        val basePart = afterVar.drop(1).trimStart()
+                        val baseOwner = basePart.takeWhile { it.isLetterOrDigit() || it == '_' }
+                        if (baseOwner == ownerCls) {
+                            recordExternalVariantArity(ownerCls, vName, 0, isUnit = false)
+                        }
+                    }
+                } else if (header.startsWith("public class ") || header.startsWith("public data class ")) {
+                    val isData = header.startsWith("public data class ")
+                    val afterKw =
+                        if (isData) {
+                            header.removePrefix("public data class ").trimStart()
+                        } else {
+                            header.removePrefix("public class ").trimStart()
+                        }
+                    val vName = afterKw.takeWhile { it.isLetterOrDigit() || it == '_' }
+                    val ltIdx = vName.length
+                    if (vName.isNotEmpty() && ltIdx < afterKw.length && afterKw[ltIdx] == '<') {
+                        var angleDepth = 0
+                        var gtIdx = -1
+                        for (idx in ltIdx until afterKw.length) {
+                            when (afterKw[idx]) {
+                                '<' -> angleDepth++
+                                '>' -> {
+                                    angleDepth--
+                                    if (angleDepth == 0) {
+                                        gtIdx = idx
+                                        break
+                                    }
+                                }
+                            }
+                        }
+                        if (gtIdx > ltIdx + 1) {
+                            val typeArity =
+                                PhantomRawPointerTypeStripper
+                                    .splitTopLevelCommaList(afterKw.substring(ltIdx + 1, gtIdx))
+                                    .size
+                            if (typeArity > 0) {
+                                val afterGt = afterKw.substring(gtIdx + 1).trimStart()
+                                if (!isData && afterGt.startsWith("()")) {
+                                    val afterUnitParen = afterGt.removePrefix("()").trimStart()
+                                    if (afterUnitParen.startsWith(":")) {
+                                        val basePart = afterUnitParen.drop(1).trimStart()
+                                        val baseOwner = basePart.takeWhile { it.isLetterOrDigit() || it == '_' }
+                                        if (baseOwner == ownerCls && basePart.drop(baseOwner.length).startsWith("<")) {
+                                            recordExternalVariantArity(ownerCls, vName, typeArity, isUnit = true)
+                                        }
+                                    }
+                                } else if (afterGt.startsWith("(") ||
+                                    afterGt.startsWith("internal constructor(") ||
+                                    afterGt.startsWith("public constructor(")
+                                ) {
+                                    val afterParen = extractAfterMatchingParen(lineIdx)?.second?.trimStart()
+                                    if (afterParen != null && afterParen.startsWith(":")) {
+                                        val basePart = afterParen.drop(1).trimStart()
+                                        val baseOwner = basePart.takeWhile { it.isLetterOrDigit() || it == '_' }
+                                        if (baseOwner == ownerCls && basePart.drop(baseOwner.length).startsWith("<")) {
+                                            recordExternalVariantArity(ownerCls, vName, typeArity, isUnit = false)
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
