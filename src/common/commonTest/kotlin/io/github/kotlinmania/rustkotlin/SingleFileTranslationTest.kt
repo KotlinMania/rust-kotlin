@@ -1039,4 +1039,211 @@ class SingleFileTranslationTest {
         val single = renderSingleKotlinFile("pub fn solo() -> i32 { 1 }\n// solitary eof\n")
         assertContains(single.text, "public fun solo(): Int {\n    return 1\n}\n\n// solitary eof\n")
     }
+
+    @Test fun arrayRepeatEvaluatesSideEffectingOperandOnceAndRespectsConstControl() {
+        val source =
+            """
+            pub struct Item {
+                pub id: i32,
+            }
+
+            pub fn tick(n: &mut i32) -> i32 {
+                *n += 1;
+                *n
+            }
+
+            pub fn make_item() -> Item {
+                Item { id: 1 }
+            }
+
+            pub fn repeat_three() -> i32 {
+                let mut n = 0;
+                let _a = [tick(&mut n); 3];
+                n
+            }
+
+            pub fn repeat_one() -> i32 {
+                let mut n = 0;
+                let _a = [tick(&mut n); 1];
+                n
+            }
+
+            pub fn repeat_zero() -> i32 {
+                let mut n = 0;
+                let _a = [tick(&mut n); 0];
+                n
+            }
+
+            pub fn repeat_mutable_generic() -> usize {
+                let mut items = [make_item(); 3];
+                items.len()
+            }
+
+            pub fn repeat_panic_zero() -> [i32; 0] {
+                [panic!("boom"); 0]
+            }
+
+            pub fn repeat_lit_array() -> [i32; 4] {
+                let a: [i32; 4] = [0; 4];
+                a
+            }
+
+            pub fn repeat_lit_and_const() -> ([i32; 4], [Vec<i32>; 3]) {
+                ([0; 4], [const { Vec::new() }; 3])
+            }
+            """.trimIndent()
+        val result = renderSingleKotlinFile(source)
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(result.text, "RepeatEval.kt")
+        assertContains(result.text, "run { val repeatElem0 = tick(RustMutableReference(")
+        assertContains(result.text, "; IntArray(3) { repeatElem0 } }")
+        assertContains(result.text, "run { val repeatElem1 = tick(RustMutableReference(")
+        assertContains(result.text, "; IntArray(1) { repeatElem1 } }")
+        assertContains(result.text, "run { val repeatElem2 = tick(RustMutableReference(")
+        assertContains(result.text, "; IntArray(0) { repeatElem2 } }")
+        assertContains(result.text, "run { val repeatElem3 = makeItem(); MutableList(3) { repeatElem3 } }")
+        assertContains(result.text, "error(\"boom\")")
+        assertFalse(result.text.contains("repeatElem4"), "Direct diverging repeat must not allocate a repeatElem temp:\n${result.text}")
+        assertContains(result.text, "IntArray(4) { 0 }")
+        assertContains(result.text, "Pair(List(4) { 0 }, List(3) { mutableListOf() })")
+    }
+
+    @Test fun optionEagerUnwrapOrAndMapOrEvaluateFallbackBeforeBranchingWhileElseStaysLazy() {
+        val source =
+            """
+            pub fn fallback() -> i32 {
+                panic!("eager panic")
+            }
+
+            pub fn bump(n: &mut i32) -> i32 {
+                *n += 1;
+                *n
+            }
+
+            pub fn eager_var_unwrap_or() -> i32 {
+                let x = Some(42);
+                x.unwrap_or(fallback())
+            }
+
+            pub fn eager_some_unwrap_or() -> i32 {
+                Some(42).unwrap_or(fallback())
+            }
+
+            pub fn lazy_unwrap_or_else(x: Option<i32>) -> i32 {
+                x.unwrap_or_else(|| fallback())
+            }
+
+            pub fn eager_map_or(opt: Option<i32>, n: &mut i32) -> i32 {
+                opt.map_or(bump(&mut n), |v| v + 1)
+            }
+
+            pub fn lazy_map_or_else(opt: Option<i32>, n: &mut i32) -> i32 {
+                opt.map_or_else(|| bump(&mut n), |v| v + 1)
+            }
+
+            pub fn pure_literal_fallbacks(opt: Option<i32>) -> i32 {
+                opt.unwrap_or(0) + opt.map_or(10, |v| v + 1)
+            }
+
+            pub fn eager_ok_or(opt: Option<i32>, n: &mut i32) -> Result<i32, i32> {
+                opt.ok_or(bump(&mut n))
+            }
+            """.trimIndent()
+        val result = renderSingleKotlinFile(source)
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(result.text, "OptionEager.kt")
+        assertContains(result.text, "val x: Int? = 42")
+        assertContains(result.text, "run { val optRecv0 = x; val optDefault0 = fallback(); optRecv0 ?: optDefault0 }")
+        assertContains(result.text, "run { val optRecv1 = 42; fallback(); optRecv1 }")
+        assertContains(result.text, "(x ?: fallback())")
+        assertContains(
+            result.text,
+            "run { val optRecv2 = opt; val optDefault2 = bump(n); if (optRecv2 != null) optRecv2.let({ v -> v + 1 }) else optDefault2 }",
+        )
+        assertContains(result.text, "(opt?.let({ v -> v + 1 }) ?: bump(n))")
+        assertContains(result.text, "(opt ?: 0)")
+        assertContains(result.text, "(opt?.let({ v -> v + 1 }) ?: 10)")
+        assertContains(result.text, "run { val optRecv3 = opt; val optErr3 = bump(n);")
+    }
+
+    @Test fun optionTakeAndFmtWriteRespectReceiverIdentityAndRetainNullableSomeStorage() {
+        val negativeTwinsSource =
+            """
+            pub struct Counter {
+                pub value: i32,
+            }
+
+            impl Counter {
+                pub fn take(&mut self) -> i32 {
+                    self.value
+                }
+
+                pub fn write_str(&self, _s: &str) -> usize {
+                    1
+                }
+
+                pub fn write_char(&self, _c: char) -> usize {
+                    1
+                }
+
+                pub fn pad(&self, _s: &str) -> usize {
+                    1
+                }
+            }
+
+            pub fn call_take(mut counter: Counter) -> i32 {
+                counter.take()
+            }
+
+            pub fn call_write_named_c(c: &Counter) -> usize {
+                c.write_str("hello") + c.write_char('x') + c.pad("y")
+            }
+
+            pub fn call_write_named_f(f: &Counter) -> usize {
+                f.write_str("hello") + f.write_char('x') + f.pad("y")
+            }
+            """.trimIndent()
+        val negativeResult = renderSingleKotlinFile(negativeTwinsSource)
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(negativeResult.text, "ReceiverIdentityNegative.kt")
+        assertContains(negativeResult.text, "return counter.take()")
+        assertFalse(negativeResult.text.contains("counter = null"), "Custom Counter.take must not become Option.take:\n${negativeResult.text}")
+        assertContains(negativeResult.text, "c.writeStr(\"hello\")")
+        assertContains(negativeResult.text, "c.writeChar('x')")
+        assertContains(negativeResult.text, "c.pad(\"y\")")
+        assertContains(negativeResult.text, "f.writeStr(\"hello\")")
+        assertContains(negativeResult.text, "f.writeChar('x')")
+        assertContains(negativeResult.text, "f.pad(\"y\")")
+        assertFalse(negativeResult.text.contains(".append("), "Custom Counter write_str/write_char/pad must not become .append():\n${negativeResult.text}")
+
+        val positiveSource =
+            """
+            use std::fmt;
+
+            pub struct Holder {
+                pub slot: Option<i32>,
+            }
+
+            pub fn fmt_write(f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("ok")?;
+                f.write_char('!')?;
+                f.pad("done")
+            }
+
+            pub fn take_inferred_some() -> Option<i32> {
+                let mut x = Some(42);
+                let _y = x.take();
+                x
+            }
+
+            pub fn take_holder_field(h: &mut Holder) -> Option<i32> {
+                h.slot.take()
+            }
+            """.trimIndent()
+        val positiveResult = renderSingleKotlinFile(positiveSource)
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(positiveResult.text, "ReceiverIdentityPositive.kt")
+        assertContains(positiveResult.text, "f.append(\"ok\")")
+        assertContains(positiveResult.text, "f.append('!')")
+        assertContains(positiveResult.text, "f.append(\"done\")")
+        assertContains(positiveResult.text, "var x: Int? = 42")
+        assertContains(positiveResult.text, "x.also { x = null }")
+        assertContains(positiveResult.text, "h.slot.also { h.slot = null }")
+    }
 }

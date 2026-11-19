@@ -58,6 +58,41 @@ internal fun KotlinJ2KEmitter.markNonNullChecked(
 private val NARROW_INTEGER_KINDS: Set<NumericKind> =
     setOf(NumericKind.U8, NumericKind.U16, NumericKind.I8, NumericKind.I16)
 
+private fun KotlinJ2KEmitter.isSafeInlineRepeatOperand(expr: Expr): Boolean =
+    when (val core = unwrapParenOrGroupExpr(expr)) {
+        is Expr.Lit, is Expr.Path, is Expr.Const -> true
+        is Expr.Unary ->
+            (core.op is UnOp.Neg || core.op is UnOp.NotOp) &&
+                unwrapParenOrGroupExpr(core.expr) is Expr.Lit
+        else -> false
+    }
+
+internal fun KotlinJ2KEmitter.isDirectDivergingRenderedExpr(
+    expr: Expr,
+    rendered: String,
+): Boolean {
+    val core = unwrapParenOrGroupExpr(expr)
+    if (core is Expr.Return || core is Expr.Break || core is Expr.Continue) return true
+    val trimmed = rendered.trim()
+    return trimmed.startsWith("error(") || trimmed.startsWith("TODO(")
+}
+
+private fun KotlinJ2KEmitter.renderRepeatCollectionExpr(
+    repExpr: Expr,
+    elemText: String,
+    lenText: String,
+    ctorName: String,
+): String {
+    if (isSafeInlineRepeatOperand(repExpr)) {
+        return "$ctorName($lenText) { $elemText }"
+    }
+    if (isDirectDivergingRenderedExpr(repExpr, elemText)) {
+        return elemText
+    }
+    val tmp = "repeatElem${closureLabelCounter++}"
+    return "run { val $tmp = $elemText; $ctorName($lenText) { $tmp } }"
+}
+
 private fun KotlinJ2KEmitter.renderArrayOrRepeatExpr(
     containerExpr: Expr,
     elems: List<Expr>?,
@@ -109,7 +144,12 @@ private fun KotlinJ2KEmitter.renderArrayOrRepeatExpr(
                 currentExpectedParseTargetType = prevParseTarget
             }
         val len = normalizeArrayLengthToIntExpr(renderTypedNumericInitializer(lenExpr, NumericKind.I32, indent, selfTypeName), lenExpr, selfTypeName)
-        if (isMutableList) "MutableList($len) { $renderedElem }" else "List($len) { $renderedElem }"
+        renderRepeatCollectionExpr(
+            repExpr = repExpr,
+            elemText = renderedElem,
+            lenText = len,
+            ctorName = if (isMutableList) "MutableList" else "List",
+        )
     }
 }
 
@@ -861,7 +901,12 @@ internal fun KotlinJ2KEmitter.renderStructPrimitiveArrayFieldInit(
                         }
                     } ?: rawElem
                 }
-            "$arrayType($lenText) { $elemText }"
+            renderRepeatCollectionExpr(
+                repExpr = initExpr.expr,
+                elemText = elemText,
+                lenText = lenText,
+                ctorName = arrayType,
+            )
         }
         else -> renderExpr(initExpr, indent, selfTypeName)
     }

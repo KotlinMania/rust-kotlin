@@ -81,6 +81,18 @@ internal fun KotlinJ2KEmitter.extractOwnerAndFieldName(expr: Expr, selfTypeName:
     val member = core.member as? Member.Named ?: return null
     val fieldName = rustFieldIdentToKotlin(member.ident.toString())
     val baseCore = unwrapTransparentCastExpr(core.base)
+    fun normalizeDeclaredOwnerType(rawRendered: String?): String? {
+        val base =
+            rawRendered
+                ?.trim()
+                ?.removeSuffix("?")
+                ?.substringBefore('<')
+                ?.substringAfterLast('.')
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: return null
+        return base.takeIf { it in inspector.declaredTypeNames }
+    }
     val ownerType =
         if (baseCore is Expr.Path && baseCore.qself == null && baseCore.path.segments.len() == 1) {
             val firstSeg = baseCore.path.segments.first()
@@ -89,10 +101,13 @@ internal fun KotlinJ2KEmitter.extractOwnerAndFieldName(expr: Expr, selfTypeName:
             if (baseRaw == "self") {
                 selfTypeName?.substringBefore('<')?.trim()
             } else {
-                baseRaw?.let(::rustTypeIdentToKotlin)?.takeIf { it in inspector.declaredTypeNames }
+                val resolvedLocal = baseRaw?.let { scopeBuilder.resolveLocalKotlinName(it) ?: rustValueIdentToKotlin(it) }
+                normalizeDeclaredOwnerType(resolvedLocal?.let { currentTypedLocals[it] })
+                    ?: normalizeDeclaredOwnerType(inferExprRenderedType(baseCore, selfTypeName))
+                    ?: baseRaw?.let(::rustTypeIdentToKotlin)?.takeIf { it in inspector.declaredTypeNames }
             }
         } else {
-            null
+            normalizeDeclaredOwnerType(inferExprRenderedType(baseCore, selfTypeName))
         }
     return ownerType to fieldName
 }
@@ -121,6 +136,20 @@ internal fun KotlinJ2KEmitter.isMutableVecExpr(expr: Expr, renderedReceiver: Str
 internal fun KotlinJ2KEmitter.isKnownNullableOptionExpr(expr: Expr, renderedReceiver: String, selfTypeName: String?): Boolean {
     if (hasDeclaredOptionEnum()) return false
     val core = unwrapTransparentCastExpr(expr)
+    if (unwrapUnqualifiedOptionSomeArg(core) != null) return true
+    if (core is Expr.Path && core.qself == null) {
+        val parts =
+            core.path.segments
+                .toList()
+                .map { it.ident.toString().removePrefix("r#") }
+        if (parts == listOf("None") ||
+            parts == listOf("Option", "None") ||
+            parts == listOf("core", "option", "Option", "None") ||
+            parts == listOf("std", "option", "Option", "None")
+        ) {
+            return true
+        }
+    }
     if (core is Expr.MethodCall) {
         val m = core.method.toString()
         if (m in setOf("ok_or", "ok_or_else", "is_ok", "is_err", "is_some", "is_none", "map_err", "to_lowercase", "to_uppercase")) {
