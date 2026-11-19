@@ -903,4 +903,140 @@ class SingleFileTranslationTest {
         assertEquals(repeated, chunks.joinToString(""))
         assertTrue(chunks.all { !it.first().isLowSurrogate() && !it.last().isHighSurrogate() })
     }
+
+    @Test fun transmuteLocalInitializerDoesNotLeakEnclosingReturnType() {
+        val source =
+            """
+            pub struct RawBits {
+                pub v: u64,
+            }
+
+            pub struct Handle {
+                pub id: u64,
+            }
+
+            pub fn leak_guard(raw: RawBits) -> &'static str {
+                let handle = unsafe { core::mem::transmute(raw) };
+                let _ = handle;
+                "ok"
+            }
+
+            pub fn typed_local(raw: RawBits) -> Handle {
+                let handle: Handle = unsafe { core::mem::transmute(raw) };
+                handle
+            }
+
+            pub fn explicit_return(raw: RawBits) -> Handle {
+                return unsafe { core::mem::transmute(raw) };
+            }
+
+            pub fn tail_return(raw: RawBits) -> Handle {
+                unsafe { core::mem::transmute(raw) }
+            }
+
+            pub fn closure_return(raw: RawBits) -> &'static str {
+                let conv = |r: RawBits| -> Handle { unsafe { core::mem::transmute(r) } };
+                let _h = conv(raw);
+                "done"
+            }
+            """.trimIndent()
+        val result =
+            renderSingleKotlinFile(
+                source,
+                FileHeaderContext(
+                    crateNamespaces = mapOf("core" to "io.github.kotlinmania.rustlang.core"),
+                ),
+            )
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(result.text, "TransmuteLocalInit.kt")
+        assertFalse(
+            result.text.contains("transmuteWithLayouts<RawBits, String>"),
+            "Unannotated local transmute must not inherit enclosing return type String:\n${result.text}",
+        )
+        assertFalse(
+            result.text.contains(", String>("),
+            "Unannotated local transmute must not resolve enclosing return type String:\n${result.text}",
+        )
+        assertContains(result.text, "val handle = transmute(raw)")
+        assertContains(result.text, "val handle: Handle = transmuteWithLayouts<RawBits, Handle>(raw")
+        assertContains(result.text, "return transmuteWithLayouts<RawBits, Handle>(raw")
+        val tailReturnCount = Regex("""transmuteWithLayouts<RawBits, Handle>\(""").findAll(result.text).count()
+        assertEquals(3, tailReturnCount, "Expected typed local, return, and tail return to resolve Handle:\n${result.text}")
+        assertContains(
+            result.text,
+            "transmuteWithLayouts<Any?, Handle>(r, UnresolvedTypeLayout<Any?>(), Handle.typeLayout())",
+        )
+    }
+
+    @Test fun vecRepeatMacroEvaluatesElementOnceEvenWhenCountIsZero() {
+        val source =
+            """
+            pub fn next_value() -> i32 {
+                7
+            }
+
+            pub fn make_lit_vec() -> Vec<i32> {
+                vec![7; 3]
+            }
+
+            pub fn make_empty_lit_vec() -> Vec<i32> {
+                vec![7; 0]
+            }
+
+            pub fn make_call_vec() -> Vec<i32> {
+                vec![next_value(); 3]
+            }
+
+            pub fn make_zero_call_vec() -> Vec<i32> {
+                vec![next_value(); 0]
+            }
+
+            pub fn make_comma_vec() -> Vec<i32> {
+                vec![next_value(), 3]
+            }
+            """.trimIndent()
+        val result = renderSingleKotlinFile(source)
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(result.text, "VecRepeat.kt")
+        assertContains(result.text, "MutableList(3) { 7 }")
+        assertContains(result.text, "MutableList(0) { 7 }")
+        assertContains(result.text, "run { val repeatElem0 = nextValue(); MutableList(3) { repeatElem0 } }")
+        assertContains(result.text, "run { val repeatElem1 = nextValue(); MutableList(0) { repeatElem1 } }")
+        assertContains(result.text, "mutableListOf(nextValue(), 3)")
+    }
+
+    @Test fun trailingEofCommentsPreservedOnMainFileAndOmittedFromSplitModCompanions() {
+        val source =
+            """
+            // leading line comment
+            pub fn shared_fn() -> i32 {
+                1
+            }
+
+            pub mod inner {
+                pub fn shared_fn() -> i32 {
+                    2
+                }
+            }
+
+            // trailing eof line comment
+            /* trailing eof block comment */
+            """.trimIndent()
+        val result = renderSingleKotlinFile(source, FileHeaderContext(packageName = "io.github.kotlinmania.sample"))
+        assertContains(result.text, "// leading line comment")
+        assertContains(result.text, "public fun sharedFn(): Int {\n    return 1\n}")
+        assertContains(result.text, "// trailing eof line comment")
+        assertContains(result.text, "// trailing eof block comment")
+        val innerCompanion = result.companionFiles.single { it.relativePath == "inner/Inner.kt" }
+        assertContains(innerCompanion.content, "public fun sharedFn(): Int {\n    return 2\n}")
+        assertFalse(
+            innerCompanion.content.contains("trailing eof line comment"),
+            "Split companion must not inherit parent EOF comment:\n${innerCompanion.content}",
+        )
+        assertFalse(
+            innerCompanion.content.contains("trailing eof block comment"),
+            "Split companion must not inherit parent EOF block comment:\n${innerCompanion.content}",
+        )
+
+        val single = renderSingleKotlinFile("pub fn solo() -> i32 { 1 }\n// solitary eof\n")
+        assertContains(single.text, "public fun solo(): Int {\n    return 1\n}\n\n// solitary eof\n")
+    }
 }

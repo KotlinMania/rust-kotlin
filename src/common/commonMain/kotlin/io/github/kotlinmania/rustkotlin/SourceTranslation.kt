@@ -431,7 +431,7 @@ private fun emitSplitInlineModCompanions(
                     source = source,
                     originalFile = rawChildFile,
                     file = selectParentItemsExcludingSplitInlineMods(rawChildFile, childHeader),
-                    trivia = trivia,
+                    trivia = trivia.withoutTrailingComments(),
                     macroDefs = macroDefs,
                     macroWrapperSpansByTargetOffset = macroWrapperSpansByTargetOffset,
                     headerContext = childHeader,
@@ -457,7 +457,7 @@ private fun emitSplitInlineModCompanions(
             for (nestedSplit in emitSplitInlineModCompanions(
                 expandedFile = rawChildFile,
                 source = source,
-                trivia = trivia,
+                trivia = trivia.withoutTrailingComments(),
                 macroDefs = macroDefs,
                 macroWrapperSpansByTargetOffset = macroWrapperSpansByTargetOffset,
                 headerContext = childHeader,
@@ -1041,6 +1041,7 @@ internal class KotlinJ2KEmitter(
     internal var usesSourceResultResidual: Boolean = false
     internal var currentEnclosingReturnsFmtResult: Boolean = false
     internal var currentTailExpectsUnitResultOk: Boolean = false
+    internal var inLocalInitializerPosition: Boolean = false
     internal var usesI128: Boolean = false
     internal var usesRustAny: Boolean = false
     internal var suppressTraitAssocPlaceholders: Boolean = false
@@ -2243,6 +2244,15 @@ internal class KotlinJ2KEmitter(
         out.append(allBodyItems.joinToString("\n\n"))
         if (out.isNotEmpty() && !out.endsWith('\n')) {
             out.append('\n')
+        }
+        if (!headerContext.isModuleRootSource && sharedDeclaredTypeNames == null && trivia.trailingComments.isNotEmpty()) {
+            val renderedTrailing = renderInlineComments(trivia.trailingComments, indent = "")
+            if (renderedTrailing.isNotEmpty()) {
+                if (allBodyItems.isNotEmpty() && !out.endsWith("\n\n")) {
+                    out.append('\n')
+                }
+                out.append(renderedTrailing)
+            }
         }
         return ensureBlankLineBeforeKDocAfterLineComment(out.toString())
     }

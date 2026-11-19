@@ -1428,7 +1428,7 @@ public object CoreIntrinsicLowering {
         val srcSyn = srcExplicitSyn ?: emitter.sourceInitializerType(argExpr)
         val dstSyn =
             dstExplicitSyn
-                ?: if (expectedTarget == null && emitter.callArgumentNestingDepth == 0) {
+                ?: if (expectedTarget == null && emitter.callArgumentNestingDepth == 0 && !emitter.inLocalInitializerPosition) {
                     emitter.currentEnclosingReturnSynType
                 } else {
                     null
@@ -1450,7 +1450,11 @@ public object CoreIntrinsicLowering {
             (
                 dstSyn?.let { emitter.renderType(it, selfTypeName) }
                     ?: expectedTarget
-                    ?: if (emitter.callArgumentNestingDepth == 0) emitter.currentEnclosingReturnRenderedType else null
+                    ?: if (emitter.callArgumentNestingDepth == 0 && !emitter.inLocalInitializerPosition) {
+                        emitter.currentEnclosingReturnRenderedType
+                    } else {
+                        null
+                    }
             )?.takeIf(::isUsableRenderedTypeArg)
         if (srcRendered != null && dstRendered != null) {
             if (srcRendered == dstRendered && srcRendered != "Unit") {
