@@ -180,60 +180,60 @@ import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.ptr
 import kotlinx.cinterop.value
 
-public actual inline fun kmLoadU8(addr: Long): UByte = $cinteropPackage.kmLoadU8(addr)
-public actual inline fun kmLoadU16(addr: Long): UShort = $cinteropPackage.kmLoadU16(addr)
-public actual inline fun kmLoadU32(addr: Long): UInt = $cinteropPackage.kmLoadU32(addr)
-public actual inline fun kmLoadU64(addr: Long): ULong = $cinteropPackage.kmLoadU64(addr)
-public actual inline fun kmLoadF32(addr: Long): Float = $cinteropPackage.kmLoadF32(addr)
-public actual inline fun kmLoadF64(addr: Long): Double = $cinteropPackage.kmLoadF64(addr)
+public actual fun kmLoadU8(addr: Long): UByte = $cinteropPackage.kmLoadU8(addr)
+public actual fun kmLoadU16(addr: Long): UShort = $cinteropPackage.kmLoadU16(addr)
+public actual fun kmLoadU32(addr: Long): UInt = $cinteropPackage.kmLoadU32(addr)
+public actual fun kmLoadU64(addr: Long): ULong = $cinteropPackage.kmLoadU64(addr)
+public actual fun kmLoadF32(addr: Long): Float = $cinteropPackage.kmLoadF32(addr)
+public actual fun kmLoadF64(addr: Long): Double = $cinteropPackage.kmLoadF64(addr)
 
-public actual inline fun kmStoreU8(addr: Long, value: UByte): Unit = $cinteropPackage.kmStoreU8(addr, value)
-public actual inline fun kmStoreU16(addr: Long, value: UShort): Unit = $cinteropPackage.kmStoreU16(addr, value)
-public actual inline fun kmStoreU32(addr: Long, value: UInt): Unit = $cinteropPackage.kmStoreU32(addr, value)
-public actual inline fun kmStoreU64(addr: Long, value: ULong): Unit = $cinteropPackage.kmStoreU64(addr, value)
-public actual inline fun kmStoreF32(addr: Long, value: Float): Unit = $cinteropPackage.kmStoreF32(addr, value)
-public actual inline fun kmStoreF64(addr: Long, value: Double): Unit = $cinteropPackage.kmStoreF64(addr, value)
+public actual fun kmStoreU8(addr: Long, value: UByte): Unit = $cinteropPackage.kmStoreU8(addr, value)
+public actual fun kmStoreU16(addr: Long, value: UShort): Unit = $cinteropPackage.kmStoreU16(addr, value)
+public actual fun kmStoreU32(addr: Long, value: UInt): Unit = $cinteropPackage.kmStoreU32(addr, value)
+public actual fun kmStoreU64(addr: Long, value: ULong): Unit = $cinteropPackage.kmStoreU64(addr, value)
+public actual fun kmStoreF32(addr: Long, value: Float): Unit = $cinteropPackage.kmStoreF32(addr, value)
+public actual fun kmStoreF64(addr: Long, value: Double): Unit = $cinteropPackage.kmStoreF64(addr, value)
 
-public actual inline fun kmVolatileLoadU8(addr: Long): UByte = $cinteropPackage.kmVolatileLoadU8(addr)
-public actual inline fun kmVolatileLoadU16(addr: Long): UShort = $cinteropPackage.kmVolatileLoadU16(addr)
-public actual inline fun kmVolatileLoadU32(addr: Long): UInt = $cinteropPackage.kmVolatileLoadU32(addr)
-public actual inline fun kmVolatileLoadU64(addr: Long): ULong = $cinteropPackage.kmVolatileLoadU64(addr)
+public actual fun kmVolatileLoadU8(addr: Long): UByte = $cinteropPackage.kmVolatileLoadU8(addr)
+public actual fun kmVolatileLoadU16(addr: Long): UShort = $cinteropPackage.kmVolatileLoadU16(addr)
+public actual fun kmVolatileLoadU32(addr: Long): UInt = $cinteropPackage.kmVolatileLoadU32(addr)
+public actual fun kmVolatileLoadU64(addr: Long): ULong = $cinteropPackage.kmVolatileLoadU64(addr)
 
-public actual inline fun kmVolatileStoreU8(addr: Long, value: UByte): Unit = $cinteropPackage.kmVolatileStoreU8(addr, value)
-public actual inline fun kmVolatileStoreU16(addr: Long, value: UShort): Unit = $cinteropPackage.kmVolatileStoreU16(addr, value)
-public actual inline fun kmVolatileStoreU32(addr: Long, value: UInt): Unit = $cinteropPackage.kmVolatileStoreU32(addr, value)
-public actual inline fun kmVolatileStoreU64(addr: Long, value: ULong): Unit = $cinteropPackage.kmVolatileStoreU64(addr, value)
+public actual fun kmVolatileStoreU8(addr: Long, value: UByte): Unit = $cinteropPackage.kmVolatileStoreU8(addr, value)
+public actual fun kmVolatileStoreU16(addr: Long, value: UShort): Unit = $cinteropPackage.kmVolatileStoreU16(addr, value)
+public actual fun kmVolatileStoreU32(addr: Long, value: UInt): Unit = $cinteropPackage.kmVolatileStoreU32(addr, value)
+public actual fun kmVolatileStoreU64(addr: Long, value: ULong): Unit = $cinteropPackage.kmVolatileStoreU64(addr, value)
 
-public actual inline fun kmCopyNonoverlapping(dst: Long, src: Long, bytes: Long): Unit =
+public actual fun kmCopyNonoverlapping(dst: Long, src: Long, bytes: Long): Unit =
     $cinteropPackage.kmCopyNonoverlapping(dst, src, bytes)
-public actual inline fun kmCopy(dst: Long, src: Long, bytes: Long): Unit =
+public actual fun kmCopy(dst: Long, src: Long, bytes: Long): Unit =
     $cinteropPackage.kmCopy(dst, src, bytes)
-public actual inline fun kmWriteBytes(dst: Long, value: UByte, bytes: Long): Unit =
+public actual fun kmWriteBytes(dst: Long, value: UByte, bytes: Long): Unit =
     $cinteropPackage.kmWriteBytes(dst, value, bytes)
-public actual inline fun kmCompareBytes(left: Long, right: Long, bytes: Long): Int =
+public actual fun kmCompareBytes(left: Long, right: Long, bytes: Long): Int =
     $cinteropPackage.kmCompareBytes(left, right, bytes)
 
-public actual inline fun kmAlloc(size: Long, align: Long): Long = $cinteropPackage.kmAlloc(size, align)
-public actual inline fun kmAllocZeroed(size: Long, align: Long): Long = $cinteropPackage.kmAllocZeroed(size, align)
-public actual inline fun kmRealloc(ptr: Long, oldSize: Long, align: Long, newSize: Long): Long =
+public actual fun kmAlloc(size: Long, align: Long): Long = $cinteropPackage.kmAlloc(size, align)
+public actual fun kmAllocZeroed(size: Long, align: Long): Long = $cinteropPackage.kmAllocZeroed(size, align)
+public actual fun kmRealloc(ptr: Long, oldSize: Long, align: Long, newSize: Long): Long =
     $cinteropPackage.kmRealloc(ptr, oldSize, align, newSize)
-public actual inline fun kmDealloc(ptr: Long, size: Long, align: Long): Unit =
+public actual fun kmDealloc(ptr: Long, size: Long, align: Long): Unit =
     $cinteropPackage.kmDealloc(ptr, size, align)
 
-public actual inline fun kmAtomicFence(ord: Int): Unit = $cinteropPackage.kmAtomicFence(ord)
-public actual inline fun kmAtomicSignalFence(ord: Int): Unit = $cinteropPackage.kmAtomicSignalFence(ord)
-public actual inline fun kmAtomicLoadU8(addr: Long, ord: Int): UByte = $cinteropPackage.kmAtomicLoadU8(addr, ord)
-public actual inline fun kmAtomicLoadU16(addr: Long, ord: Int): UShort = $cinteropPackage.kmAtomicLoadU16(addr, ord)
-public actual inline fun kmAtomicLoadU32(addr: Long, ord: Int): UInt = $cinteropPackage.kmAtomicLoadU32(addr, ord)
-public actual inline fun kmAtomicLoadU64(addr: Long, ord: Int): ULong = $cinteropPackage.kmAtomicLoadU64(addr, ord)
-public actual inline fun kmAtomicStoreU8(addr: Long, value: UByte, ord: Int): Unit = $cinteropPackage.kmAtomicStoreU8(addr, value, ord)
-public actual inline fun kmAtomicStoreU16(addr: Long, value: UShort, ord: Int): Unit = $cinteropPackage.kmAtomicStoreU16(addr, value, ord)
-public actual inline fun kmAtomicStoreU32(addr: Long, value: UInt, ord: Int): Unit = $cinteropPackage.kmAtomicStoreU32(addr, value, ord)
-public actual inline fun kmAtomicStoreU64(addr: Long, value: ULong, ord: Int): Unit = $cinteropPackage.kmAtomicStoreU64(addr, value, ord)
-public actual inline fun kmAtomicXchgU8(addr: Long, value: UByte, ord: Int): UByte = $cinteropPackage.kmAtomicXchgU8(addr, value, ord)
-public actual inline fun kmAtomicXchgU16(addr: Long, value: UShort, ord: Int): UShort = $cinteropPackage.kmAtomicXchgU16(addr, value, ord)
-public actual inline fun kmAtomicXchgU32(addr: Long, value: UInt, ord: Int): UInt = $cinteropPackage.kmAtomicXchgU32(addr, value, ord)
-public actual inline fun kmAtomicXchgU64(addr: Long, value: ULong, ord: Int): ULong = $cinteropPackage.kmAtomicXchgU64(addr, value, ord)
+public actual fun kmAtomicFence(ord: Int): Unit = $cinteropPackage.kmAtomicFence(ord)
+public actual fun kmAtomicSignalFence(ord: Int): Unit = $cinteropPackage.kmAtomicSignalFence(ord)
+public actual fun kmAtomicLoadU8(addr: Long, ord: Int): UByte = $cinteropPackage.kmAtomicLoadU8(addr, ord)
+public actual fun kmAtomicLoadU16(addr: Long, ord: Int): UShort = $cinteropPackage.kmAtomicLoadU16(addr, ord)
+public actual fun kmAtomicLoadU32(addr: Long, ord: Int): UInt = $cinteropPackage.kmAtomicLoadU32(addr, ord)
+public actual fun kmAtomicLoadU64(addr: Long, ord: Int): ULong = $cinteropPackage.kmAtomicLoadU64(addr, ord)
+public actual fun kmAtomicStoreU8(addr: Long, value: UByte, ord: Int): Unit = $cinteropPackage.kmAtomicStoreU8(addr, value, ord)
+public actual fun kmAtomicStoreU16(addr: Long, value: UShort, ord: Int): Unit = $cinteropPackage.kmAtomicStoreU16(addr, value, ord)
+public actual fun kmAtomicStoreU32(addr: Long, value: UInt, ord: Int): Unit = $cinteropPackage.kmAtomicStoreU32(addr, value, ord)
+public actual fun kmAtomicStoreU64(addr: Long, value: ULong, ord: Int): Unit = $cinteropPackage.kmAtomicStoreU64(addr, value, ord)
+public actual fun kmAtomicXchgU8(addr: Long, value: UByte, ord: Int): UByte = $cinteropPackage.kmAtomicXchgU8(addr, value, ord)
+public actual fun kmAtomicXchgU16(addr: Long, value: UShort, ord: Int): UShort = $cinteropPackage.kmAtomicXchgU16(addr, value, ord)
+public actual fun kmAtomicXchgU32(addr: Long, value: UInt, ord: Int): UInt = $cinteropPackage.kmAtomicXchgU32(addr, value, ord)
+public actual fun kmAtomicXchgU64(addr: Long, value: ULong, ord: Int): ULong = $cinteropPackage.kmAtomicXchgU64(addr, value, ord)
 
 public actual fun kmAtomicCxchgU8(addr: Long, expected: UByte, desired: UByte, succ: Int, fail: Int): AtomicCxchgU8Outcome =
     memScoped {
@@ -263,31 +263,31 @@ public actual fun kmAtomicCxchgU64(addr: Long, expected: ULong, desired: ULong, 
         AtomicCxchgU64Outcome(prev, ok.value != 0u.toUByte())
     }
 
-public actual inline fun kmAtomicRmwU8(addr: Long, value: UByte, op: Int, ord: Int): UByte = $cinteropPackage.kmAtomicRmwU8(addr, value, op, ord)
-public actual inline fun kmAtomicRmwU16(addr: Long, value: UShort, op: Int, ord: Int): UShort = $cinteropPackage.kmAtomicRmwU16(addr, value, op, ord)
-public actual inline fun kmAtomicRmwU32(addr: Long, value: UInt, op: Int, ord: Int): UInt = $cinteropPackage.kmAtomicRmwU32(addr, value, op, ord)
-public actual inline fun kmAtomicRmwU64(addr: Long, value: ULong, op: Int, ord: Int): ULong = $cinteropPackage.kmAtomicRmwU64(addr, value, op, ord)
+public actual fun kmAtomicRmwU8(addr: Long, value: UByte, op: Int, ord: Int): UByte = $cinteropPackage.kmAtomicRmwU8(addr, value, op, ord)
+public actual fun kmAtomicRmwU16(addr: Long, value: UShort, op: Int, ord: Int): UShort = $cinteropPackage.kmAtomicRmwU16(addr, value, op, ord)
+public actual fun kmAtomicRmwU32(addr: Long, value: UInt, op: Int, ord: Int): UInt = $cinteropPackage.kmAtomicRmwU32(addr, value, op, ord)
+public actual fun kmAtomicRmwU64(addr: Long, value: ULong, op: Int, ord: Int): ULong = $cinteropPackage.kmAtomicRmwU64(addr, value, op, ord)
 
-public actual inline fun kmCtpopU64(value: ULong): UInt = $cinteropPackage.kmCtpopU64(value)
-public actual inline fun kmCtlzU64(value: ULong): UInt = $cinteropPackage.kmCtlzU64(value)
-public actual inline fun kmCttzU64(value: ULong): UInt = $cinteropPackage.kmCttzU64(value)
-public actual inline fun kmBswapU16(value: UShort): UShort = $cinteropPackage.kmBswapU16(value)
-public actual inline fun kmBswapU32(value: UInt): UInt = $cinteropPackage.kmBswapU32(value)
-public actual inline fun kmBswapU64(value: ULong): ULong = $cinteropPackage.kmBswapU64(value)
-public actual inline fun kmBitreverseU64(value: ULong): ULong = $cinteropPackage.kmBitreverseU64(value)
-public actual inline fun kmFmaf32(a: Float, b: Float, c: Float): Float = $cinteropPackage.kmFmaf32(a, b, c)
-public actual inline fun kmFmaf64(a: Double, b: Double, c: Double): Double = $cinteropPackage.kmFmaf64(a, b, c)
-public actual inline fun kmSqrtf32(x: Float): Float = $cinteropPackage.kmSqrtf32(x)
-public actual inline fun kmSqrtf64(x: Double): Double = $cinteropPackage.kmSqrtf64(x)
+public actual fun kmCtpopU64(value: ULong): UInt = $cinteropPackage.kmCtpopU64(value)
+public actual fun kmCtlzU64(value: ULong): UInt = $cinteropPackage.kmCtlzU64(value)
+public actual fun kmCttzU64(value: ULong): UInt = $cinteropPackage.kmCttzU64(value)
+public actual fun kmBswapU16(value: UShort): UShort = $cinteropPackage.kmBswapU16(value)
+public actual fun kmBswapU32(value: UInt): UInt = $cinteropPackage.kmBswapU32(value)
+public actual fun kmBswapU64(value: ULong): ULong = $cinteropPackage.kmBswapU64(value)
+public actual fun kmBitreverseU64(value: ULong): ULong = $cinteropPackage.kmBitreverseU64(value)
+public actual fun kmFmaf32(a: Float, b: Float, c: Float): Float = $cinteropPackage.kmFmaf32(a, b, c)
+public actual fun kmFmaf64(a: Double, b: Double, c: Double): Double = $cinteropPackage.kmFmaf64(a, b, c)
+public actual fun kmSqrtf32(x: Float): Float = $cinteropPackage.kmSqrtf32(x)
+public actual fun kmSqrtf64(x: Double): Double = $cinteropPackage.kmSqrtf64(x)
 public actual fun kmAbort(): Nothing {
     $cinteropPackage.kmAbort()
     error("Unreachable after kmAbort")
 }
 
-public actual inline fun kmSpinLoopHint(): Unit = $cinteropPackage.kmSpinLoopHint()
-public actual inline fun kmBlackBoxU64(value: ULong): ULong = $cinteropPackage.kmBlackBoxU64(value)
-public actual inline fun kmUmulhU64(a: ULong, b: ULong): ULong = $cinteropPackage.kmUmulhU64(a, b)
-public actual inline fun kmSmulhI64(a: Long, b: Long): Long = $cinteropPackage.kmSmulhI64(a, b)
+public actual fun kmSpinLoopHint(): Unit = $cinteropPackage.kmSpinLoopHint()
+public actual fun kmBlackBoxU64(value: ULong): ULong = $cinteropPackage.kmBlackBoxU64(value)
+public actual fun kmUmulhU64(a: ULong, b: ULong): ULong = $cinteropPackage.kmUmulhU64(a, b)
+public actual fun kmSmulhI64(a: Long, b: Long): Long = $cinteropPackage.kmSmulhI64(a, b)
 public actual fun kmAtomicCxchgU128Pair(
     addr: Long,
     expLo: ULong,
@@ -302,14 +302,14 @@ public actual fun kmAtomicCxchgU128Pair(
         AtomicCxchgU128Outcome(outLo.value, outHi.value, ok != 0u.toUByte())
     }
 
-public actual inline fun kmSimdFmaF32x4(dstAddr: Long, aAddr: Long, bAddr: Long, cAddr: Long): Unit =
+public actual fun kmSimdFmaF32x4(dstAddr: Long, aAddr: Long, bAddr: Long, cAddr: Long): Unit =
     $cinteropPackage.kmSimdFmaF32x4(dstAddr, aAddr, bAddr, cAddr)
-public actual inline fun kmSimdDotF32(aAddr: Long, bAddr: Long, len: Long): Float =
+public actual fun kmSimdDotF32(aAddr: Long, bAddr: Long, len: Long): Float =
     $cinteropPackage.kmSimdDotF32(aAddr, bAddr, len)
 
 ${CoreIntrinsicMathAndBitSpecs.renderNativeActuals(cinteropPackage).trimEnd()}
 
-private class KmNativeCleanState(
+internal class KmNativeCleanState(
     private val cleanup: () -> Unit,
 ) {
     private val state = kotlin.concurrent.atomics.AtomicInt(0)
@@ -325,7 +325,7 @@ private class KmNativeCleanState(
     }
 }
 
-public actual class KmResourceCleaner internal constructor() : KmForgettableResource {
+public actual class KmResourceCleaner internal actual constructor() : KmForgettableResource {
     private var cleanState: KmNativeCleanState? = null
     private var nativeCleaner: kotlin.native.ref.Cleaner? = null
 
@@ -935,7 +935,7 @@ public actual fun kmSimdDotF32(aAddr: Long, bAddr: Long, len: Long): Float =
 
 ${CoreIntrinsicMathAndBitSpecs.renderJvmActuals(jniObjectName).trimEnd()}
 
-private class KmJvmCleanRef(
+internal class KmJvmCleanRef(
     referent: Any,
     queue: java.lang.ref.ReferenceQueue<Any>,
     private val activeRefs: java.util.concurrent.ConcurrentHashMap<KmJvmCleanRef, Boolean>,
@@ -991,7 +991,7 @@ private object KmJvmCleanerRegistry {
     }
 }
 
-public actual class KmResourceCleaner internal constructor() : KmForgettableResource {
+public actual class KmResourceCleaner internal actual constructor() : KmForgettableResource {
     private var cleanRef: KmJvmCleanRef? = null
 
     internal fun attach(ref: KmJvmCleanRef) {
