@@ -250,6 +250,7 @@ public data class FileHeaderContext(
     public val externalEnumVariantTypeArity: Map<String, Int> = emptyMap(),
     public val externalUnitEnumVariants: Set<String> = emptySet(),
     public val testClassName: String? = null,
+    public val sourceFilePath: String? = null,
 ) {
     public constructor(
         portLintSourcePath: String?,
@@ -554,6 +555,7 @@ internal fun inferFileHeaderContextWithResolvers(
         externalCrateTwoFieldResultFns = externalAbi.twoFieldResultFns,
         externalCrateNullableReturnFns = externalAbi.nullableReturnFns,
         externalCrateFnConstParams = externalAbi.fnConstParams,
+        sourceFilePath = inputPath,
     )
 }
 

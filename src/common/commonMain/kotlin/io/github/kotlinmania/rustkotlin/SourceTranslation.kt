@@ -162,10 +162,18 @@ internal fun selectSplitCandidateInlineModsForFile(file: File): List<Item.Mod> {
         }
     if (candidates.isEmpty()) return emptyList()
     val seenNames = hashSetOf<String>()
+    val seenModTargets = hashSetOf<String>()
     val parentNonModItems = file.items.filterNot { it is Item.Mod }
     seenNames.addAll(collectDirectDeclaredItemCollisionNames(parentNonModItems))
     var hasCollision = false
     for (modItem in candidates) {
+        val rawMod = modItem.ident.toString().removePrefix("r#")
+        val modKt = rustModuleIdentToKotlin(rawMod.replace('-', '_'))
+        val modPascal = rustTypeIdentToKotlin(rawMod)
+        if (modKt.isNotEmpty() && !seenModTargets.add("$modKt/$modPascal.kt")) {
+            hasCollision = true
+            break
+        }
         val modItems = (modItem.content as ModContent.Inline).items
         for (declName in collectDirectDeclaredItemCollisionNames(modItems)) {
             if (!seenNames.add(declName)) {
@@ -298,6 +306,64 @@ private fun useTreeRootIdent(tree: UseTree): String? =
         else -> null
     }
 
+private fun mergeDuplicateSplitInlineMods(
+    modGroup: List<Item.Mod>,
+    parentUses: List<Item.Use>,
+): Pair<List<Attribute>, List<Item>> {
+    if (modGroup.size == 1) {
+        val single = modGroup.first()
+        val inlineItems = (single.content as ModContent.Inline).items
+        val hasSuperImport =
+            inlineItems.any { child ->
+                child is Item.Use && !itemHasDocOnlyCfg(child) && useTreeStartsWithSuper(child.tree)
+            }
+        val childItems = if (hasSuperImport && parentUses.isNotEmpty()) parentUses + inlineItems else inlineItems
+        return single.attrs to childItems
+    }
+    val rankedMods = modGroup.sortedByDescending { cfgAttrPreferenceScore(it.attrs) }
+    val primaryMod = rankedMods.first()
+    val claimedDeclNames = hashSetOf<String>()
+    val seenUseTokens = hashSetOf<String>()
+    val mergedItems = mutableListOf<Item>()
+    var anyHasSuperImport = false
+    for (modItem in rankedMods) {
+        val inlineItems = (modItem.content as ModContent.Inline).items
+        val skippedTypeNamesInCurrentMod = hashSetOf<String>()
+        for (item in inlineItems) {
+            if (itemHasDocOnlyCfg(item)) continue
+            when (item) {
+                is Item.Use -> {
+                    if (useTreeStartsWithSuper(item.tree)) {
+                        anyHasSuperImport = true
+                    }
+                    if (seenUseTokens.add(item.toTokenStream().toString())) {
+                        mergedItems += item
+                    }
+                }
+                is Item.Impl -> {
+                    val owner = extractChunkOwnerTypeName(item.selfType, item.generics)
+                    if (owner == null || owner !in skippedTypeNamesInCurrentMod) {
+                        mergedItems += item
+                    }
+                }
+                else -> {
+                    val declNames = collectDirectDeclaredItemCollisionNames(listOf(item))
+                    if (declNames.isNotEmpty() && declNames.any { it in claimedDeclNames }) {
+                        if (item is Item.Struct || item is Item.Enum || item is Item.Union) {
+                            skippedTypeNamesInCurrentMod.addAll(declNames)
+                        }
+                        continue
+                    }
+                    claimedDeclNames.addAll(declNames)
+                    mergedItems += item
+                }
+            }
+        }
+    }
+    val finalItems = if (anyHasSuperImport && parentUses.isNotEmpty()) parentUses + mergedItems else mergedItems
+    return primaryMod.attrs to finalItems
+}
+
 private fun emitSplitInlineModCompanions(
     expandedFile: File,
     source: String,
@@ -322,12 +388,19 @@ private fun emitSplitInlineModCompanions(
                 val root = useTreeRootIdent(u.tree)
                 root != null && root != "self" && root != "super" && root !in parentLocalMods
             }.map { it.copy(vis = Visibility.Inherited) }
-    val out = mutableListOf<CompanionInteropFile>()
+    val groupedSplitMods = linkedMapOf<String, MutableList<Item.Mod>>()
     for (modItem in splitMods) {
         val rawMod = modItem.ident.toString().removePrefix("r#")
         val modKt = rustModuleIdentToKotlin(rawMod.replace('-', '_'))
         if (modKt.isEmpty()) continue
         val modPascal = rustTypeIdentToKotlin(rawMod)
+        groupedSplitMods.getOrPut("$modKt/$modPascal.kt") { mutableListOf() }.add(modItem)
+    }
+    val out = mutableListOf<CompanionInteropFile>()
+    for ((targetRelPath, modGroup) in groupedSplitMods) {
+        val primaryMod = modGroup.first()
+        val rawMod = primaryMod.ident.toString().removePrefix("r#")
+        val modKt = rustModuleIdentToKotlin(rawMod.replace('-', '_'))
         val childRelDir =
             if (headerContext.currentRelativeSourceDir.isNullOrEmpty()) {
                 rawMod
@@ -341,16 +414,11 @@ private fun emitSplitInlineModCompanions(
                 currentRelativeSourceDir = childRelDir,
                 isModuleRootSource = false,
             )
-        val inlineItems = (modItem.content as ModContent.Inline).items
-        val hasSuperImport =
-            inlineItems.any { child ->
-                child is Item.Use && !itemHasDocOnlyCfg(child) && useTreeStartsWithSuper(child.tree)
-            }
-        val childItems = if (hasSuperImport && parentUses.isNotEmpty()) parentUses + inlineItems else inlineItems
+        val (mergedAttrs, childItems) = mergeDuplicateSplitInlineMods(modGroup, parentUses)
         val rawChildFile =
             File(
                 shebang = null,
-                attrs = modItem.attrs,
+                attrs = mergedAttrs,
                 items = childItems,
             )
         val prevLayout = TranslationSession.sourceLayoutFile
@@ -372,7 +440,7 @@ private fun emitSplitInlineModCompanions(
             if (hasEmittedKotlinDeclarations(childText)) {
                 out +=
                     CompanionInteropFile(
-                        relativePath = "$modKt/$modPascal.kt",
+                        relativePath = targetRelPath,
                         kind = CompanionInteropKind.CommonKotlinSupport,
                         content = childText,
                     )

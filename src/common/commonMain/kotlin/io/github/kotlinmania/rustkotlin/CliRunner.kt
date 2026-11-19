@@ -1128,6 +1128,7 @@ private fun executeTranslate(
         val headerContext =
             FileHeaderContext(
                 portLintSourcePath = if (isModRoot) null else inferredHeader.portLintSourcePath,
+                sourceFilePath = entry.inputPath,
                 packageName = finalPackage,
                 projectGroup = finalGroup,
                 projectNamespace = finalNamespace,

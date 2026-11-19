@@ -106,6 +106,18 @@ internal fun isDocOnlyCfgPredicateTokens(tokens: List<TokenTree>): Boolean =
 internal fun evalCfgExpressionTokens(tokens: List<TokenTree>): Boolean =
     evalCfgTriState(tokens, forRuntimeCfgMacro = true) ?: false
 
+internal fun cfgAttrPreferenceScore(attrs: List<Attribute>): Int {
+    val cfgPredicates =
+        attrs.mapNotNull { attr ->
+            val meta = attr.meta
+            if (meta is Meta.List && meta.path.isIdent("cfg")) meta.tokens.clone().toList() else null
+        }
+    if (cfgPredicates.isEmpty()) return 1
+    if (cfgPredicates.all { evalCfgTriState(it, forRuntimeCfgMacro = false) == true }) return 3
+    if (cfgPredicates.all { evalCfgExpressionTokens(it) }) return 2
+    return 0
+}
+
 private data class CfgSelectArm(
     val predicateTokens: List<TokenTree>?,
     val bodyTokens: List<TokenTree>,
@@ -1163,18 +1175,6 @@ internal class MacroRulesFileExpander(
         (arg as? FnArg.Typed)?.let {
             (it.patType.pat as? Pat.Ident)?.ident?.toString()?.removePrefix("r#")
         }
-
-    private fun cfgAttrPreferenceScore(attrs: List<Attribute>): Int {
-        val cfgPredicates =
-            attrs.mapNotNull { attr ->
-                val meta = attr.meta
-                if (meta is Meta.List && meta.path.isIdent("cfg")) meta.tokens.clone().toList() else null
-            }
-        if (cfgPredicates.isEmpty()) return 1
-        if (cfgPredicates.all { evalCfgTriState(it, forRuntimeCfgMacro = false) == true }) return 3
-        if (cfgPredicates.all { evalCfgExpressionTokens(it) }) return 2
-        return 0
-    }
 
     override fun foldType(t: SynType): SynType {
         if (t is SynType.Macro && activeDefinitions.isNotEmpty() && activeExpansionDepth <= MAX_MACRO_EXPANSION_DEPTH) {
