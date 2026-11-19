@@ -3320,6 +3320,8 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
     if (diverge == null && initExpr is Expr.BlockExpr) {
         val blockStmts = initExpr.block.stmts
         if (blockStmts.size == 1 && blockStmts[0] is Stmt.ExprStmt) {
+            val prevInLocalInit = inLocalInitializerPosition
+            inLocalInitializerPosition = true
             val singleRhs =
                 try {
                     renderTypedNumericInitializer(
@@ -3330,6 +3332,7 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
                     )
                 } finally {
                     currentExpectedParseTargetType = prevParseTarget
+                    inLocalInitializerPosition = prevInLocalInit
                 }
             val (patText, typeAnnotation) =
                 renderLocalPattern(
@@ -3342,11 +3345,14 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
             val typeSuffix = if (typeAnnotation != null && !patText.startsWith("(")) ": $typeAnnotation" else ""
             return "$indent$keyword $patText$typeSuffix = $singleRhs"
         }
+        val prevInLocalInit = inLocalInitializerPosition
+        inLocalInitializerPosition = true
         val blockBody =
             try {
                 renderBlock(initExpr.block, indent, selfTypeName)
             } finally {
                 currentExpectedParseTargetType = prevParseTarget
+                inLocalInitializerPosition = prevInLocalInit
             }
         val (patText, typeAnnotation) =
             renderLocalPattern(
@@ -3359,11 +3365,14 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
         val typeSuffix = if (typeAnnotation != null && !patText.startsWith("(")) ": $typeAnnotation" else ""
         return "$indent$keyword $patText$typeSuffix = run $blockBody"
     }
+    val prevInLocalInit = inLocalInitializerPosition
+    inLocalInitializerPosition = true
     var rhs =
         try {
             renderTypedNumericInitializer(initExpr, localNumKind, indent, selfTypeName)
         } finally {
             currentExpectedParseTargetType = prevParseTarget
+            inLocalInitializerPosition = prevInLocalInit
         }
     val expectsMutableList = keyword == "var" || inferredArrayTarget?.startsWith("MutableList<") == true
     if (expectsMutableList && explicitLocalAnnotation == null && diverge == null) {

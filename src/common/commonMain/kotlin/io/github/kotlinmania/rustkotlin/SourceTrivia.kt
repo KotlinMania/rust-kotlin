@@ -38,7 +38,19 @@ internal data class TriviaPiece(
 internal class SourceTrivia private constructor(
     val fileInnerDocs: List<TriviaPiece>,
     private val inlineByNextTokenStart: Map<Int, List<TriviaPiece>>,
+    val trailingComments: List<TriviaPiece> = emptyList(),
 ) {
+    fun withoutTrailingComments(): SourceTrivia =
+        if (trailingComments.isEmpty()) {
+            this
+        } else {
+            SourceTrivia(
+                fileInnerDocs = fileInnerDocs,
+                inlineByNextTokenStart = inlineByNextTokenStart,
+                trailingComments = emptyList(),
+            )
+        }
+
     fun leadingBefore(span: Span): List<TriviaPiece> {
         val start = span.startOffset()
         return inlineByNextTokenStart[start].orEmpty()
@@ -78,11 +90,20 @@ internal class SourceTrivia private constructor(
                 }
             }
 
+            val trailingComments = mutableListOf<TriviaPiece>()
             if (cursor < source.length) {
                 val pieces = scanGapForComments(source, cursor, source.length)
                 for (piece in pieces) {
-                    if (piece.style == TriviaStyle.InnerDocLine || piece.style == TriviaStyle.InnerDocBlock) {
-                        fileInnerDocs += piece
+                    when (piece.style) {
+                        TriviaStyle.InnerDocLine, TriviaStyle.InnerDocBlock -> {
+                            fileInnerDocs += piece
+                        }
+                        TriviaStyle.LineComment, TriviaStyle.BlockComment -> {
+                            trailingComments += piece
+                        }
+                        TriviaStyle.OuterDocLine, TriviaStyle.OuterDocBlock -> {
+                            // EOF outer doc comments have no following declaration.
+                        }
                     }
                 }
             }
@@ -90,6 +111,7 @@ internal class SourceTrivia private constructor(
             return SourceTrivia(
                 fileInnerDocs = fileInnerDocs,
                 inlineByNextTokenStart = inlineByNextTokenStart,
+                trailingComments = trailingComments,
             )
         }
 

@@ -441,6 +441,8 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
             val valExpr =
                 expr.expr?.let { retArg ->
                     val savedRetTarget = currentExpectedParseTargetType
+                    val savedInLocalInit = inLocalInitializerPosition
+                    inLocalInitializerPosition = false
                     if (unwrapParenOrGroupExpr(retArg) is Expr.Macro && currentExpectedParseTargetType == null) {
                         currentExpectedParseTargetType = currentEnclosingReturnRenderedType
                     }
@@ -449,6 +451,7 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                             renderTypedNumericInitializer(retArg, retNumKind, indent, selfTypeName)
                         } finally {
                             currentExpectedParseTargetType = savedRetTarget
+                            inLocalInitializerPosition = savedInLocalInit
                         }
                     coerceTailFmtUnitToResultOk(retArg, rawRendered, selfTypeName)
                 }
@@ -873,7 +876,9 @@ internal fun KotlinJ2KEmitter.renderExprClosure(expr: Expr.Closure, indent: Stri
     val prevExpectedParseTarget = currentExpectedParseTargetType
     val prevTypedLocals = currentTypedLocals
     val prevTupleElemType = currentClosureTupleElemType
+    val prevInLocalInit = inLocalInitializerPosition
     currentClosureTupleElemType = null
+    inLocalInitializerPosition = false
     val assignedLabel =
         if (hasDirectReturn) {
             val idx = closureLabelCounter++
@@ -975,6 +980,7 @@ internal fun KotlinJ2KEmitter.renderExprClosure(expr: Expr.Closure, indent: Stri
         currentExpectedParseTargetType = prevExpectedParseTarget
         currentTypedLocals = prevTypedLocals
         currentClosureTupleElemType = prevTupleElemType
+        inLocalInitializerPosition = prevInLocalInit
     }
 }
 

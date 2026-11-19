@@ -135,18 +135,69 @@ internal fun KotlinJ2KEmitter.renderMacroInvocationAsStmtOrExpr(
                 }
             val savedParseTarget = currentExpectedParseTargetType
             val savedKind = currentExpectedNumericKind
-            val args =
-                try {
-                    if (elemTarget != null) {
+            val repeatStreams = splitTopLevelVecRepeatSemicolon(tokens)
+            if (repeatStreams != null) {
+                val (elemStream, countStream) = repeatStreams
+                val elemKind = elemTarget?.let(this::resolveNumericKind)
+                val (elemRendered, isLiteralElem) =
+                    try {
                         currentExpectedParseTargetType = elemTarget
-                        resolveNumericKind(elemTarget)?.let { currentExpectedNumericKind = it }
+                        currentExpectedNumericKind = elemKind
+                        val parsedElem =
+                            io.github.kotlinmania.syn
+                                .parse2(io.github.kotlinmania.syn.ExprParse::parse, elemStream.clone())
+                                .getOrNull()
+                        val rendered =
+                            if (parsedElem != null) {
+                                renderTypedNumericInitializer(parsedElem, elemKind, indent, selfTypeName)
+                            } else {
+                                parseAndRenderTokenStreamAsExpr(elemStream, indent, selfTypeName)
+                            }
+                        val isLit = parsedElem != null && unwrapParenOrGroupExpr(parsedElem) is Expr.Lit
+                        rendered to isLit
+                    } finally {
+                        currentExpectedParseTargetType = savedParseTarget
+                        currentExpectedNumericKind = savedKind
                     }
-                    parseCommaSeparatedExprsFromTokens(tokens, indent, selfTypeName)
-                } finally {
-                    currentExpectedParseTargetType = savedParseTarget
-                    currentExpectedNumericKind = savedKind
+                val countInt =
+                    try {
+                        currentExpectedParseTargetType = null
+                        currentExpectedNumericKind = NumericKind.I32
+                        val parsedCount =
+                            io.github.kotlinmania.syn
+                                .parse2(io.github.kotlinmania.syn.ExprParse::parse, countStream.clone())
+                                .getOrNull()
+                        if (parsedCount != null) {
+                            val rawCount = renderTypedNumericInitializer(parsedCount, NumericKind.I32, indent, selfTypeName)
+                            normalizeArrayLengthToIntExpr(rawCount, parsedCount, selfTypeName)
+                        } else {
+                            val rawCount = parseAndRenderTokenStreamAsExpr(countStream, indent, selfTypeName)
+                            normalizeArrayLengthToIntExpr(rawCount, null, selfTypeName)
+                        }
+                    } finally {
+                        currentExpectedParseTargetType = savedParseTarget
+                        currentExpectedNumericKind = savedKind
+                    }
+                if (isLiteralElem) {
+                    "MutableList($countInt) { $elemRendered }"
+                } else {
+                    val repeatElemName = "repeatElem${closureLabelCounter++}"
+                    "run { val $repeatElemName = $elemRendered; MutableList($countInt) { $repeatElemName } }"
                 }
-            "mutableListOf(${args.joinToString(", ")})"
+            } else {
+                val args =
+                    try {
+                        if (elemTarget != null) {
+                            currentExpectedParseTargetType = elemTarget
+                            resolveNumericKind(elemTarget)?.let { currentExpectedNumericKind = it }
+                        }
+                        parseCommaSeparatedExprsFromTokens(tokens, indent, selfTypeName)
+                    } finally {
+                        currentExpectedParseTargetType = savedParseTarget
+                        currentExpectedNumericKind = savedKind
+                    }
+                "mutableListOf(${args.joinToString(", ")})"
+            }
         }
         "const_assert" -> {
             val parts = MacroRulesFileExpander.splitMacroArguments(tokens)
@@ -880,6 +931,23 @@ private fun splitAssertEqArgsForMacro(stream: TokenStream): List<List<TokenTree>
         out += cur.toList()
     }
     return out
+}
+
+private fun splitTopLevelVecRepeatSemicolon(tokens: TokenStream): Pair<TokenStream, TokenStream>? {
+    val trees = tokens.clone().toList()
+    if (trees.isEmpty()) return null
+    var semiIndex = -1
+    for ((idx, tt) in trees.withIndex()) {
+        val punct = (tt as? TokenTree.Punct)?.value?.asChar() ?: continue
+        if (punct == ';') {
+            if (semiIndex >= 0) return null
+            semiIndex = idx
+        }
+    }
+    if (semiIndex <= 0 || semiIndex >= trees.lastIndex) return null
+    val elemTrees = trees.subList(0, semiIndex)
+    val countTrees = trees.subList(semiIndex + 1, trees.size)
+    return TokenStream.fromTokenTrees(elemTrees) to TokenStream.fromTokenTrees(countTrees)
 }
 
 internal fun KotlinJ2KEmitter.parseCommaSeparatedExprsFromTokens(
