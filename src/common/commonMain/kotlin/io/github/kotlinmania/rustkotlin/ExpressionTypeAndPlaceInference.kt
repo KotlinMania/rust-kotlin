@@ -1633,6 +1633,16 @@ internal fun isSetRenderedType(type: String?): Boolean {
         clean.startsWith("HashSet<")
 }
 
+internal fun isIndexedSliceOrArrayRenderedType(type: String?): Boolean {
+    val clean = type?.trim()?.removeSuffix("?")?.trim() ?: return false
+    val base = clean.substringBefore('<').substringAfterLast('.').trim()
+    return base in PRIMITIVE_ARRAY_TYPES ||
+        base == "List" ||
+        base == "MutableList" ||
+        base == "Array" ||
+        base == "ArrayDeque"
+}
+
 internal fun mutablePlaceValueType(type: String?): String? =
     type
         ?.takeIf { it.startsWith("kotlin.reflect.KMutableProperty0<") && it.endsWith('>') }

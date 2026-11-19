@@ -1246,4 +1246,66 @@ class SingleFileTranslationTest {
         assertContains(positiveResult.text, "x.also { x = null }")
         assertContains(positiveResult.text, "h.slot.also { h.slot = null }")
     }
+
+    @Test fun sliceGetAndGetMutLowerToGetOrNullWithoutHijackingCustomOrMapGet() {
+        val source =
+            """
+            use std::collections::HashMap;
+
+            pub struct Store {
+                pub value: i32,
+            }
+
+            impl Store {
+                pub fn get(&self, _idx: usize) -> i32 {
+                    self.value
+                }
+            }
+
+            pub struct FlagIter<'a> {
+                pub flags: &'a [i32],
+                pub idx: usize,
+            }
+
+            impl<'a> FlagIter<'a> {
+                pub fn next_flag(&mut self) -> Option<i32> {
+                    while let Some(flag) = self.flags.get(self.idx) {
+                        self.idx += 1;
+                        return Some(*flag);
+                    }
+                    None
+                }
+            }
+
+            pub fn slice_get_copied(xs: &[i32], i: usize) -> Option<i32> {
+                xs.get(i).copied()
+            }
+
+            pub fn slice_get_mut(xs: &mut [i32], i: usize) -> Option<&mut i32> {
+                xs.get_mut(i)
+            }
+
+            pub fn array_get(arr: [i32; 4], i: usize) -> Option<&i32> {
+                arr.get(i)
+            }
+
+            pub fn custom_store_get(store: &Store, idx: usize) -> i32 {
+                store.get(idx)
+            }
+
+            pub fn map_get(map: &HashMap<String, i32>, k: &str) -> Option<&i32> {
+                map.get(k)
+            }
+            """.trimIndent()
+        val result = renderSingleKotlinFile(source)
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(result.text, "SliceGet.kt")
+        assertContains(result.text, "xs.getOrNull(i)")
+        assertEquals(2, Regex("""xs\.getOrNull\(i\)""").findAll(result.text).count(), result.text)
+        assertContains(result.text, "arr.getOrNull(i)")
+        assertContains(result.text, "this.flags.getOrNull(this.idx)")
+        assertContains(result.text, "store.get(idx)")
+        assertFalse(result.text.contains("store.getOrNull("), "Custom Store.get must not become getOrNull:\n${result.text}")
+        assertContains(result.text, "map.get(k)")
+        assertFalse(result.text.contains("map.getOrNull("), "HashMap.get must not become getOrNull:\n${result.text}")
+    }
 }
