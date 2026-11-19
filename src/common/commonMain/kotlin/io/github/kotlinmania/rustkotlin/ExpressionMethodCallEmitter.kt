@@ -1310,6 +1310,17 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
     if (rawMethod == "push_back" && renderedValueArgs.size == 1 && typeArgs.isEmpty()) {
         return "$receiver.addLast(${renderedValueArgs[0]})"
     }
+    fun renderIndexedGetOrNull(recvTarget: String): String {
+        val indexExpr = allMethodArgs[0]
+        val idxKind = inferExprNumericKind(indexExpr, selfTypeName)
+        val idxArg =
+            if (idxKind != null && idxKind != NumericKind.I32) {
+                normalizeArrayLengthToIntExpr(renderedValueArgs[0], indexExpr, selfTypeName)
+            } else {
+                renderedValueArgs[0]
+            }
+        return "$recvTarget.getOrNull($idxArg)"
+    }
     if (isVecReceiver && typeArgs.isEmpty()) {
         when {
             rawMethod == "push" && renderedValueArgs.size == 1 ->
@@ -1318,8 +1329,10 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                 return "$receiver.add(${renderedValueArgs[0]}, ${renderedValueArgs[1]})"
             rawMethod == "clone_from" && renderedValueArgs.size == 1 ->
                 return "run { $receiver.clear(); $receiver.addAll(${renderedValueArgs[0]}) }"
-            (rawMethod == "get" || rawMethod == "get_mut") && renderedValueArgs.size == 1 ->
-                return "$receiver.getOrNull(${renderedValueArgs[0]})"
+            (rawMethod == "get" || rawMethod == "get_mut") &&
+                renderedValueArgs.size == 1 &&
+                unwrapParenOrGroupExpr(allMethodArgs[0]) !is Expr.Range ->
+                return renderIndexedGetOrNull(receiver)
         }
     }
     val recvCollectionTy = (currentTypedLocals[receiver] ?: inferExprRenderedType(expr.receiver, selfTypeName))
@@ -1333,6 +1346,15 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
             (rawMethod == "get" || rawMethod == "get_mut") && renderedValueArgs.size == 1 ->
                 return "$recvAtom.get(${renderedValueArgs[0]})"
         }
+    }
+    if ((rawMethod == "get" || rawMethod == "get_mut") &&
+        renderedValueArgs.size == 1 &&
+        typeArgs.isEmpty() &&
+        unwrapParenOrGroupExpr(allMethodArgs[0]) !is Expr.Range &&
+        isIndexedSliceOrArrayRenderedType(recvCollectionTy)
+    ) {
+        val recvAtom = if (isAtomicPostfixReceiver(expr.receiver, receiver)) receiver else "($receiver)"
+        return renderIndexedGetOrNull(recvAtom)
     }
     if (isSetRenderedType(recvCollectionTy) && typeArgs.isEmpty()) {
         val recvAtom = if (isAtomicPostfixReceiver(expr.receiver, receiver)) receiver else "($receiver)"
