@@ -3186,7 +3186,13 @@ internal fun KotlinJ2KEmitter.recordLocalInferredType(
     val inferredRenderedTy = inferExprRenderedType(initExpr, selfTypeName)
     if (inferredRenderedTy != null) {
         val adjustedTy =
-            if ((rhs.startsWith("MutableList(") || rhs.startsWith("mutableListOf(")) && inferredRenderedTy.startsWith("List<")) {
+            if ((
+                    rhs.startsWith("MutableList(") ||
+                        rhs.startsWith("mutableListOf(") ||
+                        (rhs.startsWith("run { val repeatElem") && "; MutableList(" in rhs)
+                ) &&
+                inferredRenderedTy.startsWith("List<")
+            ) {
                 "Mutable$inferredRenderedTy"
             } else {
                 inferredRenderedTy
@@ -3379,6 +3385,8 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
         val unwrappedInit = unwrapParenOrGroupExpr(initExpr)
         if (unwrappedInit is Expr.Repeat && rhs.startsWith("List(")) {
             rhs = "Mutable$rhs"
+        } else if (unwrappedInit is Expr.Repeat && rhs.startsWith("run { val repeatElem") && "; List(" in rhs) {
+            rhs = rhs.replaceFirst("; List(", "; MutableList(")
         } else if (unwrappedInit is Expr.Array && rhs.startsWith("listOf(")) {
             rhs = "mutableListOf(" + rhs.removePrefix("listOf(")
         }
@@ -3469,6 +3477,47 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
     if (rhs == "null" && typeAnnotation != null && !typeAnnotation.endsWith("?")) {
         typeAnnotation = "$typeAnnotation?"
     }
+    val somePayload =
+        if (!hasDeclaredOptionEnum() && diverge == null) {
+            unwrapUnqualifiedOptionSomeArg(unwrappedInitExpr)
+        } else {
+            null
+        }
+    if (somePayload != null && typeAnnotation == null && !patText.startsWith("(")) {
+        val unwrappedLitExpr =
+            when (val corePayload = unwrapParenOrGroupExpr(somePayload)) {
+                is Expr.Lit -> corePayload
+                is Expr.Unary ->
+                    if (corePayload.op is UnOp.Neg || corePayload.op is UnOp.NotOp) {
+                        unwrapParenOrGroupExpr(corePayload.expr) as? Expr.Lit
+                    } else {
+                        null
+                    }
+                else -> null
+            }
+        val literalFallbackTy =
+            when (unwrappedLitExpr?.lit) {
+                is Lit.Int ->
+                    when {
+                        rhs.endsWith("uL") -> "ULong"
+                        rhs.endsWith("u") -> "UInt"
+                        rhs.endsWith("L") -> "Long"
+                        else -> "Int"
+                    }
+                is Lit.Float -> if (rhs.endsWith("f")) "Float" else "Double"
+                is Lit.Bool -> "Boolean"
+                is Lit.Str -> "String"
+                is Lit.Char -> "Char"
+                else -> null
+            }
+        val inferredSomeTy =
+            inferExprRenderedType(somePayload, selfTypeName)?.trim()
+                ?: (inferExprNumericKind(somePayload, selfTypeName) ?: localNumKind)?.let(this::numericKindToPureTypeName)
+                ?: literalFallbackTy
+        if (!inferredSomeTy.isNullOrEmpty() && inferredSomeTy !in setOf("Nothing?", "Nothing", "Any?", "Any")) {
+            typeAnnotation = if (inferredSomeTy.endsWith("?")) inferredSomeTy else "$inferredSomeTy?"
+        }
+    }
     currentAddressableLocals = currentAddressableLocals - patText
     currentAddressableArrayElementTypes = currentAddressableArrayElementTypes - patText
     recordLocalInferredType(patText, typeAnnotation, initExpr, rhs, selfTypeName, localNumKind, pat = pat)
@@ -3478,6 +3527,7 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
             currentMutableListLocals = currentMutableListLocals - patText
         } else if (rhs.startsWith("mutableListOf") ||
             rhs.startsWith("MutableList(") ||
+            (rhs.startsWith("run { val repeatElem") && "; MutableList(" in rhs) ||
             rhs.startsWith("ArrayList(") ||
             rhs.startsWith("ArrayList<") ||
             rhs.endsWith(".toMutableList()") ||
@@ -3486,7 +3536,7 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
             currentMutableListLocals = currentMutableListLocals + patText
             currentDequeLocals = currentDequeLocals - patText
         }
-        if (typeAnnotation?.endsWith("?") == true || rhs == "null") {
+        if (typeAnnotation?.endsWith("?") == true || rhs == "null" || somePayload != null) {
             currentNullableLocals = currentNullableLocals + patText
         }
     }

@@ -461,12 +461,18 @@ private inline fun KotlinJ2KEmitter.withExpectedNumericKind(
     }
 }
 
-private fun KotlinJ2KEmitter.unwrapUnqualifiedOptionSomeArg(expression: Expr): Expr? {
+internal fun KotlinJ2KEmitter.unwrapUnqualifiedOptionSomeArg(expression: Expr): Expr? {
     if ("Some" in inspector.declaredTypeNames || hasDeclaredOptionEnum()) return null
     val call = unwrapParenOrGroupExpr(expression) as? Expr.Call ?: return null
     val path = (call.func as? Expr.Path)?.takeIf { it.qself == null }?.path ?: return null
     val parts = path.segments.toList().map { it.ident.toString().removePrefix("r#") }
-    if (parts != listOf("Some") && parts != listOf("Option", "Some")) return null
+    if (parts != listOf("Some") &&
+        parts != listOf("Option", "Some") &&
+        parts != listOf("core", "option", "Option", "Some") &&
+        parts != listOf("std", "option", "Option", "Some")
+    ) {
+        return null
+    }
     return call.args.toList().singleOrNull { !(it is Expr.Tuple && it.elems.isEmpty()) }
 }
 

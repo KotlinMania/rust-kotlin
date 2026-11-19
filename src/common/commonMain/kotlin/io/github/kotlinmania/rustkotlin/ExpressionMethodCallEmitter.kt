@@ -104,15 +104,31 @@ private fun KotlinJ2KEmitter.tryRenderStringAppendMethod(
     }
 }
 
+private fun KotlinJ2KEmitter.isDirectDivergingOptionArg(
+    expr: Expr,
+    rendered: String,
+): Boolean = isDirectDivergingRenderedExpr(expr, rendered)
+
 internal fun KotlinJ2KEmitter.isFmtStringBuilderReceiver(
     recvExpr: Expr,
     renderedRecv: String,
     selfTypeName: String?,
 ): Boolean {
-    if (renderedRecv in setOf("f", "fmt", "formatter")) return true
-    if (renderedRecv.isNotEmpty() && currentTypedLocals[renderedRecv] == "StringBuilder") return true
+    fun isStdFmtReceiverType(ty: String?): Boolean {
+        val clean = ty?.removeSuffix("?")?.substringBefore('<')?.trim() ?: return false
+        val simple = clean.substringAfterLast('.')
+        return clean == "StringBuilder" ||
+            simple == "StringBuilder" ||
+            ((clean == "Formatter" || clean.endsWith(".fmt.Formatter")) && "Formatter" !in inspector.declaredTypeNames)
+    }
+    val explicitLocalTy =
+        renderedRecv
+            .takeIf { it.isNotEmpty() }
+            ?.let { currentTypedLocals[it]?.removeSuffix("?")?.trim() }
     val inferred = inferExprRenderedType(recvExpr, selfTypeName)?.removeSuffix("?")?.trim()
-    return inferred == "StringBuilder"
+    if (isStdFmtReceiverType(explicitLocalTy) || isStdFmtReceiverType(inferred)) return true
+    if (explicitLocalTy != null || inferred != null) return false
+    return renderedRecv in setOf("f", "fmt", "formatter")
 }
 
 internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent: String, selfTypeName: String?): String {
@@ -1157,7 +1173,8 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
     }
     if ((rawMethod == "write_str" || rawMethod == "write_char" || rawMethod == "pad") &&
         renderedValueArgs.size == 1 &&
-        typeArgs.isEmpty()
+        typeArgs.isEmpty() &&
+        isFmtStringBuilderReceiver(expr.receiver, receiver, selfTypeName)
     ) {
         return "$receiver.append(${renderedValueArgs[0]})"
     }
@@ -1530,6 +1547,8 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
     if (rawMethod == "take" &&
         renderedValueArgs.isEmpty() &&
         typeArgs.isEmpty() &&
+        !hasDeclaredOptionEnum() &&
+        isKnownNullableOptionExpr(expr.receiver, receiver, selfTypeName) &&
         receiver.all { it.isLetterOrDigit() || it == '_' || it == '.' } &&
         (expr.receiver is Expr.Field || (expr.receiver is Expr.Path && receiver != "cell"))
     ) {
@@ -1549,6 +1568,8 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                     } else {
                         renderedValueArgs[0]
                     }
+                val isEagerNonTrivial = rawMethod == "ok_or" && !isSideEffectFreeExpr(allMethodArgs[0])
+                val isKnownSomeRecv = unwrapUnqualifiedOptionSomeArg(expr.receiver) != null
                 return if (usesTaggedCoreResult()) {
                     val res = sourceResultName()
                     val expectedRes = rustResultTypeArguments(currentExpectedParseTargetType ?: currentEnclosingReturnRenderedType)
@@ -1570,17 +1591,65 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                             ?.takeIf { it.isNotEmpty() && it != "*" && it != "Nothing" && it != "Any?" }
                             ?: expectedRes?.second
                     val resSuffix = buildExplicitResultTypeArgsSuffix(okTy, errTy)
-                    "($atomicRecv?.let { $res.Ok$resSuffix(it) } ?: $res.Err$resSuffix($errExprText))"
+                    when {
+                        isEagerNonTrivial && isDirectDivergingOptionArg(allMethodArgs[0], errExprText) ->
+                            "run { $receiver; $errExprText }"
+                        isEagerNonTrivial && isKnownSomeRecv -> {
+                            val recvTmp = "optRecv${closureLabelCounter++}"
+                            "run { val $recvTmp = $receiver; $errExprText; $res.Ok$resSuffix($recvTmp) }"
+                        }
+                        isEagerNonTrivial -> {
+                            val idx = closureLabelCounter++
+                            val recvTmp = "optRecv$idx"
+                            val errTmp = "optErr$idx"
+                            "run { val $recvTmp = $receiver; val $errTmp = $errExprText; if ($recvTmp != null) $res.Ok$resSuffix($recvTmp) else $res.Err$resSuffix($errTmp) }"
+                        }
+                        else ->
+                            "($atomicRecv?.let { $res.Ok$resSuffix(it) } ?: $res.Err$resSuffix($errExprText))"
+                    }
                 } else {
-                    "($atomicRecv?.let { Result.success(it) } ?: Result.failure($errExprText))"
+                    when {
+                        isEagerNonTrivial && isDirectDivergingOptionArg(allMethodArgs[0], errExprText) ->
+                            "run { $receiver; $errExprText }"
+                        isEagerNonTrivial && isKnownSomeRecv -> {
+                            val recvTmp = "optRecv${closureLabelCounter++}"
+                            "run { val $recvTmp = $receiver; $errExprText; Result.success($recvTmp) }"
+                        }
+                        isEagerNonTrivial -> {
+                            val idx = closureLabelCounter++
+                            val recvTmp = "optRecv$idx"
+                            val errTmp = "optErr$idx"
+                            "run { val $recvTmp = $receiver; val $errTmp = $errExprText; if ($recvTmp != null) Result.success($recvTmp) else Result.failure($errTmp) }"
+                        }
+                        else ->
+                            "($atomicRecv?.let { Result.success(it) } ?: Result.failure($errExprText))"
+                    }
                 }
             }
             rawMethod == "into_iter" && renderedValueArgs.isEmpty() -> return "ArrayDeque(listOfNotNull($receiver))"
             rawMethod == "flatten" && renderedValueArgs.isEmpty() -> return receiver
             (rawMethod == "map" || rawMethod == "and_then") && renderedValueArgs.size == 1 ->
                 return "$atomicRecv?.let(${wrapMapCallbackArg(allMethodArgs[0], renderedValueArgs[0])})"
-            rawMethod == "map_or" && renderedValueArgs.size == 2 ->
-                return "($atomicRecv?.let(${wrapMapCallbackArg(allMethodArgs[1], renderedValueArgs[1])}) ?: ${renderedValueArgs[0]})"
+            rawMethod == "map_or" && renderedValueArgs.size == 2 -> {
+                val callback = wrapMapCallbackArg(allMethodArgs[1], renderedValueArgs[1])
+                val defaultArg = renderedValueArgs[0]
+                return when {
+                    isSideEffectFreeExpr(allMethodArgs[0]) ->
+                        "($atomicRecv?.let($callback) ?: $defaultArg)"
+                    isDirectDivergingOptionArg(allMethodArgs[0], defaultArg) ->
+                        "run { $receiver; $defaultArg }"
+                    unwrapUnqualifiedOptionSomeArg(expr.receiver) != null -> {
+                        val recvTmp = "optRecv${closureLabelCounter++}"
+                        "run { val $recvTmp = $receiver; $defaultArg; $recvTmp.let($callback) }"
+                    }
+                    else -> {
+                        val idx = closureLabelCounter++
+                        val recvTmp = "optRecv$idx"
+                        val defaultTmp = "optDefault$idx"
+                        "run { val $recvTmp = $receiver; val $defaultTmp = $defaultArg; if ($recvTmp != null) $recvTmp.let($callback) else $defaultTmp }"
+                    }
+                }
+            }
             rawMethod == "map_or_else" && renderedValueArgs.size == 2 ->
                 return "($atomicRecv?.let(${wrapMapCallbackArg(allMethodArgs[1], renderedValueArgs[1])}) ?: ${unwrapZeroArgClosureText(renderedValueArgs[0])})"
             (rawMethod == "or_else" || rawMethod == "unwrap_or_else") && renderedValueArgs.size == 1 -> {
@@ -1607,7 +1676,22 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                     } else {
                         renderedValueArgs[0]
                     }
-                return "($receiver ?: $fallbackArg)"
+                return when {
+                    isSideEffectFreeExpr(allMethodArgs[0]) ->
+                        "($receiver ?: $fallbackArg)"
+                    isDirectDivergingOptionArg(allMethodArgs[0], fallbackArg) ->
+                        "run { $receiver; $fallbackArg }"
+                    unwrapUnqualifiedOptionSomeArg(expr.receiver) != null -> {
+                        val recvTmp = "optRecv${closureLabelCounter++}"
+                        "run { val $recvTmp = $receiver; $fallbackArg; $recvTmp }"
+                    }
+                    else -> {
+                        val idx = closureLabelCounter++
+                        val recvTmp = "optRecv$idx"
+                        val defaultTmp = "optDefault$idx"
+                        "run { val $recvTmp = $receiver; val $defaultTmp = $fallbackArg; $recvTmp ?: $defaultTmp }"
+                    }
+                }
             }
             rawMethod == "or" && renderedValueArgs.size == 1 -> {
                 val optionElemKind = inferredMethodRecvTy?.let(this::resolveNumericKind)
@@ -1623,7 +1707,22 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                     } else {
                         renderedValueArgs[0]
                     }
-                return "($receiver ?: $fallbackOptArg)"
+                return when {
+                    isSideEffectFreeExpr(allMethodArgs[0]) ->
+                        "($receiver ?: $fallbackOptArg)"
+                    isDirectDivergingOptionArg(allMethodArgs[0], fallbackOptArg) ->
+                        "run { $receiver; $fallbackOptArg }"
+                    unwrapUnqualifiedOptionSomeArg(expr.receiver) != null -> {
+                        val recvTmp = "optRecv${closureLabelCounter++}"
+                        "run { val $recvTmp = $receiver; $fallbackOptArg; $recvTmp }"
+                    }
+                    else -> {
+                        val idx = closureLabelCounter++
+                        val recvTmp = "optRecv$idx"
+                        val defaultTmp = "optDefault$idx"
+                        "run { val $recvTmp = $receiver; val $defaultTmp = $fallbackOptArg; $recvTmp ?: $defaultTmp }"
+                    }
+                }
             }
         }
     }
