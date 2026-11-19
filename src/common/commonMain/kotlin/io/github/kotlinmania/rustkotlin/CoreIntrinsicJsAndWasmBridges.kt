@@ -1031,7 +1031,7 @@ private external class KmJsFinalizationRegistry(callback: (Int) -> Unit) {
     fun unregister(unregisterToken: Any): Boolean
 }
 
-private class KmJsCleanToken
+internal class KmJsCleanToken
 
 private object KmJsCleanerRegistry {
     private var nextTokenId: Int = 1
@@ -1066,7 +1066,7 @@ private object KmJsCleanerRegistry {
     }
 }
 
-public actual class KmResourceCleaner internal constructor() : KmForgettableResource {
+public actual class KmResourceCleaner internal actual constructor() : KmForgettableResource {
     private var tokenId: Int = 0
     private var token: KmJsCleanToken? = null
 
@@ -1670,7 +1670,7 @@ public actual fun kmSimdDotF32(aAddr: Long, bAddr: Long, len: Long): Float =
 
 ${CoreIntrinsicMathAndBitSpecs.renderWasmJsActuals().trimEnd()}
 
-private class KmWasmCleanToken
+internal class KmWasmCleanToken
 
 @JsFun("(cb) => new FinalizationRegistry(cb)")
 private external fun kmWasmCreateFinalizationRegistry(cb: (Int) -> Unit): JsAny
@@ -1714,7 +1714,7 @@ private object KmWasmCleanerRegistry {
     }
 }
 
-public actual class KmResourceCleaner internal constructor() : KmForgettableResource {
+public actual class KmResourceCleaner internal actual constructor() : KmForgettableResource {
     private var tokenId: Int = 0
     private var token: JsAny? = null
 
@@ -1854,7 +1854,7 @@ public actual fun kmSimdDotF32(aAddr: Long, bAddr: Long, len: Long): Float =
 
 ${CoreIntrinsicMathAndBitSpecs.renderWasmWasiActuals().trimEnd()}
 
-private class KmWasmWasiCleanState(
+internal class KmWasmWasiCleanState(
     private var cleanup: (() -> Unit)?,
 ) {
     private var state: Int = 0
@@ -1876,7 +1876,7 @@ private class KmWasmWasiCleanState(
     }
 }
 
-public actual class KmResourceCleaner internal constructor() : KmForgettableResource {
+public actual class KmResourceCleaner internal actual constructor() : KmForgettableResource {
     private var cleanState: KmWasmWasiCleanState? = null
 
     internal fun attach(state: KmWasmWasiCleanState) {

@@ -1163,14 +1163,14 @@ public expect fun kmDoubleToU128Unchecked(v: Double): U128ValueOutcome
                     spec.width == 128 && spec.returns128 ->
                         appendLine(renderNativeU128OutActual("${spec.expectName}(lo: ULong, hi: ULong): U128ValueOutcome", "$cinteropPackage.${spec.expectName}Out(lo, hi, outLo.ptr, outHi.ptr)", "U128ValueOutcome"))
                     spec.width == 128 ->
-                        appendLine("public actual inline fun ${spec.expectName}(lo: ULong, hi: ULong): UInt = $cinteropPackage.${spec.expectName}(lo, hi)")
+                        appendLine("public actual fun ${spec.expectName}(lo: ULong, hi: ULong): UInt = $cinteropPackage.${spec.expectName}(lo, hi)")
                     spec.returnsUInt -> {
                         val kt = smallWidthKtReturnFromU32(spec.width)
-                        appendLine("public actual inline fun ${spec.expectName}(value: $kt): UInt = $cinteropPackage.${spec.expectName}(value)")
+                        appendLine("public actual fun ${spec.expectName}(value: $kt): UInt = $cinteropPackage.${spec.expectName}(value)")
                     }
                     else -> {
                         val kt = smallWidthKtReturnFromU32(spec.width)
-                        appendLine("public actual inline fun ${spec.expectName}(value: $kt): $kt = $cinteropPackage.${spec.expectName}(value)")
+                        appendLine("public actual fun ${spec.expectName}(value: $kt): $kt = $cinteropPackage.${spec.expectName}(value)")
                     }
                 }
             }
@@ -1179,7 +1179,7 @@ public expect fun kmDoubleToU128Unchecked(v: Double): U128ValueOutcome
                     appendLine(renderNativeU128OutActual("${spec.expectName}(lo: ULong, hi: ULong, n: UInt): U128ValueOutcome", "$cinteropPackage.${spec.expectName}Out(lo, hi, n, outLo.ptr, outHi.ptr)", "U128ValueOutcome"))
                 } else {
                     val kt = smallWidthKtReturnFromU32(spec.width)
-                    appendLine("public actual inline fun ${spec.expectName}(value: $kt, n: UInt): $kt = $cinteropPackage.${spec.expectName}(value, n)")
+                    appendLine("public actual fun ${spec.expectName}(value: $kt, n: UInt): $kt = $cinteropPackage.${spec.expectName}(value, n)")
                 }
             }
             for (op in OverflowOpKind.entries) {
@@ -1238,7 +1238,7 @@ public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): Overflow$
                 for (w in ALL_INT_WIDTHS) {
                     val fn = "kmSaturating${op.stem}${w.widthTag}"
                     if (w.bits < 128) {
-                        appendLine("public actual inline fun $fn(a: ${w.ktType}, b: ${w.ktType}): ${w.ktType} = $cinteropPackage.$fn(a, b)")
+                        appendLine("public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): ${w.ktType} = $cinteropPackage.$fn(a, b)")
                     } else {
                         appendLine(renderNativeU128OutActual("$fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): ${w.ktType}", "$cinteropPackage.${fn}Out(aLo, aHi, bLo, bHi, outLo.ptr, outHi.ptr)", w.ktType))
                     }
@@ -1269,17 +1269,17 @@ public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): $outType 
                 val fKt = if (spec.isF64) "Double" else "Float"
                 when {
                     spec.arity == 1 ->
-                        appendLine("public actual inline fun ${spec.expectName}(x: $fKt): $fKt = $cinteropPackage.${spec.expectName}(x)")
+                        appendLine("public actual fun ${spec.expectName}(x: $fKt): $fKt = $cinteropPackage.${spec.expectName}(x)")
                     spec.secondIsInt ->
-                        appendLine("public actual inline fun ${spec.expectName}(x: $fKt, exp: Int): $fKt = $cinteropPackage.${spec.expectName}(x, exp)")
+                        appendLine("public actual fun ${spec.expectName}(x: $fKt, exp: Int): $fKt = $cinteropPackage.${spec.expectName}(x, exp)")
                     else ->
-                        appendLine("public actual inline fun ${spec.expectName}(a: $fKt, b: $fKt): $fKt = $cinteropPackage.${spec.expectName}(a, b)")
+                        appendLine("public actual fun ${spec.expectName}(a: $fKt, b: $fKt): $fKt = $cinteropPackage.${spec.expectName}(a, b)")
                 }
             }
             appendLine(
                 """
-public actual inline fun kmFloatToU64Unchecked(v: Float): ULong = $cinteropPackage.kmFloatToU64Unchecked(v)
-public actual inline fun kmDoubleToU64Unchecked(v: Double): ULong = $cinteropPackage.kmDoubleToU64Unchecked(v)
+public actual fun kmFloatToU64Unchecked(v: Float): ULong = $cinteropPackage.kmFloatToU64Unchecked(v)
+public actual fun kmDoubleToU64Unchecked(v: Double): ULong = $cinteropPackage.kmDoubleToU64Unchecked(v)
 ${renderNativeU128OutActual("kmFloatToU128Unchecked(v: Float): U128ValueOutcome", "$cinteropPackage.kmFloatToU128UncheckedOut(v, outLo.ptr, outHi.ptr)", "U128ValueOutcome")}
 ${renderNativeU128OutActual("kmDoubleToU128Unchecked(v: Double): U128ValueOutcome", "$cinteropPackage.kmDoubleToU128UncheckedOut(v, outLo.ptr, outHi.ptr)", "U128ValueOutcome")}
                 """.trim(),

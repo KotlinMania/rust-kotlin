@@ -1818,26 +1818,29 @@ class StdlibSemanticWaveCTest {
         ZeroUnderscoreIdentifierValidator.requireZeroViolations(nativeBridge, "KmCoreNativeActuals.kt")
         assertContains(nativeBridge, "ExperimentalNativeApi::class")
         assertContains(nativeBridge, "kotlin.native.ref.createCleaner")
-        assertContains(nativeBridge, "public actual class KmResourceCleaner")
+        assertContains(nativeBridge, "public actual class KmResourceCleaner internal actual constructor() : KmForgettableResource")
         assertContains(nativeBridge, "public actual override fun disarmCleaner(): Unit = disarm()")
+        assertFalse(nativeBridge.contains("public actual inline fun"), nativeBridge)
 
         val jvmBridge = CoreIntrinsicFfiArtifacts.renderKmCoreJvmActualsKotlin("demo.core", "DemoJni")
         ZeroUnderscoreIdentifierValidator.requireZeroViolations(jvmBridge, "KmCoreJvmActuals.kt")
         assertContains(jvmBridge, "java.lang.ref.PhantomReference")
         assertContains(jvmBridge, "java.util.concurrent.ConcurrentHashMap")
+        assertContains(jvmBridge, "public actual class KmResourceCleaner internal actual constructor() : KmForgettableResource")
         assertContains(jvmBridge, "public actual override fun disarmCleaner(): Unit = disarm()")
         assertFalse(jvmBridge.contains("java.lang.ref.Cleaner"), jvmBridge)
 
         val androidBridge = CoreIntrinsicFfiArtifacts.renderKmCoreAndroidActualsKotlin("demo.core", "DemoJni")
         ZeroUnderscoreIdentifierValidator.requireZeroViolations(androidBridge, "KmCoreAndroidActuals.kt")
         assertContains(androidBridge, "java.lang.ref.PhantomReference")
+        assertContains(androidBridge, "public actual class KmResourceCleaner internal actual constructor() : KmForgettableResource")
         assertContains(androidBridge, "public actual override fun disarmCleaner(): Unit = disarm()")
         assertFalse(androidBridge.contains("java.lang.ref.Cleaner"), androidBridge)
 
         val jsBridge = CoreIntrinsicFfiArtifacts.renderKmCoreJsActualsKotlin("demo.core")
         ZeroUnderscoreIdentifierValidator.requireZeroViolations(jsBridge, "KmCoreJsActuals.kt")
         assertContains(jsBridge, "KmJsFinalizationRegistry")
-        assertContains(jsBridge, "public actual class KmResourceCleaner")
+        assertContains(jsBridge, "public actual class KmResourceCleaner internal actual constructor() : KmForgettableResource")
         assertContains(jsBridge, "public actual override fun disarmCleaner(): Unit = disarm()")
 
         val wasmJsBridge = CoreIntrinsicFfiArtifacts.renderKmCoreWasmJsActualsKotlin("demo.core")
@@ -1845,13 +1848,14 @@ class StdlibSemanticWaveCTest {
         assertContains(wasmJsBridge, "FinalizationRegistry")
         assertContains(wasmJsBridge, "toJsReference()")
         assertContains(wasmJsBridge, "KmWasmCleanToken")
+        assertContains(wasmJsBridge, "public actual class KmResourceCleaner internal actual constructor() : KmForgettableResource")
         assertContains(wasmJsBridge, "public actual override fun disarmCleaner(): Unit = disarm()")
         assertFalse(wasmJsBridge.contains("import kotlin.js.JsAny"), wasmJsBridge)
 
         val wasmWasiBridge = CoreIntrinsicFfiArtifacts.renderKmCoreWasmWasiActualsKotlin("demo.core")
         ZeroUnderscoreIdentifierValidator.requireZeroViolations(wasmWasiBridge, "KmCoreWasmWasiActuals.kt")
         assertContains(wasmWasiBridge, "KmWasmWasiCleanState")
-        assertContains(wasmWasiBridge, "public actual class KmResourceCleaner")
+        assertContains(wasmWasiBridge, "public actual class KmResourceCleaner internal actual constructor() : KmForgettableResource")
         assertContains(wasmWasiBridge, "public actual override fun disarmCleaner(): Unit = disarm()")
 
         val lasxCollidingSrc =
