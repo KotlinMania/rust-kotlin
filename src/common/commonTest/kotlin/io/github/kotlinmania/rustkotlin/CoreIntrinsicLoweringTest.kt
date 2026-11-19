@@ -718,4 +718,11 @@ class CoreIntrinsicLoweringTest {
         assertContains(kt, ": Int = 0")
         assertContains(kt, ".subList(")
     }
+
+    @Test
+    fun inlineHeaderGuardsInt128DivAndFloatConversionsForWindowsClangMsvc() {
+        val header = CoreIntrinsicFfiArtifacts.renderKmCoreInlineHeader()
+        val guardCount = Regex("""#if defined\(__SIZEOF_INT128__\) && !defined\(_MSC_VER\)""").findAll(header).count()
+        assertEquals(3, guardCount, "Expected !defined(_MSC_VER) guard on kmU128DivRemRaw and float/double to u128 helpers")
+    }
 }

@@ -2,8 +2,12 @@ package io.github.kotlinmania.rustkotlin
 
 import io.github.kotlinmania.io.files.SystemFileSystem
 import io.github.kotlinmania.io.files.resolve
+import io.github.kotlinmania.io.files.writeBytes
+import io.github.kotlinmania.io.files.writeString
 import io.github.kotlinmania.rand.randomLong
+import kotlin.io.encoding.Base64
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
@@ -175,6 +179,94 @@ class JvmNativeIoTest {
             ).forEach { path ->
                 SystemFileSystem.delete(KmPath(path), mustExist = false)
             }
+        }
+    }
+
+    @Test
+    fun includeBytesAndIncludeStrLowerEmptySmallLargeAndConcatPayloads() {
+        val base = prepareScratchDir()
+        val suffix = randomLong().toULong().toString()
+        val caseDir = base.resolve("include-$suffix")
+        val subDir = caseDir.resolve("sub")
+        SystemFileSystem.createDirectories(subDir, mustCreate = false)
+        val rustPath = caseDir.resolve("lib.rs")
+        val emptyPath = caseDir.resolve("empty.bin")
+        val smallBinPath = caseDir.resolve("small.bin")
+        val largeBinPath = caseDir.resolve("large.bin")
+        val concatBinPath = subDir.resolve("concat.bin")
+        val smallTxtPath = caseDir.resolve("small.txt")
+        val largeTxtPath = caseDir.resolve("large.txt")
+        val largeBytes = ByteArray(65_000) { idx -> ((idx * 37 + 11) and 0xFF).toByte() }
+        val smallBytes = byteArrayOf(0x00, 0x01, 0x7F, (-128).toByte(), (-1).toByte())
+        val concatBytes = byteArrayOf(0x42, 0x7E, (-42).toByte())
+        val smallText = "line1 \"quote\" \$var\nline2 café \uD83D\uDE80"
+        val largeText = "0123456789abcdef".repeat(3_500)
+        try {
+            SystemFileSystem.writeBytes(emptyPath, byteArrayOf())
+            SystemFileSystem.writeBytes(smallBinPath, smallBytes)
+            SystemFileSystem.writeBytes(largeBinPath, largeBytes)
+            SystemFileSystem.writeBytes(concatBinPath, concatBytes)
+            SystemFileSystem.writeString(smallTxtPath, smallText)
+            SystemFileSystem.writeString(largeTxtPath, largeText)
+
+            val rustSource =
+                """
+                pub fn empty_bytes() -> &'static [u8] {
+                    include_bytes!("empty.bin")
+                }
+
+                pub fn small_bytes() -> &'static [u8] {
+                    include_bytes!("small.bin")
+                }
+
+                pub fn large_bytes() -> &'static [u8] {
+                    include_bytes!("large.bin")
+                }
+
+                pub fn concat_bytes() -> &'static [u8] {
+                    include_bytes!(concat!("sub/", "concat.bin"))
+                }
+
+                pub fn small_text() -> &'static str {
+                    include_str!("small.txt")
+                }
+
+                pub fn large_text() -> &'static str {
+                    include_str!("large.txt")
+                }
+                """.trimIndent()
+            val kt =
+                renderSingleKotlinFile(
+                    rustSource,
+                    FileHeaderContext(
+                        packageName = "io.github.kotlinmania.sample",
+                        projectGroup = "io.github.kotlinmania",
+                        projectNamespace = "io.github.kotlinmania.sample",
+                        sourceFilePath = rustPath.toString(),
+                    ),
+                ).text
+
+            assertContains(kt, "import kotlin.io.encoding.Base64")
+            assertContains(kt, "return byteArrayOf()")
+            assertContains(kt, "Base64.decode(\"${Base64.Default.encode(smallBytes)}\")")
+            assertContains(kt, "Base64.decode(\"${Base64.Default.encode(concatBytes)}\")")
+            assertContains(kt, "return \"line1 \\\"quote\\\" \\\$var\\nline2 café \uD83D\uDE80\"")
+
+            val largeEncoded = Base64.Default.encode(largeBytes)
+            assertTrue(largeEncoded.length > 80_000)
+            assertContains(kt, "Base64.decode(\n")
+            assertContains(kt, "buildString {")
+            val chunkLiterals = Regex("append\\(\"([^\"]*)\"\\)").findAll(kt).map { it.groupValues[1] }.toList()
+            assertTrue(chunkLiterals.size >= 4, "Expected chunked appends for large binary + string: $chunkLiterals")
+            assertTrue(chunkLiterals.all { it.length <= 48_000 })
+            val firstEncoded = Base64.Default.encode(largeBytes).substring(0, 48_000)
+            assertContains(kt, "append(\"$firstEncoded\")")
+        } finally {
+            listOf(largeTxtPath, smallTxtPath, concatBinPath, largeBinPath, smallBinPath, emptyPath, rustPath).forEach {
+                SystemFileSystem.delete(it, mustExist = false)
+            }
+            SystemFileSystem.delete(subDir, mustExist = false)
+            SystemFileSystem.delete(caseDir, mustExist = false)
         }
     }
 }

@@ -788,4 +788,119 @@ class SingleFileTranslationTest {
         assertContains(replaced, "public fun replaceMe(): Int")
         assertContains(replaced, "return 9")
     }
+
+    @Test fun splitModuleRootsMergesDuplicateCfgInlineModWithoutExclusiveCreateCollision() {
+        val windowsConsoleSource =
+            """
+            #[cfg(windows)]
+            pub mod windows_console {
+                pub fn enable_ansi_colors() -> bool { true }
+            }
+
+            #[cfg(not(windows))]
+            pub mod windows_console {
+                pub fn enable_ansi_colors() -> bool { false }
+            }
+
+            pub fn enable_ansi_colors() -> bool {
+                windows_console::enable_ansi_colors()
+            }
+            """.trimIndent()
+        val openWorldFiles =
+            TestFilesHarness(
+                extraFiles = mapOf("crate/src/windows.rs" to windowsConsoleSource),
+                directories = mapOf("crate/src" to listOf("crate/src/windows.rs")),
+            )
+        openWorldFiles.run(
+            "translate",
+            "-r",
+            "--split-module-roots",
+            "-n",
+            "io.github.kotlinmania.anstylequery",
+            "-o",
+            "out",
+            "crate/src",
+        )
+        val mergedKey = "out/windows/windowsconsole/WindowsConsole.kt"
+        assertTrue(mergedKey in openWorldFiles.writes, "Expected $mergedKey in ${openWorldFiles.writes.keys}")
+        assertEquals(1, openWorldFiles.writes.keys.count { it == mergedKey })
+        val mergedContent = openWorldFiles.writes.getValue(mergedKey)
+        assertEquals(1, Regex("""\bfun enableAnsiColors\b""").findAll(mergedContent).count(), mergedContent)
+
+        val windowsTargeted =
+            TestFilesHarness(
+                extraFiles = mapOf("crate/src/windows.rs" to windowsConsoleSource),
+                directories = mapOf("crate/src" to listOf("crate/src/windows.rs")),
+            )
+        windowsTargeted.run(
+            "translate",
+            "-r",
+            "--split-module-roots",
+            "--target-os",
+            "windows",
+            "--target-family",
+            "windows",
+            "-n",
+            "io.github.kotlinmania.anstylequery",
+            "-o",
+            "out",
+            "crate/src",
+        )
+        val targetedContent = windowsTargeted.writes.getValue(mergedKey)
+        assertContains(targetedContent, "public fun enableAnsiColors(): Boolean = true")
+        assertFalse(targetedContent.contains("false"), targetedContent)
+
+        val disjointMergeSource =
+            """
+            #[cfg(windows)]
+            pub mod inner {
+                pub fn win_only() -> i32 { 1 }
+            }
+
+            #[cfg(not(windows))]
+            pub mod inner {
+                pub fn unix_only() -> i32 { 2 }
+            }
+            """.trimIndent()
+        val disjointRun =
+            TestFilesHarness(
+                extraFiles = mapOf("crate/src/mod_pair.rs" to disjointMergeSource),
+                directories = mapOf("crate/src" to listOf("crate/src/mod_pair.rs")),
+            )
+        disjointRun.run(
+            "translate",
+            "-r",
+            "--split-module-roots",
+            "-n",
+            "io.github.kotlinmania.sample",
+            "-o",
+            "out",
+            "crate/src",
+        )
+        val disjointKt = disjointRun.writes.getValue("out/modpair/inner/Inner.kt")
+        assertContains(disjointKt, "public fun winOnly(): Int")
+        assertContains(disjointKt, "public fun unixOnly(): Int")
+    }
+
+    @Test fun includeMacroPathResolutionAndModifiedUtf8Chunking() {
+        assertEquals(
+            "tmp/jiff-tzdb/concatenated-zoneinfo.dat",
+            resolveIncludeTargetPath("tmp/jiff-tzdb/lib.rs", "concatenated-zoneinfo.dat"),
+        )
+        assertEquals(
+            "/crate/assets/table.bin",
+            resolveIncludeTargetPath("/crate/src/sub/mod.rs", "../../assets/table.bin"),
+        )
+        assertEquals(
+            "sub/data.bin",
+            resolveIncludeTargetPath("src\\lib.rs", "..\\sub\\data.bin"),
+        )
+        assertEquals(listOf(""), chunkModifiedUtf8String("", maxBytesPerChunk = 16))
+        val pair = "\uD83D\uDE80"
+        val repeated = pair.repeat(5)
+        val chunks = chunkModifiedUtf8String(repeated, maxBytesPerChunk = 12)
+        assertEquals(3, chunks.size)
+        assertEquals(repeated, chunks.joinToString(""))
+        assertTrue(chunks.all { !it.first().isLowSurrogate() && !it.last().isHighSurrogate() })
+    }
 }

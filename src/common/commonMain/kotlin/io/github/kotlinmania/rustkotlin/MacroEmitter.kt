@@ -1,5 +1,7 @@
 package io.github.kotlinmania.rustkotlin
 
+import io.github.kotlinmania.io.files.SystemFileSystem
+import io.github.kotlinmania.io.files.readBytes
 import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.procmacro2.Group
 import io.github.kotlinmania.procmacro2.Punct
@@ -19,6 +21,8 @@ import io.github.kotlinmania.syn.PathArguments
 import io.github.kotlinmania.syn.Signature
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.UnOp
+import kotlin.io.encoding.Base64
+import io.github.kotlinmania.io.files.Path as KmPath
 
 /** Maps Rust `core::f*::consts` names to Kotlin `(f32Literal, f64Literal)` pairs. */
 private val RUST_FLOAT_MATH_CONSTANTS: Map<String, Pair<String, String>> =
@@ -221,6 +225,7 @@ internal fun KotlinJ2KEmitter.renderMacroInvocationAsStmtOrExpr(
                 val parts = parseCommaSeparatedExprsFromTokens(tokens, indent, selfTypeName)
                 if (parts.isEmpty()) "\"\"" else parts.joinToString(" + ")
             }
+        "include_bytes", "include_str" -> renderIncludeMacro(macroName, tokens, indent)
         "matches" -> renderMatchesMacroInvocation(tokens, indent, selfTypeName)
         "line" -> {
             if (tokens.isEmpty()) {
@@ -582,6 +587,172 @@ internal fun KotlinJ2KEmitter.tryEvalConcatTokens(tokens: TokenStream): String? 
         sb.append(piece)
     }
     return sb.toString()
+}
+
+private const val INCLUDE_CONSTANT_POOL_CHUNK_BYTES: Int = 48_000
+
+private fun KotlinJ2KEmitter.renderIncludeMacro(
+    macroName: String,
+    tokens: TokenStream,
+    indent: String,
+): String {
+    val relPath =
+        resolveIncludeMacroPathArg(tokens)
+            ?: error("$macroName! expects a compile-time string path argument")
+    val resolvedPath = resolveIncludeTargetPath(headerContext.sourceFilePath, relPath)
+    val kmPath = KmPath(resolvedPath)
+    val meta = SystemFileSystem.metadataOrNull(kmPath)
+    require(meta != null && meta.isRegularFile) {
+        "$macroName! target file not found: $resolvedPath"
+    }
+    val bytes = SystemFileSystem.readBytes(kmPath)
+    return when (macroName) {
+        "include_bytes" -> {
+            if (bytes.isEmpty()) {
+                "byteArrayOf()"
+            } else {
+                extraTypePathImports += "import kotlin.io.encoding.Base64"
+                renderChunkedBase64ByteArrayExpr(Base64.Default.encode(bytes), indent)
+            }
+        }
+        "include_str" -> renderChunkedStringLiteralExpr(bytes.decodeToString(throwOnInvalidSequence = true), indent)
+        else -> error("unsupported include macro: $macroName")
+    }
+}
+
+private fun KotlinJ2KEmitter.resolveIncludeMacroPathArg(tokens: TokenStream): String? {
+    val parts = MacroRulesFileExpander.splitMacroArguments(tokens).filter { it.isNotEmpty() }
+    if (parts.size != 1) return null
+    return tryEvalCompileTimeStringMacroArg(parts[0])
+}
+
+internal fun resolveIncludeTargetPath(
+    sourceFilePath: String?,
+    relativeIncludePath: String,
+): String {
+    val baseFile =
+        sourceFilePath?.trim()?.takeIf { it.isNotEmpty() }
+            ?: error("include_bytes!/include_str! requires FileHeaderContext.sourceFilePath")
+    val normalizedInclude = relativeIncludePath.replace('\\', '/')
+    val isAbsoluteInclude =
+        normalizedInclude.startsWith("/") ||
+            (normalizedInclude.length >= 3 && normalizedInclude[0].isLetter() && normalizedInclude[1] == ':' && normalizedInclude[2] == '/')
+    val combined =
+        if (isAbsoluteInclude) {
+            normalizedInclude
+        } else {
+            val normBase = baseFile.replace('\\', '/')
+            val slashIdx = normBase.lastIndexOf('/')
+            if (slashIdx >= 0) "${normBase.substring(0, slashIdx)}/$normalizedInclude" else normalizedInclude
+        }
+    return normalizeLexicalPath(combined)
+}
+
+internal fun normalizeLexicalPath(path: String): String {
+    val normalized = path.replace('\\', '/')
+    val hasDrivePrefix = normalized.length >= 3 && normalized[0].isLetter() && normalized[1] == ':' && normalized[2] == '/'
+    val rootPrefix =
+        when {
+            hasDrivePrefix -> normalized.substring(0, 3)
+            normalized.startsWith("/") -> "/"
+            else -> ""
+        }
+    val rest = normalized.substring(rootPrefix.length)
+    val stack = mutableListOf<String>()
+    for (seg in rest.split('/')) {
+        when (seg) {
+            "", "." -> {}
+            ".." -> {
+                if (stack.isNotEmpty() && stack.last() != "..") {
+                    stack.removeAt(stack.lastIndex)
+                } else if (rootPrefix.isEmpty()) {
+                    stack += ".."
+                }
+            }
+            else -> stack += seg
+        }
+    }
+    return rootPrefix + stack.joinToString("/")
+}
+
+private fun renderChunkedBase64ByteArrayExpr(
+    encoded: String,
+    indent: String,
+): String {
+    if (encoded.length <= INCLUDE_CONSTANT_POOL_CHUNK_BYTES) {
+        return "Base64.decode(${renderKotlinDoubleQuotedString(encoded)})"
+    }
+    return buildString {
+        append("Base64.decode(\n")
+        append(indent).append("    buildString {\n")
+        var offset = 0
+        while (offset < encoded.length) {
+            val end = minOf(offset + INCLUDE_CONSTANT_POOL_CHUNK_BYTES, encoded.length)
+            append(indent)
+                .append("        append(")
+                .append(renderKotlinDoubleQuotedString(encoded.substring(offset, end)))
+                .append(")\n")
+            offset = end
+        }
+        append(indent).append("    },\n")
+        append(indent).append(')')
+    }
+}
+
+private fun renderChunkedStringLiteralExpr(
+    text: String,
+    indent: String,
+): String {
+    val chunks = chunkModifiedUtf8String(text, INCLUDE_CONSTANT_POOL_CHUNK_BYTES)
+    if (chunks.size <= 1) {
+        return renderKotlinDoubleQuotedString(text)
+    }
+    return buildString {
+        append("buildString {\n")
+        for (chunk in chunks) {
+            append(indent)
+                .append("    append(")
+                .append(renderKotlinDoubleQuotedString(chunk))
+                .append(")\n")
+        }
+        append(indent).append('}')
+    }
+}
+
+internal fun chunkModifiedUtf8String(
+    text: String,
+    maxBytesPerChunk: Int = INCLUDE_CONSTANT_POOL_CHUNK_BYTES,
+): List<String> {
+    if (text.isEmpty()) return listOf("")
+    val chunks = mutableListOf<String>()
+    var chunkStart = 0
+    var chunkBytes = 0
+    var idx = 0
+    while (idx < text.length) {
+        val ch = text[idx]
+        val isSurrogatePair = ch.isHighSurrogate() && idx + 1 < text.length && text[idx + 1].isLowSurrogate()
+        val charLen = if (isSurrogatePair) 2 else 1
+        // JVM constant-pool Strings use Modified UTF-8: NUL or U+0080..U+07FF takes 2 bytes,
+        // other BMP chars take 3 bytes, and supplementary pairs take 2 * 3 = 6 bytes.
+        val addedBytes =
+            when {
+                isSurrogatePair -> 6
+                ch.code in 0x0001..0x007F -> 1
+                ch.code <= 0x07FF -> 2
+                else -> 3
+            }
+        if (chunkBytes + addedBytes > maxBytesPerChunk && idx > chunkStart) {
+            chunks += text.substring(chunkStart, idx)
+            chunkStart = idx
+            chunkBytes = 0
+        }
+        chunkBytes += addedBytes
+        idx += charLen
+    }
+    if (chunkStart < text.length) {
+        chunks += text.substring(chunkStart)
+    }
+    return chunks
 }
 
 internal fun KotlinJ2KEmitter.renderMatchesMacroInvocation(
