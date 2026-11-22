@@ -716,17 +716,8 @@ internal fun KotlinJ2KEmitter.renderFallbackDefaultForRenderedType(renderedType:
     return registerPtrDefaultImportIfNeeded(defaultInitializerForType(clean))
 }
 
-internal fun findTopLevelGenericCommaIndex(text: String): Int {
-    var depth = 0
-    for (i in text.indices) {
-        when (text[i]) {
-            '<' -> depth++
-            '>' -> depth--
-            ',' -> if (depth == 0) return i
-        }
-    }
-    return -1
-}
+internal fun findTopLevelGenericCommaIndex(text: String): Int =
+    KotlinTokenWalker.findTopLevelCommaIndex(text, trackParens = false)
 
 internal fun KotlinJ2KEmitter.normalizeArrayLengthToIntExpr(
     rawLen: String,

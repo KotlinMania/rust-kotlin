@@ -1276,20 +1276,8 @@ internal fun isStarProjectedOrPlainCheckType(typeTarget: String): Boolean {
     return inner.split(',').all { it.trim() == "*" }
 }
 
-private fun hasTopLevelCommaOutsideGenerics(text: String): Boolean {
-    var angleDepth = 0
-    var parenDepth = 0
-    for (ch in text) {
-        when (ch) {
-            '<' -> angleDepth++
-            '>' -> if (angleDepth > 0) angleDepth--
-            '(' -> parenDepth++
-            ')' -> if (parenDepth > 0) parenDepth--
-            ',' -> if (angleDepth == 0 && parenDepth == 0) return true
-        }
-    }
-    return false
-}
+private fun hasTopLevelCommaOutsideGenerics(text: String): Boolean =
+    KotlinTokenWalker.findTopLevelCommaIndex(text, trackParens = true) >= 0
 
 private fun KotlinJ2KEmitter.lookupEnumVariantTypeArity(variantType: String): Int {
     if ('<' in variantType) return 0

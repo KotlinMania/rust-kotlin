@@ -2483,167 +2483,34 @@ internal class KotlinJ2KEmitter(
         }
     }
 
-    internal fun stripKotlinCommentsAndStrings(text: String): String {
-        val sb = StringBuilder(text.length)
-        val interpModes = ArrayList<Char>()
-        val interpBraces = ArrayList<Int>()
-        var mode = 'C' // 'C' = code, 'S' = "..." string, 'R' = """...""" raw string
-        var i = 0
-        val n = text.length
-        while (i < n) {
-            when (mode) {
-                'C' -> {
-                    val ch = text[i]
-                    when {
-                        ch == '/' && i + 1 < n && text[i + 1] == '/' -> {
-                            i += 2
-                            while (i < n && text[i] != '\n') i++
+    internal fun stripKotlinCommentsAndStrings(text: String): String =
+        object : KotlinTokenRewriter(text) {
+            override fun emitAt(index: Int, out: StringBuilder): Int {
+                when (val tok = tokens[index]) {
+                    is KotlinLexToken.LineComment -> {}
+                    is KotlinLexToken.BlockComment -> {
+                        for (ch in tok.rawText) {
+                            if (ch == '\n') out.append('\n')
                         }
-                        ch == '/' && i + 1 < n && text[i + 1] == '*' -> {
-                            var depth = 1
-                            i += 2
-                            while (i < n && depth > 0) {
-                                if (text[i] == '/' && i + 1 < n && text[i + 1] == '*') {
-                                    depth++
-                                    i += 2
-                                } else if (text[i] == '*' && i + 1 < n && text[i + 1] == '/') {
-                                    depth--
-                                    i += 2
-                                } else {
-                                    if (text[i] == '\n') sb.append('\n')
-                                    i++
-                                }
-                            }
-                            sb.append(' ')
-                        }
-                        ch == '`' -> {
-                            sb.append(ch)
-                            i++
-                            while (i < n && text[i] != '`' && text[i] != '\n') {
-                                sb.append(text[i])
-                                i++
-                            }
-                            if (i < n && text[i] == '`') {
-                                sb.append('`')
-                                i++
-                            }
-                        }
-                        ch == '\'' -> {
-                            i++
-                            while (i < n && text[i] != '\'' && text[i] != '\n') {
-                                if (text[i] == '\\' && i + 1 < n) i += 2 else i++
-                            }
-                            if (i < n && text[i] == '\'') i++
-                            sb.append(' ')
-                        }
-                        ch == '"' && i + 2 < n && text[i + 1] == '"' && text[i + 2] == '"' -> {
-                            mode = 'R'
-                            sb.append(' ')
-                            i += 3
-                        }
-                        ch == '"' -> {
-                            mode = 'S'
-                            sb.append(' ')
-                            i++
-                        }
-                        ch == '{' -> {
-                            if (interpBraces.isNotEmpty()) {
-                                interpBraces[interpBraces.lastIndex] = interpBraces.last() + 1
-                            }
-                            sb.append(ch)
-                            i++
-                        }
-                        ch == '}' -> {
-                            if (interpBraces.isNotEmpty()) {
-                                val nextDepth = interpBraces.last() - 1
-                                if (nextDepth <= 0) {
-                                    interpBraces.removeAt(interpBraces.lastIndex)
-                                    mode = interpModes.removeAt(interpModes.lastIndex)
-                                    sb.append(' ')
-                                } else {
-                                    interpBraces[interpBraces.lastIndex] = nextDepth
-                                    sb.append(ch)
-                                }
-                            } else {
-                                sb.append(ch)
-                            }
-                            i++
-                        }
-                        else -> {
-                            sb.append(ch)
-                            i++
-                        }
+                        out.append(' ')
                     }
+                    is KotlinLexToken.CharLiteral,
+                    is KotlinLexToken.StringOpen,
+                    is KotlinLexToken.StringClose,
+                    is KotlinLexToken.TemplateExprOpen,
+                    is KotlinLexToken.TemplateExprClose,
+                    -> out.append(' ')
+                    is KotlinLexToken.StringText ->
+                        for (ch in tok.rawText) {
+                            if (ch == '\n') out.append('\n')
+                        }
+                    is KotlinLexToken.StringIdentTemplate ->
+                        out.append(' ').append(tok.ident).append(' ')
+                    else -> out.append(tok.rawText)
                 }
-                'S' -> {
-                    val ch = text[i]
-                    when {
-                        ch == '\\' && i + 1 < n -> i += 2
-                        ch == '"' -> {
-                            mode = 'C'
-                            sb.append(' ')
-                            i++
-                        }
-                        ch == '$' && i + 1 < n && text[i + 1] == '{' -> {
-                            interpModes.add('S')
-                            interpBraces.add(1)
-                            mode = 'C'
-                            sb.append(' ')
-                            i += 2
-                        }
-                        ch == '$' && i + 1 < n && (text[i + 1].isLetter() || text[i + 1] == '_') -> {
-                            sb.append(' ')
-                            i++
-                            while (i < n && (text[i].isLetterOrDigit() || text[i] == '_')) {
-                                sb.append(text[i])
-                                i++
-                            }
-                            sb.append(' ')
-                        }
-                        else -> {
-                            if (ch == '\n') sb.append('\n')
-                            i++
-                        }
-                    }
-                }
-                else -> {
-                    val ch = text[i]
-                    when {
-                        ch == '"' && i + 2 < n && text[i + 1] == '"' && text[i + 2] == '"' -> {
-                            if (i + 3 < n && text[i + 3] == '"') {
-                                i++
-                            } else {
-                                mode = 'C'
-                                sb.append(' ')
-                                i += 3
-                            }
-                        }
-                        ch == '$' && i + 1 < n && text[i + 1] == '{' -> {
-                            interpModes.add('R')
-                            interpBraces.add(1)
-                            mode = 'C'
-                            sb.append(' ')
-                            i += 2
-                        }
-                        ch == '$' && i + 1 < n && (text[i + 1].isLetter() || text[i + 1] == '_') -> {
-                            sb.append(' ')
-                            i++
-                            while (i < n && (text[i].isLetterOrDigit() || text[i] == '_')) {
-                                sb.append(text[i])
-                                i++
-                            }
-                            sb.append(' ')
-                        }
-                        else -> {
-                            if (ch == '\n') sb.append('\n')
-                            i++
-                        }
-                    }
-                }
+                return index + 1
             }
-        }
-        return sb.toString()
-    }
+        }.rewrite()
 
     internal fun renderItem(
         item: Item,

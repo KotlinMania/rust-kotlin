@@ -582,53 +582,23 @@ internal fun KotlinJ2KEmitter.isAtomicPostfixReceiver(sourceExpr: Expr, rendered
     }
 }
 
-private inline fun scanUnquotedTopLevelChars(
-    text: String,
-    trackAllBrackets: Boolean,
-    crossinline onUnquoted: (idx: Int, ch: Char, depth: Int) -> Boolean,
-): Boolean {
-    var depth = 0
-    var inString = false
-    var inChar = false
-    var escape = false
-    for ((idx, ch) in text.withIndex()) {
-        if (escape) {
-            escape = false
-            continue
-        }
-        if ((inString || inChar) && ch == '\\') {
-            escape = true
-            continue
-        }
-        if (!inChar && ch == '"') {
-            inString = !inString
-            continue
-        }
-        if (!inString && ch == '\'') {
-            inChar = !inChar
-            continue
-        }
-        if (inString || inChar) continue
-        if (ch == '(' || (trackAllBrackets && (ch == '[' || ch == '{'))) {
-            depth++
-        } else if (ch == ')' || (trackAllBrackets && (ch == ']' || ch == '}'))) {
-            if (depth > 0) depth--
-        }
-        if (!onUnquoted(idx, ch, depth)) return false
-    }
-    return depth == 0 && !inString && !inChar
-}
-
 internal fun KotlinJ2KEmitter.hasOuterBalancedParens(text: String): Boolean {
     if (text.length < 2 || text.first() != '(' || text.last() != ')') return false
-    return scanUnquotedTopLevelChars(text, trackAllBrackets = false) { idx, ch, depth ->
-        !(ch == ')' && depth == 0 && idx < text.lastIndex)
+    return KotlinTokenWalker.scanTopLevelTokens(text, trackAllBrackets = false) { tok, depth ->
+        !(tok is KotlinLexToken.Punct && tok.ch == ')' && depth == 0 && tok.end < text.length)
     }
 }
 
 internal fun KotlinJ2KEmitter.hasNoTopLevelSpacesOrColons(text: String): Boolean =
-    scanUnquotedTopLevelChars(text, trackAllBrackets = true) { _, ch, depth ->
-        !(depth == 0 && (ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t' || ch == ':'))
+    KotlinTokenWalker.scanTopLevelTokens(text, trackAllBrackets = true) { tok, depth ->
+        !(
+            depth == 0 &&
+                (
+                    tok is KotlinLexToken.Whitespace ||
+                        tok is KotlinLexToken.Newline ||
+                        (tok is KotlinLexToken.Punct && tok.ch == ':')
+                )
+        )
     }
 
 internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): String =
