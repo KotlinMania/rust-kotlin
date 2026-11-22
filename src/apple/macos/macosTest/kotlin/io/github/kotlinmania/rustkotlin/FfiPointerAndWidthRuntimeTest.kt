@@ -7,7 +7,10 @@ import io.github.kotlinmania.libc.unix.getenv
 import io.github.kotlinmania.libc.unix.getpid
 import io.github.kotlinmania.libc.unix.system
 import io.github.kotlinmania.rand.randomLong
-import io.github.kotlinmania.rustlang.core.ffi.CStr
+import io.github.kotlinmania.rustlang.alloc.ffi.cstr.toStringLossy
+import io.github.kotlinmania.rustlang.core.ffi.cstr.CStr
+import io.github.kotlinmania.rustlang.core.ptr.mutptr.castConst
+import io.github.kotlinmania.rustlang.core.ptr.mutptr.isNull
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals

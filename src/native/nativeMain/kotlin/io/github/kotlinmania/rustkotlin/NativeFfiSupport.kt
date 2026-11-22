@@ -2,22 +2,16 @@ package io.github.kotlinmania.rustkotlin
 
 import io.github.kotlinmania.rustlang.alloc.alloc.alloc
 import io.github.kotlinmania.rustlang.alloc.alloc.dealloc
-import io.github.kotlinmania.rustlang.alloc.ffi.CString
-import io.github.kotlinmania.rustlang.core.alloc.Layout
+import io.github.kotlinmania.rustlang.alloc.ffi.cstr.CString
+import io.github.kotlinmania.rustlang.core.alloc.layout.Layout
 import io.github.kotlinmania.rustlang.core.intrinsics.kmStoreU8
 import io.github.kotlinmania.rustlang.core.ptr.ConstPtr
+import io.github.kotlinmania.rustlang.core.ptr.mutptr.castConst
 
 internal inline fun <R> withCString(
     text: String,
     block: (ConstPtr) -> R,
-): R {
-    val cstr = CString.new(text).unwrap()
-    try {
-        return block(cstr.asPtr())
-    } finally {
-        cstr.deallocate()
-    }
-}
+): R = CString.new(text).unwrap().use { cstr -> block(cstr.asPtr()) }
 
 internal inline fun <R> withUtf8Buffer(
     bytes: ByteArray,
