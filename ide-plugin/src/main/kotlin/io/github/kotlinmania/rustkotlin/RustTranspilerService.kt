@@ -442,162 +442,38 @@ class RustTranspilerService(
         }
     }
 
-    fun resolvePackagePropertiesForVirtualFile(startFile: VirtualFile?): FolderPackageProperties? {
-        var current = if (startFile?.isDirectory == true) startFile else startFile?.parent
-        val traversedDirs = mutableListOf<String>()
-        val foundLayers = mutableListOf<Pair<FolderPackageProperties, List<String>>>()
-
-        while (current != null) {
-            val pkgCandidate = current.findChild("package.properties")
-            if (pkgCandidate != null && !pkgCandidate.isDirectory) {
-                val parsed = parsePackageProperties(VfsUtilCore.loadText(pkgCandidate))
-                foundLayers += parsed to traversedDirs.reversed()
-            }
-            val rustKotlinCandidate = current.findChild("rustkotlin.properties")
-            if (rustKotlinCandidate != null && !rustKotlinCandidate.isDirectory) {
-                break
-            }
-            val dirName = current.name
-            if (dirName.isNotEmpty()) {
-                traversedDirs += dirName
-            }
-            current = current.parent
-        }
-
-        if (foundLayers.isEmpty()) return null
-
-        var resolvedPackage: String? = null
-        var resolvedGroup: String? = null
-        var resolvedNamespace: String? = null
-        val mergedCrateNamespaces = linkedMapOf<String, String>()
-
-        for ((layer, relativeSubdirs) in foundLayers.asReversed()) {
-            layer.projectGroup?.let { resolvedGroup = it }
-            layer.projectNamespace?.let { resolvedNamespace = it }
-            mergedCrateNamespaces.putAll(layer.crateNamespaces)
-            val layerPkg = layer.packageName
-            if (layerPkg != null) {
-                val basePkg = layerPkg.trim().removeSuffix(".")
-                val subSuffix =
-                    relativeSubdirs
-                        .map { rustModuleIdentToKotlin(it) }
-                        .filter { it.isNotEmpty() }
-                        .joinToString(".")
-                resolvedPackage = if (subSuffix.isEmpty()) basePkg else "$basePkg.$subSuffix"
-            }
-        }
-
-        return FolderPackageProperties(
-            packageName = resolvedPackage,
-            projectGroup = resolvedGroup,
-            projectNamespace = resolvedNamespace,
-            crateNamespaces = mergedCrateNamespaces,
-        )
-    }
+    fun resolvePackagePropertiesForVirtualFile(startFile: VirtualFile?): FolderPackageProperties? =
+        VirtualFileTreeNavigator.resolveLayeredPackageProperties(startFile)
 
     private fun discoverCrateFlatFileModulesForVirtualFile(rustFile: VirtualFile): List<String> {
         val inputDir = rustFile.parent ?: return emptyList()
-        var cur: VirtualFile? = inputDir
-        var crateSrcRoot: VirtualFile = inputDir
-        var depth = 0
-        while (cur != null && depth < 12) {
-            val libChild = cur.findChild("lib.rs")
-            if ((libChild != null && !libChild.isDirectory) || cur.name == "src") {
-                crateSrcRoot = cur
-                break
-            }
-            val cargoChild = cur.findChild("Cargo.toml")
-            if (cargoChild != null && !cargoChild.isDirectory) {
-                break
-            }
-            cur = cur.parent
-            depth++
-        }
-        val flatModules = mutableListOf<String>()
-        for (child in crateSrcRoot.children) {
-            if (child.isDirectory || !child.isValid) continue
-            val fileName = child.name
-            if (!fileName.endsWith(".rs")) continue
-            val stem = fileName.removeSuffix(".rs")
-            if (stem == "lib" || stem == "mod" || stem == "main" || stem == "build") continue
-            val siblingDir = crateSrcRoot.findChild(stem)
-            if (siblingDir == null || !siblingDir.isDirectory) {
-                flatModules += stem
-            }
-        }
-        val preludeDir = crateSrcRoot.findChild("prelude")
-        if (preludeDir == null || !preludeDir.isDirectory) {
-            flatModules += "prelude"
-        }
-        return flatModules.distinct()
+        val (crateSrcRoot, _) = VirtualFileTreeNavigator.findCrateSrcRootAndAncestors(inputDir)
+        return VirtualFileTreeNavigator.discoverFlatFileModulesInRoot(crateSrcRoot).toList()
     }
 
-    private fun discoverCrateMacroSourcesForVirtualFile(rustFile: VirtualFile): List<String> {
-        val inputDir = rustFile.parent ?: return emptyList()
-        val dirsUpward = mutableListOf<VirtualFile>()
-        var cur: VirtualFile? = inputDir
-        var crateSrcRoot: VirtualFile = inputDir
-        var depth = 0
-        while (cur != null && depth < 12) {
-            dirsUpward.add(cur)
-            val libChild = cur.findChild("lib.rs")
-            if ((libChild != null && !libChild.isDirectory) || cur.name == "src") {
-                crateSrcRoot = cur
-                break
-            }
-            val cargoChild = cur.findChild("Cargo.toml")
-            if (cargoChild != null && !cargoChild.isDirectory) {
-                break
-            }
-            cur = cur.parent
-            depth++
-        }
-        val rootIdx = dirsUpward.indexOf(crateSrcRoot)
-        val ancestorDirs =
-            if (rootIdx >= 0) {
-                dirsUpward.take(rootIdx + 1).reversed()
-            } else {
-                listOf(inputDir)
-            }
+    private fun discoverCrateMacroSourcesForVirtualFile(rustFile: VirtualFile): List<String> =
+        VirtualFileTreeNavigator.discoverMacroSourcesForFile(rustFile)
 
-        val visitedPaths = linkedSetOf(rustFile.path)
-        val sources = mutableListOf<String>()
+    private fun findNearestRustKotlinPropertiesVirtualFile(startFile: VirtualFile?): VirtualFile? =
+        VirtualFileTreeNavigator.findNearestRustKotlinPropertiesNode(startFile)
+}
 
-        fun addVirtualMacroFile(candidate: VirtualFile?, followMacroUse: Boolean) {
-            if (candidate == null || candidate.isDirectory || !candidate.isValid) return
-            if (!visitedPaths.add(candidate.path)) return
-            val text = VfsUtilCore.loadText(candidate)
-            if (text.contains("macro_rules")) {
-                sources.add(text)
-            }
-            if (followMacroUse && text.contains("macro_use")) {
-                val baseDir = candidate.parent
-                if (baseDir != null) {
-                    for (modName in extractMacroUseModuleNames(text)) {
-                        addVirtualMacroFile(baseDir.findChild("$modName.rs"), followMacroUse = true)
-                        addVirtualMacroFile(baseDir.findChild(modName)?.findChild("mod.rs"), followMacroUse = true)
-                    }
-                }
-            }
-        }
+private object VirtualFileTreeNavigator : CrateFileTreeNavigator<VirtualFile>() {
+    override fun parentOf(node: VirtualFile): VirtualFile? = node.parent
 
-        addVirtualMacroFile(crateSrcRoot.findChild("lib.rs"), followMacroUse = true)
-        addVirtualMacroFile(crateSrcRoot.findChild("macros.rs"), followMacroUse = true)
-        for (dir in ancestorDirs) {
-            addVirtualMacroFile(dir.findChild("mod.rs"), followMacroUse = true)
-        }
-        return sources
-    }
+    override fun childNamed(dir: VirtualFile, name: String): VirtualFile? = dir.findChild(name)
 
-    private fun findNearestRustKotlinPropertiesVirtualFile(startFile: VirtualFile?): VirtualFile? {
-        var current = if (startFile?.isDirectory == true) startFile else startFile?.parent
-        while (current != null) {
-            val candidate = current.findChild("rustkotlin.properties")
-            if (candidate != null && !candidate.isDirectory) {
-                return candidate
-            }
-            current = current.parent
-        }
-        return null
-    }
+    override fun childrenOf(dir: VirtualFile): List<VirtualFile> = dir.children.toList()
+
+    override fun nameOf(node: VirtualFile): String = node.name
+
+    override fun pathKey(node: VirtualFile): String = node.path
+
+    override fun isDirectory(node: VirtualFile): Boolean = node.isValid && node.isDirectory
+
+    override fun isRegularFile(node: VirtualFile): Boolean = node.isValid && !node.isDirectory
+
+    override fun canonicalize(node: VirtualFile): VirtualFile = node
+
+    override fun readText(file: VirtualFile): String = VfsUtilCore.loadText(file)
 }

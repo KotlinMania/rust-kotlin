@@ -29,6 +29,14 @@ internal open class RustTokenCursor(
     fun punctCharAt(idx: Int): Char? =
         (trees.getOrNull(idx) as? TokenTree.Punct)?.value?.asChar()
 
+    fun punctSpacingAt(idx: Int): Spacing? =
+        (trees.getOrNull(idx) as? TokenTree.Punct)?.value?.spacing()
+
+    fun isLifetimeAt(idx: Int): Boolean {
+        val p0 = (trees.getOrNull(idx) as? TokenTree.Punct)?.value ?: return false
+        return p0.asChar() == '\'' && p0.spacing() == Spacing.Joint && trees.getOrNull(idx + 1) is TokenTree.Ident
+    }
+
     fun groupAt(idx: Int, delimiter: Delimiter? = null): Group? {
         val grp = (trees.getOrNull(idx) as? TokenTree.Group)?.value ?: return null
         return if (delimiter == null || grp.delimiter() == delimiter) grp else null

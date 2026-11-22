@@ -113,91 +113,256 @@ public fun parsePackageProperties(content: String): FolderPackageProperties {
     )
 }
 
-private fun readKmFileText(path: KmPath): String =
+internal fun readKmFileText(path: KmPath): String =
     SystemFileSystem.source(path).buffered().use { it.readString() }
 
-private fun isKmRegularFile(path: KmPath): Boolean =
+internal fun isKmRegularFile(path: KmPath): Boolean =
     SystemFileSystem.metadataOrNull(path)?.isRegularFile == true
 
-private fun isKmDirectory(path: KmPath): Boolean =
+internal fun isKmDirectory(path: KmPath): Boolean =
     SystemFileSystem.metadataOrNull(path)?.isDirectory == true
 
-private fun startingDirectoryKmPath(startPath: String?): KmPath? {
-    if (startPath.isNullOrBlank()) return null
-    val initial = KmPath(startPath)
-    val resolved =
-        if (SystemFileSystem.exists(initial)) {
-            SystemFileSystem.resolve(initial)
-        } else {
-            initial
+/**
+ * Abstract filesystem/VFS navigator unifying upward project/package property resolution,
+ * crate `src/` root discovery, flat-file module enumeration, and `macro_rules!` / `#[macro_use]`
+ * companion source collection across KMP `KmPath` disk trees and IntelliJ `VirtualFile` trees.
+ */
+public abstract class CrateFileTreeNavigator<Node : Any> {
+    protected abstract fun parentOf(node: Node): Node?
+
+    protected abstract fun childNamed(dir: Node, name: String): Node?
+
+    protected abstract fun childrenOf(dir: Node): List<Node>
+
+    protected abstract fun nameOf(node: Node): String
+
+    protected abstract fun pathKey(node: Node): String
+
+    protected abstract fun isDirectory(node: Node): Boolean
+
+    protected abstract fun isRegularFile(node: Node): Boolean
+
+    protected abstract fun canonicalize(node: Node): Node
+
+    protected abstract fun readText(file: Node): String
+
+    public fun startingDirectory(startNode: Node?): Node? {
+        if (startNode == null) return null
+        val resolved = canonicalize(startNode)
+        return if (isDirectory(resolved)) resolved else parentOf(resolved)
+    }
+
+    public fun findNearestRustKotlinPropertiesNode(startNode: Node?): Node? {
+        var current = startingDirectory(startNode)
+        while (current != null) {
+            val candidate = childNamed(current, "rustkotlin.properties")
+            if (candidate != null && isRegularFile(candidate)) {
+                return candidate
+            }
+            current = parentOf(current)
         }
-    return if (isKmDirectory(resolved)) resolved else (resolved.parent ?: resolved)
+        return null
+    }
+
+    public fun findNearestRustKotlinProperties(startNode: Node?): RustKotlinProperties? =
+        findNearestRustKotlinPropertiesNode(startNode)?.let { parseRustKotlinProperties(readText(it)) }
+
+    public fun resolveLayeredPackageProperties(startNode: Node?): FolderPackageProperties? {
+        var current: Node? = startingDirectory(startNode) ?: return null
+        val traversedDirs = mutableListOf<String>()
+        val foundLayers = mutableListOf<Pair<FolderPackageProperties, List<String>>>()
+
+        while (current != null) {
+            val pkgCandidate = childNamed(current, "package.properties")
+            if (pkgCandidate != null && isRegularFile(pkgCandidate)) {
+                val parsed = parsePackageProperties(readText(pkgCandidate))
+                foundLayers += parsed to traversedDirs.reversed()
+            }
+            val rustKotlinCandidate = childNamed(current, "rustkotlin.properties")
+            if (rustKotlinCandidate != null && isRegularFile(rustKotlinCandidate)) {
+                break
+            }
+            val dirName = nameOf(current)
+            if (dirName.isNotEmpty()) {
+                traversedDirs += dirName
+            }
+            current = parentOf(current)
+        }
+
+        if (foundLayers.isEmpty()) return null
+
+        var resolvedPackage: String? = null
+        var resolvedGroup: String? = null
+        var resolvedNamespace: String? = null
+        val mergedCrateNamespaces = linkedMapOf<String, String>()
+
+        // Merge from outermost ancestor to innermost folder so closer package.properties win
+        for ((layer, relativeSubdirs) in foundLayers.asReversed()) {
+            if (layer.projectGroup != null) resolvedGroup = layer.projectGroup
+            if (layer.projectNamespace != null) resolvedNamespace = layer.projectNamespace
+            mergedCrateNamespaces.putAll(layer.crateNamespaces)
+            if (layer.packageName != null) {
+                val basePkg = layer.packageName.trim().removeSuffix(".")
+                val subSuffix =
+                    relativeSubdirs
+                        .map { rustModuleIdentToKotlin(it) }
+                        .filter { it.isNotEmpty() }
+                        .joinToString(".")
+                resolvedPackage = if (subSuffix.isEmpty()) basePkg else "$basePkg.$subSuffix"
+            }
+        }
+
+        return FolderPackageProperties(
+            packageName = resolvedPackage,
+            projectGroup = resolvedGroup,
+            projectNamespace = resolvedNamespace,
+            crateNamespaces = mergedCrateNamespaces,
+        )
+    }
+
+    public fun findCrateSrcRootAndAncestors(startDir: Node): Pair<Node, List<Node>> {
+        val dirsUpward = mutableListOf<Node>()
+        var cur: Node? = startDir
+        var crateSrcRoot: Node = startDir
+        var depth = 0
+        while (cur != null && depth < 12) {
+            dirsUpward.add(cur)
+            val libRs = childNamed(cur, "lib.rs")
+            if ((libRs != null && isRegularFile(libRs)) || nameOf(cur) == "src") {
+                crateSrcRoot = cur
+                break
+            }
+            val cargoToml = childNamed(cur, "Cargo.toml")
+            if (cargoToml != null && isRegularFile(cargoToml)) {
+                break
+            }
+            cur = parentOf(cur)
+            depth++
+        }
+        val rootIdx = dirsUpward.indexOf(crateSrcRoot)
+        val ancestorDirs =
+            if (rootIdx >= 0) {
+                dirsUpward.take(rootIdx + 1).reversed()
+            } else {
+                listOf(startDir)
+            }
+        return crateSrcRoot to ancestorDirs
+    }
+
+    public fun discoverFlatFileModulesInRoot(crateSrcRoot: Node): Set<String> {
+        val flatModules = linkedSetOf<String>()
+        for (entry in childrenOf(crateSrcRoot)) {
+            if (!isRegularFile(entry)) continue
+            val fileName = nameOf(entry)
+            if (!fileName.endsWith(".rs")) continue
+            val stem = fileName.removeSuffix(".rs")
+            if (stem == "lib" || stem == "mod" || stem == "main" || stem == "build") continue
+            val siblingDir = childNamed(crateSrcRoot, stem)
+            if (siblingDir == null || !isDirectory(siblingDir)) {
+                flatModules += stem
+            }
+        }
+        val preludeDir = childNamed(crateSrcRoot, "prelude")
+        if (preludeDir == null || !isDirectory(preludeDir)) {
+            flatModules += "prelude"
+        }
+        return flatModules
+    }
+
+    public fun collectMacroSourceEntries(inputDir: Node): List<Pair<String, String>> {
+        val (crateSrcRoot, ancestorDirs) = findCrateSrcRootAndAncestors(inputDir)
+        val visitedPaths = linkedSetOf<String>()
+        val entries = mutableListOf<Pair<String, String>>()
+
+        fun addMacroSourceFile(candidate: Node?, followMacroUse: Boolean) {
+            if (candidate == null || !isRegularFile(candidate)) return
+            val resolvedCandidate = canonicalize(candidate)
+            val resolvedKey = pathKey(resolvedCandidate)
+            if (!visitedPaths.add(resolvedKey)) return
+            val text = readText(resolvedCandidate)
+            if (text.contains("macro_rules")) {
+                entries.add(resolvedKey to text)
+            }
+            if (followMacroUse && text.contains("macro_use")) {
+                val baseDir = parentOf(resolvedCandidate)
+                if (baseDir != null) {
+                    for (modName in extractMacroUseModuleNames(text)) {
+                        addMacroSourceFile(childNamed(baseDir, "$modName.rs"), followMacroUse = true)
+                        addMacroSourceFile(
+                            childNamed(baseDir, modName)?.let { childNamed(it, "mod.rs") },
+                            followMacroUse = true,
+                        )
+                    }
+                }
+            }
+        }
+
+        addMacroSourceFile(childNamed(crateSrcRoot, "lib.rs"), followMacroUse = true)
+        addMacroSourceFile(childNamed(crateSrcRoot, "macros.rs"), followMacroUse = true)
+        for (dir in ancestorDirs) {
+            addMacroSourceFile(childNamed(dir, "mod.rs"), followMacroUse = true)
+            addMacroSourceFile(childNamed(dir, "macros.rs"), followMacroUse = true)
+        }
+        return entries
+    }
+
+    public fun discoverMacroSourcesForFile(rustFile: Node): List<String> {
+        if (!isRegularFile(rustFile)) return emptyList()
+        val resolvedFile = canonicalize(rustFile)
+        val inputDir = parentOf(resolvedFile) ?: return emptyList()
+        val selfKey = pathKey(resolvedFile)
+        return collectMacroSourceEntries(inputDir).filter { it.first != selfKey }.map { it.second }
+    }
 }
 
-public fun findNearestRustKotlinProperties(startPath: String?): RustKotlinProperties? {
-    var current = startingDirectoryKmPath(startPath)
-    while (current != null) {
-        val candidate = KmPath(current, "rustkotlin.properties")
-        if (isKmRegularFile(candidate)) {
-            return parseRustKotlinProperties(readKmFileText(candidate))
-        }
-        current = current.parent
+internal object KmPathFileTreeNavigator : CrateFileTreeNavigator<KmPath>() {
+    override fun parentOf(node: KmPath): KmPath? = node.parent
+
+    override fun childNamed(dir: KmPath, name: String): KmPath = KmPath(dir, name)
+
+    override fun childrenOf(dir: KmPath): List<KmPath> = SystemFileSystem.list(dir).toList()
+
+    override fun nameOf(node: KmPath): String = node.name
+
+    override fun pathKey(node: KmPath): String = node.toString()
+
+    override fun isDirectory(node: KmPath): Boolean = isKmDirectory(node)
+
+    override fun isRegularFile(node: KmPath): Boolean = isKmRegularFile(node)
+
+    override fun canonicalize(node: KmPath): KmPath =
+        if (SystemFileSystem.exists(node)) SystemFileSystem.resolve(node) else node
+
+    override fun readText(file: KmPath): String = readKmFileText(file)
+
+    fun resolveCrateSrcRootFromDisk(
+        inputPath: String?,
+        sourceRoot: String? = null,
+    ): KmPath? {
+        val candidate =
+            when {
+                !sourceRoot.isNullOrBlank() -> KmPath(sourceRoot)
+                !inputPath.isNullOrBlank() -> {
+                    val rawFile = KmPath(inputPath)
+                    if (!isKmRegularFile(rawFile)) return null
+                    val parentDir = canonicalize(rawFile).parent ?: return null
+                    findCrateSrcRootAndAncestors(parentDir).first
+                }
+                else -> null
+            } ?: return null
+        return if (isKmDirectory(candidate)) canonicalize(candidate) else null
     }
-    return null
 }
 
-public fun findNearestPackageProperties(startPath: String?): FolderPackageProperties? {
-    var current: KmPath? = startingDirectoryKmPath(startPath) ?: return null
-    val traversedDirs = mutableListOf<String>()
-    val foundLayers = mutableListOf<Pair<FolderPackageProperties, List<String>>>()
-
-    while (current != null) {
-        val pkgCandidate = KmPath(current, "package.properties")
-        if (isKmRegularFile(pkgCandidate)) {
-            val parsed = parsePackageProperties(readKmFileText(pkgCandidate))
-            foundLayers += parsed to traversedDirs.reversed()
-        }
-        val rustKotlinCandidate = KmPath(current, "rustkotlin.properties")
-        if (isKmRegularFile(rustKotlinCandidate)) {
-            break
-        }
-        val dirName = current.name
-        if (dirName.isNotEmpty()) {
-            traversedDirs += dirName
-        }
-        current = current.parent
-    }
-
-    if (foundLayers.isEmpty()) return null
-
-    var resolvedPackage: String? = null
-    var resolvedGroup: String? = null
-    var resolvedNamespace: String? = null
-    val mergedCrateNamespaces = linkedMapOf<String, String>()
-
-    // Merge from outermost ancestor to innermost folder so closer package.properties win
-    for ((layer, relativeSubdirs) in foundLayers.asReversed()) {
-        if (layer.projectGroup != null) resolvedGroup = layer.projectGroup
-        if (layer.projectNamespace != null) resolvedNamespace = layer.projectNamespace
-        mergedCrateNamespaces.putAll(layer.crateNamespaces)
-        if (layer.packageName != null) {
-            val basePkg = layer.packageName.trim().removeSuffix(".")
-            val subSuffix =
-                relativeSubdirs
-                    .map { rustModuleIdentToKotlin(it) }
-                    .filter { it.isNotEmpty() }
-                    .joinToString(".")
-            resolvedPackage = if (subSuffix.isEmpty()) basePkg else "$basePkg.$subSuffix"
-        }
-    }
-
-    return FolderPackageProperties(
-        packageName = resolvedPackage,
-        projectGroup = resolvedGroup,
-        projectNamespace = resolvedNamespace,
-        crateNamespaces = mergedCrateNamespaces,
+public fun findNearestRustKotlinProperties(startPath: String?): RustKotlinProperties? =
+    KmPathFileTreeNavigator.findNearestRustKotlinProperties(
+        startPath?.takeIf { it.isNotBlank() }?.let(::KmPath),
     )
-}
+
+public fun findNearestPackageProperties(startPath: String?): FolderPackageProperties? =
+    KmPathFileTreeNavigator.resolveLayeredPackageProperties(
+        startPath?.takeIf { it.isNotBlank() }?.let(::KmPath),
+    )
 
 public data class FileHeaderContext(
     public val portLintSourcePath: String? = null,
@@ -338,52 +503,11 @@ internal fun discoverCrateFlatFileModulesFromDisk(
     inputPath: String?,
     sourceRoot: String? = null,
 ): Set<String> {
-    val rootCandidate =
-        when {
-            !sourceRoot.isNullOrBlank() -> KmPath(sourceRoot)
-            !inputPath.isNullOrBlank() -> {
-                val rawFile = KmPath(inputPath)
-                if (!isKmRegularFile(rawFile)) return emptySet()
-                val resolvedFile = SystemFileSystem.resolve(rawFile)
-                var cur: KmPath? = resolvedFile.parent
-                var found: KmPath? = cur
-                var depth = 0
-                while (cur != null && depth < 12) {
-                    if (isKmRegularFile(KmPath(cur, "lib.rs")) || cur.name == "src") {
-                        found = cur
-                        break
-                    }
-                    if (isKmRegularFile(KmPath(cur, "Cargo.toml"))) {
-                        break
-                    }
-                    cur = cur.parent
-                    depth++
-                }
-                found
-            }
-            else -> null
-        } ?: return emptySet()
-
-    if (!isKmDirectory(rootCandidate)) return emptySet()
-    val resolvedRoot = SystemFileSystem.resolve(rootCandidate)
+    val resolvedRoot = KmPathFileTreeNavigator.resolveCrateSrcRootFromDisk(inputPath, sourceRoot) ?: return emptySet()
     val cacheKey = resolvedRoot.toString()
     diskFlatFileModulesByRootCache[cacheKey]?.let { return it }
 
-    val flatModules = linkedSetOf<String>()
-    for (entry in SystemFileSystem.list(resolvedRoot)) {
-        if (!isKmRegularFile(entry)) continue
-        val fileName = entry.name
-        if (!fileName.endsWith(".rs")) continue
-        val stem = fileName.removeSuffix(".rs")
-        if (stem == "lib" || stem == "mod" || stem == "main" || stem == "build") continue
-        if (!isKmDirectory(KmPath(resolvedRoot, stem))) {
-            flatModules += stem
-        }
-    }
-    if (!isKmDirectory(KmPath(resolvedRoot, "prelude"))) {
-        flatModules += "prelude"
-    }
-    val result = flatModules.toSet()
+    val result = KmPathFileTreeNavigator.discoverFlatFileModulesInRoot(resolvedRoot)
     if (diskFlatFileModulesByRootCache.size >= 128) {
         diskFlatFileModulesByRootCache = mapOf(cacheKey to result)
     } else {
@@ -404,61 +528,7 @@ internal fun discoverCrateMacroSourcesFromDisk(inputPath: String?): List<String>
         return cached.filter { it.first != resolvedFileStr }.map { it.second }
     }
 
-    val dirsUpward = mutableListOf<KmPath>()
-    var cur: KmPath? = inputDir
-    var crateSrcRoot: KmPath = inputDir
-    var depth = 0
-    while (cur != null && depth < 12) {
-        dirsUpward.add(cur)
-        if (isKmRegularFile(KmPath(cur, "lib.rs")) || cur.name == "src") {
-            crateSrcRoot = cur
-            break
-        }
-        if (isKmRegularFile(KmPath(cur, "Cargo.toml"))) {
-            break
-        }
-        cur = cur.parent
-        depth++
-    }
-    val rootIdx = dirsUpward.indexOf(crateSrcRoot)
-    val ancestorDirs =
-        if (rootIdx >= 0) {
-            dirsUpward.take(rootIdx + 1).reversed()
-        } else {
-            listOf(inputDir)
-        }
-
-    val visitedPaths = linkedSetOf<String>()
-    val entries = mutableListOf<Pair<String, String>>()
-
-    fun addMacroSourceFile(candidate: KmPath, followMacroUse: Boolean) {
-        if (!isKmRegularFile(candidate)) return
-        val resolvedCandidate = SystemFileSystem.resolve(candidate)
-        val resolvedCandidateStr = resolvedCandidate.toString()
-        if (!visitedPaths.add(resolvedCandidateStr)) return
-        val text = readKmFileText(resolvedCandidate)
-        if (text.contains("macro_rules")) {
-            entries.add(resolvedCandidateStr to text)
-        }
-        if (followMacroUse && text.contains("macro_use")) {
-            val baseDir = resolvedCandidate.parent
-            if (baseDir != null) {
-                for (modName in extractMacroUseModuleNames(text)) {
-                    addMacroSourceFile(KmPath(baseDir, "$modName.rs"), followMacroUse = true)
-                    addMacroSourceFile(KmPath(KmPath(baseDir, modName), "mod.rs"), followMacroUse = true)
-                }
-            }
-        }
-    }
-
-    addMacroSourceFile(KmPath(crateSrcRoot, "lib.rs"), followMacroUse = true)
-    addMacroSourceFile(KmPath(crateSrcRoot, "macros.rs"), followMacroUse = true)
-    for (dir in ancestorDirs) {
-        addMacroSourceFile(KmPath(dir, "mod.rs"), followMacroUse = true)
-        addMacroSourceFile(KmPath(dir, "macros.rs"), followMacroUse = true)
-    }
-
-    val cachedEntries = entries.toList()
+    val cachedEntries = KmPathFileTreeNavigator.collectMacroSourceEntries(inputDir)
     if (diskMacroSourcesByDirCache.size >= 128) {
         diskMacroSourcesByDirCache = mapOf(cacheKey to cachedEntries)
     } else {

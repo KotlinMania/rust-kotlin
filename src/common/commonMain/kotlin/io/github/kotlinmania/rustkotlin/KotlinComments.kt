@@ -409,7 +409,7 @@ private fun translateSingleDoctestCandidate(
             lexTokenStreamOrNull(normalizedSource)?.toList() ?: return null
         }
 
-    return if (looksLikeTopLevelItemFile(trees)) {
+    return if (RustdocSnippetTokenInspector(trees).looksLikeTopLevelItemFile()) {
         tryAstTranslateAsFile(
             source = normalizedSource,
             preLexedStream = if (edits.isEmpty()) initialStream else null,
@@ -419,29 +419,6 @@ private fun translateSingleDoctestCandidate(
     } else {
         tryAstTranslateAsWrappedBody(normalizedSource, trees)
     }
-}
-
-private fun looksLikeTopLevelItemFile(trees: List<TokenTree>): Boolean {
-    var idx = computeLeadingUseItemsNextIndex(trees)
-    while (idx < trees.size) {
-        val tok = trees[idx]
-        if (tok is TokenTree.Punct && tok.value.asChar() == '#') {
-            idx++
-            if (idx < trees.size && (trees[idx] as? TokenTree.Punct)?.value?.asChar() == '!') idx++
-            if (idx < trees.size && trees[idx] is TokenTree.Group) idx++
-            continue
-        }
-        val ident = (tok as? TokenTree.Ident)?.value?.toString() ?: return false
-        if (ident == "pub" || ident == "async" || ident == "unsafe") {
-            idx++
-            if (idx < trees.size && trees[idx] is TokenTree.Group && (trees[idx] as TokenTree.Group).value.delimiter() == Delimiter.Parenthesis) {
-                idx++
-            }
-            continue
-        }
-        return ident in TOP_LEVEL_ITEM_KEYWORDS
-    }
-    return false
 }
 
 private fun stripCommonFenceIndentation(lines: List<String>): List<String> {
@@ -482,19 +459,19 @@ private fun buildUnhiddenRustdocSource(lines: List<String>): UnhiddenRustdocSour
             }
             val lineTokens = lexTokenStreamOrNull(normalizeSupplementaryCharLiterals(unhidden))
             if (lineTokens != null) {
-                val trees = lineTokens.toList()
-                if (isExternCrateTokenLine(trees)) {
+                val inspector = RustdocSnippetTokenInspector(lineTokens.toList())
+                if (inspector.isExternCrateLine()) {
                     continue
                 }
-                if (isStringifyConstHideHeader(trees)) {
+                if (inspector.isStringifyConstHideHeader()) {
                     inStringifyHide = true
                     continue
                 }
-                val detectedFn = extractFnHeaderIdentFromTokens(trees)
+                val detectedFn = inspector.extractFnHeaderIdent()
                 if (detectedFn != null && wrapperFnKtName == null) {
                     wrapperFnKtName = rustFunctionIdentToKotlin(detectedFn)
                 }
-                if (isOkUnitTokenLine(trees)) {
+                if (inspector.isOkUnitLine()) {
                     hadHiddenTrailingOkUnit = true
                 }
             } else {
@@ -516,60 +493,109 @@ private fun buildUnhiddenRustdocSource(lines: List<String>): UnhiddenRustdocSour
     )
 }
 
-private fun isExternCrateTokenLine(trees: List<TokenTree>): Boolean =
-    trees.size >= 3 &&
-        (trees[0] as? TokenTree.Ident)?.value?.toString() == "extern" &&
-        (trees[1] as? TokenTree.Ident)?.value?.toString() == "crate"
-
-private fun isStringifyConstHideHeader(trees: List<TokenTree>): Boolean {
-    if (trees.isEmpty()) return false
-    if ((trees[0] as? TokenTree.Ident)?.value?.toString() != "const") return false
-    return trees.any { (it as? TokenTree.Ident)?.value?.toString() == "stringify" }
-}
-
-private fun extractFnHeaderIdentFromTokens(trees: List<TokenTree>): String? {
-    var idx = 0
-    while (idx < trees.size) {
-        val ident = (trees[idx] as? TokenTree.Ident)?.value?.toString()
-        if (ident == "pub" || ident == "async" || ident == "const") {
-            idx++
-            if (idx < trees.size && trees[idx] is TokenTree.Group && (trees[idx] as TokenTree.Group).value.delimiter() == Delimiter.Parenthesis) {
-                idx++
-            }
-            continue
-        }
-        if (ident == "fn" && idx + 1 < trees.size) {
-            return (trees[idx + 1] as? TokenTree.Ident)?.value?.toString()?.removePrefix("r#")
-        }
-        break
-    }
-    return null
-}
-
 private fun extractIncompleteFnHeaderIdent(trimmedLine: String): String? {
     val withClosingBrace = "$trimmedLine }"
     val stream = lexTokenStreamOrNull(normalizeSupplementaryCharLiterals(withClosingBrace)) ?: return null
-    return extractFnHeaderIdentFromTokens(stream.toList())
+    return RustdocSnippetTokenInspector(stream.toList()).extractFnHeaderIdent()
 }
 
-private fun isOkUnitTokenLine(trees: List<TokenTree>): Boolean {
-    for (idx in trees.indices) {
-        val ident = (trees[idx] as? TokenTree.Ident)?.value?.toString() ?: continue
-        if (ident == "Ok" && idx + 1 < trees.size) {
-            val grp = (trees[idx + 1] as? TokenTree.Group)?.value
-            if (grp != null && grp.delimiter() == Delimiter.Parenthesis) {
-                val inner = grp.stream().toList()
-                if (inner.size == 1 &&
-                    inner[0] is TokenTree.Group &&
-                    (inner[0] as TokenTree.Group).value.delimiter() == Delimiter.Parenthesis &&
-                    (inner[0] as TokenTree.Group).value.stream().isEmpty()
-                ) {
+private class RustdocSnippetTokenInspector(
+    trees: List<TokenTree>,
+) : RustTokenCursor(trees) {
+    fun looksLikeTopLevelItemFile(): Boolean {
+        var idx = computeLeadingUseItemsNextIndex()
+        while (idx < size) {
+            consumeAttribute(idx, allowInnerAttr = true)?.let {
+                idx = it
+                continue
+            }
+            val ident = identAt(idx) ?: return false
+            if (ident == "pub" || ident == "async" || ident == "unsafe") {
+                idx++
+                if (groupAt(idx, Delimiter.Parenthesis) != null) {
+                    idx++
+                }
+                continue
+            }
+            return ident in TOP_LEVEL_ITEM_KEYWORDS
+        }
+        return false
+    }
+
+    fun computeLeadingUseItemsNextIndex(): Int {
+        var idx = 0
+        while (idx < size) {
+            val firstIdent = identAt(idx)
+            val isLeadingUseOrExtern =
+                firstIdent == "use" ||
+                    (firstIdent == "pub" && identAt(idx + 1) == "use") ||
+                    (firstIdent == "extern" && identAt(idx + 1) == "crate")
+            if (!isLeadingUseOrExtern) break
+            var semiIdx = idx
+            var foundSemi = false
+            while (semiIdx < size) {
+                if (punctCharAt(semiIdx) == ';') {
+                    semiIdx++
+                    foundSemi = true
+                    break
+                }
+                semiIdx++
+            }
+            if (!foundSemi) break
+            idx = semiIdx
+        }
+        return idx
+    }
+
+    fun isExternCrateLine(): Boolean =
+        size >= 3 && identAt(0) == "extern" && identAt(1) == "crate"
+
+    fun isStringifyConstHideHeader(): Boolean =
+        size > 0 && identAt(0) == "const" && (0 until size).any { identAt(it) == "stringify" }
+
+    fun extractFnHeaderIdent(): String? {
+        var idx = 0
+        while (idx < size) {
+            val ident = identAt(idx)
+            if (ident == "pub" || ident == "async" || ident == "const") {
+                idx++
+                if (groupAt(idx, Delimiter.Parenthesis) != null) {
+                    idx++
+                }
+                continue
+            }
+            if (ident == "fn" && idx + 1 < size) {
+                return cleanIdentAt(idx + 1)
+            }
+            break
+        }
+        return null
+    }
+
+    fun isOkUnitLine(): Boolean {
+        for (idx in 0 until size) {
+            if (identAt(idx) == "Ok") {
+                val outerParen = groupAt(idx + 1, Delimiter.Parenthesis) ?: continue
+                val inner = outerParen.stream().toList()
+                val unitGroup = (inner.singleOrNull() as? TokenTree.Group)?.value
+                if (unitGroup != null && unitGroup.delimiter() == Delimiter.Parenthesis && unitGroup.stream().isEmpty()) {
                     return true
                 }
             }
         }
+        return false
     }
-    return false
+
+    fun containsTryQuestionToken(): Boolean {
+        for (tree in trees) {
+            when (tree) {
+                is TokenTree.Punct -> if (tree.value.asChar() == '?') return true
+                is TokenTree.Group -> if (RustdocSnippetTokenInspector(tree.value.stream().toList()).containsTryQuestionToken()) return true
+                else -> {}
+            }
+        }
+        return false
+    }
 }
 
 private fun rewriteHiddenUnimplementedMacrosViaTokens(source: String): String {
@@ -725,14 +751,14 @@ private fun tryAstTranslateAsWrappedBody(
     trees: List<TokenTree>,
 ): List<String>? {
     if (trees.isEmpty()) return null
-    val nextIdx = computeLeadingUseItemsNextIndex(trees)
+    val nextIdx = RustdocSnippetTokenInspector(trees).computeLeadingUseItemsNextIndex()
     val splitOffset = if (nextIdx > 0 && nextIdx <= trees.size) (trees[nextIdx - 1] as? TokenTree.Punct)?.value?.span()?.endExclusiveOffset() ?: 0 else 0
     val leadingUses = if (splitOffset > 0 && splitOffset <= normalized.length) normalized.substring(0, splitOffset) else ""
     val bodyPart = if (splitOffset > 0 && splitOffset <= normalized.length) normalized.substring(splitOffset) else normalized
     if (bodyPart.isBlank()) return null
 
     val bodyTrees = if (nextIdx > 0) trees.subList(nextIdx, trees.size) else trees
-    val usesTryOperator = containsTryQuestionTokenInTrees(bodyTrees)
+    val usesTryOperator = RustdocSnippetTokenInspector(bodyTrees).containsTryQuestionToken()
     val wrapped =
         if (usesTryOperator) {
             "$leadingUses\nfn __doctest_entry__() -> Result<()> {\n$bodyPart\nOk(())\n}"
@@ -745,43 +771,6 @@ private fun tryAstTranslateAsWrappedBody(
         wrapperFnKtName = "doctestEntry",
         stripTrailingSuccessUnit = usesTryOperator,
     )
-}
-
-private fun computeLeadingUseItemsNextIndex(trees: List<TokenTree>): Int {
-    var idx = 0
-    while (idx < trees.size) {
-        val firstIdent = (trees[idx] as? TokenTree.Ident)?.value?.toString()
-        val isLeadingUseOrExtern =
-            firstIdent == "use" ||
-                (firstIdent == "pub" && idx + 1 < trees.size && (trees[idx + 1] as? TokenTree.Ident)?.value?.toString() == "use") ||
-                (firstIdent == "extern" && idx + 1 < trees.size && (trees[idx + 1] as? TokenTree.Ident)?.value?.toString() == "crate")
-        if (!isLeadingUseOrExtern) break
-        var semiIdx = idx
-        var foundSemi = false
-        while (semiIdx < trees.size) {
-            val tok = trees[semiIdx]
-            if (tok is TokenTree.Punct && tok.value.asChar() == ';') {
-                semiIdx++
-                foundSemi = true
-                break
-            }
-            semiIdx++
-        }
-        if (!foundSemi) break
-        idx = semiIdx
-    }
-    return idx
-}
-
-private fun containsTryQuestionTokenInTrees(trees: List<TokenTree>): Boolean {
-    for (tree in trees) {
-        when (tree) {
-            is TokenTree.Punct -> if (tree.value.asChar() == '?') return true
-            is TokenTree.Group -> if (containsTryQuestionTokenInTrees(tree.value.stream().toList())) return true
-            else -> {}
-        }
-    }
-    return false
 }
 
 private fun unwrapSyntheticDoctestFunction(
@@ -1049,38 +1038,7 @@ private fun renderIntraDocLinkTarget(rawCode: String): String {
     if (stream == null) {
         return sanitizeProseAndCommentVocabulary(trimmed, convertCamelIdentifiersOnly = false)
     }
-    val trees = stream.toList()
-    val parts = mutableListOf<String>()
-    var i = 0
-    while (i < trees.size) {
-        when (val tree = trees[i]) {
-            is TokenTree.Ident -> {
-                val raw = tree.value.toString().removePrefix("r#")
-                if (parts.isEmpty() && (raw == "crate" || raw == "self" || raw == "super")) {
-                    if (i + 2 < trees.size && isDoubleColonAt(trees, i + 1)) {
-                        i += 3
-                        continue
-                    }
-                }
-                val ktIdent =
-                    if (raw.firstOrNull()?.isUpperCase() == true) {
-                        rustTypeIdentToKotlin(raw)
-                    } else {
-                        rustValueIdentToKotlin(raw)
-                    }
-                parts += ktIdent
-            }
-            is TokenTree.Punct -> {
-                if (isDoubleColonAt(trees, i)) {
-                    i += 2
-                    continue
-                }
-            }
-            is TokenTree.Group -> {}
-            is TokenTree.Literal -> {}
-        }
-        i++
-    }
+    val parts = CommentRustTokenEmitter(stream.toList()).renderIntraDocLinkParts()
     return if (parts.isEmpty()) {
         sanitizeProseAndCommentVocabulary(trimmed, convertCamelIdentifiersOnly = false)
     } else {
@@ -1191,237 +1149,251 @@ private fun findMatchingBracketInText(text: String, openBracketIdx: Int): Int {
     return if (depth == 0) k - 1 else -1
 }
 
-private fun renderAttributeInteriorTokens(attrStream: TokenStream, isInner: Boolean): String {
-    val trees = attrStream.toList()
-    if (trees.isEmpty()) return ""
-    val prefix = if (isInner) "@file:" else "@"
-    var idx = 0
-    var lastPathIdent = ""
-    while (idx < trees.size) {
-        val tok = trees[idx]
-        if (tok is TokenTree.Ident) {
-            lastPathIdent = tok.value.toString().removePrefix("r#")
+private fun renderAttributeInteriorTokens(attrStream: TokenStream, isInner: Boolean): String =
+    CommentRustTokenEmitter(attrStream.toList()).renderAttributeInterior(isInner)
+
+private fun renderCommentTokenStream(stream: TokenStream): String =
+    CommentRustTokenEmitter(stream.toList()).render()
+
+private class CommentRustTokenEmitter(
+    trees: List<TokenTree>,
+) : RustTokenCursor(trees) {
+    fun renderIntraDocLinkParts(): List<String> {
+        val parts = mutableListOf<String>()
+        var i = 0
+        while (i < size) {
+            when (trees[i]) {
+                is TokenTree.Ident -> {
+                    val raw = cleanIdentAt(i).orEmpty()
+                    if (parts.isEmpty() && (raw == "crate" || raw == "self" || raw == "super")) {
+                        if (i + 2 < size && isDoubleColonAt(i + 1)) {
+                            i += 3
+                            continue
+                        }
+                    }
+                    parts +=
+                        if (raw.firstOrNull()?.isUpperCase() == true) {
+                            rustTypeIdentToKotlin(raw)
+                        } else {
+                            rustValueIdentToKotlin(raw)
+                        }
+                }
+                is TokenTree.Punct ->
+                    if (isDoubleColonAt(i)) {
+                        i += 2
+                        continue
+                    }
+                is TokenTree.Group, is TokenTree.Literal -> {}
+            }
+            i++
+        }
+        return parts
+    }
+
+    fun renderAttributeInterior(isInner: Boolean): String {
+        if (trees.isEmpty()) return ""
+        val prefix = if (isInner) "@file:" else "@"
+        var idx = 0
+        var lastPathIdent = ""
+        while (idx < size) {
+            val seg = cleanIdentAt(idx) ?: break
+            lastPathIdent = seg
             idx++
-            if (idx < trees.size && isDoubleColonAt(trees, idx)) {
+            if (idx < size && isDoubleColonAt(idx)) {
                 idx += 2
                 continue
             }
             break
-        } else {
-            break
         }
-    }
-    if (lastPathIdent.isEmpty()) {
-        val fallbackBody = renderCommentTokenTrees(trees)
-        return if (fallbackBody.isEmpty()) "" else "$prefix$fallbackBody"
-    }
-    val ktName =
-        if (lastPathIdent.startsWith("proc_macro") || lastPathIdent == "test") {
-            rustTypeIdentToKotlin(lastPathIdent)
-        } else {
-            rustValueIdentToKotlin(lastPathIdent)
+        if (lastPathIdent.isEmpty()) {
+            val fallbackBody = render()
+            return if (fallbackBody.isEmpty()) "" else "$prefix$fallbackBody"
         }
-    if (idx >= trees.size) return "$prefix$ktName"
-    val rest = trees.subList(idx, trees.size)
-    if (rest.size == 1 && rest[0] is TokenTree.Group && (rest[0] as TokenTree.Group).value.delimiter() == Delimiter.Parenthesis) {
-        val argsText = renderCommentTokenStream((rest[0] as TokenTree.Group).value.stream())
-        return "$prefix$ktName($argsText)"
-    }
-    val tailText = renderCommentTokenTrees(rest)
-    return "$prefix$ktName$tailText"
-}
-
-private fun renderCommentTokenStream(stream: TokenStream): String =
-    renderCommentTokenTrees(stream.toList())
-
-private fun renderCommentTokenTrees(trees: List<TokenTree>): String {
-    if (trees.isEmpty()) return ""
-    val outTokens = mutableListOf<String>()
-    var i = 0
-    while (i < trees.size) {
-        val current = trees[i]
-        if (current is TokenTree.Punct && current.value.asChar() == '#') {
-            var nextIdx = i + 1
-            var isInner = false
-            if (nextIdx < trees.size && (trees[nextIdx] as? TokenTree.Punct)?.value?.asChar() == '!') {
-                isInner = true
-                nextIdx++
+        val ktName =
+            if (lastPathIdent.startsWith("proc_macro") || lastPathIdent == "test") {
+                rustTypeIdentToKotlin(lastPathIdent)
+            } else {
+                rustValueIdentToKotlin(lastPathIdent)
             }
-            val grp = (trees.getOrNull(nextIdx) as? TokenTree.Group)?.value
-            if (grp != null && grp.delimiter() == Delimiter.Bracket) {
-                val renderedAttr = renderAttributeInteriorTokens(grp.stream(), isInner = isInner)
-                if (renderedAttr.isNotEmpty()) {
-                    outTokens += renderedAttr
+        if (idx >= size) return "$prefix$ktName"
+        val rest = trees.subList(idx, size)
+        val singleParen = if (rest.size == 1) groupAt(idx, Delimiter.Parenthesis) else null
+        if (singleParen != null) {
+            return "$prefix$ktName(${renderCommentTokenStream(singleParen.stream())})"
+        }
+        return "$prefix$ktName${CommentRustTokenEmitter(rest).render()}"
+    }
+
+    fun render(): String {
+        if (trees.isEmpty()) return ""
+        val outTokens = mutableListOf<String>()
+        var i = 0
+        while (i < size) {
+            val current = trees[i]
+            if (punctCharAt(i) == '#') {
+                var nextIdx = i + 1
+                var isInner = false
+                if (punctCharAt(nextIdx) == '!') {
+                    isInner = true
+                    nextIdx++
                 }
-                i = nextIdx + 1
-                continue
+                val grp = groupAt(nextIdx, Delimiter.Bracket)
+                if (grp != null) {
+                    val renderedAttr = renderAttributeInteriorTokens(grp.stream(), isInner = isInner)
+                    if (renderedAttr.isNotEmpty()) {
+                        outTokens += renderedAttr
+                    }
+                    i = nextIdx + 1
+                    continue
+                }
             }
-        }
 
-        if (current is TokenTree.Punct &&
-            current.value.asChar() == '\'' &&
-            current.value.spacing() == Spacing.Joint &&
-            i + 1 < trees.size &&
-            trees[i + 1] is TokenTree.Ident
-        ) {
-            if (trees.size == 2) {
-                val rawLt = (trees[i + 1] as TokenTree.Ident).value.toString().removePrefix("r#")
-                outTokens += mapCommentVocabularyWord(rawLt, convertCamelIdentifiersOnly = false)
-                i += 2
-                continue
-            }
-            i += 2
-            if (i < trees.size && (trees[i] as? TokenTree.Punct)?.value?.asChar() == '+') {
-                i++
-            } else if (i < trees.size && (trees[i] as? TokenTree.Punct)?.value?.asChar() == ',' && outTokens.lastOrNull() == "<") {
-                i++
-            }
-            continue
-        }
-
-        if (current is TokenTree.Punct && current.value.asChar() == '&') {
-            val prev = outTokens.lastOrNull()
-            val isBinaryAnd =
-                current.value.spacing() == Spacing.Joint &&
-                    i + 1 < trees.size &&
-                    (trees[i + 1] as? TokenTree.Punct)?.value?.asChar() == '&'
-            if (isBinaryAnd) {
-                outTokens += "&&"
-                i += 2
-                continue
-            }
-            val isRefBorrow =
-                prev == null || prev == "(" || prev == "," || prev == ":" || prev == "=" || prev == "<" || prev == "->"
-            if (isRefBorrow) {
-                i++
-                if (i < trees.size &&
-                    (trees[i] as? TokenTree.Punct)?.value?.asChar() == '\'' &&
-                    (trees[i] as TokenTree.Punct).value.spacing() == Spacing.Joint &&
-                    i + 1 < trees.size &&
-                    trees[i + 1] is TokenTree.Ident
-                ) {
+            if (isLifetimeAt(i)) {
+                if (size == 2) {
+                    outTokens += mapCommentVocabularyWord(cleanIdentAt(i + 1).orEmpty(), convertCamelIdentifiersOnly = false)
                     i += 2
+                    continue
                 }
-                if (i < trees.size && (trees[i] as? TokenTree.Ident)?.value?.toString() == "mut") {
+                i += 2
+                if (punctCharAt(i) == '+') {
+                    i++
+                } else if (punctCharAt(i) == ',' && outTokens.lastOrNull() == "<") {
                     i++
                 }
                 continue
             }
-        }
 
-        if (current is TokenTree.Ident &&
-            current.value.toString() == "Token" &&
-            i + 2 < trees.size &&
-            (trees[i + 1] as? TokenTree.Punct)?.value?.asChar() == '!' &&
-            trees[i + 2] is TokenTree.Group &&
-            (trees[i + 2] as TokenTree.Group).value.delimiter() == Delimiter.Bracket
-        ) {
-            val innerText =
-                (trees[i + 2] as TokenTree.Group)
-                    .value
-                    .stream()
-                    .toString()
-                    .replace(" ", "")
-            outTokens += mapSynTokenMacroSymbol(innerText)
-            i += 3
-            continue
-        }
-
-        if (current is TokenTree.Ident &&
-            i + 2 < trees.size &&
-            (trees[i + 1] as? TokenTree.Punct)?.value?.asChar() == '!' &&
-            trees[i + 2] is TokenTree.Group
-        ) {
-            val rawMacro = current.value.toString().removePrefix("r#")
-            val ktMacro =
-                if (rawMacro == "macro_rules") {
-                    "macroRules"
-                } else {
-                    rustFunctionIdentToKotlin(rawMacro)
+            if (punctCharAt(i) == '&') {
+                val prev = outTokens.lastOrNull()
+                if (punctSpacingAt(i) == Spacing.Joint && punctCharAt(i + 1) == '&') {
+                    outTokens += "&&"
+                    i += 2
+                    continue
                 }
-            val grp = (trees[i + 2] as TokenTree.Group).value
-            val inner = renderCommentTokenStream(grp.stream())
-            outTokens +=
-                when (grp.delimiter()) {
-                    Delimiter.Brace -> "$ktMacro { $inner }"
-                    Delimiter.Bracket -> "listOf($inner)"
-                    else -> "$ktMacro($inner)"
-                }
-            i += 3
-            continue
-        }
-
-        if (current is TokenTree.Ident &&
-            i + 1 < trees.size &&
-            (trees[i + 1] as? TokenTree.Punct)?.value?.asChar() == '!' &&
-            (i + 2 >= trees.size || (trees[i + 2] as? TokenTree.Punct)?.value?.asChar() != '=')
-        ) {
-            val rawMacro = current.value.toString().removePrefix("r#")
-            val ktMacro =
-                if (rawMacro == "macro_rules") {
-                    "macroRules"
-                } else {
-                    rustFunctionIdentToKotlin(rawMacro)
-                }
-            outTokens += ktMacro
-            i += 2
-            continue
-        }
-
-        if (isDoubleColonAt(trees, i)) {
-            if (outTokens.lastOrNull() in setOf("crate", "self", "super")) {
-                outTokens.removeAt(outTokens.lastIndex)
-                i += 2
-                continue
-            }
-            if (i + 2 < trees.size && (trees[i + 2] as? TokenTree.Punct)?.value?.asChar() == '<') {
-                i += 2
-                continue
-            }
-            outTokens += "."
-            i += 2
-            continue
-        }
-
-        when (current) {
-            is TokenTree.Ident -> {
-                val raw = current.value.toString().removePrefix("r#")
-                val mapped = mapRustIdentInCommentCode(raw)
-                if (mapped.isNotEmpty()) {
-                    outTokens += mapped
-                }
-                i++
-            }
-            is TokenTree.Literal -> {
-                outTokens += current.value.toString()
-                i++
-            }
-            is TokenTree.Group -> {
-                val grp = current.value
-                val inner = renderCommentTokenStream(grp.stream())
-                outTokens +=
-                    when (grp.delimiter()) {
-                        Delimiter.Parenthesis -> if (inner.isEmpty() && outTokens.lastOrNull() == "<") "Unit" else "($inner)"
-                        Delimiter.Bracket -> "[$inner]"
-                        Delimiter.Brace -> if (inner.isEmpty()) "{}" else "{ $inner }"
-                        Delimiter.None -> inner
+                val isRefBorrow =
+                    prev == null || prev == "(" || prev == "," || prev == ":" || prev == "=" || prev == "<" || prev == "->"
+                if (isRefBorrow) {
+                    i++
+                    if (isLifetimeAt(i)) {
+                        i += 2
                     }
-                i++
-            }
-            is TokenTree.Punct -> {
-                val punctStep = consumeMultiCharPunctInComment(trees, i, outTokens.lastOrNull())
-                if (punctStep.first.isNotEmpty()) {
-                    outTokens += punctStep.first
+                    if (identAt(i) == "mut") {
+                        i++
+                    }
+                    continue
                 }
-                i += punctStep.second
+            }
+
+            val bangMacroGrp = if (current is TokenTree.Ident && punctCharAt(i + 1) == '!') groupAt(i + 2) else null
+            if (bangMacroGrp != null) {
+                val rawMacro = cleanIdentAt(i).orEmpty()
+                if (identAt(i) == "Token" && bangMacroGrp.delimiter() == Delimiter.Bracket) {
+                    val innerText = bangMacroGrp.stream().toString().replace(" ", "")
+                    outTokens += mapSynTokenMacroSymbol(innerText)
+                    i += 3
+                    continue
+                }
+                val ktMacro = if (rawMacro == "macro_rules") "macroRules" else rustFunctionIdentToKotlin(rawMacro)
+                val inner = renderCommentTokenStream(bangMacroGrp.stream())
+                outTokens +=
+                    when (bangMacroGrp.delimiter()) {
+                        Delimiter.Brace -> "$ktMacro { $inner }"
+                        Delimiter.Bracket -> "listOf($inner)"
+                        else -> "$ktMacro($inner)"
+                    }
+                i += 3
+                continue
+            }
+
+            if (current is TokenTree.Ident && punctCharAt(i + 1) == '!' && punctCharAt(i + 2) != '=') {
+                val rawMacro = cleanIdentAt(i).orEmpty()
+                outTokens += if (rawMacro == "macro_rules") "macroRules" else rustFunctionIdentToKotlin(rawMacro)
+                i += 2
+                continue
+            }
+
+            if (isDoubleColonAt(i)) {
+                if (outTokens.lastOrNull() in setOf("crate", "self", "super")) {
+                    outTokens.removeAt(outTokens.lastIndex)
+                    i += 2
+                    continue
+                }
+                if (punctCharAt(i + 2) == '<') {
+                    i += 2
+                    continue
+                }
+                outTokens += "."
+                i += 2
+                continue
+            }
+
+            when (current) {
+                is TokenTree.Ident -> {
+                    val mapped = mapRustIdentInCommentCode(cleanIdentAt(i).orEmpty())
+                    if (mapped.isNotEmpty()) {
+                        outTokens += mapped
+                    }
+                    i++
+                }
+                is TokenTree.Literal -> {
+                    outTokens += current.value.toString()
+                    i++
+                }
+                is TokenTree.Group -> {
+                    val grp = current.value
+                    val inner = renderCommentTokenStream(grp.stream())
+                    outTokens +=
+                        when (grp.delimiter()) {
+                            Delimiter.Parenthesis -> if (inner.isEmpty() && outTokens.lastOrNull() == "<") "Unit" else "($inner)"
+                            Delimiter.Bracket -> "[$inner]"
+                            Delimiter.Brace -> if (inner.isEmpty()) "{}" else "{ $inner }"
+                            Delimiter.None -> inner
+                        }
+                    i++
+                }
+                is TokenTree.Punct -> {
+                    val punctStep = consumeMultiCharPunct(i, outTokens.lastOrNull())
+                    if (punctStep.first.isNotEmpty()) {
+                        outTokens += punctStep.first
+                    }
+                    i += punctStep.second
+                }
             }
         }
+        return joinCommentTokensCleanly(outTokens)
     }
-    return joinCommentTokensCleanly(outTokens)
-}
 
-private fun isDoubleColonAt(trees: List<TokenTree>, idx: Int): Boolean =
-    RustTokenCursor(trees).isDoubleColonAt(idx)
+    private fun consumeMultiCharPunct(
+        idx: Int,
+        prevRendered: String?,
+    ): Pair<String, Int> {
+        val c0 = punctCharAt(idx) ?: return "" to 1
+        if (punctSpacingAt(idx) == Spacing.Joint) {
+            val c1 = punctCharAt(idx + 1)
+            if (c1 != null) {
+                val pair = "$c0$c1"
+                when (pair) {
+                    "->", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=" -> return pair to 2
+                    "=>" -> return "->" to 2
+                    ".." -> {
+                        if (punctSpacingAt(idx + 1) == Spacing.Joint) {
+                            val c2 = punctCharAt(idx + 2)
+                            if (c2 == '=' || c2 == '.') return "..$c2" to 3
+                        }
+                        return ".." to 2
+                    }
+                }
+            }
+        }
+        if (c0 == '?') {
+            val isPostfixTry =
+                prevRendered != null &&
+                    (prevRendered.endsWith(")") || prevRendered.last().isLetterOrDigit() || prevRendered.endsWith("]"))
+            if (isPostfixTry) return "" to 1
+        }
+        return c0.toString() to 1
+    }
+}
 
 private fun mapSynTokenMacroSymbol(symbol: String): String =
     RustTokenCursor.resolveSynTokenIdentOrPunctTypeName(symbol)
@@ -1471,38 +1443,6 @@ private fun mapRustIdentInCommentCode(raw: String): String =
             }
         }
     }
-
-private fun consumeMultiCharPunctInComment(
-    trees: List<TokenTree>,
-    idx: Int,
-    prevRendered: String?,
-): Pair<String, Int> {
-    val p0 = (trees[idx] as TokenTree.Punct).value
-    val c0 = p0.asChar()
-    if (p0.spacing() == Spacing.Joint && idx + 1 < trees.size && trees[idx + 1] is TokenTree.Punct) {
-        val p1 = (trees[idx + 1] as TokenTree.Punct).value
-        val c1 = p1.asChar()
-        val pair = "$c0$c1"
-        when (pair) {
-            "->", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=" -> return pair to 2
-            "=>" -> return "->" to 2
-            ".." -> {
-                if (p1.spacing() == Spacing.Joint && idx + 2 < trees.size && trees[idx + 2] is TokenTree.Punct) {
-                    val c2 = (trees[idx + 2] as TokenTree.Punct).value.asChar()
-                    if (c2 == '=' || c2 == '.') return "..$c2" to 3
-                }
-                return ".." to 2
-            }
-        }
-    }
-    if (c0 == '?') {
-        val isPostfixTry =
-            prevRendered != null &&
-                (prevRendered.endsWith(")") || prevRendered.last().isLetterOrDigit() || prevRendered.endsWith("]"))
-        if (isPostfixTry) return "" to 1
-    }
-    return c0.toString() to 1
-}
 
 private fun joinCommentTokensCleanly(tokens: List<String>): String {
     if (tokens.isEmpty()) return ""

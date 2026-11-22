@@ -451,6 +451,128 @@ internal open class KotlinTokenWalker(
         return k
     }
 
+    fun nextNonTriviaIndex(startIdx: Int, limit: Int = tokens.size): Int {
+        var k = startIdx
+        while (k < limit) {
+            val t = tokens[k]
+            if (t !is KotlinLexToken.Whitespace &&
+                t !is KotlinLexToken.Newline &&
+                t !is KotlinLexToken.LineComment &&
+                t !is KotlinLexToken.BlockComment
+            ) {
+                return k
+            }
+            k++
+        }
+        return limit
+    }
+
+    fun identTextAt(idx: Int): String? {
+        val tok = tokens.getOrNull(idx) ?: return null
+        if (tok.interpolationDepth != 0) return null
+        return when (tok) {
+            is KotlinLexToken.Ident -> tok.rawText
+            is KotlinLexToken.BacktickIdent -> tok.ident
+            else -> null
+        }
+    }
+
+    fun punctAt(idx: Int): Char? {
+        val tok = tokens.getOrNull(idx) as? KotlinLexToken.Punct ?: return null
+        return if (tok.interpolationDepth == 0) tok.ch else null
+    }
+
+    fun findMatchingParenToken(openParenTokenIdx: Int): Int {
+        val openTok = tokens.getOrNull(openParenTokenIdx) as? KotlinLexToken.Punct ?: return -1
+        if (openTok.ch != '(') return -1
+        val baseInterp = openTok.interpolationDepth
+        var depth = 0
+        var k = openParenTokenIdx
+        while (k < tokens.size) {
+            val tok = tokens[k]
+            if (tok.interpolationDepth == baseInterp && tok is KotlinLexToken.Punct) {
+                when (tok.ch) {
+                    '(' -> depth++
+                    ')' -> {
+                        depth--
+                        if (depth == 0) return k
+                    }
+                }
+            }
+            k++
+        }
+        return -1
+    }
+
+    fun findMatchingBracketToken(openBracketTokenIdx: Int): Int {
+        val openTok = tokens.getOrNull(openBracketTokenIdx) as? KotlinLexToken.Punct ?: return -1
+        if (openTok.ch != '[') return -1
+        val baseInterp = openTok.interpolationDepth
+        var depth = 0
+        var k = openBracketTokenIdx
+        while (k < tokens.size) {
+            val tok = tokens[k]
+            if (tok.interpolationDepth == baseInterp && tok is KotlinLexToken.Punct) {
+                when (tok.ch) {
+                    '[' -> depth++
+                    ']' -> {
+                        depth--
+                        if (depth == 0) return k
+                    }
+                }
+            }
+            k++
+        }
+        return -1
+    }
+
+    fun skipAnnotation(atTokenIdx: Int, limit: Int = tokens.size): Int {
+        if (punctAt(atTokenIdx) != '@') return atTokenIdx
+        var k = nextNonTriviaIndex(atTokenIdx + 1, limit)
+        if (punctAt(k) == '[') {
+            val closeBracket = findMatchingBracketToken(k)
+            return if (closeBracket >= k) closeBracket + 1 else limit
+        }
+        if (identTextAt(k) != null && punctAt(nextNonTriviaIndex(k + 1, limit)) == ':') {
+            k = nextNonTriviaIndex(nextNonTriviaIndex(k + 1, limit) + 1, limit)
+        }
+        while (identTextAt(k) != null) {
+            val dotIdx = nextNonTriviaIndex(k + 1, limit)
+            if (punctAt(dotIdx) == '.') {
+                k = nextNonTriviaIndex(dotIdx + 1, limit)
+            } else {
+                k = dotIdx
+                break
+            }
+        }
+        if (punctAt(k) == '<') {
+            val closeAngle = findMatchingTypeAngleToken(k)
+            if (closeAngle > k) {
+                k = nextNonTriviaIndex(closeAngle + 1, limit)
+            }
+        }
+        if (punctAt(k) == '(') {
+            val closeParen = findMatchingParenToken(k)
+            if (closeParen > k) {
+                return closeParen + 1
+            }
+        }
+        return k
+    }
+
+    fun containsIdentifier(ident: String): Boolean {
+        if (ident.isEmpty()) return false
+        for (tok in tokens) {
+            when (tok) {
+                is KotlinLexToken.Ident -> if (tok.rawText == ident) return true
+                is KotlinLexToken.BacktickIdent -> if (tok.ident == ident) return true
+                is KotlinLexToken.StringIdentTemplate -> if (tok.ident == ident) return true
+                else -> {}
+            }
+        }
+        return false
+    }
+
     fun previousNonTriviaToken(beforeIdx: Int): KotlinLexToken? {
         var k = beforeIdx - 1
         while (k >= 0) {
