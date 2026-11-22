@@ -569,7 +569,7 @@ internal fun KotlinJ2KEmitter.renderExprCast(expr: Expr.Cast, indent: String, se
                     ?: "UByte"
             "$ptrCtor<$inferredPointee>"
         } else if (isInferTarget && savedKind != null) {
-            numericKindToTypeNameRecordingFlags(savedKind)
+            numericKindToPureTypeName(savedKind)
         } else if (isInferTarget) {
             savedParseTarget?.takeIf { it != "Unit" && it != "_" }
                 ?: inferExprRenderedType(expr.expr, selfTypeName)?.takeIf { it != "Unit" && it != "_" }

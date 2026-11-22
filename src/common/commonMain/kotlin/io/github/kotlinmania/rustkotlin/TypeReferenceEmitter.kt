@@ -89,7 +89,6 @@ internal fun KotlinJ2KEmitter.renderCastExpression(
     pointerLayoutType: SynType? = null,
 ): String {
     if (targetType == "RustAny") {
-        usesRustAny = true
         return if (inferExprRenderedType(sourceExpr, selfTypeName) == "RustAny") inner else "RustAny.from($inner)"
     }
     val targetBase = targetType.removeSuffix("?").trim()
@@ -176,18 +175,12 @@ internal fun KotlinJ2KEmitter.renderCastExpression(
             NumericKind.I16 -> "Short"
             NumericKind.I32 -> "Int"
             NumericKind.I64 -> "Long"
-            NumericKind.I128 -> {
-                usesI128 = true
-                "I128"
-            }
+            NumericKind.I128 -> "I128"
             NumericKind.U8 -> "UByte"
             NumericKind.U16 -> "UShort"
             NumericKind.U32 -> "UInt"
             NumericKind.U64 -> "ULong"
-            NumericKind.U128 -> {
-                usesU128 = true
-                "U128"
-            }
+            NumericKind.U128 -> "U128"
             NumericKind.F16 -> "F16"
             NumericKind.F32 -> kotlinF32TypeName()
             NumericKind.F64 -> "Double"
@@ -719,7 +712,6 @@ internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): St
         }
         is SynType.TraitObject -> {
             if (isStdlibDynAnyTraitObject(ty)) {
-                usesRustAny = true
                 "RustAny"
             } else {
                 val bounds = ty.bounds.toList().mapNotNull { renderTypeParamBound(it, selfTypeName) }
@@ -842,21 +834,17 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
             return "Unit"
         }
         if (rawName == "DebugStruct" && "DebugStruct" !in inspector.declaredTypeNames) {
-            usesDebugStruct = true
             return "DebugStruct"
         }
         if (rawName == "DebugTuple" && "DebugTuple" !in inspector.declaredTypeNames) {
-            usesDebugTuple = true
             return "DebugTuple"
         }
     }
     if (rawSegments.size == 1 && lastSeg.arguments is PathArguments.None) {
         if (rawName == "DebugStruct" && "DebugStruct" !in inspector.declaredTypeNames) {
-            usesDebugStruct = true
             return "DebugStruct"
         }
         if (rawName == "DebugTuple" && "DebugTuple" !in inspector.declaredTypeNames) {
-            usesDebugTuple = true
             return "DebugTuple"
         }
     }
@@ -1039,7 +1027,6 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                     return "$resName<${typeArgs[0]}, $ioErr>"
                 }
                 if (matchesStdCrateMod("thread")) {
-                    usesRustAny = true
                     return "$resName<${typeArgs[0]}, RustAny>"
                 }
             }
@@ -1172,7 +1159,6 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
         "TypeId" !in inspector.declaredTypeNames &&
         isStdlibAnyPathSegments(rawSegments.map { it.ident.toString() })
     ) {
-        usesRustAny = true
         return "RustTypeId"
     }
 
@@ -1200,8 +1186,6 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
     }
 
     if (isPrimitivePrefix && lastSeg.arguments is PathArguments.None) {
-        if (rawName == "u128") usesU128 = true
-        if (rawName == "i128") usesI128 = true
         if (rawName == "f16") return "F16"
         if (rawName == "f32") return kotlinF32TypeName()
         if (rawName == "f128") return "F128"

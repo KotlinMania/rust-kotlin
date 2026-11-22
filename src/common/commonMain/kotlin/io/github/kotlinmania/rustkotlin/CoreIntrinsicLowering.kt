@@ -513,6 +513,7 @@ public object CoreIntrinsicLowering {
     internal var activeRustcIntrinsicDeclarationName: String? = null
 
     internal fun registerCoreImport(emitter: KotlinJ2KEmitter, fqSymbol: String) {
+        if (emitter.headerContext.isDocExample) return
         val targetPkg = fqSymbol.substringBeforeLast('.', missingDelimiterValue = "")
         if (targetPkg.isNotEmpty() && targetPkg != emitter.headerContext.packageName) {
             emitter.extraTypePathImports += "import $fqSymbol"
@@ -3548,12 +3549,10 @@ public object CoreIntrinsicLowering {
                 "kmAtomicCxchgU64($addrExpr, ($expectedExpr).toULong(), ($desiredExpr).toULong(), $succOrd, $failOrd).let { cxchgRes -> $pairCtor(cxchgRes.previous.toLong(), cxchgRes.succeeded) }"
             }
             "u128" -> {
-                emitter.usesU128 = true
                 registerCoreImport(emitter, "$intrPkg.kmAtomicCxchgU128Pair")
                 "kmAtomicCxchgU128Pair($addrExpr, ($expectedExpr).low, ($expectedExpr).high, ($desiredExpr).low, ($desiredExpr).high).let { cxchgRes -> $pairCtor(U128(cxchgRes.prevHi, cxchgRes.prevLo), cxchgRes.succeeded) }"
             }
             "i128" -> {
-                emitter.usesI128 = true
                 registerCoreImport(emitter, "$intrPkg.kmAtomicCxchgU128Pair")
                 "kmAtomicCxchgU128Pair($addrExpr, ($expectedExpr).low, ($expectedExpr).high.toULong(), ($desiredExpr).low, ($desiredExpr).high.toULong()).let { cxchgRes -> $pairCtor(I128(cxchgRes.prevHi.toLong(), cxchgRes.prevLo), cxchgRes.succeeded) }"
             }

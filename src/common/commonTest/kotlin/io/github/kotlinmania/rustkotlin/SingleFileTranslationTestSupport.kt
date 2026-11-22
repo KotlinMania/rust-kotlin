@@ -61,8 +61,10 @@ internal fun runSplitCrateCommand(
     flatFileModules: Set<String> = emptySet(),
     finalStructsOverride: Boolean? = null,
     useCrateMetadata: Boolean = true,
+    initialExistingFiles: Map<String, String> = emptyMap(),
 ): LinkedHashMap<String, String> {
     val written = linkedMapOf<String, String>()
+    written.putAll(initialExistingFiles)
     runSingleFileCommand(
         args = args,
         read = { path -> sources[path] ?: error("missing $path") },

@@ -3,7 +3,6 @@ package io.github.kotlinmania.rustkotlin
 import io.github.kotlinmania.io.files.FileMetadata
 import io.github.kotlinmania.io.files.SystemFileSystem
 import io.github.kotlinmania.io.files.readBytes
-import io.github.kotlinmania.io.files.resolve
 import io.github.kotlinmania.io.files.toAbsolutePath
 import io.github.kotlinmania.io.files.writeString
 import io.github.kotlinmania.io.files.Path as KmPath

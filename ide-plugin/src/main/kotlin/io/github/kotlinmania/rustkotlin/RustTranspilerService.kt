@@ -405,8 +405,41 @@ class RustTranspilerService(
                     val companionFile = parent.findOrCreateChildData(this, companion.relativePath)
                     VfsUtil.saveText(companionFile, companion.content)
                 }
+                if (emittedKotlinImportsRustLang(kotlinSource)) {
+                    ensureProjectVersionCatalogHasRustLang(headerContext.projectNamespace)
+                }
                 targetFile
             }
+    }
+
+    private fun ensureProjectVersionCatalogHasRustLang(projectNamespace: String?) {
+        val projectRoot = project.guessProjectDir() ?: return
+        val catalogFile =
+            projectRoot
+                .findChild("gradle")
+                ?.takeIf { it.isDirectory }
+                ?.findChild("libs.versions.toml")
+                ?.takeIf { it.isValid && !it.isDirectory && it.isWritable }
+                ?: return
+        val propsFile =
+            projectRoot
+                .findChild("gradle.properties")
+                ?.takeIf { it.isValid && !it.isDirectory }
+        val existingProps = propsFile?.let(VfsUtilCore::loadText)
+        if (isRustLangSelfProject(projectNamespace, existingProps)) return
+        var targetBundle: String? = null
+        if (propsFile != null && propsFile.isWritable && existingProps != null) {
+            val (updatedProps, bundleName) = ensureRustLangInGradleProperties(existingProps)
+            targetBundle = bundleName
+            if (updatedProps != existingProps) {
+                VfsUtil.saveText(propsFile, updatedProps)
+            }
+        }
+        val existingToml = VfsUtilCore.loadText(catalogFile)
+        val updatedToml = ensureRustLangInLibsVersionsToml(existingToml, commonMainBundleName = targetBundle)
+        if (updatedToml != existingToml) {
+            VfsUtil.saveText(catalogFile, updatedToml)
+        }
     }
 
     fun resolvePackagePropertiesForVirtualFile(startFile: VirtualFile?): FolderPackageProperties? {

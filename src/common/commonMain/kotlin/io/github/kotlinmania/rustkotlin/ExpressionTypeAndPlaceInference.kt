@@ -1260,19 +1260,6 @@ internal fun KotlinJ2KEmitter.resolvePointerSizedNumericKind(signed: Boolean): N
         NumericKind.I32
     }
 
-internal fun KotlinJ2KEmitter.numericKindToTypeNameRecordingFlags(kind: NumericKind): String =
-    when (kind) {
-        NumericKind.I128 -> {
-            usesI128 = true
-            "I128"
-        }
-        NumericKind.U128 -> {
-            usesU128 = true
-            "U128"
-        }
-        else -> numericKindToPureTypeName(kind)
-    }
-
 internal fun KotlinJ2KEmitter.unwrapParenOrGroupExpr(expr: Expr): Expr =
     when (expr) {
         is Expr.Paren -> unwrapParenOrGroupExpr(expr.expr)

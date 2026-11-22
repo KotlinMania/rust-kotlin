@@ -55,7 +55,9 @@ public object ZeroUnderscoreIdentifierValidator {
         }
     }
 
-    private class IdentifierViolationWalker(source: String) : KotlinTokenWalker(source) {
+    private class IdentifierViolationWalker(
+        source: String,
+    ) : KotlinTokenWalker(source) {
         fun collectViolations(): List<Violation> {
             val out = mutableListOf<Violation>()
             for (tok in tokens) {

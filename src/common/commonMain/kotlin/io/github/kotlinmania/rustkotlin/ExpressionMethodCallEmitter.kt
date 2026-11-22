@@ -680,8 +680,6 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
                 }
         if (srcSimple != null && dstSimple != null && srcSimple in stdlibIntTypes && dstSimple in stdlibIntTypes) {
             val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-            if (dstSimple == "I128") usesI128 = true
-            if (dstSimple == "U128") usesU128 = true
             val dstOwner = if (dstSimple == "I128" || dstSimple == "U128") dstSimple else kotlinBuiltinTypeName(dstSimple)
             val fromOnlyPairs =
                 setOf(
@@ -1300,11 +1298,9 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
         }
     }
     if (rawMethod == "debug_struct" && renderedValueArgs.size == 1 && typeArgs.isEmpty() && "DebugStruct" !in inspector.declaredTypeNames) {
-        usesDebugStruct = true
         return "DebugStruct($receiver, ${renderedValueArgs[0]})"
     }
     if (rawMethod == "debug_tuple" && renderedValueArgs.size == 1 && typeArgs.isEmpty() && "DebugTuple" !in inspector.declaredTypeNames) {
-        usesDebugTuple = true
         return "DebugTuple($receiver, ${renderedValueArgs[0]})"
     }
     if (rawMethod == "push_back" && renderedValueArgs.size == 1 && typeArgs.isEmpty()) {
@@ -1508,7 +1504,6 @@ internal fun KotlinJ2KEmitter.renderExprMethodCall(expr: Expr.MethodCall, indent
         "TypeId" !in inspector.declaredTypeNames &&
         "Any" !in inspector.declaredTraitsByName
     ) {
-        usesRustAny = true
         val atomicRecv = if (isAtomicPostfixReceiver(expr.receiver, receiver)) receiver else "($receiver)"
         return if (inferredMethodRecvTy == "RustAny") {
             "$atomicRecv.typeId"
@@ -1911,11 +1906,6 @@ internal fun KotlinJ2KEmitter.renderIntToBytesMethodCall(
         rawMethod == "to_be_bytes" ||
             (rawMethod == "to_ne_bytes" && activeCfgProfile.targetEndian == "big")
     if (recvKind == NumericKind.U128 || recvKind == NumericKind.I128 || recvKind == NumericKind.F16 || recvKind == NumericKind.F128) {
-        if (recvKind == NumericKind.U128) {
-            usesU128 = true
-        } else if (recvKind == NumericKind.I128) {
-            usesI128 = true
-        }
         val recvAtom = if (isAtomicPostfixReceiver(sourceReceiver, receiver)) receiver else "($receiver)"
         val fn = if (isBigEndian) "toBeBytes" else "toLeBytes"
         return "$recvAtom.$fn()"

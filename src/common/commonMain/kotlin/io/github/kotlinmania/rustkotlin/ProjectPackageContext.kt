@@ -675,3 +675,239 @@ internal fun inferKotlinPackageName(outputPath: String): String? {
     if (dirPart.isEmpty()) return null
     return dirPart.split('/').filter { it.isNotEmpty() }.joinToString(".")
 }
+
+public const val DEFAULT_RUST_LANG_KOTLIN_VERSION: String = "0.2.0"
+
+public fun emittedKotlinImportsRustLang(kotlinSource: String): Boolean =
+    kotlinSource.lineSequence().any { it.trimStart().startsWith("import io.github.kotlinmania.rustlang.") }
+
+public fun extractProjectRootPrefixFromKotlinPath(kotlinPath: String): String? {
+    val normalized = kotlinPath.replace('\\', '/')
+    for (marker in listOf("src/common/commonMain/kotlin/", "src/common/commonTest/kotlin/")) {
+        when {
+            normalized.startsWith(marker) -> return ""
+            normalized.contains("/$marker") -> return normalized.substring(0, normalized.indexOf("/$marker") + 1)
+        }
+    }
+    return null
+}
+
+public fun isRustLangSelfProject(
+    projectNamespace: String?,
+    gradlePropertiesText: String?,
+): Boolean {
+    val ns = projectNamespace?.trim()?.removeSuffix(".")
+    if (ns == "io.github.kotlinmania.rustlang" || ns?.startsWith("io.github.kotlinmania.rustlang.") == true) {
+        return true
+    }
+    if (gradlePropertiesText != null) {
+        for (rawLine in gradlePropertiesText.lineSequence()) {
+            val line = rawLine.trim()
+            if (line.startsWith("#") || '=' !in line) continue
+            val key = line.substringBefore('=').trim()
+            val value = line.substringAfter('=').trim()
+            if (key == "project.name" && value == "rust-lang-kotlin") return true
+            if (key == "project.namespace" &&
+                (value == "io.github.kotlinmania.rustlang" || value.startsWith("io.github.kotlinmania.rustlang."))
+            ) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+public fun ensureRustLangInGradleProperties(propsText: String): Pair<String, String?> {
+    val lines = propsText.split('\n').toMutableList()
+    var configuredBundle: String? = null
+    var emptyBundleLineIdx = -1
+    var alreadyInSourceSetDeps = false
+    for ((idx, rawLine) in lines.withIndex()) {
+        val trimmed = rawLine.trim()
+        if (trimmed.startsWith("#") || '=' !in trimmed) continue
+        val key = trimmed.substringBefore('=').trim()
+        val value = trimmed.substringAfter('=').trim()
+        if (key == "project.dependencies.commonMainBundle") {
+            if (value.isNotEmpty()) {
+                configuredBundle = value
+            } else {
+                emptyBundleLineIdx = idx
+            }
+        } else if (key == "project.dependencies.sourceSet.commonMain") {
+            val items = value.split(',').map { it.trim() }
+            if ("rust-lang-kotlin" in items) {
+                alreadyInSourceSetDeps = true
+            }
+        }
+    }
+    if (configuredBundle != null || alreadyInSourceSetDeps) {
+        return propsText to configuredBundle
+    }
+    if (emptyBundleLineIdx >= 0) {
+        val cr = if (lines[emptyBundleLineIdx].endsWith('\r')) "\r" else ""
+        lines[emptyBundleLineIdx] = "project.dependencies.commonMainBundle=rust-lang-commonMain$cr"
+        return lines.joinToString("\n") to "rust-lang-commonMain"
+    }
+    return propsText to null
+}
+
+public fun ensureRustLangInLibsVersionsToml(
+    tomlText: String,
+    commonMainBundleName: String? = null,
+    version: String = DEFAULT_RUST_LANG_KOTLIN_VERSION,
+): String {
+    val hadTrailingNewline = tomlText.endsWith('\n')
+    val lines = tomlText.trimEnd('\n').split('\n').toMutableList()
+    val headerRegex = Regex("""^\[([A-Za-z0-9_.-]+)]\s*$""")
+
+    fun findSectionBounds(sectionName: String): IntRange? {
+        var start = -1
+        for (i in lines.indices) {
+            val match = headerRegex.matchEntire(lines[i].trim()) ?: continue
+            if (start < 0) {
+                if (match.groupValues[1] == sectionName) {
+                    start = i
+                }
+            } else {
+                return start until i
+            }
+        }
+        return if (start >= 0) start until lines.size else null
+    }
+
+    fun sectionInsertIndex(bounds: IntRange): Int {
+        var idx = bounds.last + 1
+        while (idx > bounds.first + 1 && lines[idx - 1].isBlank()) {
+            idx--
+        }
+        return idx
+    }
+
+    var existingLibKey: String? = null
+    var existingVerRef: String? = null
+    findSectionBounds("libraries")?.let { libBounds ->
+        for (i in (libBounds.first + 1)..libBounds.last) {
+            val line = lines[i].trim()
+            if (!line.startsWith("#") && "io.github.kotlinmania:rust-lang-kotlin" in line && '=' in line) {
+                existingLibKey = line.substringBefore('=').trim()
+                existingVerRef =
+                    Regex("""version\.ref\s*=\s*"([^"]+)"""")
+                        .find(line)
+                        ?.groupValues
+                        ?.get(1)
+                break
+            }
+        }
+    }
+
+    var versionKey = existingVerRef
+    val verBounds = findSectionBounds("versions")
+    if (versionKey == null && verBounds != null) {
+        for (i in (verBounds.first + 1)..verBounds.last) {
+            val line = lines[i].trim()
+            if (line.startsWith("#") || '=' !in line) continue
+            val k = line.substringBefore('=').trim()
+            if (k == "rustLang" || k == "rustLangKotlin") {
+                versionKey = k
+                break
+            }
+        }
+    }
+    if (versionKey == null) {
+        versionKey = "rustLang"
+        val currentVerBounds = findSectionBounds("versions")
+        if (currentVerBounds != null) {
+            lines.add(sectionInsertIndex(currentVerBounds), """$versionKey = "$version"""")
+        } else {
+            if (lines.isNotEmpty() && lines.last().isNotBlank()) lines.add("")
+            lines.add("[versions]")
+            lines.add("""$versionKey = "$version"""")
+        }
+    }
+
+    val libKey = existingLibKey ?: "rust-lang-kotlin"
+    if (existingLibKey == null) {
+        val libEntry = """$libKey = { module = "io.github.kotlinmania:rust-lang-kotlin", version.ref = "$versionKey" }"""
+        val currentLibBounds = findSectionBounds("libraries")
+        if (currentLibBounds != null) {
+            lines.add(sectionInsertIndex(currentLibBounds), libEntry)
+        } else {
+            if (lines.isNotEmpty() && lines.last().isNotBlank()) lines.add("")
+            lines.add("[libraries]")
+            lines.add(libEntry)
+        }
+    }
+
+    var bundleBounds = findSectionBounds("bundles")
+    if (bundleBounds == null) {
+        if (lines.isNotEmpty() && lines.last().isNotBlank()) lines.add("")
+        lines.add("[bundles]")
+        bundleBounds = findSectionBounds("bundles")!!
+    }
+
+    fun addLibToExistingBundle(bundleName: String): Boolean {
+        val curBounds = findSectionBounds("bundles") ?: return false
+        var startLine = -1
+        for (i in (curBounds.first + 1)..curBounds.last) {
+            val trimmed = lines[i].trim()
+            if (!trimmed.startsWith("#") && '=' in trimmed && trimmed.substringBefore('=').trim() == bundleName) {
+                startLine = i
+                break
+            }
+        }
+        if (startLine < 0) return false
+        var endLine = startLine
+        while (endLine <= curBounds.last && ']' !in lines[endLine]) {
+            endLine++
+        }
+        if (endLine > curBounds.last) return false
+        val sliceText = (startLine..endLine).joinToString("\n") { lines[it] }
+        if (Regex(""""${Regex.escape(libKey)}"""").containsMatchIn(sliceText)) {
+            return true
+        }
+        if (startLine == endLine) {
+            val beforeClose = lines[startLine].substringBeforeLast(']').trimEnd()
+            val sep = if (beforeClose.endsWith('[') || beforeClose.endsWith(',')) " " else ", "
+            lines[startLine] = """$beforeClose$sep"$libKey"]"""
+        } else {
+            lines.add(endLine, """  "$libKey",""")
+        }
+        return true
+    }
+
+    val preferredBundle =
+        commonMainBundleName?.trim()?.takeIf { it.isNotEmpty() }
+            ?: run {
+                val curBounds = findSectionBounds("bundles")!!
+                var candidate: String? = null
+                for (i in (curBounds.first + 1)..curBounds.last) {
+                    val trimmed = lines[i].trim()
+                    if (trimmed.startsWith("#") || '=' !in trimmed || '[' !in trimmed) continue
+                    val name = trimmed.substringBefore('=').trim()
+                    if (name.endsWith("-commonMain") && name != "rust-lang-commonMain") {
+                        candidate = name
+                        break
+                    }
+                }
+                candidate
+            }
+
+    if (preferredBundle != null && preferredBundle != "rust-lang-commonMain") {
+        addLibToExistingBundle(preferredBundle)
+    }
+    if (!addLibToExistingBundle("rust-lang-commonMain")) {
+        val curBounds = findSectionBounds("bundles")!!
+        val insertAt = sectionInsertIndex(curBounds)
+        lines.addAll(
+            insertAt,
+            listOf(
+                "rust-lang-commonMain = [",
+                """  "$libKey",""",
+                "]",
+            ),
+        )
+    }
+
+    val joined = lines.joinToString("\n")
+    return if (hadTrailingNewline || tomlText.isEmpty()) "$joined\n" else joined
+}

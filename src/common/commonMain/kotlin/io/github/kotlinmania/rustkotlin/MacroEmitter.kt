@@ -1145,24 +1145,19 @@ internal fun KotlinJ2KEmitter.binaryDigitsToHexLiteral(rawDigits: String): Strin
 internal fun KotlinJ2KEmitter.renderIntLiteral(digits: String, suffix: String): String {
     val parsed128 = parseUnsigned128LiteralDigits(digits)
     if (suffix == "u128") {
-        usesU128 = true
         return if (parsed128 != null) formatU128ConstructorCall(parsed128.high, parsed128.low) else "U128()"
     }
     if (suffix == "i128") {
-        usesI128 = true
         return if (parsed128 != null) formatI128ConstructorCall(parsed128.high, parsed128.low) else "I128()"
     }
     if (suffix.isEmpty()) {
         if (currentExpectedNumericKind == NumericKind.U128) {
-            usesU128 = true
             return if (parsed128 != null) formatU128ConstructorCall(parsed128.high, parsed128.low) else "U128()"
         }
         if (currentExpectedNumericKind == NumericKind.I128) {
-            usesI128 = true
             return if (parsed128 != null) formatI128ConstructorCall(parsed128.high, parsed128.low) else "I128()"
         }
         if (parsed128?.exceeds64BitUnsigned == true) {
-            usesU128 = true
             return formatU128ConstructorCall(parsed128.high, parsed128.low)
         }
     }
@@ -1616,14 +1611,8 @@ internal fun KotlinJ2KEmitter.renderPrimitiveAssociatedConst(
                             else -> "Int.MAX_VALUE"
                         }
                     "isize" -> if (headerContext.rawAbiMode) "Long.${c}_VALUE" else "Int.${c}_VALUE"
-                    "u128" -> {
-                        usesU128 = true
-                        "U128.${c}_VALUE"
-                    }
-                    "i128" -> {
-                        usesI128 = true
-                        "I128.${c}_VALUE"
-                    }
+                    "u128" -> "U128.${c}_VALUE"
+                    "i128" -> "I128.${c}_VALUE"
                     else -> "${rustTypeIdentToKotlin(prim)}.${c}_VALUE"
                 }
             }
@@ -1825,8 +1814,6 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
             (firstRaw in PRIMITIVE_TYPE_NAMES || resolveNumericKind(firstKtType) != null) &&
             (secondRaw == "MAX" || secondRaw == "MIN")
         ) {
-            if (firstRaw == "u128") usesU128 = true
-            if (firstRaw == "i128") usesI128 = true
             val kind = resolveNumericKind(firstKtType)
             val boundOwner = if (firstRaw in PRIMITIVE_TYPE_NAMES) kotlinBuiltinTypeName(firstKtType) else firstKtType
             if (secondRaw == "MIN" && (kind == NumericKind.F32 || kind == NumericKind.F64)) {
@@ -1838,14 +1825,8 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
             val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
             val ownerPrim =
                 when (firstRaw) {
-                    "u128" -> {
-                        usesU128 = true
-                        "U128"
-                    }
-                    "i128" -> {
-                        usesI128 = true
-                        "I128"
-                    }
+                    "u128" -> "U128"
+                    "i128" -> "I128"
                     "f16" -> {
                         CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.F16")
                         "F16"
@@ -2455,14 +2436,8 @@ private fun KotlinJ2KEmitter.resolvedPrimOwnerAndBits(kind: NumericKind?): Pair<
         NumericKind.U32 -> "UInt" to "32u"
         NumericKind.I64 -> "Long" to "64u"
         NumericKind.U64 -> "ULong" to "64u"
-        NumericKind.I128 -> {
-            usesI128 = true
-            "I128" to "128u"
-        }
-        NumericKind.U128 -> {
-            usesU128 = true
-            "U128" to "128u"
-        }
+        NumericKind.I128 -> "I128" to "128u"
+        NumericKind.U128 -> "U128" to "128u"
         NumericKind.F32 -> "Float" to "32u"
         NumericKind.F64 -> "Double" to "64u"
         else -> null

@@ -1,5 +1,7 @@
 package io.github.kotlinmania.rustkotlin
 
+import io.github.kotlinmania.rustlang.core.I128
+import io.github.kotlinmania.rustlang.core.U128
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertFalse
@@ -282,11 +284,10 @@ class SingleFileTranslationTypesAndLoweringTest {
         assertContains(kt, "public class Captured internal constructor(valueCtorArg: ConstPtr) : PtrEvent()")
         assertFalse(Regex("""\b_[a-zA-Z0-9]|__""").containsMatchIn(kt), "Expected zero forbidden underscores in:\n$kt")
 
-        val int128File = renderSynthesizedInt128SupportFile("io.github.kotlinmania.libc")
-        assertFalse(int128File.contains("Comparable<U128>"), "Expected U128 not to inherit Comparable<U128>")
-        assertFalse(int128File.contains("Comparable<I128>"), "Expected I128 not to inherit Comparable<I128>")
-        assertContains(int128File, "public operator fun compareTo(other: U128): Int")
-        assertContains(int128File, "public operator fun compareTo(other: I128): Int")
+        assertFalse(Comparable::class.isInstance(U128(0uL, 1uL)), "Expected U128 not to inherit Comparable<U128>")
+        assertFalse(Comparable::class.isInstance(I128(0L, 1uL)), "Expected I128 not to inherit Comparable<I128>")
+        assertTrue(U128(0uL, 2uL).compareTo(U128(0uL, 1uL)) > 0)
+        assertTrue(I128(-1L, 0uL).compareTo(I128(0L, 1uL)) < 0)
     }
 
     @Test fun unwrappedExternFnCallbackCastToUsizeLowersViaExternFnPtr() {

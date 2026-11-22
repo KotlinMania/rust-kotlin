@@ -665,16 +665,10 @@ internal fun KotlinJ2KEmitter.renderFallbackDefaultForRenderedType(renderedType:
     when (resolveNumericKind(clean)) {
         NumericKind.I8, NumericKind.I16, NumericKind.I32 -> return "0"
         NumericKind.I64 -> return "0L"
-        NumericKind.I128 -> {
-            usesI128 = true
-            return "I128()"
-        }
+        NumericKind.I128 -> return "I128()"
         NumericKind.U8, NumericKind.U16, NumericKind.U32 -> return "0u"
         NumericKind.U64 -> return "0uL"
-        NumericKind.U128 -> {
-            usesU128 = true
-            return "U128()"
-        }
+        NumericKind.U128 -> return "U128()"
         NumericKind.F16 -> return "F16()"
         NumericKind.F32 -> return "0.0f"
         NumericKind.F64 -> return "0.0"

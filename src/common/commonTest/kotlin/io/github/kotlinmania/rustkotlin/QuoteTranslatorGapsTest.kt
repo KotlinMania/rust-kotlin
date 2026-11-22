@@ -266,8 +266,10 @@ class QuoteTranslatorGapsTest {
             }
             """.trimIndent()
         val kt = translateRustSourceToKotlin(recognizeRust(rust))
-        assertContains(kt, "public data class RustTypeId(")
-        assertContains(kt, "public class RustAny(")
+        assertContains(kt, "import io.github.kotlinmania.rustlang.core.RustAny")
+        assertContains(kt, "import io.github.kotlinmania.rustlang.core.RustTypeId")
+        assertFalse(kt.contains("class RustTypeId("))
+        assertFalse(kt.contains("class RustAny("))
         assertContains(kt, "valRef: RustAny")
         assertContains(kt, "valRef.isType<Byte>()")
         assertContains(kt, "valRef.downcastRef<Int>()")

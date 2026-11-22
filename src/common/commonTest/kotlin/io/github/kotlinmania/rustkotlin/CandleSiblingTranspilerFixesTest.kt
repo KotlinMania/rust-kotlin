@@ -165,8 +165,6 @@ class CandleSiblingTranspilerFixesTest {
                 dyn_val.type_id() == TypeId::of::<i32>()
             }
             """.trimIndent()
-        TranslationSession.emittedInt128Support = false
-        TranslationSession.emittedRustAnySupport = false
         val kt =
             translateRustSourceToKotlin(
                 recognizeRust(rust),
@@ -178,8 +176,8 @@ class CandleSiblingTranspilerFixesTest {
                     isBatchCrateOutput = true,
                 ),
             )
-        assertFalse(TranslationSession.emittedInt128Support, "Crate targeting rust-lang-kotlin must not synthesize per-crate Int128Support.kt")
-        assertFalse(TranslationSession.emittedRustAnySupport, "Crate targeting rust-lang-kotlin must not synthesize per-crate RustAnySupport.kt")
+        assertFalse(kt.contains("class U128("), "Must never inline synthesized U128 class definition:\n$kt")
+        assertFalse(kt.contains("class RustAny("), "Must never inline synthesized RustAny class definition:\n$kt")
         assertContains(kt, "import io.github.kotlinmania.rustlang.core.F128")
         assertContains(kt, "import io.github.kotlinmania.rustlang.core.F16")
         assertContains(kt, "import io.github.kotlinmania.rustlang.core.I128")

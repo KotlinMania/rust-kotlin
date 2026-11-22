@@ -3459,7 +3459,6 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
         }
     }
     if (typeAnnotation == "RustAny" && inferExprRenderedType(initExpr, selfTypeName) != "RustAny" && !rhs.startsWith("RustAny.from(")) {
-        usesRustAny = true
         rhs = "RustAny.from($rhs)"
     }
     if (rhs == "null" && typeAnnotation == null && !patText.startsWith("(")) {
