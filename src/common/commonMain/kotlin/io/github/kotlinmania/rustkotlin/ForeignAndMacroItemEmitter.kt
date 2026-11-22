@@ -5,7 +5,6 @@ import io.github.kotlinmania.procmacro2.Group
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.rustkotlin.reused.starlark.AssignCount
-import io.github.kotlinmania.syn.Attribute
 import io.github.kotlinmania.syn.FnArg
 import io.github.kotlinmania.syn.ForeignItem
 import io.github.kotlinmania.syn.GenericParam
@@ -2376,26 +2375,6 @@ private val UNPORTED_RAND_TEST_IDENTS =
         "thread_rng",
     )
 
-private fun extractItemAttrs(item: Item): List<Attribute> =
-    when (item) {
-        is Item.Const -> item.attrs
-        is Item.Enum -> item.attrs
-        is Item.ExternCrate -> item.attrs
-        is Item.Fn -> item.attrs
-        is Item.ForeignMod -> item.attrs
-        is Item.Impl -> item.attrs
-        is Item.Macro -> item.attrs
-        is Item.Mod -> item.attrs
-        is Item.Static -> item.attrs
-        is Item.Struct -> item.attrs
-        is Item.Trait -> item.attrs
-        is Item.TraitAlias -> item.attrs
-        is Item.ItemType -> item.attrs
-        is Item.Union -> item.attrs
-        is Item.Use -> item.attrs
-        is Item.Verbatim -> emptyList()
-    }
-
 internal fun KotlinJ2KEmitter.itemDependsOnUnportedQuickcheckOrRand(item: Item): Boolean {
     val unportedQuickcheck = "quickcheck" !in headerContext.crateNamespaces
     val unportedRand = "rand" !in headerContext.crateNamespaces
@@ -2412,11 +2391,7 @@ internal fun KotlinJ2KEmitter.itemDependsOnUnportedQuickcheckOrRand(item: Item):
         if (unportedQuickcheck && macroName == "quickcheck") return true
         if (unportedRand && macroName == "rand") return true
     }
-    val inTestContext =
-        headerContext.portLintDirective == "tests" ||
-            headerContext.testClassName != null ||
-            currentModPathPrefix.any { it == "test" || it == "tests" || it == "stdtests" } ||
-            hasTestAttribute(extractItemAttrs(item))
+    val inTestContext = isQuickcheckOrRandTestContext(item)
     val importedQuickcheckGen =
         unportedQuickcheck &&
             inspector.allUseItems.any { useItem ->
@@ -2427,47 +2402,59 @@ internal fun KotlinJ2KEmitter.itemDependsOnUnportedQuickcheckOrRand(item: Item):
                         (leaf.segments.lastOrNull() == "*" || leaf.segments.lastOrNull()?.removePrefix("r#") == "Gen")
                 }
             }
+    return UnportedTestDepTokenScanner(
+        trees = item.toTokenStream().toList(),
+        unportedQuickcheck = unportedQuickcheck,
+        unportedRand = unportedRand,
+        inTestContext = inTestContext,
+        importedQuickcheckGen = importedQuickcheckGen,
+    ).matches()
+}
 
-    fun scanTokens(stream: TokenStream): Boolean {
-        val list = stream.toList()
-        var idx = 0
-        while (idx < list.size) {
-            when (val tt = list[idx]) {
+private class UnportedTestDepTokenScanner(
+    trees: List<TokenTree>,
+    private val unportedQuickcheck: Boolean,
+    private val unportedRand: Boolean,
+    private val inTestContext: Boolean,
+    private val importedQuickcheckGen: Boolean,
+) : RustTokenCursor(trees) {
+    fun matches(): Boolean {
+        for (idx in 0 until size) {
+            when (val tt = trees[idx]) {
                 is TokenTree.Ident -> {
-                    val raw = tt.value.toString().removePrefix("r#")
-                    val nextIsPathSep =
-                        (idx + 2 < list.size) &&
-                            list[idx + 1] is TokenTree.Punct &&
-                            (list[idx + 1] as TokenTree.Punct).value.asChar() == ':' &&
-                            list[idx + 2] is TokenTree.Punct &&
-                            (list[idx + 2] as TokenTree.Punct).value.asChar() == ':'
-                    if (unportedQuickcheck) {
-                        if ((raw == "quickcheck" && nextIsPathSep) ||
-                            (inTestContext && raw in UNPORTED_QUICKCHECK_IDENTS) ||
-                            (inTestContext && importedQuickcheckGen && raw == "Gen")
-                        ) {
-                            return true
-                        }
+                    val raw = cleanIdentAt(idx).orEmpty()
+                    val nextIsPathSep = punctCharAt(idx + 1) == ':' && punctCharAt(idx + 2) == ':'
+                    if (unportedQuickcheck &&
+                        (
+                            (raw == "quickcheck" && nextIsPathSep) ||
+                                (inTestContext && raw in UNPORTED_QUICKCHECK_IDENTS) ||
+                                (inTestContext && importedQuickcheckGen && raw == "Gen")
+                        )
+                    ) {
+                        return true
                     }
-                    if (unportedRand) {
-                        if ((raw == "rand" && nextIsPathSep) ||
-                            (inTestContext && raw in UNPORTED_RAND_TEST_IDENTS)
-                        ) {
-                            return true
-                        }
+                    if (unportedRand &&
+                        ((raw == "rand" && nextIsPathSep) || (inTestContext && raw in UNPORTED_RAND_TEST_IDENTS))
+                    ) {
+                        return true
                     }
                 }
-                is TokenTree.Group -> {
-                    if (scanTokens(tt.value.stream())) return true
-                }
+                is TokenTree.Group ->
+                    if (UnportedTestDepTokenScanner(
+                            trees = tt.value.stream().toList(),
+                            unportedQuickcheck = unportedQuickcheck,
+                            unportedRand = unportedRand,
+                            inTestContext = inTestContext,
+                            importedQuickcheckGen = importedQuickcheckGen,
+                        ).matches()
+                    ) {
+                        return true
+                    }
                 else -> {}
             }
-            idx++
         }
         return false
     }
-
-    return scanTokens(item.toTokenStream())
 }
 
 private const val OMITTED_QUICKCHECK_OR_RAND_COMMENT: String =
@@ -2477,26 +2464,7 @@ private fun KotlinJ2KEmitter.isQuickcheckOrRandTestContext(item: Item? = null): 
     headerContext.portLintDirective == "tests" ||
         headerContext.testClassName != null ||
         currentModPathPrefix.any { it == "test" || it == "tests" || it == "stdtests" } ||
-        (item != null && hasTestAttribute(extractItemAttrs(item)))
-
-private fun itemTokenStreamContainsAnyIdent(
-    stream: TokenStream,
-    idents: Set<String>,
-): Boolean {
-    if (idents.isEmpty()) return false
-    for (tt in stream.clone().toList()) {
-        when (tt) {
-            is TokenTree.Ident -> {
-                if (tt.value.toString().removePrefix("r#") in idents) return true
-            }
-            is TokenTree.Group -> {
-                if (itemTokenStreamContainsAnyIdent(tt.value.stream(), idents)) return true
-            }
-            else -> {}
-        }
-    }
-    return false
-}
+        (item != null && hasTestAttribute(item.attributes))
 
 private fun KotlinJ2KEmitter.declaredOmittedQuickcheckIdents(item: Item): Set<String> =
     when (item) {
@@ -2565,7 +2533,7 @@ internal fun KotlinJ2KEmitter.computeTransitivelyOmittedQuickcheckOrRandIdents(
                 !directHit &&
                     (
                         declared.any { it in omitted } ||
-                            itemTokenStreamContainsAnyIdent(item.toTokenStream(), omitted)
+                            RustTokenCursor.containsAnyIdentRecursive(item.toTokenStream(), omitted)
                     )
             if (directHit || transitiveHit) {
                 if (omitted.addAll(declared)) {
@@ -2582,7 +2550,7 @@ internal fun KotlinJ2KEmitter.shouldOmitItemForUnportedQuickcheckOrRand(item: It
     if (item is Item.Mod || item is Item.Use) return false
     if (!isQuickcheckOrRandTestContext(item) || currentOmittedTestIdents.isEmpty()) return false
     return declaredOmittedQuickcheckIdents(item).any { it in currentOmittedTestIdents } ||
-        itemTokenStreamContainsAnyIdent(item.toTokenStream(), currentOmittedTestIdents)
+        RustTokenCursor.containsAnyIdentRecursive(item.toTokenStream(), currentOmittedTestIdents)
 }
 
 internal fun indentBlockByFourSpaces(text: String): String =

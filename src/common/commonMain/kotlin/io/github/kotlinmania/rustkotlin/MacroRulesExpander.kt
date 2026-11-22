@@ -1226,10 +1226,10 @@ internal class MacroRulesFileExpander(
                 meta is Meta.NameValue && meta.path.isIdent("doc")
             }
         val docTargetIndex =
-            expanded.indexOfFirst { !isDocOnlyCfgAttribute(itemAttrs(it)) }.let { if (it >= 0) it else 0 }
+            expanded.indexOfFirst { !itemHasDocOnlyCfg(it) }.let { if (it >= 0) it else 0 }
         return expanded.mapIndexed { idx, item ->
             val extra = if (idx == docTargetIndex) docAttrs + nonDocAttrs else nonDocAttrs
-            if (extra.isEmpty()) item else prependItemAttrs(item, extra)
+            if (extra.isEmpty()) item else item.withPrependedAttributes(extra)
         }
     }
 
@@ -1248,7 +1248,7 @@ internal class MacroRulesFileExpander(
 
     private fun attachWrapperSpansToFirstExpandedItem(wrapperSpans: List<Span>, expanded: List<Item>) {
         if (wrapperSpans.isEmpty() || expanded.isEmpty()) return
-        val targetItem = expanded.firstOrNull { !isDocOnlyCfgAttribute(itemAttrs(it)) } ?: expanded.first()
+        val targetItem = expanded.firstOrNull { !itemHasDocOnlyCfg(it) } ?: expanded.first()
         val targetOffset = collectHeaderSourceSpans(targetItem).firstOrNull()?.startOffset() ?: return
         val bucket = macroWrapperSpansByTargetOffset.getOrPut(targetOffset) { mutableListOf() }
         for (sp in wrapperSpans) {
@@ -1267,70 +1267,12 @@ internal class MacroRulesFileExpander(
                 meta is Meta.NameValue && meta.path.isIdent("doc")
             }
         val docTargetIndex =
-            expanded.indexOfFirst { !isDocOnlyCfgAttribute(implItemAttrs(it)) }.let { if (it >= 0) it else 0 }
+            expanded.indexOfFirst { !implItemHasDocOnlyCfg(it) }.let { if (it >= 0) it else 0 }
         return expanded.mapIndexed { idx, item ->
             val extra = if (idx == docTargetIndex) docAttrs + nonDocAttrs else nonDocAttrs
-            if (extra.isEmpty()) item else prependImplItemAttrs(item, extra)
+            if (extra.isEmpty()) item else item.withPrependedAttributes(extra)
         }
     }
-
-    private fun itemAttrs(item: Item): List<Attribute> =
-        when (item) {
-            is Item.Const -> item.attrs
-            is Item.Enum -> item.attrs
-            is Item.ExternCrate -> item.attrs
-            is Item.Fn -> item.attrs
-            is Item.ForeignMod -> item.attrs
-            is Item.Impl -> item.attrs
-            is Item.Macro -> item.attrs
-            is Item.Mod -> item.attrs
-            is Item.Static -> item.attrs
-            is Item.Struct -> item.attrs
-            is Item.Trait -> item.attrs
-            is Item.TraitAlias -> item.attrs
-            is Item.ItemType -> item.attrs
-            is Item.Union -> item.attrs
-            is Item.Use -> item.attrs
-            is Item.Verbatim -> emptyList()
-        }
-
-    private fun prependItemAttrs(item: Item, prefixAttrs: List<Attribute>): Item =
-        when (item) {
-            is Item.Const -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Enum -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.ExternCrate -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Fn -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.ForeignMod -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Impl -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Macro -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Mod -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Static -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Struct -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Trait -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.TraitAlias -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.ItemType -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Union -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Use -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Verbatim -> item
-        }
-
-    private fun implItemAttrs(item: ImplItem): List<Attribute> =
-        when (item) {
-            is ImplItem.Const -> item.attrs
-            is ImplItem.Fn -> item.attrs
-            is ImplItem.AssocType -> item.attrs
-            is ImplItem.Macro -> item.attrs
-            is ImplItem.Verbatim -> emptyList()
-        }
-
-    private fun prependImplItemAttrs(item: ImplItem, prefixAttrs: List<Attribute>): ImplItem =
-        when (item) {
-            is ImplItem.Const -> item.copy(attrs = prefixAttrs + item.attrs)
-            is ImplItem.Fn -> item.copy(attrs = prefixAttrs + item.attrs)
-            is ImplItem.AssocType -> item.copy(attrs = prefixAttrs + item.attrs)
-            is ImplItem.Macro -> item.copy(attrs = prefixAttrs + item.attrs)
-            is ImplItem.Verbatim -> item
-        }
 
     private fun expandAndFoldBlockStmts(stmts: List<Stmt>, depth: Int): List<Stmt> {
         if (depth > MAX_MACRO_EXPANSION_DEPTH || activeExpansionDepth > MAX_MACRO_EXPANSION_DEPTH) {

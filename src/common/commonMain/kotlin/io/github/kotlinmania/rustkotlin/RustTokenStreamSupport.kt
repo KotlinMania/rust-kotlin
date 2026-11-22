@@ -290,6 +290,21 @@ internal open class RustTokenCursor(
             }
             return null
         }
+
+        fun containsAnyIdentRecursive(
+            stream: TokenStream,
+            idents: Set<String>,
+        ): Boolean {
+            if (idents.isEmpty()) return false
+            for (tt in stream.clone().toList()) {
+                when (tt) {
+                    is TokenTree.Ident -> if (tt.value.toString().removePrefix("r#") in idents) return true
+                    is TokenTree.Group -> if (containsAnyIdentRecursive(tt.value.stream(), idents)) return true
+                    else -> {}
+                }
+            }
+            return false
+        }
     }
 }
 
