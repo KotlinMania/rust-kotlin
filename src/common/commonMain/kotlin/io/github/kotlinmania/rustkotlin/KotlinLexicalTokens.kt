@@ -527,6 +527,34 @@ internal open class KotlinTokenWalker(
         }
     }
 
+    inline fun anyGenericApplication(
+        predicate: (ownerSimpleIdent: String, typeArgs: List<String>) -> Boolean,
+    ): Boolean {
+        var idx = 0
+        while (idx < tokens.size) {
+            val tok = tokens[idx]
+            if (tok.interpolationDepth == 0 && tok is KotlinLexToken.Punct && tok.ch == '<') {
+                val closeIdx = findMatchingTypeAngleToken(idx)
+                if (closeIdx > idx) {
+                    val prev = previousNonTriviaToken(idx)
+                    val ownerIdent =
+                        when (prev) {
+                            is KotlinLexToken.Ident -> prev.rawText
+                            is KotlinLexToken.BacktickIdent -> prev.ident
+                            else -> ""
+                        }
+                    val innerSlice = source.substring(tok.end, tokens[closeIdx].start)
+                    val topArgs = splitTopLevelCommaList(innerSlice).map { it.trim() }
+                    if (predicate(ownerIdent, topArgs)) return true
+                    idx = closeIdx + 1
+                    continue
+                }
+            }
+            idx++
+        }
+        return false
+    }
+
     companion object {
         fun splitTopLevelCommaList(segment: String): List<String> {
             if (segment.isBlank()) return emptyList()

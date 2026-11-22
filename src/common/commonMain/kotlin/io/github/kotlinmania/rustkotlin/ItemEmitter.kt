@@ -1019,73 +1019,29 @@ internal fun KotlinJ2KEmitter.isConcreteGenericTypeForSwiftExport(
             "Pair",
             "Triple",
         )
-    var i = 0
-    val n = base.length
-    while (i < n) {
-        val ch = base[i]
-        if (ch == '<' && (i == 0 || base[i - 1] != '-')) {
-            var identStart = i
-            while (identStart > 0) {
-                val c = base[identStart - 1]
-                if (c.isLetterOrDigit() || c == '.') {
-                    identStart--
-                } else {
-                    break
+    return KotlinTokenWalker(base).anyGenericApplication { rawIdent, topArgs ->
+        if (rawIdent.isNotEmpty() && rawIdent !in stdlibCollectionNames) {
+            val hasConcreteArg =
+                topArgs.any { rawArg ->
+                    val cleanArg =
+                        rawArg
+                            .removePrefix("out ")
+                            .removePrefix("in ")
+                            .trim()
+                            .removeSuffix("?")
+                            .trim()
+                    cleanArg.isNotEmpty() &&
+                        cleanArg != "*" &&
+                        cleanArg != "Any" &&
+                        cleanArg != "kotlin.Any" &&
+                        cleanArg !in unboundedOwnerTypeParams
                 }
-            }
-            val rawIdent = base.substring(identStart, i).substringAfterLast('.')
-            var depth = 1
-            var j = i + 1
-            val topArgs = mutableListOf<String>()
-            var argStart = j
-            while (j < n && depth > 0) {
-                val cj = base[j]
-                if (cj == '<' && (j == 0 || base[j - 1] != '-')) {
-                    depth++
-                } else if (cj == '>' && (j == 0 || base[j - 1] != '-')) {
-                    depth--
-                    if (depth == 0) {
-                        topArgs += base.substring(argStart, j).trim()
-                        break
-                    }
-                } else if (cj == ',' && depth == 1) {
-                    topArgs += base.substring(argStart, j).trim()
-                    argStart = j + 1
-                }
-                j++
-            }
-            if (depth == 0) {
-                if (rawIdent.isNotEmpty() && rawIdent !in stdlibCollectionNames) {
-                    for (rawArg in topArgs) {
-                        val cleanArg =
-                            rawArg
-                                .removePrefix("out ")
-                                .removePrefix("in ")
-                                .trim()
-                                .removeSuffix("?")
-                                .trim()
-                        if (cleanArg.isNotEmpty() &&
-                            cleanArg != "*" &&
-                            cleanArg != "Any" &&
-                            cleanArg != "kotlin.Any" &&
-                            cleanArg !in unboundedOwnerTypeParams
-                        ) {
-                            return true
-                        }
-                    }
-                }
-                for (rawArg in topArgs) {
-                    if (isConcreteGenericTypeForSwiftExport(rawArg, unboundedOwnerTypeParams, visitedAliases)) {
-                        return true
-                    }
-                }
-                i = j + 1
-                continue
-            }
+            if (hasConcreteArg) return@anyGenericApplication true
         }
-        i++
+        topArgs.any { rawArg ->
+            isConcreteGenericTypeForSwiftExport(rawArg, unboundedOwnerTypeParams, visitedAliases)
+        }
     }
-    return false
 }
 
 internal fun attachedImplDefinesInstanceMethod(

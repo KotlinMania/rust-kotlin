@@ -13,9 +13,13 @@ package io.github.kotlinmania.rustkotlin
  *   plus `ConstPtr<T>`, `MutPtr<T>`, and `TypeLayout<T>` runtime descriptors.
  */
 public object CoreIntrinsicFfiArtifacts {
-    public fun renderConstPtrClassHeader(attachedMembers: String = ""): String =
+    private fun renderPtrClassHeader(
+        className: String,
+        attachedMembers: String,
+        extraMethodBlock: String = "",
+    ): String =
         buildString {
-            append("public class ConstPtr(\n")
+            append("public class $className(\n")
             append("    public val rawAddress: Long,\n")
             append("    public val rawMeta: Long = 0L,\n")
             append(") {\n")
@@ -23,28 +27,24 @@ public object CoreIntrinsicFfiArtifacts {
                 append(attachedMembers.trimEnd()).append("\n\n")
             }
             append("    override fun equals(other: Any?): Boolean =\n")
-            append("        other is ConstPtr && rawAddress == other.rawAddress && rawMeta == other.rawMeta\n\n")
+            append("        other is $className && rawAddress == other.rawAddress && rawMeta == other.rawMeta\n\n")
             append("    override fun hashCode(): Int = 31 * rawAddress.hashCode() + rawMeta.hashCode()\n\n")
+            if (extraMethodBlock.isNotEmpty()) {
+                append(extraMethodBlock).append("\n\n")
+            }
             append("    override fun toString(): String = \"0x\" + rawAddress.toULong().toString(16)\n")
             append("}")
         }
 
+    public fun renderConstPtrClassHeader(attachedMembers: String = ""): String =
+        renderPtrClassHeader("ConstPtr", attachedMembers)
+
     public fun renderMutPtrClassHeader(attachedMembers: String = ""): String =
-        buildString {
-            append("public class MutPtr(\n")
-            append("    public val rawAddress: Long,\n")
-            append("    public val rawMeta: Long = 0L,\n")
-            append(") {\n")
-            if (attachedMembers.isNotBlank()) {
-                append(attachedMembers.trimEnd()).append("\n\n")
-            }
-            append("    override fun equals(other: Any?): Boolean =\n")
-            append("        other is MutPtr && rawAddress == other.rawAddress && rawMeta == other.rawMeta\n\n")
-            append("    override fun hashCode(): Int = 31 * rawAddress.hashCode() + rawMeta.hashCode()\n\n")
-            append("    public fun asConstPtr(): ConstPtr = ConstPtr(rawAddress, rawMeta)\n\n")
-            append("    override fun toString(): String = \"0x\" + rawAddress.toULong().toString(16)\n")
-            append("}")
-        }
+        renderPtrClassHeader(
+            className = "MutPtr",
+            attachedMembers = attachedMembers,
+            extraMethodBlock = "    public fun asConstPtr(): ConstPtr = ConstPtr(rawAddress, rawMeta)",
+        )
 
     private fun renderPrimitiveArrayPtrExtensions(): String =
         listOf(
