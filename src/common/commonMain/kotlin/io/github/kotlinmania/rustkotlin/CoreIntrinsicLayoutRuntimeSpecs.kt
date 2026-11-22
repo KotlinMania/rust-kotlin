@@ -339,6 +339,16 @@ public fun <T> exactDivWithLayout(
 
     private fun renderUncheckedShiftFunctions(): String =
         """
+private fun <U> shiftAmountFromLayout(
+    shift: U,
+    shiftLayout: TypeLayout<U>,
+): UInt =
+    if (shiftLayout.sizeBytes == 16L) {
+        layoutRead128Pair(shiftLayout, shift).first.toUInt()
+    } else {
+        shiftLayout.toBitsU64(shift).toUInt()
+    }
+
 public fun <T> uncheckedShlWithLayout(
     x: T,
     shift: UInt,
@@ -364,75 +374,34 @@ public fun <T, U> uncheckedShlWithLayout(
     shift: U,
     layout: TypeLayout<T>,
     shiftLayout: TypeLayout<U>,
-): T {
-    val shiftAmt =
-        if (shiftLayout.sizeBytes == 16L) {
-            layoutRead128Pair(shiftLayout, shift).first.toUInt()
-        } else {
-            shiftLayout.toBitsU64(shift).toUInt()
-        }
-    return uncheckedShlWithLayout(x, shiftAmt, layout)
-}
+): T = uncheckedShlWithLayout(x, shiftAmountFromLayout(shift, shiftLayout), layout)
 
 public fun <T> uncheckedShrWithLayout(
     x: T,
     shift: UInt,
     layout: TypeLayout<T>,
 ): T {
-    val s = shift.toInt()
-    return when (layout.sizeBytes) {
-        1L -> {
-            val bits = layout.toBitsU64(x)
-            val res =
-                if (layout.isSigned) {
-                    (bits.toByte().toInt() shr s).toUByte().toULong()
-                } else {
-                    ((bits.toUInt() and 0xFFu) shr s).toULong()
-                }
-            layout.fromBitsU64(res)
-        }
-        2L -> {
-            val bits = layout.toBitsU64(x)
-            val res =
-                if (layout.isSigned) {
-                    (bits.toShort().toInt() shr s).toUShort().toULong()
-                } else {
-                    ((bits.toUInt() and 0xFFFFu) shr s).toULong()
-                }
-            layout.fromBitsU64(res)
-        }
-        4L -> {
-            val bits = layout.toBitsU64(x)
-            val res =
-                if (layout.isSigned) {
-                    (bits.toInt() shr s).toUInt().toULong()
-                } else {
-                    (bits.toUInt() shr s).toULong()
-                }
-            layout.fromBitsU64(res)
-        }
-        8L -> {
-            val bits = layout.toBitsU64(x)
-            val res =
-                if (layout.isSigned) {
-                    (bits.toLong() shr s).toULong()
-                } else {
-                    bits shr s
-                }
-            layout.fromBitsU64(res)
-        }
-        16L -> {
-            val (lo, hi) = layoutRead128Pair(layout, x)
+    if (layout.sizeBytes == 16L) {
+        val (lo, hi) = layoutRead128Pair(layout, x)
+        val (rLo, rHi) =
             if (layout.isSigned) {
-                val out = kmI128Shr(lo, hi, shift)
-                layoutFrom128Pair(layout, out.lo, out.hi)
+                kmI128Shr(lo, hi, shift).let { it.lo to it.hi }
             } else {
-                val out = kmU128Shr(lo, hi, shift)
-                layoutFrom128Pair(layout, out.lo, out.hi)
+                kmU128Shr(lo, hi, shift).let { it.lo to it.hi }
             }
-        }
-        else -> error("Unsupported layout sizeBytes=${'$'}{layout.sizeBytes} for uncheckedShrWithLayout")
+        return layoutFrom128Pair(layout, rLo, rHi)
     }
+    val s = shift.toInt()
+    val bits = layout.toBitsU64(x)
+    val res =
+        when (layout.sizeBytes) {
+            1L -> if (layout.isSigned) (bits.toByte().toInt() shr s).toUByte().toULong() else ((bits.toUInt() and 0xFFu) shr s).toULong()
+            2L -> if (layout.isSigned) (bits.toShort().toInt() shr s).toUShort().toULong() else ((bits.toUInt() and 0xFFFFu) shr s).toULong()
+            4L -> if (layout.isSigned) (bits.toInt() shr s).toUInt().toULong() else (bits.toUInt() shr s).toULong()
+            8L -> if (layout.isSigned) (bits.toLong() shr s).toULong() else bits shr s
+            else -> error("Unsupported layout sizeBytes=${'$'}{layout.sizeBytes} for uncheckedShrWithLayout")
+        }
+    return layout.fromBitsU64(res)
 }
 
 public fun <T, U> uncheckedShrWithLayout(
@@ -440,15 +409,7 @@ public fun <T, U> uncheckedShrWithLayout(
     shift: U,
     layout: TypeLayout<T>,
     shiftLayout: TypeLayout<U>,
-): T {
-    val shiftAmt =
-        if (shiftLayout.sizeBytes == 16L) {
-            layoutRead128Pair(shiftLayout, shift).first.toUInt()
-        } else {
-            shiftLayout.toBitsU64(shift).toUInt()
-        }
-    return uncheckedShrWithLayout(x, shiftAmt, layout)
-}
+): T = uncheckedShrWithLayout(x, shiftAmountFromLayout(shift, shiftLayout), layout)
 """.trimStart()
 
     private fun renderDisjointBitOrAndThreeWayCompareFunctions(): String =
@@ -593,22 +554,54 @@ $unaryF64Arms
         else -> error("Unsupported float unary intrinsic '${'$'}op' for f64")
     }
 
+private fun <T> decodeLayoutFloat32(layout: TypeLayout<T>, v: T): Float =
+    if (layout.sizeBytes == 2L) {
+        F16(layout.toBitsU64(v).toUShort()).toFloat()
+    } else {
+        Float.fromBits(layout.toBitsU64(v).toUInt().toInt())
+    }
+
+private fun <T> encodeLayoutFloat32(layout: TypeLayout<T>, res: Float): T =
+    if (layout.sizeBytes == 2L) {
+        layout.fromBitsU64(F16.fromFloat(res).bits.toULong())
+    } else {
+        layout.fromBitsU64(res.toRawBits().toUInt().toULong())
+    }
+
+private fun <T> decodeLayoutFloat64(layout: TypeLayout<T>, v: T): Double =
+    if (layout.sizeBytes == 8L) {
+        Double.fromBits(layout.toBitsU64(v).toLong())
+    } else {
+        val (lo, hi) = layoutRead128Pair(layout, v)
+        F128(hi, lo).toDouble()
+    }
+
+private fun <T> encodeLayoutFloat64(layout: TypeLayout<T>, res: Double): T =
+    if (layout.sizeBytes == 8L) {
+        layout.fromBitsU64(res.toRawBits().toULong())
+    } else {
+        val f128 = F128.fromDouble(res)
+        layoutFrom128Pair(layout, f128.low, f128.high)
+    }
+
+private inline fun <T> mapFloatLayoutUnary(
+    fnName: String,
+    x: T,
+    layout: TypeLayout<T>,
+    eval32: (Float) -> Float,
+    eval64: (Double) -> Double,
+): T =
+    when (layout.sizeBytes) {
+        2L, 4L -> encodeLayoutFloat32(layout, eval32(decodeLayoutFloat32(layout, x)))
+        8L, 16L -> encodeLayoutFloat64(layout, eval64(decodeLayoutFloat64(layout, x)))
+        else -> error("Unsupported layout sizeBytes=${'$'}{layout.sizeBytes} for ${'$'}fnName")
+    }
+
 public fun <T> floatUnaryWithLayout(
     op: String,
     x: T,
     layout: TypeLayout<T>,
-): T =
-    when (layout.sizeBytes) {
-        2L -> layout.fromBitsU64(F16.fromFloat(evalFloatUnary32(op, F16(layout.toBitsU64(x).toUShort()).toFloat())).bits.toULong())
-        4L -> layout.fromBitsU64(evalFloatUnary32(op, Float.fromBits(layout.toBitsU64(x).toUInt().toInt())).toRawBits().toUInt().toULong())
-        8L -> layout.fromBitsU64(evalFloatUnary64(op, Double.fromBits(layout.toBitsU64(x).toLong())).toRawBits().toULong())
-        16L -> {
-            val (lo, hi) = layoutRead128Pair(layout, x)
-            val f128 = F128.fromDouble(evalFloatUnary64(op, F128(hi, lo).toDouble()))
-            layoutFrom128Pair(layout, f128.low, f128.high)
-        }
-        else -> error("Unsupported layout sizeBytes=${'$'}{layout.sizeBytes} for floatUnaryWithLayout")
-    }
+): T = mapFloatLayoutUnary("floatUnaryWithLayout", x, layout, { evalFloatUnary32(op, it) }, { evalFloatUnary64(op, it) })
 
 private fun evalFloatBinary32(
     op: String,
@@ -673,27 +666,8 @@ public fun <T> floatBinaryWithLayout(
     layout: TypeLayout<T>,
 ): T =
     when (layout.sizeBytes) {
-        2L -> {
-            val fa = F16(layout.toBitsU64(a).toUShort()).toFloat()
-            val fb = F16(layout.toBitsU64(b).toUShort()).toFloat()
-            layout.fromBitsU64(F16.fromFloat(evalFloatBinary32(op, fa, fb)).bits.toULong())
-        }
-        4L -> {
-            val fa = Float.fromBits(layout.toBitsU64(a).toUInt().toInt())
-            val fb = Float.fromBits(layout.toBitsU64(b).toUInt().toInt())
-            layout.fromBitsU64(evalFloatBinary32(op, fa, fb).toRawBits().toUInt().toULong())
-        }
-        8L -> {
-            val da = Double.fromBits(layout.toBitsU64(a).toLong())
-            val db = Double.fromBits(layout.toBitsU64(b).toLong())
-            layout.fromBitsU64(evalFloatBinary64(op, da, db).toRawBits().toULong())
-        }
-        16L -> {
-            val (aLo, aHi) = layoutRead128Pair(layout, a)
-            val (bLo, bHi) = layoutRead128Pair(layout, b)
-            val f128 = F128.fromDouble(evalFloatBinary64(op, F128(aHi, aLo).toDouble(), F128(bHi, bLo).toDouble()))
-            layoutFrom128Pair(layout, f128.low, f128.high)
-        }
+        2L, 4L -> encodeLayoutFloat32(layout, evalFloatBinary32(op, decodeLayoutFloat32(layout, a), decodeLayoutFloat32(layout, b)))
+        8L, 16L -> encodeLayoutFloat64(layout, evalFloatBinary64(op, decodeLayoutFloat64(layout, a), decodeLayoutFloat64(layout, b)))
         else -> error("Unsupported layout sizeBytes=${'$'}{layout.sizeBytes} for floatBinaryWithLayout")
     }
 
@@ -701,18 +675,7 @@ public fun <T> floatPowiWithLayout(
     a: T,
     x: Int,
     layout: TypeLayout<T>,
-): T =
-    when (layout.sizeBytes) {
-        2L -> layout.fromBitsU64(F16.fromFloat(kmPowif32(F16(layout.toBitsU64(a).toUShort()).toFloat(), x)).bits.toULong())
-        4L -> layout.fromBitsU64(kmPowif32(Float.fromBits(layout.toBitsU64(a).toUInt().toInt()), x).toRawBits().toUInt().toULong())
-        8L -> layout.fromBitsU64(kmPowif64(Double.fromBits(layout.toBitsU64(a).toLong()), x).toRawBits().toULong())
-        16L -> {
-            val (lo, hi) = layoutRead128Pair(layout, a)
-            val f128 = F128.fromDouble(kmPowif64(F128(hi, lo).toDouble(), x))
-            layoutFrom128Pair(layout, f128.low, f128.high)
-        }
-        else -> error("Unsupported layout sizeBytes=${'$'}{layout.sizeBytes} for floatPowiWithLayout")
-    }
+): T = mapFloatLayoutUnary("floatPowiWithLayout", a, layout, { kmPowif32(it, x) }, { kmPowif64(it, x) })
 
 public fun <T> floatFmaWithLayout(
     a: T,
@@ -721,31 +684,8 @@ public fun <T> floatFmaWithLayout(
     layout: TypeLayout<T>,
 ): T =
     when (layout.sizeBytes) {
-        2L -> {
-            val fa = F16(layout.toBitsU64(a).toUShort()).toFloat()
-            val fb = F16(layout.toBitsU64(b).toUShort()).toFloat()
-            val fc = F16(layout.toBitsU64(c).toUShort()).toFloat()
-            layout.fromBitsU64(F16.fromFloat(kmFmaf32(fa, fb, fc)).bits.toULong())
-        }
-        4L -> {
-            val fa = Float.fromBits(layout.toBitsU64(a).toUInt().toInt())
-            val fb = Float.fromBits(layout.toBitsU64(b).toUInt().toInt())
-            val fc = Float.fromBits(layout.toBitsU64(c).toUInt().toInt())
-            layout.fromBitsU64(kmFmaf32(fa, fb, fc).toRawBits().toUInt().toULong())
-        }
-        8L -> {
-            val da = Double.fromBits(layout.toBitsU64(a).toLong())
-            val db = Double.fromBits(layout.toBitsU64(b).toLong())
-            val dc = Double.fromBits(layout.toBitsU64(c).toLong())
-            layout.fromBitsU64(kmFmaf64(da, db, dc).toRawBits().toULong())
-        }
-        16L -> {
-            val (aLo, aHi) = layoutRead128Pair(layout, a)
-            val (bLo, bHi) = layoutRead128Pair(layout, b)
-            val (cLo, cHi) = layoutRead128Pair(layout, c)
-            val f128 = F128.fromDouble(kmFmaf64(F128(aHi, aLo).toDouble(), F128(bHi, bLo).toDouble(), F128(cHi, cLo).toDouble()))
-            layoutFrom128Pair(layout, f128.low, f128.high)
-        }
+        2L, 4L -> encodeLayoutFloat32(layout, kmFmaf32(decodeLayoutFloat32(layout, a), decodeLayoutFloat32(layout, b), decodeLayoutFloat32(layout, c)))
+        8L, 16L -> encodeLayoutFloat64(layout, kmFmaf64(decodeLayoutFloat64(layout, a), decodeLayoutFloat64(layout, b), decodeLayoutFloat64(layout, c)))
         else -> error("Unsupported layout sizeBytes=${'$'}{layout.sizeBytes} for floatFmaWithLayout")
     }
 

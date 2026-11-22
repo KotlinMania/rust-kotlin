@@ -59,11 +59,7 @@ internal fun recognizePreLexedRustOrNull(
 internal fun recognizeRustOrNull(source: String): RecognizedRust? {
     val normalizedSource = normalizeSupplementaryCharLiterals(source)
     val tokens = lexTokenStreamOrNull(normalizedSource) ?: return null
-    val parseStream = normalizeLetOrPatternsForSyn(tokens.clone())
-    val parsed = parse2(FileParse::parse, parseStream)
-    val rawFile = parsed.getOrElse { return null }
-    val file = RustNextAstNormalizer.foldFile(rawFile)
-    return RecognizedRust(tokens, file, normalizedSource)
+    return recognizePreLexedRustOrNull(normalizedSource, tokens)
 }
 
 /**
@@ -279,96 +275,86 @@ private fun scanEscapedCharLiteralEnd(source: String, openTickIdx: Int): Int {
 internal fun normalizeLetOrPatternsForSyn(stream: TokenStream): TokenStream {
     val trees = stream.toList()
     if (trees.isEmpty()) return stream
-    val out = ArrayList<TokenTree>(trees.size)
-    var i = 0
-    while (i < trees.size) {
-        val tt = trees[i]
-        if (tt is TokenTree.Ident && tt.value.toString() == "final" && isFinalFnModifierAt(trees, i)) {
-            i++
-            continue
-        }
-        if (tt is TokenTree.Ident &&
-            tt.value.toString() == "super" &&
-            (trees.getOrNull(i + 1) as? TokenTree.Ident)?.value?.toString() == "let"
-        ) {
-            i++
-            continue
-        }
-        if (tt is TokenTree.Group && tt.value.delimiter() == Delimiter.Bracket) {
-            val prevIsHash = (trees.getOrNull(i - 1) as? TokenTree.Punct)?.value?.asChar() == '#'
-            if (!prevIsHash) {
-                val innerList = tt.value.stream().toList()
-                if (innerList.size == 1 && (innerList[0] as? TokenTree.Ident)?.value?.toString() == "const") {
-                    i++
-                    continue
-                }
-            }
-        }
-        if (tt is TokenTree.Ident && tt.value.toString() == "let") {
-            out.add(tt)
-            val patInfo = findLetPatternEndAndTopLevelOr(trees, i + 1)
-            if (patInfo != null) {
-                val (patEnd, hasOr) = patInfo
-                if (hasOr && patEnd > i + 1) {
-                    val normalizedPat = normalizeLetOrPatternsForSyn(TokenStream.fromTokenTrees(trees.subList(i + 1, patEnd)))
-                    val parenGroup = Group(Delimiter.Parenthesis, normalizedPat)
-                    parenGroup.setSpan(trees[i + 1].span())
-                    out.add(TokenTree.Group(parenGroup))
-                    i = patEnd
-                    continue
-                }
-            }
-            i++
-            continue
-        }
-        if (tt is TokenTree.Group) {
-            val normalizedInner = normalizeLetOrPatternsForSyn(tt.value.stream())
-            val rebuiltGroup = Group(tt.value.delimiter(), normalizedInner)
-            rebuiltGroup.setSpan(tt.value.span())
-            out.add(TokenTree.Group(rebuiltGroup))
-        } else {
-            out.add(tt)
-        }
-        i++
-    }
-    return TokenStream.fromTokenTrees(out)
+    return SynTokenStreamNormalizer(trees).normalize()
 }
 
 private val FN_MODIFIER_KEYWORDS = setOf("default", "const", "async", "unsafe", "extern")
+private val COMPOUND_EQ_PREFIX_CHARS = charArrayOf('=', '!', '<', '>', '+', '-', '*', '/', '%', '^', '&', '|')
 
-private fun isFinalFnModifierAt(trees: List<TokenTree>, finalIdx: Int): Boolean {
-    var k = finalIdx + 1
-    while (k < trees.size) {
-        val cur = trees[k]
-        if (cur is TokenTree.Ident) {
-            val kw = cur.value.toString()
-            if (kw == "fn") return true
-            if (kw in FN_MODIFIER_KEYWORDS) {
-                k++
-                if (kw == "extern" && trees.getOrNull(k) is TokenTree.Literal) {
-                    k++
-                }
+/**
+ * Extensible [RustTokenCursor] subclass normalizing Rust 2021 unparenthesized `let A | B = ...`
+ * OR-patterns, `final fn`, `super let`, and `[const]` inline bracket modifiers before `syn` parsing.
+ */
+internal open class SynTokenStreamNormalizer(
+    trees: List<TokenTree>,
+) : RustTokenCursor(trees) {
+    open fun normalize(): TokenStream {
+        val out = ArrayList<TokenTree>(size)
+        var i = 0
+        while (i < size) {
+            val tt = trees[i]
+            val ident = identAt(i)
+            if (ident == "final" && isFinalFnModifierAt(i)) {
+                i++
                 continue
             }
+            if (ident == "super" && identAt(i + 1) == "let") {
+                i++
+                continue
+            }
+            val bracketGrp = groupAt(i, Delimiter.Bracket)
+            if (bracketGrp != null && punctCharAt(i - 1) != '#' && isSingleConstBracketGroup(bracketGrp)) {
+                i++
+                continue
+            }
+            if (ident == "let") {
+                out.add(tt)
+                val patInfo = findLetPatternEndAndTopLevelOr(i + 1)
+                if (patInfo != null && patInfo.second && patInfo.first > i + 1) {
+                    val normalizedPat = normalizeLetOrPatternsForSyn(TokenStream.fromTokenTrees(trees.subList(i + 1, patInfo.first)))
+                    val parenGroup = Group(Delimiter.Parenthesis, normalizedPat).also { it.setSpan(trees[i + 1].span()) }
+                    out.add(TokenTree.Group(parenGroup))
+                    i = patInfo.first
+                    continue
+                }
+                i++
+                continue
+            }
+            if (tt is TokenTree.Group) {
+                val rebuiltGroup = Group(tt.value.delimiter(), normalizeLetOrPatternsForSyn(tt.value.stream())).also { it.setSpan(tt.value.span()) }
+                out.add(TokenTree.Group(rebuiltGroup))
+            } else {
+                out.add(tt)
+            }
+            i++
+        }
+        return TokenStream.fromTokenTrees(out)
+    }
+
+    protected fun isFinalFnModifierAt(finalIdx: Int): Boolean {
+        var k = finalIdx + 1
+        while (k < size) {
+            val kw = identAt(k) ?: return false
+            if (kw == "fn") return true
+            if (kw !in FN_MODIFIER_KEYWORDS) return false
+            k++
+            if (kw == "extern" && trees.getOrNull(k) is TokenTree.Literal) k++
         }
         return false
     }
-    return false
-}
 
-private fun findLetPatternEndAndTopLevelOr(trees: List<TokenTree>, startIdx: Int): Pair<Int, Boolean>? {
-    if (startIdx >= trees.size) return null
-    var angleDepth = 0
-    var hasTopLevelOr = false
-    for (j in startIdx until trees.size) {
-        val tt = trees[j]
-        if (tt is TokenTree.Punct) {
-            val ch = tt.value.asChar()
-            val isJoint = tt.value.spacing() == Spacing.Joint
-            val nextCh = (trees.getOrNull(j + 1) as? TokenTree.Punct)?.value?.asChar()
-            val prevPunct = if (j > startIdx) trees.getOrNull(j - 1) as? TokenTree.Punct else null
-            val prevCh = prevPunct?.value?.asChar()
-            val prevJoint = prevPunct?.value?.spacing() == Spacing.Joint
+    protected fun findLetPatternEndAndTopLevelOr(startIdx: Int): Pair<Int, Boolean>? {
+        if (startIdx >= size) return null
+        var angleDepth = 0
+        var hasTopLevelOr = false
+        for (j in startIdx until size) {
+            val punct = (trees[j] as? TokenTree.Punct)?.value ?: continue
+            val ch = punct.asChar()
+            val isJoint = punct.spacing() == Spacing.Joint
+            val nextCh = punctCharAt(j + 1)
+            val prevPunct = if (j > startIdx) (trees.getOrNull(j - 1) as? TokenTree.Punct)?.value else null
+            val prevCh = prevPunct?.asChar()
+            val prevJoint = prevPunct?.spacing() == Spacing.Joint
 
             if (ch == '<' && !(isJoint && (nextCh == '=' || nextCh == '<' || nextCh == '-'))) {
                 angleDepth++
@@ -377,32 +363,28 @@ private fun findLetPatternEndAndTopLevelOr(trees: List<TokenTree>, startIdx: Int
             } else if (angleDepth == 0) {
                 when (ch) {
                     ';' -> return j to hasTopLevelOr
-                    ':' -> {
-                        if (!isJoint && !(prevJoint && prevCh == ':')) {
-                            return j to hasTopLevelOr
-                        }
-                    }
+                    ':' -> if (!isJoint && !(prevJoint && prevCh == ':')) return j to hasTopLevelOr
                     '=' -> {
                         val isCompoundAfter = isJoint && (nextCh == '=' || nextCh == '>')
                         val isCompoundBefore = prevJoint && prevCh != null && prevCh in COMPOUND_EQ_PREFIX_CHARS
-                        if (!isCompoundAfter && !isCompoundBefore) {
-                            return j to hasTopLevelOr
-                        }
+                        if (!isCompoundAfter && !isCompoundBefore) return j to hasTopLevelOr
                     }
                     '|' -> {
                         val isLogicalOrAssign = (isJoint && (nextCh == '|' || nextCh == '=')) || (prevJoint && prevCh == '|')
-                        if (!isLogicalOrAssign) {
-                            hasTopLevelOr = true
-                        }
+                        if (!isLogicalOrAssign) hasTopLevelOr = true
                     }
                 }
             }
         }
+        return null
     }
-    return null
 }
 
-private val COMPOUND_EQ_PREFIX_CHARS = charArrayOf('=', '!', '<', '>', '+', '-', '*', '/', '%', '^', '&', '|')
+internal fun isSingleConstBracketGroup(group: Group): Boolean {
+    if (group.delimiter() != Delimiter.Bracket) return false
+    val inner = group.stream().toList()
+    return inner.size == 1 && (inner[0] as? TokenTree.Ident)?.value?.toString() == "const"
+}
 
 /**
  * Normalizes RFC 3762 `const trait` / `const impl` items and `[const]` / `const` trait bounds
@@ -496,7 +478,7 @@ internal object RustNextAstNormalizer : Fold() {
                 out.add(trees[idx])
                 idx++
             }
-            val constModLen = leadingConstBoundModifierLength(trees, idx)
+            val constModLen = leadingConstBoundModifierLength(cursor, idx)
             if (constModLen > 0) {
                 idx += constModLen
                 stripped = true
@@ -525,29 +507,18 @@ internal object RustNextAstNormalizer : Fold() {
             out.add(trees[idx])
             idx = cursor.copyBalancedAngles(idx + 1, out)
         }
-        val constModLen = leadingConstBoundModifierLength(trees, idx)
+        val constModLen = leadingConstBoundModifierLength(cursor, idx)
         if (constModLen == 0) return null
         out.addAll(trees.subList(idx + constModLen, trees.size))
         return out
     }
 
-    private fun leadingConstBoundModifierLength(trees: List<TokenTree>, startIdx: Int): Int {
-        val cur = trees.getOrNull(startIdx) ?: return 0
-        if (cur is TokenTree.Group && cur.value.delimiter() == Delimiter.Bracket) {
-            val inner = cur.value.stream().toList()
-            if (inner.size == 1 && (inner[0] as? TokenTree.Ident)?.value?.toString() == "const") {
-                return 1
-            }
-        }
-        if ((cur as? TokenTree.Ident)?.value?.toString() == "const") {
-            return 1
-        }
-        val ch = (cur as? TokenTree.Punct)?.value?.asChar()
-        if ((ch == '~' || ch == '?') &&
-            (trees.getOrNull(startIdx + 1) as? TokenTree.Ident)?.value?.toString() == "const"
-        ) {
-            return 2
-        }
+    private fun leadingConstBoundModifierLength(cursor: RustTokenCursor, startIdx: Int): Int {
+        val bracketGrp = cursor.groupAt(startIdx, Delimiter.Bracket)
+        if (bracketGrp != null && isSingleConstBracketGroup(bracketGrp)) return 1
+        if (cursor.identAt(startIdx) == "const") return 1
+        val ch = cursor.punctCharAt(startIdx)
+        if ((ch == '~' || ch == '?') && cursor.identAt(startIdx + 1) == "const") return 2
         return 0
     }
 }

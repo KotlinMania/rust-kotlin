@@ -198,157 +198,7 @@ internal object KmLinearMemoryArena {
         return 0
     }
 
-    fun atomicXchgU8(addr: Long, value: UByte): UByte {
-        val prev = loadU8(addr)
-        storeU8(addr, value)
-        return prev
-    }
-
-    fun atomicXchgU16(addr: Long, value: UShort): UShort {
-        val prev = loadU16(addr)
-        storeU16(addr, value)
-        return prev
-    }
-
-    fun atomicXchgU32(addr: Long, value: UInt): UInt {
-        val prev = loadU32(addr)
-        storeU32(addr, value)
-        return prev
-    }
-
-    fun atomicXchgU64(addr: Long, value: ULong): ULong {
-        val prev = loadU64(addr)
-        storeU64(addr, value)
-        return prev
-    }
-
-    fun atomicCxchgU8(addr: Long, expected: UByte, desired: UByte): AtomicCxchgU8Outcome {
-        val cur = loadU8(addr)
-        return if (cur == expected) {
-            storeU8(addr, desired)
-            AtomicCxchgU8Outcome(cur, true)
-        } else {
-            AtomicCxchgU8Outcome(cur, false)
-        }
-    }
-
-    fun atomicCxchgU16(addr: Long, expected: UShort, desired: UShort): AtomicCxchgU16Outcome {
-        val cur = loadU16(addr)
-        return if (cur == expected) {
-            storeU16(addr, desired)
-            AtomicCxchgU16Outcome(cur, true)
-        } else {
-            AtomicCxchgU16Outcome(cur, false)
-        }
-    }
-
-    fun atomicCxchgU32(addr: Long, expected: UInt, desired: UInt): AtomicCxchgU32Outcome {
-        val cur = loadU32(addr)
-        return if (cur == expected) {
-            storeU32(addr, desired)
-            AtomicCxchgU32Outcome(cur, true)
-        } else {
-            AtomicCxchgU32Outcome(cur, false)
-        }
-    }
-
-    fun atomicCxchgU64(addr: Long, expected: ULong, desired: ULong): AtomicCxchgU64Outcome {
-        val cur = loadU64(addr)
-        return if (cur == expected) {
-            storeU64(addr, desired)
-            AtomicCxchgU64Outcome(cur, true)
-        } else {
-            AtomicCxchgU64Outcome(cur, false)
-        }
-    }
-
-    fun atomicCxchgU128Pair(addr: Long, expLo: ULong, expHi: ULong, desLo: ULong, desHi: ULong): AtomicCxchgU128Outcome {
-        val curLo = loadU64(addr)
-        val curHi = loadU64(addr + 8L)
-        return if (curLo == expLo && curHi == expHi) {
-            storeU64(addr, desLo)
-            storeU64(addr + 8L, desHi)
-            AtomicCxchgU128Outcome(curLo, curHi, true)
-        } else {
-            AtomicCxchgU128Outcome(curLo, curHi, false)
-        }
-    }
-
-    fun atomicRmwU8(addr: Long, value: UByte, op: Int): UByte {
-        val cur = loadU8(addr)
-        val next =
-            when (op) {
-                1 -> (cur + value).toUByte()
-                2 -> (cur - value).toUByte()
-                3 -> cur and value
-                4 -> (cur and value).inv()
-                5 -> cur or value
-                6 -> cur xor value
-                7 -> if (cur.toByte() > value.toByte()) cur else value
-                8 -> if (cur.toByte() < value.toByte()) cur else value
-                9 -> if (cur > value) cur else value
-                else -> if (cur < value) cur else value
-            }
-        storeU8(addr, next)
-        return cur
-    }
-
-    fun atomicRmwU16(addr: Long, value: UShort, op: Int): UShort {
-        val cur = loadU16(addr)
-        val next =
-            when (op) {
-                1 -> (cur + value).toUShort()
-                2 -> (cur - value).toUShort()
-                3 -> cur and value
-                4 -> (cur and value).inv()
-                5 -> cur or value
-                6 -> cur xor value
-                7 -> if (cur.toShort() > value.toShort()) cur else value
-                8 -> if (cur.toShort() < value.toShort()) cur else value
-                9 -> if (cur > value) cur else value
-                else -> if (cur < value) cur else value
-            }
-        storeU16(addr, next)
-        return cur
-    }
-
-    fun atomicRmwU32(addr: Long, value: UInt, op: Int): UInt {
-        val cur = loadU32(addr)
-        val next =
-            when (op) {
-                1 -> cur + value
-                2 -> cur - value
-                3 -> cur and value
-                4 -> (cur and value).inv()
-                5 -> cur or value
-                6 -> cur xor value
-                7 -> if (cur.toInt() > value.toInt()) cur else value
-                8 -> if (cur.toInt() < value.toInt()) cur else value
-                9 -> if (cur > value) cur else value
-                else -> if (cur < value) cur else value
-            }
-        storeU32(addr, next)
-        return cur
-    }
-
-    fun atomicRmwU64(addr: Long, value: ULong, op: Int): ULong {
-        val cur = loadU64(addr)
-        val next =
-            when (op) {
-                1 -> cur + value
-                2 -> cur - value
-                3 -> cur and value
-                4 -> (cur and value).inv()
-                5 -> cur or value
-                6 -> cur xor value
-                7 -> if (cur.toLong() > value.toLong()) cur else value
-                8 -> if (cur.toLong() < value.toLong()) cur else value
-                9 -> if (cur > value) cur else value
-                else -> if (cur < value) cur else value
-            }
-        storeU64(addr, next)
-        return cur
-    }
+${renderArenaAtomicMethods()}
 
     fun ctpopU64(value: ULong): UInt = value.countOneBits().toUInt()
     fun ctlzU64(value: ULong): UInt = value.countLeadingZeroBits().toUInt()
@@ -415,6 +265,92 @@ internal object KmLinearMemoryArena {
 ${renderLinearMemoryArenaMethods()}
 }
 """.trimStart()
+
+    private data class ArenaAtomicWidthSpec(
+        val tag: String,
+        val ktType: String,
+        val signedConv: String,
+        val narrowWrap: String,
+    )
+
+    private fun renderArenaAtomicMethods(): String {
+        val widths =
+            listOf(
+                ArenaAtomicWidthSpec("U8", "UByte", "toByte()", ".toUByte()"),
+                ArenaAtomicWidthSpec("U16", "UShort", "toShort()", ".toUShort()"),
+                ArenaAtomicWidthSpec("U32", "UInt", "toInt()", ""),
+                ArenaAtomicWidthSpec("U64", "ULong", "toLong()", ""),
+            )
+        return buildString {
+            for (w in widths) {
+                appendLine(
+                    """
+    fun atomicXchg${w.tag}(addr: Long, value: ${w.ktType}): ${w.ktType} {
+        val prev = load${w.tag}(addr)
+        store${w.tag}(addr, value)
+        return prev
+    }
+                    """.trimEnd(),
+                )
+            }
+            for (w in widths) {
+                appendLine(
+                    """
+    fun atomicCxchg${w.tag}(addr: Long, expected: ${w.ktType}, desired: ${w.ktType}): AtomicCxchg${w.tag}Outcome {
+        val cur = load${w.tag}(addr)
+        return if (cur == expected) {
+            store${w.tag}(addr, desired)
+            AtomicCxchg${w.tag}Outcome(cur, true)
+        } else {
+            AtomicCxchg${w.tag}Outcome(cur, false)
+        }
+    }
+                    """.trimEnd(),
+                )
+            }
+            appendLine(
+                """
+    fun atomicCxchgU128Pair(addr: Long, expLo: ULong, expHi: ULong, desLo: ULong, desHi: ULong): AtomicCxchgU128Outcome {
+        val curLo = loadU64(addr)
+        val curHi = loadU64(addr + 8L)
+        return if (curLo == expLo && curHi == expHi) {
+            storeU64(addr, desLo)
+            storeU64(addr + 8L, desHi)
+            AtomicCxchgU128Outcome(curLo, curHi, true)
+        } else {
+            AtomicCxchgU128Outcome(curLo, curHi, false)
+        }
+    }
+                """.trimEnd(),
+            )
+            for (w in widths) {
+                val addExpr = if (w.narrowWrap.isEmpty()) "cur + value" else "(cur + value)${w.narrowWrap}"
+                val subExpr = if (w.narrowWrap.isEmpty()) "cur - value" else "(cur - value)${w.narrowWrap}"
+                appendLine(
+                    """
+    fun atomicRmw${w.tag}(addr: Long, value: ${w.ktType}, op: Int): ${w.ktType} {
+        val cur = load${w.tag}(addr)
+        val next =
+            when (op) {
+                1 -> $addExpr
+                2 -> $subExpr
+                3 -> cur and value
+                4 -> (cur and value).inv()
+                5 -> cur or value
+                6 -> cur xor value
+                7 -> if (cur.${w.signedConv} > value.${w.signedConv}) cur else value
+                8 -> if (cur.${w.signedConv} < value.${w.signedConv}) cur else value
+                9 -> if (cur > value) cur else value
+                else -> if (cur < value) cur else value
+            }
+        store${w.tag}(addr, next)
+        return cur
+    }
+                    """.trimEnd(),
+                )
+            }
+        }.trimEnd()
+    }
 
     private fun renderLinearMemoryArenaMethods(): String =
         """
@@ -502,36 +438,9 @@ ${renderLinearMemoryArenaMethods()}
 
     fun bswapU128(lo: ULong, hi: ULong): U128ValueOutcome = U128ValueOutcome(bswapU64(hi), bswapU64(lo))
 
-    fun bitreverseU8(value: UByte): UByte {
-        var r = 0
-        var v = value.toInt() and 0xFF
-        repeat(8) {
-            r = (r shl 1) or (v and 1)
-            v = v ushr 1
-        }
-        return r.toUByte()
-    }
-
-    fun bitreverseU16(value: UShort): UShort {
-        var r = 0
-        var v = value.toInt() and 0xFFFF
-        repeat(16) {
-            r = (r shl 1) or (v and 1)
-            v = v ushr 1
-        }
-        return r.toUShort()
-    }
-
-    fun bitreverseU32(value: UInt): UInt {
-        var r = 0u
-        var v = value
-        repeat(32) {
-            r = (r shl 1) or (v and 1u)
-            v = v shr 1
-        }
-        return r
-    }
-
+    fun bitreverseU8(value: UByte): UByte = (bitreverseU64(value.toULong()) shr 56).toUByte()
+    fun bitreverseU16(value: UShort): UShort = (bitreverseU64(value.toULong()) shr 48).toUShort()
+    fun bitreverseU32(value: UInt): UInt = (bitreverseU64(value.toULong()) shr 32).toUInt()
     fun bitreverseU128(lo: ULong, hi: ULong): U128ValueOutcome = U128ValueOutcome(bitreverseU64(hi), bitreverseU64(lo))
 
     fun rotateLeftU8(value: UByte, n: UInt): UByte {
@@ -743,6 +652,15 @@ ${renderLinearMemoryArenaMethods()}
         return OverflowI128Outcome(resLo, resHi, ovf)
     }
 
+    private fun clampSigned128Overflow(lo: ULong, hi: ULong, overflowed: Boolean): I128ValueOutcome =
+        if (!overflowed) {
+            I128ValueOutcome(lo, hi)
+        } else if ((hi shr 63) != 0uL) {
+            I128ValueOutcome(ULong.MAX_VALUE, 0x7FFF_FFFF_FFFF_FFFFuL)
+        } else {
+            I128ValueOutcome(0uL, 0x8000_0000_0000_0000uL)
+        }
+
     fun saturatingAddU8(a: UByte, b: UByte): UByte = addWithOverflowU8(a, b).let { if (it.overflowed) UByte.MAX_VALUE else it.value }
     fun saturatingAddU16(a: UShort, b: UShort): UShort = addWithOverflowU16(a, b).let { if (it.overflowed) UShort.MAX_VALUE else it.value }
     fun saturatingAddU32(a: UInt, b: UInt): UInt = addWithOverflowU32(a, b).let { if (it.overflowed) UInt.MAX_VALUE else it.value }
@@ -755,13 +673,7 @@ ${renderLinearMemoryArenaMethods()}
     fun saturatingAddI32(a: Int, b: Int): Int = addWithOverflowI32(a, b).let { if (it.overflowed) (if (it.value < 0) Int.MAX_VALUE else Int.MIN_VALUE) else it.value }
     fun saturatingAddI64(a: Long, b: Long): Long = addWithOverflowI64(a, b).let { if (it.overflowed) (if (it.value < 0) Long.MAX_VALUE else Long.MIN_VALUE) else it.value }
     fun saturatingAddI128(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): I128ValueOutcome =
-        addWithOverflowI128(aLo, aHi, bLo, bHi).let {
-            if (it.overflowed) {
-                if ((it.hi shr 63) != 0uL) I128ValueOutcome(ULong.MAX_VALUE, 0x7FFF_FFFF_FFFF_FFFFuL) else I128ValueOutcome(0uL, 0x8000_0000_0000_0000uL)
-            } else {
-                I128ValueOutcome(it.lo, it.hi)
-            }
-        }
+        addWithOverflowI128(aLo, aHi, bLo, bHi).let { clampSigned128Overflow(it.lo, it.hi, it.overflowed) }
 
     fun saturatingSubU8(a: UByte, b: UByte): UByte = subWithOverflowU8(a, b).let { if (it.overflowed) 0u.toUByte() else it.value }
     fun saturatingSubU16(a: UShort, b: UShort): UShort = subWithOverflowU16(a, b).let { if (it.overflowed) 0u.toUShort() else it.value }
@@ -775,13 +687,7 @@ ${renderLinearMemoryArenaMethods()}
     fun saturatingSubI32(a: Int, b: Int): Int = subWithOverflowI32(a, b).let { if (it.overflowed) (if (it.value < 0) Int.MAX_VALUE else Int.MIN_VALUE) else it.value }
     fun saturatingSubI64(a: Long, b: Long): Long = subWithOverflowI64(a, b).let { if (it.overflowed) (if (it.value < 0) Long.MAX_VALUE else Long.MIN_VALUE) else it.value }
     fun saturatingSubI128(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): I128ValueOutcome =
-        subWithOverflowI128(aLo, aHi, bLo, bHi).let {
-            if (it.overflowed) {
-                if ((it.hi shr 63) != 0uL) I128ValueOutcome(ULong.MAX_VALUE, 0x7FFF_FFFF_FFFF_FFFFuL) else I128ValueOutcome(0uL, 0x8000_0000_0000_0000uL)
-            } else {
-                I128ValueOutcome(it.lo, it.hi)
-            }
-        }
+        subWithOverflowI128(aLo, aHi, bLo, bHi).let { clampSigned128Overflow(it.lo, it.hi, it.overflowed) }
 
     fun u128Add(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): U128ValueOutcome =
         addWithOverflowU128(aLo, aHi, bLo, bHi).let { U128ValueOutcome(it.lo, it.hi) }
