@@ -335,61 +335,6 @@ internal fun FfiInteropCollector.buildJvmOrAndroidActualsKotlinContent(
     return finalizeActualsKotlinFile(sb, actualBlocks, imports, pkgName)
 }
 
-private fun buildJniResourceLoaderBody(
-    jniObjectName: String,
-    jniLibName: String,
-    resourcePrefix: String,
-): String =
-    buildString {
-        append("    private fun loadNativeLibrary() {\n")
-        append("        val osRaw = System.getProperty(\"os.name\", \"\").lowercase()\n")
-        append("        val archRaw = System.getProperty(\"os.arch\", \"\").lowercase()\n")
-        append("        val hostPlatform =\n")
-        append("            when {\n")
-        append("                osRaw.contains(\"win\") -> \"windows\"\n")
-        append("                osRaw.contains(\"mac\") || osRaw.contains(\"darwin\") -> \"macos\"\n")
-        append("                else -> \"linux\"\n")
-        append("            }\n")
-        append("        val hostArch =\n")
-        append("            when {\n")
-        append("                archRaw == \"aarch64\" || archRaw == \"arm64\" -> \"aarch64\"\n")
-        append("                archRaw == \"amd64\" || archRaw == \"x86_64\" -> \"x86_64\"\n")
-        append("                else -> archRaw\n")
-        append("            }\n")
-        append("        val libFileName =\n")
-        append("            when (hostPlatform) {\n")
-        append("                \"windows\" -> \"").append(jniLibName).append(".dll\"\n")
-        append("                \"macos\" -> \"lib").append(jniLibName).append(".dylib\"\n")
-        append("                else -> \"lib").append(jniLibName).append(".so\"\n")
-        append("            }\n")
-        append("        val pathSep = System.getProperty(\"path.separator\", \":\")\n")
-        append("        val libPathProp = System.getProperty(\"java.library.path\", \"\")\n")
-        append("        for (dirEntry in libPathProp.split(pathSep)) {\n")
-        append("            if (dirEntry.isEmpty()) continue\n")
-        append("            val candidate = java.io.File(dirEntry, libFileName)\n")
-        append("            if (candidate.isFile) {\n")
-        append("                System.load(candidate.absolutePath)\n")
-        append("                return\n")
-        append("            }\n")
-        append("        }\n")
-        append("        val resourcePath = \"").append(resourcePrefix).append("/native/${'$'}hostPlatform-${'$'}hostArch/${'$'}libFileName\"\n")
-        append("        val stream = ").append(jniObjectName).append("::class.java.classLoader?.getResourceAsStream(resourcePath)\n")
-        append("        if (stream != null) {\n")
-        append("            val suffix = \".\" + libFileName.substringAfterLast('.')\n")
-        append("            val extracted = java.nio.file.Files.createTempFile(\"").append(jniLibName).append("-\", suffix).toFile()\n")
-        append("            extracted.deleteOnExit()\n")
-        append("            stream.use { input ->\n")
-        append("                extracted.outputStream().use { output ->\n")
-        append("                    input.copyTo(output)\n")
-        append("                }\n")
-        append("            }\n")
-        append("            System.load(extracted.absolutePath)\n")
-        append("            return\n")
-        append("        }\n")
-        append("        System.loadLibrary(\"").append(jniLibName).append("\")\n")
-        append("    }\n\n")
-    }
-
 internal fun FfiInteropCollector.buildJniCSourceContent(
     pkgName: String?,
     jniObjectName: String,

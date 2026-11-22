@@ -163,7 +163,7 @@ internal open class RustTokenCursor(
                         if (depth == 0) return true
                     }
                 }
-                else -> {}
+                else -> Unit
             }
         }
         return false

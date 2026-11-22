@@ -1337,9 +1337,10 @@ internal class FfiInteropCollector(
     companion object {
         private val POINTEE_STOP_IDENTS = setOf("c_char", "FILE", "DIR", "c_void")
 
-        private fun unwrapOuterAliases(
+        private fun unwrapTypeAliases(
             ty: SynType,
             resolveTypeAliasTarget: (String) -> SynType?,
+            stopIdents: Set<String> = emptySet(),
         ): SynType {
             var cur = unwrapType(ty)
             var depth = 0
@@ -1347,6 +1348,7 @@ internal class FfiInteropCollector(
                 val lastSeg = cur.path.segments.last() ?: break
                 if (lastSeg.arguments !is PathArguments.None) break
                 val rawIdent = lastSeg.ident.toString().removePrefix("r#")
+                if (rawIdent in stopIdents) break
                 val target = resolveTypeAliasTarget(rawIdent) ?: break
                 cur = unwrapType(target)
                 depth++
@@ -1354,23 +1356,15 @@ internal class FfiInteropCollector(
             return cur
         }
 
+        private fun unwrapOuterAliases(
+            ty: SynType,
+            resolveTypeAliasTarget: (String) -> SynType?,
+        ): SynType = unwrapTypeAliases(ty, resolveTypeAliasTarget)
+
         private fun unwrapPointeeAliases(
             ty: SynType,
             resolveTypeAliasTarget: (String) -> SynType?,
-        ): SynType {
-            var cur = unwrapType(ty)
-            var depth = 0
-            while (depth < 8 && cur is SynType.Path && cur.qself == null) {
-                val lastSeg = cur.path.segments.last() ?: break
-                if (lastSeg.arguments !is PathArguments.None) break
-                val rawIdent = lastSeg.ident.toString().removePrefix("r#")
-                if (rawIdent in POINTEE_STOP_IDENTS) break
-                val target = resolveTypeAliasTarget(rawIdent) ?: break
-                cur = unwrapType(target)
-                depth++
-            }
-            return cur
-        }
+        ): SynType = unwrapTypeAliases(ty, resolveTypeAliasTarget, POINTEE_STOP_IDENTS)
 
         internal fun classifyAbiBridge(
             synType: SynType?,
@@ -1943,18 +1937,73 @@ private val C_RESERVED_PARAM_NAMES: Set<String> =
             "sin cos tan exp log pow sqrt ceil floor index rindex bcopy bzero bcmp"
     ).split(' ').toSet()
 
-internal fun jniMangleSegment(segment: String): String {
-    val sb = StringBuilder(segment.length + 8)
-    for (ch in segment) {
-        when (ch) {
-            '_' -> sb.append("_1")
-            ';' -> sb.append("_2")
-            '[' -> sb.append("_3")
-            else -> sb.append(ch)
+internal fun jniMangleSegment(segment: String): String =
+    buildString(segment.length + 4) {
+        for (ch in segment) {
+            when {
+                ch in 'a'..'z' || ch in 'A'..'Z' || ch in '0'..'9' -> append(ch)
+                ch == '_' -> append("_1")
+                ch == ';' -> append("_2")
+                ch == '[' -> append("_3")
+                else -> append("_0").append(ch.code.toString(16).padStart(4, '0'))
+            }
         }
     }
-    return sb.toString()
-}
+
+internal fun buildJniResourceLoaderBody(
+    jniObjectName: String,
+    jniLibName: String,
+    resourcePrefix: String,
+): String =
+    buildString {
+        append("    private fun loadNativeLibrary() {\n")
+        append("        val osRaw = System.getProperty(\"os.name\", \"\").lowercase()\n")
+        append("        val archRaw = System.getProperty(\"os.arch\", \"\").lowercase()\n")
+        append("        val hostPlatform =\n")
+        append("            when {\n")
+        append("                osRaw.contains(\"win\") -> \"windows\"\n")
+        append("                osRaw.contains(\"mac\") || osRaw.contains(\"darwin\") -> \"macos\"\n")
+        append("                else -> \"linux\"\n")
+        append("            }\n")
+        append("        val hostArch =\n")
+        append("            when {\n")
+        append("                archRaw == \"aarch64\" || archRaw == \"arm64\" -> \"aarch64\"\n")
+        append("                archRaw == \"amd64\" || archRaw == \"x86_64\" -> \"x86_64\"\n")
+        append("                else -> archRaw\n")
+        append("            }\n")
+        append("        val libFileName =\n")
+        append("            when (hostPlatform) {\n")
+        append("                \"windows\" -> \"").append(jniLibName).append(".dll\"\n")
+        append("                \"macos\" -> \"lib").append(jniLibName).append(".dylib\"\n")
+        append("                else -> \"lib").append(jniLibName).append(".so\"\n")
+        append("            }\n")
+        append("        val pathSep = System.getProperty(\"path.separator\", \":\")\n")
+        append("        val libPathProp = System.getProperty(\"java.library.path\", \"\")\n")
+        append("        for (dirEntry in libPathProp.split(pathSep)) {\n")
+        append("            if (dirEntry.isEmpty()) continue\n")
+        append("            val candidate = java.io.File(dirEntry, libFileName)\n")
+        append("            if (candidate.isFile) {\n")
+        append("                System.load(candidate.absolutePath)\n")
+        append("                return\n")
+        append("            }\n")
+        append("        }\n")
+        append("        val resourcePath = \"").append(resourcePrefix).append("/native/${'$'}hostPlatform-${'$'}hostArch/${'$'}libFileName\"\n")
+        append("        val stream = ").append(jniObjectName).append("::class.java.classLoader?.getResourceAsStream(resourcePath)\n")
+        append("        if (stream != null) {\n")
+        append("            val suffix = \".\" + libFileName.substringAfterLast('.')\n")
+        append("            val extracted = java.nio.file.Files.createTempFile(\"").append(jniLibName).append("-\", suffix).toFile()\n")
+        append("            extracted.deleteOnExit()\n")
+        append("            stream.use { input ->\n")
+        append("                extracted.outputStream().use { output ->\n")
+        append("                    input.copyTo(output)\n")
+        append("                }\n")
+        append("            }\n")
+        append("            System.load(extracted.absolutePath)\n")
+        append("            return\n")
+        append("        }\n")
+        append("        System.loadLibrary(\"").append(jniLibName).append("\")\n")
+        append("    }\n\n")
+    }
 
 internal fun escapeCString(raw: String): String =
     buildString(raw.length + 4) {
