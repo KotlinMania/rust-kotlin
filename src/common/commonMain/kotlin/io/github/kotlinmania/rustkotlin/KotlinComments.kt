@@ -1424,32 +1424,8 @@ private fun isDoubleColonAt(trees: List<TokenTree>, idx: Int): Boolean =
     RustTokenCursor(trees).isDoubleColonAt(idx)
 
 private fun mapSynTokenMacroSymbol(symbol: String): String =
-    when (symbol) {
-        "," -> "Comma"
-        "=" -> "Eq"
-        ";" -> "Semi"
-        ":" -> "Colon"
-        "::" -> "PathSep"
-        "." -> "Dot"
-        ".." -> "DotDot"
-        "..." -> "DotDotDot"
-        "..=" -> "DotDotEq"
-        "->" -> "RArrow"
-        "=>" -> "FatArrow"
-        "!" -> "Not"
-        "+" -> "Plus"
-        "-" -> "Minus"
-        "*" -> "Star"
-        "/" -> "Slash"
-        "&" -> "And"
-        "|" -> "Or"
-        "<" -> "Lt"
-        ">" -> "Gt"
-        "?" -> "Question"
-        "@" -> "At"
-        "_" -> "Underscore"
-        else -> rustTypeIdentToKotlin(symbol.filter { it.isLetterOrDigit() || it == '_' }.ifEmpty { "Token" })
-    }
+    RustTokenCursor.resolveSynTokenIdentOrPunctTypeName(symbol)
+        ?: rustTypeIdentToKotlin(symbol.filter { it.isLetterOrDigit() || it == '_' }.ifEmpty { "Token" })
 
 private fun mapRustIdentInCommentCode(raw: String): String =
     when (raw) {

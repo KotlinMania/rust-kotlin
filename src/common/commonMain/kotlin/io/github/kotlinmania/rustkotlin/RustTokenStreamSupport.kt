@@ -255,6 +255,33 @@ internal open class RustTokenCursor(
             if (trees.isEmpty()) return emptyList()
             return RustTokenCursor(trees).splitByTopLevelPunct(',', turbofishOnlyAngles = true)
         }
+
+        fun resolveSynTokenIdentOrPunctTypeName(symbol: String): String? =
+            when (symbol) {
+                "Self" -> "SelfType"
+                "self" -> "SelfValue"
+                "type" -> "SynTypeToken"
+                "_" -> "Underscore"
+                in SYN_KEYWORD_TOKENS -> symbol[0].uppercaseChar() + symbol.substring(1)
+                else -> SYN_PUNCT_TOKEN_NAMES[symbol]
+            }
+
+        fun resolveSynTokenStreamTypeName(tokens: TokenStream): String? {
+            val trees = tokens.clone().toList()
+            if (trees.isEmpty()) return null
+            if (trees.size == 1 && trees[0] is TokenTree.Ident) {
+                return resolveSynTokenIdentOrPunctTypeName((trees[0] as TokenTree.Ident).value.toString())
+            }
+            if (trees.size <= 3 && trees.all { it is TokenTree.Punct }) {
+                for (idx in 0 until trees.lastIndex) {
+                    val p = (trees[idx] as TokenTree.Punct).value
+                    if (p.spacing() != Spacing.Joint) return null
+                }
+                val seq = buildString(trees.size) { trees.forEach { append((it as TokenTree.Punct).value.asChar()) } }
+                return SYN_PUNCT_TOKEN_NAMES[seq]
+            }
+            return null
+        }
     }
 }
 

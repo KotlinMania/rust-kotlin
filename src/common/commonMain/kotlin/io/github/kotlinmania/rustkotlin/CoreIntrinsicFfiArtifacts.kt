@@ -308,6 +308,64 @@ public interface TypeLayout<T> {
     }
 }
 
+private open class MappedTypeLayout<U, T>(
+    private val base: TypeLayout<U>,
+    override val isSigned: Boolean = false,
+    private val fromRaw: (U) -> T,
+    private val toRaw: (T) -> U,
+) : TypeLayout<T> {
+    override val sizeBytes: Long
+        get() = base.sizeBytes
+    override val alignBytes: Long
+        get() = base.alignBytes
+
+    override fun readNative(addr: Long): T = fromRaw(base.readNative(addr))
+
+    override fun writeNative(addr: Long, value: T): Unit = base.writeNative(addr, toRaw(value))
+
+    override fun readBytes(buf: ByteArray, offset: Int): T = fromRaw(base.readBytes(buf, offset))
+
+    override fun writeBytes(buf: ByteArray, offset: Int, value: T): Unit = base.writeBytes(buf, offset, toRaw(value))
+
+    override fun readVolatileNative(addr: Long): T = fromRaw(base.readVolatileNative(addr))
+
+    override fun writeVolatileNative(addr: Long, value: T): Unit = base.writeVolatileNative(addr, toRaw(value))
+
+    override fun toBitsU64(value: T): ULong = base.toBitsU64(toRaw(value))
+
+    override fun fromBitsU64(bits: ULong): T = fromRaw(base.fromBitsU64(bits))
+}
+
+private open class PointerWidthLayout<P>(
+    pointerWidthBits: Long,
+    private val fromAddr: (Long) -> P,
+    private val toAddr: (P) -> Long,
+) : TypeLayout<P> {
+    private val bytes: Long = pointerWidthBits / 8L
+    override val sizeBytes: Long = bytes
+    override val alignBytes: Long = bytes
+
+    override fun readNative(addr: Long): P =
+        fromAddr(if (bytes == 8L) kmLoadU64(addr).toLong() else kmLoadU32(addr).toLong())
+
+    override fun writeNative(addr: Long, value: P) {
+        val raw = toAddr(value)
+        if (bytes == 8L) kmStoreU64(addr, raw.toULong()) else kmStoreU32(addr, raw.toUInt())
+    }
+
+    override fun readBytes(buf: ByteArray, offset: Int): P =
+        fromAddr(if (bytes == 8L) kmBytesLoadU64Le(buf, offset).toLong() else kmBytesLoadU32Le(buf, offset).toLong())
+
+    override fun writeBytes(buf: ByteArray, offset: Int, value: P) {
+        val raw = toAddr(value)
+        if (bytes == 8L) kmBytesStoreU64Le(buf, offset, raw.toULong()) else kmBytesStoreU32Le(buf, offset, raw.toUInt())
+    }
+
+    override fun toBitsU64(value: P): ULong = toAddr(value).toULong()
+
+    override fun fromBitsU64(bits: ULong): P = fromAddr(bits.toLong())
+}
+
 public object PrimitiveLayouts {
     public val UNIT: TypeLayout<Unit> =
         object : TypeLayout<Unit> {
@@ -321,51 +379,12 @@ public object PrimitiveLayouts {
             override fun fromBitsU64(bits: ULong) {}
         }
 
-    public val BOOL: TypeLayout<Boolean> =
-        object : TypeLayout<Boolean> {
-            override val sizeBytes: Long = 1L
-            override val alignBytes: Long = 1L
-            override fun readNative(addr: Long): Boolean = kmLoadU8(addr) != 0u.toUByte()
-            override fun writeNative(addr: Long, value: Boolean) {
-                kmStoreU8(addr, if (value) 1u else 0u)
-            }
-            override fun readBytes(buf: ByteArray, offset: Int): Boolean = buf[offset] != 0.toByte()
-            override fun writeBytes(buf: ByteArray, offset: Int, value: Boolean) {
-                buf[offset] = if (value) 1 else 0
-            }
-            override fun readVolatileNative(addr: Long): Boolean = kmVolatileLoadU8(addr) != 0u.toUByte()
-            override fun writeVolatileNative(addr: Long, value: Boolean): Unit = kmVolatileStoreU8(addr, if (value) 1u else 0u)
-            override fun toBitsU64(value: Boolean): ULong = if (value) 1uL else 0uL
-            override fun fromBitsU64(bits: ULong): Boolean = (bits and 0xFFuL) != 0uL
-        }
-
-    public val I8: TypeLayout<Byte> =
-        object : TypeLayout<Byte> {
-            override val sizeBytes: Long = 1L
-            override val alignBytes: Long = 1L
-            override val isSigned: Boolean = true
-            override fun readNative(addr: Long): Byte = kmLoadU8(addr).toByte()
-            override fun writeNative(addr: Long, value: Byte) {
-                kmStoreU8(addr, value.toUByte())
-            }
-            override fun readBytes(buf: ByteArray, offset: Int): Byte = buf[offset]
-            override fun writeBytes(buf: ByteArray, offset: Int, value: Byte) {
-                buf[offset] = value
-            }
-            override fun readVolatileNative(addr: Long): Byte = kmVolatileLoadU8(addr).toByte()
-            override fun writeVolatileNative(addr: Long, value: Byte): Unit = kmVolatileStoreU8(addr, value.toUByte())
-            override fun toBitsU64(value: Byte): ULong = value.toUByte().toULong()
-            override fun fromBitsU64(bits: ULong): Byte = bits.toUByte().toByte()
-        }
-
     public val U8: TypeLayout<UByte> =
         object : TypeLayout<UByte> {
             override val sizeBytes: Long = 1L
             override val alignBytes: Long = 1L
             override fun readNative(addr: Long): UByte = kmLoadU8(addr)
-            override fun writeNative(addr: Long, value: UByte) {
-                kmStoreU8(addr, value)
-            }
+            override fun writeNative(addr: Long, value: UByte): Unit = kmStoreU8(addr, value)
             override fun readBytes(buf: ByteArray, offset: Int): UByte = buf[offset].toUByte()
             override fun writeBytes(buf: ByteArray, offset: Int, value: UByte) {
                 buf[offset] = value.toByte()
@@ -376,57 +395,18 @@ public object PrimitiveLayouts {
             override fun fromBitsU64(bits: ULong): UByte = bits.toUByte()
         }
 
-    public val I16: TypeLayout<Short> =
-        object : TypeLayout<Short> {
-            override val sizeBytes: Long = 2L
-            override val alignBytes: Long = 2L
-            override val isSigned: Boolean = true
-            override fun readNative(addr: Long): Short = kmLoadU16(addr).toShort()
-            override fun writeNative(addr: Long, value: Short) {
-                kmStoreU16(addr, value.toUShort())
-            }
-            override fun readBytes(buf: ByteArray, offset: Int): Short = kmBytesLoadU16Le(buf, offset).toShort()
-            override fun writeBytes(buf: ByteArray, offset: Int, value: Short): Unit =
-                kmBytesStoreU16Le(buf, offset, value.toUShort())
-            override fun readVolatileNative(addr: Long): Short = kmVolatileLoadU16(addr).toShort()
-            override fun writeVolatileNative(addr: Long, value: Short): Unit = kmVolatileStoreU16(addr, value.toUShort())
-            override fun toBitsU64(value: Short): ULong = value.toUShort().toULong()
-            override fun fromBitsU64(bits: ULong): Short = bits.toUShort().toShort()
-        }
-
     public val U16: TypeLayout<UShort> =
         object : TypeLayout<UShort> {
             override val sizeBytes: Long = 2L
             override val alignBytes: Long = 2L
             override fun readNative(addr: Long): UShort = kmLoadU16(addr)
-            override fun writeNative(addr: Long, value: UShort) {
-                kmStoreU16(addr, value)
-            }
+            override fun writeNative(addr: Long, value: UShort): Unit = kmStoreU16(addr, value)
             override fun readBytes(buf: ByteArray, offset: Int): UShort = kmBytesLoadU16Le(buf, offset)
-            override fun writeBytes(buf: ByteArray, offset: Int, value: UShort): Unit =
-                kmBytesStoreU16Le(buf, offset, value)
+            override fun writeBytes(buf: ByteArray, offset: Int, value: UShort): Unit = kmBytesStoreU16Le(buf, offset, value)
             override fun readVolatileNative(addr: Long): UShort = kmVolatileLoadU16(addr)
             override fun writeVolatileNative(addr: Long, value: UShort): Unit = kmVolatileStoreU16(addr, value)
             override fun toBitsU64(value: UShort): ULong = value.toULong()
             override fun fromBitsU64(bits: ULong): UShort = bits.toUShort()
-        }
-
-    public val I32: TypeLayout<Int> =
-        object : TypeLayout<Int> {
-            override val sizeBytes: Long = 4L
-            override val alignBytes: Long = 4L
-            override val isSigned: Boolean = true
-            override fun readNative(addr: Long): Int = kmLoadU32(addr).toInt()
-            override fun writeNative(addr: Long, value: Int) {
-                kmStoreU32(addr, value.toUInt())
-            }
-            override fun readBytes(buf: ByteArray, offset: Int): Int = kmBytesLoadU32Le(buf, offset).toInt()
-            override fun writeBytes(buf: ByteArray, offset: Int, value: Int): Unit =
-                kmBytesStoreU32Le(buf, offset, value.toUInt())
-            override fun readVolatileNative(addr: Long): Int = kmVolatileLoadU32(addr).toInt()
-            override fun writeVolatileNative(addr: Long, value: Int): Unit = kmVolatileStoreU32(addr, value.toUInt())
-            override fun toBitsU64(value: Int): ULong = value.toUInt().toULong()
-            override fun fromBitsU64(bits: ULong): Int = bits.toUInt().toInt()
         }
 
     public val U32: TypeLayout<UInt> =
@@ -434,69 +414,13 @@ public object PrimitiveLayouts {
             override val sizeBytes: Long = 4L
             override val alignBytes: Long = 4L
             override fun readNative(addr: Long): UInt = kmLoadU32(addr)
-            override fun writeNative(addr: Long, value: UInt) {
-                kmStoreU32(addr, value)
-            }
+            override fun writeNative(addr: Long, value: UInt): Unit = kmStoreU32(addr, value)
             override fun readBytes(buf: ByteArray, offset: Int): UInt = kmBytesLoadU32Le(buf, offset)
-            override fun writeBytes(buf: ByteArray, offset: Int, value: UInt): Unit =
-                kmBytesStoreU32Le(buf, offset, value)
+            override fun writeBytes(buf: ByteArray, offset: Int, value: UInt): Unit = kmBytesStoreU32Le(buf, offset, value)
             override fun readVolatileNative(addr: Long): UInt = kmVolatileLoadU32(addr)
             override fun writeVolatileNative(addr: Long, value: UInt): Unit = kmVolatileStoreU32(addr, value)
             override fun toBitsU64(value: UInt): ULong = value.toULong()
             override fun fromBitsU64(bits: ULong): UInt = bits.toUInt()
-        }
-
-    public val CHAR: TypeLayout<Char> =
-        object : TypeLayout<Char> {
-            override val sizeBytes: Long = 4L
-            override val alignBytes: Long = 4L
-            override fun readNative(addr: Long): Char = kmLoadU32(addr).toInt().toChar()
-            override fun writeNative(addr: Long, value: Char) {
-                kmStoreU32(addr, value.code.toUInt())
-            }
-            override fun readBytes(buf: ByteArray, offset: Int): Char = kmBytesLoadU32Le(buf, offset).toInt().toChar()
-            override fun writeBytes(buf: ByteArray, offset: Int, value: Char): Unit =
-                kmBytesStoreU32Le(buf, offset, value.code.toUInt())
-            override fun readVolatileNative(addr: Long): Char = kmVolatileLoadU32(addr).toInt().toChar()
-            override fun writeVolatileNative(addr: Long, value: Char): Unit = kmVolatileStoreU32(addr, value.code.toUInt())
-            override fun toBitsU64(value: Char): ULong = value.code.toUInt().toULong()
-            override fun fromBitsU64(bits: ULong): Char = bits.toUInt().toInt().toChar()
-        }
-
-    public val F32: TypeLayout<Float> =
-        object : TypeLayout<Float> {
-            override val sizeBytes: Long = 4L
-            override val alignBytes: Long = 4L
-            override val isSigned: Boolean = true
-            override fun readNative(addr: Long): Float = kmLoadF32(addr)
-            override fun writeNative(addr: Long, value: Float) {
-                kmStoreF32(addr, value)
-            }
-            override fun readBytes(buf: ByteArray, offset: Int): Float = Float.fromBits(kmBytesLoadU32Le(buf, offset).toInt())
-            override fun writeBytes(buf: ByteArray, offset: Int, value: Float): Unit =
-                kmBytesStoreU32Le(buf, offset, value.toRawBits().toUInt())
-            override fun readVolatileNative(addr: Long): Float = Float.fromBits(kmVolatileLoadU32(addr).toInt())
-            override fun writeVolatileNative(addr: Long, value: Float): Unit = kmVolatileStoreU32(addr, value.toRawBits().toUInt())
-            override fun toBitsU64(value: Float): ULong = value.toRawBits().toUInt().toULong()
-            override fun fromBitsU64(bits: ULong): Float = Float.fromBits(bits.toUInt().toInt())
-        }
-
-    public val I64: TypeLayout<Long> =
-        object : TypeLayout<Long> {
-            override val sizeBytes: Long = 8L
-            override val alignBytes: Long = 8L
-            override val isSigned: Boolean = true
-            override fun readNative(addr: Long): Long = kmLoadU64(addr).toLong()
-            override fun writeNative(addr: Long, value: Long) {
-                kmStoreU64(addr, value.toULong())
-            }
-            override fun readBytes(buf: ByteArray, offset: Int): Long = kmBytesLoadU64Le(buf, offset).toLong()
-            override fun writeBytes(buf: ByteArray, offset: Int, value: Long): Unit =
-                kmBytesStoreU64Le(buf, offset, value.toULong())
-            override fun readVolatileNative(addr: Long): Long = kmVolatileLoadU64(addr).toLong()
-            override fun writeVolatileNative(addr: Long, value: Long): Unit = kmVolatileStoreU64(addr, value.toULong())
-            override fun toBitsU64(value: Long): ULong = value.toULong()
-            override fun fromBitsU64(bits: ULong): Long = bits.toLong()
         }
 
     public val U64: TypeLayout<ULong> =
@@ -504,206 +428,53 @@ public object PrimitiveLayouts {
             override val sizeBytes: Long = 8L
             override val alignBytes: Long = 8L
             override fun readNative(addr: Long): ULong = kmLoadU64(addr)
-            override fun writeNative(addr: Long, value: ULong) {
-                kmStoreU64(addr, value)
-            }
+            override fun writeNative(addr: Long, value: ULong): Unit = kmStoreU64(addr, value)
             override fun readBytes(buf: ByteArray, offset: Int): ULong = kmBytesLoadU64Le(buf, offset)
-            override fun writeBytes(buf: ByteArray, offset: Int, value: ULong): Unit =
-                kmBytesStoreU64Le(buf, offset, value)
+            override fun writeBytes(buf: ByteArray, offset: Int, value: ULong): Unit = kmBytesStoreU64Le(buf, offset, value)
             override fun readVolatileNative(addr: Long): ULong = kmVolatileLoadU64(addr)
             override fun writeVolatileNative(addr: Long, value: ULong): Unit = kmVolatileStoreU64(addr, value)
             override fun toBitsU64(value: ULong): ULong = value
             override fun fromBitsU64(bits: ULong): ULong = bits
         }
 
+    public val BOOL: TypeLayout<Boolean> = MappedTypeLayout(U8, fromRaw = { it != 0u.toUByte() }, toRaw = { if (it) 1u else 0u })
+    public val I8: TypeLayout<Byte> = MappedTypeLayout(U8, isSigned = true, fromRaw = { it.toByte() }, toRaw = { it.toUByte() })
+    public val I16: TypeLayout<Short> = MappedTypeLayout(U16, isSigned = true, fromRaw = { it.toShort() }, toRaw = { it.toUShort() })
+    public val I32: TypeLayout<Int> = MappedTypeLayout(U32, isSigned = true, fromRaw = { it.toInt() }, toRaw = { it.toUInt() })
+    public val CHAR: TypeLayout<Char> = MappedTypeLayout(U32, fromRaw = { it.toInt().toChar() }, toRaw = { it.code.toUInt() })
+    public val F32: TypeLayout<Float> =
+        object : MappedTypeLayout<UInt, Float>(U32, isSigned = true, fromRaw = { Float.fromBits(it.toInt()) }, toRaw = { it.toRawBits().toUInt() }) {
+            override fun readNative(addr: Long): Float = kmLoadF32(addr)
+            override fun writeNative(addr: Long, value: Float): Unit = kmStoreF32(addr, value)
+        }
+    public val I64: TypeLayout<Long> = MappedTypeLayout(U64, isSigned = true, fromRaw = { it.toLong() }, toRaw = { it.toULong() })
     public val F64: TypeLayout<Double> =
-        object : TypeLayout<Double> {
-            override val sizeBytes: Long = 8L
-            override val alignBytes: Long = 8L
-            override val isSigned: Boolean = true
+        object : MappedTypeLayout<ULong, Double>(U64, isSigned = true, fromRaw = { Double.fromBits(it.toLong()) }, toRaw = { it.toRawBits().toULong() }) {
             override fun readNative(addr: Long): Double = kmLoadF64(addr)
-            override fun writeNative(addr: Long, value: Double) {
-                kmStoreF64(addr, value)
-            }
-            override fun readBytes(buf: ByteArray, offset: Int): Double = Double.fromBits(kmBytesLoadU64Le(buf, offset).toLong())
-            override fun writeBytes(buf: ByteArray, offset: Int, value: Double): Unit =
-                kmBytesStoreU64Le(buf, offset, value.toRawBits().toULong())
-            override fun readVolatileNative(addr: Long): Double = Double.fromBits(kmVolatileLoadU64(addr).toLong())
-            override fun writeVolatileNative(addr: Long, value: Double): Unit = kmVolatileStoreU64(addr, value.toRawBits().toULong())
-            override fun toBitsU64(value: Double): ULong = value.toRawBits().toULong()
-            override fun fromBitsU64(bits: ULong): Double = Double.fromBits(bits.toLong())
+            override fun writeNative(addr: Long, value: Double): Unit = kmStoreF64(addr, value)
         }
-
-    public val F16_LAYOUT: TypeLayout<F16> =
-        object : TypeLayout<F16> {
-            override val sizeBytes: Long = 2L
-            override val alignBytes: Long = 2L
-            override val isSigned: Boolean = true
-            override fun readNative(addr: Long): F16 = F16.fromBits(kmLoadU16(addr))
-            override fun writeNative(addr: Long, value: F16) {
-                kmStoreU16(addr, value.toBits())
-            }
-            override fun readBytes(buf: ByteArray, offset: Int): F16 = F16.fromBits(kmBytesLoadU16Le(buf, offset))
-            override fun writeBytes(buf: ByteArray, offset: Int, value: F16): Unit =
-                kmBytesStoreU16Le(buf, offset, value.toBits())
-            override fun readVolatileNative(addr: Long): F16 = F16.fromBits(kmVolatileLoadU16(addr))
-            override fun writeVolatileNative(addr: Long, value: F16): Unit = kmVolatileStoreU16(addr, value.toBits())
-            override fun toBitsU64(value: F16): ULong = value.toBits().toULong()
-            override fun fromBitsU64(bits: ULong): F16 = F16.fromBits(bits.toUShort())
-        }
-
+    public val F16_LAYOUT: TypeLayout<F16> = MappedTypeLayout(U16, isSigned = true, fromRaw = { F16.fromBits(it) }, toRaw = { it.toBits() })
     public val F128_LAYOUT: TypeLayout<F128> = u128Layout(::F128, { it.high }, { it.low }, isSigned = true)
-
-    public val ISIZE64: TypeLayout<Int> =
-        object : TypeLayout<Int> {
-            override val sizeBytes: Long = 8L
-            override val alignBytes: Long = 8L
-            override val isSigned: Boolean = true
-            override fun readNative(addr: Long): Int = kmLoadU64(addr).toLong().toInt()
-            override fun writeNative(addr: Long, value: Int) {
-                kmStoreU64(addr, value.toLong().toULong())
-            }
-            override fun readBytes(buf: ByteArray, offset: Int): Int = kmBytesLoadU64Le(buf, offset).toLong().toInt()
-            override fun writeBytes(buf: ByteArray, offset: Int, value: Int): Unit =
-                kmBytesStoreU64Le(buf, offset, value.toLong().toULong())
-            override fun readVolatileNative(addr: Long): Int = kmVolatileLoadU64(addr).toLong().toInt()
-            override fun writeVolatileNative(addr: Long, value: Int): Unit = kmVolatileStoreU64(addr, value.toLong().toULong())
-            override fun toBitsU64(value: Int): ULong = value.toLong().toULong()
-            override fun fromBitsU64(bits: ULong): Int = bits.toLong().toInt()
-        }
-
-    public val USIZE64: TypeLayout<Int> =
-        object : TypeLayout<Int> {
-            override val sizeBytes: Long = 8L
-            override val alignBytes: Long = 8L
-            override fun readNative(addr: Long): Int = kmLoadU64(addr).toInt()
-            override fun writeNative(addr: Long, value: Int) {
-                kmStoreU64(addr, value.toUInt().toULong())
-            }
-            override fun readBytes(buf: ByteArray, offset: Int): Int = kmBytesLoadU64Le(buf, offset).toInt()
-            override fun writeBytes(buf: ByteArray, offset: Int, value: Int): Unit =
-                kmBytesStoreU64Le(buf, offset, value.toUInt().toULong())
-            override fun readVolatileNative(addr: Long): Int = kmVolatileLoadU64(addr).toInt()
-            override fun writeVolatileNative(addr: Long, value: Int): Unit = kmVolatileStoreU64(addr, value.toUInt().toULong())
-            override fun toBitsU64(value: Int): ULong = value.toUInt().toULong()
-            override fun fromBitsU64(bits: ULong): Int = bits.toInt()
-        }
-
+    public val ISIZE64: TypeLayout<Int> = MappedTypeLayout(U64, isSigned = true, fromRaw = { it.toLong().toInt() }, toRaw = { it.toLong().toULong() })
+    public val USIZE64: TypeLayout<Int> = MappedTypeLayout(U64, fromRaw = { it.toInt() }, toRaw = { it.toUInt().toULong() })
     public val ISIZE32: TypeLayout<Int> = I32
-    public val USIZE32: TypeLayout<Int> =
-        object : TypeLayout<Int> {
-            override val sizeBytes: Long = 4L
-            override val alignBytes: Long = 4L
-            override val isSigned: Boolean = false
-            override fun readNative(addr: Long): Int = I32.readNative(addr)
-            override fun writeNative(addr: Long, value: Int): Unit = I32.writeNative(addr, value)
-            override fun readBytes(buf: ByteArray, offset: Int): Int = I32.readBytes(buf, offset)
-            override fun writeBytes(buf: ByteArray, offset: Int, value: Int): Unit = I32.writeBytes(buf, offset, value)
-            override fun readVolatileNative(addr: Long): Int = I32.readVolatileNative(addr)
-            override fun writeVolatileNative(addr: Long, value: Int): Unit = I32.writeVolatileNative(addr, value)
-            override fun toBitsU64(value: Int): ULong = I32.toBitsU64(value)
-            override fun fromBitsU64(bits: ULong): Int = I32.fromBitsU64(bits)
-        }
+    public val USIZE32: TypeLayout<Int> = MappedTypeLayout(U32, fromRaw = { it.toInt() }, toRaw = { it.toUInt() })
 
-    public fun constPtrLayout(pointerWidthBits: Long = 64L): TypeLayout<ConstPtr> {
-        val bytes = pointerWidthBits / 8L
-        return object : TypeLayout<ConstPtr> {
-            override val sizeBytes: Long = bytes
-            override val alignBytes: Long = bytes
-            override fun readNative(addr: Long): ConstPtr {
-                val raw = if (bytes == 8L) kmLoadU64(addr).toLong() else kmLoadU32(addr).toLong()
-                return ConstPtr(raw)
-            }
-            override fun writeNative(addr: Long, value: ConstPtr) {
-                if (bytes == 8L) {
-                    kmStoreU64(addr, value.rawAddress.toULong())
-                } else {
-                    kmStoreU32(addr, value.rawAddress.toUInt())
-                }
-            }
-            override fun readBytes(buf: ByteArray, offset: Int): ConstPtr {
-                val raw = if (bytes == 8L) kmBytesLoadU64Le(buf, offset).toLong() else kmBytesLoadU32Le(buf, offset).toLong()
-                return ConstPtr(raw)
-            }
-            override fun writeBytes(buf: ByteArray, offset: Int, value: ConstPtr) {
-                if (bytes == 8L) {
-                    kmBytesStoreU64Le(buf, offset, value.rawAddress.toULong())
-                } else {
-                    kmBytesStoreU32Le(buf, offset, value.rawAddress.toUInt())
-                }
-            }
-            override fun toBitsU64(value: ConstPtr): ULong = value.rawAddress.toULong()
-            override fun fromBitsU64(bits: ULong): ConstPtr = ConstPtr(bits.toLong())
-        }
-    }
+    public fun constPtrLayout(pointerWidthBits: Long = 64L): TypeLayout<ConstPtr> =
+        PointerWidthLayout(pointerWidthBits, ::ConstPtr) { it.rawAddress }
 
-    public fun mutPtrLayout(pointerWidthBits: Long = 64L): TypeLayout<MutPtr> {
-        val bytes = pointerWidthBits / 8L
-        return object : TypeLayout<MutPtr> {
-            override val sizeBytes: Long = bytes
-            override val alignBytes: Long = bytes
-            override fun readNative(addr: Long): MutPtr {
-                val raw = if (bytes == 8L) kmLoadU64(addr).toLong() else kmLoadU32(addr).toLong()
-                return MutPtr(raw)
-            }
-            override fun writeNative(addr: Long, value: MutPtr) {
-                if (bytes == 8L) {
-                    kmStoreU64(addr, value.rawAddress.toULong())
-                } else {
-                    kmStoreU32(addr, value.rawAddress.toUInt())
-                }
-            }
-            override fun readBytes(buf: ByteArray, offset: Int): MutPtr {
-                val raw = if (bytes == 8L) kmBytesLoadU64Le(buf, offset).toLong() else kmBytesLoadU32Le(buf, offset).toLong()
-                return MutPtr(raw)
-            }
-            override fun writeBytes(buf: ByteArray, offset: Int, value: MutPtr) {
-                if (bytes == 8L) {
-                    kmBytesStoreU64Le(buf, offset, value.rawAddress.toULong())
-                } else {
-                    kmBytesStoreU32Le(buf, offset, value.rawAddress.toUInt())
-                }
-            }
-            override fun toBitsU64(value: MutPtr): ULong = value.rawAddress.toULong()
-            override fun fromBitsU64(bits: ULong): MutPtr = MutPtr(bits.toLong())
-        }
-    }
+    public fun mutPtrLayout(pointerWidthBits: Long = 64L): TypeLayout<MutPtr> =
+        PointerWidthLayout(pointerWidthBits, ::MutPtr) { it.rawAddress }
 
     public fun <T> mutableReferenceLayout(
         innerLayout: TypeLayout<T>,
         pointerWidthBits: Long = 64L,
-    ): TypeLayout<RustMutableReference<T>> {
-        val bytes = pointerWidthBits / 8L
-        return object : TypeLayout<RustMutableReference<T>> {
-            override val sizeBytes: Long = bytes
-            override val alignBytes: Long = bytes
-            override fun readNative(addr: Long): RustMutableReference<T> {
-                val raw = if (bytes == 8L) kmLoadU64(addr).toLong() else kmLoadU32(addr).toLong()
-                return RustMutableReference(MutPtr(raw), innerLayout)
-            }
-            override fun writeNative(addr: Long, value: RustMutableReference<T>) {
-                if (bytes == 8L) {
-                    kmStoreU64(addr, value.pointer.rawAddress.toULong())
-                } else {
-                    kmStoreU32(addr, value.pointer.rawAddress.toUInt())
-                }
-            }
-            override fun readBytes(buf: ByteArray, offset: Int): RustMutableReference<T> {
-                val raw = if (bytes == 8L) kmBytesLoadU64Le(buf, offset).toLong() else kmBytesLoadU32Le(buf, offset).toLong()
-                return RustMutableReference(MutPtr(raw), innerLayout)
-            }
-            override fun writeBytes(buf: ByteArray, offset: Int, value: RustMutableReference<T>) {
-                if (bytes == 8L) {
-                    kmBytesStoreU64Le(buf, offset, value.pointer.rawAddress.toULong())
-                } else {
-                    kmBytesStoreU32Le(buf, offset, value.pointer.rawAddress.toUInt())
-                }
-            }
-            override fun toBitsU64(value: RustMutableReference<T>): ULong = value.pointer.rawAddress.toULong()
-            override fun fromBitsU64(bits: ULong): RustMutableReference<T> =
-                RustMutableReference(MutPtr(bits.toLong()), innerLayout)
-        }
-    }
+    ): TypeLayout<RustMutableReference<T>> =
+        PointerWidthLayout(
+            pointerWidthBits = pointerWidthBits,
+            fromAddr = { RustMutableReference(MutPtr(it), innerLayout) },
+            toAddr = { it.pointer.rawAddress },
+        )
 
     public fun <T> u128Layout(
         construct: (ULong, ULong) -> T,
@@ -1216,51 +987,48 @@ public object PrimitiveArrayLayouts {
         return out
     }
 
-    public fun booleanArray(length: Int): TypeLayout<BooleanArray> =
-        object : TypeLayout<BooleanArray> {
-            override val sizeBytes: Long = length.toLong()
-            override val alignBytes: Long = 1L
+    private open class IndexedArrayLayout<A, E>(
+        protected val length: Int,
+        private val elemLayout: TypeLayout<E>,
+        private val allocArray: (Int, (Int) -> E) -> A,
+        private val sizeOf: (A) -> Int,
+        private val elemAt: (A, Int) -> E,
+    ) : TypeLayout<A> {
+        private val step: Int = elemLayout.sizeBytes.toInt()
+        private val stepLong: Long = elemLayout.sizeBytes
+        override val sizeBytes: Long = length.toLong() * stepLong
+        override val alignBytes: Long = elemLayout.alignBytes
 
-            override fun readNative(addr: Long): BooleanArray =
-                BooleanArray(length) { i -> kmLoadU8(addr + i.toLong()) != 0u.toUByte() }
+        override fun readNative(addr: Long): A =
+            allocArray(length) { i -> elemLayout.readNative(addr + i.toLong() * stepLong) }
 
-            override fun writeNative(addr: Long, value: BooleanArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmStoreU8(addr + i.toLong(), if (value[i]) 1u else 0u)
-                }
+        override fun writeNative(addr: Long, value: A) {
+            val n = minOf(length, sizeOf(value))
+            for (i in 0 until n) {
+                elemLayout.writeNative(addr + i.toLong() * stepLong, elemAt(value, i))
             }
-
-            override fun readBytes(buf: ByteArray, offset: Int): BooleanArray =
-                BooleanArray(length) { i -> buf[offset + i] != 0.toByte() }
-
-            override fun writeBytes(buf: ByteArray, offset: Int, value: BooleanArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    buf[offset + i] = if (value[i]) 1 else 0
-                }
-            }
-
-            override fun toBitsU64(value: BooleanArray): ULong = arrayToBitsU64(this, value)
-
-            override fun fromBitsU64(bits: ULong): BooleanArray = arrayFromBitsU64(this, bits)
         }
 
-    public fun byteArray(length: Int): TypeLayout<ByteArray> =
-        object : TypeLayout<ByteArray> {
-            override val sizeBytes: Long = length.toLong()
-            override val alignBytes: Long = 1L
+        override fun readBytes(buf: ByteArray, offset: Int): A =
+            allocArray(length) { i -> elemLayout.readBytes(buf, offset + i * step) }
 
-            override fun readNative(addr: Long): ByteArray =
-                ByteArray(length) { i -> kmLoadU8(addr + i.toLong()).toByte() }
-
-            override fun writeNative(addr: Long, value: ByteArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmStoreU8(addr + i.toLong(), value[i].toUByte())
-                }
+        override fun writeBytes(buf: ByteArray, offset: Int, value: A) {
+            val n = minOf(length, sizeOf(value))
+            for (i in 0 until n) {
+                elemLayout.writeBytes(buf, offset + i * step, elemAt(value, i))
             }
+        }
 
+        override fun toBitsU64(value: A): ULong = arrayToBitsU64(this, value)
+
+        override fun fromBitsU64(bits: ULong): A = arrayFromBitsU64(this, bits)
+    }
+
+    public fun booleanArray(length: Int): TypeLayout<BooleanArray> =
+        IndexedArrayLayout(length, PrimitiveLayouts.BOOL, ::BooleanArray, { it.size }, { a, i -> a[i] })
+
+    public fun byteArray(length: Int): TypeLayout<ByteArray> =
+        object : IndexedArrayLayout<ByteArray, Byte>(length, PrimitiveLayouts.I8, ::ByteArray, { it.size }, { a, i -> a[i] }) {
             override fun readBytes(buf: ByteArray, offset: Int): ByteArray {
                 val out = ByteArray(length)
                 val n = minOf(length, maxOf(0, buf.size - offset))
@@ -1276,351 +1044,50 @@ public object PrimitiveArrayLayouts {
                     value.copyInto(buf, destinationOffset = offset, startIndex = 0, endIndex = n)
                 }
             }
-
-            override fun toBitsU64(value: ByteArray): ULong = arrayToBitsU64(this, value)
-
-            override fun fromBitsU64(bits: ULong): ByteArray = arrayFromBitsU64(this, bits)
         }
 
     @OptIn(ExperimentalUnsignedTypes::class)
     public fun uByteArray(length: Int): TypeLayout<UByteArray> =
-        object : TypeLayout<UByteArray> {
-            override val sizeBytes: Long = length.toLong()
-            override val alignBytes: Long = 1L
-
-            override fun readNative(addr: Long): UByteArray =
-                UByteArray(length) { i -> kmLoadU8(addr + i.toLong()) }
-
-            override fun writeNative(addr: Long, value: UByteArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmStoreU8(addr + i.toLong(), value[i])
-                }
-            }
-
-            override fun readBytes(buf: ByteArray, offset: Int): UByteArray {
-                val out = ByteArray(length)
-                val n = minOf(length, maxOf(0, buf.size - offset))
-                if (n > 0) {
-                    buf.copyInto(out, destinationOffset = 0, startIndex = offset, endIndex = offset + n)
-                }
-                return out.asUByteArray()
-            }
+        object : IndexedArrayLayout<UByteArray, UByte>(length, PrimitiveLayouts.U8, ::UByteArray, { it.size }, { a, i -> a[i] }) {
+            override fun readBytes(buf: ByteArray, offset: Int): UByteArray = byteArray(length).readBytes(buf, offset).asUByteArray()
 
             override fun writeBytes(buf: ByteArray, offset: Int, value: UByteArray) {
-                val n = minOf(length, value.size)
-                if (n > 0) {
-                    value.asByteArray().copyInto(buf, destinationOffset = offset, startIndex = 0, endIndex = n)
-                }
+                byteArray(length).writeBytes(buf, offset, value.asByteArray())
             }
-
-            override fun toBitsU64(value: UByteArray): ULong = arrayToBitsU64(this, value)
-
-            override fun fromBitsU64(bits: ULong): UByteArray = arrayFromBitsU64(this, bits)
         }
 
     public fun shortArray(length: Int): TypeLayout<ShortArray> =
-        object : TypeLayout<ShortArray> {
-            override val sizeBytes: Long = length.toLong() * 2L
-            override val alignBytes: Long = 2L
-
-            override fun readNative(addr: Long): ShortArray =
-                ShortArray(length) { i -> kmLoadU16(addr + i.toLong() * 2L).toShort() }
-
-            override fun writeNative(addr: Long, value: ShortArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmStoreU16(addr + i.toLong() * 2L, value[i].toUShort())
-                }
-            }
-
-            override fun readBytes(buf: ByteArray, offset: Int): ShortArray =
-                ShortArray(length) { i -> kmBytesLoadU16Le(buf, offset + i * 2).toShort() }
-
-            override fun writeBytes(buf: ByteArray, offset: Int, value: ShortArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmBytesStoreU16Le(buf, offset + i * 2, value[i].toUShort())
-                }
-            }
-
-            override fun toBitsU64(value: ShortArray): ULong = arrayToBitsU64(this, value)
-
-            override fun fromBitsU64(bits: ULong): ShortArray = arrayFromBitsU64(this, bits)
-        }
+        IndexedArrayLayout(length, PrimitiveLayouts.I16, ::ShortArray, { it.size }, { a, i -> a[i] })
 
     @OptIn(ExperimentalUnsignedTypes::class)
     public fun uShortArray(length: Int): TypeLayout<UShortArray> =
-        object : TypeLayout<UShortArray> {
-            override val sizeBytes: Long = length.toLong() * 2L
-            override val alignBytes: Long = 2L
-
-            override fun readNative(addr: Long): UShortArray =
-                UShortArray(length) { i -> kmLoadU16(addr + i.toLong() * 2L) }
-
-            override fun writeNative(addr: Long, value: UShortArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmStoreU16(addr + i.toLong() * 2L, value[i])
-                }
-            }
-
-            override fun readBytes(buf: ByteArray, offset: Int): UShortArray =
-                UShortArray(length) { i -> kmBytesLoadU16Le(buf, offset + i * 2) }
-
-            override fun writeBytes(buf: ByteArray, offset: Int, value: UShortArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmBytesStoreU16Le(buf, offset + i * 2, value[i])
-                }
-            }
-
-            override fun toBitsU64(value: UShortArray): ULong = arrayToBitsU64(this, value)
-
-            override fun fromBitsU64(bits: ULong): UShortArray = arrayFromBitsU64(this, bits)
-        }
+        IndexedArrayLayout(length, PrimitiveLayouts.U16, ::UShortArray, { it.size }, { a, i -> a[i] })
 
     public fun intArray(length: Int): TypeLayout<IntArray> =
-        object : TypeLayout<IntArray> {
-            override val sizeBytes: Long = length.toLong() * 4L
-            override val alignBytes: Long = 4L
-
-            override fun readNative(addr: Long): IntArray =
-                IntArray(length) { i -> kmLoadU32(addr + i.toLong() * 4L).toInt() }
-
-            override fun writeNative(addr: Long, value: IntArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmStoreU32(addr + i.toLong() * 4L, value[i].toUInt())
-                }
-            }
-
-            override fun readBytes(buf: ByteArray, offset: Int): IntArray =
-                IntArray(length) { i -> kmBytesLoadU32Le(buf, offset + i * 4).toInt() }
-
-            override fun writeBytes(buf: ByteArray, offset: Int, value: IntArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmBytesStoreU32Le(buf, offset + i * 4, value[i].toUInt())
-                }
-            }
-
-            override fun toBitsU64(value: IntArray): ULong = arrayToBitsU64(this, value)
-
-            override fun fromBitsU64(bits: ULong): IntArray = arrayFromBitsU64(this, bits)
-        }
+        IndexedArrayLayout(length, PrimitiveLayouts.I32, ::IntArray, { it.size }, { a, i -> a[i] })
 
     @OptIn(ExperimentalUnsignedTypes::class)
     public fun uIntArray(length: Int): TypeLayout<UIntArray> =
-        object : TypeLayout<UIntArray> {
-            override val sizeBytes: Long = length.toLong() * 4L
-            override val alignBytes: Long = 4L
-
-            override fun readNative(addr: Long): UIntArray =
-                UIntArray(length) { i -> kmLoadU32(addr + i.toLong() * 4L) }
-
-            override fun writeNative(addr: Long, value: UIntArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmStoreU32(addr + i.toLong() * 4L, value[i])
-                }
-            }
-
-            override fun readBytes(buf: ByteArray, offset: Int): UIntArray =
-                UIntArray(length) { i -> kmBytesLoadU32Le(buf, offset + i * 4) }
-
-            override fun writeBytes(buf: ByteArray, offset: Int, value: UIntArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmBytesStoreU32Le(buf, offset + i * 4, value[i])
-                }
-            }
-
-            override fun toBitsU64(value: UIntArray): ULong = arrayToBitsU64(this, value)
-
-            override fun fromBitsU64(bits: ULong): UIntArray = arrayFromBitsU64(this, bits)
-        }
+        IndexedArrayLayout(length, PrimitiveLayouts.U32, ::UIntArray, { it.size }, { a, i -> a[i] })
 
     public fun longArray(length: Int): TypeLayout<LongArray> =
-        object : TypeLayout<LongArray> {
-            override val sizeBytes: Long = length.toLong() * 8L
-            override val alignBytes: Long = 8L
-
-            override fun readNative(addr: Long): LongArray =
-                LongArray(length) { i -> kmLoadU64(addr + i.toLong() * 8L).toLong() }
-
-            override fun writeNative(addr: Long, value: LongArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmStoreU64(addr + i.toLong() * 8L, value[i].toULong())
-                }
-            }
-
-            override fun readBytes(buf: ByteArray, offset: Int): LongArray =
-                LongArray(length) { i -> kmBytesLoadU64Le(buf, offset + i * 8).toLong() }
-
-            override fun writeBytes(buf: ByteArray, offset: Int, value: LongArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmBytesStoreU64Le(buf, offset + i * 8, value[i].toULong())
-                }
-            }
-
-            override fun toBitsU64(value: LongArray): ULong = arrayToBitsU64(this, value)
-
-            override fun fromBitsU64(bits: ULong): LongArray = arrayFromBitsU64(this, bits)
-        }
+        IndexedArrayLayout(length, PrimitiveLayouts.I64, ::LongArray, { it.size }, { a, i -> a[i] })
 
     @OptIn(ExperimentalUnsignedTypes::class)
     public fun uLongArray(length: Int): TypeLayout<ULongArray> =
-        object : TypeLayout<ULongArray> {
-            override val sizeBytes: Long = length.toLong() * 8L
-            override val alignBytes: Long = 8L
-
-            override fun readNative(addr: Long): ULongArray =
-                ULongArray(length) { i -> kmLoadU64(addr + i.toLong() * 8L) }
-
-            override fun writeNative(addr: Long, value: ULongArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmStoreU64(addr + i.toLong() * 8L, value[i])
-                }
-            }
-
-            override fun readBytes(buf: ByteArray, offset: Int): ULongArray =
-                ULongArray(length) { i -> kmBytesLoadU64Le(buf, offset + i * 8) }
-
-            override fun writeBytes(buf: ByteArray, offset: Int, value: ULongArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmBytesStoreU64Le(buf, offset + i * 8, value[i])
-                }
-            }
-
-            override fun toBitsU64(value: ULongArray): ULong = arrayToBitsU64(this, value)
-
-            override fun fromBitsU64(bits: ULong): ULongArray = arrayFromBitsU64(this, bits)
-        }
+        IndexedArrayLayout(length, PrimitiveLayouts.U64, ::ULongArray, { it.size }, { a, i -> a[i] })
 
     public fun floatArray(length: Int): TypeLayout<FloatArray> =
-        object : TypeLayout<FloatArray> {
-            override val sizeBytes: Long = length.toLong() * 4L
-            override val alignBytes: Long = 4L
-
-            override fun readNative(addr: Long): FloatArray =
-                FloatArray(length) { i -> kmLoadF32(addr + i.toLong() * 4L) }
-
-            override fun writeNative(addr: Long, value: FloatArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmStoreF32(addr + i.toLong() * 4L, value[i])
-                }
-            }
-
-            override fun readBytes(buf: ByteArray, offset: Int): FloatArray =
-                FloatArray(length) { i -> kmBytesLoadF32Le(buf, offset + i * 4) }
-
-            override fun writeBytes(buf: ByteArray, offset: Int, value: FloatArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmBytesStoreF32Le(buf, offset + i * 4, value[i])
-                }
-            }
-
-            override fun toBitsU64(value: FloatArray): ULong = arrayToBitsU64(this, value)
-
-            override fun fromBitsU64(bits: ULong): FloatArray = arrayFromBitsU64(this, bits)
-        }
+        IndexedArrayLayout(length, PrimitiveLayouts.F32, ::FloatArray, { it.size }, { a, i -> a[i] })
 
     public fun doubleArray(length: Int): TypeLayout<DoubleArray> =
-        object : TypeLayout<DoubleArray> {
-            override val sizeBytes: Long = length.toLong() * 8L
-            override val alignBytes: Long = 8L
-
-            override fun readNative(addr: Long): DoubleArray =
-                DoubleArray(length) { i -> kmLoadF64(addr + i.toLong() * 8L) }
-
-            override fun writeNative(addr: Long, value: DoubleArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmStoreF64(addr + i.toLong() * 8L, value[i])
-                }
-            }
-
-            override fun readBytes(buf: ByteArray, offset: Int): DoubleArray =
-                DoubleArray(length) { i -> kmBytesLoadF64Le(buf, offset + i * 8) }
-
-            override fun writeBytes(buf: ByteArray, offset: Int, value: DoubleArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmBytesStoreF64Le(buf, offset + i * 8, value[i])
-                }
-            }
-
-            override fun toBitsU64(value: DoubleArray): ULong = arrayToBitsU64(this, value)
-
-            override fun fromBitsU64(bits: ULong): DoubleArray = arrayFromBitsU64(this, bits)
-        }
+        IndexedArrayLayout(length, PrimitiveLayouts.F64, ::DoubleArray, { it.size }, { a, i -> a[i] })
 
     public fun usize64Array(length: Int): TypeLayout<IntArray> =
-        object : TypeLayout<IntArray> {
-            override val sizeBytes: Long = length.toLong() * 8L
-            override val alignBytes: Long = 8L
-
-            override fun readNative(addr: Long): IntArray =
-                IntArray(length) { i -> kmLoadU64(addr + i.toLong() * 8L).toInt() }
-
-            override fun writeNative(addr: Long, value: IntArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmStoreU64(addr + i.toLong() * 8L, value[i].toLong().toULong() and 0xFFFF_FFFFuL)
-                }
-            }
-
-            override fun readBytes(buf: ByteArray, offset: Int): IntArray =
-                IntArray(length) { i -> kmBytesLoadU64Le(buf, offset + i * 8).toInt() }
-
-            override fun writeBytes(buf: ByteArray, offset: Int, value: IntArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmBytesStoreU64Le(buf, offset + i * 8, value[i].toLong().toULong() and 0xFFFF_FFFFuL)
-                }
-            }
-
-            override fun toBitsU64(value: IntArray): ULong = arrayToBitsU64(this, value)
-
-            override fun fromBitsU64(bits: ULong): IntArray = arrayFromBitsU64(this, bits)
-        }
+        IndexedArrayLayout(length, PrimitiveLayouts.USIZE64, ::IntArray, { it.size }, { a, i -> a[i] })
 
     public fun isize64Array(length: Int): TypeLayout<IntArray> =
-        object : TypeLayout<IntArray> {
-            override val sizeBytes: Long = length.toLong() * 8L
-            override val alignBytes: Long = 8L
-
-            override fun readNative(addr: Long): IntArray =
-                IntArray(length) { i -> kmLoadU64(addr + i.toLong() * 8L).toInt() }
-
-            override fun writeNative(addr: Long, value: IntArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmStoreU64(addr + i.toLong() * 8L, value[i].toLong().toULong())
-                }
-            }
-
-            override fun readBytes(buf: ByteArray, offset: Int): IntArray =
-                IntArray(length) { i -> kmBytesLoadU64Le(buf, offset + i * 8).toInt() }
-
-            override fun writeBytes(buf: ByteArray, offset: Int, value: IntArray) {
-                val n = minOf(length, value.size)
-                for (i in 0 until n) {
-                    kmBytesStoreU64Le(buf, offset + i * 8, value[i].toLong().toULong())
-                }
-            }
-
-            override fun toBitsU64(value: IntArray): ULong = arrayToBitsU64(this, value)
-
-            override fun fromBitsU64(bits: ULong): IntArray = arrayFromBitsU64(this, bits)
-        }
+        IndexedArrayLayout(length, PrimitiveLayouts.ISIZE64, ::IntArray, { it.size }, { a, i -> a[i] })
 }
 
 private fun <T> allocNativeArrayFromList(
