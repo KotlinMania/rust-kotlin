@@ -2097,21 +2097,15 @@ internal fun extractIdentifierTokens(
     includeBuiltins: Boolean = false,
 ): Set<String> {
     val out = linkedSetOf<String>()
-    val sb = StringBuilder()
-    for (ch in expr) {
-        if (ch.isLetterOrDigit() || ch == '_') {
-            sb.append(ch)
-        } else if (sb.isNotEmpty()) {
-            val tok = sb.toString()
-            sb.clear()
-            if (!tok.first().isDigit() && (includeBuiltins || tok !in BUILTIN_KOTLIN_IDENTS)) {
-                out += tok
+    for (token in KotlinSourceTokenizer.tokenize(expr)) {
+        val tok =
+            when (token) {
+                is KotlinLexToken.Ident -> token.rawText
+                is KotlinLexToken.BacktickIdent -> token.ident
+                is KotlinLexToken.StringIdentTemplate -> token.ident
+                else -> continue
             }
-        }
-    }
-    if (sb.isNotEmpty()) {
-        val tok = sb.toString()
-        if (!tok.first().isDigit() && (includeBuiltins || tok !in BUILTIN_KOTLIN_IDENTS)) {
+        if (tok.isNotEmpty() && !tok.first().isDigit() && (includeBuiltins || tok !in BUILTIN_KOTLIN_IDENTS)) {
             out += tok
         }
     }
@@ -2192,7 +2186,7 @@ internal fun parseInlineCMacro(
         (list[cursor] as TokenTree.Group).value.delimiter() == Delimiter.Bracket
     ) {
         val bracketGroup = list[cursor] as TokenTree.Group
-        val parts = MacroRulesFileExpander.splitMacroArguments(bracketGroup.value.stream())
+        val parts = RustTokenCursor.splitMacroArguments(bracketGroup.value.stream())
         for (part in parts) {
             parseSingleCaptureArg(part)?.let { captureArgs += it }
         }

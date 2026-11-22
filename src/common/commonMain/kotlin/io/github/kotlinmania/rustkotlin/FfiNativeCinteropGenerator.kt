@@ -427,26 +427,29 @@ internal fun renderInlineWrapperCFunction(fn: InlineCFunctionSpec): String {
 internal fun FfiInteropCollector.buildNativeActualsKotlinContent(
     pkgName: String?,
     cinteropPkg: String,
-): String {
-    val sb = StringBuilder()
-    sb.append("@file:OptIn(ExperimentalForeignApi::class, ExperimentalUnsignedTypes::class)\n\n")
-    if (!pkgName.isNullOrBlank()) {
-        sb.append("package ").append(pkgName).append("\n\n")
-    }
-    val imports = linkedSetOf("kotlinx.cinterop.ExperimentalForeignApi")
+): String = NativeActualsEmitter(this, pkgName, cinteropPkg).emit()
 
-    val actualBlocks = mutableListOf<String>()
-    val emittedActuals = linkedSetOf<String>()
-    val declaredInFile =
+private class NativeActualsEmitter(
+    collector: FfiInteropCollector,
+    pkgName: String?,
+    private val cinteropPkg: String,
+) : PlatformActualsKotlinEmitter(collector, pkgName) {
+    private val declaredInFile: Set<String> =
         buildSet {
-            addAll(localDeclaredTypeNames)
-            addAll(headerContext.moduleDeclaredTypeNames)
-            for (fn in foreignFunctions) add(fn.kotlinName)
-            for (fn in inlineFunctions) add(fn.kotlinName)
-            for (st in foreignStatics) add(st.kotlinName)
+            addAll(collector.localDeclaredTypeNames)
+            addAll(collector.headerContext.moduleDeclaredTypeNames)
+            for (fn in collector.foreignFunctions) add(fn.kotlinName)
+            for (fn in collector.inlineFunctions) add(fn.kotlinName)
+            for (st in collector.foreignStatics) add(st.kotlinName)
         }
 
-    fun resolveCinteropCallee(wrapperSym: String): Pair<String, String> =
+    override val fileOptIns: List<String> = listOf("ExperimentalForeignApi::class", "ExperimentalUnsignedTypes::class")
+
+    override fun initializeImports() {
+        imports += "kotlinx.cinterop.ExperimentalForeignApi"
+    }
+
+    private fun resolveCinteropCallee(wrapperSym: String): Pair<String, String> =
         if (wrapperSym in declaredInFile) {
             val alias = "cinterop${toPascalCaseIdentifierPart(wrapperSym)}"
             alias to "$cinteropPkg.$wrapperSym as $alias"
@@ -454,135 +457,59 @@ internal fun FfiInteropCollector.buildNativeActualsKotlinContent(
             wrapperSym to "$cinteropPkg.$wrapperSym"
         }
 
-    for (st in foreignStatics) {
-        if (!emittedActuals.add("val:${st.kotlinName}")) continue
-        actualBlocks +=
-            if (isBridgeableStaticInCWrapper(st)) {
-                val (getterCallee, getterImport) = resolveCinteropCallee(st.getterWrapperSymbolName)
-                val setterPair = if (st.isMutable) resolveCinteropCallee(st.setterWrapperSymbolName) else null
-                val rendered =
-                    renderNativeStaticActualProperty(
-                        st = st,
-                        getterCallee = getterCallee,
-                        setterCallee = setterPair?.first,
+    override fun renderBridgeableStatic(st: ForeignStaticInteropSpec): String {
+        val (getterCallee, getterImport) = resolveCinteropCallee(st.getterWrapperSymbolName)
+        val setterPair = if (st.isMutable) resolveCinteropCallee(st.setterWrapperSymbolName) else null
+        val getBody =
+            collector.renderNativeReturnConversion(
+                rawCall = "$getterCallee()",
+                kotlinReturnType = st.kotlinType,
+                returnBridgeKind = st.bridgeKind,
+                returnDefaultExpr = st.defaultExpr,
+                pkgName = pkgName,
+                importsOut = imports,
+            )
+        val setCall =
+            if (st.isMutable) {
+                val valParam = InteropParamSpec(kotlinName = "value", kotlinType = st.kotlinType, cName = "value", bridgeKind = st.bridgeKind)
+                val setArg = collector.renderNativeParamConversion(valParam, noStringConvEnabled = true, importsOut = imports)
+                "${setterPair?.first ?: st.setterWrapperSymbolName}($setArg)"
+            } else {
+                null
+            }
+        val rendered = renderStaticPropertyDecl(st, getBody, setCall)
+        val renderedTokens = extractIdentifierTokens(rendered)
+        if (getterCallee in renderedTokens) {
+            imports += getterImport
+        }
+        if (setterPair != null && setterPair.first in renderedTokens) {
+            imports += setterPair.second
+        }
+        return rendered
+    }
+
+    override fun renderBridgeableCallable(entry: CallableInteropEntry): String {
+        val (calleeIdent, calleeImport) = resolveCinteropCallee(entry.wrapperSymbolName)
+        val rendered =
+            renderStandardBridgeableCallable(
+                entry = entry,
+                calleeExpr = calleeIdent,
+                convertParam = { p, noStr -> collector.renderNativeParamConversion(p, noStr, imports) },
+                convertReturn = { rawCall, e ->
+                    collector.renderNativeReturnConversion(
+                        rawCall = rawCall,
+                        kotlinReturnType = e.kotlinReturnType,
+                        returnBridgeKind = e.returnBridgeKind,
+                        returnDefaultExpr = e.returnDefaultExpr,
                         pkgName = pkgName,
                         importsOut = imports,
                     )
-                val renderedTokens = extractIdentifierTokens(rendered)
-                if (getterCallee in renderedTokens) {
-                    imports += getterImport
-                }
-                if (setterPair != null && setterPair.first in renderedTokens) {
-                    imports += setterPair.second
-                }
-                rendered
-            } else {
-                renderStaticActualProperty(st)
-            }
-    }
-
-    fun emitNativeFunctionEntry(
-        visibilityPrefix: String,
-        kotlinName: String,
-        wrapperSymbolName: String,
-        params: List<InteropParamSpec>,
-        kotlinReturnType: String,
-        returnBridgeKind: CAbiBridgeKind,
-        returnDefaultExpr: String,
-        noStringConvEnabled: Boolean,
-        isVariadicCall: Boolean,
-        isVariadicFallback: Boolean,
-        isBridgeable: Boolean,
-    ) {
-        if (!emittedActuals.add("fn:$kotlinName:${params.size}")) return
-        actualBlocks +=
-            if (isBridgeable) {
-                val (calleeIdent, calleeImport) = resolveCinteropCallee(wrapperSymbolName)
-                val rendered =
-                    renderNativeActualFunction(
-                        visibilityPrefix = visibilityPrefix,
-                        kotlinName = kotlinName,
-                        cinteropCallee = calleeIdent,
-                        params = params,
-                        kotlinReturnType = kotlinReturnType,
-                        returnBridgeKind = returnBridgeKind,
-                        returnDefaultExpr = returnDefaultExpr,
-                        noStringConvEnabled = noStringConvEnabled,
-                        isVariadic = isVariadicCall,
-                        pkgName = pkgName,
-                        importsOut = imports,
-                    )
-                if (calleeIdent in extractIdentifierTokens(rendered)) {
-                    imports += calleeImport
-                }
-                rendered
-            } else {
-                renderFallbackActualFunction(
-                    visibilityPrefix = visibilityPrefix,
-                    kotlinName = kotlinName,
-                    params = params,
-                    kotlinReturnType = kotlinReturnType,
-                    returnBridgeKind = returnBridgeKind,
-                    returnDefaultExpr = returnDefaultExpr,
-                    isVariadic = isVariadicFallback,
-                )
-            }
-    }
-
-    for (fn in foreignFunctions) {
-        emitNativeFunctionEntry(
-            visibilityPrefix = fn.visibilityPrefix,
-            kotlinName = fn.kotlinName,
-            wrapperSymbolName = fn.wrapperSymbolName,
-            params = fn.params,
-            kotlinReturnType = fn.kotlinReturnType,
-            returnBridgeKind = fn.returnBridgeKind,
-            returnDefaultExpr = fn.returnDefaultExpr,
-            noStringConvEnabled = requiresNoStringConversion(fn.params),
-            isVariadicCall = fn.isVariadic,
-            isVariadicFallback = fn.isVariadic,
-            isBridgeable = isBridgeableInCWrapper(fn),
-        )
-    }
-    for (fn in inlineFunctions) {
-        emitNativeFunctionEntry(
-            visibilityPrefix = fn.visibilityPrefix,
-            kotlinName = fn.kotlinName,
-            wrapperSymbolName = fn.wrapperSymbolName,
-            params = fn.params,
-            kotlinReturnType = fn.kotlinReturnType,
-            returnBridgeKind = fn.returnBridgeKind,
-            returnDefaultExpr = fn.returnDefaultExpr,
-            noStringConvEnabled = requiresNoStringConversionForInline(fn.params),
-            isVariadicCall = false,
-            isVariadicFallback = fn.isVariadic,
-            isBridgeable = isBridgeableInlineInCWrapper(fn),
-        )
-    }
-
-    return finalizeActualsKotlinFile(sb, actualBlocks, imports, pkgName)
-}
-
-internal fun FfiInteropCollector.renderNativeStaticActualProperty(
-    st: ForeignStaticInteropSpec,
-    getterCallee: String,
-    setterCallee: String?,
-    pkgName: String?,
-    importsOut: MutableSet<String>,
-): String {
-    val getCall = "$getterCallee()"
-    val getBody = renderNativeReturnConversion(getCall, st.kotlinType, st.bridgeKind, st.defaultExpr, pkgName, importsOut)
-    return if (st.isMutable) {
-        val valParam = InteropParamSpec(kotlinName = "value", kotlinType = st.kotlinType, cName = "value", bridgeKind = st.bridgeKind)
-        val setArg = renderNativeParamConversion(valParam, noStringConvEnabled = true, importsOut = importsOut)
-        "${st.visibilityPrefix}actual var ${st.kotlinName}: ${st.kotlinType}\n" +
-            "    get() = $getBody\n" +
-            "    set(value) {\n" +
-            "        ${setterCallee ?: st.setterWrapperSymbolName}($setArg)\n" +
-            "    }"
-    } else {
-        "${st.visibilityPrefix}actual val ${st.kotlinName}: ${st.kotlinType}\n" +
-            "    get() = $getBody"
+                },
+            )
+        if (calleeIdent in extractIdentifierTokens(rendered)) {
+            imports += calleeImport
+        }
+        return rendered
     }
 }
 
@@ -784,180 +711,110 @@ internal fun FfiInteropCollector.buildWasmJsActualsKotlinContent(
     pkgName: String?,
     stemPascal: String,
     ffiModName: String,
-): String {
-    val sb = StringBuilder()
-    sb.append("@file:OptIn(ExperimentalUnsignedTypes::class, ExperimentalWasmJsInterop::class)\n\n")
-    if (!pkgName.isNullOrBlank()) {
-        sb.append("package ").append(pkgName).append("\n\n")
-    }
-    val imports = linkedSetOf<String>()
-    val actualBlocks = mutableListOf<String>()
-    val externalDecls = mutableListOf<String>()
-    val emittedExternals = linkedSetOf<String>()
-    val emittedActuals = linkedSetOf<String>()
-    val stemCamel = stemPascal.replaceFirstChar { it.lowercase() }
-    val availPropName = "${stemCamel}NapiAvailable"
-    val ktString = if (shadowsKotlinString(pkgName)) "kotlin.String" else "String"
-    var usesAddon = false
+): String = WasmJsActualsEmitter(this, pkgName, stemPascal, ffiModName).emit()
 
-    for (st in foreignStatics) {
-        if (!emittedActuals.add("val:${st.kotlinName}")) continue
-        if (isBridgeableStaticInCWrapper(st)) {
-            usesAddon = true
-            if (emittedExternals.add(st.getterWrapperSymbolName)) {
-                externalDecls +=
-                    renderWasmJsExternalDecl(
-                        wrapperSymbolName = st.getterWrapperSymbolName,
-                        paramTypes = emptyList(),
-                        returnType = wasmJsInteropTypeForReturn(st.bridgeKind, ktString),
-                        ffiModName = ffiModName,
-                    )
-            }
-            if (st.isMutable && emittedExternals.add(st.setterWrapperSymbolName)) {
-                val valParam = InteropParamSpec(kotlinName = "value", kotlinType = st.kotlinType, cName = "value", bridgeKind = st.bridgeKind)
-                externalDecls +=
-                    renderWasmJsExternalDecl(
-                        wrapperSymbolName = st.setterWrapperSymbolName,
-                        paramTypes = listOf(wasmJsInteropTypeForParam(valParam, noStringConvEnabled = true, ktStringType = ktString)),
-                        returnType = "Unit",
-                        ffiModName = ffiModName,
-                    )
-            }
-            actualBlocks += renderWasmJsStaticActualProperty(st, availPropName, pkgName, imports)
-        } else {
-            actualBlocks += renderStaticActualProperty(st)
-        }
-    }
+private class WasmJsActualsEmitter(
+    collector: FfiInteropCollector,
+    pkgName: String?,
+    private val stemPascal: String,
+    private val ffiModName: String,
+) : PlatformActualsKotlinEmitter(collector, pkgName) {
+    private val availPropName = "${stemPascal.replaceFirstChar { it.lowercase() }}NapiAvailable"
+    private val externalDecls = mutableListOf<String>()
+    private val emittedExternals = linkedSetOf<String>()
+    private var usesAddon = false
 
-    fun emitWasmJsCallable(
-        visibilityPrefix: String,
-        kotlinName: String,
-        wrapperSymbolName: String,
-        params: List<InteropParamSpec>,
-        kotlinReturnType: String,
-        returnBridgeKind: CAbiBridgeKind,
-        returnDefaultExpr: String,
-        noStrConv: Boolean,
-        isVariadicExternal: Boolean,
-        isVariadicUnsupported: Boolean,
-        isBridgeable: Boolean,
-    ) {
-        if (isBridgeable && emittedExternals.add(wrapperSymbolName)) {
-            val baseParamTypes = params.map { wasmJsInteropTypeForParam(it, noStrConv, ktString) }
-            val allParamTypes =
-                if (isVariadicExternal) {
-                    baseParamTypes + listOf("Int", ktString, ktString, ktString, ktString)
-                } else {
-                    baseParamTypes
-                }
+    override val fileOptIns: List<String> = listOf("ExperimentalUnsignedTypes::class", "ExperimentalWasmJsInterop::class")
+    override val unbridgeableThrowsAddonError: Boolean = true
+    override val stringifyVariadicArgs: Boolean = true
+    override val addonAvailabilityGuard: String = availPropName
+
+    override fun renderBridgeableStatic(st: ForeignStaticInteropSpec): String {
+        usesAddon = true
+        if (emittedExternals.add(st.getterWrapperSymbolName)) {
             externalDecls +=
                 renderWasmJsExternalDecl(
-                    wrapperSymbolName = wrapperSymbolName,
-                    paramTypes = allParamTypes,
-                    returnType = wasmJsInteropTypeForReturn(returnBridgeKind, ktString),
+                    wrapperSymbolName = st.getterWrapperSymbolName,
+                    paramTypes = emptyList(),
+                    returnType = wasmJsInteropTypeForReturn(st.bridgeKind, ktStringType),
                     ffiModName = ffiModName,
                 )
         }
-        if (!emittedActuals.add("fn:$kotlinName:${params.size}")) return
-        if (isBridgeable) {
-            usesAddon = true
-            actualBlocks +=
-                renderWasmJsActualFunction(
-                    visibilityPrefix = visibilityPrefix,
-                    kotlinName = kotlinName,
-                    availPropName = availPropName,
-                    wrapperSymbolName = wrapperSymbolName,
-                    params = params,
-                    kotlinReturnType = kotlinReturnType,
-                    returnBridgeKind = returnBridgeKind,
-                    returnDefaultExpr = returnDefaultExpr,
-                    noStringConvEnabled = noStrConv,
-                    isVariadic = isVariadicExternal,
+        val setCall =
+            if (st.isMutable) {
+                val valParam = InteropParamSpec(kotlinName = "value", kotlinType = st.kotlinType, cName = "value", bridgeKind = st.bridgeKind)
+                if (emittedExternals.add(st.setterWrapperSymbolName)) {
+                    externalDecls +=
+                        renderWasmJsExternalDecl(
+                            wrapperSymbolName = st.setterWrapperSymbolName,
+                            paramTypes = listOf(wasmJsInteropTypeForParam(valParam, noStringConvEnabled = true, ktStringType = ktStringType)),
+                            returnType = "Unit",
+                            ffiModName = ffiModName,
+                        )
+                }
+                val setArg = collector.renderJsOrWasmParamConversion(valParam, noStringConvEnabled = true)
+                "wasm${toPascalCaseIdentifierPart(st.setterWrapperSymbolName)}($setArg)"
+            } else {
+                null
+            }
+        val convertedGet =
+            collector.renderWasmJsReturnConversion(
+                rawCall = "wasm${toPascalCaseIdentifierPart(st.getterWrapperSymbolName)}()",
+                kotlinReturnType = st.kotlinType,
+                returnBridgeKind = st.bridgeKind,
+                returnDefaultExpr = st.defaultExpr,
+                pkgName = pkgName,
+                importsOut = imports,
+            )
+        return renderStaticPropertyDecl(st, convertedGet, setCall)
+    }
+
+    override fun onBeforeDedupBridgeableCallable(entry: CallableInteropEntry) {
+        if (!emittedExternals.add(entry.wrapperSymbolName)) return
+        val baseParamTypes = entry.params.map { wasmJsInteropTypeForParam(it, entry.noStringConvEnabled, ktStringType) }
+        val allParamTypes =
+            if (entry.isVariadicCall) {
+                baseParamTypes + listOf("Int", ktStringType, ktStringType, ktStringType, ktStringType)
+            } else {
+                baseParamTypes
+            }
+        externalDecls +=
+            renderWasmJsExternalDecl(
+                wrapperSymbolName = entry.wrapperSymbolName,
+                paramTypes = allParamTypes,
+                returnType = wasmJsInteropTypeForReturn(entry.returnBridgeKind, ktStringType),
+                ffiModName = ffiModName,
+            )
+    }
+
+    override fun renderBridgeableCallable(entry: CallableInteropEntry): String {
+        usesAddon = true
+        return renderStandardBridgeableCallable(
+            entry = entry,
+            calleeExpr = "wasm${toPascalCaseIdentifierPart(entry.wrapperSymbolName)}",
+            convertParam = { p, noStr -> collector.renderJsOrWasmParamConversion(p, noStr) },
+            convertReturn = { rawCall, e ->
+                collector.renderWasmJsReturnConversion(
+                    rawCall = rawCall,
+                    kotlinReturnType = e.kotlinReturnType,
+                    returnBridgeKind = e.returnBridgeKind,
+                    returnDefaultExpr = e.returnDefaultExpr,
                     pkgName = pkgName,
                     importsOut = imports,
                 )
-        } else {
-            actualBlocks +=
-                renderUnsupportedActualFunction(
-                    visibilityPrefix = visibilityPrefix,
-                    kotlinName = kotlinName,
-                    params = params,
-                    kotlinReturnType = kotlinReturnType,
-                    returnBridgeKind = returnBridgeKind,
-                    isVariadic = isVariadicUnsupported,
-                    message = "Native FFI addon is not available",
-                )
-        }
-    }
-
-    for (fn in foreignFunctions) {
-        emitWasmJsCallable(
-            visibilityPrefix = fn.visibilityPrefix,
-            kotlinName = fn.kotlinName,
-            wrapperSymbolName = fn.wrapperSymbolName,
-            params = fn.params,
-            kotlinReturnType = fn.kotlinReturnType,
-            returnBridgeKind = fn.returnBridgeKind,
-            returnDefaultExpr = fn.returnDefaultExpr,
-            noStrConv = requiresNoStringConversion(fn.params),
-            isVariadicExternal = fn.isVariadic,
-            isVariadicUnsupported = fn.isVariadic,
-            isBridgeable = isBridgeableInCWrapper(fn),
-        )
-    }
-    for (fn in inlineFunctions) {
-        emitWasmJsCallable(
-            visibilityPrefix = fn.visibilityPrefix,
-            kotlinName = fn.kotlinName,
-            wrapperSymbolName = fn.wrapperSymbolName,
-            params = fn.params,
-            kotlinReturnType = fn.kotlinReturnType,
-            returnBridgeKind = fn.returnBridgeKind,
-            returnDefaultExpr = fn.returnDefaultExpr,
-            noStrConv = requiresNoStringConversionForInline(fn.params),
-            isVariadicExternal = false,
-            isVariadicUnsupported = fn.isVariadic,
-            isBridgeable = isBridgeableInlineInCWrapper(fn),
+            },
         )
     }
 
-    if (usesAddon) {
+    override fun prependPreambleBlocks(blocks: MutableList<String>) {
+        if (!usesAddon) return
         val initJs = "() => { ${buildNodeNapiLoaderJsBody(ffiModName, returnBooleanStatus = true)}}"
         val loaderBlock =
             "@JsFun(\"$initJs\")\n" +
                 "private external fun init${stemPascal}NapiAddon(): Boolean\n\n" +
                 "private val $availPropName: Boolean = init${stemPascal}NapiAddon()\n\n" +
                 externalDecls.joinToString("\n\n")
-        actualBlocks.add(0, loaderBlock)
-    }
-
-    return finalizeActualsKotlinFile(sb, actualBlocks, imports, pkgName)
-}
-
-internal fun FfiInteropCollector.renderWasmJsStaticActualProperty(
-    st: ForeignStaticInteropSpec,
-    availPropName: String,
-    pkgName: String?,
-    importsOut: MutableSet<String>,
-): String {
-    val rawGet = "wasm${toPascalCaseIdentifierPart(st.getterWrapperSymbolName)}()"
-    val convertedGet = renderWasmJsReturnConversion(rawGet, st.kotlinType, st.bridgeKind, st.defaultExpr, pkgName, importsOut)
-    val getExpr = "if ($availPropName) $convertedGet else throw UnsupportedOperationException(\"Native FFI addon is not available\")"
-    return if (st.isMutable) {
-        val valParam = InteropParamSpec(kotlinName = "value", kotlinType = st.kotlinType, cName = "value", bridgeKind = st.bridgeKind)
-        val setArg = renderJsOrWasmParamConversion(valParam, noStringConvEnabled = true)
-        "${st.visibilityPrefix}actual var ${st.kotlinName}: ${st.kotlinType}\n" +
-            "    get() = $getExpr\n" +
-            "    set(value) {\n" +
-            "        if ($availPropName) {\n" +
-            "            wasm${toPascalCaseIdentifierPart(st.setterWrapperSymbolName)}($setArg)\n" +
-            "        } else {\n" +
-            "            throw UnsupportedOperationException(\"Native FFI addon is not available\")\n" +
-            "        }\n" +
-            "    }"
-    } else {
-        "${st.visibilityPrefix}actual val ${st.kotlinName}: ${st.kotlinType}\n" +
-            "    get() = $getExpr"
+        blocks.add(0, loaderBlock)
     }
 }
 
@@ -986,45 +843,6 @@ internal fun FfiInteropCollector.renderWasmJsReturnConversion(
         signedSubIntKeepsRaw = false,
         fallbackNonScalar = returnDefaultExpr,
     )
-
-internal fun FfiInteropCollector.renderWasmJsActualFunction(
-    visibilityPrefix: String,
-    kotlinName: String,
-    availPropName: String,
-    wrapperSymbolName: String,
-    params: List<InteropParamSpec>,
-    kotlinReturnType: String,
-    returnBridgeKind: CAbiBridgeKind,
-    returnDefaultExpr: String,
-    noStringConvEnabled: Boolean,
-    isVariadic: Boolean,
-    pkgName: String?,
-    importsOut: MutableSet<String>,
-): String {
-    val baseArgs = params.map { renderJsOrWasmParamConversion(it, noStringConvEnabled) }
-    val allArgs = if (isVariadic) appendVariadicKotlinArgs(baseArgs, stringifyArgs = true) else baseArgs
-    val rawCall = "wasm${toPascalCaseIdentifierPart(wrapperSymbolName)}(${allArgs.joinToString(", ")})"
-    val convertedCall =
-        renderWasmJsReturnConversion(
-            rawCall = rawCall,
-            kotlinReturnType = kotlinReturnType,
-            returnBridgeKind = returnBridgeKind,
-            returnDefaultExpr = returnDefaultExpr,
-            pkgName = pkgName,
-            importsOut = importsOut,
-        )
-    return renderActualFunctionDecl(
-        visibilityPrefix = visibilityPrefix,
-        kotlinName = kotlinName,
-        params = params,
-        kotlinReturnType = kotlinReturnType,
-        returnBridgeKind = returnBridgeKind,
-        isVariadic = isVariadic,
-        rawCall = rawCall,
-        bodyExpr = convertedCall,
-        addonAvailabilityGuard = availPropName,
-    )
-}
 
 internal fun FfiInteropCollector.renderPointerParamToCPointer(
     param: InteropParamSpec,
@@ -1144,35 +962,6 @@ internal fun FfiInteropCollector.renderNativeReturnConversion(
             }
         else -> rawCall
     }
-}
-
-internal fun FfiInteropCollector.renderNativeActualFunction(
-    visibilityPrefix: String,
-    kotlinName: String,
-    cinteropCallee: String,
-    params: List<InteropParamSpec>,
-    kotlinReturnType: String,
-    returnBridgeKind: CAbiBridgeKind,
-    returnDefaultExpr: String,
-    noStringConvEnabled: Boolean,
-    isVariadic: Boolean,
-    pkgName: String?,
-    importsOut: MutableSet<String>,
-): String {
-    val baseArgs = params.map { renderNativeParamConversion(it, noStringConvEnabled, importsOut) }
-    val allArgs = if (isVariadic) appendVariadicKotlinArgs(baseArgs, stringifyArgs = false) else baseArgs
-    val rawCall = "$cinteropCallee(${allArgs.joinToString(", ")})"
-    val bodyExpr = renderNativeReturnConversion(rawCall, kotlinReturnType, returnBridgeKind, returnDefaultExpr, pkgName, importsOut)
-    return renderActualFunctionDecl(
-        visibilityPrefix = visibilityPrefix,
-        kotlinName = kotlinName,
-        params = params,
-        kotlinReturnType = kotlinReturnType,
-        returnBridgeKind = returnBridgeKind,
-        isVariadic = isVariadic,
-        rawCall = rawCall,
-        bodyExpr = bodyExpr,
-    )
 }
 
 internal fun inferRequiredHeaders(

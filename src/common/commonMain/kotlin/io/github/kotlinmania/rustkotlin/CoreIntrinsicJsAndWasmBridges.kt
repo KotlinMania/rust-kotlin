@@ -201,14 +201,7 @@ ${CoreIntrinsicMathAndBitSpecs.renderNapiRegistrations()}
 #include "../../../native/interop/cinterop/km_core_intrinsics_inline.h"
 #endif
 
-struct KmNapiRegistrarNode {
-    void (*register_fn)(Napi::Env, Napi::Object);
-    KmNapiRegistrarNode* next;
-};
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
-extern KmNapiRegistrarNode* km_napi_registrar_head;
+${renderNapiRegistrarHeader()}
 
 namespace {
 
@@ -227,30 +220,7 @@ static void register_${stemSnake}_napi(Napi::Env env, Napi::Object exports) {
     }
 }
 
-static KmNapiRegistrarNode registrar_node = { &register_${stemSnake}_napi, nullptr };
-struct KmNapiAutoRegister {
-    KmNapiAutoRegister() {
-        registrar_node.next = km_napi_registrar_head;
-        km_napi_registrar_head = &registrar_node;
-    }
-};
-static KmNapiAutoRegister auto_register_instance;
-
-} // namespace
-
-#ifdef KM_NAPI_STANDALONE_MODULE
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
-KmNapiRegistrarNode* km_napi_registrar_head = nullptr;
-static Napi::Object KmNapiStandaloneInit(Napi::Env env, Napi::Object exports) {
-    for (KmNapiRegistrarNode* cur = km_napi_registrar_head; cur != nullptr; cur = cur->next) {
-        cur->register_fn(env, exports);
-    }
-    return exports;
-}
-NODE_API_MODULE(NODE_GYP_MODULE_NAME, KmNapiStandaloneInit)
-#endif
+${renderNapiRegistrarFooter("register_${stemSnake}_napi")}
 """.trimStart()
 
     private fun renderNodeKmCoreLoaderJsBody(ffiModName: String): String =

@@ -126,189 +126,96 @@ internal fun FfiInteropCollector.renderJvmReturnConversion(
         fallbackNonScalar = rawCall,
     )
 
-internal fun FfiInteropCollector.renderJvmStaticActualProperty(
-    st: ForeignStaticInteropSpec,
-    jniObjectName: String,
-    pkgName: String?,
-    importsOut: MutableSet<String>,
-): String {
-    val rawGet = "$jniObjectName.${st.getterWrapperSymbolName}()"
-    val getBody = renderJvmReturnConversion(rawGet, st.kotlinType, st.bridgeKind, st.defaultExpr, pkgName, importsOut)
-    return if (st.isMutable) {
-        val valParam = InteropParamSpec(kotlinName = "value", kotlinType = st.kotlinType, cName = "value", bridgeKind = st.bridgeKind)
-        val setArg = renderJvmParamConversion(valParam, noStringConvEnabled = true)
-        "${st.visibilityPrefix}actual var ${st.kotlinName}: ${st.kotlinType}\n" +
-            "    get() = $getBody\n" +
-            "    set(value) {\n" +
-            "        $jniObjectName.${st.setterWrapperSymbolName}($setArg)\n" +
-            "    }"
-    } else {
-        "${st.visibilityPrefix}actual val ${st.kotlinName}: ${st.kotlinType}\n" +
-            "    get() = $getBody"
-    }
-}
-
-internal fun FfiInteropCollector.renderJvmActualFunction(
-    visibilityPrefix: String,
-    kotlinName: String,
-    jniCallee: String,
-    params: List<InteropParamSpec>,
-    kotlinReturnType: String,
-    returnBridgeKind: CAbiBridgeKind,
-    returnDefaultExpr: String,
-    noStringConvEnabled: Boolean,
-    isVariadic: Boolean,
-    pkgName: String?,
-    importsOut: MutableSet<String>,
-): String {
-    val baseArgs = params.map { renderJvmParamConversion(it, noStringConvEnabled) }
-    val allArgs = if (isVariadic) appendVariadicKotlinArgs(baseArgs, stringifyArgs = false) else baseArgs
-    val rawCall = "$jniCallee(${allArgs.joinToString(", ")})"
-    val bodyExpr =
-        renderJvmReturnConversion(
-            rawCall = rawCall,
-            kotlinReturnType = kotlinReturnType,
-            returnBridgeKind = returnBridgeKind,
-            returnDefaultExpr = returnDefaultExpr,
-            pkgName = pkgName,
-            importsOut = importsOut,
-        )
-    return renderActualFunctionDecl(
-        visibilityPrefix = visibilityPrefix,
-        kotlinName = kotlinName,
-        params = params,
-        kotlinReturnType = kotlinReturnType,
-        returnBridgeKind = returnBridgeKind,
-        isVariadic = isVariadic,
-        rawCall = rawCall,
-        bodyExpr = bodyExpr,
-    )
-}
-
 internal fun FfiInteropCollector.buildJvmOrAndroidActualsKotlinContent(
     pkgName: String?,
     jniObjectName: String,
     jniLibName: String,
     includeJarResourceLoader: Boolean = true,
-): String {
-    val sb = StringBuilder()
-    sb.append("@file:OptIn(ExperimentalUnsignedTypes::class)\n\n")
-    if (!pkgName.isNullOrBlank()) {
-        sb.append("package ").append(pkgName).append("\n\n")
-    }
-    val imports = linkedSetOf<String>()
-    val actualBlocks = mutableListOf<String>()
-    val jniExternalDecls = mutableListOf<String>()
-    val emittedJniWrappers = linkedSetOf<String>()
-    val emittedActuals = linkedSetOf<String>()
-    val ktString = if (shadowsKotlinString(pkgName)) "kotlin.String" else "String"
+): String =
+    JvmOrAndroidActualsEmitter(
+        collector = this,
+        pkgName = pkgName,
+        jniObjectName = jniObjectName,
+        jniLibName = jniLibName,
+        includeJarResourceLoader = includeJarResourceLoader,
+    ).emit()
 
-    for (st in foreignStatics) {
-        if (!emittedActuals.add("val:${st.kotlinName}")) continue
-        if (isBridgeableStaticInCWrapper(st)) {
-            if (emittedJniWrappers.add(st.getterWrapperSymbolName)) {
-                val jniRet = jniKotlinTypeForReturn(st.bridgeKind)
-                jniExternalDecls += "    @JvmStatic\n    external fun ${st.getterWrapperSymbolName}(): $jniRet"
-            }
-            if (st.isMutable && emittedJniWrappers.add(st.setterWrapperSymbolName)) {
+private class JvmOrAndroidActualsEmitter(
+    collector: FfiInteropCollector,
+    pkgName: String?,
+    private val jniObjectName: String,
+    private val jniLibName: String,
+    private val includeJarResourceLoader: Boolean,
+) : PlatformActualsKotlinEmitter(collector, pkgName) {
+    private val jniExternalDecls = mutableListOf<String>()
+    private val emittedJniWrappers = linkedSetOf<String>()
+
+    override val fileOptIns: List<String> = listOf("ExperimentalUnsignedTypes::class")
+
+    override fun renderBridgeableStatic(st: ForeignStaticInteropSpec): String {
+        if (emittedJniWrappers.add(st.getterWrapperSymbolName)) {
+            val jniRet = jniKotlinTypeForReturn(st.bridgeKind)
+            jniExternalDecls += "    @JvmStatic\n    external fun ${st.getterWrapperSymbolName}(): $jniRet"
+        }
+        val setCall =
+            if (st.isMutable) {
                 val valParam = InteropParamSpec(kotlinName = "value", kotlinType = st.kotlinType, cName = "value", bridgeKind = st.bridgeKind)
-                val jniValType = jniKotlinTypeForParam(valParam, noStringConvEnabled = true, ktStringType = ktString)
-                jniExternalDecls += "    @JvmStatic\n    external fun ${st.setterWrapperSymbolName}(value: $jniValType)"
+                if (emittedJniWrappers.add(st.setterWrapperSymbolName)) {
+                    val jniValType = jniKotlinTypeForParam(valParam, noStringConvEnabled = true, ktStringType = ktStringType)
+                    jniExternalDecls += "    @JvmStatic\n    external fun ${st.setterWrapperSymbolName}(value: $jniValType)"
+                }
+                val setArg = collector.renderJvmParamConversion(valParam, noStringConvEnabled = true)
+                "$jniObjectName.${st.setterWrapperSymbolName}($setArg)"
+            } else {
+                null
             }
-            actualBlocks += renderJvmStaticActualProperty(st, jniObjectName, pkgName, imports)
-        } else {
-            actualBlocks += renderStaticActualProperty(st)
-        }
+        val getBody =
+            collector.renderJvmReturnConversion(
+                rawCall = "$jniObjectName.${st.getterWrapperSymbolName}()",
+                kotlinReturnType = st.kotlinType,
+                returnBridgeKind = st.bridgeKind,
+                returnDefaultExpr = st.defaultExpr,
+                pkgName = pkgName,
+                importsOut = imports,
+            )
+        return renderStaticPropertyDecl(st, getBody, setCall)
     }
 
-    fun processJniCallable(
-        visibilityPrefix: String,
-        kotlinName: String,
-        wrapperSymbolName: String,
-        params: List<InteropParamSpec>,
-        kotlinReturnType: String,
-        returnBridgeKind: CAbiBridgeKind,
-        returnDefaultExpr: String,
-        noStrConv: Boolean,
-        isVariadicExternal: Boolean,
-        isVariadicFallback: Boolean,
-        isBridgeable: Boolean,
-    ) {
-        if (isBridgeable && emittedJniWrappers.add(wrapperSymbolName)) {
-            val baseJniParams = params.map { "${it.kotlinName}: ${jniKotlinTypeForParam(it, noStrConv, ktString)}" }
-            val allJniParams =
-                if (isVariadicExternal) {
-                    baseJniParams + listOf("kmVac: Int", "kmVa0: Long", "kmVa1: Long", "kmVa2: Long", "kmVa3: Long")
-                } else {
-                    baseJniParams
-                }
-            val jniRet = jniKotlinTypeForReturn(returnBridgeKind)
-            val jniRetSuffix = if (jniRet == "Unit") "" else ": $jniRet"
-            jniExternalDecls += "    @JvmStatic\n    external fun $wrapperSymbolName(${allJniParams.joinToString(", ")})$jniRetSuffix"
-        }
-        if (!emittedActuals.add("fn:$kotlinName:${params.size}")) return
-        actualBlocks +=
-            if (isBridgeable) {
-                renderJvmActualFunction(
-                    visibilityPrefix = visibilityPrefix,
-                    kotlinName = kotlinName,
-                    jniCallee = "$jniObjectName.$wrapperSymbolName",
-                    params = params,
-                    kotlinReturnType = kotlinReturnType,
-                    returnBridgeKind = returnBridgeKind,
-                    returnDefaultExpr = returnDefaultExpr,
-                    noStringConvEnabled = noStrConv,
-                    isVariadic = isVariadicExternal,
+    override fun onBeforeDedupBridgeableCallable(entry: CallableInteropEntry) {
+        if (!emittedJniWrappers.add(entry.wrapperSymbolName)) return
+        val baseJniParams = entry.params.map { "${it.kotlinName}: ${jniKotlinTypeForParam(it, entry.noStringConvEnabled, ktStringType)}" }
+        val allJniParams =
+            if (entry.isVariadicCall) {
+                baseJniParams + listOf("kmVac: Int", "kmVa0: Long", "kmVa1: Long", "kmVa2: Long", "kmVa3: Long")
+            } else {
+                baseJniParams
+            }
+        val jniRet = jniKotlinTypeForReturn(entry.returnBridgeKind)
+        val jniRetSuffix = if (jniRet == "Unit") "" else ": $jniRet"
+        jniExternalDecls += "    @JvmStatic\n    external fun ${entry.wrapperSymbolName}(${allJniParams.joinToString(", ")})$jniRetSuffix"
+    }
+
+    override fun renderBridgeableCallable(entry: CallableInteropEntry): String =
+        renderStandardBridgeableCallable(
+            entry = entry,
+            calleeExpr = "$jniObjectName.${entry.wrapperSymbolName}",
+            convertParam = { p, noStr -> collector.renderJvmParamConversion(p, noStr) },
+            convertReturn = { rawCall, e ->
+                collector.renderJvmReturnConversion(
+                    rawCall = rawCall,
+                    kotlinReturnType = e.kotlinReturnType,
+                    returnBridgeKind = e.returnBridgeKind,
+                    returnDefaultExpr = e.returnDefaultExpr,
                     pkgName = pkgName,
                     importsOut = imports,
                 )
-            } else {
-                renderFallbackActualFunction(
-                    visibilityPrefix = visibilityPrefix,
-                    kotlinName = kotlinName,
-                    params = params,
-                    kotlinReturnType = kotlinReturnType,
-                    returnBridgeKind = returnBridgeKind,
-                    returnDefaultExpr = returnDefaultExpr,
-                    isVariadic = isVariadicFallback,
-                )
-            }
-    }
-
-    for (fn in foreignFunctions) {
-        processJniCallable(
-            visibilityPrefix = fn.visibilityPrefix,
-            kotlinName = fn.kotlinName,
-            wrapperSymbolName = fn.wrapperSymbolName,
-            params = fn.params,
-            kotlinReturnType = fn.kotlinReturnType,
-            returnBridgeKind = fn.returnBridgeKind,
-            returnDefaultExpr = fn.returnDefaultExpr,
-            noStrConv = requiresNoStringConversion(fn.params),
-            isVariadicExternal = fn.isVariadic,
-            isVariadicFallback = fn.isVariadic,
-            isBridgeable = isBridgeableInCWrapper(fn),
+            },
         )
-    }
-    for (fn in inlineFunctions) {
-        processJniCallable(
-            visibilityPrefix = fn.visibilityPrefix,
-            kotlinName = fn.kotlinName,
-            wrapperSymbolName = fn.wrapperSymbolName,
-            params = fn.params,
-            kotlinReturnType = fn.kotlinReturnType,
-            returnBridgeKind = fn.returnBridgeKind,
-            returnDefaultExpr = fn.returnDefaultExpr,
-            noStrConv = requiresNoStringConversionForInline(fn.params),
-            isVariadicExternal = false,
-            isVariadicFallback = fn.isVariadic,
-            isBridgeable = isBridgeableInlineInCWrapper(fn),
-        )
-    }
 
-    if (jniExternalDecls.isNotEmpty()) {
+    override fun prependPreambleBlocks(blocks: MutableList<String>) {
+        if (jniExternalDecls.isEmpty()) return
         val projNs =
-            headerContext.projectNamespace
+            collector.headerContext.projectNamespace
                 ?.trim()
                 ?.removeSuffix(".")
                 ?.takeIf { it.isNotEmpty() } ?: pkgName.orEmpty()
@@ -329,10 +236,8 @@ internal fun FfiInteropCollector.buildJvmOrAndroidActualsKotlinContent(
                 append(jniExternalDecls.joinToString("\n\n")).append('\n')
                 append("}")
             }
-        actualBlocks.add(0, jniObjBlock)
+        blocks.add(0, jniObjBlock)
     }
-
-    return finalizeActualsKotlinFile(sb, actualBlocks, imports, pkgName)
 }
 
 internal fun FfiInteropCollector.buildJniCSourceContent(
@@ -524,7 +429,6 @@ internal fun renderJniForeignFunction(
     sb.append("    (void)km_clazz;\n")
 
     val (stringParams, callArgs) = appendJniStringParamSetupAndCallArgs(sb, fn.params, noStrConv)
-    val symEsc = escapeCString(fn.cSymbolName)
     val isAtexit = isAtexitForeignFn(fn)
     if (isAtexit) {
         val cbName = fn.params[0].cName
@@ -536,40 +440,16 @@ internal fun renderJniForeignFunction(
         sb.append("    return (jint)atexit((void (*)(void))(uintptr_t)$cbName);\n")
         sb.append("#else\n")
     }
-    if (fn.dllName != null) {
-        sb.append("#ifdef _WIN32\n")
-        sb.append("    typedef $cRet (${if (fn.isVariadic) "" else "__stdcall "}*km_fn_t)($cParamTypes);\n")
-        sb.append("    static km_fn_t km_fn_ptr = NULL;\n")
-        sb.append("    if (km_fn_ptr == NULL) {\n")
-        sb.append("        HMODULE km_h_mod = LoadLibraryA(\"${escapeCString(fn.dllName)}\");\n")
-        sb.append("        if (km_h_mod != NULL) km_fn_ptr = (km_fn_t)(void*)GetProcAddress(km_h_mod, \"$symEsc\");\n")
-        sb.append("    }\n")
-        appendDynamicFunctionDispatch(sb, fn, cRet, callArgs, hasReturn, isCpp = false)
-        sb.append("#else\n")
-        for (p in fn.params) {
-            if (p !in stringParams) sb.append("    (void)${p.cName};\n")
-        }
-        if (fn.isVariadic) {
-            sb.append("    (void)km_vac; (void)km_va0; (void)km_va1; (void)km_va2; (void)km_va3;\n")
-        }
-        sb.append("    errno = ENOSYS;\n")
-        if (hasReturn) {
-            sb.append("    $cRet km_res = ${cFailureReturnExpr(fn, isCpp = false)};\n")
-        }
-        sb.append("#endif\n")
-    } else {
-        sb.append("    typedef $cRet (*km_fn_t)($cParamTypes);\n")
-        appendDynamicSymbolLookupBlock(
-            sb = sb,
-            ptrVarName = "km_fn_ptr",
-            ptrTypeDecl = "km_fn_t",
-            castTargetType = "km_fn_t",
-            cSymbolName = fn.cSymbolName,
-            isCpp = false,
-            extraPosixFallback = { appendPosixDynamicLookupFallbacks(it, fn, isCpp = false) },
-        )
-        appendDynamicFunctionDispatch(sb, fn, cRet, callArgs, hasReturn, isCpp = false)
-    }
+    appendDynamicOrWin32DllDispatchBlock(
+        sb = sb,
+        fn = fn,
+        cRet = cRet,
+        cParamTypes = cParamTypes,
+        callArgs = callArgs,
+        hasReturn = hasReturn,
+        isCpp = false,
+        unusedParams = fn.params.filter { it !in stringParams },
+    )
 
     for (sp in stringParams) {
         sb.append("    if (${sp.cName} != NULL && ${sp.cName}_utf != NULL) (*km_env)->ReleaseStringUTFChars(km_env, ${sp.cName}, ${sp.cName}_utf);\n")
@@ -639,103 +519,126 @@ internal fun FfiInteropCollector.renderJniInlineFunction(
     return sb.toString()
 }
 
+private fun appendDynamicOrWin32DllDispatchBlock(
+    sb: StringBuilder,
+    fn: ForeignFnInteropSpec,
+    cRet: String,
+    cParamTypes: String,
+    callArgs: String,
+    hasReturn: Boolean,
+    isCpp: Boolean,
+    unusedParams: List<InteropParamSpec> = fn.params,
+) {
+    val nullLit = if (isCpp) "nullptr" else "NULL"
+    val symEsc = escapeCString(fn.cSymbolName)
+    if (fn.dllName != null) {
+        val procCast =
+            if (isCpp) {
+                "reinterpret_cast<km_fn_t>(reinterpret_cast<void*>(GetProcAddress(km_h_mod, \"$symEsc\")))"
+            } else {
+                "(km_fn_t)(void*)GetProcAddress(km_h_mod, \"$symEsc\")"
+            }
+        sb.append("#ifdef _WIN32\n")
+        sb.append("    typedef $cRet (${if (fn.isVariadic) "" else "__stdcall "}*km_fn_t)($cParamTypes);\n")
+        sb.append("    static km_fn_t km_fn_ptr = $nullLit;\n")
+        sb.append("    if (km_fn_ptr == $nullLit) {\n")
+        sb.append("        HMODULE km_h_mod = LoadLibraryA(\"${escapeCString(fn.dllName)}\");\n")
+        sb.append("        if (km_h_mod != $nullLit) km_fn_ptr = $procCast;\n")
+        sb.append("    }\n")
+        appendDynamicFunctionDispatch(sb, fn, cRet, callArgs, hasReturn, isCpp = isCpp)
+        sb.append("#else\n")
+        for (p in unusedParams) {
+            sb.append("    (void)${p.cName};\n")
+        }
+        if (fn.isVariadic) {
+            sb.append("    (void)km_vac; (void)km_va0; (void)km_va1; (void)km_va2; (void)km_va3;\n")
+        }
+        sb.append("    errno = ENOSYS;\n")
+        if (hasReturn) {
+            sb.append("    $cRet km_res = ${cFailureReturnExpr(fn, isCpp = isCpp)};\n")
+        }
+        sb.append("#endif\n")
+    } else {
+        sb.append("    typedef $cRet (*km_fn_t)($cParamTypes);\n")
+        appendDynamicSymbolLookupBlock(
+            sb = sb,
+            ptrVarName = "km_fn_ptr",
+            ptrTypeDecl = "km_fn_t",
+            castTargetType = "km_fn_t",
+            cSymbolName = fn.cSymbolName,
+            isCpp = isCpp,
+            extraPosixFallback = { appendPosixDynamicLookupFallbacks(it, fn, isCpp = isCpp) },
+        )
+        appendDynamicFunctionDispatch(sb, fn, cRet, callArgs, hasReturn, isCpp = isCpp)
+    }
+}
+
 internal fun FfiInteropCollector.buildJsActualsKotlinContent(
     pkgName: String?,
     stemPascal: String,
     ffiModName: String,
-): String {
-    val sb = StringBuilder()
-    sb.append("@file:OptIn(ExperimentalUnsignedTypes::class)\n\n")
-    if (!pkgName.isNullOrBlank()) {
-        sb.append("package ").append(pkgName).append("\n\n")
-    }
-    val imports = linkedSetOf<String>()
-    val actualBlocks = mutableListOf<String>()
-    val emittedActuals = linkedSetOf<String>()
-    val addonPropName = "${stemPascal.replaceFirstChar { it.lowercase() }}NapiAddon"
-    var usesAddon = false
+): String = JsActualsEmitter(this, pkgName, stemPascal, ffiModName).emit()
 
-    for (st in foreignStatics) {
-        if (!emittedActuals.add("val:${st.kotlinName}")) continue
-        if (isBridgeableStaticInCWrapper(st)) {
-            usesAddon = true
-            actualBlocks += renderJsStaticActualProperty(st, addonPropName, pkgName, imports)
-        } else {
-            actualBlocks += renderStaticActualProperty(st)
-        }
+private class JsActualsEmitter(
+    collector: FfiInteropCollector,
+    pkgName: String?,
+    stemPascal: String,
+    private val ffiModName: String,
+) : PlatformActualsKotlinEmitter(collector, pkgName) {
+    private val addonPropName = "${stemPascal.replaceFirstChar { it.lowercase() }}NapiAddon"
+    private var usesAddon = false
+
+    override val fileOptIns: List<String> = listOf("ExperimentalUnsignedTypes::class")
+    override val unbridgeableThrowsAddonError: Boolean = true
+    override val stringifyVariadicArgs: Boolean = true
+    override val addonAvailabilityGuard: String = "$addonPropName != null"
+
+    override fun renderBridgeableStatic(st: ForeignStaticInteropSpec): String {
+        usesAddon = true
+        val convertedGet =
+            collector.renderJsReturnConversion(
+                rawCall = "$addonPropName.${st.getterWrapperSymbolName}()",
+                kotlinReturnType = st.kotlinType,
+                returnBridgeKind = st.bridgeKind,
+                returnDefaultExpr = st.defaultExpr,
+                pkgName = pkgName,
+                importsOut = imports,
+            )
+        val setCall =
+            if (st.isMutable) {
+                val valParam = InteropParamSpec(kotlinName = "value", kotlinType = st.kotlinType, cName = "value", bridgeKind = st.bridgeKind)
+                val setArg = collector.renderJsOrWasmParamConversion(valParam, noStringConvEnabled = true)
+                "$addonPropName.${st.setterWrapperSymbolName}($setArg)"
+            } else {
+                null
+            }
+        return renderStaticPropertyDecl(st, convertedGet, setCall)
     }
-    for (fn in foreignFunctions) {
-        if (!emittedActuals.add("fn:${fn.kotlinName}:${fn.params.size}")) continue
-        if (isBridgeableInCWrapper(fn)) {
-            usesAddon = true
-            actualBlocks +=
-                renderJsActualFunction(
-                    visibilityPrefix = fn.visibilityPrefix,
-                    kotlinName = fn.kotlinName,
-                    addonPropName = addonPropName,
-                    wrapperSymbolName = fn.wrapperSymbolName,
-                    params = fn.params,
-                    kotlinReturnType = fn.kotlinReturnType,
-                    returnBridgeKind = fn.returnBridgeKind,
-                    returnDefaultExpr = fn.returnDefaultExpr,
-                    noStringConvEnabled = requiresNoStringConversion(fn.params),
-                    isVariadic = fn.isVariadic,
+
+    override fun renderBridgeableCallable(entry: CallableInteropEntry): String {
+        usesAddon = true
+        return renderStandardBridgeableCallable(
+            entry = entry,
+            calleeExpr = "$addonPropName.${entry.wrapperSymbolName}",
+            convertParam = { p, noStr -> collector.renderJsOrWasmParamConversion(p, noStr) },
+            convertReturn = { rawCall, e ->
+                collector.renderJsReturnConversion(
+                    rawCall = rawCall,
+                    kotlinReturnType = e.kotlinReturnType,
+                    returnBridgeKind = e.returnBridgeKind,
+                    returnDefaultExpr = e.returnDefaultExpr,
                     pkgName = pkgName,
                     importsOut = imports,
                 )
-        } else {
-            actualBlocks +=
-                renderUnsupportedActualFunction(
-                    visibilityPrefix = fn.visibilityPrefix,
-                    kotlinName = fn.kotlinName,
-                    params = fn.params,
-                    kotlinReturnType = fn.kotlinReturnType,
-                    returnBridgeKind = fn.returnBridgeKind,
-                    isVariadic = fn.isVariadic,
-                    message = "Native FFI addon is not available",
-                )
-        }
-    }
-    for (fn in inlineFunctions) {
-        if (!emittedActuals.add("fn:${fn.kotlinName}:${fn.params.size}")) continue
-        val inlineNoStrConv = requiresNoStringConversionForInline(fn.params)
-        if (isBridgeableInlineInCWrapper(fn)) {
-            usesAddon = true
-            actualBlocks +=
-                renderJsActualFunction(
-                    visibilityPrefix = fn.visibilityPrefix,
-                    kotlinName = fn.kotlinName,
-                    addonPropName = addonPropName,
-                    wrapperSymbolName = fn.wrapperSymbolName,
-                    params = fn.params,
-                    kotlinReturnType = fn.kotlinReturnType,
-                    returnBridgeKind = fn.returnBridgeKind,
-                    returnDefaultExpr = fn.returnDefaultExpr,
-                    noStringConvEnabled = inlineNoStrConv,
-                    isVariadic = false,
-                    pkgName = pkgName,
-                    importsOut = imports,
-                )
-        } else {
-            actualBlocks +=
-                renderUnsupportedActualFunction(
-                    visibilityPrefix = fn.visibilityPrefix,
-                    kotlinName = fn.kotlinName,
-                    params = fn.params,
-                    kotlinReturnType = fn.kotlinReturnType,
-                    returnBridgeKind = fn.returnBridgeKind,
-                    isVariadic = fn.isVariadic,
-                    message = "Native FFI addon is not available",
-                )
-        }
+            },
+        )
     }
 
-    if (usesAddon) {
+    override fun prependPreambleBlocks(blocks: MutableList<String>) {
+        if (!usesAddon) return
         val jsExpr = "(function() { ${buildNodeNapiLoaderJsBody(ffiModName, returnBooleanStatus = false)}})()"
-        actualBlocks.add(0, "private val $addonPropName: dynamic =\n    js(\"$jsExpr\")")
+        blocks.add(0, "private val $addonPropName: dynamic =\n    js(\"$jsExpr\")")
     }
-
-    return finalizeActualsKotlinFile(sb, actualBlocks, imports, pkgName)
 }
 
 internal fun FfiInteropCollector.renderJsOrWasmParamConversion(
@@ -793,72 +696,6 @@ internal fun FfiInteropCollector.renderJsReturnConversion(
     )
 }
 
-internal fun FfiInteropCollector.renderJsStaticActualProperty(
-    st: ForeignStaticInteropSpec,
-    addonPropName: String,
-    pkgName: String?,
-    importsOut: MutableSet<String>,
-): String {
-    val rawGet = "$addonPropName.${st.getterWrapperSymbolName}()"
-    val convertedGet = renderJsReturnConversion(rawGet, st.kotlinType, st.bridgeKind, st.defaultExpr, pkgName, importsOut)
-    val getExpr = "if ($addonPropName != null) $convertedGet else throw UnsupportedOperationException(\"Native FFI addon is not available\")"
-    return if (st.isMutable) {
-        val valParam = InteropParamSpec(kotlinName = "value", kotlinType = st.kotlinType, cName = "value", bridgeKind = st.bridgeKind)
-        val setArg = renderJsOrWasmParamConversion(valParam, noStringConvEnabled = true)
-        "${st.visibilityPrefix}actual var ${st.kotlinName}: ${st.kotlinType}\n" +
-            "    get() = $getExpr\n" +
-            "    set(value) {\n" +
-            "        if ($addonPropName != null) {\n" +
-            "            $addonPropName.${st.setterWrapperSymbolName}($setArg)\n" +
-            "        } else {\n" +
-            "            throw UnsupportedOperationException(\"Native FFI addon is not available\")\n" +
-            "        }\n" +
-            "    }"
-    } else {
-        "${st.visibilityPrefix}actual val ${st.kotlinName}: ${st.kotlinType}\n" +
-            "    get() = $getExpr"
-    }
-}
-
-internal fun FfiInteropCollector.renderJsActualFunction(
-    visibilityPrefix: String,
-    kotlinName: String,
-    addonPropName: String,
-    wrapperSymbolName: String,
-    params: List<InteropParamSpec>,
-    kotlinReturnType: String,
-    returnBridgeKind: CAbiBridgeKind,
-    returnDefaultExpr: String,
-    noStringConvEnabled: Boolean,
-    isVariadic: Boolean,
-    pkgName: String?,
-    importsOut: MutableSet<String>,
-): String {
-    val baseArgs = params.map { renderJsOrWasmParamConversion(it, noStringConvEnabled) }
-    val allArgs = if (isVariadic) appendVariadicKotlinArgs(baseArgs, stringifyArgs = true) else baseArgs
-    val rawCall = "$addonPropName.$wrapperSymbolName(${allArgs.joinToString(", ")})"
-    val convertedCall =
-        renderJsReturnConversion(
-            rawCall = rawCall,
-            kotlinReturnType = kotlinReturnType,
-            returnBridgeKind = returnBridgeKind,
-            returnDefaultExpr = returnDefaultExpr,
-            pkgName = pkgName,
-            importsOut = importsOut,
-        )
-    return renderActualFunctionDecl(
-        visibilityPrefix = visibilityPrefix,
-        kotlinName = kotlinName,
-        params = params,
-        kotlinReturnType = kotlinReturnType,
-        returnBridgeKind = returnBridgeKind,
-        isVariadic = isVariadic,
-        rawCall = rawCall,
-        bodyExpr = convertedCall,
-        addonAvailabilityGuard = "$addonPropName != null",
-    )
-}
-
 internal fun FfiInteropCollector.buildNapiCppSourceContent(stemSnake: String): String {
     val sb = StringBuilder()
     sb.append("#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n")
@@ -883,15 +720,7 @@ internal fun FfiInteropCollector.buildNapiCppSourceContent(stemSnake: String): S
         }
     }
 
-    sb.append("struct KmNapiRegistrarNode {\n")
-    sb.append("    void (*register_fn)(Napi::Env, Napi::Object);\n")
-    sb.append("    KmNapiRegistrarNode* next;\n")
-    sb.append("};\n")
-    sb.append("#if defined(__GNUC__) || defined(__clang__)\n")
-    sb.append("__attribute__((visibility(\"hidden\")))\n")
-    sb.append("#endif\n")
-    sb.append("extern KmNapiRegistrarNode* km_napi_registrar_head;\n\n")
-
+    sb.append(renderNapiRegistrarHeader()).append("\n\n")
     sb.append("namespace {\n\n")
     sb.append("static int64_t km_napi_arg_i64(const Napi::Value& v) {\n")
     sb.append("    if (v.IsNull() || v.IsUndefined()) return 0;\n")
@@ -943,28 +772,7 @@ internal fun FfiInteropCollector.buildNapiCppSourceContent(stemSnake: String): S
         }
     }
     sb.append("}\n\n")
-    sb.append("static KmNapiRegistrarNode registrar_node = { &$registerFnName, nullptr };\n")
-    sb.append("struct KmNapiAutoRegister {\n")
-    sb.append("    KmNapiAutoRegister() {\n")
-    sb.append("        registrar_node.next = km_napi_registrar_head;\n")
-    sb.append("        km_napi_registrar_head = &registrar_node;\n")
-    sb.append("    }\n")
-    sb.append("};\n")
-    sb.append("static KmNapiAutoRegister auto_register_instance;\n\n")
-    sb.append("} // namespace\n\n")
-    sb.append("#ifdef KM_NAPI_STANDALONE_MODULE\n")
-    sb.append("#if defined(__GNUC__) || defined(__clang__)\n")
-    sb.append("__attribute__((visibility(\"hidden\")))\n")
-    sb.append("#endif\n")
-    sb.append("KmNapiRegistrarNode* km_napi_registrar_head = nullptr;\n")
-    sb.append("static Napi::Object KmNapiStandaloneInit(Napi::Env env, Napi::Object exports) {\n")
-    sb.append("    for (KmNapiRegistrarNode* cur = km_napi_registrar_head; cur != nullptr; cur = cur->next) {\n")
-    sb.append("        cur->register_fn(env, exports);\n")
-    sb.append("    }\n")
-    sb.append("    return exports;\n")
-    sb.append("}\n")
-    sb.append("NODE_API_MODULE(NODE_GYP_MODULE_NAME, KmNapiStandaloneInit)\n")
-    sb.append("#endif\n")
+    sb.append(renderNapiRegistrarFooter(registerFnName)).append('\n')
     return sb.toString()
 }
 
@@ -1088,7 +896,6 @@ internal fun renderNapiForeignFunction(fn: ForeignFnInteropSpec): String {
     }
 
     val callArgs = fn.params.joinToString(", ") { it.cName }
-    val symEsc = escapeCString(fn.cSymbolName)
     val isAtexit = isAtexitForeignFn(fn)
     if (isAtexit) {
         val cbName = fn.params[0].cName
@@ -1101,40 +908,15 @@ internal fun renderNapiForeignFunction(fn: ForeignFnInteropSpec): String {
         sb.append("    return Napi::Number::New(km_env, static_cast<int32_t>(km_res));\n")
         sb.append("#else\n")
     }
-    if (fn.dllName != null) {
-        sb.append("#ifdef _WIN32\n")
-        sb.append("    typedef $cRet (${if (fn.isVariadic) "" else "__stdcall "}*km_fn_t)($cParamTypes);\n")
-        sb.append("    static km_fn_t km_fn_ptr = nullptr;\n")
-        sb.append("    if (km_fn_ptr == nullptr) {\n")
-        sb.append("        HMODULE km_h_mod = LoadLibraryA(\"${escapeCString(fn.dllName)}\");\n")
-        sb.append("        if (km_h_mod != nullptr) km_fn_ptr = reinterpret_cast<km_fn_t>(reinterpret_cast<void*>(GetProcAddress(km_h_mod, \"$symEsc\")));\n")
-        sb.append("    }\n")
-        appendDynamicFunctionDispatch(sb, fn, cRet, callArgs, hasReturn, isCpp = true)
-        sb.append("#else\n")
-        for (p in fn.params) {
-            sb.append("    (void)${p.cName};\n")
-        }
-        if (fn.isVariadic) {
-            sb.append("    (void)km_vac; (void)km_va0; (void)km_va1; (void)km_va2; (void)km_va3;\n")
-        }
-        sb.append("    errno = ENOSYS;\n")
-        if (hasReturn) {
-            sb.append("    $cRet km_res = ${cFailureReturnExpr(fn, isCpp = true)};\n")
-        }
-        sb.append("#endif\n")
-    } else {
-        sb.append("    typedef $cRet (*km_fn_t)($cParamTypes);\n")
-        appendDynamicSymbolLookupBlock(
-            sb = sb,
-            ptrVarName = "km_fn_ptr",
-            ptrTypeDecl = "km_fn_t",
-            castTargetType = "km_fn_t",
-            cSymbolName = fn.cSymbolName,
-            isCpp = true,
-            extraPosixFallback = { appendPosixDynamicLookupFallbacks(it, fn, isCpp = true) },
-        )
-        appendDynamicFunctionDispatch(sb, fn, cRet, callArgs, hasReturn, isCpp = true)
-    }
+    appendDynamicOrWin32DllDispatchBlock(
+        sb = sb,
+        fn = fn,
+        cRet = cRet,
+        cParamTypes = cParamTypes,
+        callArgs = callArgs,
+        hasReturn = hasReturn,
+        isCpp = true,
+    )
 
     sb.append(renderNapiReturnStatement(fn.returnBridgeKind))
     if (isAtexit) {
