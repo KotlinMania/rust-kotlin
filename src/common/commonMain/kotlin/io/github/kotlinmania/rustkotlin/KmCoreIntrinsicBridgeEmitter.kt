@@ -17,7 +17,9 @@ internal enum class KmScalarType(
     U64("ULong", "Long", "jlong", "uint64_t", napiSlots = 2),
     I32("Int", "Int", "jint", "int32_t"),
     U32("UInt", "Int", "jint", "uint32_t"),
+    I16("Short", "Short", "jshort", "int16_t"),
     U16("UShort", "Short", "jshort", "uint16_t"),
+    I8("Byte", "Byte", "jbyte", "int8_t"),
     U8("UByte", "Byte", "jbyte", "uint8_t"),
     F32("Float", "Float", "jfloat", "float"),
     F64("Double", "Double", "jdouble", "double"),
@@ -47,7 +49,9 @@ internal enum class KmScalarType(
             U64 -> "kmCoreNapiArgU64Pair(info, $slotIdx)"
             I32 -> "kmCoreNapiArgI32(info[$slotIdx])"
             U32 -> "kmCoreNapiArgU32(info[$slotIdx])"
+            I16 -> "static_cast<int16_t>(kmCoreNapiArgI32(info[$slotIdx]))"
             U16 -> "static_cast<uint16_t>(kmCoreNapiArgU32(info[$slotIdx]))"
+            I8 -> "static_cast<int8_t>(kmCoreNapiArgI32(info[$slotIdx]))"
             U8 -> "static_cast<uint8_t>(kmCoreNapiArgU32(info[$slotIdx]))"
             F32 -> "static_cast<float>(info[$slotIdx].As<Napi::Number>().DoubleValue())"
             F64 -> "info[$slotIdx].As<Napi::Number>().DoubleValue()"
@@ -58,7 +62,7 @@ internal enum class KmScalarType(
         when (this) {
             I64 -> "lo32($paramName), hi32($paramName)"
             U64 -> "uLo32($paramName), uHi32($paramName)"
-            U32, U16, U8 -> "$paramName.toInt()"
+            U32, I16, U16, I8, U8 -> "$paramName.toInt()"
             F32 -> "$paramName.toDouble()"
             I32, F64 -> paramName
             VOID, NEVER -> error("Void/never cannot be a JS argument")
@@ -68,7 +72,7 @@ internal enum class KmScalarType(
         when (this) {
             I64, U64 -> listOf("${paramName}Lo" to "Int", "${paramName}Hi" to "Int")
             F32, F64 -> listOf(paramName to "Double")
-            I32, U32, U16, U8 -> listOf(paramName to "Int")
+            I32, U32, I16, U16, I8, U8 -> listOf(paramName to "Int")
             VOID, NEVER -> emptyList()
         }
 
@@ -99,6 +103,29 @@ internal sealed class KmBaseIntrinsicSpec {
     }
 
     data object AtomicCxchgU128 : KmBaseIntrinsicSpec()
+
+    data class U128Out2(
+        val name: String,
+        val params: List<Pair<String, KmScalarType>>,
+        val outcomeType: String,
+        val arenaExpr: String,
+    ) : KmBaseIntrinsicSpec()
+
+    data class WithOverflow(
+        val opStem: String,
+        val width: CoreIntrinsicMathAndBitSpecs.IntWidthKind,
+    ) : KmBaseIntrinsicSpec() {
+        val name: String = "km${opStem}WithOverflow${width.widthTag}"
+        val outcomeName: String = "Overflow${width.widthTag}Outcome"
+        val arenaFn: String = name.removePrefix("km").replaceFirstChar { it.lowercase() }
+    }
+
+    data class U128DivRem(
+        val name: String,
+        val outcomeType: String,
+    ) : KmBaseIntrinsicSpec() {
+        val arenaFn: String = name.removePrefix("km").replaceFirstChar { it.lowercase() }
+    }
 }
 
 internal val KM_BASE_INTRINSIC_SPECS: List<KmBaseIntrinsicSpec> =
@@ -189,6 +216,12 @@ internal abstract class KmCoreIntrinsicBridgeEmitter {
 
     protected abstract fun emitAtomicCxchgU128(out: StringBuilder)
 
+    protected abstract fun emitU128Out2(out: StringBuilder, spec: KmBaseIntrinsicSpec.U128Out2)
+
+    protected abstract fun emitWithOverflow(out: StringBuilder, spec: KmBaseIntrinsicSpec.WithOverflow)
+
+    protected abstract fun emitU128DivRem(out: StringBuilder, spec: KmBaseIntrinsicSpec.U128DivRem)
+
     fun renderDeclarations(specs: List<KmBaseIntrinsicSpec> = KM_BASE_INTRINSIC_SPECS): String =
         buildString {
             for (spec in specs) {
@@ -196,6 +229,9 @@ internal abstract class KmCoreIntrinsicBridgeEmitter {
                     is KmBaseIntrinsicSpec.Regular -> emitRegular(this, spec)
                     is KmBaseIntrinsicSpec.AtomicCxchg -> emitAtomicCxchg(this, spec)
                     KmBaseIntrinsicSpec.AtomicCxchgU128 -> emitAtomicCxchgU128(this)
+                    is KmBaseIntrinsicSpec.U128Out2 -> emitU128Out2(this, spec)
+                    is KmBaseIntrinsicSpec.WithOverflow -> emitWithOverflow(this, spec)
+                    is KmBaseIntrinsicSpec.U128DivRem -> emitU128DivRem(this, spec)
                 }
             }
         }.trimEnd()
@@ -221,6 +257,23 @@ internal object KmExpectBridgeEmitter : KmCoreIntrinsicBridgeEmitter() {
         out.appendLine(
             "public expect fun kmAtomicCxchgU128Pair(addr: Long, expLo: ULong, expHi: ULong, desLo: ULong, desHi: ULong): AtomicCxchgU128Outcome",
         )
+    }
+
+    override fun emitU128Out2(out: StringBuilder, spec: KmBaseIntrinsicSpec.U128Out2) {
+        out.appendLine("public expect fun ${spec.name}(${formatKotlinParamList(spec.params)}): ${spec.outcomeType}")
+    }
+
+    override fun emitWithOverflow(out: StringBuilder, spec: KmBaseIntrinsicSpec.WithOverflow) {
+        val w = spec.width
+        if (w.bits < 128) {
+            out.appendLine("public expect fun ${spec.name}(a: ${w.ktType}, b: ${w.ktType}): ${spec.outcomeName}")
+        } else {
+            out.appendLine("public expect fun ${spec.name}(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): ${spec.outcomeName}")
+        }
+    }
+
+    override fun emitU128DivRem(out: StringBuilder, spec: KmBaseIntrinsicSpec.U128DivRem) {
+        out.appendLine("public expect fun ${spec.name}(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): ${spec.outcomeType}")
     }
 }
 
@@ -274,6 +327,80 @@ public actual fun kmAtomicCxchgU128Pair(
             """.trim(),
         )
     }
+
+    override fun emitU128Out2(out: StringBuilder, spec: KmBaseIntrinsicSpec.U128Out2) {
+        val callArgs = (spec.params.map { it.first } + listOf("outLo.ptr", "outHi.ptr")).joinToString(", ")
+        out.appendLine(
+            """
+public actual fun ${spec.name}(${formatKotlinParamList(spec.params)}): ${spec.outcomeType} =
+    memScoped {
+        val outLo = alloc<ULongVar>()
+        val outHi = alloc<ULongVar>()
+        $cinteropPackage.${spec.name}Out($callArgs)
+        ${spec.outcomeType}(outLo.value, outHi.value)
+    }
+            """.trim(),
+        )
+    }
+
+    override fun emitWithOverflow(out: StringBuilder, spec: KmBaseIntrinsicSpec.WithOverflow) {
+        val w = spec.width
+        val fn = spec.name
+        when {
+            w.bits < 64 -> {
+                val unwrap = "packed.to${w.ktType}()"
+                out.appendLine(
+                    """
+public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): ${spec.outcomeName} {
+    val packed = $cinteropPackage.${fn}Packed(a, b)
+    return ${spec.outcomeName}($unwrap, (packed shr 32) != 0uL)
+}
+                    """.trim(),
+                )
+            }
+            w.bits == 64 -> {
+                val varType = if (w.signed) "LongVar" else "ULongVar"
+                out.appendLine(
+                    """
+public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): ${spec.outcomeName} =
+    memScoped {
+        val outVal = alloc<$varType>()
+        val ovf = $cinteropPackage.${fn}Out(a, b, outVal.ptr)
+        ${spec.outcomeName}(outVal.value, ovf != 0u.toUByte())
+    }
+                    """.trim(),
+                )
+            }
+            else ->
+                out.appendLine(
+                    """
+public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): ${spec.outcomeName} =
+    memScoped {
+        val outLo = alloc<ULongVar>()
+        val outHi = alloc<ULongVar>()
+        val ovf = $cinteropPackage.${fn}Out(aLo, aHi, bLo, bHi, outLo.ptr, outHi.ptr)
+        ${spec.outcomeName}(outLo.value, outHi.value, ovf != 0u.toUByte())
+    }
+                    """.trim(),
+                )
+        }
+    }
+
+    override fun emitU128DivRem(out: StringBuilder, spec: KmBaseIntrinsicSpec.U128DivRem) {
+        out.appendLine(
+            """
+public actual fun ${spec.name}(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): ${spec.outcomeType} =
+    memScoped {
+        val qLo = alloc<ULongVar>()
+        val qHi = alloc<ULongVar>()
+        val rLo = alloc<ULongVar>()
+        val rHi = alloc<ULongVar>()
+        $cinteropPackage.${spec.name}Out(aLo, aHi, bLo, bHi, qLo.ptr, qHi.ptr, rLo.ptr, rHi.ptr)
+        ${spec.outcomeType}(qLo.value, qHi.value, rLo.value, rHi.value)
+    }
+            """.trim(),
+        )
+    }
 }
 
 internal class KmJvmBridgeEmitter(
@@ -298,6 +425,20 @@ internal class KmJvmBridgeEmitter(
                     }
                     KmBaseIntrinsicSpec.AtomicCxchgU128 ->
                         appendLine("    @JvmStatic external fun kmAtomicCxchgU128Out(addr: Long, expLo: Long, expHi: Long, desLo: Long, desHi: Long, outBuf: LongArray)")
+                    is KmBaseIntrinsicSpec.U128Out2 -> {
+                        val params = (spec.params.map { (n, t) -> "$n: ${t.jvmKtType}" } + "outBuf: LongArray").joinToString(", ")
+                        appendLine("    @JvmStatic external fun ${spec.name}Out($params)")
+                    }
+                    is KmBaseIntrinsicSpec.WithOverflow -> {
+                        val w = spec.width
+                        when {
+                            w.bits < 64 -> appendLine("    @JvmStatic external fun ${spec.name}Packed(a: ${w.jniField}, b: ${w.jniField}): Long")
+                            w.bits == 64 -> appendLine("    @JvmStatic external fun ${spec.name}Out(a: Long, b: Long, outBuf: LongArray)")
+                            else -> appendLine("    @JvmStatic external fun ${spec.name}Out(aLo: Long, aHi: Long, bLo: Long, bHi: Long, outBuf: LongArray)")
+                        }
+                    }
+                    is KmBaseIntrinsicSpec.U128DivRem ->
+                        appendLine("    @JvmStatic external fun ${spec.name}Out(aLo: Long, aHi: Long, bLo: Long, bHi: Long, outBuf: LongArray)")
                 }
             }
         }.trimEnd()
@@ -362,6 +503,75 @@ public actual fun kmAtomicCxchgU128Pair(
     val outBuf = LongArray(3)
     $jniObjectName.kmAtomicCxchgU128Out(addr, expLo.toLong(), expHi.toLong(), desLo.toLong(), desHi.toLong(), outBuf)
     return AtomicCxchgU128Outcome(outBuf[0].toULong(), outBuf[1].toULong(), outBuf[2] != 0L)
+}
+            """.trim(),
+        )
+    }
+
+    override fun emitU128Out2(out: StringBuilder, spec: KmBaseIntrinsicSpec.U128Out2) {
+        val callArgs = (spec.params.map { (n, t) -> t.toJvmArg(n) } + "outBuf").joinToString(", ")
+        out.appendLine(
+            """
+public actual fun ${spec.name}(${formatKotlinParamList(spec.params)}): ${spec.outcomeType} {
+    val outBuf = LongArray(2)
+    $jniObjectName.${spec.name}Out($callArgs)
+    return ${spec.outcomeType}(outBuf[0].toULong(), outBuf[1].toULong())
+}
+            """.trim(),
+        )
+    }
+
+    override fun emitWithOverflow(out: StringBuilder, spec: KmBaseIntrinsicSpec.WithOverflow) {
+        val w = spec.width
+        val fn = spec.name
+        when {
+            w.bits < 64 -> {
+                val aExpr = if (w.signed) "a" else "a.to${w.jniField}()"
+                val bExpr = if (w.signed) "b" else "b.to${w.jniField}()"
+                val vConv = "packed.to${w.ktType}()"
+                out.appendLine(
+                    """
+public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): ${spec.outcomeName} {
+    val packed = $jniObjectName.${fn}Packed($aExpr, $bExpr)
+    return ${spec.outcomeName}($vConv, (packed ushr 32) != 0L)
+}
+                    """.trim(),
+                )
+            }
+            w.bits == 64 -> {
+                val aExpr = if (w.signed) "a" else "a.toLong()"
+                val bExpr = if (w.signed) "b" else "b.toLong()"
+                val outConv = if (w.signed) "outBuf[0]" else "outBuf[0].toULong()"
+                out.appendLine(
+                    """
+public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): ${spec.outcomeName} {
+    val outBuf = LongArray(2)
+    $jniObjectName.${fn}Out($aExpr, $bExpr, outBuf)
+    return ${spec.outcomeName}($outConv, outBuf[1] != 0L)
+}
+                    """.trim(),
+                )
+            }
+            else ->
+                out.appendLine(
+                    """
+public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): ${spec.outcomeName} {
+    val outBuf = LongArray(3)
+    $jniObjectName.${fn}Out(aLo.toLong(), aHi.toLong(), bLo.toLong(), bHi.toLong(), outBuf)
+    return ${spec.outcomeName}(outBuf[0].toULong(), outBuf[1].toULong(), outBuf[2] != 0L)
+}
+                    """.trim(),
+                )
+        }
+    }
+
+    override fun emitU128DivRem(out: StringBuilder, spec: KmBaseIntrinsicSpec.U128DivRem) {
+        out.appendLine(
+            """
+public actual fun ${spec.name}(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): ${spec.outcomeType} {
+    val outBuf = LongArray(4)
+    $jniObjectName.${spec.name}Out(aLo.toLong(), aHi.toLong(), bLo.toLong(), bHi.toLong(), outBuf)
+    return ${spec.outcomeType}(outBuf[0].toULong(), outBuf[1].toULong(), outBuf[2].toULong(), outBuf[3].toULong())
 }
             """.trim(),
         )
@@ -449,6 +659,87 @@ JNIEXPORT void JNICALL KM_JNI_FN(kmAtomicCxchgU128Out)(
             """.trim(),
         )
     }
+
+    override fun emitU128Out2(out: StringBuilder, spec: KmBaseIntrinsicSpec.U128Out2) {
+        val jniParams = spec.params.joinToString(", ") { (n, t) -> "${t.jniCType} $n" }
+        val cArgs = (spec.params.map { (n, t) -> "(${t.cType})$n" } + listOf("&outLo", "&outHi")).joinToString(", ")
+        out.appendLine(
+            """
+JNIEXPORT void JNICALL KM_JNI_FN(${spec.name}Out)(JNIEnv* env, jclass clazz, $jniParams, jlongArray outBuf) {
+    (void)clazz;
+    uint64_t outLo = 0ULL, outHi = 0ULL;
+    ${spec.name}Out($cArgs);
+    jlong buf[2];
+    buf[0] = (jlong)outLo;
+    buf[1] = (jlong)outHi;
+    (*env)->SetLongArrayRegion(env, outBuf, 0, 2, buf);
+}
+            """.trim(),
+        )
+    }
+
+    override fun emitWithOverflow(out: StringBuilder, spec: KmBaseIntrinsicSpec.WithOverflow) {
+        val w = spec.width
+        val fn = spec.name
+        when {
+            w.bits < 64 ->
+                out.appendLine(
+                    """
+JNIEXPORT jlong JNICALL KM_JNI_FN(${fn}Packed)(JNIEnv* env, jclass clazz, ${w.jniType} a, ${w.jniType} b) {
+    (void)env; (void)clazz;
+    return (jlong)${fn}Packed((${w.cType})a, (${w.cType})b);
+}
+                    """.trim(),
+                )
+            w.bits == 64 ->
+                out.appendLine(
+                    """
+JNIEXPORT void JNICALL KM_JNI_FN(${fn}Out)(JNIEnv* env, jclass clazz, jlong a, jlong b, jlongArray outBuf) {
+    (void)clazz;
+    ${w.cType} res = 0;
+    uint8_t ovf = ${fn}Out((${w.cType})a, (${w.cType})b, &res);
+    jlong buf[2];
+    buf[0] = (jlong)res;
+    buf[1] = (jlong)(uint64_t)ovf;
+    (*env)->SetLongArrayRegion(env, outBuf, 0, 2, buf);
+}
+                    """.trim(),
+                )
+            else ->
+                out.appendLine(
+                    """
+JNIEXPORT void JNICALL KM_JNI_FN(${fn}Out)(JNIEnv* env, jclass clazz, jlong aLo, jlong aHi, jlong bLo, jlong bHi, jlongArray outBuf) {
+    (void)clazz;
+    uint64_t outLo = 0ULL, outHi = 0ULL;
+    uint8_t ovf = ${fn}Out((uint64_t)aLo, (uint64_t)aHi, (uint64_t)bLo, (uint64_t)bHi, &outLo, &outHi);
+    jlong buf[3];
+    buf[0] = (jlong)outLo;
+    buf[1] = (jlong)outHi;
+    buf[2] = (jlong)(uint64_t)ovf;
+    (*env)->SetLongArrayRegion(env, outBuf, 0, 3, buf);
+}
+                    """.trim(),
+                )
+        }
+    }
+
+    override fun emitU128DivRem(out: StringBuilder, spec: KmBaseIntrinsicSpec.U128DivRem) {
+        out.appendLine(
+            """
+JNIEXPORT void JNICALL KM_JNI_FN(${spec.name}Out)(JNIEnv* env, jclass clazz, jlong aLo, jlong aHi, jlong bLo, jlong bHi, jlongArray outBuf) {
+    (void)clazz;
+    uint64_t qLo = 0ULL, qHi = 0ULL, rLo = 0ULL, rHi = 0ULL;
+    ${spec.name}Out((uint64_t)aLo, (uint64_t)aHi, (uint64_t)bLo, (uint64_t)bHi, &qLo, &qHi, &rLo, &rHi);
+    jlong buf[4];
+    buf[0] = (jlong)qLo;
+    buf[1] = (jlong)qHi;
+    buf[2] = (jlong)rLo;
+    buf[3] = (jlong)rHi;
+    (*env)->SetLongArrayRegion(env, outBuf, 0, 4, buf);
+}
+            """.trim(),
+        )
+    }
 }
 
 internal object KmNapiCppBridgeEmitter : KmCoreIntrinsicBridgeEmitter() {
@@ -468,7 +759,7 @@ internal object KmNapiCppBridgeEmitter : KmCoreIntrinsicBridgeEmitter() {
                 KmScalarType.I64 -> "return kmCoreReturnI64LoHi(info, $callExpr);"
                 KmScalarType.U64 -> "return kmCoreReturnU64LoHi(info, $callExpr);"
                 KmScalarType.I32 -> "return Napi::Number::New(info.Env(), $callExpr);"
-                KmScalarType.U32, KmScalarType.U16, KmScalarType.U8 ->
+                KmScalarType.U32, KmScalarType.I16, KmScalarType.U16, KmScalarType.I8, KmScalarType.U8 ->
                     "return Napi::Number::New(info.Env(), static_cast<int32_t>($callExpr));"
                 KmScalarType.F32 -> "return Napi::Number::New(info.Env(), static_cast<double>($callExpr));"
                 KmScalarType.F64 -> "return Napi::Number::New(info.Env(), $callExpr);"
@@ -540,6 +831,86 @@ internal object KmNapiCppBridgeEmitter : KmCoreIntrinsicBridgeEmitter() {
             """.trimIndent(),
         )
     }
+
+    override fun emitU128Out2(out: StringBuilder, spec: KmBaseIntrinsicSpec.U128Out2) {
+        var slot = 0
+        val argExprs =
+            spec.params.map { (_, t) ->
+                val expr = t.napiExtractArg(slot)
+                slot += t.napiSlots
+                expr
+            }
+        val cArgs = (argExprs + listOf("&outLo", "&outHi")).joinToString(", ")
+        out.appendLine(
+            """
+    coreObj.Set("${spec.name}", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
+        uint64_t outLo = 0ULL, outHi = 0ULL;
+        ${spec.name}Out($cArgs);
+        kmCoreStoreU64Scratch(0, outLo);
+        kmCoreStoreU64Scratch(2, outHi);
+        return Napi::Number::New(info.Env(), g_kmCoreOutScratch[0]);
+    }));
+            """.trimIndent(),
+        )
+    }
+
+    override fun emitWithOverflow(out: StringBuilder, spec: KmBaseIntrinsicSpec.WithOverflow) {
+        val w = spec.width
+        val fn = spec.name
+        when {
+            w.bits < 64 -> {
+                val argFn = if (w.signed) "kmCoreNapiArgI32" else "kmCoreNapiArgU32"
+                out.appendLine(
+                    """
+    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
+        return kmCoreReturnU64LoHi(info, ${fn}Packed(static_cast<${w.cType}>($argFn(info[0])), static_cast<${w.cType}>($argFn(info[1]))));
+    }));
+                    """.trimIndent(),
+                )
+            }
+            w.bits == 64 -> {
+                val argFn = if (w.signed) "kmCoreNapiArgI64Pair" else "kmCoreNapiArgU64Pair"
+                out.appendLine(
+                    """
+    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
+        ${w.cType} res = 0;
+        uint8_t ovf = ${fn}Out($argFn(info, 0), $argFn(info, 2), &res);
+        kmCoreStoreU64Scratch(0, static_cast<uint64_t>(res));
+        return Napi::Number::New(info.Env(), static_cast<int32_t>(ovf));
+    }));
+                    """.trimIndent(),
+                )
+            }
+            else ->
+                out.appendLine(
+                    """
+    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
+        uint64_t outLo = 0ULL, outHi = 0ULL;
+        uint8_t ovf = ${fn}Out(kmCoreNapiArgU64Pair(info, 0), kmCoreNapiArgU64Pair(info, 2), kmCoreNapiArgU64Pair(info, 4), kmCoreNapiArgU64Pair(info, 6), &outLo, &outHi);
+        kmCoreStoreU64Scratch(0, outLo);
+        kmCoreStoreU64Scratch(2, outHi);
+        return Napi::Number::New(info.Env(), static_cast<int32_t>(ovf));
+    }));
+                    """.trimIndent(),
+                )
+        }
+    }
+
+    override fun emitU128DivRem(out: StringBuilder, spec: KmBaseIntrinsicSpec.U128DivRem) {
+        out.appendLine(
+            """
+    coreObj.Set("${spec.name}", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
+        uint64_t qLo = 0ULL, qHi = 0ULL, rLo = 0ULL, rHi = 0ULL;
+        ${spec.name}Out(kmCoreNapiArgU64Pair(info, 0), kmCoreNapiArgU64Pair(info, 2), kmCoreNapiArgU64Pair(info, 4), kmCoreNapiArgU64Pair(info, 6), &qLo, &qHi, &rLo, &rHi);
+        kmCoreStoreU64Scratch(0, qLo);
+        kmCoreStoreU64Scratch(2, qHi);
+        kmCoreStoreU64Scratch(4, rLo);
+        kmCoreStoreU64Scratch(6, rHi);
+        return Napi::Number::New(info.Env(), g_kmCoreOutScratch[0]);
+    }));
+            """.trimIndent(),
+        )
+    }
 }
 
 internal class KmJsOrWasmBridgeEmitter(
@@ -559,11 +930,16 @@ internal class KmJsOrWasmBridgeEmitter(
     private fun invokeDouble(fn: String, args: String): String =
         if (isWasmJs) "wasmKm${fn.removePrefix("km")}($args)" else "(kmCoreNapiAddon.$fn($args) as Double)"
 
-    fun renderWasmJsFunDeclarations(specs: List<KmBaseIntrinsicSpec> = KM_BASE_INTRINSIC_SPECS): String =
+    fun renderWasmJsFunDeclarations(
+        specs: List<KmBaseIntrinsicSpec> = KM_BASE_INTRINSIC_SPECS,
+        includeScratchOutGetters: Boolean = true,
+    ): String =
         buildString {
-            for (idx in 0..7) {
-                appendLine("@JsFun(\"() => globalThis.kmCoreNapiV2.kmOut$idx()\")")
-                appendLine("private external fun wasmKmOut$idx(): Int")
+            if (includeScratchOutGetters) {
+                for (idx in 0..7) {
+                    appendLine("@JsFun(\"() => globalThis.kmCoreNapiV2.kmOut$idx()\")")
+                    appendLine("private external fun wasmKmOut$idx(): Int")
+                }
             }
             for (spec in specs) {
                 when (spec) {
@@ -593,6 +969,45 @@ internal class KmJsOrWasmBridgeEmitter(
                             }
                         appendWasmJsFun("kmAtomicCxchgU128Pair", extParams, "Int")
                     }
+                    is KmBaseIntrinsicSpec.U128Out2 -> {
+                        val extParams = spec.params.flatMap { (n, t) -> t.wasmExtParams(n) }
+                        appendWasmJsFun(spec.name, extParams, "Int")
+                    }
+                    is KmBaseIntrinsicSpec.WithOverflow -> {
+                        val w = spec.width
+                        val extParams =
+                            when {
+                                w.bits < 64 -> listOf("a" to "Int", "b" to "Int")
+                                w.bits == 64 -> listOf("aLo" to "Int", "aHi" to "Int", "bLo" to "Int", "bHi" to "Int")
+                                else ->
+                                    listOf(
+                                        "a0" to "Int",
+                                        "a1" to "Int",
+                                        "a2" to "Int",
+                                        "a3" to "Int",
+                                        "b0" to "Int",
+                                        "b1" to "Int",
+                                        "b2" to "Int",
+                                        "b3" to "Int",
+                                    )
+                            }
+                        appendWasmJsFun(spec.name, extParams, "Int")
+                    }
+                    is KmBaseIntrinsicSpec.U128DivRem ->
+                        appendWasmJsFun(
+                            spec.name,
+                            listOf(
+                                "a0" to "Int",
+                                "a1" to "Int",
+                                "a2" to "Int",
+                                "a3" to "Int",
+                                "b0" to "Int",
+                                "b1" to "Int",
+                                "b2" to "Int",
+                                "b3" to "Int",
+                            ),
+                            "Int",
+                        )
                 }
             }
         }.trimEnd()
@@ -642,8 +1057,12 @@ internal class KmJsOrWasmBridgeEmitter(
                 out.appendLine("$sig = if ($guard) ${invokeInt(spec.name, passArgs)} else ${spec.arenaExpr}")
             KmScalarType.U32 ->
                 out.appendLine("$sig = if ($guard) ${invokeInt(spec.name, passArgs)}.toUInt() else ${spec.arenaExpr}")
+            KmScalarType.I16 ->
+                out.appendLine("$sig = if ($guard) ${invokeInt(spec.name, passArgs)}.toShort() else ${spec.arenaExpr}")
             KmScalarType.U16 ->
                 out.appendLine("$sig = if ($guard) ${invokeInt(spec.name, passArgs)}.toUShort() else ${spec.arenaExpr}")
+            KmScalarType.I8 ->
+                out.appendLine("$sig = if ($guard) ${invokeInt(spec.name, passArgs)}.toByte() else ${spec.arenaExpr}")
             KmScalarType.U8 ->
                 out.appendLine("$sig = if ($guard) ${invokeInt(spec.name, passArgs)}.toUByte() else ${spec.arenaExpr}")
             KmScalarType.F32 ->
@@ -726,6 +1145,86 @@ public actual fun kmAtomicCxchgU128Pair(
             """.trim(),
         )
     }
+
+    override fun emitU128Out2(out: StringBuilder, spec: KmBaseIntrinsicSpec.U128Out2) {
+        val passArgs = spec.params.joinToString(", ") { (n, t) -> t.jsPassArgs(n) }
+        out.appendLine(
+            """
+public actual fun ${spec.name}(${formatKotlinParamList(spec.params)}): ${spec.outcomeType} =
+    if ($guard) {
+        val rLo0 = ${invokeInt(spec.name, passArgs)}
+        ${spec.outcomeType}(packU64(rLo0, ${outScratch(1)}), packU64(${outScratch(2)}, ${outScratch(3)}))
+    } else {
+        ${spec.arenaExpr}
+    }
+            """.trim(),
+        )
+    }
+
+    override fun emitWithOverflow(out: StringBuilder, spec: KmBaseIntrinsicSpec.WithOverflow) {
+        val w = spec.width
+        val fn = spec.name
+        when {
+            w.bits < 64 -> {
+                val aArg = if (w.bits == 32 && w.signed) "a" else "a.toInt()"
+                val bArg = if (w.bits == 32 && w.signed) "b" else "b.toInt()"
+                val vConv = if (w.bits == 32 && w.signed) "v" else "v${w.u32WrapSuffix}"
+                out.appendLine(
+                    """
+public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): ${spec.outcomeName} =
+    if ($guard) {
+        val v = ${invokeInt(fn, "$aArg, $bArg")}
+        ${spec.outcomeName}($vConv, ${outScratch(1)} != 0)
+    } else {
+        KmLinearMemoryArena.${spec.arenaFn}(a, b)
+    }
+                    """.trim(),
+                )
+            }
+            w.bits == 64 -> {
+                val loFn = if (w.signed) "lo32" else "uLo32"
+                val hiFn = if (w.signed) "hi32" else "uHi32"
+                val packFn = if (w.signed) "packI64" else "packU64"
+                out.appendLine(
+                    """
+public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): ${spec.outcomeName} =
+    if ($guard) {
+        val ovf = ${invokeInt(fn, "$loFn(a), $hiFn(a), $loFn(b), $hiFn(b)")} != 0
+        ${spec.outcomeName}($packFn(${outScratch(0)}, ${outScratch(1)}), ovf)
+    } else {
+        KmLinearMemoryArena.${spec.arenaFn}(a, b)
+    }
+                    """.trim(),
+                )
+            }
+            else ->
+                out.appendLine(
+                    """
+public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): ${spec.outcomeName} =
+    if ($guard) {
+        val ovf = ${invokeInt(fn, "uLo32(aLo), uHi32(aLo), uLo32(aHi), uHi32(aHi), uLo32(bLo), uHi32(bLo), uLo32(bHi), uHi32(bHi)")} != 0
+        ${spec.outcomeName}(packU64(${outScratch(0)}, ${outScratch(1)}), packU64(${outScratch(2)}, ${outScratch(3)}), ovf)
+    } else {
+        KmLinearMemoryArena.${spec.arenaFn}(aLo, aHi, bLo, bHi)
+    }
+                    """.trim(),
+                )
+        }
+    }
+
+    override fun emitU128DivRem(out: StringBuilder, spec: KmBaseIntrinsicSpec.U128DivRem) {
+        out.appendLine(
+            """
+public actual fun ${spec.name}(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): ${spec.outcomeType} =
+    if ($guard) {
+        val qLo0 = ${invokeInt(spec.name, "uLo32(aLo), uHi32(aLo), uLo32(aHi), uHi32(aHi), uLo32(bLo), uHi32(bLo), uLo32(bHi), uHi32(bHi)")}
+        ${spec.outcomeType}(packU64(qLo0, ${outScratch(1)}), packU64(${outScratch(2)}, ${outScratch(3)}), packU64(${outScratch(4)}, ${outScratch(5)}), packU64(${outScratch(6)}, ${outScratch(7)}))
+    } else {
+        KmLinearMemoryArena.${spec.arenaFn}(aLo, aHi, bLo, bHi)
+    }
+            """.trim(),
+        )
+    }
 }
 
 internal object KmWasmWasiBridgeEmitter : KmCoreIntrinsicBridgeEmitter() {
@@ -755,5 +1254,22 @@ internal object KmWasmWasiBridgeEmitter : KmCoreIntrinsicBridgeEmitter() {
         out.appendLine(
             "public actual fun kmAtomicCxchgU128Pair(addr: Long, expLo: ULong, expHi: ULong, desLo: ULong, desHi: ULong): AtomicCxchgU128Outcome = KmLinearMemoryArena.atomicCxchgU128Pair(addr, expLo, expHi, desLo, desHi)",
         )
+    }
+
+    override fun emitU128Out2(out: StringBuilder, spec: KmBaseIntrinsicSpec.U128Out2) {
+        out.appendLine("public actual fun ${spec.name}(${formatKotlinParamList(spec.params)}): ${spec.outcomeType} = ${spec.arenaExpr}")
+    }
+
+    override fun emitWithOverflow(out: StringBuilder, spec: KmBaseIntrinsicSpec.WithOverflow) {
+        val w = spec.width
+        if (w.bits < 128) {
+            out.appendLine("public actual fun ${spec.name}(a: ${w.ktType}, b: ${w.ktType}): ${spec.outcomeName} = KmLinearMemoryArena.${spec.arenaFn}(a, b)")
+        } else {
+            out.appendLine("public actual fun ${spec.name}(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): ${spec.outcomeName} = KmLinearMemoryArena.${spec.arenaFn}(aLo, aHi, bLo, bHi)")
+        }
+    }
+
+    override fun emitU128DivRem(out: StringBuilder, spec: KmBaseIntrinsicSpec.U128DivRem) {
+        out.appendLine("public actual fun ${spec.name}(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): ${spec.outcomeType} = KmLinearMemoryArena.${spec.arenaFn}(aLo, aHi, bLo, bHi)")
     }
 }

@@ -19,29 +19,27 @@ internal object CoreIntrinsicMathAndBitSpecs {
         val ktType: String,
         val jniType: String,
         val jniField: String,
-        val ktMaskSuffix: String,
         val u32WrapSuffix: String,
     ) {
-        U8("U8", 8, false, "uint8_t", "UByte", "jbyte", "Byte", "0xFF", ".toUByte()"),
-        U16("U16", 16, false, "uint16_t", "UShort", "jshort", "Short", "0xFFFF", ".toUShort()"),
-        U32("U32", 32, false, "uint32_t", "UInt", "jint", "Int", "", ".toUInt()"),
-        U64("U64", 64, false, "uint64_t", "ULong", "jlong", "Long", "", ".toULong()"),
-        U128("U128", 128, false, "uint64_t", "U128ValueOutcome", "jlong", "Long", "", ""),
-        I8("I8", 8, true, "int8_t", "Byte", "jbyte", "Byte", "0xFF", ".toByte()"),
-        I16("I16", 16, true, "int16_t", "Short", "jshort", "Short", "0xFFFF", ".toShort()"),
-        I32("I32", 32, true, "int32_t", "Int", "jint", "Int", "", ""),
-        I64("I64", 64, true, "int64_t", "Long", "jlong", "Long", "", ""),
-        I128("I128", 128, true, "int64_t", "I128ValueOutcome", "jlong", "Long", "", ""),
+        U8("U8", 8, false, "uint8_t", "UByte", "jbyte", "Byte", ".toUByte()"),
+        U16("U16", 16, false, "uint16_t", "UShort", "jshort", "Short", ".toUShort()"),
+        U32("U32", 32, false, "uint32_t", "UInt", "jint", "Int", ".toUInt()"),
+        U64("U64", 64, false, "uint64_t", "ULong", "jlong", "Long", ".toULong()"),
+        U128("U128", 128, false, "uint64_t", "U128ValueOutcome", "jlong", "Long", ""),
+        I8("I8", 8, true, "int8_t", "Byte", "jbyte", "Byte", ".toByte()"),
+        I16("I16", 16, true, "int16_t", "Short", "jshort", "Short", ".toShort()"),
+        I32("I32", 32, true, "int32_t", "Int", "jint", "Int", ""),
+        I64("I64", 64, true, "int64_t", "Long", "jlong", "Long", ""),
+        I128("I128", 128, true, "int64_t", "I128ValueOutcome", "jlong", "Long", ""),
     }
 
     internal enum class OverflowOpKind(
         val stem: String,
-        val opSymbol: String,
         val builtinName: String,
     ) {
-        ADD("Add", "+", "__builtin_add_overflow"),
-        SUB("Sub", "-", "__builtin_sub_overflow"),
-        MUL("Mul", "*", "__builtin_mul_overflow"),
+        ADD("Add", "__builtin_add_overflow"),
+        SUB("Sub", "__builtin_sub_overflow"),
+        MUL("Mul", "__builtin_mul_overflow"),
     }
 
     internal enum class UnaryBitKind(
@@ -165,15 +163,6 @@ internal object CoreIntrinsicMathAndBitSpecs {
             else -> "uint64_t"
         }
 
-    private fun smallWidthKtReturnFromU32(width: Int): String =
-        when (width) {
-            8 -> "UByte"
-            16 -> "UShort"
-            32 -> "UInt"
-            64 -> "ULong"
-            else -> "U128ValueOutcome"
-        }
-
     private fun smallWidthCType(width: Int): String =
         when (width) {
             8 -> "uint8_t"
@@ -181,22 +170,6 @@ internal object CoreIntrinsicMathAndBitSpecs {
             32 -> "uint32_t"
             64 -> "uint64_t"
             else -> "uint64_t"
-        }
-
-    private fun smallWidthJniType(width: Int): String =
-        when (width) {
-            8 -> "jbyte"
-            16 -> "jshort"
-            32 -> "jint"
-            else -> "jlong"
-        }
-
-    private fun smallWidthJvmType(width: Int): String =
-        when (width) {
-            8 -> "Byte"
-            16 -> "Short"
-            32 -> "Int"
-            else -> "Long"
         }
 
     public fun renderOutcomeDataClasses(): String =
@@ -419,155 +392,60 @@ KM_ALWAYS_INLINE void kmI128DivRemRaw(
 }
         """.trim()
 
-    private fun renderUnaryBitC(spec: UnaryBitKind): String =
-        when (spec) {
-            UnaryBitKind.CTPOP_U8 ->
-                """
-KM_ALWAYS_INLINE uint32_t kmCtpopU8(uint8_t v) {
-    return (uint32_t)kmCtpopU64((uint64_t)v);
-}
-                """.trim()
-            UnaryBitKind.CTPOP_U16 ->
-                """
-KM_ALWAYS_INLINE uint32_t kmCtpopU16(uint16_t v) {
-    return (uint32_t)kmCtpopU64((uint64_t)v);
-}
-                """.trim()
-            UnaryBitKind.CTPOP_U32 ->
-                """
-KM_ALWAYS_INLINE uint32_t kmCtpopU32(uint32_t v) {
-    return (uint32_t)kmCtpopU64((uint64_t)v);
-}
-                """.trim()
+    private fun renderUnaryBitC(spec: UnaryBitKind): String {
+        val ct = smallWidthCType(spec.width)
+        return when (spec) {
+            UnaryBitKind.CTPOP_U8, UnaryBitKind.CTPOP_U16, UnaryBitKind.CTPOP_U32 ->
+                "KM_ALWAYS_INLINE uint32_t ${spec.expectName}($ct v) { return (uint32_t)kmCtpopU64((uint64_t)v); }"
             UnaryBitKind.CTPOP_U128 ->
+                "KM_ALWAYS_INLINE uint32_t kmCtpopU128(uint64_t lo, uint64_t hi) { return kmCtpopU64(lo) + kmCtpopU64(hi); }"
+            UnaryBitKind.CTLZ_U8, UnaryBitKind.CTLZ_U16, UnaryBitKind.CTLZ_U32 -> {
+                val clzBias = if (spec.width < 32) " - ${32 - spec.width}u" else ""
+                val castV = if (spec.width < 32) "(unsigned int)v" else "v"
                 """
-KM_ALWAYS_INLINE uint32_t kmCtpopU128(uint64_t lo, uint64_t hi) {
-    return kmCtpopU64(lo) + kmCtpopU64(hi);
-}
-                """.trim()
-            UnaryBitKind.CTLZ_U8 ->
-                """
-KM_ALWAYS_INLINE uint32_t kmCtlzU8(uint8_t v) {
-    if (v == 0u) return 8u;
+KM_ALWAYS_INLINE uint32_t ${spec.expectName}($ct v) {
+    if (v == 0u) return ${spec.width}u;
 #if defined(__clang__) || defined(__GNUC__)
-    return (uint32_t)__builtin_clz((unsigned int)v) - 24u;
+    return (uint32_t)__builtin_clz($castV)$clzBias;
 #else
-    return kmCtlzU64((uint64_t)v) - 56u;
+    return kmCtlzU64((uint64_t)v) - ${64 - spec.width}u;
 #endif
 }
                 """.trim()
-            UnaryBitKind.CTLZ_U16 ->
-                """
-KM_ALWAYS_INLINE uint32_t kmCtlzU16(uint16_t v) {
-    if (v == 0u) return 16u;
-#if defined(__clang__) || defined(__GNUC__)
-    return (uint32_t)__builtin_clz((unsigned int)v) - 16u;
-#else
-    return kmCtlzU64((uint64_t)v) - 48u;
-#endif
-}
-                """.trim()
-            UnaryBitKind.CTLZ_U32 ->
-                """
-KM_ALWAYS_INLINE uint32_t kmCtlzU32(uint32_t v) {
-    if (v == 0u) return 32u;
-#if defined(__clang__) || defined(__GNUC__)
-    return (uint32_t)__builtin_clz(v);
-#else
-    return kmCtlzU64((uint64_t)v) - 32u;
-#endif
-}
-                """.trim()
+            }
             UnaryBitKind.CTLZ_U128 ->
+                "KM_ALWAYS_INLINE uint32_t kmCtlzU128(uint64_t lo, uint64_t hi) { return hi != 0ULL ? kmCtlzU64(hi) : (64u + kmCtlzU64(lo)); }"
+            UnaryBitKind.CTTZ_U8, UnaryBitKind.CTTZ_U16, UnaryBitKind.CTTZ_U32 -> {
+                val castV = if (spec.width < 32) "(unsigned int)v" else "v"
                 """
-KM_ALWAYS_INLINE uint32_t kmCtlzU128(uint64_t lo, uint64_t hi) {
-    return hi != 0ULL ? kmCtlzU64(hi) : (64u + kmCtlzU64(lo));
-}
-                """.trim()
-            UnaryBitKind.CTTZ_U8 ->
-                """
-KM_ALWAYS_INLINE uint32_t kmCttzU8(uint8_t v) {
-    if (v == 0u) return 8u;
+KM_ALWAYS_INLINE uint32_t ${spec.expectName}($ct v) {
+    if (v == 0u) return ${spec.width}u;
 #if defined(__clang__) || defined(__GNUC__)
-    return (uint32_t)__builtin_ctz((unsigned int)v);
+    return (uint32_t)__builtin_ctz($castV);
 #else
     return kmCttzU64((uint64_t)v);
 #endif
 }
                 """.trim()
-            UnaryBitKind.CTTZ_U16 ->
-                """
-KM_ALWAYS_INLINE uint32_t kmCttzU16(uint16_t v) {
-    if (v == 0u) return 16u;
-#if defined(__clang__) || defined(__GNUC__)
-    return (uint32_t)__builtin_ctz((unsigned int)v);
-#else
-    return kmCttzU64((uint64_t)v);
-#endif
-}
-                """.trim()
-            UnaryBitKind.CTTZ_U32 ->
-                """
-KM_ALWAYS_INLINE uint32_t kmCttzU32(uint32_t v) {
-    if (v == 0u) return 32u;
-#if defined(__clang__) || defined(__GNUC__)
-    return (uint32_t)__builtin_ctz(v);
-#else
-    return kmCttzU64((uint64_t)v);
-#endif
-}
-                """.trim()
+            }
             UnaryBitKind.CTTZ_U128 ->
-                """
-KM_ALWAYS_INLINE uint32_t kmCttzU128(uint64_t lo, uint64_t hi) {
-    return lo != 0ULL ? kmCttzU64(lo) : (64u + kmCttzU64(hi));
-}
-                """.trim()
+                "KM_ALWAYS_INLINE uint32_t kmCttzU128(uint64_t lo, uint64_t hi) { return lo != 0ULL ? kmCttzU64(lo) : (64u + kmCttzU64(hi)); }"
             UnaryBitKind.BSWAP_U128 ->
+                "KM_ALWAYS_INLINE void kmBswapU128Out(uint64_t lo, uint64_t hi, uint64_t* outLo, uint64_t* outHi) { *outLo = kmBswapU64(hi); *outHi = kmBswapU64(lo); }"
+            UnaryBitKind.BITREVERSE_U8, UnaryBitKind.BITREVERSE_U16, UnaryBitKind.BITREVERSE_U32 ->
                 """
-KM_ALWAYS_INLINE void kmBswapU128Out(uint64_t lo, uint64_t hi, uint64_t* outLo, uint64_t* outHi) {
-    *outLo = kmBswapU64(hi);
-    *outHi = kmBswapU64(lo);
-}
-                """.trim()
-            UnaryBitKind.BITREVERSE_U8 ->
-                """
-KM_ALWAYS_INLINE uint8_t kmBitreverseU8(uint8_t v) {
+KM_ALWAYS_INLINE $ct ${spec.expectName}($ct v) {
 #if defined(__clang__)
-    return __builtin_bitreverse8(v);
+    return __builtin_bitreverse${spec.width}(v);
 #else
-    return (uint8_t)(kmBitreverseU64((uint64_t)v) >> 56);
-#endif
-}
-                """.trim()
-            UnaryBitKind.BITREVERSE_U16 ->
-                """
-KM_ALWAYS_INLINE uint16_t kmBitreverseU16(uint16_t v) {
-#if defined(__clang__)
-    return __builtin_bitreverse16(v);
-#else
-    return (uint16_t)(kmBitreverseU64((uint64_t)v) >> 48);
-#endif
-}
-                """.trim()
-            UnaryBitKind.BITREVERSE_U32 ->
-                """
-KM_ALWAYS_INLINE uint32_t kmBitreverseU32(uint32_t v) {
-#if defined(__clang__)
-    return __builtin_bitreverse32(v);
-#else
-    return (uint32_t)(kmBitreverseU64((uint64_t)v) >> 32);
+    return ($ct)(kmBitreverseU64((uint64_t)v) >> ${64 - spec.width});
 #endif
 }
                 """.trim()
             UnaryBitKind.BITREVERSE_U128 ->
-                """
-KM_ALWAYS_INLINE void kmBitreverseU128Out(uint64_t lo, uint64_t hi, uint64_t* outLo, uint64_t* outHi) {
-    *outLo = kmBitreverseU64(hi);
-    *outHi = kmBitreverseU64(lo);
-}
-                """.trim()
+                "KM_ALWAYS_INLINE void kmBitreverseU128Out(uint64_t lo, uint64_t hi, uint64_t* outLo, uint64_t* outHi) { *outLo = kmBitreverseU64(hi); *outHi = kmBitreverseU64(lo); }"
         }
+    }
 
     private fun renderRotateBitC(spec: RotateBitSpec): String {
         val fn = spec.expectName
@@ -1087,1348 +965,156 @@ KM_ALWAYS_INLINE void kmDoubleToU128UncheckedOut(double v, uint64_t* outLo, uint
             )
         }
 
-    public fun renderExpectDeclarations(): String =
-        buildString {
+    private fun scalarTypeForUnsignedWidth(width: Int): KmScalarType =
+        when (width) {
+            8 -> KmScalarType.U8
+            16 -> KmScalarType.U16
+            32 -> KmScalarType.U32
+            else -> KmScalarType.U64
+        }
+
+    private fun scalarTypeForIntWidth(w: IntWidthKind): KmScalarType =
+        when (w) {
+            IntWidthKind.U8 -> KmScalarType.U8
+            IntWidthKind.U16 -> KmScalarType.U16
+            IntWidthKind.U32 -> KmScalarType.U32
+            IntWidthKind.U64 -> KmScalarType.U64
+            IntWidthKind.I8 -> KmScalarType.I8
+            IntWidthKind.I16 -> KmScalarType.I16
+            IntWidthKind.I32 -> KmScalarType.I32
+            IntWidthKind.I64 -> KmScalarType.I64
+            IntWidthKind.U128, IntWidthKind.I128 -> error("128-bit uses U128Out2")
+        }
+
+    internal val MATH_AND_BIT_SPECS: List<KmBaseIntrinsicSpec> =
+        buildList {
             for (spec in UnaryBitKind.entries) {
-                val sig =
-                    when {
-                        spec.width == 128 && spec.returns128 -> "(lo: ULong, hi: ULong): U128ValueOutcome"
-                        spec.width == 128 -> "(lo: ULong, hi: ULong): UInt"
-                        spec.returnsUInt -> "(value: ${smallWidthKtReturnFromU32(spec.width)}): UInt"
-                        else -> "(value: ${smallWidthKtReturnFromU32(spec.width)}): ${smallWidthKtReturnFromU32(spec.width)}"
+                val fn = spec.expectName
+                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
+                when {
+                    spec.width == 128 && spec.returns128 ->
+                        add(KmBaseIntrinsicSpec.U128Out2(fn, listOf("lo" to KmScalarType.U64, "hi" to KmScalarType.U64), "U128ValueOutcome", "KmLinearMemoryArena.$arenaFn(lo, hi)"))
+                    spec.width == 128 ->
+                        add(KmBaseIntrinsicSpec.Regular(fn, listOf("lo" to KmScalarType.U64, "hi" to KmScalarType.U64), KmScalarType.U32, "KmLinearMemoryArena.$arenaFn(lo, hi)"))
+                    else -> {
+                        val valTy = scalarTypeForUnsignedWidth(spec.width)
+                        val retTy = if (spec.returnsUInt) KmScalarType.U32 else valTy
+                        add(KmBaseIntrinsicSpec.Regular(fn, listOf("value" to valTy), retTy, "KmLinearMemoryArena.$arenaFn(value)"))
                     }
-                appendLine("public expect fun ${spec.expectName}$sig")
+                }
             }
             for (spec in ROTATE_SPECS) {
+                val fn = spec.expectName
+                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
                 if (spec.width == 128) {
-                    appendLine("public expect fun ${spec.expectName}(lo: ULong, hi: ULong, n: UInt): U128ValueOutcome")
+                    add(
+                        KmBaseIntrinsicSpec.U128Out2(
+                            name = fn,
+                            params = listOf("lo" to KmScalarType.U64, "hi" to KmScalarType.U64, "n" to KmScalarType.U32),
+                            outcomeType = "U128ValueOutcome",
+                            arenaExpr = "KmLinearMemoryArena.$arenaFn(lo, hi, n)",
+                        ),
+                    )
                 } else {
-                    val kt = smallWidthKtReturnFromU32(spec.width)
-                    appendLine("public expect fun ${spec.expectName}(value: $kt, n: UInt): $kt")
+                    val valTy = scalarTypeForUnsignedWidth(spec.width)
+                    add(KmBaseIntrinsicSpec.Regular(fn, listOf("value" to valTy, "n" to KmScalarType.U32), valTy, "KmLinearMemoryArena.$arenaFn(value, n)"))
                 }
             }
             for (op in OverflowOpKind.entries) {
                 for (w in ALL_INT_WIDTHS) {
-                    val fn = "km${op.stem}WithOverflow${w.widthTag}"
-                    if (w.bits < 128) {
-                        appendLine("public expect fun $fn(a: ${w.ktType}, b: ${w.ktType}): Overflow${w.widthTag}Outcome")
-                    } else {
-                        appendLine("public expect fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): Overflow${w.widthTag}Outcome")
-                    }
+                    add(KmBaseIntrinsicSpec.WithOverflow(op.stem, w))
                 }
             }
             for (op in listOf(OverflowOpKind.ADD, OverflowOpKind.SUB)) {
                 for (w in ALL_INT_WIDTHS) {
                     val fn = "kmSaturating${op.stem}${w.widthTag}"
+                    val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
                     if (w.bits < 128) {
-                        appendLine("public expect fun $fn(a: ${w.ktType}, b: ${w.ktType}): ${w.ktType}")
+                        val st = scalarTypeForIntWidth(w)
+                        add(KmBaseIntrinsicSpec.Regular(fn, listOf("a" to st, "b" to st), st, "KmLinearMemoryArena.$arenaFn(a, b)"))
                     } else {
-                        appendLine("public expect fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): ${w.ktType}")
+                        add(
+                            KmBaseIntrinsicSpec.U128Out2(
+                                name = fn,
+                                params = listOf("aLo" to KmScalarType.U64, "aHi" to KmScalarType.U64, "bLo" to KmScalarType.U64, "bHi" to KmScalarType.U64),
+                                outcomeType = w.ktType,
+                                arenaExpr = "KmLinearMemoryArena.$arenaFn(aLo, aHi, bLo, bHi)",
+                            ),
+                        )
                     }
                 }
             }
             for ((fn, _) in U128_VALUE_BINOPS) {
-                appendLine("public expect fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): U128ValueOutcome")
+                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
+                add(
+                    KmBaseIntrinsicSpec.U128Out2(
+                        name = fn,
+                        params = listOf("aLo" to KmScalarType.U64, "aHi" to KmScalarType.U64, "bLo" to KmScalarType.U64, "bHi" to KmScalarType.U64),
+                        outcomeType = "U128ValueOutcome",
+                        arenaExpr = "KmLinearMemoryArena.$arenaFn(aLo, aHi, bLo, bHi)",
+                    ),
+                )
             }
             for ((fn, outType) in U128_DIVREM_OPS) {
-                appendLine("public expect fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): $outType")
+                add(KmBaseIntrinsicSpec.U128DivRem(fn, outType))
             }
             for ((fn, outType, _) in U128_SHIFT_OPS) {
-                appendLine("public expect fun $fn(aLo: ULong, aHi: ULong, shift: UInt): $outType")
+                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
+                add(
+                    KmBaseIntrinsicSpec.U128Out2(
+                        name = fn,
+                        params = listOf("aLo" to KmScalarType.U64, "aHi" to KmScalarType.U64, "shift" to KmScalarType.U32),
+                        outcomeType = outType,
+                        arenaExpr = "KmLinearMemoryArena.$arenaFn(aLo, aHi, shift)",
+                    ),
+                )
             }
             for (spec in FLOAT_MATH_SPECS) {
-                val fKt = if (spec.isF64) "Double" else "Float"
-                val sig =
-                    when {
-                        spec.arity == 1 -> "(x: $fKt): $fKt"
-                        spec.secondIsInt -> "(x: $fKt, exp: Int): $fKt"
-                        else -> "(a: $fKt, b: $fKt): $fKt"
-                    }
-                appendLine("public expect fun ${spec.expectName}$sig")
+                val fn = spec.expectName
+                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
+                val fTy = if (spec.isF64) KmScalarType.F64 else KmScalarType.F32
+                when {
+                    spec.arity == 1 ->
+                        add(KmBaseIntrinsicSpec.Regular(fn, listOf("x" to fTy), fTy, "KmLinearMemoryArena.$arenaFn(x)"))
+                    spec.secondIsInt ->
+                        add(KmBaseIntrinsicSpec.Regular(fn, listOf("x" to fTy, "exp" to KmScalarType.I32), fTy, "KmLinearMemoryArena.$arenaFn(x, exp)"))
+                    else ->
+                        add(KmBaseIntrinsicSpec.Regular(fn, listOf("a" to fTy, "b" to fTy), fTy, "KmLinearMemoryArena.$arenaFn(a, b)"))
+                }
             }
-            appendLine(
-                """
-public expect fun kmFloatToU64Unchecked(v: Float): ULong
-public expect fun kmDoubleToU64Unchecked(v: Double): ULong
-public expect fun kmFloatToU128Unchecked(v: Float): U128ValueOutcome
-public expect fun kmDoubleToU128Unchecked(v: Double): U128ValueOutcome
-                """.trim(),
-            )
+            add(KmBaseIntrinsicSpec.Regular("kmFloatToU64Unchecked", listOf("v" to KmScalarType.F32), KmScalarType.U64, "KmLinearMemoryArena.floatToU64Unchecked(v)"))
+            add(KmBaseIntrinsicSpec.Regular("kmDoubleToU64Unchecked", listOf("v" to KmScalarType.F64), KmScalarType.U64, "KmLinearMemoryArena.doubleToU64Unchecked(v)"))
+            add(KmBaseIntrinsicSpec.U128Out2("kmFloatToU128Unchecked", listOf("v" to KmScalarType.F32), "U128ValueOutcome", "KmLinearMemoryArena.floatToU128Unchecked(v)"))
+            add(KmBaseIntrinsicSpec.U128Out2("kmDoubleToU128Unchecked", listOf("v" to KmScalarType.F64), "U128ValueOutcome", "KmLinearMemoryArena.doubleToU128Unchecked(v)"))
         }
+
+    public fun renderExpectDeclarations(): String =
+        KmExpectBridgeEmitter.renderDeclarations(MATH_AND_BIT_SPECS)
 
     public fun renderNativeActuals(cinteropPackage: String): String =
-        buildString {
-            for (spec in UnaryBitKind.entries) {
-                when {
-                    spec.width == 128 && spec.returns128 ->
-                        appendLine(renderNativeU128OutActual("${spec.expectName}(lo: ULong, hi: ULong): U128ValueOutcome", "$cinteropPackage.${spec.expectName}Out(lo, hi, outLo.ptr, outHi.ptr)", "U128ValueOutcome"))
-                    spec.width == 128 ->
-                        appendLine("public actual fun ${spec.expectName}(lo: ULong, hi: ULong): UInt = $cinteropPackage.${spec.expectName}(lo, hi)")
-                    spec.returnsUInt -> {
-                        val kt = smallWidthKtReturnFromU32(spec.width)
-                        appendLine("public actual fun ${spec.expectName}(value: $kt): UInt = $cinteropPackage.${spec.expectName}(value)")
-                    }
-                    else -> {
-                        val kt = smallWidthKtReturnFromU32(spec.width)
-                        appendLine("public actual fun ${spec.expectName}(value: $kt): $kt = $cinteropPackage.${spec.expectName}(value)")
-                    }
-                }
-            }
-            for (spec in ROTATE_SPECS) {
-                if (spec.width == 128) {
-                    appendLine(renderNativeU128OutActual("${spec.expectName}(lo: ULong, hi: ULong, n: UInt): U128ValueOutcome", "$cinteropPackage.${spec.expectName}Out(lo, hi, n, outLo.ptr, outHi.ptr)", "U128ValueOutcome"))
-                } else {
-                    val kt = smallWidthKtReturnFromU32(spec.width)
-                    appendLine("public actual fun ${spec.expectName}(value: $kt, n: UInt): $kt = $cinteropPackage.${spec.expectName}(value, n)")
-                }
-            }
-            for (op in OverflowOpKind.entries) {
-                for (w in ALL_INT_WIDTHS) {
-                    val fn = "km${op.stem}WithOverflow${w.widthTag}"
-                    when {
-                        w.bits < 64 -> {
-                            val unwrap =
-                                when (w.widthTag) {
-                                    "U8" -> "packed.toUByte()"
-                                    "U16" -> "packed.toUShort()"
-                                    "U32" -> "packed.toUInt()"
-                                    "I8" -> "packed.toByte()"
-                                    "I16" -> "packed.toShort()"
-                                    else -> "packed.toInt()"
-                                }
-                            appendLine(
-                                """
-public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): Overflow${w.widthTag}Outcome {
-    val packed = $cinteropPackage.${fn}Packed(a, b)
-    return Overflow${w.widthTag}Outcome($unwrap, (packed shr 32) != 0uL)
-}
-                                """.trim(),
-                            )
-                        }
-                        w.bits == 64 -> {
-                            val varType = if (w.signed) "LongVar" else "ULongVar"
-                            appendLine(
-                                """
-public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): Overflow${w.widthTag}Outcome =
-    memScoped {
-        val outVal = alloc<$varType>()
-        val ovf = $cinteropPackage.${fn}Out(a, b, outVal.ptr)
-        Overflow${w.widthTag}Outcome(outVal.value, ovf != 0u.toUByte())
-    }
-                                """.trim(),
-                            )
-                        }
-                        else -> {
-                            appendLine(
-                                """
-public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): Overflow${w.widthTag}Outcome =
-    memScoped {
-        val outLo = alloc<ULongVar>()
-        val outHi = alloc<ULongVar>()
-        val ovf = $cinteropPackage.${fn}Out(aLo, aHi, bLo, bHi, outLo.ptr, outHi.ptr)
-        Overflow${w.widthTag}Outcome(outLo.value, outHi.value, ovf != 0u.toUByte())
-    }
-                                """.trim(),
-                            )
-                        }
-                    }
-                }
-            }
-            for (op in listOf(OverflowOpKind.ADD, OverflowOpKind.SUB)) {
-                for (w in ALL_INT_WIDTHS) {
-                    val fn = "kmSaturating${op.stem}${w.widthTag}"
-                    if (w.bits < 128) {
-                        appendLine("public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): ${w.ktType} = $cinteropPackage.$fn(a, b)")
-                    } else {
-                        appendLine(renderNativeU128OutActual("$fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): ${w.ktType}", "$cinteropPackage.${fn}Out(aLo, aHi, bLo, bHi, outLo.ptr, outHi.ptr)", w.ktType))
-                    }
-                }
-            }
-            for ((fn, _) in U128_VALUE_BINOPS) {
-                appendLine(renderNativeU128OutActual("$fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): U128ValueOutcome", "$cinteropPackage.${fn}Out(aLo, aHi, bLo, bHi, outLo.ptr, outHi.ptr)", "U128ValueOutcome"))
-            }
-            for ((fn, outType) in U128_DIVREM_OPS) {
-                appendLine(
-                    """
-public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): $outType =
-    memScoped {
-        val qLo = alloc<ULongVar>()
-        val qHi = alloc<ULongVar>()
-        val rLo = alloc<ULongVar>()
-        val rHi = alloc<ULongVar>()
-        $cinteropPackage.${fn}Out(aLo, aHi, bLo, bHi, qLo.ptr, qHi.ptr, rLo.ptr, rHi.ptr)
-        $outType(qLo.value, qHi.value, rLo.value, rHi.value)
-    }
-                    """.trim(),
-                )
-            }
-            for ((fn, outType, _) in U128_SHIFT_OPS) {
-                appendLine(renderNativeU128OutActual("$fn(aLo: ULong, aHi: ULong, shift: UInt): $outType", "$cinteropPackage.${fn}Out(aLo, aHi, shift, outLo.ptr, outHi.ptr)", outType))
-            }
-            for (spec in FLOAT_MATH_SPECS) {
-                val fKt = if (spec.isF64) "Double" else "Float"
-                when {
-                    spec.arity == 1 ->
-                        appendLine("public actual fun ${spec.expectName}(x: $fKt): $fKt = $cinteropPackage.${spec.expectName}(x)")
-                    spec.secondIsInt ->
-                        appendLine("public actual fun ${spec.expectName}(x: $fKt, exp: Int): $fKt = $cinteropPackage.${spec.expectName}(x, exp)")
-                    else ->
-                        appendLine("public actual fun ${spec.expectName}(a: $fKt, b: $fKt): $fKt = $cinteropPackage.${spec.expectName}(a, b)")
-                }
-            }
-            appendLine(
-                """
-public actual fun kmFloatToU64Unchecked(v: Float): ULong = $cinteropPackage.kmFloatToU64Unchecked(v)
-public actual fun kmDoubleToU64Unchecked(v: Double): ULong = $cinteropPackage.kmDoubleToU64Unchecked(v)
-${renderNativeU128OutActual("kmFloatToU128Unchecked(v: Float): U128ValueOutcome", "$cinteropPackage.kmFloatToU128UncheckedOut(v, outLo.ptr, outHi.ptr)", "U128ValueOutcome")}
-${renderNativeU128OutActual("kmDoubleToU128Unchecked(v: Double): U128ValueOutcome", "$cinteropPackage.kmDoubleToU128UncheckedOut(v, outLo.ptr, outHi.ptr)", "U128ValueOutcome")}
-                """.trim(),
-            )
-        }
-
-    private fun renderNativeU128OutActual(sig: String, call: String, retType: String): String =
-        """
-public actual fun $sig =
-    memScoped {
-        val outLo = alloc<ULongVar>()
-        val outHi = alloc<ULongVar>()
-        $call
-        $retType(outLo.value, outHi.value)
-    }
-        """.trim()
+        KmNativeBridgeEmitter(cinteropPackage).renderDeclarations(MATH_AND_BIT_SPECS)
 
     public fun renderJniCFunctions(): String =
-        buildString {
-            for (spec in UnaryBitKind.entries) {
-                when {
-                    spec.width == 128 && spec.returns128 ->
-                        appendLine(renderJniU128PairOut("${spec.expectName}Out", "jlong lo, jlong hi", "${spec.expectName}Out((uint64_t)lo, (uint64_t)hi, &outLo, &outHi)"))
-                    spec.width == 128 ->
-                        appendLine(
-                            """
-JNIEXPORT jint JNICALL KM_JNI_FN(${spec.expectName})(JNIEnv* env, jclass clazz, jlong lo, jlong hi) {
-    (void)env; (void)clazz;
-    return (jint)${spec.expectName}((uint64_t)lo, (uint64_t)hi);
-}
-                            """.trim(),
-                        )
-                    else -> {
-                        val jt = smallWidthJniType(spec.width)
-                        val ct = smallWidthCType(spec.width)
-                        val retJ = if (spec.returnsUInt) "jint" else jt
-                        appendLine(
-                            """
-JNIEXPORT $retJ JNICALL KM_JNI_FN(${spec.expectName})(JNIEnv* env, jclass clazz, $jt value) {
-    (void)env; (void)clazz;
-    return ($retJ)${spec.expectName}(($ct)value);
-}
-                            """.trim(),
-                        )
-                    }
-                }
-            }
-            for (spec in ROTATE_SPECS) {
-                if (spec.width == 128) {
-                    appendLine(renderJniU128PairOut("${spec.expectName}Out", "jlong lo, jlong hi, jint n", "${spec.expectName}Out((uint64_t)lo, (uint64_t)hi, (uint32_t)n, &outLo, &outHi)"))
-                } else {
-                    val jt = smallWidthJniType(spec.width)
-                    val ct = smallWidthCType(spec.width)
-                    appendLine(
-                        """
-JNIEXPORT $jt JNICALL KM_JNI_FN(${spec.expectName})(JNIEnv* env, jclass clazz, $jt value, jint n) {
-    (void)env; (void)clazz;
-    return ($jt)${spec.expectName}(($ct)value, (uint32_t)n);
-}
-                        """.trim(),
-                    )
-                }
-            }
-            for (op in OverflowOpKind.entries) {
-                for (w in ALL_INT_WIDTHS) {
-                    val fn = "km${op.stem}WithOverflow${w.widthTag}"
-                    when {
-                        w.bits < 64 ->
-                            appendLine(
-                                """
-JNIEXPORT jlong JNICALL KM_JNI_FN(${fn}Packed)(JNIEnv* env, jclass clazz, ${w.jniType} a, ${w.jniType} b) {
-    (void)env; (void)clazz;
-    return (jlong)${fn}Packed((${w.cType})a, (${w.cType})b);
-}
-                                """.trim(),
-                            )
-                        w.bits == 64 ->
-                            appendLine(
-                                """
-JNIEXPORT void JNICALL KM_JNI_FN(${fn}Out)(JNIEnv* env, jclass clazz, jlong a, jlong b, jlongArray outBuf) {
-    (void)clazz;
-    ${w.cType} res = 0;
-    uint8_t ovf = ${fn}Out((${w.cType})a, (${w.cType})b, &res);
-    jlong buf[2];
-    buf[0] = (jlong)res;
-    buf[1] = (jlong)(uint64_t)ovf;
-    (*env)->SetLongArrayRegion(env, outBuf, 0, 2, buf);
-}
-                                """.trim(),
-                            )
-                        else ->
-                            appendLine(
-                                """
-JNIEXPORT void JNICALL KM_JNI_FN(${fn}Out)(JNIEnv* env, jclass clazz, jlong aLo, jlong aHi, jlong bLo, jlong bHi, jlongArray outBuf) {
-    (void)clazz;
-    uint64_t outLo = 0ULL, outHi = 0ULL;
-    uint8_t ovf = ${fn}Out((uint64_t)aLo, (uint64_t)aHi, (uint64_t)bLo, (uint64_t)bHi, &outLo, &outHi);
-    jlong buf[3];
-    buf[0] = (jlong)outLo;
-    buf[1] = (jlong)outHi;
-    buf[2] = (jlong)(uint64_t)ovf;
-    (*env)->SetLongArrayRegion(env, outBuf, 0, 3, buf);
-}
-                                """.trim(),
-                            )
-                    }
-                }
-            }
-            for (op in listOf(OverflowOpKind.ADD, OverflowOpKind.SUB)) {
-                for (w in ALL_INT_WIDTHS) {
-                    val fn = "kmSaturating${op.stem}${w.widthTag}"
-                    if (w.bits < 128) {
-                        appendLine(
-                            """
-JNIEXPORT ${w.jniType} JNICALL KM_JNI_FN($fn)(JNIEnv* env, jclass clazz, ${w.jniType} a, ${w.jniType} b) {
-    (void)env; (void)clazz;
-    return (${w.jniType})$fn((${w.cType})a, (${w.cType})b);
-}
-                            """.trim(),
-                        )
-                    } else {
-                        appendLine(renderJniU128PairOut("${fn}Out", "jlong aLo, jlong aHi, jlong bLo, jlong bHi", "${fn}Out((uint64_t)aLo, (uint64_t)aHi, (uint64_t)bLo, (uint64_t)bHi, &outLo, &outHi)"))
-                    }
-                }
-            }
-            for ((fn, _) in U128_VALUE_BINOPS) {
-                appendLine(renderJniU128PairOut("${fn}Out", "jlong aLo, jlong aHi, jlong bLo, jlong bHi", "${fn}Out((uint64_t)aLo, (uint64_t)aHi, (uint64_t)bLo, (uint64_t)bHi, &outLo, &outHi)"))
-            }
-            for ((fn, _) in U128_DIVREM_OPS) {
-                appendLine(
-                    """
-JNIEXPORT void JNICALL KM_JNI_FN(${fn}Out)(JNIEnv* env, jclass clazz, jlong aLo, jlong aHi, jlong bLo, jlong bHi, jlongArray outBuf) {
-    (void)clazz;
-    uint64_t qLo = 0ULL, qHi = 0ULL, rLo = 0ULL, rHi = 0ULL;
-    ${fn}Out((uint64_t)aLo, (uint64_t)aHi, (uint64_t)bLo, (uint64_t)bHi, &qLo, &qHi, &rLo, &rHi);
-    jlong buf[4];
-    buf[0] = (jlong)qLo;
-    buf[1] = (jlong)qHi;
-    buf[2] = (jlong)rLo;
-    buf[3] = (jlong)rHi;
-    (*env)->SetLongArrayRegion(env, outBuf, 0, 4, buf);
-}
-                    """.trim(),
-                )
-            }
-            for ((fn, _, _) in U128_SHIFT_OPS) {
-                appendLine(renderJniU128PairOut("${fn}Out", "jlong aLo, jlong aHi, jint shift", "${fn}Out((uint64_t)aLo, (uint64_t)aHi, (uint32_t)shift, &outLo, &outHi)"))
-            }
-            for (spec in FLOAT_MATH_SPECS) {
-                val jt = if (spec.isF64) "jdouble" else "jfloat"
-                val ct = if (spec.isF64) "double" else "float"
-                when {
-                    spec.arity == 1 ->
-                        appendLine(
-                            """
-JNIEXPORT $jt JNICALL KM_JNI_FN(${spec.expectName})(JNIEnv* env, jclass clazz, $jt x) {
-    (void)env; (void)clazz;
-    return ($jt)${spec.expectName}(($ct)x);
-}
-                            """.trim(),
-                        )
-                    spec.secondIsInt ->
-                        appendLine(
-                            """
-JNIEXPORT $jt JNICALL KM_JNI_FN(${spec.expectName})(JNIEnv* env, jclass clazz, $jt x, jint exp) {
-    (void)env; (void)clazz;
-    return ($jt)${spec.expectName}(($ct)x, (int32_t)exp);
-}
-                            """.trim(),
-                        )
-                    else ->
-                        appendLine(
-                            """
-JNIEXPORT $jt JNICALL KM_JNI_FN(${spec.expectName})(JNIEnv* env, jclass clazz, $jt a, $jt b) {
-    (void)env; (void)clazz;
-    return ($jt)${spec.expectName}(($ct)a, ($ct)b);
-}
-                            """.trim(),
-                        )
-                }
-            }
-            appendLine(
-                """
-JNIEXPORT jlong JNICALL KM_JNI_FN(kmFloatToU64Unchecked)(JNIEnv* env, jclass clazz, jfloat v) {
-    (void)env; (void)clazz;
-    return (jlong)kmFloatToU64Unchecked((float)v);
-}
-JNIEXPORT jlong JNICALL KM_JNI_FN(kmDoubleToU64Unchecked)(JNIEnv* env, jclass clazz, jdouble v) {
-    (void)env; (void)clazz;
-    return (jlong)kmDoubleToU64Unchecked((double)v);
-}
-${renderJniU128PairOut("kmFloatToU128UncheckedOut", "jfloat v", "kmFloatToU128UncheckedOut((float)v, &outLo, &outHi)")}
-${renderJniU128PairOut("kmDoubleToU128UncheckedOut", "jdouble v", "kmDoubleToU128UncheckedOut((double)v, &outLo, &outHi)")}
-                """.trim(),
-            )
-        }
-
-    private fun renderJniU128PairOut(jniName: String, params: String, cCall: String): String =
-        """
-JNIEXPORT void JNICALL KM_JNI_FN($jniName)(JNIEnv* env, jclass clazz, $params, jlongArray outBuf) {
-    (void)clazz;
-    uint64_t outLo = 0ULL, outHi = 0ULL;
-    $cCall;
-    jlong buf[2];
-    buf[0] = (jlong)outLo;
-    buf[1] = (jlong)outHi;
-    (*env)->SetLongArrayRegion(env, outBuf, 0, 2, buf);
-}
-        """.trim()
+        KmJniCBridgeEmitter.renderDeclarations(MATH_AND_BIT_SPECS)
 
     public fun renderJvmExternalDeclarations(): String =
-        buildString {
-            for (spec in UnaryBitKind.entries) {
-                when {
-                    spec.width == 128 && spec.returns128 ->
-                        appendLine("    @JvmStatic external fun ${spec.expectName}Out(lo: Long, hi: Long, outBuf: LongArray)")
-                    spec.width == 128 ->
-                        appendLine("    @JvmStatic external fun ${spec.expectName}(lo: Long, hi: Long): Int")
-                    else -> {
-                        val jt = smallWidthJvmType(spec.width)
-                        val ret = if (spec.returnsUInt) "Int" else jt
-                        appendLine("    @JvmStatic external fun ${spec.expectName}(value: $jt): $ret")
-                    }
-                }
-            }
-            for (spec in ROTATE_SPECS) {
-                if (spec.width == 128) {
-                    appendLine("    @JvmStatic external fun ${spec.expectName}Out(lo: Long, hi: Long, n: Int, outBuf: LongArray)")
-                } else {
-                    val jt = smallWidthJvmType(spec.width)
-                    appendLine("    @JvmStatic external fun ${spec.expectName}(value: $jt, n: Int): $jt")
-                }
-            }
-            for (op in OverflowOpKind.entries) {
-                for (w in ALL_INT_WIDTHS) {
-                    val fn = "km${op.stem}WithOverflow${w.widthTag}"
-                    when {
-                        w.bits < 64 -> appendLine("    @JvmStatic external fun ${fn}Packed(a: ${w.jniField}, b: ${w.jniField}): Long")
-                        w.bits == 64 -> appendLine("    @JvmStatic external fun ${fn}Out(a: Long, b: Long, outBuf: LongArray)")
-                        else -> appendLine("    @JvmStatic external fun ${fn}Out(aLo: Long, aHi: Long, bLo: Long, bHi: Long, outBuf: LongArray)")
-                    }
-                }
-            }
-            for (op in listOf(OverflowOpKind.ADD, OverflowOpKind.SUB)) {
-                for (w in ALL_INT_WIDTHS) {
-                    val fn = "kmSaturating${op.stem}${w.widthTag}"
-                    if (w.bits < 128) {
-                        appendLine("    @JvmStatic external fun $fn(a: ${w.jniField}, b: ${w.jniField}): ${w.jniField}")
-                    } else {
-                        appendLine("    @JvmStatic external fun ${fn}Out(aLo: Long, aHi: Long, bLo: Long, bHi: Long, outBuf: LongArray)")
-                    }
-                }
-            }
-            for ((fn, _) in U128_VALUE_BINOPS) {
-                appendLine("    @JvmStatic external fun ${fn}Out(aLo: Long, aHi: Long, bLo: Long, bHi: Long, outBuf: LongArray)")
-            }
-            for ((fn, _) in U128_DIVREM_OPS) {
-                appendLine("    @JvmStatic external fun ${fn}Out(aLo: Long, aHi: Long, bLo: Long, bHi: Long, outBuf: LongArray)")
-            }
-            for ((fn, _, _) in U128_SHIFT_OPS) {
-                appendLine("    @JvmStatic external fun ${fn}Out(aLo: Long, aHi: Long, shift: Int, outBuf: LongArray)")
-            }
-            for (spec in FLOAT_MATH_SPECS) {
-                val kt = if (spec.isF64) "Double" else "Float"
-                when {
-                    spec.arity == 1 -> appendLine("    @JvmStatic external fun ${spec.expectName}(x: $kt): $kt")
-                    spec.secondIsInt -> appendLine("    @JvmStatic external fun ${spec.expectName}(x: $kt, exp: Int): $kt")
-                    else -> appendLine("    @JvmStatic external fun ${spec.expectName}(a: $kt, b: $kt): $kt")
-                }
-            }
-            appendLine(
-                """
-    @JvmStatic external fun kmFloatToU64Unchecked(v: Float): Long
-    @JvmStatic external fun kmDoubleToU64Unchecked(v: Double): Long
-    @JvmStatic external fun kmFloatToU128UncheckedOut(v: Float, outBuf: LongArray)
-    @JvmStatic external fun kmDoubleToU128UncheckedOut(v: Double, outBuf: LongArray)
-                """.trimEnd(),
-            )
-        }
+        KmJvmBridgeEmitter("").renderExternalDeclarations(MATH_AND_BIT_SPECS)
 
     public fun renderJvmActuals(jniObjectName: String): String =
-        buildString {
-            for (spec in UnaryBitKind.entries) {
-                when {
-                    spec.width == 128 && spec.returns128 ->
-                        appendLine(renderJvmOut2("${spec.expectName}(lo: ULong, hi: ULong): U128ValueOutcome", "$jniObjectName.${spec.expectName}Out(lo.toLong(), hi.toLong(), outBuf)", "U128ValueOutcome"))
-                    spec.width == 128 ->
-                        appendLine("public actual fun ${spec.expectName}(lo: ULong, hi: ULong): UInt = $jniObjectName.${spec.expectName}(lo.toLong(), hi.toLong()).toUInt()")
-                    else -> {
-                        val kt = smallWidthKtReturnFromU32(spec.width)
-                        val argConv = jvmToUnsignedArgConv(spec.width, "value")
-                        if (spec.returnsUInt) {
-                            appendLine("public actual fun ${spec.expectName}(value: $kt): UInt = $jniObjectName.${spec.expectName}($argConv).toUInt()")
-                        } else {
-                            val retConv = jvmToUnsignedRetConv(spec.width)
-                            appendLine("public actual fun ${spec.expectName}(value: $kt): $kt = $jniObjectName.${spec.expectName}($argConv)$retConv")
-                        }
-                    }
-                }
-            }
-            for (spec in ROTATE_SPECS) {
-                if (spec.width == 128) {
-                    appendLine(renderJvmOut2("${spec.expectName}(lo: ULong, hi: ULong, n: UInt): U128ValueOutcome", "$jniObjectName.${spec.expectName}Out(lo.toLong(), hi.toLong(), n.toInt(), outBuf)", "U128ValueOutcome"))
-                } else {
-                    val kt = smallWidthKtReturnFromU32(spec.width)
-                    val argConv = jvmToUnsignedArgConv(spec.width, "value")
-                    val retConv = jvmToUnsignedRetConv(spec.width)
-                    appendLine("public actual fun ${spec.expectName}(value: $kt, n: UInt): $kt = $jniObjectName.${spec.expectName}($argConv, n.toInt())$retConv")
-                }
-            }
-            for (op in OverflowOpKind.entries) {
-                for (w in ALL_INT_WIDTHS) {
-                    val fn = "km${op.stem}WithOverflow${w.widthTag}"
-                    when {
-                        w.bits < 64 -> {
-                            val aExpr = if (w.signed) "a" else "a.to${w.jniField}()"
-                            val bExpr = if (w.signed) "b" else "b.to${w.jniField}()"
-                            val vConv =
-                                when (w.widthTag) {
-                                    "U8" -> "packed.toUByte()"
-                                    "U16" -> "packed.toUShort()"
-                                    "U32" -> "packed.toUInt()"
-                                    "I8" -> "packed.toByte()"
-                                    "I16" -> "packed.toShort()"
-                                    else -> "packed.toInt()"
-                                }
-                            appendLine(
-                                """
-public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): Overflow${w.widthTag}Outcome {
-    val packed = $jniObjectName.${fn}Packed($aExpr, $bExpr)
-    return Overflow${w.widthTag}Outcome($vConv, (packed ushr 32) != 0L)
-}
-                                """.trim(),
-                            )
-                        }
-                        w.bits == 64 -> {
-                            val aExpr = if (w.signed) "a" else "a.toLong()"
-                            val bExpr = if (w.signed) "b" else "b.toLong()"
-                            val outConv = if (w.signed) "outBuf[0]" else "outBuf[0].toULong()"
-                            appendLine(
-                                """
-public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): Overflow${w.widthTag}Outcome {
-    val outBuf = LongArray(2)
-    $jniObjectName.${fn}Out($aExpr, $bExpr, outBuf)
-    return Overflow${w.widthTag}Outcome($outConv, outBuf[1] != 0L)
-}
-                                """.trim(),
-                            )
-                        }
-                        else -> {
-                            appendLine(
-                                """
-public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): Overflow${w.widthTag}Outcome {
-    val outBuf = LongArray(3)
-    $jniObjectName.${fn}Out(aLo.toLong(), aHi.toLong(), bLo.toLong(), bHi.toLong(), outBuf)
-    return Overflow${w.widthTag}Outcome(outBuf[0].toULong(), outBuf[1].toULong(), outBuf[2] != 0L)
-}
-                                """.trim(),
-                            )
-                        }
-                    }
-                }
-            }
-            for (op in listOf(OverflowOpKind.ADD, OverflowOpKind.SUB)) {
-                for (w in ALL_INT_WIDTHS) {
-                    val fn = "kmSaturating${op.stem}${w.widthTag}"
-                    if (w.bits < 128) {
-                        val aExpr = if (w.signed) "a" else "a.to${w.jniField}()"
-                        val bExpr = if (w.signed) "b" else "b.to${w.jniField}()"
-                        val retConv = if (w.signed) "" else ".to${w.ktType}()"
-                        appendLine("public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): ${w.ktType} = $jniObjectName.$fn($aExpr, $bExpr)$retConv")
-                    } else {
-                        appendLine(renderJvmOut2("$fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): ${w.ktType}", "$jniObjectName.${fn}Out(aLo.toLong(), aHi.toLong(), bLo.toLong(), bHi.toLong(), outBuf)", w.ktType))
-                    }
-                }
-            }
-            for ((fn, _) in U128_VALUE_BINOPS) {
-                appendLine(renderJvmOut2("$fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): U128ValueOutcome", "$jniObjectName.${fn}Out(aLo.toLong(), aHi.toLong(), bLo.toLong(), bHi.toLong(), outBuf)", "U128ValueOutcome"))
-            }
-            for ((fn, outType) in U128_DIVREM_OPS) {
-                appendLine(
-                    """
-public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): $outType {
-    val outBuf = LongArray(4)
-    $jniObjectName.${fn}Out(aLo.toLong(), aHi.toLong(), bLo.toLong(), bHi.toLong(), outBuf)
-    return $outType(outBuf[0].toULong(), outBuf[1].toULong(), outBuf[2].toULong(), outBuf[3].toULong())
-}
-                    """.trim(),
-                )
-            }
-            for ((fn, outType, _) in U128_SHIFT_OPS) {
-                appendLine(renderJvmOut2("$fn(aLo: ULong, aHi: ULong, shift: UInt): $outType", "$jniObjectName.${fn}Out(aLo.toLong(), aHi.toLong(), shift.toInt(), outBuf)", outType))
-            }
-            for (spec in FLOAT_MATH_SPECS) {
-                val kt = if (spec.isF64) "Double" else "Float"
-                when {
-                    spec.arity == 1 ->
-                        appendLine("public actual fun ${spec.expectName}(x: $kt): $kt = $jniObjectName.${spec.expectName}(x)")
-                    spec.secondIsInt ->
-                        appendLine("public actual fun ${spec.expectName}(x: $kt, exp: Int): $kt = $jniObjectName.${spec.expectName}(x, exp)")
-                    else ->
-                        appendLine("public actual fun ${spec.expectName}(a: $kt, b: $kt): $kt = $jniObjectName.${spec.expectName}(a, b)")
-                }
-            }
-            appendLine(
-                """
-public actual fun kmFloatToU64Unchecked(v: Float): ULong = $jniObjectName.kmFloatToU64Unchecked(v).toULong()
-public actual fun kmDoubleToU64Unchecked(v: Double): ULong = $jniObjectName.kmDoubleToU64Unchecked(v).toULong()
-${renderJvmOut2("kmFloatToU128Unchecked(v: Float): U128ValueOutcome", "$jniObjectName.kmFloatToU128UncheckedOut(v, outBuf)", "U128ValueOutcome")}
-${renderJvmOut2("kmDoubleToU128Unchecked(v: Double): U128ValueOutcome", "$jniObjectName.kmDoubleToU128UncheckedOut(v, outBuf)", "U128ValueOutcome")}
-                """.trim(),
-            )
-        }
-
-    private fun renderJvmOut2(sig: String, call: String, retType: String): String =
-        """
-public actual fun $sig {
-    val outBuf = LongArray(2)
-    $call
-    return $retType(outBuf[0].toULong(), outBuf[1].toULong())
-}
-        """.trim()
-
-    private fun jvmToUnsignedArgConv(width: Int, v: String): String =
-        when (width) {
-            8 -> "$v.toByte()"
-            16 -> "$v.toShort()"
-            32 -> "$v.toInt()"
-            else -> "$v.toLong()"
-        }
-
-    private fun jvmToUnsignedRetConv(width: Int): String =
-        when (width) {
-            8 -> ".toUByte()"
-            16 -> ".toUShort()"
-            32 -> ".toUInt()"
-            else -> ".toULong()"
-        }
+        KmJvmBridgeEmitter(jniObjectName).renderDeclarations(MATH_AND_BIT_SPECS)
 
     public fun renderNapiRegistrations(): String =
-        buildString {
-            for (spec in UnaryBitKind.entries) {
-                val fn = spec.expectName
-                when {
-                    spec.width == 128 && spec.returns128 ->
-                        appendLine(renderNapiU128Pair(fn, "${fn}Out(kmCoreNapiArgU64Pair(info, 0), kmCoreNapiArgU64Pair(info, 2), &outLo, &outHi)"))
-                    spec.width == 128 ->
-                        appendLine(
-                            """
-    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        return Napi::Number::New(info.Env(), static_cast<int32_t>($fn(kmCoreNapiArgU64Pair(info, 0), kmCoreNapiArgU64Pair(info, 2))));
-    }));
-                            """.trim(),
-                        )
-                    else -> {
-                        val ct = smallWidthCType(spec.width)
-                        appendLine(
-                            """
-    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        return Napi::Number::New(info.Env(), static_cast<int32_t>($fn(static_cast<$ct>(kmCoreNapiArgU32(info[0])))));
-    }));
-                            """.trim(),
-                        )
-                    }
-                }
-            }
-            for (spec in ROTATE_SPECS) {
-                val fn = spec.expectName
-                if (spec.width == 128) {
-                    appendLine(renderNapiU128Pair(fn, "${fn}Out(kmCoreNapiArgU64Pair(info, 0), kmCoreNapiArgU64Pair(info, 2), kmCoreNapiArgU32(info[4]), &outLo, &outHi)"))
-                } else {
-                    val ct = smallWidthCType(spec.width)
-                    appendLine(
-                        """
-    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        return Napi::Number::New(info.Env(), static_cast<int32_t>($fn(static_cast<$ct>(kmCoreNapiArgU32(info[0])), kmCoreNapiArgU32(info[1]))));
-    }));
-                        """.trim(),
-                    )
-                }
-            }
-            for (op in OverflowOpKind.entries) {
-                for (w in ALL_INT_WIDTHS) {
-                    val fn = "km${op.stem}WithOverflow${w.widthTag}"
-                    when {
-                        w.bits < 64 -> {
-                            val arg0 =
-                                if (w.signed) {
-                                    "static_cast<${w.cType}>(kmCoreNapiArgI32(info[0]))"
-                                } else {
-                                    "static_cast<${w.cType}>(kmCoreNapiArgU32(info[0]))"
-                                }
-                            val arg1 =
-                                if (w.signed) {
-                                    "static_cast<${w.cType}>(kmCoreNapiArgI32(info[1]))"
-                                } else {
-                                    "static_cast<${w.cType}>(kmCoreNapiArgU32(info[1]))"
-                                }
-                            appendLine(
-                                """
-    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        return kmCoreReturnU64LoHi(info, ${fn}Packed($arg0, $arg1));
-    }));
-                                """.trim(),
-                            )
-                        }
-                        w.bits == 64 -> {
-                            val argFn = if (w.signed) "kmCoreNapiArgI64Pair" else "kmCoreNapiArgU64Pair"
-                            appendLine(
-                                """
-    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        ${w.cType} res = 0;
-        uint8_t ovf = ${fn}Out($argFn(info, 0), $argFn(info, 2), &res);
-        kmCoreStoreU64Scratch(0, static_cast<uint64_t>(res));
-        return Napi::Number::New(info.Env(), static_cast<int32_t>(ovf));
-    }));
-                                """.trim(),
-                            )
-                        }
-                        else -> {
-                            appendLine(
-                                """
-    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        uint64_t outLo = 0ULL, outHi = 0ULL;
-        uint8_t ovf = ${fn}Out(kmCoreNapiArgU64Pair(info, 0), kmCoreNapiArgU64Pair(info, 2), kmCoreNapiArgU64Pair(info, 4), kmCoreNapiArgU64Pair(info, 6), &outLo, &outHi);
-        kmCoreStoreU64Scratch(0, outLo);
-        kmCoreStoreU64Scratch(2, outHi);
-        return Napi::Number::New(info.Env(), static_cast<int32_t>(ovf));
-    }));
-                                """.trim(),
-                            )
-                        }
-                    }
-                }
-            }
-            for (op in listOf(OverflowOpKind.ADD, OverflowOpKind.SUB)) {
-                for (w in ALL_INT_WIDTHS) {
-                    val fn = "kmSaturating${op.stem}${w.widthTag}"
-                    when {
-                        w.bits < 64 -> {
-                            val argFn = if (w.signed) "kmCoreNapiArgI32" else "kmCoreNapiArgU32"
-                            appendLine(
-                                """
-    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        return Napi::Number::New(info.Env(), static_cast<int32_t>($fn(static_cast<${w.cType}>($argFn(info[0])), static_cast<${w.cType}>($argFn(info[1])))));
-    }));
-                                """.trim(),
-                            )
-                        }
-                        w.bits == 64 -> {
-                            val argFn = if (w.signed) "kmCoreNapiArgI64Pair" else "kmCoreNapiArgU64Pair"
-                            val retFn = if (w.signed) "kmCoreReturnI64LoHi" else "kmCoreReturnU64LoHi"
-                            appendLine(
-                                """
-    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        return $retFn(info, $fn($argFn(info, 0), $argFn(info, 2)));
-    }));
-                                """.trim(),
-                            )
-                        }
-                        else ->
-                            appendLine(renderNapiU128Pair(fn, "${fn}Out(kmCoreNapiArgU64Pair(info, 0), kmCoreNapiArgU64Pair(info, 2), kmCoreNapiArgU64Pair(info, 4), kmCoreNapiArgU64Pair(info, 6), &outLo, &outHi)"))
-                    }
-                }
-            }
-            for ((fn, _) in U128_VALUE_BINOPS) {
-                appendLine(renderNapiU128Pair(fn, "${fn}Out(kmCoreNapiArgU64Pair(info, 0), kmCoreNapiArgU64Pair(info, 2), kmCoreNapiArgU64Pair(info, 4), kmCoreNapiArgU64Pair(info, 6), &outLo, &outHi)"))
-            }
-            for ((fn, _) in U128_DIVREM_OPS) {
-                appendLine(
-                    """
-    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        uint64_t qLo = 0ULL, qHi = 0ULL, rLo = 0ULL, rHi = 0ULL;
-        ${fn}Out(kmCoreNapiArgU64Pair(info, 0), kmCoreNapiArgU64Pair(info, 2), kmCoreNapiArgU64Pair(info, 4), kmCoreNapiArgU64Pair(info, 6), &qLo, &qHi, &rLo, &rHi);
-        kmCoreStoreU64Scratch(0, qLo);
-        kmCoreStoreU64Scratch(2, qHi);
-        kmCoreStoreU64Scratch(4, rLo);
-        kmCoreStoreU64Scratch(6, rHi);
-        return Napi::Number::New(info.Env(), g_kmCoreOutScratch[0]);
-    }));
-                    """.trim(),
-                )
-            }
-            for ((fn, _, _) in U128_SHIFT_OPS) {
-                appendLine(renderNapiU128Pair(fn, "${fn}Out(kmCoreNapiArgU64Pair(info, 0), kmCoreNapiArgU64Pair(info, 2), kmCoreNapiArgU32(info[4]), &outLo, &outHi)"))
-            }
-            for (spec in FLOAT_MATH_SPECS) {
-                val fn = spec.expectName
-                when {
-                    spec.arity == 1 ->
-                        if (spec.isF64) {
-                            appendLine(
-                                """
-    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        return Napi::Number::New(info.Env(), $fn(info[0].As<Napi::Number>().DoubleValue()));
-    }));
-                                """.trim(),
-                            )
-                        } else {
-                            appendLine(
-                                """
-    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        return Napi::Number::New(info.Env(), static_cast<double>($fn(static_cast<float>(info[0].As<Napi::Number>().DoubleValue()))));
-    }));
-                                """.trim(),
-                            )
-                        }
-                    spec.secondIsInt ->
-                        if (spec.isF64) {
-                            appendLine(
-                                """
-    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        return Napi::Number::New(info.Env(), $fn(info[0].As<Napi::Number>().DoubleValue(), kmCoreNapiArgI32(info[1])));
-    }));
-                                """.trim(),
-                            )
-                        } else {
-                            appendLine(
-                                """
-    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        return Napi::Number::New(info.Env(), static_cast<double>($fn(static_cast<float>(info[0].As<Napi::Number>().DoubleValue()), kmCoreNapiArgI32(info[1]))));
-    }));
-                                """.trim(),
-                            )
-                        }
-                    else ->
-                        if (spec.isF64) {
-                            appendLine(
-                                """
-    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        return Napi::Number::New(info.Env(), $fn(info[0].As<Napi::Number>().DoubleValue(), info[1].As<Napi::Number>().DoubleValue()));
-    }));
-                                """.trim(),
-                            )
-                        } else {
-                            appendLine(
-                                """
-    coreObj.Set("$fn", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        return Napi::Number::New(info.Env(), static_cast<double>($fn(static_cast<float>(info[0].As<Napi::Number>().DoubleValue()), static_cast<float>(info[1].As<Napi::Number>().DoubleValue()))));
-    }));
-                                """.trim(),
-                            )
-                        }
-                }
-            }
-            appendLine(
-                """
-    coreObj.Set("kmFloatToU64Unchecked", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        return kmCoreReturnU64LoHi(info, kmFloatToU64Unchecked(static_cast<float>(info[0].As<Napi::Number>().DoubleValue())));
-    }));
-    coreObj.Set("kmDoubleToU64Unchecked", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        return kmCoreReturnU64LoHi(info, kmDoubleToU64Unchecked(info[0].As<Napi::Number>().DoubleValue()));
-    }));
-${renderNapiU128Pair("kmFloatToU128Unchecked", "kmFloatToU128UncheckedOut(static_cast<float>(info[0].As<Napi::Number>().DoubleValue()), &outLo, &outHi)")}
-${renderNapiU128Pair("kmDoubleToU128Unchecked", "kmDoubleToU128UncheckedOut(info[0].As<Napi::Number>().DoubleValue(), &outLo, &outHi)")}
-                """.trim(),
-            )
-        }
-
-    private fun renderNapiU128Pair(jsName: String, cCall: String): String =
-        """
-    coreObj.Set("$jsName", Napi::Function::New(env, [](const Napi::CallbackInfo& info) -> Napi::Value {
-        uint64_t outLo = 0ULL, outHi = 0ULL;
-        $cCall;
-        kmCoreStoreU64Scratch(0, outLo);
-        kmCoreStoreU64Scratch(2, outHi);
-        return Napi::Number::New(info.Env(), g_kmCoreOutScratch[0]);
-    }));
-        """.trim()
-
-    public fun renderJsActuals(): String = renderJsOrWasmActuals(isWasmJs = false)
-
-    public fun renderWasmJsActuals(): String = renderJsOrWasmActuals(isWasmJs = true)
+        KmNapiCppBridgeEmitter.renderDeclarations(MATH_AND_BIT_SPECS)
 
     public fun renderWasmJsFunDeclarations(): String =
-        buildString {
-            for (spec in UnaryBitKind.entries) {
-                val fn = spec.expectName
-                if (spec.width == 128) {
-                    appendLine("@JsFun(\"(lo0, hi0, lo1, hi1) => globalThis.kmCoreNapiV2.$fn(lo0, hi0, lo1, hi1)\")")
-                    appendLine("private external fun wasmKm${fn.removePrefix("km")}(lo0: Int, hi0: Int, lo1: Int, hi1: Int): Int")
-                } else {
-                    appendLine("@JsFun(\"(v) => globalThis.kmCoreNapiV2.$fn(v)\")")
-                    appendLine("private external fun wasmKm${fn.removePrefix("km")}(v: Int): Int")
-                }
-            }
-            for (spec in ROTATE_SPECS) {
-                val fn = spec.expectName
-                if (spec.width == 128) {
-                    appendLine("@JsFun(\"(lo0, hi0, lo1, hi1, n) => globalThis.kmCoreNapiV2.$fn(lo0, hi0, lo1, hi1, n)\")")
-                    appendLine("private external fun wasmKm${fn.removePrefix("km")}(lo0: Int, hi0: Int, lo1: Int, hi1: Int, n: Int): Int")
-                } else if (spec.width == 64) {
-                    appendLine("@JsFun(\"(lo, hi, n) => globalThis.kmCoreNapiV2.$fn(lo, hi, n)\")")
-                    appendLine("private external fun wasmKm${fn.removePrefix("km")}(lo: Int, hi: Int, n: Int): Int")
-                } else {
-                    appendLine("@JsFun(\"(v, n) => globalThis.kmCoreNapiV2.$fn(v, n)\")")
-                    appendLine("private external fun wasmKm${fn.removePrefix("km")}(v: Int, n: Int): Int")
-                }
-            }
-            for (op in OverflowOpKind.entries) {
-                for (w in ALL_INT_WIDTHS) {
-                    val fn = "km${op.stem}WithOverflow${w.widthTag}"
-                    when {
-                        w.bits < 64 -> {
-                            appendLine("@JsFun(\"(a, b) => globalThis.kmCoreNapiV2.$fn(a, b)\")")
-                            appendLine("private external fun wasmKm${fn.removePrefix("km")}(a: Int, b: Int): Int")
-                        }
-                        w.bits == 64 -> {
-                            appendLine("@JsFun(\"(aLo, aHi, bLo, bHi) => globalThis.kmCoreNapiV2.$fn(aLo, aHi, bLo, bHi)\")")
-                            appendLine("private external fun wasmKm${fn.removePrefix("km")}(aLo: Int, aHi: Int, bLo: Int, bHi: Int): Int")
-                        }
-                        else -> {
-                            appendLine("@JsFun(\"(a0, a1, a2, a3, b0, b1, b2, b3) => globalThis.kmCoreNapiV2.$fn(a0, a1, a2, a3, b0, b1, b2, b3)\")")
-                            appendLine("private external fun wasmKm${fn.removePrefix("km")}(a0: Int, a1: Int, a2: Int, a3: Int, b0: Int, b1: Int, b2: Int, b3: Int): Int")
-                        }
-                    }
-                }
-            }
-            for (op in listOf(OverflowOpKind.ADD, OverflowOpKind.SUB)) {
-                for (w in ALL_INT_WIDTHS) {
-                    val fn = "kmSaturating${op.stem}${w.widthTag}"
-                    when {
-                        w.bits < 64 -> {
-                            appendLine("@JsFun(\"(a, b) => globalThis.kmCoreNapiV2.$fn(a, b)\")")
-                            appendLine("private external fun wasmKm${fn.removePrefix("km")}(a: Int, b: Int): Int")
-                        }
-                        w.bits == 64 -> {
-                            appendLine("@JsFun(\"(aLo, aHi, bLo, bHi) => globalThis.kmCoreNapiV2.$fn(aLo, aHi, bLo, bHi)\")")
-                            appendLine("private external fun wasmKm${fn.removePrefix("km")}(aLo: Int, aHi: Int, bLo: Int, bHi: Int): Int")
-                        }
-                        else -> {
-                            appendLine("@JsFun(\"(a0, a1, a2, a3, b0, b1, b2, b3) => globalThis.kmCoreNapiV2.$fn(a0, a1, a2, a3, b0, b1, b2, b3)\")")
-                            appendLine("private external fun wasmKm${fn.removePrefix("km")}(a0: Int, a1: Int, a2: Int, a3: Int, b0: Int, b1: Int, b2: Int, b3: Int): Int")
-                        }
-                    }
-                }
-            }
-            for ((fn, _) in U128_VALUE_BINOPS) {
-                appendLine("@JsFun(\"(a0, a1, a2, a3, b0, b1, b2, b3) => globalThis.kmCoreNapiV2.$fn(a0, a1, a2, a3, b0, b1, b2, b3)\")")
-                appendLine("private external fun wasmKm${fn.removePrefix("km")}(a0: Int, a1: Int, a2: Int, a3: Int, b0: Int, b1: Int, b2: Int, b3: Int): Int")
-            }
-            for ((fn, _) in U128_DIVREM_OPS) {
-                appendLine("@JsFun(\"(a0, a1, a2, a3, b0, b1, b2, b3) => globalThis.kmCoreNapiV2.$fn(a0, a1, a2, a3, b0, b1, b2, b3)\")")
-                appendLine("private external fun wasmKm${fn.removePrefix("km")}(a0: Int, a1: Int, a2: Int, a3: Int, b0: Int, b1: Int, b2: Int, b3: Int): Int")
-            }
-            for ((fn, _, _) in U128_SHIFT_OPS) {
-                appendLine("@JsFun(\"(lo0, hi0, lo1, hi1, s) => globalThis.kmCoreNapiV2.$fn(lo0, hi0, lo1, hi1, s)\")")
-                appendLine("private external fun wasmKm${fn.removePrefix("km")}(lo0: Int, hi0: Int, lo1: Int, hi1: Int, s: Int): Int")
-            }
-            for (spec in FLOAT_MATH_SPECS) {
-                val fn = spec.expectName
-                when {
-                    spec.arity == 1 -> {
-                        appendLine("@JsFun(\"(x) => globalThis.kmCoreNapiV2.$fn(x)\")")
-                        appendLine("private external fun wasmKm${fn.removePrefix("km")}(x: Double): Double")
-                    }
-                    spec.secondIsInt -> {
-                        appendLine("@JsFun(\"(x, e) => globalThis.kmCoreNapiV2.$fn(x, e)\")")
-                        appendLine("private external fun wasmKm${fn.removePrefix("km")}(x: Double, e: Int): Double")
-                    }
-                    else -> {
-                        appendLine("@JsFun(\"(a, b) => globalThis.kmCoreNapiV2.$fn(a, b)\")")
-                        appendLine("private external fun wasmKm${fn.removePrefix("km")}(a: Double, b: Double): Double")
-                    }
-                }
-            }
-            appendLine(
-                """
-@JsFun("(v) => globalThis.kmCoreNapiV2.kmFloatToU64Unchecked(v)")
-private external fun wasmKmFloatToU64Unchecked(v: Double): Int
-@JsFun("(v) => globalThis.kmCoreNapiV2.kmDoubleToU64Unchecked(v)")
-private external fun wasmKmDoubleToU64Unchecked(v: Double): Int
-@JsFun("(v) => globalThis.kmCoreNapiV2.kmFloatToU128Unchecked(v)")
-private external fun wasmKmFloatToU128Unchecked(v: Double): Int
-@JsFun("(v) => globalThis.kmCoreNapiV2.kmDoubleToU128Unchecked(v)")
-private external fun wasmKmDoubleToU128Unchecked(v: Double): Int
-                """.trim(),
-            )
-        }
+        KmJsOrWasmBridgeEmitter(isWasmJs = true).renderWasmJsFunDeclarations(MATH_AND_BIT_SPECS, includeScratchOutGetters = false)
 
-    private fun renderJsOrWasmActuals(isWasmJs: Boolean): String =
-        buildString {
-            val guard = if (isWasmJs) "kmCoreNapiAvailable" else "kmCoreNapiAddon != null"
-            fun out(idx: Int): String = if (isWasmJs) "wasmKmOut$idx()" else "(kmCoreNapiAddon.kmOut$idx() as Int)"
-            fun jsIntCall(fn: String, args: String): String =
-                if (isWasmJs) "wasmKm${fn.removePrefix("km")}($args)" else "(kmCoreNapiAddon.$fn($args) as Int)"
-            fun jsDoubleCall(fn: String, args: String): String =
-                if (isWasmJs) "wasmKm${fn.removePrefix("km")}($args)" else "(kmCoreNapiAddon.$fn($args) as Double)"
+    public fun renderJsActuals(): String =
+        KmJsOrWasmBridgeEmitter(isWasmJs = false).renderDeclarations(MATH_AND_BIT_SPECS)
 
-            for (spec in UnaryBitKind.entries) {
-                val fn = spec.expectName
-                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
-                when {
-                    spec.width == 128 && spec.returns128 ->
-                        appendLine(
-                            """
-public actual fun $fn(lo: ULong, hi: ULong): U128ValueOutcome =
-    if ($guard) {
-        val rLo0 = ${jsIntCall(fn, "uLo32(lo), uHi32(lo), uLo32(hi), uHi32(hi)")}
-        U128ValueOutcome(packU64(rLo0, ${out(1)}), packU64(${out(2)}, ${out(3)}))
-    } else {
-        KmLinearMemoryArena.$arenaFn(lo, hi)
-    }
-                            """.trim(),
-                        )
-                    spec.width == 128 ->
-                        appendLine(
-                            """
-public actual fun $fn(lo: ULong, hi: ULong): UInt =
-    if ($guard) ${jsIntCall(fn, "uLo32(lo), uHi32(lo), uLo32(hi), uHi32(hi)")}.toUInt() else KmLinearMemoryArena.$arenaFn(lo, hi)
-                            """.trim(),
-                        )
-                    else -> {
-                        val kt = smallWidthKtReturnFromU32(spec.width)
-                        val conv = if (spec.returnsUInt) ".toUInt()" else jvmToUnsignedRetConv(spec.width)
-                        val retKt = if (spec.returnsUInt) "UInt" else kt
-                        appendLine(
-                            """
-public actual fun $fn(value: $kt): $retKt =
-    if ($guard) ${jsIntCall(fn, "value.toInt()")}$conv else KmLinearMemoryArena.$arenaFn(value)
-                            """.trim(),
-                        )
-                    }
-                }
-            }
-            for (spec in ROTATE_SPECS) {
-                val fn = spec.expectName
-                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
-                when (spec.width) {
-                    128 ->
-                        appendLine(
-                            """
-public actual fun $fn(lo: ULong, hi: ULong, n: UInt): U128ValueOutcome =
-    if ($guard) {
-        val rLo0 = ${jsIntCall(fn, "uLo32(lo), uHi32(lo), uLo32(hi), uHi32(hi), n.toInt()")}
-        U128ValueOutcome(packU64(rLo0, ${out(1)}), packU64(${out(2)}, ${out(3)}))
-    } else {
-        KmLinearMemoryArena.$arenaFn(lo, hi, n)
-    }
-                            """.trim(),
-                        )
-                    64 ->
-                        appendLine(
-                            """
-public actual fun $fn(value: ULong, n: UInt): ULong =
-    if ($guard) {
-        val lo = ${jsIntCall(fn, "uLo32(value), uHi32(value), n.toInt()")}
-        packU64(lo, ${out(1)})
-    } else {
-        KmLinearMemoryArena.$arenaFn(value, n)
-    }
-                            """.trim(),
-                        )
-                    else -> {
-                        val kt = smallWidthKtReturnFromU32(spec.width)
-                        val retConv = jvmToUnsignedRetConv(spec.width)
-                        appendLine(
-                            """
-public actual fun $fn(value: $kt, n: UInt): $kt =
-    if ($guard) ${jsIntCall(fn, "value.toInt(), n.toInt()")}$retConv else KmLinearMemoryArena.$arenaFn(value, n)
-                            """.trim(),
-                        )
-                    }
-                }
-            }
-            for (op in OverflowOpKind.entries) {
-                for (w in ALL_INT_WIDTHS) {
-                    val fn = "km${op.stem}WithOverflow${w.widthTag}"
-                    val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
-                    when {
-                        w.bits < 64 -> {
-                            val aArg = if (w.bits == 32 && w.signed) "a" else "a.toInt()"
-                            val bArg = if (w.bits == 32 && w.signed) "b" else "b.toInt()"
-                            val vConv = if (w.bits == 32 && w.signed) "v" else "v${w.u32WrapSuffix}"
-                            appendLine(
-                                """
-public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): Overflow${w.widthTag}Outcome =
-    if ($guard) {
-        val v = ${jsIntCall(fn, "$aArg, $bArg")}
-        Overflow${w.widthTag}Outcome($vConv, ${out(1)} != 0)
-    } else {
-        KmLinearMemoryArena.$arenaFn(a, b)
-    }
-                                """.trim(),
-                            )
-                        }
-                        w.bits == 64 -> {
-                            val loFn = if (w.signed) "lo32" else "uLo32"
-                            val hiFn = if (w.signed) "hi32" else "uHi32"
-                            val packFn = if (w.signed) "packI64" else "packU64"
-                            appendLine(
-                                """
-public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): Overflow${w.widthTag}Outcome =
-    if ($guard) {
-        val ovf = ${jsIntCall(fn, "$loFn(a), $hiFn(a), $loFn(b), $hiFn(b)")} != 0
-        Overflow${w.widthTag}Outcome($packFn(${out(0)}, ${out(1)}), ovf)
-    } else {
-        KmLinearMemoryArena.$arenaFn(a, b)
-    }
-                                """.trim(),
-                            )
-                        }
-                        else -> {
-                            appendLine(
-                                """
-public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): Overflow${w.widthTag}Outcome =
-    if ($guard) {
-        val ovf = ${jsIntCall(fn, "uLo32(aLo), uHi32(aLo), uLo32(aHi), uHi32(aHi), uLo32(bLo), uHi32(bLo), uLo32(bHi), uHi32(bHi)")} != 0
-        Overflow${w.widthTag}Outcome(packU64(${out(0)}, ${out(1)}), packU64(${out(2)}, ${out(3)}), ovf)
-    } else {
-        KmLinearMemoryArena.$arenaFn(aLo, aHi, bLo, bHi)
-    }
-                                """.trim(),
-                            )
-                        }
-                    }
-                }
-            }
-            for (op in listOf(OverflowOpKind.ADD, OverflowOpKind.SUB)) {
-                for (w in ALL_INT_WIDTHS) {
-                    val fn = "kmSaturating${op.stem}${w.widthTag}"
-                    val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
-                    when {
-                        w.bits < 64 -> {
-                            val aArg = if (w.bits == 32 && w.signed) "a" else "a.toInt()"
-                            val bArg = if (w.bits == 32 && w.signed) "b" else "b.toInt()"
-                            val rConv = if (w.bits == 32 && w.signed) "" else w.u32WrapSuffix
-                            appendLine(
-                                """
-public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): ${w.ktType} =
-    if ($guard) ${jsIntCall(fn, "$aArg, $bArg")}$rConv else KmLinearMemoryArena.$arenaFn(a, b)
-                                """.trim(),
-                            )
-                        }
-                        w.bits == 64 -> {
-                            val loFn = if (w.signed) "lo32" else "uLo32"
-                            val hiFn = if (w.signed) "hi32" else "uHi32"
-                            val packFn = if (w.signed) "packI64" else "packU64"
-                            appendLine(
-                                """
-public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): ${w.ktType} =
-    if ($guard) {
-        val lo = ${jsIntCall(fn, "$loFn(a), $hiFn(a), $loFn(b), $hiFn(b)")}
-        $packFn(lo, ${out(1)})
-    } else {
-        KmLinearMemoryArena.$arenaFn(a, b)
-    }
-                                """.trim(),
-                            )
-                        }
-                        else ->
-                            appendLine(
-                                """
-public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): ${w.ktType} =
-    if ($guard) {
-        val rLo0 = ${jsIntCall(fn, "uLo32(aLo), uHi32(aLo), uLo32(aHi), uHi32(aHi), uLo32(bLo), uHi32(bLo), uLo32(bHi), uHi32(bHi)")}
-        ${w.ktType}(packU64(rLo0, ${out(1)}), packU64(${out(2)}, ${out(3)}))
-    } else {
-        KmLinearMemoryArena.$arenaFn(aLo, aHi, bLo, bHi)
-    }
-                                """.trim(),
-                            )
-                    }
-                }
-            }
-            for ((fn, _) in U128_VALUE_BINOPS) {
-                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
-                appendLine(
-                    """
-public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): U128ValueOutcome =
-    if ($guard) {
-        val rLo0 = ${jsIntCall(fn, "uLo32(aLo), uHi32(aLo), uLo32(aHi), uHi32(aHi), uLo32(bLo), uHi32(bLo), uLo32(bHi), uHi32(bHi)")}
-        U128ValueOutcome(packU64(rLo0, ${out(1)}), packU64(${out(2)}, ${out(3)}))
-    } else {
-        KmLinearMemoryArena.$arenaFn(aLo, aHi, bLo, bHi)
-    }
-                    """.trim(),
-                )
-            }
-            for ((fn, outType) in U128_DIVREM_OPS) {
-                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
-                appendLine(
-                    """
-public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): $outType =
-    if ($guard) {
-        val qLo0 = ${jsIntCall(fn, "uLo32(aLo), uHi32(aLo), uLo32(aHi), uHi32(aHi), uLo32(bLo), uHi32(bLo), uLo32(bHi), uHi32(bHi)")}
-        $outType(packU64(qLo0, ${out(1)}), packU64(${out(2)}, ${out(3)}), packU64(${out(4)}, ${out(5)}), packU64(${out(6)}, ${out(7)}))
-    } else {
-        KmLinearMemoryArena.$arenaFn(aLo, aHi, bLo, bHi)
-    }
-                    """.trim(),
-                )
-            }
-            for ((fn, outType, _) in U128_SHIFT_OPS) {
-                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
-                appendLine(
-                    """
-public actual fun $fn(aLo: ULong, aHi: ULong, shift: UInt): $outType =
-    if ($guard) {
-        val rLo0 = ${jsIntCall(fn, "uLo32(aLo), uHi32(aLo), uLo32(aHi), uHi32(aHi), shift.toInt()")}
-        $outType(packU64(rLo0, ${out(1)}), packU64(${out(2)}, ${out(3)}))
-    } else {
-        KmLinearMemoryArena.$arenaFn(aLo, aHi, shift)
-    }
-                    """.trim(),
-                )
-            }
-            for (spec in FLOAT_MATH_SPECS) {
-                val fn = spec.expectName
-                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
-                val kt = if (spec.isF64) "Double" else "Float"
-                val retCast = if (spec.isF64) "" else ".toFloat()"
-                val argSuffix = if (spec.isF64) "" else ".toDouble()"
-                when {
-                    spec.arity == 1 ->
-                        appendLine(
-                            """
-public actual fun $fn(x: $kt): $kt =
-    if ($guard) ${jsDoubleCall(fn, "x$argSuffix")}$retCast else KmLinearMemoryArena.$arenaFn(x)
-                            """.trim(),
-                        )
-                    spec.secondIsInt ->
-                        appendLine(
-                            """
-public actual fun $fn(x: $kt, exp: Int): $kt =
-    if ($guard) ${jsDoubleCall(fn, "x$argSuffix, exp")}$retCast else KmLinearMemoryArena.$arenaFn(x, exp)
-                            """.trim(),
-                        )
-                    else ->
-                        appendLine(
-                            """
-public actual fun $fn(a: $kt, b: $kt): $kt =
-    if ($guard) ${jsDoubleCall(fn, "a$argSuffix, b$argSuffix")}$retCast else KmLinearMemoryArena.$arenaFn(a, b)
-                            """.trim(),
-                        )
-                }
-            }
-            appendLine(
-                """
-public actual fun kmFloatToU64Unchecked(v: Float): ULong =
-    if ($guard) {
-        val lo = ${jsIntCall("kmFloatToU64Unchecked", "v.toDouble()")}
-        packU64(lo, ${out(1)})
-    } else {
-        KmLinearMemoryArena.floatToU64Unchecked(v)
-    }
-public actual fun kmDoubleToU64Unchecked(v: Double): ULong =
-    if ($guard) {
-        val lo = ${jsIntCall("kmDoubleToU64Unchecked", "v")}
-        packU64(lo, ${out(1)})
-    } else {
-        KmLinearMemoryArena.doubleToU64Unchecked(v)
-    }
-public actual fun kmFloatToU128Unchecked(v: Float): U128ValueOutcome =
-    if ($guard) {
-        val rLo0 = ${jsIntCall("kmFloatToU128Unchecked", "v.toDouble()")}
-        U128ValueOutcome(packU64(rLo0, ${out(1)}), packU64(${out(2)}, ${out(3)}))
-    } else {
-        KmLinearMemoryArena.floatToU128Unchecked(v)
-    }
-public actual fun kmDoubleToU128Unchecked(v: Double): U128ValueOutcome =
-    if ($guard) {
-        val rLo0 = ${jsIntCall("kmDoubleToU128Unchecked", "v")}
-        U128ValueOutcome(packU64(rLo0, ${out(1)}), packU64(${out(2)}, ${out(3)}))
-    } else {
-        KmLinearMemoryArena.doubleToU128Unchecked(v)
-    }
-                """.trim(),
-            )
-        }
+    public fun renderWasmJsActuals(): String =
+        KmJsOrWasmBridgeEmitter(isWasmJs = true).renderDeclarations(MATH_AND_BIT_SPECS)
 
     public fun renderWasmWasiActuals(): String =
-        buildString {
-            for (spec in UnaryBitKind.entries) {
-                val fn = spec.expectName
-                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
-                when {
-                    spec.width == 128 && spec.returns128 ->
-                        appendLine("public actual fun $fn(lo: ULong, hi: ULong): U128ValueOutcome = KmLinearMemoryArena.$arenaFn(lo, hi)")
-                    spec.width == 128 ->
-                        appendLine("public actual fun $fn(lo: ULong, hi: ULong): UInt = KmLinearMemoryArena.$arenaFn(lo, hi)")
-                    else -> {
-                        val kt = smallWidthKtReturnFromU32(spec.width)
-                        val retKt = if (spec.returnsUInt) "UInt" else kt
-                        appendLine("public actual fun $fn(value: $kt): $retKt = KmLinearMemoryArena.$arenaFn(value)")
-                    }
-                }
-            }
-            for (spec in ROTATE_SPECS) {
-                val fn = spec.expectName
-                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
-                if (spec.width == 128) {
-                    appendLine("public actual fun $fn(lo: ULong, hi: ULong, n: UInt): U128ValueOutcome = KmLinearMemoryArena.$arenaFn(lo, hi, n)")
-                } else {
-                    val kt = smallWidthKtReturnFromU32(spec.width)
-                    appendLine("public actual fun $fn(value: $kt, n: UInt): $kt = KmLinearMemoryArena.$arenaFn(value, n)")
-                }
-            }
-            for (op in OverflowOpKind.entries) {
-                for (w in ALL_INT_WIDTHS) {
-                    val fn = "km${op.stem}WithOverflow${w.widthTag}"
-                    val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
-                    if (w.bits < 128) {
-                        appendLine("public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): Overflow${w.widthTag}Outcome = KmLinearMemoryArena.$arenaFn(a, b)")
-                    } else {
-                        appendLine("public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): Overflow${w.widthTag}Outcome = KmLinearMemoryArena.$arenaFn(aLo, aHi, bLo, bHi)")
-                    }
-                }
-            }
-            for (op in listOf(OverflowOpKind.ADD, OverflowOpKind.SUB)) {
-                for (w in ALL_INT_WIDTHS) {
-                    val fn = "kmSaturating${op.stem}${w.widthTag}"
-                    val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
-                    if (w.bits < 128) {
-                        appendLine("public actual fun $fn(a: ${w.ktType}, b: ${w.ktType}): ${w.ktType} = KmLinearMemoryArena.$arenaFn(a, b)")
-                    } else {
-                        appendLine("public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): ${w.ktType} = KmLinearMemoryArena.$arenaFn(aLo, aHi, bLo, bHi)")
-                    }
-                }
-            }
-            for ((fn, _) in U128_VALUE_BINOPS) {
-                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
-                appendLine("public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): U128ValueOutcome = KmLinearMemoryArena.$arenaFn(aLo, aHi, bLo, bHi)")
-            }
-            for ((fn, outType) in U128_DIVREM_OPS) {
-                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
-                appendLine("public actual fun $fn(aLo: ULong, aHi: ULong, bLo: ULong, bHi: ULong): $outType = KmLinearMemoryArena.$arenaFn(aLo, aHi, bLo, bHi)")
-            }
-            for ((fn, outType, _) in U128_SHIFT_OPS) {
-                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
-                appendLine("public actual fun $fn(aLo: ULong, aHi: ULong, shift: UInt): $outType = KmLinearMemoryArena.$arenaFn(aLo, aHi, shift)")
-            }
-            for (spec in FLOAT_MATH_SPECS) {
-                val fn = spec.expectName
-                val arenaFn = fn.removePrefix("km").replaceFirstChar { it.lowercase() }
-                val kt = if (spec.isF64) "Double" else "Float"
-                when {
-                    spec.arity == 1 -> appendLine("public actual fun $fn(x: $kt): $kt = KmLinearMemoryArena.$arenaFn(x)")
-                    spec.secondIsInt -> appendLine("public actual fun $fn(x: $kt, exp: Int): $kt = KmLinearMemoryArena.$arenaFn(x, exp)")
-                    else -> appendLine("public actual fun $fn(a: $kt, b: $kt): $kt = KmLinearMemoryArena.$arenaFn(a, b)")
-                }
-            }
-            appendLine(
-                """
-public actual fun kmFloatToU64Unchecked(v: Float): ULong = KmLinearMemoryArena.floatToU64Unchecked(v)
-public actual fun kmDoubleToU64Unchecked(v: Double): ULong = KmLinearMemoryArena.doubleToU64Unchecked(v)
-public actual fun kmFloatToU128Unchecked(v: Float): U128ValueOutcome = KmLinearMemoryArena.floatToU128Unchecked(v)
-public actual fun kmDoubleToU128Unchecked(v: Double): U128ValueOutcome = KmLinearMemoryArena.doubleToU128Unchecked(v)
-                """.trim(),
-            )
-        }
+        KmWasmWasiBridgeEmitter.renderDeclarations(MATH_AND_BIT_SPECS)
 }
