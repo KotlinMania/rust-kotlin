@@ -379,115 +379,14 @@ private fun translateRustDocCodeBlock(
 }
 
 private fun isSelfContainedSnippetStructure(source: String): Boolean {
-    var braceDepth = 0
-    var parenDepth = 0
-    var bracketDepth = 0
-    var inLineComment = false
-    var blockCommentDepth = 0
-    var inString = false
-    var escaped = false
-    var lastSignificantWord = ""
-    var currentWord = StringBuilder()
-    var lastSigPunct = ' '
-    var i = 0
-    while (i < source.length) {
-        val ch = source[i]
-        if (inLineComment) {
-            if (ch == '\n') inLineComment = false
-            i++
-            continue
-        }
-        if (blockCommentDepth > 0) {
-            if (ch == '/' && i + 1 < source.length && source[i + 1] == '*') {
-                blockCommentDepth++
-                i += 2
-                continue
-            }
-            if (ch == '*' && i + 1 < source.length && source[i + 1] == '/') {
-                blockCommentDepth--
-                i += 2
-                continue
-            }
-            i++
-            continue
-        }
-        if (inString) {
-            if (escaped) {
-                escaped = false
-            } else if (ch == '\\') {
-                escaped = true
-            } else if (ch == '"') {
-                inString = false
-            }
-            i++
-            continue
-        }
-        if (ch == '/' && i + 1 < source.length && source[i + 1] == '/') {
-            inLineComment = true
-            i += 2
-            continue
-        }
-        if (ch == '/' && i + 1 < source.length && source[i + 1] == '*') {
-            blockCommentDepth = 1
-            i += 2
-            continue
-        }
-        if (ch == '"') {
-            if (currentWord.isNotEmpty()) {
-                lastSignificantWord = currentWord.toString()
-                currentWord = StringBuilder()
-            }
-            lastSigPunct = '"'
-            inString = true
-            i++
-            continue
-        }
-        if (ch.isLetterOrDigit() || ch == '_') {
-            currentWord.append(ch)
-            lastSigPunct = ' '
-            i++
-            continue
-        }
-        if (currentWord.isNotEmpty()) {
-            lastSignificantWord = currentWord.toString()
-            currentWord = StringBuilder()
-        }
-        if (!ch.isWhitespace()) {
-            if (ch == '>' && lastSigPunct == '=') {
-                lastSigPunct = '>'
-            } else {
-                lastSigPunct = ch
-            }
-            when (ch) {
-                '{' -> braceDepth++
-                '}' -> {
-                    braceDepth--
-                    if (braceDepth < 0) return false
-                }
-                '(' -> parenDepth++
-                ')' -> {
-                    parenDepth--
-                    if (parenDepth < 0) return false
-                }
-                '[' -> bracketDepth++
-                ']' -> {
-                    bracketDepth--
-                    if (bracketDepth < 0) return false
-                }
-            }
-        }
-        i++
+    val stream = lexTokenStreamOrNull(normalizeSupplementaryCharLiterals(source)) ?: return false
+    val trees = stream.toList()
+    if (trees.isEmpty()) return true
+    return when (val last = trees.last()) {
+        is TokenTree.Ident -> last.value.toString() != "else"
+        is TokenTree.Punct -> last.value.asChar() != '>'
+        else -> true
     }
-    if (currentWord.isNotEmpty()) {
-        lastSignificantWord = currentWord.toString()
-    }
-    if (braceDepth != 0 || parenDepth != 0 || bracketDepth != 0 || blockCommentDepth != 0 || inString) {
-        return false
-    }
-    if (lastSignificantWord == "else" || lastSigPunct == '>') {
-        return false
-    }
-    return true
 }
 
 private fun translateSingleDoctestCandidate(
@@ -1521,12 +1420,8 @@ private fun renderCommentTokenTrees(trees: List<TokenTree>): String {
     return joinCommentTokensCleanly(outTokens)
 }
 
-private fun isDoubleColonAt(trees: List<TokenTree>, idx: Int): Boolean {
-    if (idx + 1 >= trees.size) return false
-    val first = (trees[idx] as? TokenTree.Punct)?.value ?: return false
-    val second = (trees[idx + 1] as? TokenTree.Punct)?.value ?: return false
-    return first.asChar() == ':' && first.spacing() == Spacing.Joint && second.asChar() == ':'
-}
+private fun isDoubleColonAt(trees: List<TokenTree>, idx: Int): Boolean =
+    RustTokenCursor(trees).isDoubleColonAt(idx)
 
 private fun mapSynTokenMacroSymbol(symbol: String): String =
     when (symbol) {

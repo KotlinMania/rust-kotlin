@@ -118,11 +118,6 @@ internal fun cfgAttrPreferenceScore(attrs: List<Attribute>): Int {
     return 0
 }
 
-private data class CfgSelectArm(
-    val predicateTokens: List<TokenTree>?,
-    val bodyTokens: List<TokenTree>,
-)
-
 private val UNSUPPORTED_RUST_TARGET_OS =
     setOf(
         "hermit",
@@ -224,93 +219,12 @@ internal fun isUnsupportedTargetRustRelPath(
     }
 }
 
-private fun parseCfgSelectArms(innerTrees: List<TokenTree>): List<CfgSelectArm>? {
-    if (innerTrees.isEmpty()) return emptyList()
-    val arms = mutableListOf<CfgSelectArm>()
-    var idx = 0
-    while (idx < innerTrees.size) {
-        var arrowIdx = -1
-        var scan = idx
-        while (scan + 1 < innerTrees.size) {
-            val eq = (innerTrees[scan] as? TokenTree.Punct)?.value
-            val gt = (innerTrees[scan + 1] as? TokenTree.Punct)?.value
-            if (eq?.asChar() == '=' && eq.spacing() == Spacing.Joint && gt?.asChar() == '>') {
-                arrowIdx = scan
-                break
-            }
-            scan++
-        }
-        if (arrowIdx <= idx) return null
-        val predSlice = innerTrees.subList(idx, arrowIdx)
-        val isWildcard =
-            predSlice.size == 1 && (predSlice[0] as? TokenTree.Ident)?.value?.toString() == "_"
-        val bodyStart = arrowIdx + 2
-        if (bodyStart > innerTrees.size) return null
-        val bodyTok = innerTrees.getOrNull(bodyStart)
-        val (bodyTokens, nextIdx) =
-            if (bodyTok is TokenTree.Group && bodyTok.value.delimiter() == Delimiter.Brace) {
-                val afterGrp = bodyStart + 1
-                val nextAfter =
-                    if (afterGrp < innerTrees.size &&
-                        (innerTrees[afterGrp] as? TokenTree.Punct)?.value?.asChar() == ','
-                    ) {
-                        afterGrp + 1
-                    } else {
-                        afterGrp
-                    }
-                bodyTok.value.stream().toList() to nextAfter
-            } else {
-                var commaIdx = bodyStart
-                while (commaIdx < innerTrees.size &&
-                    (innerTrees[commaIdx] as? TokenTree.Punct)?.value?.asChar() != ','
-                ) {
-                    commaIdx++
-                }
-                val slice = innerTrees.subList(bodyStart, commaIdx)
-                val nextAfter = if (commaIdx < innerTrees.size) commaIdx + 1 else commaIdx
-                slice to nextAfter
-            }
-        arms +=
-            CfgSelectArm(
-                predicateTokens = if (isWildcard) null else predSlice,
-                bodyTokens = bodyTokens,
-            )
-        idx = nextIdx
-    }
-    return arms
-}
-
-internal fun partitionCfgSelectBranchBodies(innerTrees: List<TokenTree>): List<Pair<List<TokenTree>, Boolean>>? {
-    val arms = parseCfgSelectArms(innerTrees) ?: return null
-    val result = mutableListOf<Pair<List<TokenTree>, Boolean>>()
-    var guaranteedWinner = false
-    for (arm in arms) {
-        if (guaranteedWinner) {
-            result += arm.bodyTokens to false
-            continue
-        }
-        val pred = arm.predicateTokens
-        if (pred == null) {
-            guaranteedWinner = true
-            result += arm.bodyTokens to true
-            continue
-        }
-        val tri = evalCfgTriState(pred, forRuntimeCfgMacro = false)
-        when (tri) {
-            true -> {
-                guaranteedWinner = true
-                result += arm.bodyTokens to true
-            }
-            false -> result += arm.bodyTokens to false
-            null -> result += arm.bodyTokens to true
-        }
-    }
-    return result
-}
+internal fun partitionCfgSelectBranchBodies(innerTrees: List<TokenTree>): List<Pair<List<TokenTree>, Boolean>>? =
+    parseCfgSelectArms(innerTrees)?.let(::partitionCfgBranchArms)
 
 private fun chooseSingleActiveCfgSelectBody(innerTrees: List<TokenTree>): List<TokenTree>? {
     val arms = parseCfgSelectArms(innerTrees) ?: return null
-    var firstNonFalse: CfgSelectArm? = null
+    var firstNonFalse: CfgBranchArm? = null
     for (arm in arms) {
         val pred = arm.predicateTokens ?: return firstNonFalse?.bodyTokens ?: arm.bodyTokens
         when (evalCfgTriState(pred, forRuntimeCfgMacro = false)) {
@@ -344,106 +258,43 @@ private fun implItemDeclarationKey(item: ImplItem): String? =
         else -> null
     }
 
-internal fun selectActiveCfgSelectBodies(innerTrees: List<TokenTree>): List<List<TokenTree>>? {
-    val arms = parseCfgSelectArms(innerTrees) ?: return null
-    val candidates = mutableListOf<Pair<CfgSelectArm, Boolean>>()
-    for (arm in arms) {
-        val pred = arm.predicateTokens
-        if (pred == null) {
-            candidates += arm to true
-            break
-        }
-        when (evalCfgTriState(pred, forRuntimeCfgMacro = false)) {
-            true -> return listOf(arm.bodyTokens)
-            false -> Unit
-            null -> candidates += arm to false
-        }
-    }
-    if (candidates.isEmpty()) return emptyList()
-    val hasNonWildcard = candidates.any { !it.second }
-    val seenKeys = linkedSetOf<String>()
-    val keptBodies = mutableListOf<List<TokenTree>>()
-    for ((arm, isWildcard) in candidates) {
-        if (arm.bodyTokens.isEmpty()) continue
-        val parsed =
-            parse2(FileParse::parse, TokenStream.fromTokenTrees(arm.bodyTokens))
+private object TokenBodyCfgSelector : CfgArmSelector<List<TokenTree>>() {
+    override fun parseArmBody(bodyTokens: List<TokenTree>): List<List<TokenTree>> = listOf(bodyTokens)
+
+    override fun extractArmKeys(parsed: List<List<TokenTree>>): List<String>? {
+        val file =
+            parse2(FileParse::parse, TokenStream.fromTokenTrees(parsed.single()))
                 .getOrNull()
-                ?.let(RustNextAstNormalizer::foldFile)
-        if (parsed == null) {
-            if (!isWildcard || !hasNonWildcard) {
-                keptBodies += arm.bodyTokens
-            }
-            continue
-        }
-        val armKeys = parsed.items.mapNotNull(::itemDeclarationKey)
-        if (isWildcard && hasNonWildcard) {
-            val isUnsupportedFallbackMod =
-                "mod:unsupported" in armKeys &&
-                    seenKeys.any { it.startsWith("mod:") }
-            val allKeysAlreadySeen =
-                armKeys.isNotEmpty() && armKeys.all { it in seenKeys }
-            if (isUnsupportedFallbackMod || allKeysAlreadySeen) {
-                continue
-            }
-        }
-        if (armKeys.isNotEmpty() && armKeys.all { it in seenKeys }) {
-            continue
-        }
-        seenKeys += armKeys
-        keptBodies += arm.bodyTokens
+                ?.let(RustNextAstNormalizer::foldFile) ?: return null
+        return file.items.mapNotNull(::itemDeclarationKey)
     }
-    return keptBodies
+
+    override fun shouldSkipWildcardArm(armKeys: List<String>, seenKeys: Set<String>): Boolean =
+        ("mod:unsupported" in armKeys && seenKeys.any { it.startsWith("mod:") }) ||
+            (armKeys.isNotEmpty() && armKeys.all { it in seenKeys })
 }
 
-private fun selectActiveCfgSelectImplItems(innerTrees: List<TokenTree>): List<ImplItem>? {
-    val arms = parseCfgSelectArms(innerTrees) ?: return null
-    val candidates = mutableListOf<Pair<CfgSelectArm, Boolean>>()
-    for (arm in arms) {
-        val pred = arm.predicateTokens
-        if (pred == null) {
-            candidates += arm to true
-            break
-        }
-        when (evalCfgTriState(pred, forRuntimeCfgMacro = false)) {
-            true -> {
-                val wrapped = wrapImplDummyStream(TokenStream.fromTokenTrees(arm.bodyTokens))
-                val dummy =
-                    parse2(FileParse::parse, wrapped)
-                        .getOrNull()
-                        ?.let(RustNextAstNormalizer::foldFile)
-                        ?.items
-                        ?.singleOrNull() as? Item.Impl ?: return null
-                return dummy.items
-            }
-            false -> Unit
-            null -> candidates += arm to false
-        }
-    }
-    if (candidates.isEmpty()) return emptyList()
-    val hasNonWildcard = candidates.any { !it.second }
-    val seenKeys = linkedSetOf<String>()
-    val collected = mutableListOf<ImplItem>()
-    for ((arm, isWildcard) in candidates) {
-        if (arm.bodyTokens.isEmpty()) continue
-        val wrapped = wrapImplDummyStream(TokenStream.fromTokenTrees(arm.bodyTokens))
+private object ImplItemCfgSelector : CfgArmSelector<ImplItem>() {
+    override fun parseArmBody(bodyTokens: List<TokenTree>): List<ImplItem>? {
+        val wrapped = wrapImplDummyStream(TokenStream.fromTokenTrees(bodyTokens))
         val dummy =
             parse2(FileParse::parse, wrapped)
                 .getOrNull()
                 ?.let(RustNextAstNormalizer::foldFile)
                 ?.items
                 ?.singleOrNull() as? Item.Impl ?: return null
-        val armKeys = dummy.items.mapNotNull(::implItemDeclarationKey)
-        if (isWildcard && hasNonWildcard && armKeys.isNotEmpty() && armKeys.all { it in seenKeys }) {
-            continue
-        }
-        if (armKeys.isNotEmpty() && armKeys.all { it in seenKeys }) {
-            continue
-        }
-        seenKeys += armKeys
-        collected += dummy.items
+        return dummy.items
     }
-    return collected
+
+    override fun extractArmKeys(parsed: List<ImplItem>): List<String> =
+        parsed.mapNotNull(::implItemDeclarationKey)
 }
+
+internal fun selectActiveCfgSelectBodies(innerTrees: List<TokenTree>): List<List<TokenTree>>? =
+    parseCfgSelectArms(innerTrees)?.let(TokenBodyCfgSelector::selectActive)
+
+private fun selectActiveCfgSelectImplItems(innerTrees: List<TokenTree>): List<ImplItem>? =
+    parseCfgSelectArms(innerTrees)?.let(ImplItemCfgSelector::selectActive)
 
 private fun wrapImplDummyStream(inner: TokenStream): TokenStream {
     val prefix = TokenStream.fromString("impl Dummy").getOrThrow().toList()
@@ -2206,26 +2057,14 @@ internal class MacroRulesFileExpander(
             return idx
         }
 
-        private fun skipBalancedAngles(input: List<TokenTree>, openIdx: Int): Int {
-            var depth = 1
-            var idx = openIdx + 1
-            while (idx < input.size && depth > 0) {
-                val c = (input[idx] as? TokenTree.Punct)?.value?.asChar()
-                if (c == '<') {
-                    depth++
-                } else if (c == '>' && !isPartOfRArrow(input, idx)) {
-                    depth--
-                }
-                idx++
-            }
-            return idx
-        }
+        private fun hasMatchingClosingAngle(input: List<TokenTree>, openIdx: Int): Boolean =
+            RustTokenCursor(input).hasMatchingClosingAngle(openIdx)
 
-        private fun isPartOfRArrow(trees: List<TokenTree>, gtIdx: Int): Boolean {
-            if (gtIdx <= 0) return false
-            val prev = trees[gtIdx - 1] as? TokenTree.Punct ?: return false
-            return prev.value.asChar() == '-' && prev.value.spacing() == Spacing.Joint
-        }
+        private fun skipBalancedAngles(input: List<TokenTree>, openIdx: Int): Int =
+            RustTokenCursor(input).skipBalancedAngles(openIdx) ?: input.size
+
+        private fun isPartOfRArrow(trees: List<TokenTree>, gtIdx: Int): Boolean =
+            RustTokenCursor(trees).isRArrowEndAt(gtIdx)
 
         private fun tokenMatchesLiteral(tt: TokenTree, pat: MacroPat.LiteralToken): Boolean =
             when (tt) {
@@ -2251,17 +2090,8 @@ internal class MacroRulesFileExpander(
                 }
             }
 
-        private fun flattenTopLevelNoneGroups(trees: List<TokenTree>): List<TokenTree> {
-            val out = mutableListOf<TokenTree>()
-            for (tt in trees) {
-                if (tt is TokenTree.Group && tt.value.delimiter() == Delimiter.None) {
-                    out.addAll(flattenTopLevelNoneGroups(tt.value.stream().toList()))
-                } else {
-                    out.add(tt)
-                }
-            }
-            return out
-        }
+        private fun flattenTopLevelNoneGroups(trees: List<TokenTree>): List<TokenTree> =
+            RustTokenCursor.flattenNoneDelimitedGroupList(trees)
 
         private fun collectDirectPatMetavars(pats: List<MacroPat>): Set<String> {
             val vars = linkedSetOf<String>()
@@ -2579,95 +2409,11 @@ internal class MacroRulesFileExpander(
             return TokenStream.fromTokenTrees(out)
         }
 
-        internal fun splitMacroArguments(stream: TokenStream): List<List<TokenTree>> {
-            val trees = stream.clone().toList()
-            if (trees.isEmpty()) return emptyList()
-            val commaArgs = splitByPunct(trees, ',')
-            if (commaArgs.size > 1) return commaArgs
-            val semiArgs = splitByPunct(trees, ';')
-            if (semiArgs.size > 1) return semiArgs
-            return commaArgs
-        }
+        internal fun splitMacroArguments(stream: TokenStream): List<List<TokenTree>> =
+            RustTokenCursor.splitMacroArguments(stream)
 
         internal fun splitTopLevelCommaClauses(trees: List<TokenTree>): List<List<TokenTree>> =
-            splitByPunct(trees, ',')
-
-        private fun hasMatchingClosingAngle(trees: List<TokenTree>, openIdx: Int): Boolean {
-            if (openIdx > 0 && (trees[openIdx - 1] as? TokenTree.Punct)?.value?.asChar() == '<') {
-                return false
-            }
-            if (openIdx + 1 < trees.size) {
-                val nextPunct = (trees[openIdx + 1] as? TokenTree.Punct)?.value?.asChar()
-                if (nextPunct == '=' || nextPunct == '<' || nextPunct == '-') return false
-            }
-            val isTurbofish =
-                openIdx >= 2 &&
-                    (trees[openIdx - 1] as? TokenTree.Punct)?.value?.asChar() == ':' &&
-                    (trees[openIdx - 2] as? TokenTree.Punct)?.value?.asChar() == ':'
-            val afterUpperIdent =
-                (trees.getOrNull(openIdx - 1) as? TokenTree.Ident)
-                    ?.value
-                    ?.toString()
-                    ?.firstOrNull()
-                    ?.isUpperCase() == true
-            val allowLiterals = isTurbofish || afterUpperIdent
-            var depth = 1
-            for (j in (openIdx + 1) until trees.size) {
-                when (val t = trees[j]) {
-                    is TokenTree.Literal -> if (!allowLiterals) return false
-                    is TokenTree.Punct -> {
-                        val ch = t.value.asChar()
-                        if (ch == ';') return false
-                        val nextCh = (trees.getOrNull(j + 1) as? TokenTree.Punct)?.value?.asChar()
-                        if ((ch == '=' && nextCh == '>') ||
-                            (ch == '&' && nextCh == '&') ||
-                            (ch == '|' && nextCh == '|') ||
-                            (ch == '=' && nextCh == '=') ||
-                            (ch == '!' && nextCh == '=') ||
-                            (ch == '<' && nextCh == '=') ||
-                            (ch == '>' && nextCh == '=')
-                        ) {
-                            return false
-                        }
-                        if (ch == '<') {
-                            depth++
-                        } else if (ch == '>' && !isPartOfRArrow(trees, j)) {
-                            depth--
-                            if (depth == 0) return true
-                        }
-                    }
-                    else -> {}
-                }
-            }
-            return false
-        }
-
-        private fun splitByPunct(trees: List<TokenTree>, sep: Char): List<List<TokenTree>> {
-            val args = mutableListOf<List<TokenTree>>()
-            val current = mutableListOf<TokenTree>()
-            var angleDepth = 0
-            for ((idx, tt) in trees.withIndex()) {
-                if (tt is TokenTree.Punct) {
-                    val ch = tt.value.asChar()
-                    if (ch == '<' && hasMatchingClosingAngle(trees, idx)) {
-                        angleDepth++
-                    } else if (ch == '>' && angleDepth > 0 && !isPartOfRArrow(trees, idx)) {
-                        angleDepth--
-                    } else if (ch == sep && angleDepth == 0) {
-                        if (current.isNotEmpty()) {
-                            args.add(current.toList())
-                            current.clear()
-                        }
-                        continue
-                    }
-                }
-                current.add(tt)
-            }
-            if (current.isNotEmpty()) {
-                args.add(current.toList())
-            }
-            return args
-        }
+            RustTokenCursor(trees).splitByTopLevelPunct(',')
 
         internal fun substituteMacroTokens(
             template: TokenStream,

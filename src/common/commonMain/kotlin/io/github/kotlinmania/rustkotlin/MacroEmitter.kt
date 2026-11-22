@@ -550,15 +550,8 @@ internal fun KotlinJ2KEmitter.buildQuoteTemplateAndBindings(
     }
 }
 
-internal fun KotlinJ2KEmitter.flattenNoneDelimitedGroups(stream: TokenStream, out: MutableList<TokenTree>) {
-    for (tt in stream.clone().toList()) {
-        if (tt is TokenTree.Group && tt.value.delimiter() == Delimiter.None) {
-            flattenNoneDelimitedGroups(tt.value.stream(), out)
-        } else {
-            out += tt
-        }
-    }
-}
+internal fun KotlinJ2KEmitter.flattenNoneDelimitedGroups(stream: TokenStream, out: MutableList<TokenTree>): Unit =
+    RustTokenCursor.flattenNoneDelimitedGroups(stream, out)
 
 internal fun KotlinJ2KEmitter.stringifyTokenStream(tokens: TokenStream): String {
     val flat = mutableListOf<TokenTree>()
@@ -566,13 +559,8 @@ internal fun KotlinJ2KEmitter.stringifyTokenStream(tokens: TokenStream): String 
     return TokenStream.fromTokenTrees(flat).toString()
 }
 
-internal fun KotlinJ2KEmitter.unwrapNoneGroupSlice(trees: List<TokenTree>): List<TokenTree> {
-    var cur = trees
-    while (cur.size == 1 && cur[0] is TokenTree.Group && (cur[0] as TokenTree.Group).value.delimiter() == Delimiter.None) {
-        cur = (cur[0] as TokenTree.Group).value.stream().toList()
-    }
-    return cur
-}
+internal fun KotlinJ2KEmitter.unwrapNoneGroupSlice(trees: List<TokenTree>): List<TokenTree> =
+    RustTokenCursor.unwrapNoneGroupSlice(trees)
 
 internal fun KotlinJ2KEmitter.tryEvalCompileTimeStringMacroArg(rawTrees: List<TokenTree>): String? {
     val trees = unwrapNoneGroupSlice(rawTrees)
@@ -892,46 +880,8 @@ internal fun KotlinJ2KEmitter.renderWriteMacroInvocation(
     return "$target.$appendMethod($formatted)"
 }
 
-private fun splitAssertEqArgsForMacro(stream: TokenStream): List<List<TokenTree>> {
-    val parts = MacroRulesFileExpander.splitMacroArguments(stream.clone())
-    if (parts.size >= 2) return parts
-    val trees = stream.clone().toList()
-    if (trees.isEmpty()) return emptyList()
-    val out = mutableListOf<List<TokenTree>>()
-    val cur = mutableListOf<TokenTree>()
-    var turbofishAngleDepth = 0
-    for ((idx, tt) in trees.withIndex()) {
-        if (tt is TokenTree.Punct) {
-            val ch = tt.value.asChar()
-            val prevIsColon =
-                idx >= 2 &&
-                    (trees[idx - 1] as? TokenTree.Punct)?.value?.asChar() == ':' &&
-                    (trees[idx - 2] as? TokenTree.Punct)?.value?.asChar() == ':'
-            if (ch == '<' && prevIsColon) {
-                turbofishAngleDepth++
-                cur += tt
-                continue
-            }
-            if (ch == '>' && turbofishAngleDepth > 0) {
-                turbofishAngleDepth--
-                cur += tt
-                continue
-            }
-            if (ch == ',' && turbofishAngleDepth == 0) {
-                if (cur.isNotEmpty()) {
-                    out += cur.toList()
-                    cur.clear()
-                }
-                continue
-            }
-        }
-        cur += tt
-    }
-    if (cur.isNotEmpty()) {
-        out += cur.toList()
-    }
-    return out
-}
+private fun splitAssertEqArgsForMacro(stream: TokenStream): List<List<TokenTree>> =
+    RustTokenCursor.splitMacroCommaArgsWithComparisonFallback(stream)
 
 private fun splitTopLevelVecRepeatSemicolon(tokens: TokenStream): Pair<TokenStream, TokenStream>? {
     val trees = tokens.clone().toList()

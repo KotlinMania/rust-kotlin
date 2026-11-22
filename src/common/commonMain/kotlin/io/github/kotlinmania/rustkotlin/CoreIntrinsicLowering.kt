@@ -778,7 +778,7 @@ public object CoreIntrinsicLowering {
             }
         }
         // Form 2: `const_eval_select!((arg0, arg1), const_fn, runtime_fn)`
-        val topArgs = splitMacroTopLevelCommaArgs(tokens)
+        val topArgs = RustTokenCursor(tokens).splitByTopLevelPunct(',')
         if (topArgs.size >= 3) {
             val tupleTree = topArgs[0].singleOrNull() as? TokenTree.Group
             val runtimeFnSrc = topArgs[2].joinToString("") { it.toString() }.trim()
@@ -796,21 +796,6 @@ public object CoreIntrinsicLowering {
             }
         }
         return null
-    }
-
-    private fun splitMacroTopLevelCommaArgs(tokens: List<TokenTree>): List<List<TokenTree>> {
-        val result = mutableListOf<List<TokenTree>>()
-        val current = mutableListOf<TokenTree>()
-        for (tok in tokens) {
-            if (tok is TokenTree.Punct && tok.value.asChar() == ',') {
-                result += current.toList()
-                current.clear()
-            } else {
-                current += tok
-            }
-        }
-        if (current.isNotEmpty()) result += current.toList()
-        return result
     }
 
     internal fun renderRustcIntrinsicVerbatimItem(

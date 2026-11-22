@@ -16,41 +16,12 @@ internal fun tryConsumeScannerAttr(
     idx: Int,
     pendingAttrsOut: MutableList<List<TokenTree>>? = null,
     allowInnerAttr: Boolean = true,
-): Int? {
-    val cur = trees.getOrNull(idx) as? TokenTree.Punct ?: return null
-    if (cur.value.asChar() != '#') return null
-    if (allowInnerAttr &&
-        (trees.getOrNull(idx + 1) as? TokenTree.Punct)?.value?.asChar() == '!' &&
-        (trees.getOrNull(idx + 2) as? TokenTree.Group)?.value?.delimiter() == Delimiter.Bracket
-    ) {
-        return idx + 3
-    }
-    val attrGrp = trees.getOrNull(idx + 1) as? TokenTree.Group
-    if (attrGrp != null && attrGrp.value.delimiter() == Delimiter.Bracket) {
-        pendingAttrsOut?.add(attrGrp.value.stream().toList())
-        return idx + 2
-    }
-    return null
-}
+): Int? = RustTokenCursor(trees).consumeAttribute(idx, pendingAttrsOut, allowInnerAttr)
 
 internal fun skipBalancedAngleBrackets(
     trees: List<TokenTree>,
     startIdx: Int,
-): Int? {
-    if ((trees.getOrNull(startIdx) as? TokenTree.Punct)?.value?.asChar() != '<') return null
-    var depth = 1
-    var k = startIdx + 1
-    while (k < trees.size && depth > 0) {
-        val ch = (trees[k] as? TokenTree.Punct)?.value?.asChar()
-        if (ch == '<') {
-            depth++
-        } else if (ch == '>' && !isScannerRArrow(trees, k)) {
-            depth--
-        }
-        k++
-    }
-    return if (depth == 0) k else null
-}
+): Int? = RustTokenCursor(trees).skipBalancedAngles(startIdx)
 
 internal fun skipFnQualifiersAndFindFnKw(
     trees: List<TokenTree>,
@@ -543,66 +514,8 @@ internal fun collectCfgDisabledChildModuleRelPrefixes(
 internal fun selectActiveCfgIfBodies(innerTrees: List<TokenTree>): List<List<TokenTree>>? =
     partitionCfgIfBranchBodies(innerTrees)?.filter { it.second }?.map { it.first }
 
-private fun partitionCfgIfBranchBodies(innerTrees: List<TokenTree>): List<Pair<List<TokenTree>, Boolean>>? {
-    if ((innerTrees.firstOrNull() as? TokenTree.Ident)?.value?.toString() != "if") return null
-    val branches = mutableListOf<Pair<List<TokenTree>, Boolean>>()
-    var matchedActiveBranch = false
-    var idx = 0
-    while (idx < innerTrees.size) {
-        val kw = (innerTrees.getOrNull(idx) as? TokenTree.Ident)?.value?.toString()
-        if (kw == "if") {
-            val hash = (innerTrees.getOrNull(idx + 1) as? TokenTree.Punct)?.value?.asChar()
-            val attrGrp = innerTrees.getOrNull(idx + 2) as? TokenTree.Group
-            val bodyGrp = innerTrees.getOrNull(idx + 3) as? TokenTree.Group
-            if (hash != '#' ||
-                attrGrp?.value?.delimiter() != Delimiter.Bracket ||
-                bodyGrp?.value?.delimiter() != Delimiter.Brace
-            ) {
-                return null
-            }
-            val attrTokens = attrGrp.value.stream().toList()
-            if (attrTokens.size != 2 ||
-                (attrTokens[0] as? TokenTree.Ident)?.value?.toString() != "cfg" ||
-                (attrTokens[1] as? TokenTree.Group)?.value?.delimiter() != Delimiter.Parenthesis
-            ) {
-                return null
-            }
-            val predTokens = (attrTokens[1] as TokenTree.Group).value.stream().toList()
-            val bodyTokens = bodyGrp.value.stream().toList()
-            val isActive =
-                when {
-                    matchedActiveBranch -> false
-                    isDocOnlyCfgPredicateTokens(predTokens) -> false
-                    else -> {
-                        when (evalCfgTriState(predTokens, forRuntimeCfgMacro = false)) {
-                            true -> {
-                                matchedActiveBranch = true
-                                true
-                            }
-                            false -> false
-                            null -> true
-                        }
-                    }
-                }
-            branches += bodyTokens to isActive
-            idx += 4
-            if ((innerTrees.getOrNull(idx) as? TokenTree.Ident)?.value?.toString() == "else") {
-                idx++
-                if ((innerTrees.getOrNull(idx) as? TokenTree.Ident)?.value?.toString() == "if") {
-                    continue
-                }
-                val elseBody = innerTrees.getOrNull(idx) as? TokenTree.Group
-                if (elseBody?.value?.delimiter() == Delimiter.Brace) {
-                    branches += elseBody.value.stream().toList() to !matchedActiveBranch
-                    idx++
-                }
-            }
-        } else {
-            break
-        }
-    }
-    return branches
-}
+private fun partitionCfgIfBranchBodies(innerTrees: List<TokenTree>): List<Pair<List<TokenTree>, Boolean>>? =
+    parseCfgIfArms(innerTrees)?.let(::partitionCfgBranchArms)
 
 private fun extractReprPackAlign(attrGroups: List<List<TokenTree>>): Int? {
     var pack: Int? = null
@@ -1495,11 +1408,8 @@ private fun skipItemAfterHeader(
     return trees.size
 }
 
-internal fun isScannerRArrow(trees: List<TokenTree>, gtIdx: Int): Boolean {
-    if (gtIdx <= 0) return false
-    val prev = trees[gtIdx - 1] as? TokenTree.Punct ?: return false
-    return prev.value.asChar() == '-' && prev.value.spacing() == Spacing.Joint
-}
+internal fun isScannerRArrow(trees: List<TokenTree>, gtIdx: Int): Boolean =
+    RustTokenCursor(trees).isRArrowEndAt(gtIdx)
 
 private data class HeaderGenericTypeParams(
     val paramNames: Set<String>,

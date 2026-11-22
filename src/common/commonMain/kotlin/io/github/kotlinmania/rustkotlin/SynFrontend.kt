@@ -456,29 +456,13 @@ internal object RustNextAstNormalizer : Fold() {
 
     private fun stripConstFromVerbatimItemTokens(trees: List<TokenTree>): List<TokenTree>? {
         if (trees.isEmpty()) return null
+        val cursor = RustTokenCursor(trees)
         val out = ArrayList<TokenTree>(trees.size)
-        var idx = 0
-        while (idx + 1 < trees.size &&
-            (trees[idx] as? TokenTree.Punct)?.value?.asChar() == '#' &&
-            (trees[idx + 1] as? TokenTree.Group)?.value?.delimiter() == Delimiter.Bracket
-        ) {
-            out.add(trees[idx])
-            out.add(trees[idx + 1])
-            idx += 2
-        }
-        if ((trees.getOrNull(idx) as? TokenTree.Ident)?.value?.toString() == "pub") {
-            out.add(trees[idx])
-            idx++
-            if ((trees.getOrNull(idx) as? TokenTree.Group)?.value?.delimiter() == Delimiter.Parenthesis) {
-                out.add(trees[idx])
-                idx++
-            }
-        }
+        var idx = cursor.copyLeadingOuterAttributes(0, out)
+        idx = cursor.copyOptionalPubVisibility(idx, out)
         var stripped = false
-        if ((trees.getOrNull(idx) as? TokenTree.Ident)?.value?.toString() == "impl" &&
-            (trees.getOrNull(idx + 1) as? TokenTree.Group)?.value?.delimiter() == Delimiter.Parenthesis
-        ) {
-            val afterRestriction = (trees.getOrNull(idx + 2) as? TokenTree.Ident)?.value?.toString()
+        if (cursor.identAt(idx) == "impl" && cursor.groupAt(idx + 1, Delimiter.Parenthesis) != null) {
+            val afterRestriction = cursor.identAt(idx + 2)
             if (afterRestriction == "const" || afterRestriction == "unsafe" || afterRestriction == "auto" || afterRestriction == "trait") {
                 idx += 2
                 stripped = true
@@ -488,8 +472,7 @@ internal object RustNextAstNormalizer : Fold() {
         var scan = idx
         var sawConstHeader = false
         while (scan < trees.size) {
-            val ident = (trees[scan] as? TokenTree.Ident)?.value?.toString() ?: break
-            when (ident) {
+            when (cursor.identAt(scan) ?: break) {
                 "const" -> {
                     sawConstHeader = true
                     scan++
@@ -501,35 +484,15 @@ internal object RustNextAstNormalizer : Fold() {
                 else -> break
             }
         }
-        val keyword = (trees.getOrNull(scan) as? TokenTree.Ident)?.value?.toString()
-        if (keyword != "trait" && keyword != "impl") {
-            return null
-        }
-        if (sawConstHeader) {
-            stripped = true
-        }
+        val keyword = cursor.identAt(scan)
+        if (keyword != "trait" && keyword != "impl") return null
+        if (sawConstHeader) stripped = true
         out.addAll(keptModifiers)
         out.add(trees[scan])
         idx = scan + 1
         if (keyword == "impl") {
-            if ((trees.getOrNull(idx) as? TokenTree.Punct)?.value?.asChar() == '<') {
-                var angleDepth = 0
-                while (idx < trees.size) {
-                    val tt = trees[idx]
-                    out.add(tt)
-                    idx++
-                    if (tt is TokenTree.Punct) {
-                        val ch = tt.value.asChar()
-                        if (ch == '<') {
-                            angleDepth++
-                        } else if (ch == '>' && angleDepth > 0) {
-                            angleDepth--
-                            if (angleDepth == 0) break
-                        }
-                    }
-                }
-            }
-            if ((trees.getOrNull(idx) as? TokenTree.Punct)?.value?.asChar() == '!') {
+            idx = cursor.copyBalancedAngles(idx, out)
+            if (cursor.punctCharAt(idx) == '!') {
                 out.add(trees[idx])
                 idx++
             }
@@ -540,54 +503,31 @@ internal object RustNextAstNormalizer : Fold() {
             }
         }
         if (!stripped) return null
-        while (idx < trees.size) {
-            out.add(trees[idx])
-            idx++
-        }
+        out.addAll(trees.subList(idx, trees.size))
         return out
     }
 
     private fun stripConstFromVerbatimBoundTokens(trees: List<TokenTree>): List<TokenTree>? {
         if (trees.isEmpty()) return null
+        val cursor = RustTokenCursor(trees)
         if (trees.size == 1) {
-            val parenGrp = trees[0] as? TokenTree.Group
-            if (parenGrp != null && parenGrp.value.delimiter() == Delimiter.Parenthesis) {
-                val innerStripped = stripConstFromVerbatimBoundTokens(parenGrp.value.stream().toList()) ?: return null
+            val parenGrp = cursor.groupAt(0, Delimiter.Parenthesis)
+            if (parenGrp != null) {
+                val innerStripped = stripConstFromVerbatimBoundTokens(parenGrp.stream().toList()) ?: return null
                 val rebuiltGrp = Group(Delimiter.Parenthesis, TokenStream.fromTokenTrees(innerStripped))
-                rebuiltGrp.setSpan(parenGrp.value.span())
+                rebuiltGrp.setSpan(parenGrp.span())
                 return listOf(TokenTree.Group(rebuiltGrp))
             }
         }
         val out = ArrayList<TokenTree>(trees.size)
         var idx = 0
-        if ((trees.getOrNull(idx) as? TokenTree.Ident)?.value?.toString() == "for" &&
-            (trees.getOrNull(idx + 1) as? TokenTree.Punct)?.value?.asChar() == '<'
-        ) {
+        if (cursor.identAt(idx) == "for" && cursor.punctCharAt(idx + 1) == '<') {
             out.add(trees[idx])
-            idx++
-            var angleDepth = 0
-            while (idx < trees.size) {
-                val tt = trees[idx]
-                out.add(tt)
-                idx++
-                if (tt is TokenTree.Punct) {
-                    val ch = tt.value.asChar()
-                    if (ch == '<') {
-                        angleDepth++
-                    } else if (ch == '>' && angleDepth > 0) {
-                        angleDepth--
-                        if (angleDepth == 0) break
-                    }
-                }
-            }
+            idx = cursor.copyBalancedAngles(idx + 1, out)
         }
         val constModLen = leadingConstBoundModifierLength(trees, idx)
         if (constModLen == 0) return null
-        idx += constModLen
-        while (idx < trees.size) {
-            out.add(trees[idx])
-            idx++
-        }
+        out.addAll(trees.subList(idx + constModLen, trees.size))
         return out
     }
 
