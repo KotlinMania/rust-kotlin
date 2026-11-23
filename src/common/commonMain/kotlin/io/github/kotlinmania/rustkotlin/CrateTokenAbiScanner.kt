@@ -714,8 +714,7 @@ private fun scanSourcesWithActiveSession(
         val makeNullableForUnion = decl.isUnion && !rawAbiMode
         for (field in decl.fields) {
             val mappedTy =
-                mapTokensFieldTypeQuick(
-                    tokens = field.typeTokens,
+                RustTypeSliceInspector(field.typeTokens).mapFieldTypeQuick(
                     rawAbiMode = rawAbiMode,
                     selfOwnerKt = decl.ktName,
                     numericKinds = numericKinds,
@@ -1147,7 +1146,7 @@ private fun resolveTokenTypeScalarKind(
         }
         return null
     }
-    val leaf = extractSimplePathLeafIdent(typeTokens) ?: return null
+    val leaf = RustTokenCursor(typeTokens).simplePathLeafIdent() ?: return null
     if (typeTokens.any { (it as? TokenTree.Punct)?.value?.asChar() == '<' }) return null
     when (leaf) {
         "isize" -> return if (rawAbiMode && TranslationSession.cfgTargetProfile.pointerWidth == 64) "I64" else "I32"
@@ -1275,14 +1274,15 @@ private fun resolveFieldShape(
         }
     }
 
-    if (extractOptionAngleInnerTokens(typeTokens)?.let(::tryParseBareFnTokens) != null) {
+    val typeSlice = RustTypeSliceInspector(typeTokens)
+    if (typeSlice.extractOptionAngleInnerTokens()?.let { RustTypeSliceInspector(it).tryParseBareFnTokens() } != null) {
         return ComputedFieldShape.CallbackPtr(samKtName = "", isNullable = true)
     }
-    if (tryParseBareFnTokens(typeTokens) != null) {
+    if (typeSlice.tryParseBareFnTokens() != null) {
         return ComputedFieldShape.CallbackPtr(samKtName = "", isNullable = false)
     }
 
-    val leaf = extractSimplePathLeafIdent(typeTokens) ?: return null
+    val leaf = typeSlice.simplePathLeafIdent() ?: return null
     if (typeTokens.any { (it as? TokenTree.Punct)?.value?.asChar() == '<' }) return null
     val ktIdent = KotlinNamingPolicy.Default.toTypeIdentifier(leaf, allowRawAbi = rawAbiMode)
     val scopedKey = if (subpkg.isEmpty()) ktIdent else "$subpkg.$ktIdent"
@@ -1545,10 +1545,11 @@ private fun resolveFnReturnDefaultExpr(
             "ConstPtr(0L)"
         }
     }
-    if (extractOptionAngleInnerTokens(retTokens) != null) {
+    val retSlice = RustTypeSliceInspector(retTokens)
+    if (retSlice.extractOptionAngleInnerTokens() != null) {
         return "null"
     }
-    val leaf = extractSimplePathLeafIdent(retTokens) ?: return "Unit"
+    val leaf = retSlice.simplePathLeafIdent() ?: return "Unit"
     val (bDef, _) = classifyBuiltinLeaf(leaf, ownerKtName)
     if (bDef != null) return bDef
     val retKt = KotlinNamingPolicy.Default.toTypeIdentifier(leaf, allowRawAbi = rawAbiMode)
@@ -1576,7 +1577,7 @@ private fun buildFnPtrInvokeTemplate(
                 "F64" -> "$pName.toRawBits()"
                 "I8", "U8", "I16", "U16", "I32", "U32", "U64" -> "$pName.toLong()"
                 else -> {
-                    val leaf = extractSimplePathLeafIdent(paramTokens)
+                    val leaf = RustTokenCursor(paramTokens).simplePathLeafIdent()
                     val ktIdent = leaf?.let { KotlinNamingPolicy.Default.toTypeIdentifier(it, allowRawAbi = rawAbiMode) }
                     val scoped = if (ktIdent != null && spec.subpkg.isNotEmpty()) "${spec.subpkg}.$ktIdent" else ktIdent
                     val packTpl =
@@ -1587,14 +1588,9 @@ private fun buildFnPtrInvokeTemplate(
             }
         }
     val invokeExpr = "__FFI__.invokePtr(rawRet, longArrayOf(${slotExprs.joinToString(", ")}))"
+    val specRetSlice = RustTypeSliceInspector(spec.retTokens)
     val retBody =
-        if (spec.retTokens.isEmpty() ||
-            (
-                spec.retTokens.size == 1 &&
-                    (spec.retTokens[0] as? TokenTree.Group)?.value?.delimiter() == Delimiter.Parenthesis &&
-                    (spec.retTokens[0] as TokenTree.Group).value.stream().isEmpty()
-            )
-        ) {
+        if (spec.retTokens.isEmpty() || specRetSlice.isUnitParens()) {
             invokeExpr
         } else {
             val retKind = resolveTokenTypeScalarKind(spec.retTokens, spec.subpkg, rawAbiMode, numericKinds, aliasDefaults)
@@ -1611,7 +1607,7 @@ private fun buildFnPtrInvokeTemplate(
                 "F64" -> "Double.fromBits($invokeExpr)"
                 "BOOL" -> "(($invokeExpr and 0xFFL) != 0L)"
                 else -> {
-                    if (extractOptionAngleInnerTokens(spec.retTokens) != null) {
+                    if (specRetSlice.extractOptionAngleInnerTokens() != null) {
                         "run { $invokeExpr; null }"
                     } else {
                         return null

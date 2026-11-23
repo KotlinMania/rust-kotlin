@@ -49,11 +49,20 @@ internal open class RustTokenCursor(
         return p0.asChar() == ':' && p0.spacing() == Spacing.Joint && p1.asChar() == ':'
     }
 
+    fun isRArrowStartAt(minusIdx: Int): Boolean =
+        punctCharAt(minusIdx) == '-' && punctSpacingAt(minusIdx) == Spacing.Joint && punctCharAt(minusIdx + 1) == '>'
+
     fun isRArrowEndAt(gtIdx: Int): Boolean {
         if (gtIdx <= 0) return false
         val prev = (trees.getOrNull(gtIdx - 1) as? TokenTree.Punct)?.value ?: return false
         return prev.asChar() == '-' && prev.spacing() == Spacing.Joint
     }
+
+    fun isSingleColonAt(idx: Int): Boolean =
+        punctCharAt(idx) == ':' && punctSpacingAt(idx) != Spacing.Joint
+
+    fun isUnitParens(): Boolean =
+        trees.size == 1 && groupAt(0, Delimiter.Parenthesis)?.stream()?.isEmpty() == true
 
     fun isFatArrowAt(eqIdx: Int): Boolean {
         if (eqIdx + 1 >= trees.size) return false
@@ -98,6 +107,74 @@ internal open class RustTokenCursor(
             idx++
         }
         return idx
+    }
+
+    fun stripLeadingPubVisibility(): List<TokenTree> {
+        val nextIdx = copyOptionalPubVisibility(0)
+        return if (nextIdx == 0) trees else trees.subList(nextIdx, trees.size)
+    }
+
+    fun findPathTailIdentIndex(startIdx: Int = 0): Int? {
+        var i = startIdx
+        if (i + 1 < trees.size && punctCharAt(i) == ':' && punctCharAt(i + 1) == ':') {
+            i += 2
+        }
+        if (trees.getOrNull(i) !is TokenTree.Ident) return null
+        var lastIdent = i
+        i++
+        while (i + 2 < trees.size &&
+            punctCharAt(i) == ':' &&
+            punctCharAt(i + 1) == ':' &&
+            trees[i + 2] is TokenTree.Ident
+        ) {
+            lastIdent = i + 2
+            i += 3
+        }
+        return lastIdent
+    }
+
+    fun simplePathLeafIdent(startIdx: Int = 0): String? =
+        findPathTailIdentIndex(startIdx)?.let(::cleanIdentAt)
+
+    fun skipFnQualifiersToFnKeyword(
+        startIdx: Int,
+        endIdx: Int = trees.size,
+        allowBareLiteral: Boolean = false,
+    ): Int? {
+        var j = startIdx
+        val limit = minOf(endIdx, trees.size)
+        while (j < limit) {
+            when (val cur = trees[j]) {
+                is TokenTree.Ident ->
+                    when (cur.value.toString()) {
+                        "const", "unsafe", "async" -> j++
+                        "extern" -> {
+                            j++
+                            if (j < limit && trees[j] is TokenTree.Literal) j++
+                        }
+                        "fn" -> return j
+                        else -> return null
+                    }
+                is TokenTree.Literal -> if (allowBareLiteral) j++ else return null
+                else -> return null
+            }
+        }
+        return null
+    }
+
+    fun skipAfterItemHeader(
+        startIdx: Int,
+        semicolonOnly: Boolean = false,
+    ): Int {
+        var j = startIdx
+        while (j < trees.size) {
+            if (punctCharAt(j) == ';') return j + 1
+            if (!semicolonOnly && groupAt(j, Delimiter.Brace) != null && punctCharAt(j - 1) != '<') {
+                return j + 1
+            }
+            j++
+        }
+        return trees.size
     }
 
     fun skipBalancedAngles(openIdx: Int): Int? {
@@ -180,6 +257,7 @@ internal open class RustTokenCursor(
     fun splitByTopLevelPunct(
         sep: Char,
         turbofishOnlyAngles: Boolean = false,
+        unconditionalAngles: Boolean = false,
     ): List<List<TokenTree>> {
         if (trees.isEmpty()) return emptyList()
         val args = mutableListOf<List<TokenTree>>()
@@ -189,10 +267,10 @@ internal open class RustTokenCursor(
             if (tt is TokenTree.Punct) {
                 val ch = tt.value.asChar()
                 val opensAngle =
-                    if (turbofishOnlyAngles) {
-                        ch == '<' && idx >= 2 && punctCharAt(idx - 1) == ':' && punctCharAt(idx - 2) == ':'
-                    } else {
-                        ch == '<' && hasMatchingClosingAngle(idx)
+                    when {
+                        unconditionalAngles -> ch == '<'
+                        turbofishOnlyAngles -> ch == '<' && idx >= 2 && punctCharAt(idx - 1) == ':' && punctCharAt(idx - 2) == ':'
+                        else -> ch == '<' && hasMatchingClosingAngle(idx)
                     }
                 if (opensAngle) {
                     angleDepth++
