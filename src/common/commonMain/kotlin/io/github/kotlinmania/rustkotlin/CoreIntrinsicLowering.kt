@@ -970,159 +970,18 @@ public object CoreIntrinsicLowering {
                 val opLayout = if (typeParams.size >= 2) layout1 else layout0
                 "atomicRmwWithLayout($p0.rawAddress, $p1, $opCode, $ord0, $layout0, $opLayout)"
             }
-            in SUFFIXED_FLOAT_UNARY_KM -> {
-                val kmFn = SUFFIXED_FLOAT_UNARY_KM.getValue(canonicalIntrinsicName)
-                registerCoreImport(emitter, "$intrPkg.$kmFn")
-                "$kmFn($p0)"
-            }
-            in SUFFIXED_FLOAT_BINARY_KM -> {
-                val kmFn = SUFFIXED_FLOAT_BINARY_KM.getValue(canonicalIntrinsicName)
-                registerCoreImport(emitter, "$intrPkg.$kmFn")
-                "$kmFn($p0, $p1)"
-            }
-            "fmaf32", "fmuladdf32" -> {
-                registerCoreImport(emitter, "$intrPkg.kmFmaf32")
-                "kmFmaf32($p0, $p1, $p2)"
-            }
-            "fmaf64", "fmuladdf64" -> {
-                registerCoreImport(emitter, "$intrPkg.kmFmaf64")
-                "kmFmaf64($p0, $p1, $p2)"
-            }
-            "minimumf32", "maximumf32" -> {
-                val op = if (canonicalIntrinsicName.startsWith("min")) "minimum" else "maximum"
-                registerCoreImport(emitter, "$memPkg.floatBinaryWithLayout")
-                registerCoreImport(emitter, "$memPkg.PrimitiveLayouts")
-                "floatBinaryWithLayout(\"$op\", $p0, $p1, PrimitiveLayouts.F32)"
-            }
-            "minimumf64", "maximumf64" -> {
-                val op = if (canonicalIntrinsicName.startsWith("min")) "minimum" else "maximum"
-                registerCoreImport(emitter, "$memPkg.floatBinaryWithLayout")
-                registerCoreImport(emitter, "$memPkg.PrimitiveLayouts")
-                "floatBinaryWithLayout(\"$op\", $p0, $p1, PrimitiveLayouts.F64)"
-            }
-            in GENERIC_FLOAT_UNARY_KM -> {
-                registerCoreImport(emitter, "$memPkg.floatUnaryWithLayout")
-                "floatUnaryWithLayout(\"$canonicalIntrinsicName\", $p0, $layout0)"
-            }
-            in GENERIC_FLOAT_BINARY_OP_NAMES -> {
-                val op = GENERIC_FLOAT_BINARY_OP_NAMES.getValue(canonicalIntrinsicName)
-                registerCoreImport(emitter, "$memPkg.floatBinaryWithLayout")
-                "floatBinaryWithLayout(\"$op\", $p0, $p1, $layout0)"
-            }
-            "powi" -> {
-                registerCoreImport(emitter, "$memPkg.floatPowiWithLayout")
-                "floatPowiWithLayout($p0, $p1, $layout0)"
-            }
-            "fma", "fmuladd" -> {
-                registerCoreImport(emitter, "$memPkg.floatFmaWithLayout")
-                "floatFmaWithLayout($p0, $p1, $p2, $layout0)"
-            }
-            "float_to_int_unchecked" -> {
-                registerCoreImport(emitter, "$memPkg.floatToIntUncheckedWithLayout")
-                "floatToIntUncheckedWithLayout($p0, $layout0, $layout1)"
-            }
-            "ctpop" -> {
-                registerCoreImport(emitter, "$memPkg.ctpopWithLayout")
-                "ctpopWithLayout($p0, $layout0)"
-            }
-            "ctlz", "ctlz_nonzero" -> {
-                registerCoreImport(emitter, "$memPkg.ctlzWithLayout")
-                "ctlzWithLayout($p0, $layout0)"
-            }
-            "cttz", "cttz_nonzero" -> {
-                registerCoreImport(emitter, "$memPkg.cttzWithLayout")
-                "cttzWithLayout($p0, $layout0)"
-            }
-            "bswap" -> {
-                registerCoreImport(emitter, "$memPkg.bswapWithLayout")
-                "bswapWithLayout($p0, $layout0)"
-            }
-            "bitreverse" -> {
-                registerCoreImport(emitter, "$memPkg.bitreverseWithLayout")
-                "bitreverseWithLayout($p0, $layout0)"
-            }
-            "rotate_left" -> {
-                registerCoreImport(emitter, "$memPkg.rotateLeftWithLayout")
-                "rotateLeftWithLayout($p0, ($p1).toUInt(), $layout0)"
-            }
-            "rotate_right" -> {
-                registerCoreImport(emitter, "$memPkg.rotateRightWithLayout")
-                "rotateRightWithLayout($p0, ($p1).toUInt(), $layout0)"
-            }
-            "wrapping_add", "unchecked_add" -> {
-                registerCoreImport(emitter, "$memPkg.wrappingAddWithLayout")
-                "wrappingAddWithLayout($p0, $p1, $layout0)"
-            }
-            "wrapping_sub", "unchecked_sub" -> {
-                registerCoreImport(emitter, "$memPkg.wrappingSubWithLayout")
-                "wrappingSubWithLayout($p0, $p1, $layout0)"
-            }
-            "wrapping_mul", "unchecked_mul" -> {
-                registerCoreImport(emitter, "$memPkg.wrappingMulWithLayout")
-                "wrappingMulWithLayout($p0, $p1, $layout0)"
-            }
-            "saturating_add" -> {
-                registerCoreImport(emitter, "$memPkg.saturatingAddWithLayout")
-                "saturatingAddWithLayout($p0, $p1, $layout0)"
-            }
-            "saturating_sub" -> {
-                registerCoreImport(emitter, "$memPkg.saturatingSubWithLayout")
-                "saturatingSubWithLayout($p0, $p1, $layout0)"
-            }
-            "add_with_overflow" -> {
-                registerCoreImport(emitter, "$memPkg.addWithOverflowWithLayout")
-                "addWithOverflowWithLayout($p0, $p1, $layout0)"
-            }
-            "sub_with_overflow" -> {
-                registerCoreImport(emitter, "$memPkg.subWithOverflowWithLayout")
-                "subWithOverflowWithLayout($p0, $p1, $layout0)"
-            }
-            "mul_with_overflow" -> {
-                registerCoreImport(emitter, "$memPkg.mulWithOverflowWithLayout")
-                "mulWithOverflowWithLayout($p0, $p1, $layout0)"
-            }
-            "unchecked_div" -> {
-                registerCoreImport(emitter, "$memPkg.uncheckedDivWithLayout")
-                "uncheckedDivWithLayout($p0, $p1, $layout0)"
-            }
-            "unchecked_rem" -> {
-                registerCoreImport(emitter, "$memPkg.uncheckedRemWithLayout")
-                "uncheckedRemWithLayout($p0, $p1, $layout0)"
-            }
-            "exact_div" -> {
-                registerCoreImport(emitter, "$memPkg.exactDivWithLayout")
-                "exactDivWithLayout($p0, $p1, $layout0)"
-            }
-            "unchecked_shl" -> {
-                registerCoreImport(emitter, "$memPkg.uncheckedShlWithLayout")
-                if (typeParams.size >= 2) {
-                    "uncheckedShlWithLayout($p0, $p1, $layout0, $layout1)"
-                } else {
-                    "uncheckedShlWithLayout($p0, ($p1).toUInt(), $layout0)"
-                }
-            }
-            "unchecked_shr" -> {
-                registerCoreImport(emitter, "$memPkg.uncheckedShrWithLayout")
-                if (typeParams.size >= 2) {
-                    "uncheckedShrWithLayout($p0, $p1, $layout0, $layout1)"
-                } else {
-                    "uncheckedShrWithLayout($p0, ($p1).toUInt(), $layout0)"
-                }
-            }
-            "disjoint_bitor" -> {
-                registerCoreImport(emitter, "$memPkg.disjointBitorWithLayout")
-                "disjointBitorWithLayout($p0, $p1, $layout0)"
-            }
-            "three_way_compare" -> {
-                registerCoreImport(emitter, "$memPkg.threeWayCompareWithLayout")
-                "threeWayCompareWithLayout($p0, $p1, $layout0)"
-            }
+            in INT_INTRINSIC_RULES_BY_NAME ->
+                INT_INTRINSIC_RULES_BY_NAME
+                    .getValue(canonicalIntrinsicName)
+                    .renderSynthesizedBody(p0, p1, typeParams.size, layout0, layout1, memPkg, emitter)
             else ->
-                if (isSimdIntrinsicName(canonicalIntrinsicName)) {
-                    renderSynthesizedSimdIntrinsicFnBody(fnItem, canonicalIntrinsicName, typeParams, intrPkg, emitter)
-                } else {
-                    null
-                }
+                renderFixedFloatIntrinsicCall(canonicalIntrinsicName, listOf(p0, p1, p2), intrPkg, memPkg, emitter)
+                    ?: renderSynthesizedGenericFloatBody(canonicalIntrinsicName, p0, p1, p2, layout0, layout1, memPkg, emitter)
+                    ?: if (isSimdIntrinsicName(canonicalIntrinsicName)) {
+                        renderSynthesizedSimdIntrinsicFnBody(fnItem, canonicalIntrinsicName, typeParams, intrPkg, emitter)
+                    } else {
+                        null
+                    }
         }
     }
 
@@ -2134,74 +1993,57 @@ public object CoreIntrinsicLowering {
             }
             "read_via_copy", "volatile_load", "unaligned_volatile_load" -> {
                 val isVolatile = rawName != "read_via_copy"
-                val pointee =
-                    explicitTypes.firstOrNull()
-                        ?: (callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) } as? SynType.Ptr)?.elem
-                val directLoad = pointee?.let { renderDirectScalarLoad(it, rawAddrOf(0), isVolatile, intrPkg, emitter) }
-                if (directLoad != null) {
-                    directLoad
-                } else if (pointee != null) {
-                    val layout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
-                    val method = if (isVolatile) "readVolatileNative" else "readNative"
-                    "($layout).$method(${rawAddrOf(0)})"
-                } else {
-                    null
+                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, 0, emitter)
+                pointee?.let {
+                    DirectLoadIntrinsicEmitter(
+                        fnPrefix = if (isVolatile) "kmVolatileLoad" else "kmLoad",
+                        allowChar = true,
+                        allowFloat = true,
+                        isVolatile = isVolatile,
+                        trailingArgs = emptyList(),
+                        intrPkg = intrPkg,
+                        ptrPkg = ptrPkg,
+                        emitter = emitter,
+                    ).render(it, rawAddrOf(0)) ?: run {
+                        val layout = resolveTypeLayoutExpression(it, selfTypeName, emitter)
+                        val method = if (isVolatile) "readVolatileNative" else "readNative"
+                        "($layout).$method(${rawAddrOf(0)})"
+                    }
                 }
             }
             "write_via_move", "volatile_store", "unaligned_volatile_store", "nontemporal_store" -> {
                 val isVolatile = rawName == "volatile_store" || rawName == "unaligned_volatile_store"
-                val pointee =
-                    explicitTypes.firstOrNull()
-                        ?: (callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) } as? SynType.Ptr)?.elem
-                val directStore = pointee?.let { renderDirectScalarStore(it, rawAddrOf(0), renderedArgs[1], isVolatile, intrPkg, emitter) }
-                if (directStore != null) {
-                    directStore
-                } else if (pointee != null) {
-                    val layout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
-                    val method = if (isVolatile) "writeVolatileNative" else "writeNative"
-                    "($layout).$method(${rawAddrOf(0)}, ${renderedArgs[1]})"
-                } else {
-                    null
+                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, 0, emitter)
+                pointee?.let {
+                    DirectStoreIntrinsicEmitter(
+                        fnPrefix = if (isVolatile) "kmVolatileStore" else "kmStore",
+                        allowChar = true,
+                        allowFloat = true,
+                        isVolatile = isVolatile,
+                        trailingArgs = emptyList(),
+                        intrPkg = intrPkg,
+                        ptrPkg = ptrPkg,
+                        emitter = emitter,
+                    ).render(it, rawAddrOf(0), renderedArgs[1]) ?: run {
+                        val layout = resolveTypeLayoutExpression(it, selfTypeName, emitter)
+                        val method = if (isVolatile) "writeVolatileNative" else "writeNative"
+                        "($layout).$method(${rawAddrOf(0)}, ${renderedArgs[1]})"
+                    }
                 }
             }
             "copy_nonoverlapping", "volatile_copy_nonoverlapping_memory", "copy", "volatile_copy_memory" -> {
-                val isNonOverlapping = rawName.contains("nonoverlapping")
-                val fnName = if (isNonOverlapping) "kmCopyNonoverlapping" else "kmCopy"
+                val fnName = if (rawName.contains("nonoverlapping")) "kmCopyNonoverlapping" else "kmCopy"
                 registerCoreImport(emitter, "$intrPkg.$fnName")
                 val srcIdx = if (rawName.startsWith("volatile_")) 1 else 0
                 val dstIdx = if (rawName.startsWith("volatile_")) 0 else 1
-                val pointee =
-                    explicitTypes.firstOrNull()
-                        ?: (callArgsList.getOrNull(srcIdx)?.let { emitter.sourceInitializerType(it) } as? SynType.Ptr)?.elem
-                val elemSize = pointee?.let { staticScalarByteWidth(it, emitter) }
-                val bytesExpr =
-                    when {
-                        elemSize == 1L -> "(${renderedArgs[2]}).toLong()"
-                        elemSize != null -> "(${renderedArgs[2]}).toLong() * ${elemSize}L"
-                        pointee != null -> {
-                            val layout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
-                            "(${renderedArgs[2]}).toLong() * ($layout).sizeBytes"
-                        }
-                        else -> "(${renderedArgs[2]}).toLong()"
-                    }
+                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, srcIdx, emitter)
+                val bytesExpr = renderScaledByteCountExpr(pointee, renderedArgs[2], selfTypeName, emitter)
                 "$fnName(${rawAddrOf(dstIdx)}, ${rawAddrOf(srcIdx)}, $bytesExpr)"
             }
             "write_bytes", "volatile_set_memory" -> {
                 registerCoreImport(emitter, "$intrPkg.kmWriteBytes")
-                val pointee =
-                    explicitTypes.firstOrNull()
-                        ?: (callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) } as? SynType.Ptr)?.elem
-                val elemSize = pointee?.let { staticScalarByteWidth(it, emitter) }
-                val bytesExpr =
-                    when {
-                        elemSize == 1L -> "(${renderedArgs[2]}).toLong()"
-                        elemSize != null -> "(${renderedArgs[2]}).toLong() * ${elemSize}L"
-                        pointee != null -> {
-                            val layout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
-                            "(${renderedArgs[2]}).toLong() * ($layout).sizeBytes"
-                        }
-                        else -> "(${renderedArgs[2]}).toLong()"
-                    }
+                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, 0, emitter)
+                val bytesExpr = renderScaledByteCountExpr(pointee, renderedArgs[2], selfTypeName, emitter)
                 "kmWriteBytes(${rawAddrOf(0)}, (${renderedArgs[1]}).toUByte(), $bytesExpr)"
             }
             "compare_bytes" -> {
@@ -2217,104 +2059,87 @@ public object CoreIntrinsicLowering {
                 "kmAtomicSignalFence(${orderingCode(0)})"
             }
             "atomic_load" -> {
-                val pointee =
-                    explicitTypes.firstOrNull()
-                        ?: (callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) } as? SynType.Ptr)?.elem
-                        ?: return null
-                val direct = renderDirectAtomicLoad(pointee, rawAddrOf(0), orderingCode(0), intrPkg, ptrPkg, emitter)
-                if (direct != null) {
-                    direct
-                } else {
+                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, 0, emitter) ?: return null
+                DirectLoadIntrinsicEmitter(
+                    fnPrefix = "kmAtomicLoad",
+                    allowChar = false,
+                    allowFloat = false,
+                    isVolatile = false,
+                    trailingArgs = listOf(orderingCode(0)),
+                    intrPkg = intrPkg,
+                    ptrPkg = ptrPkg,
+                    emitter = emitter,
+                ).render(pointee, rawAddrOf(0)) ?: run {
                     registerCoreImport(emitter, "$memPkg.atomicLoadWithLayout")
                     val layout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
                     "atomicLoadWithLayout(${rawAddrOf(0)}, ${orderingCode(0)}, $layout)"
                 }
             }
             "atomic_store" -> {
-                val pointee =
-                    explicitTypes.firstOrNull()
-                        ?: (callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) } as? SynType.Ptr)?.elem
-                        ?: return null
-                val direct = renderDirectAtomicStore(pointee, rawAddrOf(0), renderedArgs[1], orderingCode(0), intrPkg, emitter)
-                if (direct != null) {
-                    direct
-                } else {
+                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, 0, emitter) ?: return null
+                DirectStoreIntrinsicEmitter(
+                    fnPrefix = "kmAtomicStore",
+                    allowChar = false,
+                    allowFloat = false,
+                    isVolatile = false,
+                    trailingArgs = listOf(orderingCode(0)),
+                    intrPkg = intrPkg,
+                    ptrPkg = ptrPkg,
+                    emitter = emitter,
+                ).render(pointee, rawAddrOf(0), renderedArgs[1]) ?: run {
                     registerCoreImport(emitter, "$memPkg.atomicStoreWithLayout")
                     val layout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
                     "atomicStoreWithLayout(${rawAddrOf(0)}, ${renderedArgs[1]}, ${orderingCode(0)}, $layout)"
                 }
             }
             "atomic_xchg" -> {
-                val pointee =
-                    explicitTypes.firstOrNull()
-                        ?: (callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) } as? SynType.Ptr)?.elem
-                        ?: return null
-                val direct = renderDirectAtomicXchg(pointee, rawAddrOf(0), renderedArgs[1], orderingCode(0), intrPkg, ptrPkg, emitter)
-                if (direct != null) {
-                    direct
-                } else {
+                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, 0, emitter) ?: return null
+                DirectReadModifyWriteIntrinsicEmitter(
+                    fnPrefix = "kmAtomicXchg",
+                    trailingArgs = listOf(orderingCode(0)),
+                    intrPkg = intrPkg,
+                    ptrPkg = ptrPkg,
+                    emitter = emitter,
+                ).render(pointee, rawAddrOf(0), renderedArgs[1]) ?: run {
                     registerCoreImport(emitter, "$memPkg.atomicXchgWithLayout")
                     val layout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
                     "atomicXchgWithLayout(${rawAddrOf(0)}, ${renderedArgs[1]}, ${orderingCode(0)}, $layout)"
                 }
             }
             "atomic_cxchg", "atomic_cxchgweak" -> {
-                val pointee =
-                    explicitTypes.firstOrNull()
-                        ?: (callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) } as? SynType.Ptr)?.elem
-                        ?: return null
-                val direct =
-                    renderDirectAtomicCxchg(
-                        pointee = pointee,
-                        addrExpr = rawAddrOf(0),
-                        expectedExpr = renderedArgs[1],
-                        desiredExpr = renderedArgs[2],
-                        succOrd = orderingCode(0),
-                        failOrd = orderingCode(1),
-                        intrPkg = intrPkg,
-                        ptrPkg = ptrPkg,
-                        emitter = emitter,
-                    )
-                if (direct != null) {
-                    direct
-                } else {
-                    registerCoreImport(emitter, "$memPkg.atomicCxchgWithLayout")
-                    val layout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
-                    "atomicCxchgWithLayout(${rawAddrOf(0)}, ${renderedArgs[1]}, ${renderedArgs[2]}, ${orderingCode(0)}, ${orderingCode(1)}, $layout)"
-                }
+                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, 0, emitter) ?: return null
+                DirectCompareExchangeIntrinsicEmitter(intrPkg, ptrPkg, emitter)
+                    .render(pointee, rawAddrOf(0), renderedArgs[1], renderedArgs[2], orderingCode(0), orderingCode(1))
+                    ?: run {
+                        registerCoreImport(emitter, "$memPkg.atomicCxchgWithLayout")
+                        val layout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
+                        "atomicCxchgWithLayout(${rawAddrOf(0)}, ${renderedArgs[1]}, ${renderedArgs[2]}, ${orderingCode(0)}, ${orderingCode(1)}, $layout)"
+                    }
             }
             in ATOMIC_RMW_OP_CODES -> {
                 val opCode = ATOMIC_RMW_OP_CODES.getValue(canonicalIntrinsicName)
-                val pointee =
-                    explicitTypes.firstOrNull()
-                        ?: (callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) } as? SynType.Ptr)?.elem
-                        ?: return null
+                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, 0, emitter) ?: return null
                 val operandType = explicitTypes.getOrNull(1) ?: pointee
                 val direct =
                     if (explicitTypes.size <= 1) {
-                        renderDirectAtomicRmw(pointee, rawAddrOf(0), renderedArgs[1], opCode, orderingCode(0), intrPkg, ptrPkg, emitter)
+                        DirectReadModifyWriteIntrinsicEmitter(
+                            fnPrefix = "kmAtomicRmw",
+                            trailingArgs = listOf(opCode.toString(), orderingCode(0)),
+                            intrPkg = intrPkg,
+                            ptrPkg = ptrPkg,
+                            emitter = emitter,
+                        ).render(pointee, rawAddrOf(0), renderedArgs[1])
                     } else {
                         null
                     }
-                if (direct != null) {
-                    direct
-                } else {
+                direct ?: run {
                     registerCoreImport(emitter, "$memPkg.atomicRmwWithLayout")
                     val dstLayout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
                     val opLayout = resolveTypeLayoutExpression(operandType, selfTypeName, emitter)
                     "atomicRmwWithLayout(${rawAddrOf(0)}, ${renderedArgs[1]}, $opCode, ${orderingCode(0)}, $dstLayout, $opLayout)"
                 }
             }
-            "ctpop", "ctlz", "ctlz_nonzero", "cttz", "cttz_nonzero", "bswap", "bitreverse",
-            "rotate_left", "rotate_right",
-            "wrapping_add", "wrapping_sub", "wrapping_mul",
-            "unchecked_add", "unchecked_sub", "unchecked_mul",
-            "saturating_add", "saturating_sub",
-            "add_with_overflow", "sub_with_overflow", "mul_with_overflow",
-            "unchecked_div", "unchecked_rem", "exact_div",
-            "unchecked_shl", "unchecked_shr",
-            "disjoint_bitor", "three_way_compare",
-            ->
+            in INT_INTRINSIC_RULES_BY_NAME ->
                 renderIntOrBitIntrinsicCall(
                     canonicalName = canonicalIntrinsicName,
                     renderedArgs = renderedArgs,
@@ -2570,6 +2395,412 @@ public object CoreIntrinsicLowering {
         }
     }
 
+    private fun resolvePointeeTypeFromArg(
+        explicitTypes: List<SynType>,
+        callArgsList: List<Expr>,
+        argIdx: Int,
+        emitter: KotlinJ2KEmitter,
+    ): SynType? =
+        explicitTypes.firstOrNull()
+            ?: (callArgsList.getOrNull(argIdx)?.let { emitter.sourceInitializerType(it) } as? SynType.Ptr)?.elem
+
+    private fun renderScaledByteCountExpr(
+        pointee: SynType?,
+        countExpr: String,
+        selfTypeName: String?,
+        emitter: KotlinJ2KEmitter,
+    ): String {
+        val elemSize = pointee?.let { staticScalarByteWidth(it, emitter) }
+        return when {
+            elemSize == 1L -> "($countExpr).toLong()"
+            elemSize != null -> "($countExpr).toLong() * ${elemSize}L"
+            pointee != null -> {
+                val layout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
+                "($countExpr).toLong() * ($layout).sizeBytes"
+            }
+            else -> "($countExpr).toLong()"
+        }
+    }
+
+    private data class IntIntrinsicCallContext(
+        val canonicalName: String,
+        val renderedArgs: List<String>,
+        val callArgsList: List<Expr>,
+        val explicitTypes: List<SynType>,
+        val kind: NumericKind?,
+        val firstTargetTy: SynType?,
+        val selfTypeName: String?,
+        val coreNs: String,
+        val intrPkg: String,
+        val memPkg: String,
+        val emitter: KotlinJ2KEmitter,
+    ) {
+        fun fallbackWithLayout(fnName: String, argsPart: String): String? {
+            val ty = firstTargetTy ?: return null
+            val layout = resolveTypeLayoutExpression(ty, selfTypeName, emitter)
+            registerCoreImport(emitter, "$memPkg.$fnName")
+            return "$fnName($argsPart, $layout)"
+        }
+
+        fun binary128Call(
+            kmFn: String,
+            lhsExpr: String,
+            rhsExpr: String,
+            wrapResult: (String) -> String = { it },
+        ): String {
+            registerCoreImport(emitter, "$intrPkg.$kmFn")
+            val hiL = if (kind == NumericKind.I128) "lhs.high.toULong()" else "lhs.high"
+            val hiR = if (kind == NumericKind.I128) "rhs.high.toULong()" else "rhs.high"
+            val built = reconstruct128Expr(kind ?: NumericKind.U128, "it.lo", "it.hi", coreNs, emitter)
+            return "run { val lhs = $lhsExpr; val rhs = $rhsExpr; $kmFn(lhs.low, $hiL, rhs.low, $hiR).let { ${wrapResult(built)} } }"
+        }
+    }
+
+    private abstract class IntIntrinsicLoweringRule(
+        val names: Set<String>,
+        val withLayoutFn: String,
+        val symmetricArgCount: Int = 2,
+    ) {
+        constructor(
+            name: String,
+            withLayoutFn: String,
+            symmetricArgCount: Int = 2,
+        ) : this(setOf(name), withLayoutFn, symmetricArgCount)
+
+        open fun renderSynthesizedBody(
+            p0: String,
+            p1: String,
+            typeParamCount: Int,
+            layout0: String,
+            layout1: String,
+            memPkg: String,
+            emitter: KotlinJ2KEmitter,
+        ): String {
+            registerCoreImport(emitter, "$memPkg.$withLayoutFn")
+            return "$withLayoutFn($p0, $p1, $layout0)"
+        }
+
+        abstract fun renderCall(ctx: IntIntrinsicCallContext): String?
+    }
+
+    private class UnaryBitCountIntrinsicRule(
+        names: Set<String>,
+        private val kmStem: String,
+        withLayoutFn: String,
+    ) : IntIntrinsicLoweringRule(names, withLayoutFn, symmetricArgCount = 1) {
+        override fun renderSynthesizedBody(
+            p0: String,
+            p1: String,
+            typeParamCount: Int,
+            layout0: String,
+            layout1: String,
+            memPkg: String,
+            emitter: KotlinJ2KEmitter,
+        ): String {
+            registerCoreImport(emitter, "$memPkg.$withLayoutFn")
+            return "$withLayoutFn($p0, $layout0)"
+        }
+
+        override fun renderCall(ctx: IntIntrinsicCallContext): String? {
+            val arg0 = ctx.renderedArgs.firstOrNull() ?: return null
+            val kind = ctx.kind
+            val uTag = kind?.let(::numericKindUnsignedBitTag)
+            return when {
+                uTag == "U128" -> {
+                    val kmFn = "${kmStem}U128"
+                    registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
+                    val hiExpr = if (kind == NumericKind.I128) "v.high.toULong()" else "v.high"
+                    "($arg0).let { v -> $kmFn(v.low, $hiExpr) }"
+                }
+                uTag != null -> {
+                    val kmFn = "$kmStem$uTag"
+                    registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
+                    "$kmFn(${toExactWidthUnsignedExpr(arg0, kind)})"
+                }
+                else -> ctx.fallbackWithLayout(withLayoutFn, arg0)
+            }
+        }
+    }
+
+    private class UnaryBitTransformIntrinsicRule(
+        name: String,
+        private val kmStem: String,
+        withLayoutFn: String,
+        private val identityOnByte: Boolean,
+    ) : IntIntrinsicLoweringRule(name, withLayoutFn, symmetricArgCount = 1) {
+        override fun renderSynthesizedBody(
+            p0: String,
+            p1: String,
+            typeParamCount: Int,
+            layout0: String,
+            layout1: String,
+            memPkg: String,
+            emitter: KotlinJ2KEmitter,
+        ): String {
+            registerCoreImport(emitter, "$memPkg.$withLayoutFn")
+            return "$withLayoutFn($p0, $layout0)"
+        }
+
+        override fun renderCall(ctx: IntIntrinsicCallContext): String? {
+            val arg0 = ctx.renderedArgs.firstOrNull() ?: return null
+            val kind = ctx.kind
+            if (identityOnByte && (kind == NumericKind.I8 || kind == NumericKind.U8)) return arg0
+            val uTag = kind?.let(::numericKindUnsignedBitTag)
+            return when {
+                uTag == "U128" -> {
+                    val kmFn = "${kmStem}U128"
+                    registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
+                    val hiExpr = if (kind == NumericKind.I128) "v.high.toULong()" else "v.high"
+                    val built = reconstruct128Expr(kind, "r.lo", "r.hi", ctx.coreNs, ctx.emitter)
+                    "($arg0).let { v -> $kmFn(v.low, $hiExpr).let { r -> $built } }"
+                }
+                uTag != null -> {
+                    val kmFn = "$kmStem$uTag"
+                    registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
+                    fromExactWidthUnsignedExpr("$kmFn(${toExactWidthUnsignedExpr(arg0, kind)})", kind)
+                }
+                else -> ctx.fallbackWithLayout(withLayoutFn, arg0)
+            }
+        }
+    }
+
+    private class RotateIntrinsicRule(
+        name: String,
+        private val kmStem: String,
+        withLayoutFn: String,
+    ) : IntIntrinsicLoweringRule(name, withLayoutFn, symmetricArgCount = 1) {
+        override fun renderSynthesizedBody(
+            p0: String,
+            p1: String,
+            typeParamCount: Int,
+            layout0: String,
+            layout1: String,
+            memPkg: String,
+            emitter: KotlinJ2KEmitter,
+        ): String {
+            registerCoreImport(emitter, "$memPkg.$withLayoutFn")
+            return "$withLayoutFn($p0, ($p1).toUInt(), $layout0)"
+        }
+
+        override fun renderCall(ctx: IntIntrinsicCallContext): String? {
+            if (ctx.renderedArgs.size < 2) return null
+            val arg0 = ctx.renderedArgs[0]
+            val shift = "(${ctx.renderedArgs[1]}).toUInt()"
+            val kind = ctx.kind
+            val uTag = kind?.let(::numericKindUnsignedBitTag)
+            return when {
+                uTag == "U128" -> {
+                    val kmFn = "${kmStem}U128"
+                    registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
+                    val hiExpr = if (kind == NumericKind.I128) "v.high.toULong()" else "v.high"
+                    val built = reconstruct128Expr(kind, "r.lo", "r.hi", ctx.coreNs, ctx.emitter)
+                    "($arg0).let { v -> $kmFn(v.low, $hiExpr, $shift).let { r -> $built } }"
+                }
+                uTag != null -> {
+                    val kmFn = "$kmStem$uTag"
+                    registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
+                    fromExactWidthUnsignedExpr("$kmFn(${toExactWidthUnsignedExpr(arg0, kind)}, $shift)", kind)
+                }
+                else -> ctx.fallbackWithLayout(withLayoutFn, "$arg0, $shift")
+            }
+        }
+    }
+
+    private class WrappingArithmeticIntrinsicRule(
+        names: Set<String>,
+        private val opSymbol: String,
+        private val u128Fn: String,
+        withLayoutFn: String,
+    ) : IntIntrinsicLoweringRule(names, withLayoutFn) {
+        override fun renderCall(ctx: IntIntrinsicCallContext): String? {
+            if (ctx.renderedArgs.size < 2) return null
+            val a = ctx.renderedArgs[0]
+            val b = ctx.renderedArgs[1]
+            return when (ctx.kind) {
+                NumericKind.I8 -> "((($a) $opSymbol ($b))).toByte()"
+                NumericKind.U8 -> "((($a) $opSymbol ($b))).toUByte()"
+                NumericKind.I16 -> "((($a) $opSymbol ($b))).toShort()"
+                NumericKind.U16 -> "((($a) $opSymbol ($b))).toUShort()"
+                NumericKind.I32, NumericKind.U32, NumericKind.I64, NumericKind.U64 -> "(($a) $opSymbol ($b))"
+                NumericKind.I128, NumericKind.U128 -> ctx.binary128Call(u128Fn, a, b)
+                else -> ctx.fallbackWithLayout(withLayoutFn, "$a, $b")
+            }
+        }
+    }
+
+    private class WidthTaggedBinaryIntrinsicRule(
+        name: String,
+        private val kmPrefix: String,
+        withLayoutFn: String,
+        private val wrapPairOverflow: Boolean,
+    ) : IntIntrinsicLoweringRule(name, withLayoutFn) {
+        override fun renderCall(ctx: IntIntrinsicCallContext): String? {
+            if (ctx.renderedArgs.size < 2) return null
+            val a = ctx.renderedArgs[0]
+            val b = ctx.renderedArgs[1]
+            val kind = ctx.kind
+            val wTag = kind?.let(::numericKindWidthTag)
+            return when {
+                (kind == NumericKind.I128 || kind == NumericKind.U128) && wTag != null ->
+                    ctx.binary128Call("$kmPrefix$wTag", a, b) { built ->
+                        if (wrapPairOverflow) "Pair($built, it.overflowed)" else built
+                    }
+                wTag != null -> {
+                    val kmFn = "$kmPrefix$wTag"
+                    registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
+                    if (wrapPairOverflow) "$kmFn($a, $b).let { Pair(it.value, it.overflowed) }" else "$kmFn($a, $b)"
+                }
+                else -> ctx.fallbackWithLayout(withLayoutFn, "$a, $b")
+            }
+        }
+    }
+
+    private class DivisionIntrinsicRule(
+        name: String,
+        private val opSymbol: String,
+        withLayoutFn: String,
+    ) : IntIntrinsicLoweringRule(name, withLayoutFn) {
+        override fun renderCall(ctx: IntIntrinsicCallContext): String? {
+            if (ctx.renderedArgs.size < 2) return null
+            val a = ctx.renderedArgs[0]
+            val b = ctx.renderedArgs[1]
+            return when (ctx.kind) {
+                NumericKind.I8 -> "((($a) $opSymbol ($b))).toByte()"
+                NumericKind.U8 -> "((($a) $opSymbol ($b))).toUByte()"
+                NumericKind.I16 -> "((($a) $opSymbol ($b))).toShort()"
+                NumericKind.U16 -> "((($a) $opSymbol ($b))).toUShort()"
+                NumericKind.I32, NumericKind.U32, NumericKind.I64, NumericKind.U64, NumericKind.I128, NumericKind.U128 ->
+                    "(($a) $opSymbol ($b))"
+                else -> ctx.fallbackWithLayout(withLayoutFn, "$a, $b")
+            }
+        }
+    }
+
+    private class UncheckedShiftIntrinsicRule(
+        name: String,
+        private val isLeft: Boolean,
+        withLayoutFn: String,
+    ) : IntIntrinsicLoweringRule(name, withLayoutFn, symmetricArgCount = 1) {
+        override fun renderSynthesizedBody(
+            p0: String,
+            p1: String,
+            typeParamCount: Int,
+            layout0: String,
+            layout1: String,
+            memPkg: String,
+            emitter: KotlinJ2KEmitter,
+        ): String {
+            registerCoreImport(emitter, "$memPkg.$withLayoutFn")
+            return if (typeParamCount >= 2) {
+                "$withLayoutFn($p0, $p1, $layout0, $layout1)"
+            } else {
+                "$withLayoutFn($p0, ($p1).toUInt(), $layout0)"
+            }
+        }
+
+        override fun renderCall(ctx: IntIntrinsicCallContext): String? {
+            if (ctx.renderedArgs.size < 2) return null
+            val x = ctx.renderedArgs[0]
+            val shift = ctx.renderedArgs[1]
+            val op = if (isLeft) "shl" else "shr"
+            return when (ctx.kind) {
+                NumericKind.I8 -> "((($x).toInt() $op ($shift).toInt()).toByte())"
+                NumericKind.U8 -> "(((($x).toUInt() and 0xFFu) $op ($shift).toInt()).toUByte())"
+                NumericKind.I16 -> "((($x).toInt() $op ($shift).toInt()).toShort())"
+                NumericKind.U16 -> "(((($x).toUInt() and 0xFFFFu) $op ($shift).toInt()).toUShort())"
+                NumericKind.I32, NumericKind.U32, NumericKind.I64, NumericKind.U64 -> "(($x) $op ($shift).toInt())"
+                NumericKind.U128 -> {
+                    val kmFn = if (isLeft) "kmU128Shl" else "kmU128Shr"
+                    registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
+                    registerCoreImport(ctx.emitter, "${ctx.coreNs}.U128")
+                    "($x).let { v -> $kmFn(v.low, v.high, ($shift).toUInt()).let { r -> U128(r.hi, r.lo) } }"
+                }
+                NumericKind.I128 -> {
+                    val kmFn = if (isLeft) "kmU128Shl" else "kmI128Shr"
+                    registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
+                    registerCoreImport(ctx.emitter, "${ctx.coreNs}.I128")
+                    "($x).let { v -> $kmFn(v.low, v.high.toULong(), ($shift).toUInt()).let { r -> I128(r.hi.toLong(), r.lo) } }"
+                }
+                else -> {
+                    val ty0 = ctx.firstTargetTy ?: return null
+                    val layout0 = resolveTypeLayoutExpression(ty0, ctx.selfTypeName, ctx.emitter)
+                    registerCoreImport(ctx.emitter, "${ctx.memPkg}.$withLayoutFn")
+                    val shiftTy =
+                        ctx.explicitTypes.getOrNull(1)?.takeUnless { it is SynType.Infer }
+                            ?: ctx.callArgsList.getOrNull(1)?.let { ctx.emitter.sourceInitializerType(it) }
+                    if (shiftTy != null && ctx.explicitTypes.size >= 2) {
+                        val layout1 = resolveTypeLayoutExpression(shiftTy, ctx.selfTypeName, ctx.emitter)
+                        "$withLayoutFn($x, $shift, $layout0, $layout1)"
+                    } else {
+                        "$withLayoutFn($x, ($shift).toUInt(), $layout0)"
+                    }
+                }
+            }
+        }
+    }
+
+    private object DisjointBitorIntrinsicRule : IntIntrinsicLoweringRule("disjoint_bitor", "disjointBitorWithLayout") {
+        override fun renderCall(ctx: IntIntrinsicCallContext): String? {
+            if (ctx.renderedArgs.size < 2) return null
+            val a = ctx.renderedArgs[0]
+            val b = ctx.renderedArgs[1]
+            return if (ctx.kind != null && numericKindWidthTag(ctx.kind) != null) {
+                "(($a) or ($b))"
+            } else {
+                ctx.fallbackWithLayout(withLayoutFn, "$a, $b")
+            }
+        }
+    }
+
+    private object ThreeWayCompareIntrinsicRule : IntIntrinsicLoweringRule("three_way_compare", "threeWayCompareWithLayout") {
+        override fun renderCall(ctx: IntIntrinsicCallContext): String? {
+            if (ctx.renderedArgs.size < 2) return null
+            val a = ctx.renderedArgs[0]
+            val b = ctx.renderedArgs[1]
+            return if (ctx.kind != null && numericKindWidthTag(ctx.kind) != null) {
+                registerCoreImport(ctx.emitter, "${ctx.coreNs}.cmp.Ordering")
+                "run { val lhs = $a; val rhs = $b; when { lhs < rhs -> Ordering.Less; lhs > rhs -> Ordering.Greater; else -> Ordering.Equal } }"
+            } else {
+                ctx.fallbackWithLayout(withLayoutFn, "$a, $b")
+            }
+        }
+    }
+
+    private val INT_INTRINSIC_RULES: List<IntIntrinsicLoweringRule> =
+        listOf(
+            UnaryBitCountIntrinsicRule(setOf("ctpop"), "kmCtpop", "ctpopWithLayout"),
+            UnaryBitCountIntrinsicRule(setOf("ctlz", "ctlz_nonzero"), "kmCtlz", "ctlzWithLayout"),
+            UnaryBitCountIntrinsicRule(setOf("cttz", "cttz_nonzero"), "kmCttz", "cttzWithLayout"),
+            UnaryBitTransformIntrinsicRule("bswap", "kmBswap", "bswapWithLayout", identityOnByte = true),
+            UnaryBitTransformIntrinsicRule("bitreverse", "kmBitreverse", "bitreverseWithLayout", identityOnByte = false),
+            RotateIntrinsicRule("rotate_left", "kmRotateLeft", "rotateLeftWithLayout"),
+            RotateIntrinsicRule("rotate_right", "kmRotateRight", "rotateRightWithLayout"),
+            WrappingArithmeticIntrinsicRule(setOf("wrapping_add", "unchecked_add"), "+", "kmU128Add", "wrappingAddWithLayout"),
+            WrappingArithmeticIntrinsicRule(setOf("wrapping_sub", "unchecked_sub"), "-", "kmU128Sub", "wrappingSubWithLayout"),
+            WrappingArithmeticIntrinsicRule(setOf("wrapping_mul", "unchecked_mul"), "*", "kmU128Mul", "wrappingMulWithLayout"),
+            WidthTaggedBinaryIntrinsicRule("saturating_add", "kmSaturatingAdd", "saturatingAddWithLayout", wrapPairOverflow = false),
+            WidthTaggedBinaryIntrinsicRule("saturating_sub", "kmSaturatingSub", "saturatingSubWithLayout", wrapPairOverflow = false),
+            WidthTaggedBinaryIntrinsicRule("add_with_overflow", "kmAddWithOverflow", "addWithOverflowWithLayout", wrapPairOverflow = true),
+            WidthTaggedBinaryIntrinsicRule("sub_with_overflow", "kmSubWithOverflow", "subWithOverflowWithLayout", wrapPairOverflow = true),
+            WidthTaggedBinaryIntrinsicRule("mul_with_overflow", "kmMulWithOverflow", "mulWithOverflowWithLayout", wrapPairOverflow = true),
+            DivisionIntrinsicRule("unchecked_div", "/", "uncheckedDivWithLayout"),
+            DivisionIntrinsicRule("exact_div", "/", "exactDivWithLayout"),
+            DivisionIntrinsicRule("unchecked_rem", "%", "uncheckedRemWithLayout"),
+            UncheckedShiftIntrinsicRule("unchecked_shl", isLeft = true, "uncheckedShlWithLayout"),
+            UncheckedShiftIntrinsicRule("unchecked_shr", isLeft = false, "uncheckedShrWithLayout"),
+            DisjointBitorIntrinsicRule,
+            ThreeWayCompareIntrinsicRule,
+        )
+
+    private val INT_INTRINSIC_RULES_BY_NAME: Map<String, IntIntrinsicLoweringRule> =
+        buildMap {
+            for (rule in INT_INTRINSIC_RULES) {
+                for (name in rule.names) {
+                    put(name, rule)
+                }
+            }
+        }
+
     private fun renderIntOrBitIntrinsicCall(
         canonicalName: String,
         renderedArgs: List<String>,
@@ -2581,298 +2812,31 @@ public object CoreIntrinsicLowering {
         memPkg: String,
         emitter: KotlinJ2KEmitter,
     ): String? {
-        val symmetricCount =
-            when (canonicalName) {
-                "ctpop", "ctlz", "ctlz_nonzero", "cttz", "cttz_nonzero", "bswap", "bitreverse",
-                "rotate_left", "rotate_right", "unchecked_shl", "unchecked_shr",
-                -> 1
-                else -> 2
-            }
-        val kind = resolveIntrinsicNumericKind(explicitTypes.firstOrNull(), callArgsList.take(symmetricCount), selfTypeName, emitter)
+        val rule = INT_INTRINSIC_RULES_BY_NAME[canonicalName] ?: return null
+        val kind = resolveIntrinsicNumericKind(explicitTypes.firstOrNull(), callArgsList.take(rule.symmetricArgCount), selfTypeName, emitter)
         val firstTargetTy =
             explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
                 ?: callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) }
-        fun fallbackWithLayout(fnName: String, argsPart: String): String? {
-            val ty = firstTargetTy ?: return null
-            val layout = resolveTypeLayoutExpression(ty, selfTypeName, emitter)
-            registerCoreImport(emitter, "$memPkg.$fnName")
-            return "$fnName($argsPart, $layout)"
-        }
-        return when (canonicalName) {
-            "ctpop", "ctlz", "ctlz_nonzero", "cttz", "cttz_nonzero" -> {
-                val arg0 = renderedArgs.firstOrNull() ?: return null
-                val uTag = kind?.let { numericKindUnsignedBitTag(it) }
-                val stem =
-                    when (canonicalName) {
-                        "ctpop" -> "kmCtpop"
-                        "ctlz", "ctlz_nonzero" -> "kmCtlz"
-                        else -> "kmCttz"
-                    }
-                when {
-                    uTag == "U128" -> {
-                        val kmFn = "${stem}U128"
-                        registerCoreImport(emitter, "$intrPkg.$kmFn")
-                        val hiExpr = if (kind == NumericKind.I128) "v.high.toULong()" else "v.high"
-                        "($arg0).let { v -> $kmFn(v.low, $hiExpr) }"
-                    }
-                    uTag != null -> {
-                        val kmFn = "$stem$uTag"
-                        registerCoreImport(emitter, "$intrPkg.$kmFn")
-                        "$kmFn(${toExactWidthUnsignedExpr(arg0, kind)})"
-                    }
-                    else -> {
-                        val withLayout =
-                            when (canonicalName) {
-                                "ctpop" -> "ctpopWithLayout"
-                                "ctlz", "ctlz_nonzero" -> "ctlzWithLayout"
-                                else -> "cttzWithLayout"
-                            }
-                        fallbackWithLayout(withLayout, arg0)
-                    }
-                }
-            }
-            "bswap", "bitreverse" -> {
-                val arg0 = renderedArgs.firstOrNull() ?: return null
-                if (canonicalName == "bswap" && (kind == NumericKind.I8 || kind == NumericKind.U8)) {
-                    return arg0
-                }
-                val uTag = kind?.let { numericKindUnsignedBitTag(it) }
-                val stem = if (canonicalName == "bswap") "kmBswap" else "kmBitreverse"
-                when {
-                    uTag == "U128" -> {
-                        val kmFn = "${stem}U128"
-                        registerCoreImport(emitter, "$intrPkg.$kmFn")
-                        val hiExpr = if (kind == NumericKind.I128) "v.high.toULong()" else "v.high"
-                        val built = reconstruct128Expr(kind, "r.lo", "r.hi", coreNs, emitter)
-                        "($arg0).let { v -> $kmFn(v.low, $hiExpr).let { r -> $built } }"
-                    }
-                    uTag != null -> {
-                        val kmFn = "$stem$uTag"
-                        registerCoreImport(emitter, "$intrPkg.$kmFn")
-                        fromExactWidthUnsignedExpr("$kmFn(${toExactWidthUnsignedExpr(arg0, kind)})", kind)
-                    }
-                    else -> fallbackWithLayout(if (canonicalName == "bswap") "bswapWithLayout" else "bitreverseWithLayout", arg0)
-                }
-            }
-            "rotate_left", "rotate_right" -> {
-                if (renderedArgs.size < 2) return null
-                val arg0 = renderedArgs[0]
-                val shift = "(${renderedArgs[1]}).toUInt()"
-                val uTag = kind?.let { numericKindUnsignedBitTag(it) }
-                val stem = if (canonicalName == "rotate_left") "kmRotateLeft" else "kmRotateRight"
-                when {
-                    uTag == "U128" -> {
-                        val kmFn = "${stem}U128"
-                        registerCoreImport(emitter, "$intrPkg.$kmFn")
-                        val hiExpr = if (kind == NumericKind.I128) "v.high.toULong()" else "v.high"
-                        val built = reconstruct128Expr(kind, "r.lo", "r.hi", coreNs, emitter)
-                        "($arg0).let { v -> $kmFn(v.low, $hiExpr, $shift).let { r -> $built } }"
-                    }
-                    uTag != null -> {
-                        val kmFn = "$stem$uTag"
-                        registerCoreImport(emitter, "$intrPkg.$kmFn")
-                        fromExactWidthUnsignedExpr("$kmFn(${toExactWidthUnsignedExpr(arg0, kind)}, $shift)", kind)
-                    }
-                    else -> {
-                        val fn = if (canonicalName == "rotate_left") "rotateLeftWithLayout" else "rotateRightWithLayout"
-                        fallbackWithLayout(fn, "$arg0, $shift")
-                    }
-                }
-            }
-            "wrapping_add", "wrapping_sub", "wrapping_mul", "unchecked_add", "unchecked_sub", "unchecked_mul" -> {
-                if (renderedArgs.size < 2) return null
-                val a = renderedArgs[0]
-                val b = renderedArgs[1]
-                val op =
-                    when {
-                        canonicalName.endsWith("_add") -> "+"
-                        canonicalName.endsWith("_sub") -> "-"
-                        else -> "*"
-                    }
-                when (kind) {
-                    NumericKind.I8 -> "((($a) $op ($b))).toByte()"
-                    NumericKind.U8 -> "((($a) $op ($b))).toUByte()"
-                    NumericKind.I16 -> "((($a) $op ($b))).toShort()"
-                    NumericKind.U16 -> "((($a) $op ($b))).toUShort()"
-                    NumericKind.I32, NumericKind.U32, NumericKind.I64, NumericKind.U64 -> "(($a) $op ($b))"
-                    NumericKind.I128, NumericKind.U128 -> {
-                        val kmFn =
-                            when {
-                                canonicalName.endsWith("_add") -> "kmU128Add"
-                                canonicalName.endsWith("_sub") -> "kmU128Sub"
-                                else -> "kmU128Mul"
-                            }
-                        registerCoreImport(emitter, "$intrPkg.$kmFn")
-                        val hiL = if (kind == NumericKind.I128) "lhs.high.toULong()" else "lhs.high"
-                        val hiR = if (kind == NumericKind.I128) "rhs.high.toULong()" else "rhs.high"
-                        val built = reconstruct128Expr(kind, "it.lo", "it.hi", coreNs, emitter)
-                        "run { val lhs = $a; val rhs = $b; $kmFn(lhs.low, $hiL, rhs.low, $hiR).let { $built } }"
-                    }
-                    else -> {
-                        val fn =
-                            when {
-                                canonicalName.endsWith("_add") -> "wrappingAddWithLayout"
-                                canonicalName.endsWith("_sub") -> "wrappingSubWithLayout"
-                                else -> "wrappingMulWithLayout"
-                            }
-                        fallbackWithLayout(fn, "$a, $b")
-                    }
-                }
-            }
-            "saturating_add", "saturating_sub" -> {
-                if (renderedArgs.size < 2) return null
-                val a = renderedArgs[0]
-                val b = renderedArgs[1]
-                val stem = if (canonicalName == "saturating_add") "kmSaturatingAdd" else "kmSaturatingSub"
-                val wTag = kind?.let { numericKindWidthTag(it) }
-                when {
-                    (kind == NumericKind.I128 || kind == NumericKind.U128) && wTag != null -> {
-                        val kmFn = "$stem$wTag"
-                        registerCoreImport(emitter, "$intrPkg.$kmFn")
-                        val hiL = if (kind == NumericKind.I128) "lhs.high.toULong()" else "lhs.high"
-                        val hiR = if (kind == NumericKind.I128) "rhs.high.toULong()" else "rhs.high"
-                        val built = reconstruct128Expr(kind, "it.lo", "it.hi", coreNs, emitter)
-                        "run { val lhs = $a; val rhs = $b; $kmFn(lhs.low, $hiL, rhs.low, $hiR).let { $built } }"
-                    }
-                    wTag != null -> {
-                        val kmFn = "$stem$wTag"
-                        registerCoreImport(emitter, "$intrPkg.$kmFn")
-                        "$kmFn($a, $b)"
-                    }
-                    else -> fallbackWithLayout(if (canonicalName == "saturating_add") "saturatingAddWithLayout" else "saturatingSubWithLayout", "$a, $b")
-                }
-            }
-            "add_with_overflow", "sub_with_overflow", "mul_with_overflow" -> {
-                if (renderedArgs.size < 2) return null
-                val a = renderedArgs[0]
-                val b = renderedArgs[1]
-                val stem =
-                    when (canonicalName) {
-                        "add_with_overflow" -> "Add"
-                        "sub_with_overflow" -> "Sub"
-                        else -> "Mul"
-                    }
-                val wTag = kind?.let { numericKindWidthTag(it) }
-                when {
-                    (kind == NumericKind.I128 || kind == NumericKind.U128) && wTag != null -> {
-                        val kmFn = "km${stem}WithOverflow$wTag"
-                        registerCoreImport(emitter, "$intrPkg.$kmFn")
-                        val hiL = if (kind == NumericKind.I128) "lhs.high.toULong()" else "lhs.high"
-                        val hiR = if (kind == NumericKind.I128) "rhs.high.toULong()" else "rhs.high"
-                        val built = reconstruct128Expr(kind, "it.lo", "it.hi", coreNs, emitter)
-                        "run { val lhs = $a; val rhs = $b; $kmFn(lhs.low, $hiL, rhs.low, $hiR).let { Pair($built, it.overflowed) } }"
-                    }
-                    wTag != null -> {
-                        val kmFn = "km${stem}WithOverflow$wTag"
-                        registerCoreImport(emitter, "$intrPkg.$kmFn")
-                        "$kmFn($a, $b).let { Pair(it.value, it.overflowed) }"
-                    }
-                    else -> {
-                        val fn =
-                            when (canonicalName) {
-                                "add_with_overflow" -> "addWithOverflowWithLayout"
-                                "sub_with_overflow" -> "subWithOverflowWithLayout"
-                                else -> "mulWithOverflowWithLayout"
-                            }
-                        fallbackWithLayout(fn, "$a, $b")
-                    }
-                }
-            }
-            "unchecked_div", "unchecked_rem", "exact_div" -> {
-                if (renderedArgs.size < 2) return null
-                val a = renderedArgs[0]
-                val b = renderedArgs[1]
-                val op = if (canonicalName == "unchecked_rem") "%" else "/"
-                when (kind) {
-                    NumericKind.I8 -> "((($a) $op ($b))).toByte()"
-                    NumericKind.U8 -> "((($a) $op ($b))).toUByte()"
-                    NumericKind.I16 -> "((($a) $op ($b))).toShort()"
-                    NumericKind.U16 -> "((($a) $op ($b))).toUShort()"
-                    NumericKind.I32, NumericKind.U32, NumericKind.I64, NumericKind.U64, NumericKind.I128, NumericKind.U128 -> "(($a) $op ($b))"
-                    else -> {
-                        val fn =
-                            when (canonicalName) {
-                                "unchecked_rem" -> "uncheckedRemWithLayout"
-                                "exact_div" -> "exactDivWithLayout"
-                                else -> "uncheckedDivWithLayout"
-                            }
-                        fallbackWithLayout(fn, "$a, $b")
-                    }
-                }
-            }
-            "unchecked_shl", "unchecked_shr" -> {
-                if (renderedArgs.size < 2) return null
-                val x = renderedArgs[0]
-                val shift = renderedArgs[1]
-                val isLeft = canonicalName == "unchecked_shl"
-                val op = if (isLeft) "shl" else "shr"
-                when (kind) {
-                    NumericKind.I8 -> "((($x).toInt() $op ($shift).toInt()).toByte())"
-                    NumericKind.U8 -> "(((($x).toUInt() and 0xFFu) $op ($shift).toInt()).toUByte())"
-                    NumericKind.I16 -> "((($x).toInt() $op ($shift).toInt()).toShort())"
-                    NumericKind.U16 -> "(((($x).toUInt() and 0xFFFFu) $op ($shift).toInt()).toUShort())"
-                    NumericKind.I32, NumericKind.U32, NumericKind.I64, NumericKind.U64 -> "(($x) $op ($shift).toInt())"
-                    NumericKind.U128 -> {
-                        val kmFn = if (isLeft) "kmU128Shl" else "kmU128Shr"
-                        registerCoreImport(emitter, "$intrPkg.$kmFn")
-                        registerCoreImport(emitter, "$coreNs.U128")
-                        "($x).let { v -> $kmFn(v.low, v.high, ($shift).toUInt()).let { r -> U128(r.hi, r.lo) } }"
-                    }
-                    NumericKind.I128 -> {
-                        val kmFn = if (isLeft) "kmU128Shl" else "kmI128Shr"
-                        registerCoreImport(emitter, "$intrPkg.$kmFn")
-                        registerCoreImport(emitter, "$coreNs.I128")
-                        "($x).let { v -> $kmFn(v.low, v.high.toULong(), ($shift).toUInt()).let { r -> I128(r.hi.toLong(), r.lo) } }"
-                    }
-                    else -> {
-                        val ty0 = firstTargetTy ?: return null
-                        val layout0 = resolveTypeLayoutExpression(ty0, selfTypeName, emitter)
-                        val fn = if (isLeft) "uncheckedShlWithLayout" else "uncheckedShrWithLayout"
-                        registerCoreImport(emitter, "$memPkg.$fn")
-                        val shiftTy =
-                            explicitTypes.getOrNull(1)?.takeUnless { it is SynType.Infer }
-                                ?: callArgsList.getOrNull(1)?.let { emitter.sourceInitializerType(it) }
-                        if (shiftTy != null && explicitTypes.size >= 2) {
-                            val layout1 = resolveTypeLayoutExpression(shiftTy, selfTypeName, emitter)
-                            "$fn($x, $shift, $layout0, $layout1)"
-                        } else {
-                            "$fn($x, ($shift).toUInt(), $layout0)"
-                        }
-                    }
-                }
-            }
-            "disjoint_bitor" -> {
-                if (renderedArgs.size < 2) return null
-                val a = renderedArgs[0]
-                val b = renderedArgs[1]
-                if (kind != null && numericKindWidthTag(kind) != null) {
-                    "(($a) or ($b))"
-                } else {
-                    fallbackWithLayout("disjointBitorWithLayout", "$a, $b")
-                }
-            }
-            "three_way_compare" -> {
-                if (renderedArgs.size < 2) return null
-                val a = renderedArgs[0]
-                val b = renderedArgs[1]
-                if (kind != null && numericKindWidthTag(kind) != null) {
-                    registerCoreImport(emitter, "$coreNs.cmp.Ordering")
-                    "run { val lhs = $a; val rhs = $b; when { lhs < rhs -> Ordering.Less; lhs > rhs -> Ordering.Greater; else -> Ordering.Equal } }"
-                } else {
-                    fallbackWithLayout("threeWayCompareWithLayout", "$a, $b")
-                }
-            }
-            else -> null
-        }
+        return rule.renderCall(
+            IntIntrinsicCallContext(
+                canonicalName = canonicalName,
+                renderedArgs = renderedArgs,
+                callArgsList = callArgsList,
+                explicitTypes = explicitTypes,
+                kind = kind,
+                firstTargetTy = firstTargetTy,
+                selfTypeName = selfTypeName,
+                coreNs = coreNs,
+                intrPkg = intrPkg,
+                memPkg = memPkg,
+                emitter = emitter,
+            ),
+        )
     }
 
-    private fun renderFloatIntrinsicCall(
+    private fun renderFixedFloatIntrinsicCall(
         canonicalName: String,
         renderedArgs: List<String>,
-        callArgsList: List<Expr>,
-        explicitTypes: List<SynType>,
-        selfTypeName: String?,
-        coreNs: String,
         intrPkg: String,
         memPkg: String,
         emitter: KotlinJ2KEmitter,
@@ -2887,16 +2851,16 @@ public object CoreIntrinsicLowering {
             registerCoreImport(emitter, "$intrPkg.$kmFn")
             return "$kmFn(${renderedArgs[0]}, ${renderedArgs[1]})"
         }
-        when (canonicalName) {
+        return when (canonicalName) {
             "fmaf32", "fmuladdf32" -> {
                 if (renderedArgs.size < 3) return null
                 registerCoreImport(emitter, "$intrPkg.kmFmaf32")
-                return "kmFmaf32(${renderedArgs[0]}, ${renderedArgs[1]}, ${renderedArgs[2]})"
+                "kmFmaf32(${renderedArgs[0]}, ${renderedArgs[1]}, ${renderedArgs[2]})"
             }
             "fmaf64", "fmuladdf64" -> {
                 if (renderedArgs.size < 3) return null
                 registerCoreImport(emitter, "$intrPkg.kmFmaf64")
-                return "kmFmaf64(${renderedArgs[0]}, ${renderedArgs[1]}, ${renderedArgs[2]})"
+                "kmFmaf64(${renderedArgs[0]}, ${renderedArgs[1]}, ${renderedArgs[2]})"
             }
             "minimumf32", "maximumf32", "minimumf64", "maximumf64" -> {
                 if (renderedArgs.size < 2) return null
@@ -2904,9 +2868,59 @@ public object CoreIntrinsicLowering {
                 val layoutName = if (canonicalName.endsWith("f32")) "PrimitiveLayouts.F32" else "PrimitiveLayouts.F64"
                 registerCoreImport(emitter, "$memPkg.floatBinaryWithLayout")
                 registerCoreImport(emitter, "$memPkg.PrimitiveLayouts")
-                return "floatBinaryWithLayout(\"$op\", ${renderedArgs[0]}, ${renderedArgs[1]}, $layoutName)"
+                "floatBinaryWithLayout(\"$op\", ${renderedArgs[0]}, ${renderedArgs[1]}, $layoutName)"
             }
+            else -> null
         }
+    }
+
+    private fun renderSynthesizedGenericFloatBody(
+        canonicalName: String,
+        p0: String,
+        p1: String,
+        p2: String,
+        layout0: String,
+        layout1: String,
+        memPkg: String,
+        emitter: KotlinJ2KEmitter,
+    ): String? =
+        when (canonicalName) {
+            in GENERIC_FLOAT_UNARY_KM -> {
+                registerCoreImport(emitter, "$memPkg.floatUnaryWithLayout")
+                "floatUnaryWithLayout(\"$canonicalName\", $p0, $layout0)"
+            }
+            in GENERIC_FLOAT_BINARY_OP_NAMES -> {
+                val op = GENERIC_FLOAT_BINARY_OP_NAMES.getValue(canonicalName)
+                registerCoreImport(emitter, "$memPkg.floatBinaryWithLayout")
+                "floatBinaryWithLayout(\"$op\", $p0, $p1, $layout0)"
+            }
+            "powi" -> {
+                registerCoreImport(emitter, "$memPkg.floatPowiWithLayout")
+                "floatPowiWithLayout($p0, $p1, $layout0)"
+            }
+            "fma", "fmuladd" -> {
+                registerCoreImport(emitter, "$memPkg.floatFmaWithLayout")
+                "floatFmaWithLayout($p0, $p1, $p2, $layout0)"
+            }
+            "float_to_int_unchecked" -> {
+                registerCoreImport(emitter, "$memPkg.floatToIntUncheckedWithLayout")
+                "floatToIntUncheckedWithLayout($p0, $layout0, $layout1)"
+            }
+            else -> null
+        }
+
+    private fun renderFloatIntrinsicCall(
+        canonicalName: String,
+        renderedArgs: List<String>,
+        callArgsList: List<Expr>,
+        explicitTypes: List<SynType>,
+        selfTypeName: String?,
+        coreNs: String,
+        intrPkg: String,
+        memPkg: String,
+        emitter: KotlinJ2KEmitter,
+    ): String? {
+        renderFixedFloatIntrinsicCall(canonicalName, renderedArgs, intrPkg, memPkg, emitter)?.let { return it }
 
         if (canonicalName == "float_to_int_unchecked") {
             val arg0 = renderedArgs.firstOrNull() ?: return null
@@ -2929,21 +2943,16 @@ public object CoreIntrinsicLowering {
                     NumericKind.I16 -> return "($arg0).toInt().toShort()"
                     NumericKind.I32 -> return "($arg0).toInt()"
                     NumericKind.I64 -> return "($arg0).toLong()"
-                    NumericKind.U8 -> {
+                    NumericKind.U8, NumericKind.U16, NumericKind.U32, NumericKind.U64 -> {
                         registerCoreImport(emitter, "$intrPkg.$u64Km")
-                        return "$u64Km($arg0).toUByte()"
-                    }
-                    NumericKind.U16 -> {
-                        registerCoreImport(emitter, "$intrPkg.$u64Km")
-                        return "$u64Km($arg0).toUShort()"
-                    }
-                    NumericKind.U32 -> {
-                        registerCoreImport(emitter, "$intrPkg.$u64Km")
-                        return "$u64Km($arg0).toUInt()"
-                    }
-                    NumericKind.U64 -> {
-                        registerCoreImport(emitter, "$intrPkg.$u64Km")
-                        return "$u64Km($arg0)"
+                        val suffix =
+                            when (dstKind) {
+                                NumericKind.U8 -> ".toUByte()"
+                                NumericKind.U16 -> ".toUShort()"
+                                NumericKind.U32 -> ".toUInt()"
+                                else -> ""
+                            }
+                        return "$u64Km($arg0)$suffix"
                     }
                     NumericKind.U128 -> {
                         registerCoreImport(emitter, "$intrPkg.$u128Km")
@@ -2951,10 +2960,9 @@ public object CoreIntrinsicLowering {
                         return "$u128Km($arg0).let { U128(it.hi, it.lo) }"
                     }
                     NumericKind.I128 -> {
-                        registerCoreImport(emitter, "$memPkg.floatToIntUncheckedWithLayout")
                         val srcLayout = layoutExprForNumericKind(srcKind, coreNs, memPkg, emitter)
                         val dstLayout = layoutExprForNumericKind(NumericKind.I128, coreNs, memPkg, emitter)
-                        return "floatToIntUncheckedWithLayout($arg0, $srcLayout, $dstLayout)"
+                        return renderSynthesizedGenericFloatBody(canonicalName, arg0, "", "", srcLayout, dstLayout, memPkg, emitter)
                     }
                     else -> Unit
                 }
@@ -2967,14 +2975,12 @@ public object CoreIntrinsicLowering {
                 dstKind?.let { layoutExprForNumericKind(it, coreNs, memPkg, emitter) }
                     ?: dstTy?.let { resolveTypeLayoutExpression(it, selfTypeName, emitter) }
                     ?: return null
-            registerCoreImport(emitter, "$memPkg.floatToIntUncheckedWithLayout")
-            return "floatToIntUncheckedWithLayout($arg0, $srcLayout, $dstLayout)"
+            return renderSynthesizedGenericFloatBody(canonicalName, arg0, "", "", srcLayout, dstLayout, memPkg, emitter)
         }
 
         val arity =
             when {
-                canonicalName in GENERIC_FLOAT_UNARY_KM -> 1
-                canonicalName == "powi" -> 1
+                canonicalName in GENERIC_FLOAT_UNARY_KM || canonicalName == "powi" -> 1
                 canonicalName in GENERIC_FLOAT_BINARY_OP_NAMES -> 2
                 else -> 3
             }
@@ -2990,653 +2996,282 @@ public object CoreIntrinsicLowering {
                 else -> null
             }
 
-        GENERIC_FLOAT_UNARY_KM[canonicalName]?.let { (f32Km, f64Km) ->
-            val arg0 = renderedArgs.firstOrNull() ?: return null
+        fun dispatchF32F64OrFallback(f32Km: String, f64Km: String, requiredArity: Int): String? {
+            if (renderedArgs.size < requiredArity) return null
+            val callArgsJoined = renderedArgs.take(requiredArity).joinToString(", ")
             return when (kind) {
                 NumericKind.F32 -> {
                     registerCoreImport(emitter, "$intrPkg.$f32Km")
-                    "$f32Km($arg0)"
+                    "$f32Km($callArgsJoined)"
                 }
                 NumericKind.F64 -> {
                     registerCoreImport(emitter, "$intrPkg.$f64Km")
-                    "$f64Km($arg0)"
+                    "$f64Km($callArgsJoined)"
                 }
                 else -> {
                     val layout = floatLayoutExpr() ?: return null
-                    registerCoreImport(emitter, "$memPkg.floatUnaryWithLayout")
-                    "floatUnaryWithLayout(\"$canonicalName\", $arg0, $layout)"
+                    renderSynthesizedGenericFloatBody(
+                        canonicalName = canonicalName,
+                        p0 = renderedArgs.getOrElse(0) { "" },
+                        p1 = renderedArgs.getOrElse(1) { "" },
+                        p2 = renderedArgs.getOrElse(2) { "" },
+                        layout0 = layout,
+                        layout1 = layout,
+                        memPkg = memPkg,
+                        emitter = emitter,
+                    )
                 }
             }
         }
 
+        GENERIC_FLOAT_UNARY_KM[canonicalName]?.let { (f32Km, f64Km) ->
+            return dispatchF32F64OrFallback(f32Km, f64Km, requiredArity = 1)
+        }
         GENERIC_FLOAT_BINARY_OP_NAMES[canonicalName]?.let { op ->
             if (renderedArgs.size < 2) return null
             val a = renderedArgs[0]
             val b = renderedArgs[1]
             if (kind == NumericKind.F32 || kind == NumericKind.F64) {
-                val isF32 = kind == NumericKind.F32
                 when (op) {
                     "fadd" -> return "(($a) + ($b))"
                     "fsub" -> return "(($a) - ($b))"
                     "fmul" -> return "(($a) * ($b))"
                     "fdiv" -> return "(($a) / ($b))"
                     "frem" -> return "(($a) % ($b))"
-                    "powf", "copysign", "minnum", "maxnum" -> {
-                        val kmFn =
-                            when (op) {
-                                "powf" -> if (isF32) "kmPowf32" else "kmPowf64"
-                                "copysign" -> if (isF32) "kmCopysignf32" else "kmCopysignf64"
-                                "minnum" -> if (isF32) "kmMinnumf32" else "kmMinnumf64"
-                                else -> if (isF32) "kmMaxnumf32" else "kmMaxnumf64"
-                            }
-                        registerCoreImport(emitter, "$intrPkg.$kmFn")
-                        return "$kmFn($a, $b)"
-                    }
+                    "powf" -> return dispatchF32F64OrFallback("kmPowf32", "kmPowf64", requiredArity = 2)
+                    "copysign" -> return dispatchF32F64OrFallback("kmCopysignf32", "kmCopysignf64", requiredArity = 2)
+                    "minnum" -> return dispatchF32F64OrFallback("kmMinnumf32", "kmMinnumf64", requiredArity = 2)
+                    "maxnum" -> return dispatchF32F64OrFallback("kmMaxnumf32", "kmMaxnumf64", requiredArity = 2)
                 }
             }
             val layout = floatLayoutExpr() ?: return null
-            registerCoreImport(emitter, "$memPkg.floatBinaryWithLayout")
-            return "floatBinaryWithLayout(\"$op\", $a, $b, $layout)"
+            return renderSynthesizedGenericFloatBody(canonicalName, a, b, "", layout, layout, memPkg, emitter)
         }
-
         if (canonicalName == "powi") {
-            if (renderedArgs.size < 2) return null
-            val a = renderedArgs[0]
-            val x = renderedArgs[1]
-            return when (kind) {
-                NumericKind.F32 -> {
-                    registerCoreImport(emitter, "$intrPkg.kmPowif32")
-                    "kmPowif32($a, $x)"
-                }
-                NumericKind.F64 -> {
-                    registerCoreImport(emitter, "$intrPkg.kmPowif64")
-                    "kmPowif64($a, $x)"
-                }
-                else -> {
-                    val layout = floatLayoutExpr() ?: return null
-                    registerCoreImport(emitter, "$memPkg.floatPowiWithLayout")
-                    "floatPowiWithLayout($a, $x, $layout)"
-                }
-            }
+            return dispatchF32F64OrFallback("kmPowif32", "kmPowif64", requiredArity = 2)
         }
-
         if (canonicalName == "fma" || canonicalName == "fmuladd") {
-            if (renderedArgs.size < 3) return null
-            val a = renderedArgs[0]
-            val b = renderedArgs[1]
-            val c = renderedArgs[2]
-            return when (kind) {
-                NumericKind.F32 -> {
-                    registerCoreImport(emitter, "$intrPkg.kmFmaf32")
-                    "kmFmaf32($a, $b, $c)"
-                }
-                NumericKind.F64 -> {
-                    registerCoreImport(emitter, "$intrPkg.kmFmaf64")
-                    "kmFmaf64($a, $b, $c)"
-                }
-                else -> {
-                    val layout = floatLayoutExpr() ?: return null
-                    registerCoreImport(emitter, "$memPkg.floatFmaWithLayout")
-                    "floatFmaWithLayout($a, $b, $c, $layout)"
-                }
-            }
+            return dispatchF32F64OrFallback("kmFmaf32", "kmFmaf64", requiredArity = 3)
         }
         return null
     }
 
-    private fun renderDirectScalarLoad(
-        pointee: SynType,
-        addrExpr: String,
-        isVolatile: Boolean,
-        intrPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String? {
-        val resolved = emitter.resolveLayoutType(pointee, emptyMap())
-        val ptrBits = emitter.activeCfgProfile.pointerWidth
-        val prefix = if (isVolatile) "kmVolatileLoad" else "kmLoad"
-        if (resolved is SynType.Ptr && !emitter.headerContext.rawAbiMode) {
-            val isMut = resolved.mutability is PointerMutability.Mut
-            val ctor = if (isMut) "MutPtr" else "ConstPtr"
-            val coreNs = resolveCoreNamespace(emitter.headerContext)
-            registerCoreImport(emitter, "$coreNs.ptr.$ctor")
-            val loadFn = if (ptrBits == 64) "${prefix}U64" else "${prefix}U32"
-            registerCoreImport(emitter, "$intrPkg.$loadFn")
-            return "$ctor($loadFn($addrExpr).toLong())"
+    /**
+     * Base class for direct scalar/pointer memory & atomic intrinsic emitters (`kmLoad*`,
+     * `kmVolatileLoad*`, `kmStore*`, `kmVolatileStore*`, `kmAtomicLoad*`, `kmAtomicStore*`,
+     * `kmAtomicXchg*`, `kmAtomicRmw*`, and `kmAtomicCxchg*`), centralizing pointee width
+     * resolution, unsigned bit packing/unpacking, pointer constructor wrapping, and import registration.
+     */
+    private abstract class DirectPointeeMemoryIntrinsicEmitter(
+        protected val intrPkg: String,
+        protected val ptrPkg: String,
+        protected val emitter: KotlinJ2KEmitter,
+    ) {
+        protected val ptrBits: Int = emitter.activeCfgProfile.pointerWidth
+        protected val rawAbi: Boolean = emitter.headerContext.rawAbiMode
+        protected val ptrUnsignedTag: String
+            get() = if (ptrBits == 64) "U64" else "U32"
+
+        protected open val allowChar: Boolean = false
+
+        protected data class EncodedUnsignedArg(
+            val widthTag: String,
+            val expr: String,
+        )
+
+        protected fun resolvePointee(pointee: SynType): Pair<SynType, String?> {
+            val resolved = emitter.resolveLayoutType(pointee, emptyMap())
+            return resolved to explicitScalarRustName(resolved, emitter)
         }
-        return when (explicitScalarRustName(resolved, emitter)) {
-            "bool" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U8")
-                "(${prefix}U8($addrExpr) != 0u.toUByte())"
+
+        protected fun resolveLoadWidthTag(resolved: SynType, scalarName: String?): String? {
+            if (resolved is SynType.Ptr && !rawAbi) return ptrUnsignedTag
+            return when (scalarName) {
+                "bool", "u8", "i8" -> "U8"
+                "u16", "i16" -> "U16"
+                "u32", "i32" -> "U32"
+                "char" -> if (allowChar) "U32" else null
+                "u64", "i64" -> "U64"
+                "usize", "isize" -> ptrUnsignedTag
+                else -> null
             }
-            "u8" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U8")
-                "${prefix}U8($addrExpr)"
+        }
+
+        protected fun encodePointeeToUnsigned(
+            resolved: SynType,
+            scalarName: String?,
+            valExpr: String,
+        ): EncodedUnsignedArg? {
+            if (resolved is SynType.Ptr && !rawAbi) {
+                val conv = if (ptrBits == 64) "($valExpr).rawAddress.toULong()" else "($valExpr).rawAddress.toUInt()"
+                return EncodedUnsignedArg(ptrUnsignedTag, conv)
             }
-            "i8" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U8")
-                "${prefix}U8($addrExpr).toByte()"
-            }
-            "u16" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U16")
-                "${prefix}U16($addrExpr)"
-            }
-            "i16" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U16")
-                "${prefix}U16($addrExpr).toShort()"
-            }
-            "u32" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U32")
-                "${prefix}U32($addrExpr)"
-            }
-            "i32" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U32")
-                "${prefix}U32($addrExpr).toInt()"
-            }
-            "char" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U32")
-                "${prefix}U32($addrExpr).toInt().toChar()"
-            }
-            "u64" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U64")
-                "${prefix}U64($addrExpr)"
-            }
-            "i64" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U64")
-                "${prefix}U64($addrExpr).toLong()"
-            }
-            "usize" -> {
-                val fn = if (ptrBits == 64) "${prefix}U64" else "${prefix}U32"
-                registerCoreImport(emitter, "$intrPkg.$fn")
-                if (emitter.headerContext.rawAbiMode) "$fn($addrExpr)" else "$fn($addrExpr).toInt()"
-            }
-            "isize" -> {
-                val fn = if (ptrBits == 64) "${prefix}U64" else "${prefix}U32"
-                registerCoreImport(emitter, "$intrPkg.$fn")
-                if (emitter.headerContext.rawAbiMode) "$fn($addrExpr).toLong()" else "$fn($addrExpr).toLong().toInt()"
-            }
-            "f32" ->
-                if (!isVolatile) {
-                    registerCoreImport(emitter, "$intrPkg.kmLoadF32")
-                    "kmLoadF32($addrExpr)"
-                } else {
-                    registerCoreImport(emitter, "$intrPkg.kmVolatileLoadU32")
-                    "Float.fromBits(kmVolatileLoadU32($addrExpr).toInt())"
+            return when (scalarName) {
+                "bool" -> EncodedUnsignedArg("U8", "if ($valExpr) 1u else 0u")
+                "u8" -> EncodedUnsignedArg("U8", valExpr)
+                "i8" -> EncodedUnsignedArg("U8", "($valExpr).toUByte()")
+                "u16" -> EncodedUnsignedArg("U16", valExpr)
+                "i16" -> EncodedUnsignedArg("U16", "($valExpr).toUShort()")
+                "u32" -> EncodedUnsignedArg("U32", valExpr)
+                "i32" -> EncodedUnsignedArg("U32", "($valExpr).toUInt()")
+                "char" -> if (allowChar) EncodedUnsignedArg("U32", "($valExpr).code.toUInt()") else null
+                "u64" -> EncodedUnsignedArg("U64", valExpr)
+                "i64" -> EncodedUnsignedArg("U64", "($valExpr).toULong()")
+                "usize" -> {
+                    val v =
+                        when {
+                            rawAbi -> valExpr
+                            ptrBits == 64 -> "($valExpr).toUInt().toULong()"
+                            else -> "($valExpr).toUInt()"
+                        }
+                    EncodedUnsignedArg(ptrUnsignedTag, v)
                 }
-            "f64" ->
-                if (!isVolatile) {
-                    registerCoreImport(emitter, "$intrPkg.kmLoadF64")
-                    "kmLoadF64($addrExpr)"
-                } else {
-                    registerCoreImport(emitter, "$intrPkg.kmVolatileLoadU64")
-                    "Double.fromBits(kmVolatileLoadU64($addrExpr).toLong())"
+                "isize" -> {
+                    val v = if (ptrBits == 64) "($valExpr).toLong().toULong()" else "($valExpr).toUInt()"
+                    EncodedUnsignedArg(ptrUnsignedTag, v)
                 }
-            else -> null
+                else -> null
+            }
+        }
+
+        protected fun decodeUnsignedToPointee(
+            resolved: SynType,
+            scalarName: String?,
+            rawExpr: String,
+            parenthesizeBool: Boolean = true,
+        ): String? {
+            if (resolved is SynType.Ptr && !rawAbi) {
+                val ctor = if (resolved.mutability is PointerMutability.Mut) "MutPtr" else "ConstPtr"
+                registerCoreImport(emitter, "$ptrPkg.$ctor")
+                return "$ctor($rawExpr.toLong())"
+            }
+            return when (scalarName) {
+                "bool" -> if (parenthesizeBool) "($rawExpr != 0u.toUByte())" else "$rawExpr != 0u.toUByte()"
+                "u8", "u16", "u32", "u64" -> rawExpr
+                "i8" -> "$rawExpr.toByte()"
+                "i16" -> "$rawExpr.toShort()"
+                "i32" -> "$rawExpr.toInt()"
+                "char" -> if (allowChar) "$rawExpr.toInt().toChar()" else null
+                "i64" -> "$rawExpr.toLong()"
+                "usize" -> if (rawAbi) rawExpr else "$rawExpr.toInt()"
+                "isize" -> if (rawAbi) "$rawExpr.toLong()" else "$rawExpr.toLong().toInt()"
+                else -> null
+            }
+        }
+
+        protected fun registerAndCall(fnName: String, args: List<String>): String {
+            registerCoreImport(emitter, "$intrPkg.$fnName")
+            return "$fnName(${args.joinToString(", ")})"
         }
     }
 
-    private fun renderDirectScalarStore(
-        pointee: SynType,
-        addrExpr: String,
-        valExpr: String,
-        isVolatile: Boolean,
-        intrPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String? {
-        val resolved = emitter.resolveLayoutType(pointee, emptyMap())
-        val ptrBits = emitter.activeCfgProfile.pointerWidth
-        val prefix = if (isVolatile) "kmVolatileStore" else "kmStore"
-        if (resolved is SynType.Ptr && !emitter.headerContext.rawAbiMode) {
-            val fn = if (ptrBits == 64) "${prefix}U64" else "${prefix}U32"
-            registerCoreImport(emitter, "$intrPkg.$fn")
-            val conv = if (ptrBits == 64) "($valExpr).rawAddress.toULong()" else "($valExpr).rawAddress.toUInt()"
-            return "$fn($addrExpr, $conv)"
-        }
-        return when (explicitScalarRustName(resolved, emitter)) {
-            "bool" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U8")
-                "${prefix}U8($addrExpr, if ($valExpr) 1u else 0u)"
-            }
-            "u8" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U8")
-                "${prefix}U8($addrExpr, $valExpr)"
-            }
-            "i8" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U8")
-                "${prefix}U8($addrExpr, ($valExpr).toUByte())"
-            }
-            "u16" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U16")
-                "${prefix}U16($addrExpr, $valExpr)"
-            }
-            "i16" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U16")
-                "${prefix}U16($addrExpr, ($valExpr).toUShort())"
-            }
-            "u32" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U32")
-                "${prefix}U32($addrExpr, $valExpr)"
-            }
-            "i32" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U32")
-                "${prefix}U32($addrExpr, ($valExpr).toUInt())"
-            }
-            "char" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U32")
-                "${prefix}U32($addrExpr, ($valExpr).code.toUInt())"
-            }
-            "u64" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U64")
-                "${prefix}U64($addrExpr, $valExpr)"
-            }
-            "i64" -> {
-                registerCoreImport(emitter, "$intrPkg.${prefix}U64")
-                "${prefix}U64($addrExpr, ($valExpr).toULong())"
-            }
-            "usize" -> {
-                val fn = if (ptrBits == 64) "${prefix}U64" else "${prefix}U32"
-                registerCoreImport(emitter, "$intrPkg.$fn")
-                val v = if (ptrBits == 64) "($valExpr).toUInt().toULong()" else "($valExpr).toUInt()"
-                val rawV = if (emitter.headerContext.rawAbiMode) valExpr else v
-                "$fn($addrExpr, $rawV)"
-            }
-            "isize" -> {
-                val fn = if (ptrBits == 64) "${prefix}U64" else "${prefix}U32"
-                registerCoreImport(emitter, "$intrPkg.$fn")
-                val v = if (ptrBits == 64) "($valExpr).toLong().toULong()" else "($valExpr).toUInt()"
-                "$fn($addrExpr, $v)"
-            }
-            "f32" ->
-                if (!isVolatile) {
-                    registerCoreImport(emitter, "$intrPkg.kmStoreF32")
-                    "kmStoreF32($addrExpr, $valExpr)"
-                } else {
-                    registerCoreImport(emitter, "$intrPkg.kmVolatileStoreU32")
-                    "kmVolatileStoreU32($addrExpr, ($valExpr).toRawBits().toUInt())"
-                }
-            "f64" ->
-                if (!isVolatile) {
-                    registerCoreImport(emitter, "$intrPkg.kmStoreF64")
-                    "kmStoreF64($addrExpr, $valExpr)"
-                } else {
-                    registerCoreImport(emitter, "$intrPkg.kmVolatileStoreU64")
-                    "kmVolatileStoreU64($addrExpr, ($valExpr).toRawBits().toULong())"
-                }
-            else -> null
-        }
-    }
-
-    private fun renderDirectAtomicLoad(
-        pointee: SynType,
-        addrExpr: String,
-        ordExpr: String,
+    private class DirectLoadIntrinsicEmitter(
+        private val fnPrefix: String,
+        override val allowChar: Boolean,
+        private val allowFloat: Boolean,
+        private val isVolatile: Boolean,
+        private val trailingArgs: List<String>,
         intrPkg: String,
         ptrPkg: String,
         emitter: KotlinJ2KEmitter,
-    ): String? {
-        val resolved = emitter.resolveLayoutType(pointee, emptyMap())
-        val ptrBits = emitter.activeCfgProfile.pointerWidth
-        if (resolved is SynType.Ptr && !emitter.headerContext.rawAbiMode) {
-            val ctor = if (resolved.mutability is PointerMutability.Mut) "MutPtr" else "ConstPtr"
-            registerCoreImport(emitter, "$ptrPkg.$ctor")
-            val fn = if (ptrBits == 64) "kmAtomicLoadU64" else "kmAtomicLoadU32"
-            registerCoreImport(emitter, "$intrPkg.$fn")
-            return "$ctor($fn($addrExpr, $ordExpr).toLong())"
-        }
-        return when (explicitScalarRustName(resolved, emitter)) {
-            "bool" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicLoadU8")
-                "(kmAtomicLoadU8($addrExpr, $ordExpr) != 0u.toUByte())"
+    ) : DirectPointeeMemoryIntrinsicEmitter(intrPkg, ptrPkg, emitter) {
+        fun render(pointee: SynType, addrExpr: String): String? {
+            val (resolved, scalar) = resolvePointee(pointee)
+            if (allowFloat && (scalar == "f32" || scalar == "f64")) {
+                val isF32 = scalar == "f32"
+                return if (!isVolatile) {
+                    registerAndCall(if (isF32) "kmLoadF32" else "kmLoadF64", listOf(addrExpr))
+                } else if (isF32) {
+                    "Float.fromBits(${registerAndCall("kmVolatileLoadU32", listOf(addrExpr))}.toInt())"
+                } else {
+                    "Double.fromBits(${registerAndCall("kmVolatileLoadU64", listOf(addrExpr))}.toLong())"
+                }
             }
-            "u8" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicLoadU8")
-                "kmAtomicLoadU8($addrExpr, $ordExpr)"
-            }
-            "i8" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicLoadU8")
-                "kmAtomicLoadU8($addrExpr, $ordExpr).toByte()"
-            }
-            "u16" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicLoadU16")
-                "kmAtomicLoadU16($addrExpr, $ordExpr)"
-            }
-            "i16" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicLoadU16")
-                "kmAtomicLoadU16($addrExpr, $ordExpr).toShort()"
-            }
-            "u32" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicLoadU32")
-                "kmAtomicLoadU32($addrExpr, $ordExpr)"
-            }
-            "i32" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicLoadU32")
-                "kmAtomicLoadU32($addrExpr, $ordExpr).toInt()"
-            }
-            "u64" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicLoadU64")
-                "kmAtomicLoadU64($addrExpr, $ordExpr)"
-            }
-            "i64" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicLoadU64")
-                "kmAtomicLoadU64($addrExpr, $ordExpr).toLong()"
-            }
-            "usize" -> {
-                val fn = if (ptrBits == 64) "kmAtomicLoadU64" else "kmAtomicLoadU32"
-                registerCoreImport(emitter, "$intrPkg.$fn")
-                if (emitter.headerContext.rawAbiMode) "$fn($addrExpr, $ordExpr)" else "$fn($addrExpr, $ordExpr).toInt()"
-            }
-            "isize" -> {
-                val fn = if (ptrBits == 64) "kmAtomicLoadU64" else "kmAtomicLoadU32"
-                registerCoreImport(emitter, "$intrPkg.$fn")
-                if (emitter.headerContext.rawAbiMode) "$fn($addrExpr, $ordExpr).toLong()" else "$fn($addrExpr, $ordExpr).toLong().toInt()"
-            }
-            else -> null
+            val widthTag = resolveLoadWidthTag(resolved, scalar) ?: return null
+            val call = registerAndCall("$fnPrefix$widthTag", listOf(addrExpr) + trailingArgs)
+            return decodeUnsignedToPointee(resolved, scalar, call)
         }
     }
 
-    private fun renderDirectAtomicStore(
-        pointee: SynType,
-        addrExpr: String,
-        valExpr: String,
-        ordExpr: String,
-        intrPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String? {
-        val resolved = emitter.resolveLayoutType(pointee, emptyMap())
-        val ptrBits = emitter.activeCfgProfile.pointerWidth
-        if (resolved is SynType.Ptr && !emitter.headerContext.rawAbiMode) {
-            val fn = if (ptrBits == 64) "kmAtomicStoreU64" else "kmAtomicStoreU32"
-            registerCoreImport(emitter, "$intrPkg.$fn")
-            val conv = if (ptrBits == 64) "($valExpr).rawAddress.toULong()" else "($valExpr).rawAddress.toUInt()"
-            return "$fn($addrExpr, $conv, $ordExpr)"
-        }
-        return when (explicitScalarRustName(resolved, emitter)) {
-            "bool" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicStoreU8")
-                "kmAtomicStoreU8($addrExpr, if ($valExpr) 1u else 0u, $ordExpr)"
-            }
-            "u8" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicStoreU8")
-                "kmAtomicStoreU8($addrExpr, $valExpr, $ordExpr)"
-            }
-            "i8" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicStoreU8")
-                "kmAtomicStoreU8($addrExpr, ($valExpr).toUByte(), $ordExpr)"
-            }
-            "u16" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicStoreU16")
-                "kmAtomicStoreU16($addrExpr, $valExpr, $ordExpr)"
-            }
-            "i16" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicStoreU16")
-                "kmAtomicStoreU16($addrExpr, ($valExpr).toUShort(), $ordExpr)"
-            }
-            "u32" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicStoreU32")
-                "kmAtomicStoreU32($addrExpr, $valExpr, $ordExpr)"
-            }
-            "i32" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicStoreU32")
-                "kmAtomicStoreU32($addrExpr, ($valExpr).toUInt(), $ordExpr)"
-            }
-            "u64" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicStoreU64")
-                "kmAtomicStoreU64($addrExpr, $valExpr, $ordExpr)"
-            }
-            "i64" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicStoreU64")
-                "kmAtomicStoreU64($addrExpr, ($valExpr).toULong(), $ordExpr)"
-            }
-            "usize" -> {
-                val fn = if (ptrBits == 64) "kmAtomicStoreU64" else "kmAtomicStoreU32"
-                registerCoreImport(emitter, "$intrPkg.$fn")
-                val v =
-                    if (emitter.headerContext.rawAbiMode) {
-                        valExpr
-                    } else if (ptrBits == 64) {
-                        "($valExpr).toUInt().toULong()"
-                    } else {
-                        "($valExpr).toUInt()"
-                    }
-                "$fn($addrExpr, $v, $ordExpr)"
-            }
-            "isize" -> {
-                val fn = if (ptrBits == 64) "kmAtomicStoreU64" else "kmAtomicStoreU32"
-                registerCoreImport(emitter, "$intrPkg.$fn")
-                val v = if (ptrBits == 64) "($valExpr).toLong().toULong()" else "($valExpr).toUInt()"
-                "$fn($addrExpr, $v, $ordExpr)"
-            }
-            else -> null
-        }
-    }
-
-    private fun renderDirectAtomicXchg(
-        pointee: SynType,
-        addrExpr: String,
-        valExpr: String,
-        ordExpr: String,
+    private class DirectStoreIntrinsicEmitter(
+        private val fnPrefix: String,
+        override val allowChar: Boolean,
+        private val allowFloat: Boolean,
+        private val isVolatile: Boolean,
+        private val trailingArgs: List<String>,
         intrPkg: String,
         ptrPkg: String,
         emitter: KotlinJ2KEmitter,
-    ): String? {
-        val resolved = emitter.resolveLayoutType(pointee, emptyMap())
-        val ptrBits = emitter.activeCfgProfile.pointerWidth
-        if (resolved is SynType.Ptr && !emitter.headerContext.rawAbiMode) {
-            val ctor = if (resolved.mutability is PointerMutability.Mut) "MutPtr" else "ConstPtr"
-            registerCoreImport(emitter, "$ptrPkg.$ctor")
-            val fn = if (ptrBits == 64) "kmAtomicXchgU64" else "kmAtomicXchgU32"
-            registerCoreImport(emitter, "$intrPkg.$fn")
-            val conv = if (ptrBits == 64) "($valExpr).rawAddress.toULong()" else "($valExpr).rawAddress.toUInt()"
-            return "$ctor($fn($addrExpr, $conv, $ordExpr).toLong())"
-        }
-        return when (explicitScalarRustName(resolved, emitter)) {
-            "bool" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicXchgU8")
-                "(kmAtomicXchgU8($addrExpr, if ($valExpr) 1u else 0u, $ordExpr) != 0u.toUByte())"
+    ) : DirectPointeeMemoryIntrinsicEmitter(intrPkg, ptrPkg, emitter) {
+        fun render(pointee: SynType, addrExpr: String, valExpr: String): String? {
+            val (resolved, scalar) = resolvePointee(pointee)
+            if (allowFloat && (scalar == "f32" || scalar == "f64")) {
+                val isF32 = scalar == "f32"
+                return if (!isVolatile) {
+                    registerAndCall(if (isF32) "kmStoreF32" else "kmStoreF64", listOf(addrExpr, valExpr))
+                } else if (isF32) {
+                    registerAndCall("kmVolatileStoreU32", listOf(addrExpr, "($valExpr).toRawBits().toUInt()"))
+                } else {
+                    registerAndCall("kmVolatileStoreU64", listOf(addrExpr, "($valExpr).toRawBits().toULong()"))
+                }
             }
-            "u8" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicXchgU8")
-                "kmAtomicXchgU8($addrExpr, $valExpr, $ordExpr)"
-            }
-            "i8" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicXchgU8")
-                "kmAtomicXchgU8($addrExpr, ($valExpr).toUByte(), $ordExpr).toByte()"
-            }
-            "u16" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicXchgU16")
-                "kmAtomicXchgU16($addrExpr, $valExpr, $ordExpr)"
-            }
-            "i16" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicXchgU16")
-                "kmAtomicXchgU16($addrExpr, ($valExpr).toUShort(), $ordExpr).toShort()"
-            }
-            "u32" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicXchgU32")
-                "kmAtomicXchgU32($addrExpr, $valExpr, $ordExpr)"
-            }
-            "i32" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicXchgU32")
-                "kmAtomicXchgU32($addrExpr, ($valExpr).toUInt(), $ordExpr).toInt()"
-            }
-            "u64" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicXchgU64")
-                "kmAtomicXchgU64($addrExpr, $valExpr, $ordExpr)"
-            }
-            "i64" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicXchgU64")
-                "kmAtomicXchgU64($addrExpr, ($valExpr).toULong(), $ordExpr).toLong()"
-            }
-            "usize" -> {
-                val fn = if (ptrBits == 64) "kmAtomicXchgU64" else "kmAtomicXchgU32"
-                registerCoreImport(emitter, "$intrPkg.$fn")
-                val v =
-                    if (emitter.headerContext.rawAbiMode) {
-                        valExpr
-                    } else if (ptrBits == 64) {
-                        "($valExpr).toUInt().toULong()"
-                    } else {
-                        "($valExpr).toUInt()"
-                    }
-                if (emitter.headerContext.rawAbiMode) "$fn($addrExpr, $v, $ordExpr)" else "$fn($addrExpr, $v, $ordExpr).toInt()"
-            }
-            "isize" -> {
-                val fn = if (ptrBits == 64) "kmAtomicXchgU64" else "kmAtomicXchgU32"
-                registerCoreImport(emitter, "$intrPkg.$fn")
-                val v = if (ptrBits == 64) "($valExpr).toLong().toULong()" else "($valExpr).toUInt()"
-                if (emitter.headerContext.rawAbiMode) "$fn($addrExpr, $v, $ordExpr).toLong()" else "$fn($addrExpr, $v, $ordExpr).toLong().toInt()"
-            }
-            else -> null
+            val encoded = encodePointeeToUnsigned(resolved, scalar, valExpr) ?: return null
+            return registerAndCall("$fnPrefix${encoded.widthTag}", listOf(addrExpr, encoded.expr) + trailingArgs)
         }
     }
 
-    private fun renderDirectAtomicCxchg(
-        pointee: SynType,
-        addrExpr: String,
-        expectedExpr: String,
-        desiredExpr: String,
-        succOrd: String,
-        failOrd: String,
+    private class DirectReadModifyWriteIntrinsicEmitter(
+        private val fnPrefix: String,
+        private val trailingArgs: List<String>,
         intrPkg: String,
         ptrPkg: String,
         emitter: KotlinJ2KEmitter,
-    ): String? {
-        val resolved = emitter.resolveLayoutType(pointee, emptyMap())
-        val ptrBits = emitter.activeCfgProfile.pointerWidth
-        val pairCtor = if ("Pair" in emitter.inspector.declaredTypeNames) "kotlin.Pair" else "Pair"
-        if (resolved is SynType.Ptr && !emitter.headerContext.rawAbiMode) {
-            val ctor = if (resolved.mutability is PointerMutability.Mut) "MutPtr" else "ConstPtr"
-            registerCoreImport(emitter, "$ptrPkg.$ctor")
-            val fn = if (ptrBits == 64) "kmAtomicCxchgU64" else "kmAtomicCxchgU32"
-            registerCoreImport(emitter, "$intrPkg.$fn")
-            val expConv = if (ptrBits == 64) "($expectedExpr).rawAddress.toULong()" else "($expectedExpr).rawAddress.toUInt()"
-            val desConv = if (ptrBits == 64) "($desiredExpr).rawAddress.toULong()" else "($desiredExpr).rawAddress.toUInt()"
-            return "$fn($addrExpr, $expConv, $desConv, $succOrd, $failOrd).let { cxchgRes -> $pairCtor($ctor(cxchgRes.previous.toLong()), cxchgRes.succeeded) }"
-        }
-        return when (explicitScalarRustName(resolved, emitter)) {
-            "bool" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicCxchgU8")
-                "kmAtomicCxchgU8($addrExpr, if ($expectedExpr) 1u else 0u, if ($desiredExpr) 1u else 0u, $succOrd, $failOrd).let { cxchgRes -> $pairCtor(cxchgRes.previous != 0u.toUByte(), cxchgRes.succeeded) }"
-            }
-            "u8" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicCxchgU8")
-                "kmAtomicCxchgU8($addrExpr, $expectedExpr, $desiredExpr, $succOrd, $failOrd).let { cxchgRes -> $pairCtor(cxchgRes.previous, cxchgRes.succeeded) }"
-            }
-            "i8" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicCxchgU8")
-                "kmAtomicCxchgU8($addrExpr, ($expectedExpr).toUByte(), ($desiredExpr).toUByte(), $succOrd, $failOrd).let { cxchgRes -> $pairCtor(cxchgRes.previous.toByte(), cxchgRes.succeeded) }"
-            }
-            "u16" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicCxchgU16")
-                "kmAtomicCxchgU16($addrExpr, $expectedExpr, $desiredExpr, $succOrd, $failOrd).let { cxchgRes -> $pairCtor(cxchgRes.previous, cxchgRes.succeeded) }"
-            }
-            "i16" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicCxchgU16")
-                "kmAtomicCxchgU16($addrExpr, ($expectedExpr).toUShort(), ($desiredExpr).toUShort(), $succOrd, $failOrd).let { cxchgRes -> $pairCtor(cxchgRes.previous.toShort(), cxchgRes.succeeded) }"
-            }
-            "u32" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicCxchgU32")
-                "kmAtomicCxchgU32($addrExpr, $expectedExpr, $desiredExpr, $succOrd, $failOrd).let { cxchgRes -> $pairCtor(cxchgRes.previous, cxchgRes.succeeded) }"
-            }
-            "i32" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicCxchgU32")
-                "kmAtomicCxchgU32($addrExpr, ($expectedExpr).toUInt(), ($desiredExpr).toUInt(), $succOrd, $failOrd).let { cxchgRes -> $pairCtor(cxchgRes.previous.toInt(), cxchgRes.succeeded) }"
-            }
-            "u64" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicCxchgU64")
-                "kmAtomicCxchgU64($addrExpr, $expectedExpr, $desiredExpr, $succOrd, $failOrd).let { cxchgRes -> $pairCtor(cxchgRes.previous, cxchgRes.succeeded) }"
-            }
-            "i64" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicCxchgU64")
-                "kmAtomicCxchgU64($addrExpr, ($expectedExpr).toULong(), ($desiredExpr).toULong(), $succOrd, $failOrd).let { cxchgRes -> $pairCtor(cxchgRes.previous.toLong(), cxchgRes.succeeded) }"
-            }
-            "u128" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicCxchgU128Pair")
-                "kmAtomicCxchgU128Pair($addrExpr, ($expectedExpr).low, ($expectedExpr).high, ($desiredExpr).low, ($desiredExpr).high).let { cxchgRes -> $pairCtor(U128(cxchgRes.prevHi, cxchgRes.prevLo), cxchgRes.succeeded) }"
-            }
-            "i128" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicCxchgU128Pair")
-                "kmAtomicCxchgU128Pair($addrExpr, ($expectedExpr).low, ($expectedExpr).high.toULong(), ($desiredExpr).low, ($desiredExpr).high.toULong()).let { cxchgRes -> $pairCtor(I128(cxchgRes.prevHi.toLong(), cxchgRes.prevLo), cxchgRes.succeeded) }"
-            }
-            else -> null
+    ) : DirectPointeeMemoryIntrinsicEmitter(intrPkg, ptrPkg, emitter) {
+        fun render(pointee: SynType, addrExpr: String, valExpr: String): String? {
+            val (resolved, scalar) = resolvePointee(pointee)
+            val encoded = encodePointeeToUnsigned(resolved, scalar, valExpr) ?: return null
+            val call = registerAndCall("$fnPrefix${encoded.widthTag}", listOf(addrExpr, encoded.expr) + trailingArgs)
+            return decodeUnsignedToPointee(resolved, scalar, call)
         }
     }
 
-    private fun renderDirectAtomicRmw(
-        pointee: SynType,
-        addrExpr: String,
-        valExpr: String,
-        opCode: Int,
-        ordExpr: String,
+    private class DirectCompareExchangeIntrinsicEmitter(
         intrPkg: String,
         ptrPkg: String,
         emitter: KotlinJ2KEmitter,
-    ): String? {
-        val resolved = emitter.resolveLayoutType(pointee, emptyMap())
-        val ptrBits = emitter.activeCfgProfile.pointerWidth
-        if (resolved is SynType.Ptr && !emitter.headerContext.rawAbiMode) {
-            val ctor = if (resolved.mutability is PointerMutability.Mut) "MutPtr" else "ConstPtr"
-            registerCoreImport(emitter, "$ptrPkg.$ctor")
-            val fn = if (ptrBits == 64) "kmAtomicRmwU64" else "kmAtomicRmwU32"
-            registerCoreImport(emitter, "$intrPkg.$fn")
-            val conv = if (ptrBits == 64) "($valExpr).rawAddress.toULong()" else "($valExpr).rawAddress.toUInt()"
-            return "$ctor($fn($addrExpr, $conv, $opCode, $ordExpr).toLong())"
-        }
-        return when (explicitScalarRustName(resolved, emitter)) {
-            "bool" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicRmwU8")
-                "(kmAtomicRmwU8($addrExpr, if ($valExpr) 1u else 0u, $opCode, $ordExpr) != 0u.toUByte())"
+    ) : DirectPointeeMemoryIntrinsicEmitter(intrPkg, ptrPkg, emitter) {
+        fun render(
+            pointee: SynType,
+            addrExpr: String,
+            expectedExpr: String,
+            desiredExpr: String,
+            succOrd: String,
+            failOrd: String,
+        ): String? {
+            val (resolved, scalar) = resolvePointee(pointee)
+            if (scalar == "usize" || scalar == "isize") return null
+            val pairCtor = if ("Pair" in emitter.inspector.declaredTypeNames) "kotlin.Pair" else "Pair"
+            if (scalar == "u128" || scalar == "i128") {
+                val isSigned = scalar == "i128"
+                val expHi = if (isSigned) "($expectedExpr).high.toULong()" else "($expectedExpr).high"
+                val desHi = if (isSigned) "($desiredExpr).high.toULong()" else "($desiredExpr).high"
+                val call =
+                    registerAndCall(
+                        "kmAtomicCxchgU128Pair",
+                        listOf(addrExpr, "($expectedExpr).low", expHi, "($desiredExpr).low", desHi),
+                    )
+                val prevVal = if (isSigned) "I128(cxchgRes.prevHi.toLong(), cxchgRes.prevLo)" else "U128(cxchgRes.prevHi, cxchgRes.prevLo)"
+                return "$call.let { cxchgRes -> $pairCtor($prevVal, cxchgRes.succeeded) }"
             }
-            "u8" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicRmwU8")
-                "kmAtomicRmwU8($addrExpr, $valExpr, $opCode, $ordExpr)"
-            }
-            "i8" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicRmwU8")
-                "kmAtomicRmwU8($addrExpr, ($valExpr).toUByte(), $opCode, $ordExpr).toByte()"
-            }
-            "u16" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicRmwU16")
-                "kmAtomicRmwU16($addrExpr, $valExpr, $opCode, $ordExpr)"
-            }
-            "i16" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicRmwU16")
-                "kmAtomicRmwU16($addrExpr, ($valExpr).toUShort(), $opCode, $ordExpr).toShort()"
-            }
-            "u32" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicRmwU32")
-                "kmAtomicRmwU32($addrExpr, $valExpr, $opCode, $ordExpr)"
-            }
-            "i32" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicRmwU32")
-                "kmAtomicRmwU32($addrExpr, ($valExpr).toUInt(), $opCode, $ordExpr).toInt()"
-            }
-            "u64" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicRmwU64")
-                "kmAtomicRmwU64($addrExpr, $valExpr, $opCode, $ordExpr)"
-            }
-            "i64" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicRmwU64")
-                "kmAtomicRmwU64($addrExpr, ($valExpr).toULong(), $opCode, $ordExpr).toLong()"
-            }
-            "usize" -> {
-                val fn = if (ptrBits == 64) "kmAtomicRmwU64" else "kmAtomicRmwU32"
-                registerCoreImport(emitter, "$intrPkg.$fn")
-                val v =
-                    if (emitter.headerContext.rawAbiMode) {
-                        valExpr
-                    } else if (ptrBits == 64) {
-                        "($valExpr).toUInt().toULong()"
-                    } else {
-                        "($valExpr).toUInt()"
-                    }
-                if (emitter.headerContext.rawAbiMode) "$fn($addrExpr, $v, $opCode, $ordExpr)" else "$fn($addrExpr, $v, $opCode, $ordExpr).toInt()"
-            }
-            "isize" -> {
-                val fn = if (ptrBits == 64) "kmAtomicRmwU64" else "kmAtomicRmwU32"
-                registerCoreImport(emitter, "$intrPkg.$fn")
-                val v = if (ptrBits == 64) "($valExpr).toLong().toULong()" else "($valExpr).toUInt()"
-                if (emitter.headerContext.rawAbiMode) "$fn($addrExpr, $v, $opCode, $ordExpr).toLong()" else "$fn($addrExpr, $v, $opCode, $ordExpr).toLong().toInt()"
-            }
-            else -> null
+            val expEnc = encodePointeeToUnsigned(resolved, scalar, expectedExpr) ?: return null
+            val desEnc = encodePointeeToUnsigned(resolved, scalar, desiredExpr) ?: return null
+            val call =
+                registerAndCall(
+                    "kmAtomicCxchg${expEnc.widthTag}",
+                    listOf(addrExpr, expEnc.expr, desEnc.expr, succOrd, failOrd),
+                )
+            val prevDecoded = decodeUnsignedToPointee(resolved, scalar, "cxchgRes.previous", parenthesizeBool = false) ?: return null
+            return "$call.let { cxchgRes -> $pairCtor($prevDecoded, cxchgRes.succeeded) }"
         }
     }
 }
