@@ -1254,49 +1254,38 @@ internal fun KotlinJ2KEmitter.renderItemTrait(
     }
 }
 
-private fun extractSigHeaderForwardArgs(sigHeader: String): List<String> {
-    val funIdx = sigHeader.indexOf("fun ")
-    if (funIdx < 0) return emptyList()
-    var i = funIdx + 4
-    var angleDepth = 0
-    while (i < sigHeader.length) {
-        val ch = sigHeader[i]
-        when {
-            ch == '<' -> angleDepth++
-            ch == '>' -> if (angleDepth > 0 && (i == 0 || sigHeader[i - 1] != '-')) angleDepth--
-            ch == '(' && angleDepth == 0 -> break
-        }
-        i++
-    }
-    if (i >= sigHeader.length || sigHeader[i] != '(') return emptyList()
-    val openIdx = i
-    var parenDepth = 0
-    var closeIdx = -1
-    while (i < sigHeader.length) {
-        when (sigHeader[i]) {
-            '(' -> parenDepth++
-            ')' -> {
-                parenDepth--
-                if (parenDepth == 0) {
-                    closeIdx = i
-                    break
+private fun extractSigHeaderForwardArgs(sigHeader: String): List<String> =
+    SignatureForwardArgWalker(sigHeader).extractArgs()
+
+private class SignatureForwardArgWalker(
+    source: String,
+) : KotlinTokenWalker(source) {
+    fun extractArgs(): List<String> {
+        val funTokenIdx = tokens.indices.firstOrNull { identTextAt(it) == "fun" } ?: return emptyList()
+        var idx = funTokenIdx + 1
+        while (idx < tokens.size) {
+            when (punctAt(idx)) {
+                '<' -> {
+                    val closeAngle = findMatchingTypeAngleToken(idx)
+                    idx = if (closeAngle > idx) closeAngle + 1 else idx + 1
                 }
+                '(' -> break
+                else -> idx++
             }
         }
-        i++
-    }
-    if (closeIdx <= openIdx) return emptyList()
-    val body = sigHeader.substring(openIdx + 1, closeIdx).trim()
-    if (body.isEmpty()) return emptyList()
-    return PhantomRawPointerTypeStripper
-        .splitTopLevelCommaList(body)
-        .mapNotNull { entry ->
+        if (punctAt(idx) != '(') return emptyList()
+        val closeParenIdx = findMatchingParenToken(idx)
+        if (closeParenIdx <= idx) return emptyList()
+        val body = source.substring(tokens[idx].end, tokens[closeParenIdx].start).trim()
+        if (body.isEmpty()) return emptyList()
+        return splitTopLevelCommaList(body).mapNotNull { entry ->
             entry
                 .substringBefore(':')
                 .trim()
                 .substringAfterLast(' ')
                 .takeIf { it.isNotEmpty() }
         }
+    }
 }
 
 internal fun KotlinJ2KEmitter.stdlibIteratorTypeName(): String {

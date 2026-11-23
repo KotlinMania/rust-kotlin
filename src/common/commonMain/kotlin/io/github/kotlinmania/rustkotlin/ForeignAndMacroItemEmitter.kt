@@ -2859,27 +2859,10 @@ internal fun KotlinJ2KEmitter.renderForwardToDeserializeAnyMembers(
     isInterface: Boolean,
     isLocalItem: Boolean,
 ): List<String> {
-    var angleDepth = 0
-    val keys = mutableListOf<String>()
-    for (tt in mac.tokens.clone().toList()) {
-        when (tt) {
-            is TokenTree.Punct -> {
-                when (tt.value.asChar()) {
-                    '<' -> angleDepth++
-                    '>' -> if (angleDepth > 0) angleDepth--
-                }
-            }
-            is TokenTree.Ident -> {
-                if (angleDepth == 0) {
-                    val raw = tt.value.toString().removePrefix("r#")
-                    if (raw in FORWARD_DESERIALIZE_KEYS) {
-                        keys += raw
-                    }
-                }
-            }
-            else -> {}
-        }
-    }
+    val keys =
+        RustTokenCursor(mac.tokens.clone().toList())
+            .collectTopLevelIdentsOutsideAngles()
+            .filter { it in FORWARD_DESERIALIZE_KEYS }
     if (keys.isEmpty()) return emptyList()
 
     val ownerParams = ownerGenerics?.params?.toList().orEmpty()

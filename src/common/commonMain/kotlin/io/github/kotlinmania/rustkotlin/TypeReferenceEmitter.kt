@@ -729,7 +729,7 @@ internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): St
                     ?.ident
                     ?.toString()
             if (macroName == "Token") {
-                resolveSynTokenMacroTypeName(ty.mac.tokens) ?: "Token"
+                RustTokenCursor.resolveSynTokenStreamTypeName(ty.mac.tokens) ?: "Token"
             } else {
                 rustTypeIdentToKotlin(macroName ?: "Token")
             }

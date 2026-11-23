@@ -2251,43 +2251,47 @@ internal fun KotlinJ2KEmitter.primitiveArrayTypeForElementRenderedType(elemTy: S
     }
 
 private fun extractCallableReturnRenderedType(renderedCallableType: String?): String? {
-    val raw = renderedCallableType?.trim() ?: return null
-    val unwrapped =
-        if (raw.startsWith('(') && raw.endsWith(")?") && " -> " in raw) {
-            raw.substring(1, raw.length - 2).trim()
-        } else {
-            raw
-        }
-    if (unwrapped.startsWith('(')) {
-        var parenDepth = 0
-        var angleDepth = 0
-        for (idx in unwrapped.indices) {
-            when (unwrapped[idx]) {
-                '(' -> parenDepth++
-                ')' -> {
-                    parenDepth--
-                    if (parenDepth == 0 && angleDepth == 0) {
-                        val afterParen = unwrapped.substring(idx + 1).trimStart()
-                        if (afterParen.startsWith("->")) {
-                            return afterParen.removePrefix("->").trim().takeIf { it.isNotEmpty() }
-                        }
-                        return null
+    val raw = renderedCallableType?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    return CallableReturnTypeWalker(raw).extractReturnType()
+}
+
+private class CallableReturnTypeWalker(
+    source: String,
+) : KotlinTokenWalker(source) {
+    fun extractReturnType(): String? {
+        if (punctAt(0) == '(') {
+            val closeParenIdx = findMatchingParenToken(0)
+            if (closeParenIdx > 0) {
+                val nextIdx = nextNonTriviaIndex(closeParenIdx + 1)
+                if (tokens.getOrNull(nextIdx) is KotlinLexToken.Arrow) {
+                    return source
+                        .substring(tokens[nextIdx].end)
+                        .trim()
+                        .takeIf { it.isNotEmpty() }
+                }
+                if (closeParenIdx == tokens.lastIndex - 1 && punctAt(tokens.lastIndex) == '?') {
+                    val inner = source.substring(tokens[0].end, tokens[closeParenIdx].start).trim()
+                    if ("->" in inner) {
+                        return CallableReturnTypeWalker(inner).extractReturnType()
                     }
                 }
-                '<' -> angleDepth++
-                '>' -> if (angleDepth > 0) angleDepth--
+                return null
             }
         }
-    }
-    val base = unwrapped.substringBefore('<').substringAfterLast('.').trim()
-    if (base in setOf("Fn", "FnMut", "FnOnce") && '<' in unwrapped && unwrapped.endsWith('>')) {
-        val argsInner = unwrapped.substringAfter('<').dropLast(1)
-        val comma = findTopLevelGenericCommaIndex(argsInner)
-        if (comma >= 0) {
-            return argsInner.substring(comma + 1).trim().takeIf { it.isNotEmpty() }
+        val base = source.substringBefore('<').substringAfterLast('.').trim()
+        if (base in FN_TRAIT_NAMES && '<' in source && source.endsWith('>')) {
+            val argsInner = source.substringAfter('<').dropLast(1)
+            val comma = findTopLevelCommaIndex(argsInner)
+            if (comma >= 0) {
+                return argsInner.substring(comma + 1).trim().takeIf { it.isNotEmpty() }
+            }
         }
+        return null
     }
-    return null
+
+    companion object {
+        private val FN_TRAIT_NAMES = setOf("Fn", "FnMut", "FnOnce")
+    }
 }
 
 internal fun KotlinJ2KEmitter.inferExplicitArrayElementRenderedType(

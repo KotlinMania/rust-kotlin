@@ -2809,69 +2809,49 @@ internal fun KotlinJ2KEmitter.isImplicitStdlibSupertraitPath(path: io.github.kot
 }
 internal fun ensureBlankLineBeforeKDocAfterLineComment(text: String): String {
     if ("/**" !in text) return text
-    val lines = text.split('\n')
-    val out = ArrayList<String>(lines.size + 8)
-    var parenDepth = 0
-    var inBlockComment = false
-    for (i in lines.indices) {
-        val line = lines[i]
-        val trimmed = line.trimStart()
-        if (!inBlockComment &&
-            i > 0 &&
-            parenDepth == 0 &&
-            trimmed.startsWith("/**") &&
-            lines[i - 1].trimStart().startsWith("//")
-        ) {
-            out += ""
-        }
-        out += line
-        var j = 0
-        var inString = false
-        var inChar = false
-        while (j < line.length) {
-            val ch = line[j]
-            val next = if (j + 1 < line.length) line[j + 1] else '\u0000'
-            when {
-                inBlockComment -> {
-                    if (ch == '*' && next == '/') {
-                        inBlockComment = false
-                        j += 2
-                        continue
-                    }
-                }
-                inString -> {
-                    if (ch == '\\') {
-                        j += 2
-                        continue
-                    }
-                    if (ch == '"') {
-                        inString = false
-                    }
-                }
-                inChar -> {
-                    if (ch == '\\') {
-                        j += 2
-                        continue
-                    }
-                    if (ch == '\'') {
-                        inChar = false
-                    }
-                }
-                ch == '/' && next == '/' -> break
-                ch == '/' && next == '*' -> {
-                    inBlockComment = true
-                    j += 2
-                    continue
-                }
-                ch == '"' -> inString = true
-                ch == '\'' -> inChar = true
-                ch == '(' -> parenDepth += 1
-                ch == ')' -> if (parenDepth > 0) parenDepth -= 1
+    return KDocSpacingRewriter(text).rewrite()
+}
+
+private class KDocSpacingRewriter(
+    source: String,
+) : KotlinTokenRewriter(source) {
+    private var parenDepth: Int = 0
+    private var prevLineStartedWithLineComment: Boolean = false
+    private var currentLineStartedWithLineComment: Boolean = false
+    private var atLineStart: Boolean = true
+
+    override fun emitAt(index: Int, out: StringBuilder): Int {
+        if (atLineStart) {
+            val firstCodeIdx = skipHorizontalWhitespace(index)
+            val firstTok = tokens.getOrNull(firstCodeIdx)
+            currentLineStartedWithLineComment = firstTok is KotlinLexToken.LineComment
+            if (prevLineStartedWithLineComment &&
+                parenDepth == 0 &&
+                firstTok is KotlinLexToken.BlockComment &&
+                firstTok.rawText.startsWith("/**")
+            ) {
+                out.append('\n')
             }
-            j += 1
+            atLineStart = false
         }
+        val tok = tokens[index]
+        out.append(tok.rawText)
+        when {
+            tok is KotlinLexToken.Newline -> {
+                prevLineStartedWithLineComment = currentLineStartedWithLineComment
+                currentLineStartedWithLineComment = false
+                atLineStart = true
+            }
+            tok is KotlinLexToken.BlockComment && '\n' in tok.rawText -> currentLineStartedWithLineComment = false
+            tok is KotlinLexToken.StringText && '\n' in tok.rawText -> currentLineStartedWithLineComment = false
+            tok is KotlinLexToken.Punct && tok.interpolationDepth == 0 ->
+                when (tok.ch) {
+                    '(' -> parenDepth++
+                    ')' -> if (parenDepth > 0) parenDepth--
+                }
+        }
+        return index + 1
     }
-    return out.joinToString("\n")
 }
 
 internal val STDLIB_ERASED_OR_BUILTIN_IMPORTS =

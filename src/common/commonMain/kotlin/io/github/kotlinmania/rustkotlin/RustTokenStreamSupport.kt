@@ -177,6 +177,19 @@ internal open class RustTokenCursor(
         return trees.size
     }
 
+    fun collectTopLevelIdentsOutsideAngles(): List<String> {
+        val out = mutableListOf<String>()
+        var angleDepth = 0
+        for (idx in 0 until trees.size) {
+            when (punctCharAt(idx)) {
+                '<' -> angleDepth++
+                '>' -> if (angleDepth > 0 && !isRArrowEndAt(idx)) angleDepth--
+                null -> if (angleDepth == 0) cleanIdentAt(idx)?.let { out += it }
+            }
+        }
+        return out
+    }
+
     fun skipBalancedAngles(openIdx: Int): Int? {
         if (punctCharAt(openIdx) != '<') return null
         var depth = 1
