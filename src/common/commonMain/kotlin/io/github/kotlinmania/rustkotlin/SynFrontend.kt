@@ -68,203 +68,198 @@ internal fun recognizeRustOrNull(source: String): RecognizedRust? {
  * exact same 21-bit scalar in `syn`'s `LitChar`. Rewrite unescaped supplementary character literals
  * outside comments and string literals in a single lexical pass so token spans and trivia align.
  */
-internal fun normalizeSupplementaryCharLiterals(source: String): String {
-    if (!containsCandidateSupplementaryCharLiteral(source)) {
-        return source
-    }
-    val out = StringBuilder(source.length + 32)
-    var i = 0
-    val len = source.length
-    while (i < len) {
-        val ch = source[i]
-        if (ch == '/' && i + 1 < len && source[i + 1] == '/') {
-            val end = source.indexOf('\n', i + 2)
-            if (end < 0) {
-                out.append(source, i, len)
-                return out.toString()
+internal fun normalizeSupplementaryCharLiterals(source: String): String =
+    SupplementaryCharLiteralRewriter(source).rewrite()
+
+/**
+ * Reusable lexical scanner base class over raw Rust source text for comment, raw-string,
+ * cooked-string, and character-literal boundary navigation prior to `proc_macro2` tokenization.
+ */
+internal open class RustLexicalSourceScanner(
+    protected val source: String,
+) {
+    protected val len: Int = source.length
+
+    protected fun isIdentContinue(ch: Char): Boolean = ch.isLetterOrDigit() || ch == '_'
+
+    protected fun tryScanCommentOrStringEnd(index: Int): Int? {
+        val ch = source[index]
+        if (ch == '/' && index + 1 < len) {
+            if (source[index + 1] == '/') {
+                val nl = source.indexOf('\n', index + 2)
+                return if (nl < 0) len else nl + 1
             }
-            out.append(source, i, end + 1)
-            i = end + 1
-            continue
+            if (source[index + 1] == '*') {
+                return scanNestedBlockCommentEnd(index)
+            }
         }
-        if (ch == '/' && i + 1 < len && source[i + 1] == '*') {
-            val end = scanNestedBlockCommentEnd(source, i)
-            out.append(source, i, end)
-            i = end
-            continue
+        val rawStrEnd = tryScanRawStringEnd(index)
+        if (rawStrEnd > index) return rawStrEnd
+        val cookedPrefixLen = cookedStringPrefixLength(index)
+        if (cookedPrefixLen >= 0) return scanCookedStringEnd(index + cookedPrefixLen)
+        return null
+    }
+
+    protected fun scanNestedBlockCommentEnd(start: Int): Int {
+        var depth = 1
+        var k = start + 2
+        while (k < len && depth > 0) {
+            if (source[k] == '/' && k + 1 < len && source[k + 1] == '*') {
+                depth++
+                k += 2
+            } else if (source[k] == '*' && k + 1 < len && source[k + 1] == '/') {
+                depth--
+                k += 2
+            } else {
+                k++
+            }
         }
-        val rawStrEnd = tryScanRawStringEnd(source, i)
-        if (rawStrEnd > i) {
-            out.append(source, i, rawStrEnd)
-            i = rawStrEnd
-            continue
+        return k
+    }
+
+    protected fun tryScanRawStringEnd(index: Int): Int {
+        if (index > 0 && isIdentContinue(source[index - 1])) return index
+        val rPos =
+            when {
+                source[index] == 'r' -> index
+                (source[index] == 'b' || source[index] == 'c') && index + 1 < len && source[index + 1] == 'r' -> index + 1
+                else -> return index
+            }
+        var j = rPos + 1
+        var hashes = 0
+        while (j < len && source[j] == '#') {
+            hashes++
+            j++
         }
-        val cookedStrPrefixLen = cookedStringPrefixLength(source, i)
-        if (cookedStrPrefixLen >= 0) {
-            val end = scanCookedStringEnd(source, i + cookedStrPrefixLen)
-            out.append(source, i, end)
-            i = end
-            continue
+        if (j >= len || source[j] != '"') return index
+        j++
+        while (j < len) {
+            if (source[j] == '"') {
+                var matched = 0
+                while (matched < hashes && j + 1 + matched < len && source[j + 1 + matched] == '#') {
+                    matched++
+                }
+                if (matched == hashes) return j + 1 + hashes
+            }
+            j++
         }
-        if (ch == '\'') {
-            val isByteCharPrefix =
-                i > 0 &&
-                    source[i - 1] == 'b' &&
-                    (i == 1 || !isRustLexIdentContinue(source[i - 2]))
-            if (!isByteCharPrefix &&
-                i + 3 < len &&
+        return len
+    }
+
+    protected fun cookedStringPrefixLength(index: Int): Int {
+        val ch = source[index]
+        if (ch == '"') return 0
+        if ((ch == 'b' || ch == 'c') &&
+            (index == 0 || !isIdentContinue(source[index - 1])) &&
+            index + 1 < len &&
+            source[index + 1] == '"'
+        ) {
+            return 1
+        }
+        return -1
+    }
+
+    protected fun scanCookedStringEnd(openQuoteIdx: Int): Int {
+        var j = openQuoteIdx + 1
+        while (j < len) {
+            val c = source[j]
+            if (c == '\\') {
+                j += if (j + 1 < len) 2 else 1
+            } else if (c == '"') {
+                return j + 1
+            } else {
+                j++
+            }
+        }
+        return len
+    }
+
+    protected fun scanEscapedCharLiteralEnd(openTickIdx: Int): Int {
+        var j = openTickIdx + 1
+        while (j < len) {
+            val c = source[j]
+            if (c == '\\') {
+                j += if (j + 1 < len) 2 else 1
+            } else if (c == '\'') {
+                return j + 1
+            } else if (c == '\n') {
+                return j
+            } else {
+                j++
+            }
+        }
+        return len
+    }
+}
+
+private class SupplementaryCharLiteralRewriter(
+    source: String,
+) : RustLexicalSourceScanner(source) {
+    fun rewrite(): String {
+        if (!containsCandidate()) return source
+        val out = StringBuilder(len + 32)
+        var i = 0
+        while (i < len) {
+            val skippedEnd = tryScanCommentOrStringEnd(i)
+            if (skippedEnd != null) {
+                out.append(source, i, skippedEnd)
+                i = skippedEnd
+                continue
+            }
+            val ch = source[i]
+            if (ch == '\'') {
+                val isByteCharPrefix =
+                    i > 0 &&
+                        source[i - 1] == 'b' &&
+                        (i == 1 || !isIdentContinue(source[i - 2]))
+                if (!isByteCharPrefix &&
+                    i + 3 < len &&
+                    source[i + 1].isHighSurrogate() &&
+                    source[i + 2].isLowSurrogate() &&
+                    source[i + 3] == '\''
+                ) {
+                    val codePoint =
+                        ((source[i + 1].code - 0xD800) shl 10) +
+                            (source[i + 2].code - 0xDC00) +
+                            0x10000
+                    out
+                        .append("'\\u{")
+                        .append(codePoint.toString(16))
+                        .append("}'")
+                    i += 4
+                    continue
+                }
+                if (i + 3 < len && source[i + 1] == '\\') {
+                    val end = scanEscapedCharLiteralEnd(i)
+                    out.append(source, i, end)
+                    i = end
+                    continue
+                }
+                if (i + 2 < len && source[i + 1] != '\'' && source[i + 1] != '\\' && source[i + 2] == '\'') {
+                    out.append(source, i, i + 3)
+                    i += 3
+                    continue
+                }
+            }
+            out.append(ch)
+            i++
+        }
+        return out.toString()
+    }
+
+    private fun containsCandidate(): Boolean {
+        val limit = len - 3
+        for (i in 0 until limit) {
+            if (source[i] == '\'' &&
                 source[i + 1].isHighSurrogate() &&
                 source[i + 2].isLowSurrogate() &&
                 source[i + 3] == '\''
             ) {
-                val codePoint =
-                    ((source[i + 1].code - 0xD800) shl 10) +
-                        (source[i + 2].code - 0xDC00) +
-                        0x10000
-                out
-                    .append("'\\u{")
-                    .append(codePoint.toString(16))
-                    .append("}'")
-                i += 4
-                continue
-            }
-            if (i + 3 < len && source[i + 1] == '\\') {
-                val end = scanEscapedCharLiteralEnd(source, i)
-                out.append(source, i, end)
-                i = end
-                continue
-            }
-            if (i + 2 < len && source[i + 1] != '\'' && source[i + 1] != '\\' && source[i + 2] == '\'') {
-                out.append(source, i, i + 3)
-                i += 3
-                continue
+                return true
             }
         }
-        out.append(ch)
-        i++
+        return false
     }
-    return out.toString()
-}
-
-private fun containsCandidateSupplementaryCharLiteral(source: String): Boolean {
-    var i = 0
-    val limit = source.length - 3
-    while (i < limit) {
-        if (source[i] == '\'' &&
-            source[i + 1].isHighSurrogate() &&
-            source[i + 2].isLowSurrogate() &&
-            source[i + 3] == '\''
-        ) {
-            return true
-        }
-        i++
-    }
-    return false
-}
-
-private fun isRustLexIdentContinue(ch: Char): Boolean = ch.isLetterOrDigit() || ch == '_'
-
-private fun scanNestedBlockCommentEnd(source: String, start: Int): Int {
-    var depth = 1
-    var k = start + 2
-    val len = source.length
-    while (k < len && depth > 0) {
-        if (source[k] == '/' && k + 1 < len && source[k + 1] == '*') {
-            depth++
-            k += 2
-        } else if (source[k] == '*' && k + 1 < len && source[k + 1] == '/') {
-            depth--
-            k += 2
-        } else {
-            k++
-        }
-    }
-    return k
-}
-
-private fun tryScanRawStringEnd(source: String, index: Int): Int {
-    if (index > 0 && isRustLexIdentContinue(source[index - 1])) {
-        return index
-    }
-    val len = source.length
-    val rPos =
-        when {
-            source[index] == 'r' -> index
-            (source[index] == 'b' || source[index] == 'c') && index + 1 < len && source[index + 1] == 'r' -> index + 1
-            else -> return index
-        }
-    var j = rPos + 1
-    var hashes = 0
-    while (j < len && source[j] == '#') {
-        hashes++
-        j++
-    }
-    if (j >= len || source[j] != '"') {
-        return index
-    }
-    j++
-    while (j < len) {
-        if (source[j] == '"') {
-            var matched = 0
-            while (matched < hashes && j + 1 + matched < len && source[j + 1 + matched] == '#') {
-                matched++
-            }
-            if (matched == hashes) {
-                return j + 1 + hashes
-            }
-        }
-        j++
-    }
-    return len
-}
-
-private fun cookedStringPrefixLength(source: String, index: Int): Int {
-    val ch = source[index]
-    if (ch == '"') {
-        return 0
-    }
-    if ((ch == 'b' || ch == 'c') &&
-        (index == 0 || !isRustLexIdentContinue(source[index - 1])) &&
-        index + 1 < source.length &&
-        source[index + 1] == '"'
-    ) {
-        return 1
-    }
-    return -1
-}
-
-private fun scanCookedStringEnd(source: String, openQuoteIdx: Int): Int {
-    var j = openQuoteIdx + 1
-    val len = source.length
-    while (j < len) {
-        val c = source[j]
-        if (c == '\\') {
-            j += if (j + 1 < len) 2 else 1
-        } else if (c == '"') {
-            return j + 1
-        } else {
-            j++
-        }
-    }
-    return len
-}
-
-private fun scanEscapedCharLiteralEnd(source: String, openTickIdx: Int): Int {
-    var j = openTickIdx + 1
-    val len = source.length
-    while (j < len) {
-        val c = source[j]
-        if (c == '\\') {
-            j += if (j + 1 < len) 2 else 1
-        } else if (c == '\'') {
-            return j + 1
-        } else if (c == '\n') {
-            return j
-        } else {
-            j++
-        }
-    }
-    return len
 }
 
 /**
@@ -412,7 +407,7 @@ internal object RustNextAstNormalizer : Fold() {
 
     override fun foldItem(i: Item): Item {
         if (i is Item.Verbatim) {
-            val stripped = stripConstFromVerbatimItemTokens(i.tokens.clone().toList())
+            val stripped = ConstVerbatimTokenStripper(i.tokens.clone().toList()).stripItem()
             if (stripped != null) {
                 val reparsed = parse2(ItemParse::parse, TokenStream.fromTokenTrees(stripped)).getOrNull()
                 if (reparsed != null && reparsed !is Item.Verbatim) {
@@ -425,7 +420,7 @@ internal object RustNextAstNormalizer : Fold() {
 
     override fun foldTypeParamBound(bound: TypeParamBound): TypeParamBound {
         if (bound is TypeParamBound.Verbatim) {
-            val stripped = stripConstFromVerbatimBoundTokens(bound.tokens.clone().toList())
+            val stripped = ConstVerbatimTokenStripper(bound.tokens.clone().toList()).stripBound()
             if (stripped != null) {
                 val reparsed = parse2(TypeParamBound.Companion::parse, TokenStream.fromTokenTrees(stripped)).getOrNull()
                 if (reparsed != null && reparsed !is TypeParamBound.Verbatim) {
@@ -435,16 +430,19 @@ internal object RustNextAstNormalizer : Fold() {
         }
         return super.foldTypeParamBound(bound)
     }
+}
 
-    private fun stripConstFromVerbatimItemTokens(trees: List<TokenTree>): List<TokenTree>? {
-        if (trees.isEmpty()) return null
-        val cursor = RustTokenCursor(trees)
-        val out = ArrayList<TokenTree>(trees.size)
-        var idx = cursor.copyLeadingOuterAttributes(0, out)
-        idx = cursor.copyOptionalPubVisibility(idx, out)
+private class ConstVerbatimTokenStripper(
+    trees: List<TokenTree>,
+) : RustTokenCursor(trees) {
+    fun stripItem(): List<TokenTree>? {
+        if (size == 0) return null
+        val out = ArrayList<TokenTree>(size)
+        var idx = copyLeadingOuterAttributes(0, out)
+        idx = copyOptionalPubVisibility(idx, out)
         var stripped = false
-        if (cursor.identAt(idx) == "impl" && cursor.groupAt(idx + 1, Delimiter.Parenthesis) != null) {
-            val afterRestriction = cursor.identAt(idx + 2)
+        if (identAt(idx) == "impl" && groupAt(idx + 1, Delimiter.Parenthesis) != null) {
+            val afterRestriction = identAt(idx + 2)
             if (afterRestriction == "const" || afterRestriction == "unsafe" || afterRestriction == "auto" || afterRestriction == "trait") {
                 idx += 2
                 stripped = true
@@ -453,8 +451,8 @@ internal object RustNextAstNormalizer : Fold() {
         val keptModifiers = ArrayList<TokenTree>(4)
         var scan = idx
         var sawConstHeader = false
-        while (scan < trees.size) {
-            when (cursor.identAt(scan) ?: break) {
+        while (scan < size) {
+            when (identAt(scan) ?: break) {
                 "const" -> {
                     sawConstHeader = true
                     scan++
@@ -466,59 +464,58 @@ internal object RustNextAstNormalizer : Fold() {
                 else -> break
             }
         }
-        val keyword = cursor.identAt(scan)
+        val keyword = identAt(scan)
         if (keyword != "trait" && keyword != "impl") return null
         if (sawConstHeader) stripped = true
         out.addAll(keptModifiers)
         out.add(trees[scan])
         idx = scan + 1
         if (keyword == "impl") {
-            idx = cursor.copyBalancedAngles(idx, out)
-            if (cursor.punctCharAt(idx) == '!') {
+            idx = copyBalancedAngles(idx, out)
+            if (punctCharAt(idx) == '!') {
                 out.add(trees[idx])
                 idx++
             }
-            val constModLen = leadingConstBoundModifierLength(cursor, idx)
+            val constModLen = leadingConstBoundModifierLength(idx)
             if (constModLen > 0) {
                 idx += constModLen
                 stripped = true
             }
         }
         if (!stripped) return null
-        out.addAll(trees.subList(idx, trees.size))
+        out.addAll(trees.subList(idx, size))
         return out
     }
 
-    private fun stripConstFromVerbatimBoundTokens(trees: List<TokenTree>): List<TokenTree>? {
-        if (trees.isEmpty()) return null
-        val cursor = RustTokenCursor(trees)
-        if (trees.size == 1) {
-            val parenGrp = cursor.groupAt(0, Delimiter.Parenthesis)
+    fun stripBound(): List<TokenTree>? {
+        if (size == 0) return null
+        if (size == 1) {
+            val parenGrp = groupAt(0, Delimiter.Parenthesis)
             if (parenGrp != null) {
-                val innerStripped = stripConstFromVerbatimBoundTokens(parenGrp.stream().toList()) ?: return null
+                val innerStripped = ConstVerbatimTokenStripper(parenGrp.stream().toList()).stripBound() ?: return null
                 val rebuiltGrp = Group(Delimiter.Parenthesis, TokenStream.fromTokenTrees(innerStripped))
                 rebuiltGrp.setSpan(parenGrp.span())
                 return listOf(TokenTree.Group(rebuiltGrp))
             }
         }
-        val out = ArrayList<TokenTree>(trees.size)
+        val out = ArrayList<TokenTree>(size)
         var idx = 0
-        if (cursor.identAt(idx) == "for" && cursor.punctCharAt(idx + 1) == '<') {
+        if (identAt(idx) == "for" && punctCharAt(idx + 1) == '<') {
             out.add(trees[idx])
-            idx = cursor.copyBalancedAngles(idx + 1, out)
+            idx = copyBalancedAngles(idx + 1, out)
         }
-        val constModLen = leadingConstBoundModifierLength(cursor, idx)
+        val constModLen = leadingConstBoundModifierLength(idx)
         if (constModLen == 0) return null
-        out.addAll(trees.subList(idx + constModLen, trees.size))
+        out.addAll(trees.subList(idx + constModLen, size))
         return out
     }
 
-    private fun leadingConstBoundModifierLength(cursor: RustTokenCursor, startIdx: Int): Int {
-        val bracketGrp = cursor.groupAt(startIdx, Delimiter.Bracket)
+    private fun leadingConstBoundModifierLength(startIdx: Int): Int {
+        val bracketGrp = groupAt(startIdx, Delimiter.Bracket)
         if (bracketGrp != null && isSingleConstBracketGroup(bracketGrp)) return 1
-        if (cursor.identAt(startIdx) == "const") return 1
-        val ch = cursor.punctCharAt(startIdx)
-        if ((ch == '~' || ch == '?') && cursor.identAt(startIdx + 1) == "const") return 2
+        if (identAt(startIdx) == "const") return 1
+        val ch = punctCharAt(startIdx)
+        if ((ch == '~' || ch == '?') && identAt(startIdx + 1) == "const") return 2
         return 0
     }
 }

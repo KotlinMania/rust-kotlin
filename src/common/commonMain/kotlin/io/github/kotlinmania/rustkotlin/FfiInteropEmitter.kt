@@ -502,7 +502,7 @@ internal class FfiInteropCollector(
             if (meta is Meta.List && meta.path.isIdent("link")) {
                 extractLinkLibraryNamesFromLinkArgs(meta.tokens, modLibs)
             } else if (meta is Meta.List && meta.path.isIdent("cfg_attr")) {
-                val cfgParts = MacroRulesFileExpander.splitMacroArguments(meta.tokens.clone())
+                val cfgParts = RustTokenCursor.splitMacroArguments(meta.tokens.clone())
                 for (part in cfgParts.drop(1)) {
                     if (part.size == 2 &&
                         (part[0] as? TokenTree.Ident)?.value?.toString() == "link" &&
@@ -1533,7 +1533,7 @@ internal fun extractLinkLibraryNamesFromLinkArgs(
     tokens: TokenStream,
     out: MutableSet<String>,
 ) {
-    for (part in MacroRulesFileExpander.splitMacroArguments(tokens.clone())) {
+    for (part in RustTokenCursor.splitMacroArguments(tokens.clone())) {
         if (part.size >= 3 &&
             (part[0] as? TokenTree.Ident)?.value?.toString() == "name" &&
             (part[1] as? TokenTree.Punct)?.value?.asChar() == '=' &&

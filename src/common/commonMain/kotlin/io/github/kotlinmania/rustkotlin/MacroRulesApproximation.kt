@@ -702,7 +702,7 @@ private class MacroCfgAttributeParser(
         val parenGroup = if (firstIdent != null && cursor.size == 2) cursor.groupAt(1, Delimiter.Parenthesis) else null
         if (firstIdent != null && parenGroup != null) {
             val groupTokens = parenGroup.stream().clone().toList()
-            val clauses = MacroRulesFileExpander.splitTopLevelCommaClauses(groupTokens).mapNotNull(::parseTokens)
+            val clauses = RustTokenCursor(groupTokens).splitByTopLevelPunct(',').mapNotNull(::parseTokens)
             return when (firstIdent) {
                 "not" -> clauses.firstOrNull()?.let(CfgConditionAst::Not)
                 "all" -> clauses.singleOrNull() ?: clauses.takeIf { it.isNotEmpty() }?.let(CfgConditionAst::All)
