@@ -767,7 +767,8 @@ class SingleFileTranslationFfiAndAbiTest {
                     finalClasses = true,
                 ),
             ).text
-        assertContains(guidKt, "public class U128(")
+        assertContains(guidKt, "import io.github.kotlinmania.rustlang.core.U128")
+        assertFalse(guidKt.contains("class U128("))
         assertContains(guidKt, "public fun from_u128(uuid: U128): GUID")
         assertContains(guidKt, "GUID.from_u128(U128(0x0uL, 0xc000000000000046uL))")
 
@@ -818,7 +819,8 @@ class SingleFileTranslationFfiAndAbiTest {
                     finalClasses = true,
                 ),
             ).text
-        assertContains(renamedKt, "public class U128(")
+        assertContains(renamedKt, "import io.github.kotlinmania.rustlang.core.U128")
+        assertFalse(renamedKt.contains("class U128("))
         assertContains(renamedKt, "bits.toBeBytes()")
         assertContains(renamedKt, "(bits shr 96).toUInt()")
     }
@@ -1606,6 +1608,26 @@ class SingleFileTranslationFfiAndAbiTest {
                 metadataStripPrefix = "tmp/windows-sys/src/",
                 macroSources = listOf(crateSources.getValue("tmp/windows-sys/src/core/literals.rs")),
                 flatFileModules = setOf("core/literals.rs"),
+                initialExistingFiles =
+                    mapOf(
+                        "/proj/gradle/libs.versions.toml" to
+                            """
+                            [versions]
+                            kotlin = "2.4.21"
+
+                            [libraries]
+
+                            [bundles]
+                            windowssys-commonMain = [
+                            ]
+                            """.trimIndent() + "\n",
+                        "/proj/gradle.properties" to
+                            """
+                            project.name=windows-sys-kotlin
+                            project.namespace=io.github.kotlinmania.windowssys
+                            project.dependencies.commonMainBundle=windowssys-commonMain
+                            """.trimIndent() + "\n",
+                    ),
             )
 
         val coreTypes = out.getValue("/proj/src/common/commonMain/kotlin/io/github/kotlinmania/windowssys/core/CoreTypes.kt")
@@ -1650,14 +1672,18 @@ class SingleFileTranslationFfiAndAbiTest {
         assertContains(fsStructs, "prgActions: MutPtr = MutPtr(0L)")
         assertFalse(fsStructs.contains("Pwstr?"), "Expected no '?' on non-nullable Pwstr alias:\n$fsStructs")
 
-        assertTrue(
+        assertFalse(
             out.containsKey("/proj/src/native/interop/cinterop/km_core_intrinsics_inline.h"),
-            "Expected downstream N-API batch translation to emit km_core_intrinsics_inline.h",
+            "Downstream crate translation must not emit embedded km_core_intrinsics_inline.h",
         )
-        assertTrue(
+        assertFalse(
             out.containsKey("/proj/src/js/node-windowssys/src/windowssys_kmcore_intrinsics_bindings.cpp"),
-            "Expected downstream N-API batch translation to emit windowssys_kmcore_intrinsics_bindings.cpp, got keys: ${out.keys}",
+            "Downstream crate translation must not emit embedded *_kmcore_intrinsics_bindings.cpp",
         )
+        val updatedToml = out.getValue("/proj/gradle/libs.versions.toml")
+        assertContains(updatedToml, """rustLang = "$DEFAULT_RUST_LANG_KOTLIN_VERSION"""")
+        assertContains(updatedToml, """rust-lang-kotlin = { module = "io.github.kotlinmania:rust-lang-kotlin", version.ref = "rustLang" }""")
+        assertContains(updatedToml, "windowssys-commonMain = [\n  \"rust-lang-kotlin\",\n]")
 
         val fsFunctions = out.getValue("/proj/src/common/commonMain/kotlin/io/github/kotlinmania/windowssys/filesystem/FileSystemFunctions.kt")
         assertContains(fsFunctions, "path: io.github.kotlinmania.windowssys.kernel.String")

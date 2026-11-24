@@ -2,15 +2,13 @@ package io.github.kotlinmania.rustkotlin
 
 import io.github.kotlinmania.io.files.SystemPathSeparator
 
-internal fun isJvmWindowsHost(): Boolean =
-    SystemPathSeparator == '\\'
+internal fun isJvmWindowsHost(): Boolean = SystemPathSeparator == '\\'
+
+private fun activeJvmFileProbe(): TargetFileProbe =
+    if (isJvmWindowsHost()) JvmWindowsFileProbe else JvmPosixFileProbe
 
 public actual fun probeTargetKotlinFile(path: String): TargetKotlinFileDetails =
-    if (isJvmWindowsHost()) {
-        probeTargetKotlinFileJvmWindows(path)
-    } else {
-        probeTargetKotlinFileJvmPosix(path)
-    }
+    activeJvmFileProbe().probe(path)
 
 public actual fun describeVirtualKotlinFile(
     path: String,
@@ -19,16 +17,7 @@ public actual fun describeVirtualKotlinFile(
     isWritable: Boolean,
     sizeBytes: Long,
 ): TargetKotlinFileDetails =
-    if (isJvmWindowsHost()) {
-        describeVirtualKotlinFileJvmWindows(path, fileName, isDirectory, isWritable, sizeBytes)
-    } else {
-        describeVirtualKotlinFileJvmPosix(path, fileName, isDirectory, isWritable, sizeBytes)
-    }
+    activeJvmFileProbe().describeVirtual(path, fileName, isDirectory, isWritable, sizeBytes)
 
-public actual fun writeNew(path: String, text: String) {
-    if (isJvmWindowsHost()) {
-        writeNewJvmWindows(path, text)
-    } else {
-        writeNewJvmPosix(path, text)
-    }
-}
+public actual fun writeNew(path: String, text: String): Unit =
+    activeJvmFileProbe().writeNew(path, text)

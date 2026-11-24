@@ -1033,17 +1033,12 @@ internal class KotlinJ2KEmitter(
     internal val aliasedUnderlyingSelfCalls: MutableMap<String, String> = linkedMapOf()
     internal var currentReceiverIsSharedBorrow: Boolean = false
     internal var currentReceiverIsMutBorrow: Boolean = false
-    internal var usesDebugStruct: Boolean = false
-    internal var usesDebugTuple: Boolean = false
-    internal var usesU128: Boolean = false
     internal var usesRustChar: Boolean = false
     internal var usesSourceResult: Boolean = false
     internal var usesSourceResultResidual: Boolean = false
     internal var currentEnclosingReturnsFmtResult: Boolean = false
     internal var currentTailExpectsUnitResultOk: Boolean = false
     internal var inLocalInitializerPosition: Boolean = false
-    internal var usesI128: Boolean = false
-    internal var usesRustAny: Boolean = false
     internal var suppressTraitAssocPlaceholders: Boolean = false
     internal var activeConstParamNames: Set<String> = emptySet()
 
@@ -1411,16 +1406,7 @@ internal class KotlinJ2KEmitter(
                                 unwrapSynType(item.selfType).let { u -> u is SynType.Ptr && u.mutability is PointerMutability.Mut }
                         }
                 )
-        if (headerContext.packageName == "$activeCoreNs.ptr") {
-            if (isConstPtrSource && "ConstPtr" !in inspector.declaredTypeNames) {
-                inspector.declaredTypeNames += "ConstPtr"
-                renderedItems.add(0, CoreIntrinsicFfiArtifacts.renderConstPtrClassHeader())
-            }
-            if (isMutPtrSource && "MutPtr" !in inspector.declaredTypeNames) {
-                inspector.declaredTypeNames += "MutPtr"
-                renderedItems.add(0, CoreIntrinsicFfiArtifacts.renderMutPtrClassHeader())
-            }
-        } else if (headerContext.packageName?.startsWith("$activeCoreNs.ptr.") == true) {
+        if (headerContext.packageName?.startsWith("$activeCoreNs.ptr.") == true) {
             if (isConstPtrSource && "ConstPtr" !in inspector.declaredTypeNames) {
                 CoreIntrinsicLowering.registerCoreImport(this, "$activeCoreNs.ptr.ConstPtr")
             }
@@ -1432,69 +1418,10 @@ internal class KotlinJ2KEmitter(
         if (usesCurrentThreadToken && topLevelSignatureCounts["currentThreadBoundToken()"] == null) {
             renderedItems.add(0, "internal expect fun currentThreadBoundToken(): Any")
         }
-        val isMultiFileCrate = headerContext.isBatchCrateOutput || headerContext.crateSymbolSubpackages.isNotEmpty()
-        val renderedSigLines by lazy(LazyThreadSafetyMode.NONE) {
-            renderedItems
-                .asSequence()
-                .flatMap { it.lineSequence() }
-                .map { it.trim() }
-                .filter { it.startsWith("public ") || it.startsWith("internal ") }
-                .map { it.substringBefore('=').substringBefore('{') }
-                .toList()
-        }
-        if (usesDebugTuple && "DebugTuple" !in inspector.declaredTypeNames) {
-            val exposedInSig = renderedSigLines.any { containsWholeIdentifier(it, "DebugTuple") }
-            val decl =
-                if (isMultiFileCrate && !exposedInSig) {
-                    SYNTHESIZED_DEBUG_TUPLE_DECLARATION.replaceFirst("public class DebugTuple(", "private class DebugTuple(")
-                } else {
-                    SYNTHESIZED_DEBUG_TUPLE_DECLARATION
-                }
-            renderedItems.add(0, decl)
-        }
-        if (!headerContext.isDocExample && usesDebugStruct && "DebugStruct" !in inspector.declaredTypeNames) {
-            val exposedInSig = renderedSigLines.any { containsWholeIdentifier(it, "DebugStruct") }
-            val decl =
-                if (isMultiFileCrate && !exposedInSig) {
-                    SYNTHESIZED_DEBUG_STRUCT_DECLARATION.replaceFirst("public class DebugStruct(", "private class DebugStruct(")
-                } else {
-                    SYNTHESIZED_DEBUG_STRUCT_DECLARATION
-                }
-            renderedItems.add(0, decl)
-        }
         val usesExternalRustLangCore =
             "core" in headerContext.crateNamespaces ||
                 headerContext.packageName == activeCoreNs ||
                 headerContext.packageName?.startsWith("$activeCoreNs.") == true
-        val needsSynthesizedInt128 =
-            !headerContext.isDocExample &&
-                !usesExternalRustLangCore &&
-                (usesU128 || usesI128) &&
-                "U128" !in inspector.declaredTypeNames &&
-                "I128" !in inspector.declaredTypeNames &&
-                "U128" !in headerContext.crateSymbolSubpackages &&
-                "I128" !in headerContext.crateSymbolSubpackages
-        if (needsSynthesizedInt128) {
-            TranslationSession.emittedInt128Support = true
-            if (!headerContext.isBatchCrateOutput) {
-                renderedItems.add(0, SYNTHESIZED_I128_DECLARATION)
-                renderedItems.add(0, SYNTHESIZED_U128_DECLARATION)
-            }
-        }
-        val needsSynthesizedRustAny =
-            !headerContext.isDocExample &&
-                !usesExternalRustLangCore &&
-                usesRustAny &&
-                "RustAny" !in inspector.declaredTypeNames &&
-                "RustTypeId" !in inspector.declaredTypeNames &&
-                "RustAny" !in headerContext.crateSymbolSubpackages &&
-                "RustTypeId" !in headerContext.crateSymbolSubpackages
-        if (needsSynthesizedRustAny) {
-            TranslationSession.emittedRustAnySupport = true
-            if (!headerContext.isBatchCrateOutput) {
-                renderedItems.add(0, SYNTHESIZED_RUST_ANY_DECLARATION)
-            }
-        }
 
         val inlineExpects = ffiCollector.renderInlineExpectDeclarations()
         renderedItems.addAll(inlineExpects)
@@ -1587,124 +1514,130 @@ internal class KotlinJ2KEmitter(
         }
         val activeAllocNs = CoreIntrinsicLowering.resolveAllocNamespace(headerContext)
         val autoCoreSymbols =
-            buildList {
-                add("ConstPtr" to "$activeCoreNs.ptr")
-                add("MutPtr" to "$activeCoreNs.ptr")
-                add("TypeLayout" to "$activeCoreNs.mem")
-                add("PrimitiveLayouts" to "$activeCoreNs.mem")
-                add("PrimitiveArrayLayouts" to "$activeCoreNs.mem")
-                add("fixedListTypeLayout" to "$activeCoreNs.mem")
-                add("F16" to activeCoreNs)
-                add("F128" to activeCoreNs)
-                if (!headerContext.rawAbiMode) {
-                    for (ffiSym in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS.values.distinct()) {
-                        if (resolveBestSubpackageForSymbol(ffiSym) == null) {
+            if (headerContext.isDocExample) {
+                emptyList()
+            } else {
+                buildList {
+                    add("ConstPtr" to "$activeCoreNs.ptr")
+                    add("MutPtr" to "$activeCoreNs.ptr")
+                    add("TypeLayout" to "$activeCoreNs.mem")
+                    add("PrimitiveLayouts" to "$activeCoreNs.mem")
+                    add("PrimitiveArrayLayouts" to "$activeCoreNs.mem")
+                    add("fixedListTypeLayout" to "$activeCoreNs.mem")
+                    add("U128" to activeCoreNs)
+                    add("I128" to activeCoreNs)
+                    add("F16" to activeCoreNs)
+                    add("F128" to activeCoreNs)
+                    add("RustAny" to activeCoreNs)
+                    add("RustTypeId" to activeCoreNs)
+                    add("DebugStruct" to "$activeCoreNs.fmt")
+                    add("DebugTuple" to "$activeCoreNs.fmt")
+                    if (!headerContext.rawAbiMode) {
+                        for (ffiSym in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS.values.distinct()) {
+                            if (resolveBestSubpackageForSymbol(ffiSym) == null) {
+                                add(
+                                    ffiSym to
+                                        CoreIntrinsicLowering.defaultStdlibFfiSymbolPackage(
+                                            ffiSym,
+                                            activeCoreNs,
+                                            activeAllocNs,
+                                        ),
+                                )
+                            }
+                        }
+                        if (resolveBestSubpackageForSymbol("CString") == null) {
                             add(
-                                ffiSym to
+                                "CString" to
                                     CoreIntrinsicLowering.defaultStdlibFfiSymbolPackage(
-                                        ffiSym,
+                                        "CString",
                                         activeCoreNs,
                                         activeAllocNs,
                                     ),
                             )
                         }
                     }
-                    if (resolveBestSubpackageForSymbol("CString") == null) {
-                        add(
-                            "CString" to
-                                CoreIntrinsicLowering.defaultStdlibFfiSymbolPackage(
-                                    "CString",
-                                    activeCoreNs,
-                                    activeAllocNs,
-                                ),
-                        )
+                    if (usesExternalRustLangCore) {
+                        add("Ordering" to "$activeCoreNs.cmp")
+                        add("ParseIntError" to "$activeCoreNs.num.error")
+                        add("IntErrorKind" to "$activeCoreNs.num.error")
+                        add("TryFromIntError" to "$activeCoreNs.num.error")
+                        add("FpCategory" to "$activeCoreNs.num")
+                        add("Wrapping" to "$activeCoreNs.num.wrapping")
+                        add("Pin" to "$activeCoreNs.pin")
+                        add("ControlFlow" to "$activeCoreNs.ops.controlflow")
+                        add("Allocator" to "$activeCoreNs.alloc")
+                        add("AllocError" to "$activeCoreNs.alloc")
+                        add("Layout" to "$activeCoreNs.alloc.layout")
+                        add("transmute" to "$activeCoreNs.mem")
+                        add("transmuteUnchecked" to "$activeCoreNs.mem")
+                        add("sizeOf" to "$activeCoreNs.mem")
+                        add("alignOf" to "$activeCoreNs.mem")
                     }
-                }
-                if (usesExternalRustLangCore) {
-                    add("U128" to activeCoreNs)
-                    add("I128" to activeCoreNs)
-                    add("RustAny" to activeCoreNs)
-                    add("RustTypeId" to activeCoreNs)
-                    add("Ordering" to "$activeCoreNs.cmp")
-                    add("ParseIntError" to "$activeCoreNs.num.error")
-                    add("IntErrorKind" to "$activeCoreNs.num.error")
-                    add("TryFromIntError" to "$activeCoreNs.num.error")
-                    add("FpCategory" to "$activeCoreNs.num")
-                    add("Wrapping" to "$activeCoreNs.num.wrapping")
-                    add("Pin" to "$activeCoreNs.pin")
-                    add("ControlFlow" to "$activeCoreNs.ops.controlflow")
-                    add("Allocator" to "$activeCoreNs.alloc")
-                    add("AllocError" to "$activeCoreNs.alloc")
-                    add("Layout" to "$activeCoreNs.alloc.layout")
-                    add("transmute" to "$activeCoreNs.mem")
-                    add("transmuteUnchecked" to "$activeCoreNs.mem")
-                    add("sizeOf" to "$activeCoreNs.mem")
-                    add("alignOf" to "$activeCoreNs.mem")
-                }
-                if (usesExternalRustLangCore ||
-                    "core" in headerContext.crateNamespaces ||
-                    headerContext.packageName == activeCoreNs ||
-                    headerContext.packageName?.startsWith("$activeCoreNs.") == true
-                ) {
-                    for (ptrFn in listOf(
-                        "nullMut",
-                        "nullVal",
-                        "withoutProvenance",
-                        "withoutProvenanceMut",
-                        "dangling",
-                        "danglingMut",
-                        "fromRef",
-                        "fromMut",
-                        "sliceFromRawParts",
-                        "sliceFromRawPartsMut",
-                        "copyNonoverlapping",
-                        "writeBytes",
-                        "dropInPlace",
-                    )) {
-                        add(ptrFn to "$activeCoreNs.ptr")
+                    if (usesExternalRustLangCore ||
+                        "core" in headerContext.crateNamespaces ||
+                        headerContext.packageName == activeCoreNs ||
+                        headerContext.packageName?.startsWith("$activeCoreNs.") == true
+                    ) {
+                        for (ptrFn in listOf(
+                            "nullMut",
+                            "nullVal",
+                            "withoutProvenance",
+                            "withoutProvenanceMut",
+                            "dangling",
+                            "danglingMut",
+                            "fromRef",
+                            "fromMut",
+                            "sliceFromRawParts",
+                            "sliceFromRawPartsMut",
+                            "copyNonoverlapping",
+                            "writeBytes",
+                            "dropInPlace",
+                        )) {
+                            add(ptrFn to "$activeCoreNs.ptr")
+                        }
                     }
-                }
-                if ("core" in headerContext.crateNamespaces || headerContext.scalarChar) {
-                    add("Cell" to "$activeCoreNs.cell")
-                    add("RefCell" to "$activeCoreNs.cell")
-                    add("Ref" to "$activeCoreNs.cell")
-                    add("RefMut" to "$activeCoreNs.cell")
-                    add("OnceCell" to "$activeCoreNs.cell.once")
-                    add("RustChar" to "$activeCoreNs.char")
-                    add("CharTryFromError" to "$activeCoreNs.char")
-                    add("RustCharIndex" to "$activeCoreNs.char")
-                    add("rustChars" to "$activeCoreNs.char")
-                    add("rustCharIndices" to "$activeCoreNs.char")
-                    for (asciiHelper in listOf(
-                        "isAscii",
-                        "isAsciiAlphabetic",
-                        "isAsciiUppercase",
-                        "isAsciiLowercase",
-                        "isAsciiAlphanumeric",
-                        "isAsciiDigit",
-                        "isAsciiHexdigit",
-                        "isAsciiPunctuation",
-                        "isAsciiGraphic",
-                        "isAsciiWhitespace",
-                        "isAsciiControl",
-                        "toAsciiLowercase",
-                        "toAsciiUppercase",
-                    )) {
-                        add(asciiHelper to "$activeCoreNs.char.methods")
+                    if ("core" in headerContext.crateNamespaces || headerContext.scalarChar) {
+                        add("Cell" to "$activeCoreNs.cell")
+                        add("RefCell" to "$activeCoreNs.cell")
+                        add("Ref" to "$activeCoreNs.cell")
+                        add("RefMut" to "$activeCoreNs.cell")
+                        add("OnceCell" to "$activeCoreNs.cell.once")
+                        add("RustChar" to "$activeCoreNs.char")
+                        add("CharTryFromError" to "$activeCoreNs.char")
+                        add("RustCharIndex" to "$activeCoreNs.char")
+                        add("rustChars" to "$activeCoreNs.char")
+                        add("rustCharIndices" to "$activeCoreNs.char")
+                        for (asciiHelper in listOf(
+                            "isAscii",
+                            "isAsciiAlphabetic",
+                            "isAsciiUppercase",
+                            "isAsciiLowercase",
+                            "isAsciiAlphanumeric",
+                            "isAsciiDigit",
+                            "isAsciiHexdigit",
+                            "isAsciiPunctuation",
+                            "isAsciiGraphic",
+                            "isAsciiWhitespace",
+                            "isAsciiControl",
+                            "toAsciiLowercase",
+                            "toAsciiUppercase",
+                        )) {
+                            add(asciiHelper to "$activeCoreNs.char.methods")
+                        }
                     }
-                }
-                if ("core" in headerContext.crateNamespaces && !headerContext.rawAbiMode) {
-                    add("unreachableUnchecked" to "$activeCoreNs.hint")
-                    add("assertUnchecked" to "$activeCoreNs.hint")
-                    add("sizeOf" to "$activeCoreNs.mem")
-                    add("alignOf" to "$activeCoreNs.mem")
-                    add("sizeOfVal" to "$activeCoreNs.mem")
-                    add("alignOfVal" to "$activeCoreNs.mem")
-                    add("readUnaligned" to "$activeCoreNs.ptr")
-                    add("writeUnaligned" to "$activeCoreNs.ptr")
-                    add("min" to "$activeCoreNs.cmp")
-                    add("max" to "$activeCoreNs.cmp")
-                    add("clamp" to "$activeCoreNs.cmp")
+                    if ("core" in headerContext.crateNamespaces && !headerContext.rawAbiMode) {
+                        add("unreachableUnchecked" to "$activeCoreNs.hint")
+                        add("assertUnchecked" to "$activeCoreNs.hint")
+                        add("sizeOf" to "$activeCoreNs.mem")
+                        add("alignOf" to "$activeCoreNs.mem")
+                        add("sizeOfVal" to "$activeCoreNs.mem")
+                        add("alignOfVal" to "$activeCoreNs.mem")
+                        add("readUnaligned" to "$activeCoreNs.ptr")
+                        add("writeUnaligned" to "$activeCoreNs.ptr")
+                        add("min" to "$activeCoreNs.cmp")
+                        add("max" to "$activeCoreNs.cmp")
+                        add("clamp" to "$activeCoreNs.cmp")
+                    }
                 }
             }
         val stdlibOverloadExtImports = hashSetOf<String>()
@@ -2089,22 +2022,6 @@ internal class KotlinJ2KEmitter(
         )
         val rawProjNs = headerContext.projectNamespace?.trim()?.removeSuffix(".")
         val projNs = rawProjNs?.takeIf { it.isNotEmpty() }
-        if (needsSynthesizedInt128 && headerContext.isBatchCrateOutput && projNs != null && headerContext.packageName != projNs) {
-            if (containsWholeIdentifier(bodyTextForImports, "U128")) {
-                extraImports += "import $projNs.U128"
-            }
-            if (containsWholeIdentifier(bodyTextForImports, "I128")) {
-                extraImports += "import $projNs.I128"
-            }
-        }
-        if (needsSynthesizedRustAny && headerContext.isBatchCrateOutput && projNs != null && headerContext.packageName != projNs) {
-            if (containsWholeIdentifier(bodyTextForImports, "RustAny")) {
-                extraImports += "import $projNs.RustAny"
-            }
-            if (containsWholeIdentifier(bodyTextForImports, "RustTypeId")) {
-                extraImports += "import $projNs.RustTypeId"
-            }
-        }
         val libcNs = FfiInteropCollector.resolveLibcNamespace(headerContext)
         if (libcNs != null && headerContext.packageName != libcNs) {
             if (projNs == libcNs &&
@@ -2483,167 +2400,34 @@ internal class KotlinJ2KEmitter(
         }
     }
 
-    internal fun stripKotlinCommentsAndStrings(text: String): String {
-        val sb = StringBuilder(text.length)
-        val interpModes = ArrayList<Char>()
-        val interpBraces = ArrayList<Int>()
-        var mode = 'C' // 'C' = code, 'S' = "..." string, 'R' = """...""" raw string
-        var i = 0
-        val n = text.length
-        while (i < n) {
-            when (mode) {
-                'C' -> {
-                    val ch = text[i]
-                    when {
-                        ch == '/' && i + 1 < n && text[i + 1] == '/' -> {
-                            i += 2
-                            while (i < n && text[i] != '\n') i++
+    internal fun stripKotlinCommentsAndStrings(text: String): String =
+        object : KotlinTokenRewriter(text) {
+            override fun emitAt(index: Int, out: StringBuilder): Int {
+                when (val tok = tokens[index]) {
+                    is KotlinLexToken.LineComment -> {}
+                    is KotlinLexToken.BlockComment -> {
+                        for (ch in tok.rawText) {
+                            if (ch == '\n') out.append('\n')
                         }
-                        ch == '/' && i + 1 < n && text[i + 1] == '*' -> {
-                            var depth = 1
-                            i += 2
-                            while (i < n && depth > 0) {
-                                if (text[i] == '/' && i + 1 < n && text[i + 1] == '*') {
-                                    depth++
-                                    i += 2
-                                } else if (text[i] == '*' && i + 1 < n && text[i + 1] == '/') {
-                                    depth--
-                                    i += 2
-                                } else {
-                                    if (text[i] == '\n') sb.append('\n')
-                                    i++
-                                }
-                            }
-                            sb.append(' ')
-                        }
-                        ch == '`' -> {
-                            sb.append(ch)
-                            i++
-                            while (i < n && text[i] != '`' && text[i] != '\n') {
-                                sb.append(text[i])
-                                i++
-                            }
-                            if (i < n && text[i] == '`') {
-                                sb.append('`')
-                                i++
-                            }
-                        }
-                        ch == '\'' -> {
-                            i++
-                            while (i < n && text[i] != '\'' && text[i] != '\n') {
-                                if (text[i] == '\\' && i + 1 < n) i += 2 else i++
-                            }
-                            if (i < n && text[i] == '\'') i++
-                            sb.append(' ')
-                        }
-                        ch == '"' && i + 2 < n && text[i + 1] == '"' && text[i + 2] == '"' -> {
-                            mode = 'R'
-                            sb.append(' ')
-                            i += 3
-                        }
-                        ch == '"' -> {
-                            mode = 'S'
-                            sb.append(' ')
-                            i++
-                        }
-                        ch == '{' -> {
-                            if (interpBraces.isNotEmpty()) {
-                                interpBraces[interpBraces.lastIndex] = interpBraces.last() + 1
-                            }
-                            sb.append(ch)
-                            i++
-                        }
-                        ch == '}' -> {
-                            if (interpBraces.isNotEmpty()) {
-                                val nextDepth = interpBraces.last() - 1
-                                if (nextDepth <= 0) {
-                                    interpBraces.removeAt(interpBraces.lastIndex)
-                                    mode = interpModes.removeAt(interpModes.lastIndex)
-                                    sb.append(' ')
-                                } else {
-                                    interpBraces[interpBraces.lastIndex] = nextDepth
-                                    sb.append(ch)
-                                }
-                            } else {
-                                sb.append(ch)
-                            }
-                            i++
-                        }
-                        else -> {
-                            sb.append(ch)
-                            i++
-                        }
+                        out.append(' ')
                     }
+                    is KotlinLexToken.CharLiteral,
+                    is KotlinLexToken.StringOpen,
+                    is KotlinLexToken.StringClose,
+                    is KotlinLexToken.TemplateExprOpen,
+                    is KotlinLexToken.TemplateExprClose,
+                    -> out.append(' ')
+                    is KotlinLexToken.StringText ->
+                        for (ch in tok.rawText) {
+                            if (ch == '\n') out.append('\n')
+                        }
+                    is KotlinLexToken.StringIdentTemplate ->
+                        out.append(' ').append(tok.ident).append(' ')
+                    else -> out.append(tok.rawText)
                 }
-                'S' -> {
-                    val ch = text[i]
-                    when {
-                        ch == '\\' && i + 1 < n -> i += 2
-                        ch == '"' -> {
-                            mode = 'C'
-                            sb.append(' ')
-                            i++
-                        }
-                        ch == '$' && i + 1 < n && text[i + 1] == '{' -> {
-                            interpModes.add('S')
-                            interpBraces.add(1)
-                            mode = 'C'
-                            sb.append(' ')
-                            i += 2
-                        }
-                        ch == '$' && i + 1 < n && (text[i + 1].isLetter() || text[i + 1] == '_') -> {
-                            sb.append(' ')
-                            i++
-                            while (i < n && (text[i].isLetterOrDigit() || text[i] == '_')) {
-                                sb.append(text[i])
-                                i++
-                            }
-                            sb.append(' ')
-                        }
-                        else -> {
-                            if (ch == '\n') sb.append('\n')
-                            i++
-                        }
-                    }
-                }
-                else -> {
-                    val ch = text[i]
-                    when {
-                        ch == '"' && i + 2 < n && text[i + 1] == '"' && text[i + 2] == '"' -> {
-                            if (i + 3 < n && text[i + 3] == '"') {
-                                i++
-                            } else {
-                                mode = 'C'
-                                sb.append(' ')
-                                i += 3
-                            }
-                        }
-                        ch == '$' && i + 1 < n && text[i + 1] == '{' -> {
-                            interpModes.add('R')
-                            interpBraces.add(1)
-                            mode = 'C'
-                            sb.append(' ')
-                            i += 2
-                        }
-                        ch == '$' && i + 1 < n && (text[i + 1].isLetter() || text[i + 1] == '_') -> {
-                            sb.append(' ')
-                            i++
-                            while (i < n && (text[i].isLetterOrDigit() || text[i] == '_')) {
-                                sb.append(text[i])
-                                i++
-                            }
-                            sb.append(' ')
-                        }
-                        else -> {
-                            if (ch == '\n') sb.append('\n')
-                            i++
-                        }
-                    }
-                }
+                return index + 1
             }
-        }
-        return sb.toString()
-    }
+        }.rewrite()
 
     internal fun renderItem(
         item: Item,
@@ -3025,123 +2809,50 @@ internal fun KotlinJ2KEmitter.isImplicitStdlibSupertraitPath(path: io.github.kot
 }
 internal fun ensureBlankLineBeforeKDocAfterLineComment(text: String): String {
     if ("/**" !in text) return text
-    val lines = text.split('\n')
-    val out = ArrayList<String>(lines.size + 8)
-    var parenDepth = 0
-    var inBlockComment = false
-    for (i in lines.indices) {
-        val line = lines[i]
-        val trimmed = line.trimStart()
-        if (!inBlockComment &&
-            i > 0 &&
-            parenDepth == 0 &&
-            trimmed.startsWith("/**") &&
-            lines[i - 1].trimStart().startsWith("//")
-        ) {
-            out += ""
-        }
-        out += line
-        var j = 0
-        var inString = false
-        var inChar = false
-        while (j < line.length) {
-            val ch = line[j]
-            val next = if (j + 1 < line.length) line[j + 1] else '\u0000'
-            when {
-                inBlockComment -> {
-                    if (ch == '*' && next == '/') {
-                        inBlockComment = false
-                        j += 2
-                        continue
-                    }
-                }
-                inString -> {
-                    if (ch == '\\') {
-                        j += 2
-                        continue
-                    }
-                    if (ch == '"') {
-                        inString = false
-                    }
-                }
-                inChar -> {
-                    if (ch == '\\') {
-                        j += 2
-                        continue
-                    }
-                    if (ch == '\'') {
-                        inChar = false
-                    }
-                }
-                ch == '/' && next == '/' -> break
-                ch == '/' && next == '*' -> {
-                    inBlockComment = true
-                    j += 2
-                    continue
-                }
-                ch == '"' -> inString = true
-                ch == '\'' -> inChar = true
-                ch == '(' -> parenDepth += 1
-                ch == ')' -> if (parenDepth > 0) parenDepth -= 1
-            }
-            j += 1
-        }
-    }
-    return out.joinToString("\n")
+    return KDocSpacingRewriter(text).rewrite()
 }
 
-internal val SYNTHESIZED_DEBUG_STRUCT_DECLARATION =
-    """
-    public class DebugStruct(
-        private val out: StringBuilder,
-        private val name: String,
-    ) {
-        private val fields: MutableList<String> = mutableListOf()
+private class KDocSpacingRewriter(
+    source: String,
+) : KotlinTokenRewriter(source) {
+    private var parenDepth: Int = 0
+    private var prevLineStartedWithLineComment: Boolean = false
+    private var currentLineStartedWithLineComment: Boolean = false
+    private var atLineStart: Boolean = true
 
-        public fun field(name: String, value: Any?): DebugStruct =
-            apply {
-                fields.add("${'$'}name: ${'$'}value")
+    override fun emitAt(index: Int, out: StringBuilder): Int {
+        if (atLineStart) {
+            val firstCodeIdx = skipHorizontalWhitespace(index)
+            val firstTok = tokens.getOrNull(firstCodeIdx)
+            currentLineStartedWithLineComment = firstTok is KotlinLexToken.LineComment
+            if (prevLineStartedWithLineComment &&
+                parenDepth == 0 &&
+                firstTok is KotlinLexToken.BlockComment &&
+                firstTok.rawText.startsWith("/**")
+            ) {
+                out.append('\n')
             }
-
-        public fun finish() {
-            if (fields.isEmpty()) {
-                out.append(name)
-            } else {
-                out.append("${'$'}name { ${'$'}{fields.joinToString(", ")} }")
+            atLineStart = false
+        }
+        val tok = tokens[index]
+        out.append(tok.rawText)
+        when {
+            tok is KotlinLexToken.Newline -> {
+                prevLineStartedWithLineComment = currentLineStartedWithLineComment
+                currentLineStartedWithLineComment = false
+                atLineStart = true
             }
+            tok is KotlinLexToken.BlockComment && '\n' in tok.rawText -> currentLineStartedWithLineComment = false
+            tok is KotlinLexToken.StringText && '\n' in tok.rawText -> currentLineStartedWithLineComment = false
+            tok is KotlinLexToken.Punct && tok.interpolationDepth == 0 ->
+                when (tok.ch) {
+                    '(' -> parenDepth++
+                    ')' -> if (parenDepth > 0) parenDepth--
+                }
         }
-
-        public fun finishNonExhaustive() {
-            fields.add("..")
-            finish()
-        }
+        return index + 1
     }
-    """.trimIndent()
-
-internal val SYNTHESIZED_DEBUG_TUPLE_DECLARATION =
-    """
-    public class DebugTuple(
-        private val out: StringBuilder,
-        private val name: String,
-    ) {
-        private val fields: MutableList<String> = mutableListOf()
-
-        public fun field(value: Any?): DebugTuple =
-            apply {
-                fields.add(value.toString())
-            }
-
-        public fun finish() {
-            if (fields.isEmpty()) {
-                out.append(name)
-            } else if (name.isEmpty()) {
-                out.append("(${'$'}{fields.joinToString(", ")})")
-            } else {
-                out.append("${'$'}name(${'$'}{fields.joinToString(", ")})")
-            }
-        }
-    }
-    """.trimIndent()
+}
 
 internal val STDLIB_ERASED_OR_BUILTIN_IMPORTS =
     RUST_STD_IMPLICIT_SUPERTRAITS +

@@ -1,8 +1,6 @@
 package io.github.kotlinmania.rustkotlin
 
-import io.github.kotlinmania.io.buffered
 import io.github.kotlinmania.io.files.SystemFileSystem
-import io.github.kotlinmania.io.readString
 import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
@@ -72,15 +70,6 @@ internal data class ExternalCrateAbiMetadata(
 private var diskCrateRawAbiMetadataCache: Map<String, CrateRawAbiMetadata> = emptyMap()
 private var diskExternalCrateAbiCache: Map<String, ExternalCrateAbiMetadata> = emptyMap()
 
-private fun readScannerKmFileText(path: KmPath): String =
-    SystemFileSystem.source(path).buffered().use { it.readString() }
-
-private fun isScannerKmRegularFile(path: KmPath): Boolean =
-    SystemFileSystem.metadataOrNull(path)?.isRegularFile == true
-
-private fun isScannerKmDirectory(path: KmPath): Boolean =
-    SystemFileSystem.metadataOrNull(path)?.isDirectory == true
-
 internal fun discoverCrateRawAbiMetadataFromDisk(
     inputPath: String?,
     sourceRoot: String? = null,
@@ -88,34 +77,7 @@ internal fun discoverCrateRawAbiMetadataFromDisk(
     splitModuleRoots: Boolean = false,
     finalStructs: Boolean = false,
 ): CrateRawAbiMetadata {
-    val rootCandidate =
-        when {
-            !sourceRoot.isNullOrBlank() -> KmPath(sourceRoot)
-            !inputPath.isNullOrBlank() -> {
-                val rawFile = KmPath(inputPath)
-                if (!isScannerKmRegularFile(rawFile)) return CrateRawAbiMetadata()
-                val resolvedFile = SystemFileSystem.resolve(rawFile)
-                var cur: KmPath? = resolvedFile.parent
-                var found: KmPath? = cur
-                var depth = 0
-                while (cur != null && depth < 12) {
-                    if (isScannerKmRegularFile(KmPath(cur, "lib.rs")) || cur.name == "src") {
-                        found = cur
-                        break
-                    }
-                    if (isScannerKmRegularFile(KmPath(cur, "Cargo.toml"))) {
-                        break
-                    }
-                    cur = cur.parent
-                    depth++
-                }
-                found
-            }
-            else -> null
-        } ?: return CrateRawAbiMetadata()
-
-    if (!isScannerKmDirectory(rootCandidate)) return CrateRawAbiMetadata()
-    val resolvedRoot = SystemFileSystem.resolve(rootCandidate)
+    val resolvedRoot = KmPathFileTreeNavigator.resolveCrateSrcRootFromDisk(inputPath, sourceRoot) ?: return CrateRawAbiMetadata()
     val cacheKey = "$resolvedRoot|$rawAbiMode|$splitModuleRoots|$finalStructs|${TranslationSession.cfgTargetProfile}"
     diskCrateRawAbiMetadataCache[cacheKey]?.let { return it }
 
@@ -135,10 +97,10 @@ internal fun discoverCrateRawAbiMetadataFromDisk(
             if (isUnsupportedTargetRustRelPath(relEntry, TranslationSession.cfgTargetProfile)) {
                 continue
             }
-            if (isScannerKmDirectory(entry)) {
+            if (isKmDirectory(entry)) {
                 collectDir(entry)
-            } else if (isScannerKmRegularFile(entry) && entry.name.endsWith(".rs", ignoreCase = true)) {
-                collectedSources += relEntry to readScannerKmFileText(entry)
+            } else if (isKmRegularFile(entry) && entry.name.endsWith(".rs", ignoreCase = true)) {
+                collectedSources += relEntry to readKmFileText(entry)
             }
         }
     }
@@ -752,8 +714,7 @@ private fun scanSourcesWithActiveSession(
         val makeNullableForUnion = decl.isUnion && !rawAbiMode
         for (field in decl.fields) {
             val mappedTy =
-                mapTokensFieldTypeQuick(
-                    tokens = field.typeTokens,
+                RustTypeSliceInspector(field.typeTokens).mapFieldTypeQuick(
                     rawAbiMode = rawAbiMode,
                     selfOwnerKt = decl.ktName,
                     numericKinds = numericKinds,
@@ -1185,7 +1146,7 @@ private fun resolveTokenTypeScalarKind(
         }
         return null
     }
-    val leaf = extractSimplePathLeafIdent(typeTokens) ?: return null
+    val leaf = RustTokenCursor(typeTokens).simplePathLeafIdent() ?: return null
     if (typeTokens.any { (it as? TokenTree.Punct)?.value?.asChar() == '<' }) return null
     when (leaf) {
         "isize" -> return if (rawAbiMode && TranslationSession.cfgTargetProfile.pointerWidth == 64) "I64" else "I32"
@@ -1313,14 +1274,15 @@ private fun resolveFieldShape(
         }
     }
 
-    if (extractOptionAngleInnerTokens(typeTokens)?.let(::tryParseBareFnTokens) != null) {
+    val typeSlice = RustTypeSliceInspector(typeTokens)
+    if (typeSlice.extractOptionAngleInnerTokens()?.let { RustTypeSliceInspector(it).tryParseBareFnTokens() } != null) {
         return ComputedFieldShape.CallbackPtr(samKtName = "", isNullable = true)
     }
-    if (tryParseBareFnTokens(typeTokens) != null) {
+    if (typeSlice.tryParseBareFnTokens() != null) {
         return ComputedFieldShape.CallbackPtr(samKtName = "", isNullable = false)
     }
 
-    val leaf = extractSimplePathLeafIdent(typeTokens) ?: return null
+    val leaf = typeSlice.simplePathLeafIdent() ?: return null
     if (typeTokens.any { (it as? TokenTree.Punct)?.value?.asChar() == '<' }) return null
     val ktIdent = KotlinNamingPolicy.Default.toTypeIdentifier(leaf, allowRawAbi = rawAbiMode)
     val scopedKey = if (subpkg.isEmpty()) ktIdent else "$subpkg.$ktIdent"
@@ -1583,10 +1545,11 @@ private fun resolveFnReturnDefaultExpr(
             "ConstPtr(0L)"
         }
     }
-    if (extractOptionAngleInnerTokens(retTokens) != null) {
+    val retSlice = RustTypeSliceInspector(retTokens)
+    if (retSlice.extractOptionAngleInnerTokens() != null) {
         return "null"
     }
-    val leaf = extractSimplePathLeafIdent(retTokens) ?: return "Unit"
+    val leaf = retSlice.simplePathLeafIdent() ?: return "Unit"
     val (bDef, _) = classifyBuiltinLeaf(leaf, ownerKtName)
     if (bDef != null) return bDef
     val retKt = KotlinNamingPolicy.Default.toTypeIdentifier(leaf, allowRawAbi = rawAbiMode)
@@ -1614,7 +1577,7 @@ private fun buildFnPtrInvokeTemplate(
                 "F64" -> "$pName.toRawBits()"
                 "I8", "U8", "I16", "U16", "I32", "U32", "U64" -> "$pName.toLong()"
                 else -> {
-                    val leaf = extractSimplePathLeafIdent(paramTokens)
+                    val leaf = RustTokenCursor(paramTokens).simplePathLeafIdent()
                     val ktIdent = leaf?.let { KotlinNamingPolicy.Default.toTypeIdentifier(it, allowRawAbi = rawAbiMode) }
                     val scoped = if (ktIdent != null && spec.subpkg.isNotEmpty()) "${spec.subpkg}.$ktIdent" else ktIdent
                     val packTpl =
@@ -1625,14 +1588,9 @@ private fun buildFnPtrInvokeTemplate(
             }
         }
     val invokeExpr = "__FFI__.invokePtr(rawRet, longArrayOf(${slotExprs.joinToString(", ")}))"
+    val specRetSlice = RustTypeSliceInspector(spec.retTokens)
     val retBody =
-        if (spec.retTokens.isEmpty() ||
-            (
-                spec.retTokens.size == 1 &&
-                    (spec.retTokens[0] as? TokenTree.Group)?.value?.delimiter() == Delimiter.Parenthesis &&
-                    (spec.retTokens[0] as TokenTree.Group).value.stream().isEmpty()
-            )
-        ) {
+        if (spec.retTokens.isEmpty() || specRetSlice.isUnitParens()) {
             invokeExpr
         } else {
             val retKind = resolveTokenTypeScalarKind(spec.retTokens, spec.subpkg, rawAbiMode, numericKinds, aliasDefaults)
@@ -1649,7 +1607,7 @@ private fun buildFnPtrInvokeTemplate(
                 "F64" -> "Double.fromBits($invokeExpr)"
                 "BOOL" -> "(($invokeExpr and 0xFFL) != 0L)"
                 else -> {
-                    if (extractOptionAngleInnerTokens(spec.retTokens) != null) {
+                    if (specRetSlice.extractOptionAngleInnerTokens() != null) {
                         "run { $invokeExpr; null }"
                     } else {
                         return null
@@ -1661,17 +1619,41 @@ private fun buildFnPtrInvokeTemplate(
     return "__SAM__ { $lambdaHeader$retBody }"
 }
 
-private val EXTERNAL_PKG_REGEX = Regex("""^\s*package\s+([A-Za-z0-9_.]+)""")
-private val EXTERNAL_LEADING_ANN_REGEX = Regex("""^(?:@[A-Za-z_][A-Za-z0-9_.]*(?:\([^)]*\))?\s+)+""")
-private val EXTERNAL_DATA_CLASS_REGEX = Regex("""^public\s+data\s+class\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(""")
-private val EXTERNAL_OWNER_CLASS_REGEX =
-    Regex("""^(?:public|internal|private)?\s*(?:(?:sealed|data|enum|value|abstract|open|inner|expect|actual)\s+)*(?:class|interface|object)\s+([A-Za-z_][A-Za-z0-9_]*)""")
-private val EXTERNAL_PUBLIC_FUN_REGEX =
-    Regex("""^public\s+(?:(?:inline|infix|operator|suspend|tailrec|external)\s+)*fun\s+(?:<[^>]+>\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(""")
-private val EXTERNAL_PUBLIC_TYPE_OR_VAL_REGEX =
-    Regex("""^public\s+(?:(?:const|sealed|data|enum|value|abstract|open|inner|expect|actual|external)\s+)*(?:class|interface|object|typealias|val|var)\s+([A-Za-z_][A-Za-z0-9_]*)""")
-private val EXTERNAL_RETURN_TYPE_REGEX = Regex("""^\s*:\s*([A-Za-z_][A-Za-z0-9_.]*)""")
-private val EXTERNAL_TUPLE_MEMBER_PROP_REGEX = Regex("""^public\s+(?:open\s+|override\s+)*(?:var|val)\s+(value|field(\d+))\s*:""")
+private val TUPLE_CTOR_FIELD_REGEX = Regex("""^field\d+(?:CtorArg)?$""")
+
+private val KOTLIN_DECL_MODIFIERS =
+    setOf(
+        "public",
+        "internal",
+        "private",
+        "protected",
+        "sealed",
+        "data",
+        "enum",
+        "value",
+        "annotation",
+        "abstract",
+        "open",
+        "final",
+        "inner",
+        "expect",
+        "actual",
+        "inline",
+        "noinline",
+        "crossinline",
+        "infix",
+        "operator",
+        "suspend",
+        "tailrec",
+        "external",
+        "const",
+        "override",
+        "lateinit",
+        "companion",
+    )
+
+private val KOTLIN_DECL_KEYWORDS =
+    setOf("class", "interface", "object", "fun", "typealias", "val", "var")
 
 internal fun discoverExternalCrateAbiFromDisk(
     anchorPath: String?,
@@ -1683,13 +1665,7 @@ internal fun discoverExternalCrateAbiFromDisk(
             .filterValues { it.isNotEmpty() }
     if (externalNs.isEmpty() || anchorPath.isNullOrBlank()) return ExternalCrateAbiMetadata()
 
-    val rawAnchor = KmPath(anchorPath)
-    val startDir =
-        when {
-            isScannerKmDirectory(rawAnchor) -> SystemFileSystem.resolve(rawAnchor)
-            isScannerKmRegularFile(rawAnchor) -> SystemFileSystem.resolve(rawAnchor).parent
-            else -> null
-        } ?: return ExternalCrateAbiMetadata()
+    val startDir = KmPathFileTreeNavigator.startingDirectory(KmPath(anchorPath)) ?: return ExternalCrateAbiMetadata()
 
     var currentAnchorRepo: KmPath? = null
     var workspaceRoot: KmPath? = null
@@ -1697,8 +1673,8 @@ internal fun discoverExternalCrateAbiFromDisk(
     var depth = 0
     while (cur != null && depth < 24) {
         val hasRepoMarker =
-            isScannerKmRegularFile(KmPath(cur, "rustkotlin.properties")) ||
-                isScannerKmRegularFile(KmPath(cur, "build.gradle.kts"))
+            isKmRegularFile(KmPath(cur, "rustkotlin.properties")) ||
+                isKmRegularFile(KmPath(cur, "build.gradle.kts"))
         if (hasRepoMarker) {
             currentAnchorRepo = cur
             workspaceRoot = cur.parent
@@ -1707,12 +1683,12 @@ internal fun discoverExternalCrateAbiFromDisk(
         cur = cur.parent
         depth++
     }
-    val resolvedWorkspace = workspaceRoot?.takeIf(::isScannerKmDirectory) ?: return ExternalCrateAbiMetadata()
+    val resolvedWorkspace = workspaceRoot?.takeIf(::isKmDirectory) ?: return ExternalCrateAbiMetadata()
 
     val workspaceRepos =
         SystemFileSystem
             .list(resolvedWorkspace)
-            .filter { isScannerKmDirectory(it) && it.name.endsWith("-kotlin") }
+            .filter { isKmDirectory(it) && it.name.endsWith("-kotlin") }
             .sortedBy { it.name }
     val candidateRepos =
         buildList {
@@ -1727,18 +1703,18 @@ internal fun discoverExternalCrateAbiFromDisk(
     fun readRepoPropsNs(dir: KmPath): String? =
         propsNsCache.getOrPut(dir) {
             val propsFile = KmPath(dir, "rustkotlin.properties")
-            if (!isScannerKmRegularFile(propsFile)) {
+            if (!isKmRegularFile(propsFile)) {
                 null
             } else {
-                parseRustKotlinProperties(readScannerKmFileText(propsFile)).projectNamespace?.trim()?.removeSuffix(".")
+                parseRustKotlinProperties(readKmFileText(propsFile)).projectNamespace?.trim()?.removeSuffix(".")
             }
         }
 
     fun collectKtFilesRecursive(dir: KmPath, out: MutableList<KmPath>) {
         for (entry in SystemFileSystem.list(dir).sortedBy { it.toString() }) {
-            if (isScannerKmDirectory(entry)) {
+            if (isKmDirectory(entry)) {
                 collectKtFilesRecursive(entry, out)
-            } else if (isScannerKmRegularFile(entry) && entry.name.endsWith(".kt", ignoreCase = true)) {
+            } else if (isKmRegularFile(entry) && entry.name.endsWith(".kt", ignoreCase = true)) {
                 out += entry
             }
         }
@@ -1761,7 +1737,7 @@ internal fun discoverExternalCrateAbiFromDisk(
             candidateRepos.firstNotNullOfOrNull { dir ->
                 val propsNs = readRepoPropsNs(dir) ?: return@firstNotNullOfOrNull null
                 if (propsNs != crateNs) return@firstNotNullOfOrNull null
-                KmPath(dir, "src/common/commonMain/kotlin").takeIf(::isScannerKmDirectory)
+                KmPath(dir, "src/common/commonMain/kotlin").takeIf(::isKmDirectory)
             }
         val prefixRoot =
             if (exactPropsNsRoot != null) {
@@ -1770,7 +1746,7 @@ internal fun discoverExternalCrateAbiFromDisk(
                 candidateRepos.firstNotNullOfOrNull { dir ->
                     val propsNs = readRepoPropsNs(dir) ?: return@firstNotNullOfOrNull null
                     if (!crateNs.startsWith("$propsNs.")) return@firstNotNullOfOrNull null
-                    KmPath(dir, "src/common/commonMain/kotlin/${crateNs.replace('.', '/')}").takeIf(::isScannerKmDirectory)
+                    KmPath(dir, "src/common/commonMain/kotlin/${crateNs.replace('.', '/')}").takeIf(::isKmDirectory)
                 }
             }
         val fallbackDirRoot =
@@ -1779,7 +1755,7 @@ internal fun discoverExternalCrateAbiFromDisk(
             } else {
                 candidateRepos.firstNotNullOfOrNull { dir ->
                     if (readRepoPropsNs(dir) != null || !dirMatchesCrateKey(dir)) return@firstNotNullOfOrNull null
-                    KmPath(dir, "src/common/commonMain/kotlin").takeIf(::isScannerKmDirectory)
+                    KmPath(dir, "src/common/commonMain/kotlin").takeIf(::isKmDirectory)
                 }
             }
         val kotlinRoot = exactPropsNsRoot ?: prefixRoot ?: fallbackDirRoot ?: continue
@@ -1810,8 +1786,8 @@ internal fun discoverExternalCrateAbiFromDisk(
         val crateNs = matched.crateNs
         val pkgMapBySym = linkedMapOf<String, LinkedHashSet<String>>()
         for (ktFile in matched.ktFiles) {
-            scanExternalKotlinFileSymbols(
-                sourceText = readScannerKmFileText(ktFile),
+            ExternalKotlinSymbolWalker(
+                sourceText = readKmFileText(ktFile),
                 expectedCrateNs = crateNs,
                 pkgMapBySym = pkgMapBySym,
                 twoFieldResultFns = twoFieldResultFns,
@@ -1820,7 +1796,7 @@ internal fun discoverExternalCrateAbiFromDisk(
                 tupleStructArity = tupleStructArity,
                 enumVariantTypeArity = enumVariantTypeArity,
                 unitEnumVariants = unitEnumVariants,
-            )
+            ).scan()
         }
         if (pkgMapBySym.isNotEmpty()) {
             symbolPackages[crateKey] =
@@ -1857,18 +1833,66 @@ internal fun discoverExternalCrateAbiFromDisk(
     return metadata
 }
 
-private fun scanExternalKotlinFileSymbols(
+/**
+ * Lexical Kotlin declaration walker extending [KotlinTokenWalker] to extract exported symbol
+ * packages, tuple-struct arity, generic enum variant arity, non-default const parameter shapes,
+ * two-field result data classes, and nullable return types from sibling crate `.kt` files.
+ */
+private class ExternalKotlinSymbolWalker(
     sourceText: String,
-    expectedCrateNs: String,
-    pkgMapBySym: MutableMap<String, LinkedHashSet<String>>,
-    twoFieldResultFns: MutableSet<String>,
-    nullableReturnFns: MutableSet<String>,
-    fnConstParams: MutableMap<String, Pair<Int, List<String>>>,
-    tupleStructArity: MutableMap<String, Int>,
-    enumVariantTypeArity: MutableMap<String, Int>,
-    unitEnumVariants: MutableSet<String>,
-) {
-    fun recordExternalVariantArity(
+    private val expectedCrateNs: String,
+    private val pkgMapBySym: MutableMap<String, LinkedHashSet<String>>,
+    private val twoFieldResultFns: MutableSet<String>,
+    private val nullableReturnFns: MutableSet<String>,
+    private val fnConstParams: MutableMap<String, Pair<Int, List<String>>>,
+    private val tupleStructArity: MutableMap<String, Int>,
+    private val enumVariantTypeArity: MutableMap<String, Int>,
+    private val unitEnumVariants: MutableSet<String>,
+) : KotlinTokenWalker(sourceText) {
+    private val twoFieldClasses = linkedSetOf<String>()
+    private val candidateTwoFieldFns = mutableListOf<Pair<String, String>>()
+
+    fun scan() {
+        val packageName = parsePackageHeader() ?: return
+        if (packageName != expectedCrateNs && !packageName.startsWith("$expectedCrateNs.")) return
+        scanScope(
+            startIdx = 0,
+            endExclusive = tokens.size,
+            packageName = packageName,
+            ownerCls = null,
+            inCompanion = false,
+        )
+        for ((fnName, retSimple) in candidateTwoFieldFns) {
+            if (retSimple in twoFieldClasses) {
+                twoFieldResultFns += "$packageName.$fnName"
+            }
+        }
+    }
+
+    private fun parsePackageHeader(): String? {
+        var idx = nextNonTriviaIndex(0)
+        while (punctAt(idx) == '@') {
+            idx = nextNonTriviaIndex(skipAnnotation(idx))
+        }
+        if (identTextAt(idx) != "package") return null
+        val (pkg, _) = readDottedIdentifier(nextNonTriviaIndex(idx + 1)) ?: return null
+        return pkg
+    }
+
+    private fun readDottedIdentifier(startIdx: Int, limit: Int = tokens.size): Pair<String, Int>? {
+        val first = identTextAt(startIdx) ?: return null
+        val sb = StringBuilder(first)
+        var cur = nextNonTriviaIndex(startIdx + 1, limit)
+        while (punctAt(cur) == '.') {
+            val segIdx = nextNonTriviaIndex(cur + 1, limit)
+            val seg = identTextAt(segIdx) ?: break
+            sb.append('.').append(seg)
+            cur = nextNonTriviaIndex(segIdx + 1, limit)
+        }
+        return sb.toString() to cur
+    }
+
+    private fun recordExternalVariantArity(
         owner: String,
         variant: String,
         arity: Int,
@@ -1886,411 +1910,509 @@ private fun scanExternalKotlinFileSymbols(
             unitEnumVariants += variant
         }
     }
-    val lines = sourceText.lines()
-    var pkg: String? = null
-    for (line in lines) {
-        val m = EXTERNAL_PKG_REGEX.find(line)
-        if (m != null) {
-            pkg = m.groupValues[1].trim()
-            break
-        }
-    }
-    val packageName = pkg ?: return
-    if (packageName != expectedCrateNs && !packageName.startsWith("$expectedCrateNs.")) return
-    val twoFieldClasses = linkedSetOf<String>()
-    val candidateTwoFieldFns = mutableListOf<Pair<String, String>>()
-    var braceDepth = 0
-    var parenDepth = 0
-    var inBlockComment = false
-    var currentOwnerCls: String? = null
-    var companionDepth: Int? = null
 
-    fun updateBraceDepth(line: String) {
-        var i = 0
-        var inStr = false
-        var inChar = false
-        while (i < line.length) {
-            val ch = line[i]
-            val next = if (i + 1 < line.length) line[i + 1] else '\u0000'
-            when {
-                inBlockComment -> {
-                    if (ch == '*' && next == '/') {
-                        inBlockComment = false
-                        i += 2
-                        continue
-                    }
-                }
-                inStr -> {
-                    if (ch == '\\') {
-                        i += 2
-                        continue
-                    }
-                    if (ch == '"') inStr = false
-                }
-                inChar -> {
-                    if (ch == '\\') {
-                        i += 2
-                        continue
-                    }
-                    if (ch == '\'') inChar = false
-                }
-                ch == '/' && next == '/' -> break
-                ch == '/' && next == '*' -> {
-                    inBlockComment = true
-                    i += 2
-                    continue
-                }
-                ch == '"' -> inStr = true
-                ch == '\'' -> inChar = true
-                ch == '(' -> parenDepth++
-                ch == ')' -> if (parenDepth > 0) parenDepth--
-                ch == '{' -> braceDepth++
-                ch == '}' -> if (braceDepth > 0) braceDepth--
-            }
-            i++
-        }
-    }
-
-    fun extractAfterMatchingParen(startLineIdx: Int): Pair<String, String>? {
-        val joined = StringBuilder()
+    private fun scanScope(
+        startIdx: Int,
+        endExclusive: Int,
+        packageName: String,
+        ownerCls: String?,
+        inCompanion: Boolean,
+    ) {
+        var idx = startIdx
+        var atStatementStart = true
         var parenDepth = 0
-        var started = false
-        var idx = startLineIdx
-        while (idx < lines.size) {
-            val l = lines[idx]
-            for (chIdx in l.indices) {
-                val ch = l[chIdx]
-                joined.append(ch)
-                if (ch == '(') {
-                    parenDepth++
-                    started = true
-                } else if (ch == ')' && started) {
-                    parenDepth--
-                    if (parenDepth == 0) {
-                        val restOnLine = l.substring(chIdx + 1)
-                        val nextLine = lines.getOrNull(idx + 1).orEmpty()
-                        return joined.toString() to "$restOnLine $nextLine"
+        var bracketDepth = 0
+
+        while (idx < endExclusive) {
+            val tok = tokens[idx]
+            if (tok is KotlinLexToken.Whitespace ||
+                tok is KotlinLexToken.LineComment ||
+                tok is KotlinLexToken.BlockComment
+            ) {
+                idx++
+                continue
+            }
+            if (tok is KotlinLexToken.Newline) {
+                if (parenDepth == 0 && bracketDepth == 0) {
+                    atStatementStart = true
+                }
+                idx++
+                continue
+            }
+            if (tok.interpolationDepth == 0 && tok is KotlinLexToken.Punct) {
+                when (tok.ch) {
+                    '{' ->
+                        if (parenDepth == 0 && bracketDepth == 0) {
+                            idx = findMatchingBraceEndToken(idx)
+                            atStatementStart = true
+                            continue
+                        }
+                    '(' -> parenDepth++
+                    ')' -> if (parenDepth > 0) parenDepth--
+                    '[' -> bracketDepth++
+                    ']' -> if (bracketDepth > 0) bracketDepth--
+                    ';' ->
+                        if (parenDepth == 0 && bracketDepth == 0) {
+                            atStatementStart = true
+                            idx++
+                            continue
+                        }
+                }
+            }
+
+            if (atStatementStart && parenDepth == 0 && bracketDepth == 0) {
+                atStatementStart = false
+                val prev = previousNonTriviaToken(idx)
+                val afterAssign = prev is KotlinLexToken.Punct && prev.ch == '='
+                if (!afterAssign) {
+                    val jumpTo = tryInspectDeclarationAt(idx, endExclusive, packageName, ownerCls, inCompanion)
+                    if (jumpTo != null) {
+                        idx = jumpTo
+                        atStatementStart = true
+                        continue
                     }
                 }
             }
-            joined.append('\n')
             idx++
         }
-        return null
     }
 
-    for (lineIdx in lines.indices) {
-        val line = lines[lineIdx]
-        val depthBefore = braceDepth
-        val parenBefore = parenDepth
-        val wasInComment = inBlockComment
-        updateBraceDepth(line)
-        if (braceDepth == 0 && parenDepth == 0) {
-            currentOwnerCls = null
-            companionDepth = null
-        } else {
-            val activeCompDepth = companionDepth
-            if (activeCompDepth != null && braceDepth < activeCompDepth) {
-                companionDepth = null
-            }
+    private fun tryInspectDeclarationAt(
+        declStartIdx: Int,
+        endExclusive: Int,
+        packageName: String,
+        ownerCls: String?,
+        inCompanion: Boolean,
+    ): Int? {
+        var cur = declStartIdx
+        while (punctAt(cur) == '@') {
+            cur = nextNonTriviaIndex(skipAnnotation(cur, endExclusive), endExclusive)
         }
-        if (wasInComment || parenBefore != 0) continue
-
-        val header = line.trim().replace(EXTERNAL_LEADING_ANN_REGEX, "")
-        if (depthBefore == 0) {
-            EXTERNAL_OWNER_CLASS_REGEX.find(header)?.let { clsMatch ->
-                if (braceDepth > 0 || parenDepth > 0) {
-                    currentOwnerCls = clsMatch.groupValues[1]
-                }
+        val modifiers = linkedSetOf<String>()
+        while (cur < endExclusive) {
+            val mod = identTextAt(cur) ?: break
+            if (mod == "fun" && identTextAt(nextNonTriviaIndex(cur + 1, endExclusive)) == "interface") {
+                modifiers += "fun"
+                cur = nextNonTriviaIndex(cur + 1, endExclusive)
+                break
             }
-        } else if (depthBefore == 1 &&
-            currentOwnerCls != null &&
-            (header.startsWith("public companion object") || header.startsWith("companion object")) &&
-            braceDepth >= 2
-        ) {
-            companionDepth = braceDepth
+            if (mod !in KOTLIN_DECL_MODIFIERS) break
+            modifiers += mod
+            cur = nextNonTriviaIndex(cur + 1, endExclusive)
         }
+        val declKw = identTextAt(cur) ?: return null
+        if (declKw !in KOTLIN_DECL_KEYWORDS) return null
 
-        val isTopLevel = depthBefore == 0
-        val isCompanionMember = !isTopLevel && companionDepth != null && depthBefore == companionDepth
-        if (!isTopLevel && !isCompanionMember) {
-            val ownerCls = currentOwnerCls
-            if (depthBefore == 1 && ownerCls != null) {
-                EXTERNAL_TUPLE_MEMBER_PROP_REGEX.find(header)?.let { propMatch ->
-                    val propName = propMatch.groupValues[1]
-                    val fieldIdxStr = propMatch.groupValues[2]
-                    if (propName == "value") {
-                        tupleStructArity.putIfMissing(ownerCls, 1)
-                    } else if (fieldIdxStr.isNotEmpty()) {
-                        val fieldIdx = fieldIdxStr.toIntOrNull()
-                        if (fieldIdx != null && fieldIdx >= 1) {
-                            tupleStructArity[ownerCls] = maxOf(tupleStructArity[ownerCls] ?: 0, fieldIdx + 1)
-                        }
-                    }
-                }
-                if (header.startsWith("public data object ")) {
-                    val afterObj = header.removePrefix("public data object ").trimStart()
-                    val vName = afterObj.takeWhile { it.isLetterOrDigit() || it == '_' }
-                    val afterVar = afterObj.drop(vName.length).trimStart()
-                    if (vName.isNotEmpty() && afterVar.startsWith(":")) {
-                        val basePart = afterVar.drop(1).trimStart()
-                        val baseOwner = basePart.takeWhile { it.isLetterOrDigit() || it == '_' }
-                        if (baseOwner == ownerCls) {
-                            recordExternalVariantArity(ownerCls, vName, 0, isUnit = false)
-                        }
-                    }
-                } else if (header.startsWith("public class ") || header.startsWith("public data class ")) {
-                    val isData = header.startsWith("public data class ")
-                    val afterKw =
-                        if (isData) {
-                            header.removePrefix("public data class ").trimStart()
-                        } else {
-                            header.removePrefix("public class ").trimStart()
-                        }
-                    val vName = afterKw.takeWhile { it.isLetterOrDigit() || it == '_' }
-                    val ltIdx = vName.length
-                    if (vName.isNotEmpty() && ltIdx < afterKw.length && afterKw[ltIdx] == '<') {
-                        var angleDepth = 0
-                        var gtIdx = -1
-                        for (idx in ltIdx until afterKw.length) {
-                            when (afterKw[idx]) {
-                                '<' -> angleDepth++
-                                '>' -> {
-                                    angleDepth--
-                                    if (angleDepth == 0) {
-                                        gtIdx = idx
-                                        break
-                                    }
-                                }
-                            }
-                        }
-                        if (gtIdx > ltIdx + 1) {
-                            val typeArity =
-                                PhantomRawPointerTypeStripper
-                                    .splitTopLevelCommaList(afterKw.substring(ltIdx + 1, gtIdx))
-                                    .size
-                            if (typeArity > 0) {
-                                val afterGt = afterKw.substring(gtIdx + 1).trimStart()
-                                if (!isData && afterGt.startsWith("()")) {
-                                    val afterUnitParen = afterGt.removePrefix("()").trimStart()
-                                    if (afterUnitParen.startsWith(":")) {
-                                        val basePart = afterUnitParen.drop(1).trimStart()
-                                        val baseOwner = basePart.takeWhile { it.isLetterOrDigit() || it == '_' }
-                                        if (baseOwner == ownerCls && basePart.drop(baseOwner.length).startsWith("<")) {
-                                            recordExternalVariantArity(ownerCls, vName, typeArity, isUnit = true)
-                                        }
-                                    }
-                                } else if (afterGt.startsWith("(") ||
-                                    afterGt.startsWith("internal constructor(") ||
-                                    afterGt.startsWith("public constructor(")
-                                ) {
-                                    val afterParen = extractAfterMatchingParen(lineIdx)?.second?.trimStart()
-                                    if (afterParen != null && afterParen.startsWith(":")) {
-                                        val basePart = afterParen.drop(1).trimStart()
-                                        val baseOwner = basePart.takeWhile { it.isLetterOrDigit() || it == '_' }
-                                        if (baseOwner == ownerCls && basePart.drop(baseOwner.length).startsWith("<")) {
-                                            recordExternalVariantArity(ownerCls, vName, typeArity, isUnit = false)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        if (ownerCls != null && !inCompanion && "companion" in modifiers && declKw == "object") {
+            val braceIdx = findDeclarationBodyBrace(nextNonTriviaIndex(cur + 1, endExclusive), endExclusive)
+            if (braceIdx >= 0) {
+                val closeEnd = findMatchingBraceEndToken(braceIdx)
+                scanScope(braceIdx + 1, closeEnd - 1, packageName, ownerCls = ownerCls, inCompanion = true)
+                return closeEnd
             }
-            continue
-        }
-        if (!header.startsWith("public ")) continue
-
-        if (isTopLevel) {
-            EXTERNAL_OWNER_CLASS_REGEX.find(header)?.let { clsMatch ->
-                val clsName = clsMatch.groupValues[1]
-                val afterCls = header.substring(clsMatch.range.last + 1).trimStart()
-                val startsCtor =
-                    afterCls.startsWith("(") ||
-                        afterCls.startsWith("<") ||
-                        afterCls.startsWith("internal constructor") ||
-                        afterCls.startsWith("public constructor")
-                if (startsCtor && ('(' in afterCls || parenDepth > 0)) {
-                    val paramsText = extractAfterMatchingParen(lineIdx)?.first
-                    if (paramsText != null) {
-                        val rawCtorNames = extractExternalNonDefaultParamNames(paramsText)
-                        val cleanCtorNames =
-                            rawCtorNames.map { raw ->
-                                raw
-                                    .replace(Regex("""^(?:(?:public|internal|private|open|override)\s+)*(?:val|var)\s+"""), "")
-                                    .trim()
-                            }
-                        if (cleanCtorNames.size == 1 && cleanCtorNames[0] in setOf("value", "valueCtorArg")) {
-                            tupleStructArity.putIfMissing(clsName, 1)
-                        } else if (cleanCtorNames.size >= 2 && cleanCtorNames[0] in setOf("field0", "field0CtorArg")) {
-                            val fieldCount =
-                                cleanCtorNames.count { p ->
-                                    Regex("""^field\d+(?:CtorArg)?$""").matches(p)
-                                }
-                            if (fieldCount >= 2) {
-                                tupleStructArity.putIfMissing(clsName, fieldCount)
-                            }
-                        }
-                    }
-                }
-            }
-            EXTERNAL_DATA_CLASS_REGEX.find(header)?.let { dcMatch ->
-                val clsName = dcMatch.groupValues[1]
-                pkgMapBySym.getOrPut(clsName) { linkedSetOf() } += packageName
-                val paramsText = extractAfterMatchingParen(lineIdx)?.first
-                if (paramsText != null) {
-                    val inner = paramsText.substringAfter('(').substringBeforeLast(')')
-                    val propCount = Regex("""\b(val|var)\s+""").findAll(inner).count()
-                    if (propCount == 2) {
-                        twoFieldClasses += clsName
-                    }
-                }
-            }
+            return null
         }
 
-        val funMatch = EXTERNAL_PUBLIC_FUN_REGEX.find(header)
-        if (funMatch != null) {
-            val fnName = funMatch.groupValues[1]
-            val extractedParen = extractAfterMatchingParen(lineIdx)
-            val paramNames = extractedParen?.first?.let(::extractExternalNonDefaultParamNames).orEmpty()
-            if (paramNames.isNotEmpty()) {
-                val shape = paramNames.size to paramNames
-                if (isTopLevel) {
-                    fnConstParams.putIfMissing("$packageName.$fnName", shape)
-                    fnConstParams.putIfMissing(fnName, shape)
-                } else {
-                    val owner = currentOwnerCls
-                    if (owner != null) {
-                        fnConstParams.putIfMissing("$packageName.$owner.$fnName", shape)
-                        fnConstParams.putIfMissing("$owner.$fnName", shape)
-                    }
+        return when (declKw) {
+            "class", "interface", "object" ->
+                inspectTypeLikeDeclaration(cur, declKw, modifiers, endExclusive, packageName, ownerCls, inCompanion)
+            "fun" -> {
+                if ("public" in modifiers && (ownerCls == null || inCompanion)) {
+                    inspectPublicFunctionDeclaration(cur, endExclusive, packageName, ownerCls)
                 }
+                null
             }
-            if (!isTopLevel) continue
-            pkgMapBySym.getOrPut(fnName) { linkedSetOf() } += packageName
-            val afterParen = extractedParen?.second
-            val retSimple =
-                afterParen
-                    ?.let { EXTERNAL_RETURN_TYPE_REGEX.find(it)?.groupValues?.get(1) }
-                    ?.substringAfterLast('.')
-            if (retSimple != null) {
-                candidateTwoFieldFns += fnName to retSimple
+            "typealias", "val", "var" -> {
+                if ("public" in modifiers) {
+                    inspectPublicPropertyOrAlias(cur, declKw, endExclusive, packageName, ownerCls, inCompanion)
+                }
+                null
             }
-            if (afterParen != null && hasNullableExternalReturnType(afterParen)) {
-                nullableReturnFns += "$packageName.$fnName"
-            }
-            continue
-        }
-
-        if (isTopLevel) {
-            EXTERNAL_PUBLIC_TYPE_OR_VAL_REGEX.find(header)?.let { tvMatch ->
-                val symName = tvMatch.groupValues[1]
-                pkgMapBySym.getOrPut(symName) { linkedSetOf() } += packageName
-            }
+            else -> null
         }
     }
-    for ((fnName, retSimple) in candidateTwoFieldFns) {
-        if (retSimple in twoFieldClasses) {
-            twoFieldResultFns += "$packageName.$fnName"
-        }
-    }
-}
 
-private fun extractExternalNonDefaultParamNames(paramsText: String): List<String> {
-    val startParen = paramsText.indexOf('(')
-    val endParen = paramsText.lastIndexOf(')')
-    if (startParen < 0 || endParen <= startParen) return emptyList()
-    val inner = paramsText.substring(startParen + 1, endParen)
-    if (inner.isBlank()) return emptyList()
-    val names = mutableListOf<String>()
-    var angleDepth = 0
-    var parenDepth = 0
-    var bracketDepth = 0
-    var clauseStart = 0
-    fun processClause(rawClause: String) {
-        val trimmed = rawClause.trim()
-        if (trimmed.isEmpty()) return
-        var eqFound = false
-        var a = 0
-        var p = 0
-        var b = 0
-        for (ch in trimmed) {
-            when (ch) {
-                '<' -> a++
-                '>' -> if (a > 0) a--
-                '(' -> p++
-                ')' -> if (p > 0) p--
-                '[' -> b++
-                ']' -> if (b > 0) b--
-                '=' ->
-                    if (a == 0 && p == 0 && b == 0) {
-                        eqFound = true
-                        break
-                    }
+    private fun inspectTypeLikeDeclaration(
+        kwIdx: Int,
+        declKw: String,
+        modifiers: Set<String>,
+        endExclusive: Int,
+        packageName: String,
+        ownerCls: String?,
+        inCompanion: Boolean,
+    ): Int? {
+        val nameIdx = nextNonTriviaIndex(kwIdx + 1, endExclusive)
+        val clsName = identTextAt(nameIdx)
+        var afterName = if (clsName != null) nextNonTriviaIndex(nameIdx + 1, endExclusive) else nameIdx
+        var typeParamSlice: String? = null
+        if (punctAt(afterName) == '<') {
+            val closeAngle = findMatchingTypeAngleToken(afterName)
+            if (closeAngle > afterName) {
+                typeParamSlice = source.substring(tokens[afterName].end, tokens[closeAngle].start)
+                afterName = nextNonTriviaIndex(closeAngle + 1, endExclusive)
             }
         }
-        if (eqFound) return
-        val colonIdx = trimmed.indexOf(':')
-        if (colonIdx <= 0) return
-        val name = trimmed.substring(0, colonIdx).replace("vararg ", "").trim()
-        if (name.isNotEmpty()) names += name
-    }
-    for (idx in inner.indices) {
-        when (inner[idx]) {
-            '<' -> angleDepth++
-            '>' -> if ((idx == 0 || inner[idx - 1] != '-') && angleDepth > 0) angleDepth--
-            '(' -> parenDepth++
-            ')' -> if (parenDepth > 0) parenDepth--
-            '[' -> bracketDepth++
-            ']' -> if (bracketDepth > 0) bracketDepth--
-            ',' ->
-                if (angleDepth == 0 && parenDepth == 0 && bracketDepth == 0) {
-                    processClause(inner.substring(clauseStart, idx))
-                    clauseStart = idx + 1
+
+        var ctorScan = afterName
+        while (punctAt(ctorScan) == '@') {
+            ctorScan = nextNonTriviaIndex(skipAnnotation(ctorScan, endExclusive), endExclusive)
+        }
+        while (identTextAt(ctorScan) in setOf("public", "internal", "private", "protected")) {
+            ctorScan = nextNonTriviaIndex(ctorScan + 1, endExclusive)
+        }
+        val hasExplicitCtorKw = identTextAt(ctorScan) == "constructor"
+        if (hasExplicitCtorKw) {
+            ctorScan = nextNonTriviaIndex(ctorScan + 1, endExclusive)
+        }
+        var openParenIdx = -1
+        var closeParenIdx = -1
+        if (punctAt(ctorScan) == '(') {
+            val cp = findMatchingParenToken(ctorScan)
+            if (cp >= ctorScan) {
+                openParenIdx = ctorScan
+                closeParenIdx = cp
+                ctorScan = nextNonTriviaIndex(cp + 1, endExclusive)
+            }
+        } else if (!hasExplicitCtorKw) {
+            ctorScan = afterName
+        }
+
+        if (ownerCls == null && clsName != null && "public" in modifiers) {
+            pkgMapBySym.getOrPut(clsName) { linkedSetOf() } += packageName
+            if (openParenIdx >= 0) {
+                val ctorNames = extractNonDefaultParamNames(openParenIdx, closeParenIdx)
+                if (ctorNames.size == 1 && ctorNames[0] in setOf("value", "valueCtorArg")) {
+                    tupleStructArity.putIfMissing(clsName, 1)
+                } else if (ctorNames.size >= 2 && ctorNames[0] in setOf("field0", "field0CtorArg")) {
+                    val fieldCount = ctorNames.count { TUPLE_CTOR_FIELD_REGEX.matches(it) }
+                    if (fieldCount >= 2) {
+                        tupleStructArity.putIfMissing(clsName, fieldCount)
+                    }
                 }
+                if ("data" in modifiers && declKw == "class" && countPrimaryCtorProperties(openParenIdx, closeParenIdx) == 2) {
+                    twoFieldClasses += clsName
+                }
+            }
+        } else if (ownerCls != null && !inCompanion && clsName != null && "public" in modifiers) {
+            inspectNestedVariantDeclaration(
+                ownerCls = ownerCls,
+                variantName = clsName,
+                declKw = declKw,
+                modifiers = modifiers,
+                typeParamSlice = typeParamSlice,
+                hasExplicitCtorKw = hasExplicitCtorKw,
+                openParenIdx = openParenIdx,
+                closeParenIdx = closeParenIdx,
+                afterHeaderIdx = ctorScan,
+                endExclusive = endExclusive,
+            )
+        }
+
+        val braceIdx = findDeclarationBodyBrace(ctorScan, endExclusive)
+        if (braceIdx < 0) return null
+        val closeEnd = findMatchingBraceEndToken(braceIdx)
+        if (ownerCls == null && clsName != null) {
+            scanScope(braceIdx + 1, closeEnd - 1, packageName, ownerCls = clsName, inCompanion = false)
+        }
+        return closeEnd
+    }
+
+    private fun inspectNestedVariantDeclaration(
+        ownerCls: String,
+        variantName: String,
+        declKw: String,
+        modifiers: Set<String>,
+        typeParamSlice: String?,
+        hasExplicitCtorKw: Boolean,
+        openParenIdx: Int,
+        closeParenIdx: Int,
+        afterHeaderIdx: Int,
+        endExclusive: Int,
+    ) {
+        if ("data" in modifiers && declKw == "object" && punctAt(afterHeaderIdx) == ':') {
+            val baseOwner = identTextAt(nextNonTriviaIndex(afterHeaderIdx + 1, endExclusive))
+            if (baseOwner == ownerCls) {
+                recordExternalVariantArity(ownerCls, variantName, 0, isUnit = false)
+            }
+            return
+        }
+        if (declKw == "class" && typeParamSlice != null && openParenIdx >= 0 && punctAt(afterHeaderIdx) == ':') {
+            val typeArity = splitTopLevelCommaList(typeParamSlice).size
+            if (typeArity <= 0) return
+            val baseIdx = nextNonTriviaIndex(afterHeaderIdx + 1, endExclusive)
+            if (identTextAt(baseIdx) != ownerCls || punctAt(nextNonTriviaIndex(baseIdx + 1, endExclusive)) != '<') {
+                return
+            }
+            val isEmptyUnitParens =
+                !hasExplicitCtorKw &&
+                    "data" !in modifiers &&
+                    nextNonTriviaIndex(openParenIdx + 1, closeParenIdx) == closeParenIdx
+            recordExternalVariantArity(ownerCls, variantName, typeArity, isUnit = isEmptyUnitParens)
         }
     }
-    processClause(inner.substring(clauseStart))
-    return names
-}
 
-private fun hasNullableExternalReturnType(afterParen: String): Boolean {
-    var i = 0
-    while (i < afterParen.length && afterParen[i].isWhitespace()) i++
-    if (i >= afterParen.length || afterParen[i] != ':') return false
-    val start = i + 1
-    var angleDepth = 0
-    var parenDepth = 0
-    var bracketDepth = 0
-    var end = afterParen.length
-    var j = start
-    while (j < afterParen.length) {
-        val ch = afterParen[j]
-        val prev = if (j > 0) afterParen[j - 1] else '\u0000'
-        when (ch) {
-            '<' -> angleDepth++
-            '>' -> if (prev != '-' && angleDepth > 0) angleDepth--
-            '(' -> parenDepth++
-            ')' -> if (parenDepth > 0) parenDepth--
-            '[' -> bracketDepth++
-            ']' -> if (bracketDepth > 0) bracketDepth--
-            '=', '{' ->
-                if (angleDepth == 0 && parenDepth == 0 && bracketDepth == 0) {
-                    end = j
+    private fun findDeclarationBodyBrace(afterHeaderIdx: Int, endExclusive: Int): Int {
+        if (punctAt(afterHeaderIdx) == '{') return afterHeaderIdx
+        if (punctAt(afterHeaderIdx) != ':' && identTextAt(afterHeaderIdx) != "where") return -1
+        var k = afterHeaderIdx
+        var parenDepth = 0
+        var angleDepth = 0
+        while (k < endExclusive) {
+            val tok = tokens[k]
+            if (tok is KotlinLexToken.Newline && parenDepth == 0 && angleDepth == 0) {
+                val next = nextNonTriviaIndex(k + 1, endExclusive)
+                if (startsSiblingDeclaration(next, endExclusive)) return -1
+            } else if (tok.interpolationDepth == 0 && tok is KotlinLexToken.Punct) {
+                when (tok.ch) {
+                    '(' -> parenDepth++
+                    ')' -> if (parenDepth > 0) parenDepth--
+                    '<' -> angleDepth++
+                    '>' -> if (angleDepth > 0) angleDepth--
+                    '{' -> if (parenDepth == 0 && angleDepth == 0) return k
+                    ';' -> if (parenDepth == 0 && angleDepth == 0) return -1
+                }
+            }
+            k++
+        }
+        return -1
+    }
+
+    private fun startsSiblingDeclaration(tokenIdx: Int, endExclusive: Int): Boolean {
+        if (tokenIdx >= endExclusive) return true
+        if (punctAt(tokenIdx) == '@' || punctAt(tokenIdx) == '}') return true
+        val word = identTextAt(tokenIdx) ?: return false
+        return word == "package" ||
+            word == "import" ||
+            word in KOTLIN_DECL_MODIFIERS ||
+            (word in KOTLIN_DECL_KEYWORDS && word != "where")
+    }
+
+    private fun inspectPublicFunctionDeclaration(
+        funKwIdx: Int,
+        endExclusive: Int,
+        packageName: String,
+        ownerCls: String?,
+    ) {
+        var cur = nextNonTriviaIndex(funKwIdx + 1, endExclusive)
+        if (punctAt(cur) == '<') {
+            val closeAngle = findMatchingTypeAngleToken(cur)
+            if (closeAngle > cur) {
+                cur = nextNonTriviaIndex(closeAngle + 1, endExclusive)
+            }
+        }
+        val fnName = identTextAt(cur) ?: return
+        val parenIdx = nextNonTriviaIndex(cur + 1, endExclusive)
+        if (punctAt(parenIdx) != '(') return
+        val closeParen = findMatchingParenToken(parenIdx)
+        if (closeParen < parenIdx) return
+
+        val paramNames = extractNonDefaultParamNames(parenIdx, closeParen)
+        if (paramNames.isNotEmpty()) {
+            val shape = paramNames.size to paramNames
+            if (ownerCls == null) {
+                fnConstParams.putIfMissing("$packageName.$fnName", shape)
+                fnConstParams.putIfMissing(fnName, shape)
+            } else {
+                fnConstParams.putIfMissing("$packageName.$ownerCls.$fnName", shape)
+                fnConstParams.putIfMissing("$ownerCls.$fnName", shape)
+            }
+        }
+        if (ownerCls != null) return
+
+        pkgMapBySym.getOrPut(fnName) { linkedSetOf() } += packageName
+        inspectTopLevelFnReturnType(fnName, packageName, closeParen + 1, endExclusive)
+    }
+
+    private fun inspectTopLevelFnReturnType(
+        fnName: String,
+        packageName: String,
+        afterParenIdx: Int,
+        endExclusive: Int,
+    ) {
+        val colonIdx = nextNonTriviaIndex(afterParenIdx, endExclusive)
+        if (punctAt(colonIdx) != ':') return
+        val retStart = nextNonTriviaIndex(colonIdx + 1, endExclusive)
+        readDottedIdentifier(retStart, endExclusive)?.first?.let { dotted ->
+            candidateTwoFieldFns += fnName to dotted.substringAfterLast('.')
+        }
+
+        val retTokens = mutableListOf<KotlinLexToken>()
+        var k = retStart
+        var angleDepth = 0
+        var parenDepth = 0
+        var bracketDepth = 0
+        while (k < endExclusive) {
+            val tok = tokens[k]
+            val atTop = angleDepth == 0 && parenDepth == 0 && bracketDepth == 0
+            if (atTop) {
+                if (tok is KotlinLexToken.Newline && startsSiblingDeclaration(nextNonTriviaIndex(k + 1, endExclusive), endExclusive)) {
                     break
                 }
+                if (identTextAt(k) == "where") break
+                val ch = punctAt(k)
+                if (ch == '=' || ch == '{' || ch == ';') break
+            }
+            if (tok.interpolationDepth == 0 && tok is KotlinLexToken.Punct) {
+                when (tok.ch) {
+                    '<' -> angleDepth++
+                    '>' -> if (angleDepth > 0) angleDepth--
+                    '(' -> parenDepth++
+                    ')' -> if (parenDepth > 0) parenDepth--
+                    '[' -> bracketDepth++
+                    ']' -> if (bracketDepth > 0) bracketDepth--
+                }
+            }
+            if (tok !is KotlinLexToken.Whitespace &&
+                tok !is KotlinLexToken.Newline &&
+                tok !is KotlinLexToken.LineComment &&
+                tok !is KotlinLexToken.BlockComment
+            ) {
+                retTokens += tok
+            }
+            k++
         }
-        if (angleDepth == 0 && parenDepth == 0 && bracketDepth == 0 &&
-            afterParen.startsWith("where", j) &&
-            (j == start || !afterParen[j - 1].isLetterOrDigit()) &&
-            (j + 5 >= afterParen.length || afterParen[j + 5].isWhitespace())
-        ) {
-            end = j
-            break
+        if (retTokens.isEmpty()) return
+        val lastTok = retTokens.last()
+        if (lastTok !is KotlinLexToken.Punct || lastTok.ch != '?') return
+        val hasArrow = retTokens.any { it is KotlinLexToken.Arrow }
+        val parenthesizedFnNullable =
+            retTokens.size >= 3 &&
+                retTokens.first().let { it is KotlinLexToken.Punct && it.ch == '(' } &&
+                retTokens[retTokens.size - 2].let { it is KotlinLexToken.Punct && it.ch == ')' }
+        if (!hasArrow || parenthesizedFnNullable) {
+            nullableReturnFns += "$packageName.$fnName"
         }
-        j++
     }
-    val retSlice = afterParen.substring(start, end).trim()
-    return retSlice.endsWith("?") && (!retSlice.contains("->") || (retSlice.startsWith("(") && retSlice.endsWith(")?")))
+
+    private fun inspectPublicPropertyOrAlias(
+        kwIdx: Int,
+        declKw: String,
+        endExclusive: Int,
+        packageName: String,
+        ownerCls: String?,
+        inCompanion: Boolean,
+    ) {
+        val nameIdx = nextNonTriviaIndex(kwIdx + 1, endExclusive)
+        val symName = identTextAt(nameIdx) ?: return
+        val afterSymIdx = nextNonTriviaIndex(nameIdx + 1, endExclusive)
+        if (ownerCls == null) {
+            if (punctAt(afterSymIdx) != '.') {
+                pkgMapBySym.getOrPut(symName) { linkedSetOf() } += packageName
+            }
+        } else if (!inCompanion && (declKw == "val" || declKw == "var") && punctAt(afterSymIdx) == ':') {
+            if (symName == "value") {
+                tupleStructArity.putIfMissing(ownerCls, 1)
+            } else if (symName.startsWith("field")) {
+                val fieldIdx = symName.removePrefix("field").toIntOrNull()
+                if (fieldIdx != null && fieldIdx >= 1) {
+                    tupleStructArity[ownerCls] = maxOf(tupleStructArity[ownerCls] ?: 0, fieldIdx + 1)
+                }
+            }
+        }
+    }
+
+    private fun splitParameterTokenClauses(openParenIdx: Int, closeParenIdx: Int): List<IntRange> {
+        val clauses = mutableListOf<IntRange>()
+        var clauseStart = openParenIdx + 1
+        var angleDepth = 0
+        var parenDepth = 0
+        var bracketDepth = 0
+        var braceDepth = 0
+        for (k in (openParenIdx + 1) until closeParenIdx) {
+            val ch = punctAt(k) ?: continue
+            when (ch) {
+                '<' -> angleDepth++
+                '>' -> if (angleDepth > 0) angleDepth--
+                '(' -> parenDepth++
+                ')' -> if (parenDepth > 0) parenDepth--
+                '[' -> bracketDepth++
+                ']' -> if (bracketDepth > 0) bracketDepth--
+                '{' -> braceDepth++
+                '}' -> if (braceDepth > 0) braceDepth--
+                ',' ->
+                    if (angleDepth == 0 && parenDepth == 0 && bracketDepth == 0 && braceDepth == 0) {
+                        clauses += clauseStart until k
+                        clauseStart = k + 1
+                    }
+            }
+        }
+        if (clauseStart < closeParenIdx) {
+            clauses += clauseStart until closeParenIdx
+        }
+        return clauses
+    }
+
+    private fun extractNonDefaultParamNames(openParenIdx: Int, closeParenIdx: Int): List<String> {
+        val names = mutableListOf<String>()
+        for (range in splitParameterTokenClauses(openParenIdx, closeParenIdx)) {
+            val rangeEnd = range.last + 1
+            var k = nextNonTriviaIndex(range.first, rangeEnd)
+            while (punctAt(k) == '@') {
+                k = nextNonTriviaIndex(skipAnnotation(k, rangeEnd), rangeEnd)
+            }
+            if (k >= rangeEnd) continue
+            var colonIdx = -1
+            var hasDefault = false
+            var angleDepth = 0
+            var parenDepth = 0
+            var bracketDepth = 0
+            while (k < rangeEnd) {
+                val ch = punctAt(k)
+                if (ch != null) {
+                    when (ch) {
+                        '<' -> angleDepth++
+                        '>' -> if (angleDepth > 0) angleDepth--
+                        '(' -> parenDepth++
+                        ')' -> if (parenDepth > 0) parenDepth--
+                        '[' -> bracketDepth++
+                        ']' -> if (bracketDepth > 0) bracketDepth--
+                        ':' ->
+                            if (colonIdx < 0 && angleDepth == 0 && parenDepth == 0 && bracketDepth == 0) {
+                                colonIdx = k
+                            }
+                        '=' ->
+                            if (angleDepth == 0 && parenDepth == 0 && bracketDepth == 0) {
+                                hasDefault = true
+                                break
+                            }
+                    }
+                }
+                k++
+            }
+            if (hasDefault || colonIdx <= range.first) continue
+            val prevTok = previousNonTriviaToken(colonIdx)
+            val paramName =
+                when (prevTok) {
+                    is KotlinLexToken.Ident -> prevTok.rawText
+                    is KotlinLexToken.BacktickIdent -> prevTok.ident
+                    else -> null
+                }
+            if (!paramName.isNullOrEmpty()) {
+                names += paramName
+            }
+        }
+        return names
+    }
+
+    private fun countPrimaryCtorProperties(openParenIdx: Int, closeParenIdx: Int): Int {
+        var count = 0
+        for (range in splitParameterTokenClauses(openParenIdx, closeParenIdx)) {
+            val rangeEnd = range.last + 1
+            var k = nextNonTriviaIndex(range.first, rangeEnd)
+            while (punctAt(k) == '@') {
+                k = nextNonTriviaIndex(skipAnnotation(k, rangeEnd), rangeEnd)
+            }
+            while (k < rangeEnd) {
+                val ch = punctAt(k)
+                if (ch == ':') break
+                val word = identTextAt(k)
+                if (word == "val" || word == "var") {
+                    count++
+                    break
+                }
+                k++
+            }
+        }
+        return count
+    }
 }

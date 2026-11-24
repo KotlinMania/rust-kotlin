@@ -445,7 +445,6 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
             renderKotlinDoubleQuotedString(selfTypeName?.substringBefore('<')?.trim() ?: "Any")
         (calleeBase == "TypeId.of" || calleeBase == "RustTypeId.of" || calleeBase.endsWith(".TypeId.of") || calleeBase.endsWith(".RustTypeId.of")) &&
             nonUnitArgs.isEmpty() -> {
-            usesRustAny = true
             val tfSuffix = if ('<' in callee) "<${callee.substringAfter('<')}" else ""
             "RustTypeId.of$tfSuffix()"
         }
@@ -1336,14 +1335,8 @@ internal fun KotlinJ2KEmitter.renderPrimitiveFromBytesCall(
         val fn = if (isBigEndian) "fromBeBytes" else "fromLeBytes"
         val owner =
             when (primRaw) {
-                "u128", "U128" -> {
-                    usesU128 = true
-                    "U128"
-                }
-                "i128", "I128" -> {
-                    usesI128 = true
-                    "I128"
-                }
+                "u128", "U128" -> "U128"
+                "i128", "I128" -> "I128"
                 "f128", "F128" -> {
                     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
                     CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.F128")
@@ -1520,7 +1513,7 @@ internal fun parseSimdLaneVectorSpec(
                         else -> null
                     }
             } ?: return null
-        val elemTy = emitter.numericKindToTypeNameRecordingFlags(elemKind)
+        val elemTy = emitter.numericKindToPureTypeName(elemKind)
         return SimdLaneVectorSpec(wrapperName = wrapperName, elemTy = elemTy, elemKind = elemKind, lanes = lanes)
     }
     if (!visited.add(clean)) return null
@@ -1575,14 +1568,8 @@ internal fun simdZeroLiteralExpr(elemTy: String, elemKind: NumericKind?, emitter
         NumericKind.U32 -> "0u"
         NumericKind.I64 -> "0L"
         NumericKind.U64 -> "0uL"
-        NumericKind.I128 -> {
-            emitter.usesI128 = true
-            "I128.ZERO"
-        }
-        NumericKind.U128 -> {
-            emitter.usesU128 = true
-            "U128.ZERO"
-        }
+        NumericKind.I128 -> "I128.ZERO"
+        NumericKind.U128 -> "U128.ZERO"
         NumericKind.F16 -> {
             val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
             CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.F16")

@@ -1,5 +1,21 @@
 package io.github.kotlinmania.rustkotlin
 
+import io.github.kotlinmania.rustlang.core.F128
+import io.github.kotlinmania.rustlang.core.F16
+import io.github.kotlinmania.rustlang.core.intrinsics.kmAlloc
+import io.github.kotlinmania.rustlang.core.intrinsics.kmAtomicCxchgU128Pair
+import io.github.kotlinmania.rustlang.core.intrinsics.kmCtpopU64
+import io.github.kotlinmania.rustlang.core.intrinsics.kmDealloc
+import io.github.kotlinmania.rustlang.core.intrinsics.kmLoadU64
+import io.github.kotlinmania.rustlang.core.intrinsics.kmSmulhI64
+import io.github.kotlinmania.rustlang.core.intrinsics.kmStoreU64
+import io.github.kotlinmania.rustlang.core.intrinsics.kmUmulhU64
+import io.github.kotlinmania.rustlang.core.mem.PrimitiveLayouts
+import io.github.kotlinmania.rustlang.core.mem.kmCompareValues
+import io.github.kotlinmania.rustlang.core.mem.linearMutSliceView
+import io.github.kotlinmania.rustlang.core.mem.linearSliceView
+import io.github.kotlinmania.rustlang.core.ptr.ConstPtr
+import io.github.kotlinmania.rustlang.core.ptr.MutPtr
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
@@ -72,19 +88,30 @@ class CoreIntrinsicLoweringTest {
     }
 
     @Test
-    fun allGeneratedKmCoreCompanionKotlinFilesHaveZeroForbiddenUnderscoreIdentifiers() {
-        val coreNs = "io.github.kotlinmania.rustlang.core"
-        val typeLayoutKt = CoreIntrinsicFfiArtifacts.renderTypeLayoutSupportKotlin(coreNs)
-        ZeroUnderscoreIdentifierValidator.requireZeroViolations(typeLayoutKt, "TypeLayout.kt")
+    fun coreIntrinsicsExecuteDirectlyViaImportedRustLangKotlinCrate() {
+        val buf = kmAlloc(64L, 16L)
+        assertTrue(buf != 0L, "Expected non-null arena/heap allocation from kmAlloc")
+        try {
+            kmStoreU64(buf, 0x0102030405060708uL)
+            val loaded = kmLoadU64(buf)
+            assertEquals(0x0102030405060708uL, loaded)
+            assertEquals(13u, kmCtpopU64(loaded))
 
-        val companions = CoreIntrinsicFfiArtifacts.emitAllKmCoreCompanionFiles(coreNs)
-        assertTrue(companions.any { it.relativePath == "km_core_intrinsics_inline.h" })
-        assertTrue(companions.any { it.relativePath == "km_core_llvm_aarch64.S" })
-        assertTrue(companions.any { it.relativePath == "km_core_llvm_x86_64.S" })
-        for (file in companions) {
-            if (file.relativePath.endsWith(".kt")) {
-                ZeroUnderscoreIdentifierValidator.requireZeroViolations(file.content, file.relativePath)
-            }
+            kmStoreU64(buf, 11uL)
+            kmStoreU64(buf + 8L, 22uL)
+            val cas1 = kmAtomicCxchgU128Pair(buf, 11uL, 22uL, 33uL, 44uL)
+            assertTrue(cas1.succeeded)
+            assertEquals(11uL, cas1.prevLo)
+            assertEquals(22uL, cas1.prevHi)
+            val cas2 = kmAtomicCxchgU128Pair(buf, 11uL, 22uL, 99uL, 99uL)
+            assertFalse(cas2.succeeded)
+            assertEquals(33uL, cas2.prevLo)
+            assertEquals(44uL, cas2.prevHi)
+
+            assertEquals(1uL, kmUmulhU64(ULong.MAX_VALUE, 2uL))
+            assertEquals(-1L, kmSmulhI64(-2L, 2L))
+        } finally {
+            kmDealloc(buf, 64L, 16L)
         }
     }
 
@@ -266,25 +293,21 @@ class CoreIntrinsicLoweringTest {
                 isBatchCrateOutput = true,
             )
         val kt = renderSingleKotlinFile(rustSource, header).text
+        assertContains(kt, "import $coreNs.F16")
+        assertContains(kt, "import $coreNs.F128")
+        assertFalse(kt.contains("import $coreNs.U128"))
         assertContains(kt, "F16.fromFloat(1.5f)")
         assertContains(kt, "F128.fromDouble(2.5)")
         assertContains(kt, "F16.fromBits(")
         assertContains(kt, "F16.INFINITY")
         assertContains(kt, "F128.EPSILON")
+        assertFalse(kt.contains("class F16("))
+        assertFalse(kt.contains("class F128("))
 
-        val floatSupport = renderSynthesizedFloatSupportFile(coreNs)
-        assertContains(floatSupport, "class F16")
-        assertContains(floatSupport, "class F128")
-        ZeroUnderscoreIdentifierValidator.requireZeroViolations(floatSupport, "FloatSupport.kt")
-
-        val typeLayout = CoreIntrinsicFfiArtifacts.renderTypeLayoutSupportKotlin(coreNs)
-        assertContains(typeLayout, "import $coreNs.F16")
-        assertContains(typeLayout, "import $coreNs.F128")
-        assertContains(typeLayout, "F16_LAYOUT")
-        assertContains(typeLayout, "F128_LAYOUT")
-
-        val bindingGyp = CoreIntrinsicFfiArtifacts.renderKmCoreBindingGyp("kmcore")
-        assertFalse(bindingGyp.contains("KM_NAPI_STANDALONE_MODULE"))
+        assertEquals(1.5f, F16.fromFloat(1.5f).toFloat())
+        assertEquals(2.5, F128.fromDouble(2.5).toDouble())
+        assertEquals(2L, PrimitiveLayouts.F16_LAYOUT.sizeBytes)
+        assertEquals(16L, PrimitiveLayouts.F128_LAYOUT.sizeBytes)
 
         val props =
             parseRustKotlinProperties(
@@ -642,33 +665,20 @@ class CoreIntrinsicLoweringTest {
     }
 
     @Test
-    fun coreIntrinsicFfiArtifactsProvideLayoutAndSliceSupportWithoutLegacyShims() {
-        val coreNs = "io.github.kotlinmania.rustlang.core"
-        val typeLayout = CoreIntrinsicFfiArtifacts.renderTypeLayoutSupportKotlin(coreNs)
-        assertContains(typeLayout, "public class UnresolvedTypeLayout<T>")
-        assertContains(typeLayout, "public class LinearSliceView<T>")
-        assertContains(typeLayout, "public class LinearMutSliceView<T>")
-        assertContains(typeLayout, "public fun <T> linearSliceView(")
-        assertContains(typeLayout, "public fun <T> linearMutSliceView(")
-        assertContains(typeLayout, "public operator fun <T> MutableList<T>.get(range: IntRange): MutableList<T>")
-        assertContains(typeLayout, "public fun <T : Comparable<T>> kmCompareValues(")
-        assertContains(typeLayout, "isSigned: Boolean")
-        assertFalse(typeLayout.contains("@Suppress"), "TypeLayoutSupport must not contain @Suppress")
-        assertFalse(typeLayout.contains("// port-lint:"), "TypeLayoutSupport must not contain port-lint directive")
-        assertFalse(typeLayout.contains("import java."), "TypeLayoutSupport must not import java.*")
-        assertFalse(typeLayout.contains("import javax."), "TypeLayoutSupport must not import javax.*")
-        assertFalse(typeLayout.contains("ObjectSlotLayout"), "TypeLayoutSupport must not reference ObjectSlotLayout")
-        assertFalse(typeLayout.contains("ManagedSlotRegistry"), "TypeLayoutSupport must not reference ManagedSlotRegistry")
-        assertFalse(typeLayout.contains("flushMutableSliceWriteBacks"), "TypeLayoutSupport must not reference flushMutableSliceWriteBacks")
-
-        val expectKt = CoreIntrinsicFfiArtifacts.renderKmCoreIntrinsicsExpectKotlin(coreNs)
-        assertContains(expectKt, "kmSqrtf32")
-        assertContains(expectKt, "kmFloatToU128Unchecked")
-        assertFalse(expectKt.contains("@Suppress"))
-        assertFalse(expectKt.contains("import java."))
-
-        val defFile = CoreIntrinsicFfiArtifacts.renderKmCoreDef("io.github.kotlinmania.rustlang.core.intrinsics.cinterop")
-        assertContains(defFile, "-lm")
+    fun rustLangCoreProvidesLayoutAndLinearSliceSupportDirectly() {
+        val addr = kmAlloc(32L, 8L)
+        try {
+            val mutSlice = linearMutSliceView(MutPtr(addr), 4, PrimitiveLayouts.I32)
+            mutSlice[0] = 10
+            mutSlice[1] = 20
+            mutSlice[2] = 30
+            mutSlice[3] = 40
+            val roSlice = linearSliceView(ConstPtr(addr), 4, PrimitiveLayouts.I32)
+            assertEquals(listOf(10, 20, 30, 40), roSlice.toList())
+            assertTrue(kmCompareValues(10, 20) < 0)
+        } finally {
+            kmDealloc(addr, 32L, 8L)
+        }
     }
 
     @Test
@@ -720,9 +730,25 @@ class CoreIntrinsicLoweringTest {
     }
 
     @Test
-    fun inlineHeaderGuardsInt128DivAndFloatConversionsForWindowsClangMsvc() {
-        val header = CoreIntrinsicFfiArtifacts.renderKmCoreInlineHeader()
-        val guardCount = Regex("""#if defined\(__SIZEOF_INT128__\) && !defined\(_MSC_VER\)""").findAll(header).count()
-        assertEquals(3, guardCount, "Expected !defined(_MSC_VER) guard on kmU128DivRemRaw and float/double to u128 helpers")
+    fun ensureRustLangInLibsVersionsTomlAddsDependencyAndBundlesIdempotently() {
+        val initialToml =
+            """
+            [versions]
+            kotlin = "2.4.21"
+
+            [libraries]
+            km-io = { module = "io.github.kotlinmania:km-io", version.ref = "kotlin" }
+
+            [bundles]
+            demo-commonMain = [
+              "km-io",
+            ]
+            """.trimIndent() + "\n"
+        val updated = ensureRustLangInLibsVersionsToml(initialToml, commonMainBundleName = "demo-commonMain")
+        assertContains(updated, """rustLang = "$DEFAULT_RUST_LANG_KOTLIN_VERSION"""")
+        assertContains(updated, """rust-lang-kotlin = { module = "io.github.kotlinmania:rust-lang-kotlin", version.ref = "rustLang" }""")
+        assertContains(updated, "demo-commonMain = [\n  \"km-io\",\n  \"rust-lang-kotlin\",\n]")
+        assertContains(updated, "rust-lang-commonMain = [\n  \"rust-lang-kotlin\",\n]")
+        assertEquals(updated, ensureRustLangInLibsVersionsToml(updated, commonMainBundleName = "demo-commonMain"))
     }
 }

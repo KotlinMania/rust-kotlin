@@ -1120,12 +1120,10 @@ internal fun KotlinJ2KEmitter.sourcePointerLayout(
             return "PrimitiveLayouts.$constName"
         }
         "i128" -> {
-            usesI128 = true
             CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
             return "PrimitiveLayouts.i128Layout(::I128, { it.high }, { it.low })"
         }
         "u128" -> {
-            usesU128 = true
             CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
             return "PrimitiveLayouts.u128Layout(::U128, { it.high }, { it.low })"
         }

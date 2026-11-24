@@ -669,8 +669,7 @@ public object StructLayoutComputer {
             NumericKind.U64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$primitiveLayoutsRef.U64")
             NumericKind.F64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$primitiveLayoutsRef.F64")
             NumericKind.F128 -> FieldLayoutSpec(16L, 16L, "16L", "16L", "$primitiveLayoutsRef.F128_LAYOUT")
-            NumericKind.I128 -> {
-                emitter.usesI128 = true
+            NumericKind.I128 ->
                 FieldLayoutSpec(
                     16L,
                     16L,
@@ -678,9 +677,7 @@ public object StructLayoutComputer {
                     "16L",
                     "$primitiveLayoutsRef.i128Layout(::I128, { it.high }, { it.low })",
                 )
-            }
-            NumericKind.U128 -> {
-                emitter.usesU128 = true
+            NumericKind.U128 ->
                 FieldLayoutSpec(
                     16L,
                     16L,
@@ -688,7 +685,6 @@ public object StructLayoutComputer {
                     "16L",
                     "$primitiveLayoutsRef.u128Layout(::U128, { it.high }, { it.low })",
                 )
-            }
         }
     }
 

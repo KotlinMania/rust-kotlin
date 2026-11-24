@@ -997,8 +997,10 @@ class SingleFileTranslationSynAndMacrosTest {
         assertEquals(1, Regex("is BackendSpan\\.Compiler ->").findAll(kt).count())
         assertContains(kt, "val matched = when {")
         assertContains(kt, "line!()".let { "u, \"wrapper.rs\"" })
-        assertContains(kt, "public class DebugStruct(")
-        assertContains(kt, "public class DebugTuple(")
+        assertContains(kt, "import io.github.kotlinmania.rustlang.core.fmt.DebugStruct")
+        assertContains(kt, "import io.github.kotlinmania.rustlang.core.fmt.DebugTuple")
+        assertFalse(kt.contains("class DebugStruct("))
+        assertFalse(kt.contains("class DebugTuple("))
         assertContains(kt, "public fun appendDebug(debug: DebugStruct, f: StringBuilder, label: String)")
 
         val manualDropFnSource =

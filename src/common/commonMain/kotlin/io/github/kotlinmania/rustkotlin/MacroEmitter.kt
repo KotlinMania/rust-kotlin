@@ -10,6 +10,7 @@ import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.BinOp
 import io.github.kotlinmania.syn.Expr
+import io.github.kotlinmania.syn.ExprParse
 import io.github.kotlinmania.syn.FnArg
 import io.github.kotlinmania.syn.GenericParam
 import io.github.kotlinmania.syn.Item
@@ -21,6 +22,7 @@ import io.github.kotlinmania.syn.PathArguments
 import io.github.kotlinmania.syn.Signature
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.UnOp
+import io.github.kotlinmania.syn.parse2
 import kotlin.io.encoding.Base64
 import io.github.kotlinmania.io.files.Path as KmPath
 
@@ -68,614 +70,747 @@ internal fun KotlinJ2KEmitter.renderMacroInvocationAsStmtOrExpr(
     selfTypeName: String?,
 ): String {
     CoreIntrinsicLowering.renderConstEvalSelectMacro(mac, this, indent, selfTypeName)?.let { return it }
-    val macroName =
-        mac.path.segments
-            .last()
-            ?.ident
-            ?.toString() ?: "macroCall"
-    val tokens = mac.tokens.clone()
-    return when (macroName) {
-        "tri" -> {
-            val inner = parseAndRenderTokenStreamAsExpr(tokens, indent, selfTypeName)
-            renderSourceResultTry(inner, "return")
+    val lastSegment = mac.path.segments.last()
+    val macroName = lastSegment?.ident?.toString() ?: "macroCall"
+    val ctx =
+        MacroInvocationContext(
+            emitter = this,
+            mac = mac,
+            macroName = macroName,
+            tokens = mac.tokens.clone(),
+            indent = indent,
+            selfTypeName = selfTypeName,
+        )
+    val rule = BUILTIN_MACRO_CALL_RULES_BY_NAME[macroName]
+    return if (rule != null) {
+        rule.render(ctx)
+    } else {
+        ctx.renderUserOrCrateMacroCall()
+    }
+}
+
+private class MacroInvocationContext(
+    val emitter: KotlinJ2KEmitter,
+    val mac: Macro,
+    val macroName: String,
+    val tokens: TokenStream,
+    val indent: String,
+    val selfTypeName: String?,
+) {
+    fun splitArgs(): List<List<TokenTree>> =
+        RustTokenCursor.splitMacroArguments(tokens)
+
+    fun renderTreesAsExpr(trees: List<TokenTree>): String =
+        emitter.parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(trees), indent, selfTypeName)
+
+    fun renderStreamAsExpr(stream: TokenStream): String =
+        emitter.parseAndRenderTokenStreamAsExpr(stream, indent, selfTypeName)
+
+    fun renderCommaExprs(): List<String> =
+        splitArgs()
+            .map(::renderTreesAsExpr)
+            .filter { it.isNotBlank() }
+
+    fun renderPlainFnCallFallback(callee: String = rustFunctionIdentToKotlin(macroName)): String =
+        "$callee(${renderCommaExprs().joinToString(", ")})"
+
+    fun joinCommaSeparatedTail(parts: List<List<TokenTree>>, fromIndex: Int = 1): TokenStream {
+        val joined = mutableListOf<TokenTree>()
+        for (i in fromIndex until parts.size) {
+            if (i > fromIndex) {
+                joined += TokenTree.Punct(Punct(',', Spacing.Alone))
+            }
+            joined.addAll(parts[i])
         }
-        "format", "format_args" -> renderFormatMacroInvocation(tokens, indent, selfTypeName)
-        "write", "writeln" -> renderWriteMacroInvocation(macroName, tokens, indent, selfTypeName)
-        "panic", "unreachable", "unimplemented", "todo" -> {
-            val msg =
-                if (tokens.isEmpty()) {
-                    val safeLabel = if (macroName == "unimplemented" || macroName == "todo") "unsupported" else macroName
-                    "\"$safeLabel\""
+        return TokenStream.fromTokenTrees(joined)
+    }
+
+    fun renderFormat(stream: TokenStream = tokens): String {
+        val parts = RustTokenCursor.splitMacroArguments(stream)
+        if (parts.isEmpty()) return "\"\""
+        val rawFormatBody = CompileTimeMacroStringEvaluator(parts[0]).evaluate()
+        if (rawFormatBody != null) {
+            val positional = mutableListOf<String>()
+            val named = linkedMapOf<String, String>()
+            for (i in 1 until parts.size) {
+                val argTrees = parts[i]
+                val argCursor = RustTokenCursor(argTrees)
+                if (argCursor.size >= 3 && argCursor.identAt(0) != null && argCursor.punctCharAt(1) == '=') {
+                    val key = argCursor.identAt(0)!!
+                    val renderedVal = renderTreesAsExpr(argTrees.drop(2))
+                    named[key] = renderedVal
+                    positional += renderedVal
                 } else {
-                    renderFormatMacroInvocation(tokens, indent, selfTypeName)
-                }
-            "error($msg)"
-        }
-        "const_panic" -> {
-            val parts = MacroRulesFileExpander.splitMacroArguments(tokens)
-            val firstMsg =
-                if (parts.isEmpty()) {
-                    "\"const_panic\""
-                } else {
-                    parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(parts[0]), indent, selfTypeName)
-                }
-            "error($firstMsg)"
-        }
-        "const_error" -> {
-            val parts = MacroRulesFileExpander.splitMacroArguments(tokens)
-            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-            val errType = bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.Error")
-            val msgType = bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.SimpleMessage")
-            if (parts.size >= 2) {
-                val kindExpr = parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(parts[0]), indent, selfTypeName)
-                val msgExpr = parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(parts[1]), indent, selfTypeName)
-                "$errType.fromStaticMessage($msgType(kind = $kindExpr, message = $msgExpr))"
-            } else {
-                val kindType = bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.ErrorKind")
-                "$errType.fromStaticMessage($msgType(kind = $kindType.Other, message = \"const_error\"))"
-            }
-        }
-        "println", "eprintln" -> {
-            val msg = renderFormatMacroInvocation(tokens, indent, selfTypeName)
-            "println($msg)"
-        }
-        "print", "eprint" -> {
-            val msg = renderFormatMacroInvocation(tokens, indent, selfTypeName)
-            "print($msg)"
-        }
-        "vec" -> {
-            val outerListTarget = currentExpectedParseTargetType?.removeSuffix("?")?.trim()
-            val elemTarget =
-                when {
-                    outerListTarget != null && outerListTarget.startsWith("MutableList<") && outerListTarget.endsWith(">") ->
-                        outerListTarget.removePrefix("MutableList<").dropLast(1).trim()
-                    outerListTarget != null && outerListTarget.startsWith("List<") && outerListTarget.endsWith(">") ->
-                        outerListTarget.removePrefix("List<").dropLast(1).trim()
-                    else -> null
-                }
-            val savedParseTarget = currentExpectedParseTargetType
-            val savedKind = currentExpectedNumericKind
-            val repeatStreams = splitTopLevelVecRepeatSemicolon(tokens)
-            if (repeatStreams != null) {
-                val (elemStream, countStream) = repeatStreams
-                val elemKind = elemTarget?.let(this::resolveNumericKind)
-                val (elemRendered, isLiteralElem) =
-                    try {
-                        currentExpectedParseTargetType = elemTarget
-                        currentExpectedNumericKind = elemKind
-                        val parsedElem =
-                            io.github.kotlinmania.syn
-                                .parse2(io.github.kotlinmania.syn.ExprParse::parse, elemStream.clone())
-                                .getOrNull()
-                        val rendered =
-                            if (parsedElem != null) {
-                                renderTypedNumericInitializer(parsedElem, elemKind, indent, selfTypeName)
-                            } else {
-                                parseAndRenderTokenStreamAsExpr(elemStream, indent, selfTypeName)
-                            }
-                        val isLit = parsedElem != null && unwrapParenOrGroupExpr(parsedElem) is Expr.Lit
-                        rendered to isLit
-                    } finally {
-                        currentExpectedParseTargetType = savedParseTarget
-                        currentExpectedNumericKind = savedKind
-                    }
-                val countInt =
-                    try {
-                        currentExpectedParseTargetType = null
-                        currentExpectedNumericKind = NumericKind.I32
-                        val parsedCount =
-                            io.github.kotlinmania.syn
-                                .parse2(io.github.kotlinmania.syn.ExprParse::parse, countStream.clone())
-                                .getOrNull()
-                        if (parsedCount != null) {
-                            val rawCount = renderTypedNumericInitializer(parsedCount, NumericKind.I32, indent, selfTypeName)
-                            normalizeArrayLengthToIntExpr(rawCount, parsedCount, selfTypeName)
-                        } else {
-                            val rawCount = parseAndRenderTokenStreamAsExpr(countStream, indent, selfTypeName)
-                            normalizeArrayLengthToIntExpr(rawCount, null, selfTypeName)
-                        }
-                    } finally {
-                        currentExpectedParseTargetType = savedParseTarget
-                        currentExpectedNumericKind = savedKind
-                    }
-                if (isLiteralElem) {
-                    "MutableList($countInt) { $elemRendered }"
-                } else {
-                    val repeatElemName = "repeatElem${closureLabelCounter++}"
-                    "run { val $repeatElemName = $elemRendered; MutableList($countInt) { $repeatElemName } }"
-                }
-            } else {
-                val args =
-                    try {
-                        if (elemTarget != null) {
-                            currentExpectedParseTargetType = elemTarget
-                            resolveNumericKind(elemTarget)?.let { currentExpectedNumericKind = it }
-                        }
-                        parseCommaSeparatedExprsFromTokens(tokens, indent, selfTypeName)
-                    } finally {
-                        currentExpectedParseTargetType = savedParseTarget
-                        currentExpectedNumericKind = savedKind
-                    }
-                "mutableListOf(${args.joinToString(", ")})"
-            }
-        }
-        "const_assert" -> {
-            val parts = MacroRulesFileExpander.splitMacroArguments(tokens)
-            if (parts.isEmpty()) {
-                "check(true)"
-            } else {
-                val cond = parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(parts[0]), indent, selfTypeName)
-                if (parts.size >= 2) {
-                    val firstMsg = parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(parts[1]), indent, selfTypeName)
-                    "check($cond) { $firstMsg }"
-                } else {
-                    "check($cond)"
+                    positional += renderTreesAsExpr(argTrees)
                 }
             }
+            return renderRustFormatAsKotlinTemplate(rawFormatBody, positional, named)
         }
-        "assert", "debug_assert" -> {
-            val parts = MacroRulesFileExpander.splitMacroArguments(tokens)
-            if (parts.isEmpty()) {
-                "check(true)"
-            } else {
-                val cond = parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(parts[0]), indent, selfTypeName)
-                if (parts.size >= 2) {
-                    val msgTokens = mutableListOf<TokenTree>()
-                    for (i in 1 until parts.size) {
-                        if (i > 1) {
-                            msgTokens += TokenTree.Punct(Punct(',', Spacing.Alone))
-                        }
-                        msgTokens.addAll(parts[i])
-                    }
-                    val msg = renderFormatMacroInvocation(TokenStream.fromTokenTrees(msgTokens), indent, selfTypeName)
-                    "check($cond) { $msg }"
-                } else {
-                    "check($cond)"
-                }
-            }
-        }
-        "assert_eq", "debug_assert_eq", "assert_ne", "debug_assert_ne" -> {
-            val parts = splitAssertEqArgsForMacro(tokens)
-            val isNotEq = macroName.endsWith("_ne")
-            when {
-                parts.isEmpty() -> "check(true)"
-                parts.size == 1 -> {
-                    val single = parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(parts[0]), indent, selfTypeName)
-                    "check($single)"
-                }
-                else -> {
-                    val leftStream = TokenStream.fromTokenTrees(parts[0])
-                    val rightStream = TokenStream.fromTokenTrees(parts[1])
-                    val left =
-                        io.github.kotlinmania.syn
-                            .parse2(io.github.kotlinmania.syn.ExprParse::parse, leftStream.clone())
-                            .getOrNull()
-                    val right =
-                        io.github.kotlinmania.syn
-                            .parse2(io.github.kotlinmania.syn.ExprParse::parse, rightStream.clone())
-                            .getOrNull()
-                    if (left != null && right != null) {
-                        "check(${renderSourceEquality(left, right, isNotEq, indent, selfTypeName)})"
-                    } else {
-                        val lRendered =
-                            left?.let { renderExpr(it, indent, selfTypeName) }
-                                ?: parseAndRenderTokenStreamAsExpr(leftStream, indent, selfTypeName)
-                        val rRendered =
-                            right?.let { renderExpr(it, indent, selfTypeName) }
-                                ?: parseAndRenderTokenStreamAsExpr(rightStream, indent, selfTypeName)
-                        val op = if (isNotEq) "!=" else "=="
-                        "check(($lRendered) $op ($rRendered))"
-                    }
-                }
-            }
-        }
-        "cfg" -> evalCfgExpressionTokens(tokens.clone().toList()).toString()
-        "stringify" -> renderKotlinDoubleQuotedString(stringifyTokenStream(tokens))
-        "concat" ->
-            tryEvalConcatTokens(tokens)?.let(::renderKotlinDoubleQuotedString) ?: run {
-                val parts = parseCommaSeparatedExprsFromTokens(tokens, indent, selfTypeName)
-                if (parts.isEmpty()) "\"\"" else parts.joinToString(" + ")
-            }
-        "include_bytes", "include_str" -> renderIncludeMacro(macroName, tokens, indent)
-        "matches" -> renderMatchesMacroInvocation(tokens, indent, selfTypeName)
-        "line" -> {
-            if (tokens.isEmpty()) {
-                val startLoc = mac.path.span().start()
-                "${startLoc.line}u"
-            } else {
-                val args = parseCommaSeparatedExprsFromTokens(tokens, indent, selfTypeName)
-                "line(${args.joinToString(", ")})"
-            }
-        }
-        "column" -> {
-            if (tokens.isEmpty()) {
-                val startLoc = mac.path.span().start()
-                "${startLoc.column + 1}u"
-            } else {
-                val args = parseCommaSeparatedExprsFromTokens(tokens, indent, selfTypeName)
-                "column(${args.joinToString(", ")})"
-            }
-        }
-        "file" -> {
-            if (tokens.isEmpty()) {
-                renderKotlinDoubleQuotedString(headerContext.portLintSourcePath.orEmpty())
-            } else {
-                val args = parseCommaSeparatedExprsFromTokens(tokens, indent, selfTypeName)
-                "file(${args.joinToString(", ")})"
-            }
-        }
-        "Token" -> renderTokenMacro(tokens)
-        "parenthesized", "braced", "bracketed" -> {
-            val delim = extractDelimitedMacroParts(mac, indent, selfTypeName)
-            if (delim != null) {
-                renderSourceResultTry("${delim.first}(${delim.third})", "return")
-            } else {
-                val fnName = rustFunctionIdentToKotlin(macroName)
-                val args = parseCommaSeparatedExprsFromTokens(tokens, indent, selfTypeName)
-                "$fnName(${args.joinToString(", ")})"
-            }
-        }
-        "quote", "parse_quote" ->
-            renderQuoteMacroInvocation(rustFunctionIdentToKotlin(macroName), tokens, indent, selfTypeName, spanned = false)
-        "quote_block" ->
-            "Fragment.Block(${renderQuoteMacroInvocation("quote", tokens, indent, selfTypeName, spanned = false)})"
-        "quote_expr" ->
-            "Fragment.Expr(${renderQuoteMacroInvocation("quote", tokens, indent, selfTypeName, spanned = false)})"
-        "quote_spanned", "parse_quote_spanned" ->
-            renderQuoteMacroInvocation(rustFunctionIdentToKotlin(macroName), tokens, indent, selfTypeName, spanned = true)
-        "cpp", "c" -> {
-            val inlineCall =
-                ffiCollector.recordInlineExpressionMacro(
-                    mac = mac,
-                    enclosingFnKotlinName = currentEnclosingFunctionName,
-                    renderRustType = { rustTy, isParam ->
-                        val prevAbi = inExternAbiSignature
-                        val prevParam = inExternParamType
-                        inExternAbiSignature = true
-                        inExternParamType = isParam
-                        try {
-                            renderType(rustTy, selfTypeName)
-                        } finally {
-                            inExternParamType = prevParam
-                            inExternAbiSignature = prevAbi
-                        }
-                    },
-                    resolveLocalExprName = { raw -> scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw) },
-                )
-            if (inlineCall != null) {
-                inlineCall
-            } else {
-                val fnName = rustFunctionIdentToKotlin(macroName)
-                val args = parseCommaSeparatedExprsFromTokens(tokens, indent, selfTypeName)
-                "$fnName(${args.joinToString(", ")})"
-            }
-        }
-        "offset_of" -> {
-            if (headerContext.rawAbiMode && currentExpectedNumericKind == null) {
-                "0uL"
-            } else {
-                renderIntLiteral("0", "")
-            }
-        }
-        "addr_of", "addr_of_mut" -> {
-            // Taking an address must not become null or a copied pointee value.
-            // Retain the raw-place operation for the pointer/storage lowering,
-            // including field/index places rather than only simple identifiers.
-            val place = parseAndRenderTokenStreamAsExpr(tokens, indent, selfTypeName)
-            val callee = rustFunctionIdentToKotlin(macroName)
-            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-            if (("core" in headerContext.crateNamespaces || headerContext.packageName?.startsWith(coreNs) == true) &&
-                headerContext.packageName != "$coreNs.mem"
-            ) {
-                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.$callee")
-            }
-            "$callee($place)"
-        }
-        "asm", "naked_asm", "global_asm" -> "Unit"
-        else -> {
-            val macSegs = mac.path.segments.toList()
-            val segStrings = macSegs.map { it.ident.toString() }
-            val args = parseCommaSeparatedExprsFromTokens(tokens, indent, selfTypeName)
-            val fnName = rustFunctionIdentToKotlin(macroName)
-            val callee =
-                if (segStrings.size >= 2) {
-                    val crossTarget = resolveCrossModulePathTarget(segStrings)
-                    if (crossTarget != null && crossTarget.second.isEmpty()) {
-                        bindOrQualifyResolvedCrossSymbol(crossTarget.first)
-                    } else if (scopeBuilder.isImportedModuleInScope(segStrings.first().removePrefix("r#"))) {
-                        val modKt =
-                            scopeBuilder.resolveModuleBinding(segStrings.first().removePrefix("r#"))?.kotlinName
-                                ?: rustModuleIdentToKotlin(segStrings.first())
-                        "$modKt.$fnName"
-                    } else {
-                        fnName
-                    }
-                } else if (macroName.removePrefix("r#") !in inspector.declaredTopLevelFnRawNames &&
-                    fnName !in KOTLIN_STDLIB_SHADOWED_IMPORTS &&
-                    !(fnName.length == 1 && fnName[0] in 'A'..'Z') &&
-                    fnName !in inspector.enumVariantSimpleNames &&
-                    fnName !in inspector.importedEnumVariantSimpleNames &&
-                    scopeBuilder.resolveLocalKotlinName(macroName.removePrefix("r#")) == null &&
-                    headerContext.crateSymbolSubpackages.isNotEmpty()
-                ) {
-                    val subpkg = resolveBestSubpackageForSymbol(fnName)
-                    val nsPrefix = currentNamespacePrefix()
-                    if (subpkg != null && nsPrefix != null) {
-                        val targetPkg = if (subpkg.isEmpty()) nsPrefix else "$nsPrefix.$subpkg"
-                        bindOrQualifyResolvedCrossSymbol("$targetPkg.$fnName")
-                    } else {
-                        fnName
-                    }
+        return parts.joinToString(" + ", transform = ::renderTreesAsExpr)
+    }
+
+    fun renderUserOrCrateMacroCall(): String {
+        val pathSegments = mac.path.segments.toList()
+        val segStrings = pathSegments.map { it.ident.toString() }
+        val args = renderCommaExprs()
+        val fnName = rustFunctionIdentToKotlin(macroName)
+        val rawMacro = macroName.removePrefix("r#")
+        val callee =
+            if (segStrings.size >= 2) {
+                val crossTarget = emitter.resolveCrossModulePathTarget(segStrings)
+                val firstModRaw = segStrings.first().removePrefix("r#")
+                if (crossTarget != null && crossTarget.second.isEmpty()) {
+                    emitter.bindOrQualifyResolvedCrossSymbol(crossTarget.first)
+                } else if (emitter.scopeBuilder.isImportedModuleInScope(firstModRaw)) {
+                    val modKt =
+                        emitter.scopeBuilder.resolveModuleBinding(firstModRaw)?.kotlinName
+                            ?: rustModuleIdentToKotlin(segStrings.first())
+                    "$modKt.$fnName"
                 } else {
                     fnName
                 }
-            "$callee(${args.joinToString(", ")})"
-        }
-    }
-}
-
-internal fun KotlinJ2KEmitter.renderTokenMacro(tokens: TokenStream): String =
-    resolveSynTokenMacroTypeName(tokens)?.let { "$it.default()" } ?: "Token"
-
-internal fun KotlinJ2KEmitter.resolveSynTokenMacroTypeName(tokens: TokenStream): String? {
-    val trees = tokens.clone().toList()
-    if (trees.isEmpty()) return null
-    if (trees.size == 1 && trees[0] is TokenTree.Ident) {
-        val ident = (trees[0] as TokenTree.Ident).value.toString()
-        return when (ident) {
-            "Self" -> "SelfType"
-            "self" -> "SelfValue"
-            "type" -> "SynTypeToken"
-            "_" -> "Underscore"
-            in SYN_KEYWORD_TOKENS -> ident[0].uppercaseChar() + ident.substring(1)
-            else -> null
-        }
-    }
-    if (trees.size <= 3 && trees.all { it is TokenTree.Punct }) {
-        for (idx in 0 until trees.lastIndex) {
-            val p = (trees[idx] as TokenTree.Punct).value
-            if (p.spacing() != Spacing.Joint) return null
-        }
-        val seq = buildString(trees.size) { trees.forEach { append((it as TokenTree.Punct).value.asChar()) } }
-        return SYN_PUNCT_TOKEN_NAMES[seq]
-    }
-    return null
-}
-
-internal fun KotlinJ2KEmitter.renderQuoteMacroInvocation(
-    fnName: String,
-    tokens: TokenStream,
-    indent: String,
-    selfTypeName: String?,
-    spanned: Boolean,
-): String {
-    val list = tokens.clone().toList()
-    var bodyStartIdx = 0
-    var spanArg: String? = null
-    if (spanned) {
-        for (i in 0 until list.size - 1) {
-            val p1 = list[i] as? TokenTree.Punct
-            val p2 = list[i + 1] as? TokenTree.Punct
-            if (p1?.value?.asChar() == '=' && p2?.value?.asChar() == '>') {
-                val spanStream = TokenStream.fromTokenTrees(list.subList(0, i))
-                spanArg = parseAndRenderTokenStreamAsExpr(spanStream, indent, selfTypeName)
-                bodyStartIdx = i + 2
-                break
+            } else if (rawMacro !in emitter.inspector.declaredTopLevelFnRawNames &&
+                fnName !in KOTLIN_STDLIB_SHADOWED_IMPORTS &&
+                !(fnName.length == 1 && fnName[0] in 'A'..'Z') &&
+                fnName !in emitter.inspector.enumVariantSimpleNames &&
+                fnName !in emitter.inspector.importedEnumVariantSimpleNames &&
+                emitter.scopeBuilder.resolveLocalKotlinName(rawMacro) == null &&
+                emitter.headerContext.crateSymbolSubpackages.isNotEmpty()
+            ) {
+                val subpkg = emitter.resolveBestSubpackageForSymbol(fnName)
+                val nsPrefix = emitter.currentNamespacePrefix()
+                if (subpkg != null && nsPrefix != null) {
+                    val targetPkg = if (subpkg.isEmpty()) nsPrefix else "$nsPrefix.$subpkg"
+                    emitter.bindOrQualifyResolvedCrossSymbol("$targetPkg.$fnName")
+                } else {
+                    fnName
+                }
+            } else {
+                fnName
             }
-        }
+        return "$callee(${args.joinToString(", ")})"
     }
-    val bodyTrees =
-        if (bodyStartIdx > 0) {
-            list.subList(bodyStartIdx, list.size)
-        } else {
-            list
-        }
-    val templateSb = StringBuilder()
-    val bindings = linkedMapOf<String, String>()
-    buildQuoteTemplateAndBindings(bodyTrees, templateSb, bindings, selfTypeName)
-    val templateLit = renderKotlinDoubleQuotedString(templateSb.toString().trim())
-    val callArgs = mutableListOf<String>()
-    if (spanArg != null) callArgs += spanArg
-    callArgs += templateLit
-    for ((k, v) in bindings) {
-        callArgs += "\"$k\" to $v"
-    }
-    return "$fnName(${callArgs.joinToString(", ")})"
 }
 
-internal fun KotlinJ2KEmitter.buildQuoteTemplateAndBindings(
-    list: List<TokenTree>,
-    out: StringBuilder,
-    bindings: MutableMap<String, String>,
-    selfTypeName: String?,
+private abstract class BuiltinMacroCallRule(
+    val names: Set<String>,
 ) {
-    var i = 0
-    while (i < list.size) {
-        val tt = list[i]
-        if (tt is TokenTree.Punct && tt.value.asChar() == '#' && i + 1 < list.size) {
-            val next = list[i + 1]
-            if (next is TokenTree.Ident) {
-                val raw = next.value.toString().removePrefix("r#")
-                val ktIdent =
-                    when {
-                        raw == "self" -> "this"
-                        raw == "Self" -> selfTypeName ?: "Self"
-                        raw.first().isUpperCase() -> rustTypeIdentToKotlin(raw)
-                        else -> scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
-                    }
-                out.append("`#`").append(ktIdent).append(' ')
-                if (ktIdent != "this") {
-                    bindings[ktIdent] = ktIdent
-                }
-                i += 2
-                continue
-            } else if (next is TokenTree.Group && next.value.delimiter() == Delimiter.Bracket) {
-                out.append("`#`[")
-                buildQuoteTemplateAndBindings(next.value.stream().toList(), out, bindings, selfTypeName)
-                out.append("] ")
-                i += 2
-                continue
-            } else if (next is TokenTree.Group && next.value.delimiter() == Delimiter.Parenthesis) {
-                buildQuoteTemplateAndBindings(next.value.stream().toList(), out, bindings, selfTypeName)
-                i += 2
-                if (i < list.size && list[i] is TokenTree.Punct && (list[i] as TokenTree.Punct).value.asChar() == '*') {
-                    i++
-                }
-                continue
-            }
+    constructor(vararg names: String) : this(names.toSet())
+
+    abstract fun render(ctx: MacroInvocationContext): String
+}
+
+private object TriMacroRule : BuiltinMacroCallRule("tri") {
+    override fun render(ctx: MacroInvocationContext): String =
+        ctx.emitter.renderSourceResultTry(ctx.renderStreamAsExpr(ctx.tokens), "return")
+}
+
+private object FormatMacroRule : BuiltinMacroCallRule("format", "format_args") {
+    override fun render(ctx: MacroInvocationContext): String =
+        ctx.renderFormat()
+}
+
+private object WriteMacroRule : BuiltinMacroCallRule("write", "writeln") {
+    override fun render(ctx: MacroInvocationContext): String {
+        val parts = ctx.splitArgs()
+        if (parts.isEmpty()) return "${rustFunctionIdentToKotlin(ctx.macroName)}()"
+        val target = ctx.renderTreesAsExpr(parts[0])
+        val isWriteln = ctx.macroName == "writeln"
+        if (parts.size == 1) {
+            return if (isWriteln) "$target.appendLine()" else "$target.append(\"\")"
         }
-        when (tt) {
-            is TokenTree.Ident -> out.append(tt.value.toString()).append(' ')
-            is TokenTree.Literal -> out.append(tt.value.toString()).append(' ')
-            is TokenTree.Punct -> {
-                out.append(tt.value.asChar())
-                if (tt.value.spacing() == io.github.kotlinmania.procmacro2.Spacing.Alone) {
-                    out.append(' ')
-                }
-            }
-            is TokenTree.Group -> {
-                val (open, close) =
-                    when (tt.value.delimiter()) {
-                        Delimiter.Brace -> "{ " to " } "
-                        Delimiter.Parenthesis -> "(" to ") "
-                        Delimiter.Bracket -> "[" to "] "
-                        Delimiter.None -> "" to " "
-                    }
-                out.append(open)
-                buildQuoteTemplateAndBindings(tt.value.stream().toList(), out, bindings, selfTypeName)
-                out.append(close)
-            }
-        }
-        i++
+        val appendMethod = if (isWriteln) "appendLine" else "append"
+        val formatted = ctx.renderFormat(ctx.joinCommaSeparatedTail(parts))
+        return "$target.$appendMethod($formatted)"
     }
 }
 
-internal fun KotlinJ2KEmitter.flattenNoneDelimitedGroups(stream: TokenStream, out: MutableList<TokenTree>) {
-    for (tt in stream.clone().toList()) {
-        if (tt is TokenTree.Group && tt.value.delimiter() == Delimiter.None) {
-            flattenNoneDelimitedGroups(tt.value.stream(), out)
+private object PrintMacroRule : BuiltinMacroCallRule("println", "eprintln", "print", "eprint") {
+    override fun render(ctx: MacroInvocationContext): String {
+        val fn = if (ctx.macroName.endsWith("ln")) "println" else "print"
+        return "$fn(${ctx.renderFormat()})"
+    }
+}
+
+private object PanicMacroRule : BuiltinMacroCallRule("panic", "unreachable", "unimplemented", "todo", "const_panic") {
+    override fun render(ctx: MacroInvocationContext): String {
+        if (ctx.macroName == "const_panic") {
+            val parts = ctx.splitArgs()
+            val firstMsg = if (parts.isEmpty()) "\"const_panic\"" else ctx.renderTreesAsExpr(parts[0])
+            return "error($firstMsg)"
+        }
+        val msg =
+            if (ctx.tokens.isEmpty()) {
+                val safeLabel = if (ctx.macroName == "unimplemented" || ctx.macroName == "todo") "unsupported" else ctx.macroName
+                "\"$safeLabel\""
+            } else {
+                ctx.renderFormat()
+            }
+        return "error($msg)"
+    }
+}
+
+private object ConstErrorMacroRule : BuiltinMacroCallRule("const_error") {
+    override fun render(ctx: MacroInvocationContext): String {
+        val parts = ctx.splitArgs()
+        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(ctx.emitter.headerContext)
+        val errType = ctx.emitter.bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.Error")
+        val msgType = ctx.emitter.bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.SimpleMessage")
+        return if (parts.size >= 2) {
+            val kindExpr = ctx.renderTreesAsExpr(parts[0])
+            val msgExpr = ctx.renderTreesAsExpr(parts[1])
+            "$errType.fromStaticMessage($msgType(kind = $kindExpr, message = $msgExpr))"
         } else {
-            out += tt
+            val kindType = ctx.emitter.bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.ErrorKind")
+            "$errType.fromStaticMessage($msgType(kind = $kindType.Other, message = \"const_error\"))"
         }
     }
 }
 
-internal fun KotlinJ2KEmitter.stringifyTokenStream(tokens: TokenStream): String {
-    val flat = mutableListOf<TokenTree>()
-    flattenNoneDelimitedGroups(tokens, flat)
-    return TokenStream.fromTokenTrees(flat).toString()
-}
-
-internal fun KotlinJ2KEmitter.unwrapNoneGroupSlice(trees: List<TokenTree>): List<TokenTree> {
-    var cur = trees
-    while (cur.size == 1 && cur[0] is TokenTree.Group && (cur[0] as TokenTree.Group).value.delimiter() == Delimiter.None) {
-        cur = (cur[0] as TokenTree.Group).value.stream().toList()
-    }
-    return cur
-}
-
-internal fun KotlinJ2KEmitter.tryEvalCompileTimeStringMacroArg(rawTrees: List<TokenTree>): String? {
-    val trees = unwrapNoneGroupSlice(rawTrees)
-    if (trees.isEmpty()) return null
-    if (trees.size == 1) {
-        when (val single = trees[0]) {
-            is TokenTree.Literal -> {
-                val strRes = single.value.strValue()
-                strRes.value?.let { return it }
-                return when (val lit = Lit.new(single.value)) {
-                    is Lit.Str -> lit.value.value()
-                    is Lit.Char -> {
-                        val cp = lit.value.value()
-                        if (cp > 0xFFFF && cp <= 0x10FFFF) {
-                            val hi = ((cp - 0x10000) ushr 10) + 0xD800
-                            val lo = ((cp - 0x10000) and 0x3FF) + 0xDC00
-                            charArrayOf(hi.toChar(), lo.toChar()).concatToString()
+private object VecMacroRule : BuiltinMacroCallRule("vec") {
+    override fun render(ctx: MacroInvocationContext): String {
+        val emitter = ctx.emitter
+        val outerListTarget = emitter.currentExpectedParseTargetType?.removeSuffix("?")?.trim()
+        val elemTarget =
+            when {
+                outerListTarget != null && outerListTarget.startsWith("MutableList<") && outerListTarget.endsWith(">") ->
+                    outerListTarget.removePrefix("MutableList<").dropLast(1).trim()
+                outerListTarget != null && outerListTarget.startsWith("List<") && outerListTarget.endsWith(">") ->
+                    outerListTarget.removePrefix("List<").dropLast(1).trim()
+                else -> null
+            }
+        val savedParseTarget = emitter.currentExpectedParseTargetType
+        val savedKind = emitter.currentExpectedNumericKind
+        val repeatStreams = splitTopLevelVecRepeatSemicolon(ctx.tokens)
+        if (repeatStreams != null) {
+            val (elemStream, countStream) = repeatStreams
+            val elemKind = elemTarget?.let(emitter::resolveNumericKind)
+            val (elemRendered, isLiteralElem) =
+                try {
+                    emitter.currentExpectedParseTargetType = elemTarget
+                    emitter.currentExpectedNumericKind = elemKind
+                    val parsedElem = parse2(ExprParse::parse, elemStream.clone()).getOrNull()
+                    val rendered =
+                        if (parsedElem != null) {
+                            emitter.renderTypedNumericInitializer(parsedElem, elemKind, ctx.indent, ctx.selfTypeName)
                         } else {
-                            cp.toChar().toString()
+                            ctx.renderStreamAsExpr(elemStream)
                         }
+                    val isLit = parsedElem != null && emitter.unwrapParenOrGroupExpr(parsedElem) is Expr.Lit
+                    rendered to isLit
+                } finally {
+                    emitter.currentExpectedParseTargetType = savedParseTarget
+                    emitter.currentExpectedNumericKind = savedKind
+                }
+            val countInt =
+                try {
+                    emitter.currentExpectedParseTargetType = null
+                    emitter.currentExpectedNumericKind = NumericKind.I32
+                    val parsedCount = parse2(ExprParse::parse, countStream.clone()).getOrNull()
+                    if (parsedCount != null) {
+                        val rawCount = emitter.renderTypedNumericInitializer(parsedCount, NumericKind.I32, ctx.indent, ctx.selfTypeName)
+                        emitter.normalizeArrayLengthToIntExpr(rawCount, parsedCount, ctx.selfTypeName)
+                    } else {
+                        val rawCount = ctx.renderStreamAsExpr(countStream)
+                        emitter.normalizeArrayLengthToIntExpr(rawCount, null, ctx.selfTypeName)
                     }
-                    is Lit.Int -> lit.value.base10Digits()
-                    is Lit.Float -> lit.value.base10Digits()
-                    is Lit.Bool -> lit.value.value().toString()
+                } finally {
+                    emitter.currentExpectedParseTargetType = savedParseTarget
+                    emitter.currentExpectedNumericKind = savedKind
+                }
+            return if (isLiteralElem) {
+                "MutableList($countInt) { $elemRendered }"
+            } else {
+                val repeatElemName = "repeatElem${emitter.closureLabelCounter++}"
+                "run { val $repeatElemName = $elemRendered; MutableList($countInt) { $repeatElemName } }"
+            }
+        }
+        val args =
+            try {
+                if (elemTarget != null) {
+                    emitter.currentExpectedParseTargetType = elemTarget
+                    emitter.resolveNumericKind(elemTarget)?.let { emitter.currentExpectedNumericKind = it }
+                }
+                ctx.renderCommaExprs()
+            } finally {
+                emitter.currentExpectedParseTargetType = savedParseTarget
+                emitter.currentExpectedNumericKind = savedKind
+            }
+        return "mutableListOf(${args.joinToString(", ")})"
+    }
+
+    private fun splitTopLevelVecRepeatSemicolon(tokens: TokenStream): Pair<TokenStream, TokenStream>? {
+        val cursor = RustTokenCursor(tokens.clone().toList())
+        if (cursor.size == 0) return null
+        var semiIndex = -1
+        for (idx in 0 until cursor.size) {
+            if (cursor.punctCharAt(idx) == ';') {
+                if (semiIndex >= 0) return null
+                semiIndex = idx
+            }
+        }
+        if (semiIndex <= 0 || semiIndex >= cursor.size - 1) return null
+        return TokenStream.fromTokenTrees(cursor.trees.subList(0, semiIndex)) to
+            TokenStream.fromTokenTrees(cursor.trees.subList(semiIndex + 1, cursor.size))
+    }
+}
+
+private object AssertMacroRule : BuiltinMacroCallRule("assert", "debug_assert", "const_assert") {
+    override fun render(ctx: MacroInvocationContext): String {
+        val parts = ctx.splitArgs()
+        if (parts.isEmpty()) return "check(true)"
+        val cond = ctx.renderTreesAsExpr(parts[0])
+        if (parts.size < 2) return "check($cond)"
+        val msg =
+            if (ctx.macroName == "const_assert") {
+                ctx.renderTreesAsExpr(parts[1])
+            } else {
+                ctx.renderFormat(ctx.joinCommaSeparatedTail(parts))
+            }
+        return "check($cond) { $msg }"
+    }
+}
+
+private object EqualityAssertMacroRule : BuiltinMacroCallRule("assert_eq", "debug_assert_eq", "assert_ne", "debug_assert_ne") {
+    override fun render(ctx: MacroInvocationContext): String {
+        val parts = RustTokenCursor.splitMacroCommaArgsWithComparisonFallback(ctx.tokens)
+        val isNotEq = ctx.macroName.endsWith("_ne")
+        return when {
+            parts.isEmpty() -> "check(true)"
+            parts.size == 1 -> "check(${ctx.renderTreesAsExpr(parts[0])})"
+            else -> {
+                val leftStream = TokenStream.fromTokenTrees(parts[0])
+                val rightStream = TokenStream.fromTokenTrees(parts[1])
+                val left = parse2(ExprParse::parse, leftStream.clone()).getOrNull()
+                val right = parse2(ExprParse::parse, rightStream.clone()).getOrNull()
+                if (left != null && right != null) {
+                    "check(${ctx.emitter.renderSourceEquality(left, right, isNotEq, ctx.indent, ctx.selfTypeName)})"
+                } else {
+                    val lRendered = left?.let { ctx.emitter.renderExpr(it, ctx.indent, ctx.selfTypeName) } ?: ctx.renderStreamAsExpr(leftStream)
+                    val rRendered = right?.let { ctx.emitter.renderExpr(it, ctx.indent, ctx.selfTypeName) } ?: ctx.renderStreamAsExpr(rightStream)
+                    val op = if (isNotEq) "!=" else "=="
+                    "check(($lRendered) $op ($rRendered))"
+                }
+            }
+        }
+    }
+}
+
+private object CompileTimeTextMacroRule : BuiltinMacroCallRule("cfg", "stringify", "concat") {
+    override fun render(ctx: MacroInvocationContext): String =
+        when (ctx.macroName) {
+            "cfg" -> evalCfgExpressionTokens(ctx.tokens.clone().toList()).toString()
+            "stringify" -> renderKotlinDoubleQuotedString(CompileTimeMacroStringEvaluator.stringifyStream(ctx.tokens))
+            else ->
+                CompileTimeMacroStringEvaluator.evaluateConcat(ctx.tokens)?.let(::renderKotlinDoubleQuotedString) ?: run {
+                    val parts = ctx.renderCommaExprs()
+                    if (parts.isEmpty()) "\"\"" else parts.joinToString(" + ")
+                }
+        }
+}
+
+private object IncludeFileMacroRule : BuiltinMacroCallRule("include_bytes", "include_str") {
+    override fun render(ctx: MacroInvocationContext): String {
+        val nonEmptyParts = ctx.splitArgs().filter { it.isNotEmpty() }
+        val relPath =
+            nonEmptyParts
+                .singleOrNull()
+                ?.let { CompileTimeMacroStringEvaluator(it).evaluate() }
+                ?: error("${ctx.macroName}! expects a compile-time string path argument")
+        val resolvedPath = resolveIncludeTargetPath(ctx.emitter.headerContext.sourceFilePath, relPath)
+        val kmPath = KmPath(resolvedPath)
+        val meta = SystemFileSystem.metadataOrNull(kmPath)
+        require(meta != null && meta.isRegularFile) {
+            "${ctx.macroName}! target file not found: $resolvedPath"
+        }
+        val bytes = SystemFileSystem.readBytes(kmPath)
+        return when (ctx.macroName) {
+            "include_bytes" -> {
+                if (bytes.isEmpty()) {
+                    "byteArrayOf()"
+                } else {
+                    ctx.emitter.extraTypePathImports += "import kotlin.io.encoding.Base64"
+                    renderChunkedBase64ByteArrayExpr(Base64.Default.encode(bytes), ctx.indent)
+                }
+            }
+            "include_str" -> renderChunkedStringLiteralExpr(bytes.decodeToString(throwOnInvalidSequence = true), ctx.indent)
+            else -> error("unsupported include macro: ${ctx.macroName}")
+        }
+    }
+}
+
+private object MatchesMacroRule : BuiltinMacroCallRule("matches") {
+    override fun render(ctx: MacroInvocationContext): String {
+        val parts = ctx.splitArgs().filter { it.isNotEmpty() }
+        if (parts.size < 2) return "false"
+        val matchHead = TokenStream.fromString("match").getOrThrow().toList()
+        val matchTail = TokenStream.fromString("=> true, _ => false").getOrThrow().toList()
+        val scrutineeTokens =
+            if (parts[0].any { it is TokenTree.Group && it.value.delimiter() == Delimiter.Brace }) {
+                listOf(TokenTree.Group(Group(Delimiter.Parenthesis, TokenStream.fromTokenTrees(parts[0]))))
+            } else {
+                parts[0]
+            }
+        val armTokens =
+            buildList {
+                addAll(parts[1])
+                addAll(matchTail)
+            }
+        val fullTokens =
+            buildList {
+                addAll(matchHead)
+                addAll(scrutineeTokens)
+                add(TokenTree.Group(Group(Delimiter.Brace, TokenStream.fromTokenTrees(armTokens))))
+            }
+        return ctx.renderTreesAsExpr(fullTokens)
+    }
+}
+
+private object SourceLocationMacroRule : BuiltinMacroCallRule("line", "column", "file") {
+    override fun render(ctx: MacroInvocationContext): String {
+        if (!ctx.tokens.isEmpty()) {
+            return ctx.renderPlainFnCallFallback(ctx.macroName)
+        }
+        val macSpan = ctx.mac.path.span()
+        val startLoc = macSpan.start()
+        val sourcePath = ctx.emitter.headerContext.portLintSourcePath
+        return when (ctx.macroName) {
+            "line" -> "${startLoc.line}u"
+            "column" -> "${startLoc.column + 1}u"
+            else -> renderKotlinDoubleQuotedString(sourcePath.orEmpty())
+        }
+    }
+}
+
+private object SynDelimiterOrTokenMacroRule : BuiltinMacroCallRule("Token", "parenthesized", "braced", "bracketed") {
+    override fun render(ctx: MacroInvocationContext): String {
+        if (ctx.macroName == "Token") {
+            return RustTokenCursor.resolveSynTokenStreamTypeName(ctx.tokens)?.let { "$it.default()" } ?: "Token"
+        }
+        val delim = ctx.emitter.extractDelimitedMacroParts(ctx.mac, ctx.indent, ctx.selfTypeName)
+        return if (delim != null) {
+            ctx.emitter.renderSourceResultTry("${delim.first}(${delim.third})", "return")
+        } else {
+            ctx.renderPlainFnCallFallback()
+        }
+    }
+}
+
+private object QuoteFamilyMacroRule : BuiltinMacroCallRule(
+    "quote",
+    "parse_quote",
+    "quote_block",
+    "quote_expr",
+    "quote_spanned",
+    "parse_quote_spanned",
+) {
+    override fun render(ctx: MacroInvocationContext): String {
+        val list = ctx.tokens.clone().toList()
+        return when (ctx.macroName) {
+            "quote_block" ->
+                "Fragment.Block(${QuoteMacroTokenEmitter(list, ctx.emitter, ctx.selfTypeName).renderCall("quote", ctx.indent, spanned = false)})"
+            "quote_expr" ->
+                "Fragment.Expr(${QuoteMacroTokenEmitter(list, ctx.emitter, ctx.selfTypeName).renderCall("quote", ctx.indent, spanned = false)})"
+            "quote_spanned", "parse_quote_spanned" ->
+                QuoteMacroTokenEmitter(list, ctx.emitter, ctx.selfTypeName)
+                    .renderCall(rustFunctionIdentToKotlin(ctx.macroName), ctx.indent, spanned = true)
+            else ->
+                QuoteMacroTokenEmitter(list, ctx.emitter, ctx.selfTypeName)
+                    .renderCall(rustFunctionIdentToKotlin(ctx.macroName), ctx.indent, spanned = false)
+        }
+    }
+}
+
+private object InlineHostMacroRule : BuiltinMacroCallRule("cpp", "c") {
+    override fun render(ctx: MacroInvocationContext): String {
+        val emitter = ctx.emitter
+        val inlineCall =
+            emitter.ffiCollector.recordInlineExpressionMacro(
+                mac = ctx.mac,
+                enclosingFnKotlinName = emitter.currentEnclosingFunctionName,
+                renderRustType = { rustTy, isParam ->
+                    val prevAbi = emitter.inExternAbiSignature
+                    val prevParam = emitter.inExternParamType
+                    emitter.inExternAbiSignature = true
+                    emitter.inExternParamType = isParam
+                    try {
+                        emitter.renderType(rustTy, ctx.selfTypeName)
+                    } finally {
+                        emitter.inExternParamType = prevParam
+                        emitter.inExternAbiSignature = prevAbi
+                    }
+                },
+                resolveLocalExprName = { raw -> emitter.scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw) },
+            )
+        return inlineCall ?: ctx.renderPlainFnCallFallback()
+    }
+}
+
+private object LowLevelMemoryOrAsmMacroRule : BuiltinMacroCallRule("offset_of", "addr_of", "addr_of_mut", "asm", "naked_asm", "global_asm") {
+    override fun render(ctx: MacroInvocationContext): String =
+        when (ctx.macroName) {
+            "offset_of" -> {
+                if (ctx.emitter.headerContext.rawAbiMode && ctx.emitter.currentExpectedNumericKind == null) {
+                    "0uL"
+                } else {
+                    ctx.emitter.renderIntLiteral("0", "")
+                }
+            }
+            "addr_of", "addr_of_mut" -> {
+                val place = ctx.renderStreamAsExpr(ctx.tokens)
+                val callee = rustFunctionIdentToKotlin(ctx.macroName)
+                val headerCtx = ctx.emitter.headerContext
+                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerCtx)
+                val pkgName = headerCtx.packageName
+                if (("core" in headerCtx.crateNamespaces || pkgName?.startsWith(coreNs) == true) && pkgName != "$coreNs.mem") {
+                    CoreIntrinsicLowering.registerCoreImport(ctx.emitter, "$coreNs.mem.$callee")
+                }
+                "$callee($place)"
+            }
+            else -> "Unit"
+        }
+}
+
+private val BUILTIN_MACRO_CALL_RULES: List<BuiltinMacroCallRule> =
+    listOf(
+        TriMacroRule,
+        FormatMacroRule,
+        WriteMacroRule,
+        PrintMacroRule,
+        PanicMacroRule,
+        ConstErrorMacroRule,
+        VecMacroRule,
+        AssertMacroRule,
+        EqualityAssertMacroRule,
+        CompileTimeTextMacroRule,
+        IncludeFileMacroRule,
+        MatchesMacroRule,
+        SourceLocationMacroRule,
+        SynDelimiterOrTokenMacroRule,
+        QuoteFamilyMacroRule,
+        InlineHostMacroRule,
+        LowLevelMemoryOrAsmMacroRule,
+    )
+
+private val BUILTIN_MACRO_CALL_RULES_BY_NAME: Map<String, BuiltinMacroCallRule> =
+    buildMap {
+        for (rule in BUILTIN_MACRO_CALL_RULES) {
+            for (name in rule.names) {
+                put(name, rule)
+            }
+        }
+    }
+
+private class QuoteMacroTokenEmitter(
+    trees: List<TokenTree>,
+    private val emitter: KotlinJ2KEmitter,
+    private val selfTypeName: String?,
+) : RustTokenCursor(trees) {
+    fun renderCall(
+        fnName: String,
+        indent: String,
+        spanned: Boolean,
+    ): String {
+        var bodyStartIdx = 0
+        var spanArg: String? = null
+        if (spanned) {
+            for (i in 0 until size - 1) {
+                if (punctCharAt(i) == '=' && punctCharAt(i + 1) == '>') {
+                    val spanStream = TokenStream.fromTokenTrees(trees.subList(0, i))
+                    spanArg = emitter.parseAndRenderTokenStreamAsExpr(spanStream, indent, selfTypeName)
+                    bodyStartIdx = i + 2
+                    break
+                }
+            }
+        }
+        val bodyEmitter =
+            if (bodyStartIdx > 0) {
+                QuoteMacroTokenEmitter(trees.subList(bodyStartIdx, size), emitter, selfTypeName)
+            } else {
+                this
+            }
+        val templateSb = StringBuilder()
+        val bindings = linkedMapOf<String, String>()
+        bodyEmitter.emitTemplateAndBindings(templateSb, bindings)
+        val templateLit = renderKotlinDoubleQuotedString(templateSb.toString().trim())
+        val callArgs = mutableListOf<String>()
+        if (spanArg != null) callArgs += spanArg
+        callArgs += templateLit
+        for ((k, v) in bindings) {
+            callArgs += "\"$k\" to $v"
+        }
+        return "$fnName(${callArgs.joinToString(", ")})"
+    }
+
+    fun emitTemplateAndBindings(
+        out: StringBuilder,
+        bindings: MutableMap<String, String>,
+    ) {
+        var i = 0
+        while (i < size) {
+            if (punctCharAt(i) == '#' && i + 1 < size) {
+                val nextIdent = cleanIdentAt(i + 1)
+                val nextBracket = groupAt(i + 1, Delimiter.Bracket)
+                val nextParen = groupAt(i + 1, Delimiter.Parenthesis)
+                when {
+                    nextIdent != null -> {
+                        val ktIdent =
+                            when {
+                                nextIdent == "self" -> "this"
+                                nextIdent == "Self" -> selfTypeName ?: "Self"
+                                nextIdent.first().isUpperCase() -> rustTypeIdentToKotlin(nextIdent)
+                                else -> emitter.scopeBuilder.resolveLocalKotlinName(nextIdent) ?: rustValueIdentToKotlin(nextIdent)
+                            }
+                        out.append("`#`").append(ktIdent).append(' ')
+                        if (ktIdent != "this") {
+                            bindings[ktIdent] = ktIdent
+                        }
+                        i += 2
+                        continue
+                    }
+                    nextBracket != null -> {
+                        out.append("`#`[")
+                        QuoteMacroTokenEmitter(nextBracket.stream().toList(), emitter, selfTypeName).emitTemplateAndBindings(out, bindings)
+                        out.append("] ")
+                        i += 2
+                        continue
+                    }
+                    nextParen != null -> {
+                        QuoteMacroTokenEmitter(nextParen.stream().toList(), emitter, selfTypeName).emitTemplateAndBindings(out, bindings)
+                        i += 2
+                        if (punctCharAt(i) == '*') i++
+                        continue
+                    }
+                }
+            }
+            when (val tt = trees[i]) {
+                is TokenTree.Ident -> out.append(tt.value.toString()).append(' ')
+                is TokenTree.Literal -> out.append(tt.value.toString()).append(' ')
+                is TokenTree.Punct -> {
+                    out.append(tt.value.asChar())
+                    if (tt.value.spacing() == Spacing.Alone) {
+                        out.append(' ')
+                    }
+                }
+                is TokenTree.Group -> {
+                    val (open, close) =
+                        when (tt.value.delimiter()) {
+                            Delimiter.Brace -> "{ " to " } "
+                            Delimiter.Parenthesis -> "(" to ") "
+                            Delimiter.Bracket -> "[" to "] "
+                            Delimiter.None -> "" to " "
+                        }
+                    out.append(open)
+                    QuoteMacroTokenEmitter(tt.value.stream().toList(), emitter, selfTypeName).emitTemplateAndBindings(out, bindings)
+                    out.append(close)
+                }
+            }
+            i++
+        }
+    }
+
+    fun collectFlatMacroTokenArgs(): List<String> {
+        val out = mutableListOf<String>()
+        for (tt in trees) {
+            when (tt) {
+                is TokenTree.Ident -> {
+                    val raw = tt.value.toString().removePrefix("r#")
+                    if (raw != "_" && raw !in IGNORED_QUOTE_KEYWORDS) {
+                        val mapped =
+                            when {
+                                raw == "self" -> "this"
+                                raw == "Self" -> selfTypeName ?: "Self"
+                                raw == "true" || raw == "false" -> raw
+                                emitter.scopeBuilder.resolveLocalKotlinName(raw) != null -> emitter.scopeBuilder.resolveLocalKotlinName(raw)!!
+                                raw in emitter.inspector.declaredConstNames -> emitter.inspector.declaredConstNames.getValue(raw)
+                                emitter.isScreamingSnakeIdent(raw) -> rustConstIdentToKotlin(raw)
+                                raw.first().isUpperCase() -> rustTypeIdentToKotlin(raw)
+                                else -> rustValueIdentToKotlin(raw)
+                            }
+                        out += mapped
+                    }
+                }
+                is TokenTree.Literal -> out += emitter.renderLit(Lit.new(tt.value))
+                is TokenTree.Group ->
+                    out.addAll(QuoteMacroTokenEmitter(tt.value.stream().toList(), emitter, selfTypeName).collectFlatMacroTokenArgs())
+                is TokenTree.Punct -> Unit
+            }
+        }
+        return out
+    }
+}
+
+private class CompileTimeMacroStringEvaluator(
+    rawTrees: List<TokenTree>,
+) : RustTokenCursor(unwrapNoneGroupSlice(rawTrees)) {
+    fun evaluate(): String? {
+        if (size == 0) return null
+        if (size == 1) {
+            when (val single = trees[0]) {
+                is TokenTree.Literal -> {
+                    val strRes = single.value.strValue()
+                    strRes.value?.let { return it }
+                    return when (val lit = Lit.new(single.value)) {
+                        is Lit.Str -> lit.value.value()
+                        is Lit.Char -> {
+                            val cp = lit.value.value()
+                            if (cp in 0x10000..0x10FFFF) {
+                                val hi = ((cp - 0x10000) ushr 10) + 0xD800
+                                val lo = ((cp - 0x10000) and 0x3FF) + 0xDC00
+                                charArrayOf(hi.toChar(), lo.toChar()).concatToString()
+                            } else {
+                                cp.toChar().toString()
+                            }
+                        }
+                        is Lit.Int -> lit.value.base10Digits()
+                        is Lit.Float -> lit.value.base10Digits()
+                        is Lit.Bool -> lit.value.value().toString()
+                        else -> null
+                    }
+                }
+                is TokenTree.Ident -> {
+                    val id = single.value.toString()
+                    if (id == "true" || id == "false") return id
+                }
+                else -> Unit
+            }
+        }
+        val lastGrp = if (size >= 3 && punctCharAt(size - 2) == '!') groupAt(size - 1) else null
+        if (lastGrp != null) {
+            val validPath = (0 until size - 2).all { idx -> identAt(idx) != null || punctCharAt(idx) == ':' }
+            val macroIdent = identAt(size - 3)
+            if (validPath && macroIdent != null) {
+                val argStream = lastGrp.stream()
+                return when (macroIdent) {
+                    "stringify" -> stringifyStream(argStream)
+                    "concat" -> evaluateConcat(argStream)
                     else -> null
                 }
             }
-            is TokenTree.Ident -> {
-                val id = single.value.toString()
-                if (id == "true" || id == "false") return id
-            }
-            else -> {}
         }
+        return null
     }
-    if (trees.size >= 3 &&
-        trees.last() is TokenTree.Group &&
-        (trees[trees.size - 2] as? TokenTree.Punct)?.value?.asChar() == '!'
-    ) {
-        val pathTrees = trees.subList(0, trees.size - 2)
-        val validPath =
-            pathTrees.all { tt ->
-                tt is TokenTree.Ident || (tt is TokenTree.Punct && tt.value.asChar() == ':')
-            }
-        val macroIdent = (pathTrees.lastOrNull() as? TokenTree.Ident)?.value?.toString()
-        if (validPath && macroIdent != null) {
-            val argStream = (trees.last() as TokenTree.Group).value.stream()
-            return when (macroIdent) {
-                "stringify" -> stringifyTokenStream(argStream)
-                "concat" -> tryEvalConcatTokens(argStream)
-                else -> null
-            }
-        }
-    }
-    return null
-}
 
-internal fun KotlinJ2KEmitter.tryEvalConcatTokens(tokens: TokenStream): String? {
-    val parts = MacroRulesFileExpander.splitMacroArguments(tokens)
-    val sb = StringBuilder()
-    for (part in parts) {
-        if (part.isEmpty()) continue
-        val piece = tryEvalCompileTimeStringMacroArg(part) ?: return null
-        sb.append(piece)
+    companion object {
+        fun stringifyStream(tokens: TokenStream): String {
+            val flat = mutableListOf<TokenTree>()
+            flattenNoneDelimitedGroups(tokens, flat)
+            return TokenStream.fromTokenTrees(flat).toString()
+        }
+
+        fun evaluateConcat(tokens: TokenStream): String? {
+            val sb = StringBuilder()
+            for (part in splitMacroArguments(tokens)) {
+                if (part.isEmpty()) continue
+                val piece = CompileTimeMacroStringEvaluator(part).evaluate() ?: return null
+                sb.append(piece)
+            }
+            return sb.toString()
+        }
     }
-    return sb.toString()
 }
 
 private const val INCLUDE_CONSTANT_POOL_CHUNK_BYTES: Int = 48_000
-
-private fun KotlinJ2KEmitter.renderIncludeMacro(
-    macroName: String,
-    tokens: TokenStream,
-    indent: String,
-): String {
-    val relPath =
-        resolveIncludeMacroPathArg(tokens)
-            ?: error("$macroName! expects a compile-time string path argument")
-    val resolvedPath = resolveIncludeTargetPath(headerContext.sourceFilePath, relPath)
-    val kmPath = KmPath(resolvedPath)
-    val meta = SystemFileSystem.metadataOrNull(kmPath)
-    require(meta != null && meta.isRegularFile) {
-        "$macroName! target file not found: $resolvedPath"
-    }
-    val bytes = SystemFileSystem.readBytes(kmPath)
-    return when (macroName) {
-        "include_bytes" -> {
-            if (bytes.isEmpty()) {
-                "byteArrayOf()"
-            } else {
-                extraTypePathImports += "import kotlin.io.encoding.Base64"
-                renderChunkedBase64ByteArrayExpr(Base64.Default.encode(bytes), indent)
-            }
-        }
-        "include_str" -> renderChunkedStringLiteralExpr(bytes.decodeToString(throwOnInvalidSequence = true), indent)
-        else -> error("unsupported include macro: $macroName")
-    }
-}
-
-private fun KotlinJ2KEmitter.resolveIncludeMacroPathArg(tokens: TokenStream): String? {
-    val parts = MacroRulesFileExpander.splitMacroArguments(tokens).filter { it.isNotEmpty() }
-    if (parts.size != 1) return null
-    return tryEvalCompileTimeStringMacroArg(parts[0])
-}
 
 internal fun resolveIncludeTargetPath(
     sourceFilePath: String?,
@@ -806,214 +941,18 @@ internal fun chunkModifiedUtf8String(
     return chunks
 }
 
-internal fun KotlinJ2KEmitter.renderMatchesMacroInvocation(
-    tokens: TokenStream,
-    indent: String,
-    selfTypeName: String?,
-): String {
-    val parts = MacroRulesFileExpander.splitMacroArguments(tokens).filter { it.isNotEmpty() }
-    if (parts.size < 2) return "false"
-    val matchHead = TokenStream.fromString("match").getOrThrow().toList()
-    val matchTail = TokenStream.fromString("=> true, _ => false").getOrThrow().toList()
-    val scrutineeTokens =
-        if (parts[0].any { it is TokenTree.Group && it.value.delimiter() == Delimiter.Brace }) {
-            listOf(TokenTree.Group(Group(Delimiter.Parenthesis, TokenStream.fromTokenTrees(parts[0]))))
-        } else {
-            parts[0]
-        }
-    val armTokens =
-        buildList {
-            addAll(parts[1])
-            addAll(matchTail)
-        }
-    val fullTokens =
-        buildList {
-            addAll(matchHead)
-            addAll(scrutineeTokens)
-            add(TokenTree.Group(Group(Delimiter.Brace, TokenStream.fromTokenTrees(armTokens))))
-        }
-    return parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(fullTokens), indent, selfTypeName)
-}
-
-internal fun KotlinJ2KEmitter.renderFormatMacroInvocation(
-    tokens: TokenStream,
-    indent: String,
-    selfTypeName: String?,
-): String {
-    val parts = MacroRulesFileExpander.splitMacroArguments(tokens)
-    if (parts.isEmpty()) return "\"\""
-    val rawFormatBody = tryEvalCompileTimeStringMacroArg(parts[0])
-    if (rawFormatBody != null) {
-        val positional = mutableListOf<String>()
-        val named = linkedMapOf<String, String>()
-        for (i in 1 until parts.size) {
-            val argTrees = parts[i]
-            if (argTrees.size >= 3 &&
-                argTrees[0] is TokenTree.Ident &&
-                (argTrees[1] as? TokenTree.Punct)?.value?.asChar() == '='
-            ) {
-                val key = (argTrees[0] as TokenTree.Ident).value.toString()
-                val valTokens = TokenStream.fromTokenTrees(argTrees.drop(2))
-                val renderedVal = parseAndRenderTokenStreamAsExpr(valTokens, indent, selfTypeName)
-                named[key] = renderedVal
-                positional += renderedVal
-            } else {
-                val valTokens = TokenStream.fromTokenTrees(argTrees)
-                positional += parseAndRenderTokenStreamAsExpr(valTokens, indent, selfTypeName)
-            }
-        }
-        return renderRustFormatAsKotlinTemplate(rawFormatBody, positional, named)
-    }
-    val renderedParts = parts.map { parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(it), indent, selfTypeName) }
-    return renderedParts.joinToString(" + ")
-}
-
-internal fun KotlinJ2KEmitter.renderWriteMacroInvocation(
-    macroName: String,
-    tokens: TokenStream,
-    indent: String,
-    selfTypeName: String?,
-): String {
-    val parts = MacroRulesFileExpander.splitMacroArguments(tokens)
-    if (parts.isEmpty()) return "${rustFunctionIdentToKotlin(macroName)}()"
-    val target = parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(parts[0]), indent, selfTypeName)
-    val appendMethod = if (macroName == "writeln") "appendLine" else "append"
-    if (parts.size == 1) {
-        return if (macroName == "writeln") "$target.appendLine()" else "$target.append(\"\")"
-    }
-    val restTokens = mutableListOf<TokenTree>()
-    for (i in 1 until parts.size) {
-        if (i > 1) {
-            restTokens += TokenTree.Punct(Punct(',', Spacing.Alone))
-        }
-        restTokens.addAll(parts[i])
-    }
-    val formatted = renderFormatMacroInvocation(TokenStream.fromTokenTrees(restTokens), indent, selfTypeName)
-    return "$target.$appendMethod($formatted)"
-}
-
-private fun splitAssertEqArgsForMacro(stream: TokenStream): List<List<TokenTree>> {
-    val parts = MacroRulesFileExpander.splitMacroArguments(stream.clone())
-    if (parts.size >= 2) return parts
-    val trees = stream.clone().toList()
-    if (trees.isEmpty()) return emptyList()
-    val out = mutableListOf<List<TokenTree>>()
-    val cur = mutableListOf<TokenTree>()
-    var turbofishAngleDepth = 0
-    for ((idx, tt) in trees.withIndex()) {
-        if (tt is TokenTree.Punct) {
-            val ch = tt.value.asChar()
-            val prevIsColon =
-                idx >= 2 &&
-                    (trees[idx - 1] as? TokenTree.Punct)?.value?.asChar() == ':' &&
-                    (trees[idx - 2] as? TokenTree.Punct)?.value?.asChar() == ':'
-            if (ch == '<' && prevIsColon) {
-                turbofishAngleDepth++
-                cur += tt
-                continue
-            }
-            if (ch == '>' && turbofishAngleDepth > 0) {
-                turbofishAngleDepth--
-                cur += tt
-                continue
-            }
-            if (ch == ',' && turbofishAngleDepth == 0) {
-                if (cur.isNotEmpty()) {
-                    out += cur.toList()
-                    cur.clear()
-                }
-                continue
-            }
-        }
-        cur += tt
-    }
-    if (cur.isNotEmpty()) {
-        out += cur.toList()
-    }
-    return out
-}
-
-private fun splitTopLevelVecRepeatSemicolon(tokens: TokenStream): Pair<TokenStream, TokenStream>? {
-    val trees = tokens.clone().toList()
-    if (trees.isEmpty()) return null
-    var semiIndex = -1
-    for ((idx, tt) in trees.withIndex()) {
-        val punct = (tt as? TokenTree.Punct)?.value?.asChar() ?: continue
-        if (punct == ';') {
-            if (semiIndex >= 0) return null
-            semiIndex = idx
-        }
-    }
-    if (semiIndex <= 0 || semiIndex >= trees.lastIndex) return null
-    val elemTrees = trees.subList(0, semiIndex)
-    val countTrees = trees.subList(semiIndex + 1, trees.size)
-    return TokenStream.fromTokenTrees(elemTrees) to TokenStream.fromTokenTrees(countTrees)
-}
-
-internal fun KotlinJ2KEmitter.parseCommaSeparatedExprsFromTokens(
-    tokens: TokenStream,
-    indent: String,
-    selfTypeName: String?,
-): List<String> {
-    val parts = MacroRulesFileExpander.splitMacroArguments(tokens)
-    if (parts.isEmpty()) return emptyList()
-    return parts
-        .map { part ->
-            parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(part), indent, selfTypeName)
-        }.filter { it.isNotBlank() }
-}
-
 internal fun KotlinJ2KEmitter.parseAndRenderTokenStreamAsExpr(
     stream: TokenStream,
     indent: String,
     selfTypeName: String?,
 ): String {
-    val parsed =
-        io.github.kotlinmania.syn
-            .parse2(io.github.kotlinmania.syn.ExprParse::parse, stream.clone())
-            .getOrNull()
+    val parsed = parse2(ExprParse::parse, stream.clone()).getOrNull()
     if (parsed != null) {
         return renderExpr(parsed, indent, selfTypeName)
     }
-    val flat = renderFlatMacroTokenArgs(stream, indent, selfTypeName)
-    return flat.joinToString(", ")
-}
-
-internal fun KotlinJ2KEmitter.renderFlatMacroTokenArgs(
-    stream: TokenStream,
-    indent: String,
-    selfTypeName: String?,
-): List<String> {
-    val out = mutableListOf<String>()
-    for (tt in stream.clone()) {
-        when (tt) {
-            is TokenTree.Ident -> {
-                val raw = tt.value.toString().removePrefix("r#")
-                if (raw != "_" && raw !in IGNORED_QUOTE_KEYWORDS) {
-                    val mapped =
-                        when {
-                            raw == "self" -> "this"
-                            raw == "Self" -> selfTypeName ?: "Self"
-                            raw == "true" || raw == "false" -> raw
-                            scopeBuilder.resolveLocalKotlinName(raw) != null -> scopeBuilder.resolveLocalKotlinName(raw)!!
-                            raw in inspector.declaredConstNames -> inspector.declaredConstNames.getValue(raw)
-                            isScreamingSnakeIdent(raw) -> rustConstIdentToKotlin(raw)
-                            raw.first().isUpperCase() -> rustTypeIdentToKotlin(raw)
-                            else -> rustValueIdentToKotlin(raw)
-                        }
-                    out += mapped
-                }
-            }
-            is TokenTree.Literal -> {
-                out += renderLit(Lit.new(tt.value))
-            }
-            is TokenTree.Group -> {
-                out.addAll(renderFlatMacroTokenArgs(tt.value.stream(), indent, selfTypeName))
-            }
-            is TokenTree.Punct -> {}
-        }
-    }
-    return out
+    return QuoteMacroTokenEmitter(stream.clone().toList(), this, selfTypeName)
+        .collectFlatMacroTokenArgs()
+        .joinToString(", ")
 }
 
 internal fun KotlinJ2KEmitter.renderBitwiseComplementOperand(
@@ -1217,24 +1156,19 @@ internal fun KotlinJ2KEmitter.binaryDigitsToHexLiteral(rawDigits: String): Strin
 internal fun KotlinJ2KEmitter.renderIntLiteral(digits: String, suffix: String): String {
     val parsed128 = parseUnsigned128LiteralDigits(digits)
     if (suffix == "u128") {
-        usesU128 = true
         return if (parsed128 != null) formatU128ConstructorCall(parsed128.high, parsed128.low) else "U128()"
     }
     if (suffix == "i128") {
-        usesI128 = true
         return if (parsed128 != null) formatI128ConstructorCall(parsed128.high, parsed128.low) else "I128()"
     }
     if (suffix.isEmpty()) {
         if (currentExpectedNumericKind == NumericKind.U128) {
-            usesU128 = true
             return if (parsed128 != null) formatU128ConstructorCall(parsed128.high, parsed128.low) else "U128()"
         }
         if (currentExpectedNumericKind == NumericKind.I128) {
-            usesI128 = true
             return if (parsed128 != null) formatI128ConstructorCall(parsed128.high, parsed128.low) else "I128()"
         }
         if (parsed128?.exceeds64BitUnsigned == true) {
-            usesU128 = true
             return formatU128ConstructorCall(parsed128.high, parsed128.low)
         }
     }
@@ -1688,14 +1622,8 @@ internal fun KotlinJ2KEmitter.renderPrimitiveAssociatedConst(
                             else -> "Int.MAX_VALUE"
                         }
                     "isize" -> if (headerContext.rawAbiMode) "Long.${c}_VALUE" else "Int.${c}_VALUE"
-                    "u128" -> {
-                        usesU128 = true
-                        "U128.${c}_VALUE"
-                    }
-                    "i128" -> {
-                        usesI128 = true
-                        "I128.${c}_VALUE"
-                    }
+                    "u128" -> "U128.${c}_VALUE"
+                    "i128" -> "I128.${c}_VALUE"
                     else -> "${rustTypeIdentToKotlin(prim)}.${c}_VALUE"
                 }
             }
@@ -1897,8 +1825,6 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
             (firstRaw in PRIMITIVE_TYPE_NAMES || resolveNumericKind(firstKtType) != null) &&
             (secondRaw == "MAX" || secondRaw == "MIN")
         ) {
-            if (firstRaw == "u128") usesU128 = true
-            if (firstRaw == "i128") usesI128 = true
             val kind = resolveNumericKind(firstKtType)
             val boundOwner = if (firstRaw in PRIMITIVE_TYPE_NAMES) kotlinBuiltinTypeName(firstKtType) else firstKtType
             if (secondRaw == "MIN" && (kind == NumericKind.F32 || kind == NumericKind.F64)) {
@@ -1910,14 +1836,8 @@ internal fun KotlinJ2KEmitter.renderPathAsExpression(path: Path, selfTypeName: S
             val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
             val ownerPrim =
                 when (firstRaw) {
-                    "u128" -> {
-                        usesU128 = true
-                        "U128"
-                    }
-                    "i128" -> {
-                        usesI128 = true
-                        "I128"
-                    }
+                    "u128" -> "U128"
+                    "i128" -> "I128"
                     "f16" -> {
                         CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.F16")
                         "F16"
@@ -2527,14 +2447,8 @@ private fun KotlinJ2KEmitter.resolvedPrimOwnerAndBits(kind: NumericKind?): Pair<
         NumericKind.U32 -> "UInt" to "32u"
         NumericKind.I64 -> "Long" to "64u"
         NumericKind.U64 -> "ULong" to "64u"
-        NumericKind.I128 -> {
-            usesI128 = true
-            "I128" to "128u"
-        }
-        NumericKind.U128 -> {
-            usesU128 = true
-            "U128" to "128u"
-        }
+        NumericKind.I128 -> "I128" to "128u"
+        NumericKind.U128 -> "U128" to "128u"
         NumericKind.F32 -> "Float" to "32u"
         NumericKind.F64 -> "Double" to "64u"
         else -> null

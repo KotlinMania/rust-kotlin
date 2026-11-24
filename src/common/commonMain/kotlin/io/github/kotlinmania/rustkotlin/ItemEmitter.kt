@@ -665,16 +665,10 @@ internal fun KotlinJ2KEmitter.renderFallbackDefaultForRenderedType(renderedType:
     when (resolveNumericKind(clean)) {
         NumericKind.I8, NumericKind.I16, NumericKind.I32 -> return "0"
         NumericKind.I64 -> return "0L"
-        NumericKind.I128 -> {
-            usesI128 = true
-            return "I128()"
-        }
+        NumericKind.I128 -> return "I128()"
         NumericKind.U8, NumericKind.U16, NumericKind.U32 -> return "0u"
         NumericKind.U64 -> return "0uL"
-        NumericKind.U128 -> {
-            usesU128 = true
-            return "U128()"
-        }
+        NumericKind.U128 -> return "U128()"
         NumericKind.F16 -> return "F16()"
         NumericKind.F32 -> return "0.0f"
         NumericKind.F64 -> return "0.0"
@@ -716,17 +710,8 @@ internal fun KotlinJ2KEmitter.renderFallbackDefaultForRenderedType(renderedType:
     return registerPtrDefaultImportIfNeeded(defaultInitializerForType(clean))
 }
 
-internal fun findTopLevelGenericCommaIndex(text: String): Int {
-    var depth = 0
-    for (i in text.indices) {
-        when (text[i]) {
-            '<' -> depth++
-            '>' -> depth--
-            ',' -> if (depth == 0) return i
-        }
-    }
-    return -1
-}
+internal fun findTopLevelGenericCommaIndex(text: String): Int =
+    KotlinTokenWalker.findTopLevelCommaIndex(text, trackParens = false)
 
 internal fun KotlinJ2KEmitter.normalizeArrayLengthToIntExpr(
     rawLen: String,
@@ -1028,73 +1013,29 @@ internal fun KotlinJ2KEmitter.isConcreteGenericTypeForSwiftExport(
             "Pair",
             "Triple",
         )
-    var i = 0
-    val n = base.length
-    while (i < n) {
-        val ch = base[i]
-        if (ch == '<' && (i == 0 || base[i - 1] != '-')) {
-            var identStart = i
-            while (identStart > 0) {
-                val c = base[identStart - 1]
-                if (c.isLetterOrDigit() || c == '.') {
-                    identStart--
-                } else {
-                    break
+    return KotlinTokenWalker(base).anyGenericApplication { rawIdent, topArgs ->
+        if (rawIdent.isNotEmpty() && rawIdent !in stdlibCollectionNames) {
+            val hasConcreteArg =
+                topArgs.any { rawArg ->
+                    val cleanArg =
+                        rawArg
+                            .removePrefix("out ")
+                            .removePrefix("in ")
+                            .trim()
+                            .removeSuffix("?")
+                            .trim()
+                    cleanArg.isNotEmpty() &&
+                        cleanArg != "*" &&
+                        cleanArg != "Any" &&
+                        cleanArg != "kotlin.Any" &&
+                        cleanArg !in unboundedOwnerTypeParams
                 }
-            }
-            val rawIdent = base.substring(identStart, i).substringAfterLast('.')
-            var depth = 1
-            var j = i + 1
-            val topArgs = mutableListOf<String>()
-            var argStart = j
-            while (j < n && depth > 0) {
-                val cj = base[j]
-                if (cj == '<' && (j == 0 || base[j - 1] != '-')) {
-                    depth++
-                } else if (cj == '>' && (j == 0 || base[j - 1] != '-')) {
-                    depth--
-                    if (depth == 0) {
-                        topArgs += base.substring(argStart, j).trim()
-                        break
-                    }
-                } else if (cj == ',' && depth == 1) {
-                    topArgs += base.substring(argStart, j).trim()
-                    argStart = j + 1
-                }
-                j++
-            }
-            if (depth == 0) {
-                if (rawIdent.isNotEmpty() && rawIdent !in stdlibCollectionNames) {
-                    for (rawArg in topArgs) {
-                        val cleanArg =
-                            rawArg
-                                .removePrefix("out ")
-                                .removePrefix("in ")
-                                .trim()
-                                .removeSuffix("?")
-                                .trim()
-                        if (cleanArg.isNotEmpty() &&
-                            cleanArg != "*" &&
-                            cleanArg != "Any" &&
-                            cleanArg != "kotlin.Any" &&
-                            cleanArg !in unboundedOwnerTypeParams
-                        ) {
-                            return true
-                        }
-                    }
-                }
-                for (rawArg in topArgs) {
-                    if (isConcreteGenericTypeForSwiftExport(rawArg, unboundedOwnerTypeParams, visitedAliases)) {
-                        return true
-                    }
-                }
-                i = j + 1
-                continue
-            }
+            if (hasConcreteArg) return@anyGenericApplication true
         }
-        i++
+        topArgs.any { rawArg ->
+            isConcreteGenericTypeForSwiftExport(rawArg, unboundedOwnerTypeParams, visitedAliases)
+        }
     }
-    return false
 }
 
 internal fun attachedImplDefinesInstanceMethod(

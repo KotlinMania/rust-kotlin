@@ -89,7 +89,6 @@ internal fun KotlinJ2KEmitter.renderCastExpression(
     pointerLayoutType: SynType? = null,
 ): String {
     if (targetType == "RustAny") {
-        usesRustAny = true
         return if (inferExprRenderedType(sourceExpr, selfTypeName) == "RustAny") inner else "RustAny.from($inner)"
     }
     val targetBase = targetType.removeSuffix("?").trim()
@@ -176,18 +175,12 @@ internal fun KotlinJ2KEmitter.renderCastExpression(
             NumericKind.I16 -> "Short"
             NumericKind.I32 -> "Int"
             NumericKind.I64 -> "Long"
-            NumericKind.I128 -> {
-                usesI128 = true
-                "I128"
-            }
+            NumericKind.I128 -> "I128"
             NumericKind.U8 -> "UByte"
             NumericKind.U16 -> "UShort"
             NumericKind.U32 -> "UInt"
             NumericKind.U64 -> "ULong"
-            NumericKind.U128 -> {
-                usesU128 = true
-                "U128"
-            }
+            NumericKind.U128 -> "U128"
             NumericKind.F16 -> "F16"
             NumericKind.F32 -> kotlinF32TypeName()
             NumericKind.F64 -> "Double"
@@ -395,18 +388,18 @@ internal fun KotlinJ2KEmitter.renderCastExpression(
     return "(($inner as Any?) as $targetType)"
 }
 
-private fun hasTopLevelOperatorOutsidePostfix(s: String): Boolean {
-    var depth = 0
-    for (i in s.indices) {
-        when (s[i]) {
-            '(', '[', '{' -> depth++
-            ')', ']', '}' -> depth--
-            ' ' -> if (depth == 0) return true
-            '+', '-', '*', '/', '%', '&', '|', '^', '=', '<', '>' -> if (depth == 0 && i > 0) return true
+private fun hasTopLevelOperatorOutsidePostfix(s: String): Boolean =
+    !KotlinTokenWalker.scanTopLevelTokens(s, trackAllBrackets = true) { tok, depth ->
+        if (depth != 0) {
+            true
+        } else {
+            when (tok) {
+                is KotlinLexToken.Whitespace, is KotlinLexToken.Newline, is KotlinLexToken.Arrow -> false
+                is KotlinLexToken.Punct -> tok.start == 0 || tok.ch !in "+-*/%&|^=<>"
+                else -> true
+            }
         }
     }
-    return false
-}
 
 internal fun KotlinJ2KEmitter.isAlreadyRenderedAsNumericKind(rendered: String, kind: NumericKind?): Boolean {
     if (kind == null) return false
@@ -582,53 +575,23 @@ internal fun KotlinJ2KEmitter.isAtomicPostfixReceiver(sourceExpr: Expr, rendered
     }
 }
 
-private inline fun scanUnquotedTopLevelChars(
-    text: String,
-    trackAllBrackets: Boolean,
-    crossinline onUnquoted: (idx: Int, ch: Char, depth: Int) -> Boolean,
-): Boolean {
-    var depth = 0
-    var inString = false
-    var inChar = false
-    var escape = false
-    for ((idx, ch) in text.withIndex()) {
-        if (escape) {
-            escape = false
-            continue
-        }
-        if ((inString || inChar) && ch == '\\') {
-            escape = true
-            continue
-        }
-        if (!inChar && ch == '"') {
-            inString = !inString
-            continue
-        }
-        if (!inString && ch == '\'') {
-            inChar = !inChar
-            continue
-        }
-        if (inString || inChar) continue
-        if (ch == '(' || (trackAllBrackets && (ch == '[' || ch == '{'))) {
-            depth++
-        } else if (ch == ')' || (trackAllBrackets && (ch == ']' || ch == '}'))) {
-            if (depth > 0) depth--
-        }
-        if (!onUnquoted(idx, ch, depth)) return false
-    }
-    return depth == 0 && !inString && !inChar
-}
-
 internal fun KotlinJ2KEmitter.hasOuterBalancedParens(text: String): Boolean {
     if (text.length < 2 || text.first() != '(' || text.last() != ')') return false
-    return scanUnquotedTopLevelChars(text, trackAllBrackets = false) { idx, ch, depth ->
-        !(ch == ')' && depth == 0 && idx < text.lastIndex)
+    return KotlinTokenWalker.scanTopLevelTokens(text, trackAllBrackets = false) { tok, depth ->
+        !(tok is KotlinLexToken.Punct && tok.ch == ')' && depth == 0 && tok.end < text.length)
     }
 }
 
 internal fun KotlinJ2KEmitter.hasNoTopLevelSpacesOrColons(text: String): Boolean =
-    scanUnquotedTopLevelChars(text, trackAllBrackets = true) { _, ch, depth ->
-        !(depth == 0 && (ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t' || ch == ':'))
+    KotlinTokenWalker.scanTopLevelTokens(text, trackAllBrackets = true) { tok, depth ->
+        !(
+            depth == 0 &&
+                (
+                    tok is KotlinLexToken.Whitespace ||
+                        tok is KotlinLexToken.Newline ||
+                        (tok is KotlinLexToken.Punct && tok.ch == ':')
+                )
+        )
     }
 
 internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): String =
@@ -749,7 +712,6 @@ internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): St
         }
         is SynType.TraitObject -> {
             if (isStdlibDynAnyTraitObject(ty)) {
-                usesRustAny = true
                 "RustAny"
             } else {
                 val bounds = ty.bounds.toList().mapNotNull { renderTypeParamBound(it, selfTypeName) }
@@ -767,7 +729,7 @@ internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): St
                     ?.ident
                     ?.toString()
             if (macroName == "Token") {
-                resolveSynTokenMacroTypeName(ty.mac.tokens) ?: "Token"
+                RustTokenCursor.resolveSynTokenStreamTypeName(ty.mac.tokens) ?: "Token"
             } else {
                 rustTypeIdentToKotlin(macroName ?: "Token")
             }
@@ -872,21 +834,17 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
             return "Unit"
         }
         if (rawName == "DebugStruct" && "DebugStruct" !in inspector.declaredTypeNames) {
-            usesDebugStruct = true
             return "DebugStruct"
         }
         if (rawName == "DebugTuple" && "DebugTuple" !in inspector.declaredTypeNames) {
-            usesDebugTuple = true
             return "DebugTuple"
         }
     }
     if (rawSegments.size == 1 && lastSeg.arguments is PathArguments.None) {
         if (rawName == "DebugStruct" && "DebugStruct" !in inspector.declaredTypeNames) {
-            usesDebugStruct = true
             return "DebugStruct"
         }
         if (rawName == "DebugTuple" && "DebugTuple" !in inspector.declaredTypeNames) {
-            usesDebugTuple = true
             return "DebugTuple"
         }
     }
@@ -947,10 +905,7 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
         }
     }
 
-    if (!headerContext.rawAbiMode &&
-        rawName == "Result" &&
-        "Ok" !in inspector.declaredTypeNames
-    ) {
+    if (!headerContext.rawAbiMode && rawName == "Result") {
         val rawSegNames =
             rewriteCrateRootAliasAndReexportSegments(
                 rawSegments.map { it.ident.toString().removePrefix("r#") },
@@ -962,92 +917,79 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
             } else {
                 null
             }
-        val matchesStdMod: (String) -> Boolean = { expected ->
-            val modIdx = rawSegNames.size - 2
-            (
-                modIdx >= 0 &&
-                    rawSegNames[modIdx] == expected &&
-                    (modIdx == 0 || rawSegNames[modIdx - 1] in setOf("core", "std", "alloc"))
-            ) ||
-                resolvedModImp == expected ||
-                resolvedModImp == "core.$expected" ||
-                resolvedModImp == "std.$expected" ||
-                resolvedModImp == "alloc.$expected"
-        }
         val isTaggedOrRustLangStd =
             usesTaggedCoreResult() ||
                 headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true
-        if (lastSeg.arguments is PathArguments.None &&
-            rawSegNames.size >= 2 &&
-            matchesStdMod("fmt") &&
-            isTaggedOrRustLangStd &&
-            ("Result" !in inspector.declaredTypeNames || rawSegNames.dropLast(1).lastOrNull() == "fmt" || resolvedModImp != null)
-        ) {
-            if (!usesTaggedCoreResult()) {
-                return if ("Result" in inspector.declaredTypeNames) "kotlin.Result<Unit>" else "Result<Unit>"
+        if ("Ok" !in inspector.declaredTypeNames) {
+            val matchesCoreOrStdMod: (String) -> Boolean = { expected ->
+                val modIdx = rawSegNames.size - 2
+                (
+                    modIdx >= 0 &&
+                        rawSegNames[modIdx] == expected &&
+                        (modIdx == 0 || rawSegNames[modIdx - 1] in setOf("core", "std", "alloc"))
+                ) ||
+                    resolvedModImp == expected ||
+                    resolvedModImp == "core.$expected" ||
+                    resolvedModImp == "std.$expected" ||
+                    resolvedModImp == "alloc.$expected"
             }
-            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-            val errRef = bindOrQualifyResolvedCrossSymbol("$coreNs.fmt.Error")
-            val resName =
-                if (hasDeclaredResultEnum()) {
-                    "Result"
-                } else if ("Result" in inspector.declaredTypeNames) {
-                    "$coreNs.result.Result"
-                } else {
-                    sourceResultName()
+            if (lastSeg.arguments is PathArguments.None &&
+                rawSegNames.size >= 2 &&
+                matchesCoreOrStdMod("fmt") &&
+                isTaggedOrRustLangStd &&
+                ("Result" !in inspector.declaredTypeNames || rawSegNames.dropLast(1).lastOrNull() == "fmt" || resolvedModImp != null)
+            ) {
+                if (!usesTaggedCoreResult()) {
+                    return if ("Result" in inspector.declaredTypeNames) "kotlin.Result<Unit>" else "Result<Unit>"
                 }
-            return "$resName<Unit, $errRef>"
+                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+                val errRef = bindOrQualifyResolvedCrossSymbol("$coreNs.fmt.Error")
+                val resName =
+                    if (hasDeclaredResultEnum()) {
+                        "Result"
+                    } else if ("Result" in inspector.declaredTypeNames) {
+                        "$coreNs.result.Result"
+                    } else {
+                        sourceResultName()
+                    }
+                return "$resName<Unit, $errRef>"
+            }
+            if (!hasDeclaredResultEnum() && lastSeg.arguments is PathArguments.AngleBracketed) {
+                val isStdOrCoreResult =
+                    rawSegNames.size == 1 ||
+                        matchesCoreOrStdMod("result") ||
+                        (rawSegNames.size == 2 && modHead == "result")
+                val argsList =
+                    (lastSeg.arguments as PathArguments.AngleBracketed)
+                        .args
+                        .toList()
+                        .mapNotNull { renderGenericArgument(it, selfTypeName) }
+                if (isStdOrCoreResult &&
+                    argsList.size == 2 &&
+                    (rawSegNames.size >= 2 || "Result" !in inspector.declaredTypeNames)
+                ) {
+                    return when {
+                        usesTaggedCoreResult() && "Result" in inspector.declaredTypeNames ->
+                            "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.result.Result<${argsList.joinToString(", ")}>"
+                        usesTaggedCoreResult() -> "${sourceResultName()}<${argsList.joinToString(", ")}>"
+                        "Result" in inspector.declaredTypeNames -> "kotlin.Result<${argsList[0]}>"
+                        else -> "Result<${argsList[0]}>"
+                    }
+                }
+            }
         }
-        if (!hasDeclaredResultEnum() && lastSeg.arguments is PathArguments.AngleBracketed) {
-            val isStdOrCoreResult =
-                rawSegNames.size == 1 ||
-                    matchesStdMod("result") ||
-                    (rawSegNames.size == 2 && modHead == "result")
-            val argsList =
+        if ("Result" !in inspector.declaredTypeNames &&
+            !hasDeclaredResultEnum() &&
+            isTaggedOrRustLangStd &&
+            lastSeg.arguments is PathArguments.AngleBracketed
+        ) {
+            val typeArgs =
                 (lastSeg.arguments as PathArguments.AngleBracketed)
                     .args
                     .toList()
                     .mapNotNull { renderGenericArgument(it, selfTypeName) }
-            if (isStdOrCoreResult &&
-                argsList.size == 2 &&
-                (rawSegNames.size >= 2 || "Result" !in inspector.declaredTypeNames)
-            ) {
-                return when {
-                    usesTaggedCoreResult() && "Result" in inspector.declaredTypeNames ->
-                        "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.result.Result<${argsList.joinToString(", ")}>"
-                    usesTaggedCoreResult() -> "${sourceResultName()}<${argsList.joinToString(", ")}>"
-                    "Result" in inspector.declaredTypeNames -> "kotlin.Result<${argsList[0]}>"
-                    else -> "Result<${argsList[0]}>"
-                }
-            }
-        }
-    }
-
-    if (!headerContext.rawAbiMode &&
-        rawName == "Result" &&
-        "Result" !in inspector.declaredTypeNames &&
-        !hasDeclaredResultEnum() &&
-        lastSeg.arguments is PathArguments.AngleBracketed
-    ) {
-        val typeArgs =
-            (lastSeg.arguments as PathArguments.AngleBracketed)
-                .args
-                .toList()
-                .mapNotNull { renderGenericArgument(it, selfTypeName) }
-        if (typeArgs.size == 1) {
-            val rawSegNames =
-                rewriteCrateRootAliasAndReexportSegments(
-                    rawSegments.map { it.ident.toString().removePrefix("r#") },
-                )
-            val modHead = rawSegNames.getOrNull(rawSegNames.size - 2)
-            val resolvedModImp =
-                if (rawSegNames.size == 2 && modHead != null) {
-                    scopeBuilder.resolveModuleBinding(modHead)?.importedPath
-                } else {
-                    null
-                }
-            val matchesStdMod =
-                { expected: String ->
+            if (typeArgs.size == 1) {
+                val matchesStdCrateMod = { expected: String ->
                     modHead == expected &&
                         (
                             (rawSegNames.size == 3 && rawSegNames[0] in setOf("std", "crate")) ||
@@ -1062,35 +1004,31 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                                 )
                         )
                 }
-            val isTaggedOrRustLangStd =
-                usesTaggedCoreResult() ||
-                    headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true
-            if (matchesStdMod("io") && isTaggedOrRustLangStd) {
-                val stdNs =
-                    headerContext.crateNamespaces["std"]
-                        ?.trim()
-                        ?.removeSuffix(".")
-                        ?.takeIf { it.isNotEmpty() }
-                        ?: "io.github.kotlinmania.rustlang.std".takeIf {
-                            headerContext.packageName?.startsWith(it) == true
+                val resName = if (usesTaggedCoreResult()) sourceResultName() else "Result"
+                if (matchesStdCrateMod("io")) {
+                    val stdNs =
+                        headerContext.crateNamespaces["std"]
+                            ?.trim()
+                            ?.removeSuffix(".")
+                            ?.takeIf { it.isNotEmpty() }
+                            ?: "io.github.kotlinmania.rustlang.std".takeIf {
+                                headerContext.packageName?.startsWith(it) == true
+                            }
+                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+                    val ioErr =
+                        if (stdNs != null ||
+                            "core" in headerContext.crateNamespaces ||
+                            headerContext.packageName?.startsWith("$coreNs.") == true
+                        ) {
+                            bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.Error")
+                        } else {
+                            "Error"
                         }
-                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                val ioErr =
-                    if (stdNs != null ||
-                        "core" in headerContext.crateNamespaces ||
-                        headerContext.packageName?.startsWith("$coreNs.") == true
-                    ) {
-                        bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.Error")
-                    } else {
-                        "Error"
-                    }
-                val resName = if (usesTaggedCoreResult()) sourceResultName() else "Result"
-                return "$resName<${typeArgs[0]}, $ioErr>"
-            }
-            if (matchesStdMod("thread") && isTaggedOrRustLangStd) {
-                usesRustAny = true
-                val resName = if (usesTaggedCoreResult()) sourceResultName() else "Result"
-                return "$resName<${typeArgs[0]}, RustAny>"
+                    return "$resName<${typeArgs[0]}, $ioErr>"
+                }
+                if (matchesStdCrateMod("thread")) {
+                    return "$resName<${typeArgs[0]}, RustAny>"
+                }
             }
         }
     }
@@ -1221,7 +1159,6 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
         "TypeId" !in inspector.declaredTypeNames &&
         isStdlibAnyPathSegments(rawSegments.map { it.ident.toString() })
     ) {
-        usesRustAny = true
         return "RustTypeId"
     }
 
@@ -1249,8 +1186,6 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
     }
 
     if (isPrimitivePrefix && lastSeg.arguments is PathArguments.None) {
-        if (rawName == "u128") usesU128 = true
-        if (rawName == "i128") usesI128 = true
         if (rawName == "f16") return "F16"
         if (rawName == "f32") return kotlinF32TypeName()
         if (rawName == "f128") return "F128"
@@ -1615,6 +1550,29 @@ internal fun KotlinJ2KEmitter.renderTypeParameters(
     return if (parts.isEmpty()) "" else "<${parts.joinToString(", ")}>"
 }
 
+private fun KotlinJ2KEmitter.collectRenderedBoundsForTypeParam(
+    param: GenericParam.TypeParam,
+    boundedName: String,
+    selfTypeName: String?,
+    excludeSimdElement: Boolean,
+): List<String> {
+    val prevBounded = currentBoundedTypeName
+    currentBoundedTypeName = boundedName
+    return try {
+        param.bounds
+            .toList()
+            .mapNotNull { renderTypeParamBound(it, selfTypeName) }
+            .filter {
+                it != "Any" &&
+                    it != boundedName &&
+                    !it.contains("->") &&
+                    (!excludeSimdElement || !it.startsWith("SimdElement"))
+            }
+    } finally {
+        currentBoundedTypeName = prevBounded
+    }
+}
+
 internal fun KotlinJ2KEmitter.renderTypeParametersFromParams(
     params: List<GenericParam>,
     selfTypeName: String?,
@@ -1623,30 +1581,12 @@ internal fun KotlinJ2KEmitter.renderTypeParametersFromParams(
     val rendered = mutableListOf<String>()
     val seenNames = hashSetOf<String>()
     for (param in params) {
-        when (param) {
-            is GenericParam.LifetimeParam -> {}
-            is GenericParam.TypeParam -> {
-                val rawTpName = rustTypeIdentToKotlin(param.ident.toString())
-                val name = renamedTypeParamIdentifiers[rawTpName] ?: rawTpName
-                if (rawTpName in excludeNames || name in excludeNames || !seenNames.add(name)) continue
-                val prevBounded = currentBoundedTypeName
-                currentBoundedTypeName = name
-                val bounds =
-                    try {
-                        param.bounds
-                            .toList()
-                            .mapNotNull { renderTypeParamBound(it, selfTypeName) }
-                            .filter { it != "Any" && it != name && !it.contains("->") && !it.startsWith("SimdElement") }
-                    } finally {
-                        currentBoundedTypeName = prevBounded
-                    }
-                if (bounds.size == 1) {
-                    rendered += "$name : ${bounds[0]}"
-                } else {
-                    rendered += name
-                }
-            }
-            is GenericParam.ConstParam -> {}
+        if (param is GenericParam.TypeParam) {
+            val rawTpName = rustTypeIdentToKotlin(param.ident.toString())
+            val name = renamedTypeParamIdentifiers[rawTpName] ?: rawTpName
+            if (rawTpName in excludeNames || name in excludeNames || !seenNames.add(name)) continue
+            val bounds = collectRenderedBoundsForTypeParam(param, name, selfTypeName, excludeSimdElement = true)
+            rendered += if (bounds.size == 1) "$name : ${bounds[0]}" else name
         }
     }
     return if (rendered.isEmpty()) "" else "<${rendered.joinToString(", ")}>"
@@ -1709,21 +1649,9 @@ internal fun KotlinJ2KEmitter.renderCombinedWhereClause(
             val rawTpName = rustTypeIdentToKotlin(param.ident.toString())
             val name = renamedTypeParamIdentifiers[rawTpName] ?: rawTpName
             if (rawTpName in excludeNames || name in excludeNames || !seenParamNames.add(name)) continue
-            val prevBounded = currentBoundedTypeName
-            currentBoundedTypeName = name
-            val bounds =
-                try {
-                    param.bounds
-                        .toList()
-                        .mapNotNull { renderTypeParamBound(it, selfTypeName) }
-                        .filter { it != "Any" && it != name && !it.contains("->") }
-                } finally {
-                    currentBoundedTypeName = prevBounded
-                }
+            val bounds = collectRenderedBoundsForTypeParam(param, name, selfTypeName, excludeSimdElement = false)
             if (bounds.size > 1) {
-                for (b in bounds) {
-                    clauses += "$name : $b"
-                }
+                bounds.forEach { clauses += "$name : $it" }
             }
         }
     }
@@ -1850,23 +1778,16 @@ internal fun KotlinJ2KEmitter.hasTestAttribute(attrs: List<Attribute>): Boolean 
 }
 
 internal fun KotlinJ2KEmitter.containsPositiveCfgTestIdent(stream: TokenStream): Boolean {
-    val trees = stream.clone().toList()
+    val cursor = RustTokenCursor(stream.clone().toList())
     var idx = 0
-    while (idx < trees.size) {
-        when (val tree = trees[idx]) {
-            is TokenTree.Ident -> {
-                val word = tree.value.toString()
-                if (word == "not" && idx + 1 < trees.size && trees[idx + 1] is TokenTree.Group) {
-                    idx += 2
-                    continue
-                }
-                if (word == "test") return true
-            }
-            is TokenTree.Group -> {
-                if (containsPositiveCfgTestIdent(tree.value.stream())) return true
-            }
-            else -> {}
+    while (idx < cursor.size) {
+        val word = cursor.identAt(idx)
+        if (word == "not" && cursor.groupAt(idx + 1) != null) {
+            idx += 2
+            continue
         }
+        if (word == "test") return true
+        if (cursor.groupAt(idx)?.let { containsPositiveCfgTestIdent(it.stream()) } == true) return true
         idx++
     }
     return false

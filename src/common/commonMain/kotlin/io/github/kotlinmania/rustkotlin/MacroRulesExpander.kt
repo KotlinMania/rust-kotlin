@@ -51,6 +51,55 @@ internal sealed class MacroPat {
         val sep: LiteralToken?,
         val op: Char,
     ) : MacroPat()
+
+    companion object {
+        fun collectMetavars(
+            pats: List<MacroPat>,
+            includeRepetitions: Boolean,
+            out: MutableCollection<String>,
+        ) {
+            for (p in pats) {
+                when (p) {
+                    is Metavar -> out.add(p.name)
+                    is GroupPat -> collectMetavars(p.inner, includeRepetitions, out)
+                    is Repetition -> if (includeRepetitions) collectMetavars(p.inner, includeRepetitions = true, out)
+                    is LiteralToken -> {}
+                }
+            }
+        }
+
+        fun collectMetavarSet(pats: List<MacroPat>, includeRepetitions: Boolean): Set<String> =
+            linkedSetOf<String>().also { collectMetavars(pats, includeRepetitions, it) }
+
+        fun collectMetavarList(pats: List<MacroPat>): List<String> =
+            mutableListOf<String>().also { collectMetavars(pats, includeRepetitions = true, it) }
+
+        fun hasTtMetavar(pats: List<MacroPat>): Boolean =
+            pats.any { p ->
+                when (p) {
+                    is Metavar -> p.fragSpec == "tt"
+                    is GroupPat -> hasTtMetavar(p.inner)
+                    is Repetition -> hasTtMetavar(p.inner)
+                    is LiteralToken -> false
+                }
+            }
+
+        fun tokenMatchesLiteral(tt: TokenTree, pat: LiteralToken): Boolean =
+            when (tt) {
+                is TokenTree.Punct -> pat.isPunct && tt.value.asChar().toString() == pat.text
+                is TokenTree.Ident -> !pat.isPunct && tt.value.toString() == pat.text
+                is TokenTree.Literal -> !pat.isPunct && tt.value.toString() == pat.text
+                is TokenTree.Group -> {
+                    val grp = tt.value
+                    if (grp.delimiter() != Delimiter.None) {
+                        false
+                    } else {
+                        val single = grp.stream().toList().singleOrNull()
+                        single != null && tokenMatchesLiteral(single, pat)
+                    }
+                }
+            }
+    }
 }
 
 internal data class RepetitionGroup(
@@ -117,11 +166,6 @@ internal fun cfgAttrPreferenceScore(attrs: List<Attribute>): Int {
     if (cfgPredicates.all { evalCfgExpressionTokens(it) }) return 2
     return 0
 }
-
-private data class CfgSelectArm(
-    val predicateTokens: List<TokenTree>?,
-    val bodyTokens: List<TokenTree>,
-)
 
 private val UNSUPPORTED_RUST_TARGET_OS =
     setOf(
@@ -224,93 +268,12 @@ internal fun isUnsupportedTargetRustRelPath(
     }
 }
 
-private fun parseCfgSelectArms(innerTrees: List<TokenTree>): List<CfgSelectArm>? {
-    if (innerTrees.isEmpty()) return emptyList()
-    val arms = mutableListOf<CfgSelectArm>()
-    var idx = 0
-    while (idx < innerTrees.size) {
-        var arrowIdx = -1
-        var scan = idx
-        while (scan + 1 < innerTrees.size) {
-            val eq = (innerTrees[scan] as? TokenTree.Punct)?.value
-            val gt = (innerTrees[scan + 1] as? TokenTree.Punct)?.value
-            if (eq?.asChar() == '=' && eq.spacing() == Spacing.Joint && gt?.asChar() == '>') {
-                arrowIdx = scan
-                break
-            }
-            scan++
-        }
-        if (arrowIdx <= idx) return null
-        val predSlice = innerTrees.subList(idx, arrowIdx)
-        val isWildcard =
-            predSlice.size == 1 && (predSlice[0] as? TokenTree.Ident)?.value?.toString() == "_"
-        val bodyStart = arrowIdx + 2
-        if (bodyStart > innerTrees.size) return null
-        val bodyTok = innerTrees.getOrNull(bodyStart)
-        val (bodyTokens, nextIdx) =
-            if (bodyTok is TokenTree.Group && bodyTok.value.delimiter() == Delimiter.Brace) {
-                val afterGrp = bodyStart + 1
-                val nextAfter =
-                    if (afterGrp < innerTrees.size &&
-                        (innerTrees[afterGrp] as? TokenTree.Punct)?.value?.asChar() == ','
-                    ) {
-                        afterGrp + 1
-                    } else {
-                        afterGrp
-                    }
-                bodyTok.value.stream().toList() to nextAfter
-            } else {
-                var commaIdx = bodyStart
-                while (commaIdx < innerTrees.size &&
-                    (innerTrees[commaIdx] as? TokenTree.Punct)?.value?.asChar() != ','
-                ) {
-                    commaIdx++
-                }
-                val slice = innerTrees.subList(bodyStart, commaIdx)
-                val nextAfter = if (commaIdx < innerTrees.size) commaIdx + 1 else commaIdx
-                slice to nextAfter
-            }
-        arms +=
-            CfgSelectArm(
-                predicateTokens = if (isWildcard) null else predSlice,
-                bodyTokens = bodyTokens,
-            )
-        idx = nextIdx
-    }
-    return arms
-}
-
-internal fun partitionCfgSelectBranchBodies(innerTrees: List<TokenTree>): List<Pair<List<TokenTree>, Boolean>>? {
-    val arms = parseCfgSelectArms(innerTrees) ?: return null
-    val result = mutableListOf<Pair<List<TokenTree>, Boolean>>()
-    var guaranteedWinner = false
-    for (arm in arms) {
-        if (guaranteedWinner) {
-            result += arm.bodyTokens to false
-            continue
-        }
-        val pred = arm.predicateTokens
-        if (pred == null) {
-            guaranteedWinner = true
-            result += arm.bodyTokens to true
-            continue
-        }
-        val tri = evalCfgTriState(pred, forRuntimeCfgMacro = false)
-        when (tri) {
-            true -> {
-                guaranteedWinner = true
-                result += arm.bodyTokens to true
-            }
-            false -> result += arm.bodyTokens to false
-            null -> result += arm.bodyTokens to true
-        }
-    }
-    return result
-}
+internal fun partitionCfgSelectBranchBodies(innerTrees: List<TokenTree>): List<Pair<List<TokenTree>, Boolean>>? =
+    parseCfgSelectArms(innerTrees)?.let(::partitionCfgBranchArms)
 
 private fun chooseSingleActiveCfgSelectBody(innerTrees: List<TokenTree>): List<TokenTree>? {
     val arms = parseCfgSelectArms(innerTrees) ?: return null
-    var firstNonFalse: CfgSelectArm? = null
+    var firstNonFalse: CfgBranchArm? = null
     for (arm in arms) {
         val pred = arm.predicateTokens ?: return firstNonFalse?.bodyTokens ?: arm.bodyTokens
         when (evalCfgTriState(pred, forRuntimeCfgMacro = false)) {
@@ -344,106 +307,43 @@ private fun implItemDeclarationKey(item: ImplItem): String? =
         else -> null
     }
 
-internal fun selectActiveCfgSelectBodies(innerTrees: List<TokenTree>): List<List<TokenTree>>? {
-    val arms = parseCfgSelectArms(innerTrees) ?: return null
-    val candidates = mutableListOf<Pair<CfgSelectArm, Boolean>>()
-    for (arm in arms) {
-        val pred = arm.predicateTokens
-        if (pred == null) {
-            candidates += arm to true
-            break
-        }
-        when (evalCfgTriState(pred, forRuntimeCfgMacro = false)) {
-            true -> return listOf(arm.bodyTokens)
-            false -> Unit
-            null -> candidates += arm to false
-        }
-    }
-    if (candidates.isEmpty()) return emptyList()
-    val hasNonWildcard = candidates.any { !it.second }
-    val seenKeys = linkedSetOf<String>()
-    val keptBodies = mutableListOf<List<TokenTree>>()
-    for ((arm, isWildcard) in candidates) {
-        if (arm.bodyTokens.isEmpty()) continue
-        val parsed =
-            parse2(FileParse::parse, TokenStream.fromTokenTrees(arm.bodyTokens))
+private object TokenBodyCfgSelector : CfgArmSelector<List<TokenTree>>() {
+    override fun parseArmBody(bodyTokens: List<TokenTree>): List<List<TokenTree>> = listOf(bodyTokens)
+
+    override fun extractArmKeys(parsed: List<List<TokenTree>>): List<String>? {
+        val file =
+            parse2(FileParse::parse, TokenStream.fromTokenTrees(parsed.single()))
                 .getOrNull()
-                ?.let(RustNextAstNormalizer::foldFile)
-        if (parsed == null) {
-            if (!isWildcard || !hasNonWildcard) {
-                keptBodies += arm.bodyTokens
-            }
-            continue
-        }
-        val armKeys = parsed.items.mapNotNull(::itemDeclarationKey)
-        if (isWildcard && hasNonWildcard) {
-            val isUnsupportedFallbackMod =
-                "mod:unsupported" in armKeys &&
-                    seenKeys.any { it.startsWith("mod:") }
-            val allKeysAlreadySeen =
-                armKeys.isNotEmpty() && armKeys.all { it in seenKeys }
-            if (isUnsupportedFallbackMod || allKeysAlreadySeen) {
-                continue
-            }
-        }
-        if (armKeys.isNotEmpty() && armKeys.all { it in seenKeys }) {
-            continue
-        }
-        seenKeys += armKeys
-        keptBodies += arm.bodyTokens
+                ?.let(RustNextAstNormalizer::foldFile) ?: return null
+        return file.items.mapNotNull(::itemDeclarationKey)
     }
-    return keptBodies
+
+    override fun shouldSkipWildcardArm(armKeys: List<String>, seenKeys: Set<String>): Boolean =
+        ("mod:unsupported" in armKeys && seenKeys.any { it.startsWith("mod:") }) ||
+            (armKeys.isNotEmpty() && armKeys.all { it in seenKeys })
 }
 
-private fun selectActiveCfgSelectImplItems(innerTrees: List<TokenTree>): List<ImplItem>? {
-    val arms = parseCfgSelectArms(innerTrees) ?: return null
-    val candidates = mutableListOf<Pair<CfgSelectArm, Boolean>>()
-    for (arm in arms) {
-        val pred = arm.predicateTokens
-        if (pred == null) {
-            candidates += arm to true
-            break
-        }
-        when (evalCfgTriState(pred, forRuntimeCfgMacro = false)) {
-            true -> {
-                val wrapped = wrapImplDummyStream(TokenStream.fromTokenTrees(arm.bodyTokens))
-                val dummy =
-                    parse2(FileParse::parse, wrapped)
-                        .getOrNull()
-                        ?.let(RustNextAstNormalizer::foldFile)
-                        ?.items
-                        ?.singleOrNull() as? Item.Impl ?: return null
-                return dummy.items
-            }
-            false -> Unit
-            null -> candidates += arm to false
-        }
-    }
-    if (candidates.isEmpty()) return emptyList()
-    val hasNonWildcard = candidates.any { !it.second }
-    val seenKeys = linkedSetOf<String>()
-    val collected = mutableListOf<ImplItem>()
-    for ((arm, isWildcard) in candidates) {
-        if (arm.bodyTokens.isEmpty()) continue
-        val wrapped = wrapImplDummyStream(TokenStream.fromTokenTrees(arm.bodyTokens))
+private object ImplItemCfgSelector : CfgArmSelector<ImplItem>() {
+    override fun parseArmBody(bodyTokens: List<TokenTree>): List<ImplItem>? {
+        val wrapped = wrapImplDummyStream(TokenStream.fromTokenTrees(bodyTokens))
         val dummy =
             parse2(FileParse::parse, wrapped)
                 .getOrNull()
                 ?.let(RustNextAstNormalizer::foldFile)
                 ?.items
                 ?.singleOrNull() as? Item.Impl ?: return null
-        val armKeys = dummy.items.mapNotNull(::implItemDeclarationKey)
-        if (isWildcard && hasNonWildcard && armKeys.isNotEmpty() && armKeys.all { it in seenKeys }) {
-            continue
-        }
-        if (armKeys.isNotEmpty() && armKeys.all { it in seenKeys }) {
-            continue
-        }
-        seenKeys += armKeys
-        collected += dummy.items
+        return dummy.items
     }
-    return collected
+
+    override fun extractArmKeys(parsed: List<ImplItem>): List<String> =
+        parsed.mapNotNull(::implItemDeclarationKey)
 }
+
+internal fun selectActiveCfgSelectBodies(innerTrees: List<TokenTree>): List<List<TokenTree>>? =
+    parseCfgSelectArms(innerTrees)?.let(TokenBodyCfgSelector::selectActive)
+
+private fun selectActiveCfgSelectImplItems(innerTrees: List<TokenTree>): List<ImplItem>? =
+    parseCfgSelectArms(innerTrees)?.let(ImplItemCfgSelector::selectActive)
 
 private fun wrapImplDummyStream(inner: TokenStream): TokenStream {
     val prefix = TokenStream.fromString("impl Dummy").getOrThrow().toList()
@@ -497,186 +397,189 @@ private fun resolveUnknownCfgOutcome(profile: CfgTargetProfile, forRuntimeCfgMac
         UnknownCfgPolicy.PERMISSIVE_TRUE -> true
     }
 
-private fun unquoteCfgStringLiteral(tt: TokenTree.Literal): String? {
-    val decoded = tt.value.strValue().value
-    if (decoded != null) return decoded
-    val raw = tt.value.toString()
-    if (raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')) {
-        return raw.substring(1, raw.length - 1)
-    }
-    if (raw.startsWith('r')) {
-        val quoteStart = raw.indexOf('"')
-        val quoteEnd = raw.lastIndexOf('"')
-        if (quoteStart > 0 && quoteEnd > quoteStart) {
-            val prefixHashes = quoteStart - 1
-            val suffixHashes = raw.length - 1 - quoteEnd
-            val validPrefix = (1 until quoteStart).all { raw[it] == '#' }
-            val validSuffix = (quoteEnd + 1 until raw.length).all { raw[it] == '#' }
-            if (prefixHashes == suffixHashes && validPrefix && validSuffix) {
-                return raw.substring(quoteStart + 1, quoteEnd)
-            }
-        }
-    }
-    return null
-}
+internal fun evalCfgTriState(tokens: List<TokenTree>, forRuntimeCfgMacro: Boolean): Boolean? =
+    CfgPredicateTokenEvaluator(tokens, forRuntimeCfgMacro).eval()
 
-private fun extractCfgPredicateKey(keyTokens: List<TokenTree>): String? {
-    if (keyTokens.isEmpty() || keyTokens.size % 3 != 1) return null
-    val segments = mutableListOf<String>()
-    var idx = 0
-    while (idx < keyTokens.size) {
-        val segIdent = (keyTokens[idx] as? TokenTree.Ident)?.value?.toString()?.removePrefix("r#") ?: return null
-        segments += segIdent
-        if (idx + 1 < keyTokens.size) {
-            val c1 = (keyTokens[idx + 1] as? TokenTree.Punct)?.value
-            val c2 = (keyTokens[idx + 2] as? TokenTree.Punct)?.value
-            if (c1?.asChar() != ':' || c1.spacing() != Spacing.Joint || c2?.asChar() != ':') {
-                return null
-            }
-        }
-        idx += 3
-    }
-    return segments.joinToString("::")
-}
+private class CfgPredicateTokenEvaluator(
+    trees: List<TokenTree>,
+    private val forRuntimeCfgMacro: Boolean,
+) : RustTokenCursor(trees) {
+    private val profile: CfgTargetProfile = TranslationSession.cfgTargetProfile
+    private val relDir: String? =
+        if (profile.useRelativeDirPlatformHints) TranslationSession.currentRelativeSourceDir else null
 
-internal fun evalCfgTriState(tokens: List<TokenTree>, forRuntimeCfgMacro: Boolean): Boolean? {
-    val profile = TranslationSession.cfgTargetProfile
-    val relDir = if (profile.useRelativeDirPlatformHints) TranslationSession.currentRelativeSourceDir else null
-    if (tokens.size == 2) {
-        val fnIdent = (tokens[0] as? TokenTree.Ident)?.value?.toString()?.removePrefix("r#")
-        val grp = tokens[1] as? TokenTree.Group
-        if (grp != null && grp.value.delimiter() == Delimiter.Parenthesis) {
-            val innerStream = grp.value.stream()
-            val clauses = MacroRulesFileExpander.splitTopLevelCommaClauses(innerStream.clone().toList())
-            when (fnIdent) {
-                "all" -> {
-                    var allTrue = true
-                    for (clause in clauses) {
-                        val sub = evalCfgTriState(clause, forRuntimeCfgMacro)
-                        if (sub == false) return false
-                        if (sub != true) allTrue = false
+    fun eval(): Boolean? {
+        if (size == 2) {
+            val fnIdent = cleanIdentAt(0)
+            val grp = groupAt(1, Delimiter.Parenthesis)
+            if (fnIdent != null && grp != null) {
+                val innerTrees = grp.stream().clone().toList()
+                val clauses = RustTokenCursor(innerTrees).splitByTopLevelPunct(',')
+                when (fnIdent) {
+                    "all" -> {
+                        var allTrue = true
+                        for (clause in clauses) {
+                            val sub = CfgPredicateTokenEvaluator(clause, forRuntimeCfgMacro).eval()
+                            if (sub == false) return false
+                            if (sub != true) allTrue = false
+                        }
+                        return if (allTrue) true else null
                     }
-                    return if (allTrue) true else null
-                }
-                "any" -> {
-                    var allFalse = true
-                    for (clause in clauses) {
-                        val sub = evalCfgTriState(clause, forRuntimeCfgMacro)
-                        if (sub == true) return true
-                        if (sub != false) allFalse = false
+                    "any" -> {
+                        var allFalse = true
+                        for (clause in clauses) {
+                            val sub = CfgPredicateTokenEvaluator(clause, forRuntimeCfgMacro).eval()
+                            if (sub == true) return true
+                            if (sub != false) allFalse = false
+                        }
+                        return if (allFalse) false else null
                     }
-                    return if (allFalse) false else null
-                }
-                "not" -> {
-                    if (clauses.size == 1) {
-                        return evalCfgTriState(clauses[0], forRuntimeCfgMacro)?.not()
+                    "not" -> {
+                        if (clauses.size == 1) {
+                            return CfgPredicateTokenEvaluator(clauses[0], forRuntimeCfgMacro).eval()?.not()
+                        }
                     }
                 }
             }
         }
+        if (size >= 3 && punctCharAt(size - 2) == '=') {
+            val litToken = trees[size - 1] as? TokenTree.Literal
+            val key = if (litToken != null) extractPredicateKey(size - 2) else null
+            val litText = litToken?.let(::unquoteCfgStringLiteral)
+            if (key != null && litText != null) {
+                return evalKeyValuePredicate(key, litText)
+            }
+        }
+        val ident = extractPredicateKey(size) ?: return null
+        if (ident == "true") return true
+        if (ident == "false") return false
+        if (ident in profile.enabledCfgFlags) return true
+        if (ident in profile.disabledCfgFlags) return false
+        if (ident in ALWAYS_FALSE_CFG_FLAGS) return false
+        if (ident == "test") return if (forRuntimeCfgMacro) false else null
+        if (ident == "unix" || ident == "windows" || ident == "wasm") {
+            profile.targetFamilies?.let { return ident in it }
+            if (dirContainsSegment(relDir, ident)) return true
+        }
+        return resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
     }
-    if (tokens.size >= 3) {
-        val eq = (tokens[tokens.size - 2] as? TokenTree.Punct)?.value?.asChar()
-        val litToken = tokens.last() as? TokenTree.Literal
-        val key = if (eq == '=' && litToken != null) extractCfgPredicateKey(tokens.subList(0, tokens.size - 2)) else null
-        val litText = litToken?.let(::unquoteCfgStringLiteral)
-        if (eq == '=' && key != null && litText != null) {
-            return when (key) {
-                "target_pointer_width" -> litText.toIntOrNull()?.let { it == profile.pointerWidth }
-                "target_endian" -> litText == profile.targetEndian
-                "target_arch" -> {
-                    if (profile.targetArch != null) {
-                        litText == profile.targetArch
-                    } else if (dirContainsSegment(relDir, litText)) {
+
+    private fun evalKeyValuePredicate(key: String, litText: String): Boolean? =
+        when (key) {
+            "target_pointer_width" -> litText.toIntOrNull()?.let { it == profile.pointerWidth }
+            "target_endian" -> litText == profile.targetEndian
+            "target_arch" ->
+                when {
+                    profile.targetArch != null -> litText == profile.targetArch
+                    dirContainsSegment(relDir, litText) -> true
+                    profile.pointerWidth == 64 && litText in ARCHS_16_OR_32_BIT -> false
+                    profile.pointerWidth in POINTER_WIDTHS_16_OR_32 && litText in ARCHS_64_BIT -> false
+                    else -> resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
+                }
+            "target_has_atomic", "target_has_atomic_load_store", "target_has_atomic_equal_alignment" ->
+                when {
+                    profile.pointerWidth >= 64 && litText in ATOMIC_WIDTHS_64 -> true
+                    profile.pointerWidth == 32 && litText in ATOMIC_WIDTHS_32 -> true
+                    profile.pointerWidth == 16 && litText in ATOMIC_WIDTHS_16 -> true
+                    else -> resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
+                }
+            "target_os" -> evalTargetProperty(profile.targetOs, UNSUPPORTED_RUST_TARGET_OS, litText)
+            "target_env" -> evalTargetProperty(profile.targetEnv, UNSUPPORTED_RUST_TARGET_ENV, litText)
+            "target_vendor" -> evalTargetProperty(profile.targetVendor, UNSUPPORTED_RUST_TARGET_VENDOR, litText)
+            "target_family" ->
+                profile.targetFamilies?.let { litText in it }
+                    ?: if (dirContainsSegment(relDir, litText)) {
                         true
-                    } else if (profile.pointerWidth == 64 && litText in ARCHS_16_OR_32_BIT) {
-                        false
-                    } else if (profile.pointerWidth in setOf(16, 32) && litText in ARCHS_64_BIT) {
-                        false
                     } else {
                         resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
                     }
-                }
-                "target_has_atomic", "target_has_atomic_load_store", "target_has_atomic_equal_alignment" -> {
-                    when {
-                        profile.pointerWidth >= 64 && litText in setOf("8", "16", "32", "64", "ptr") -> true
-                        profile.pointerWidth == 32 && litText in setOf("8", "16", "32", "ptr") -> true
-                        profile.pointerWidth == 16 && litText in setOf("8", "16", "ptr") -> true
-                        else -> resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
-                    }
-                }
-                "target_os" -> {
-                    profile.targetOs?.let { litText == it }
-                        ?: if (litText in UNSUPPORTED_RUST_TARGET_OS) {
-                            false
-                        } else if (dirContainsSegment(relDir, litText)) {
-                            true
-                        } else {
-                            resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
-                        }
-                }
-                "target_env" -> {
-                    profile.targetEnv?.let { litText == it }
-                        ?: if (litText in UNSUPPORTED_RUST_TARGET_ENV) {
-                            false
-                        } else if (dirContainsSegment(relDir, litText)) {
-                            true
-                        } else {
-                            resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
-                        }
-                }
-                "target_vendor" -> {
-                    profile.targetVendor?.let { litText == it }
-                        ?: if (litText in UNSUPPORTED_RUST_TARGET_VENDOR) {
-                            false
-                        } else if (dirContainsSegment(relDir, litText)) {
-                            true
-                        } else {
-                            resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
-                        }
-                }
-                "target_family" -> {
-                    profile.targetFamilies?.let { litText in it }
-                        ?: if (dirContainsSegment(relDir, litText)) {
-                            true
-                        } else {
-                            resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
-                        }
-                }
-                "feature" -> {
-                    val kvEntry = "feature=$litText"
-                    val quotedKvEntry = "feature=\"$litText\""
-                    when {
-                        kvEntry in profile.disabledCfgFlags || quotedKvEntry in profile.disabledCfgFlags -> false
-                        kvEntry in profile.enabledCfgFlags || quotedKvEntry in profile.enabledCfgFlags -> true
-                        profile.enabledFeatures != null -> litText in profile.enabledFeatures
-                        else -> resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
-                    }
-                }
-                else -> {
-                    val kvEntry = "$key=$litText"
-                    val quotedKvEntry = "$key=\"$litText\""
-                    when {
-                        kvEntry in profile.enabledCfgFlags || quotedKvEntry in profile.enabledCfgFlags -> true
-                        kvEntry in profile.disabledCfgFlags || quotedKvEntry in profile.disabledCfgFlags -> false
-                        else -> resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
-                    }
-                }
+            "feature" ->
+                lookupExplicitKvFlag("feature", litText, checkDisabledFirst = true)
+                    ?: profile.enabledFeatures?.let { litText in it }
+                    ?: resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
+            else ->
+                lookupExplicitKvFlag(key, litText, checkDisabledFirst = false)
+                    ?: resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
+        }
+
+    private fun evalTargetProperty(
+        configured: String?,
+        unsupported: Set<String>,
+        litText: String,
+    ): Boolean? =
+        configured?.let { litText == it }
+            ?: when {
+                litText in unsupported -> false
+                dirContainsSegment(relDir, litText) -> true
+                else -> resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
+            }
+
+    private fun lookupExplicitKvFlag(
+        key: String,
+        litText: String,
+        checkDisabledFirst: Boolean,
+    ): Boolean? {
+        val kvEntry = "$key=$litText"
+        val quotedKvEntry = "$key=\"$litText\""
+        val inEnabled = kvEntry in profile.enabledCfgFlags || quotedKvEntry in profile.enabledCfgFlags
+        val inDisabled = kvEntry in profile.disabledCfgFlags || quotedKvEntry in profile.disabledCfgFlags
+        return if (checkDisabledFirst) {
+            when {
+                inDisabled -> false
+                inEnabled -> true
+                else -> null
+            }
+        } else {
+            when {
+                inEnabled -> true
+                inDisabled -> false
+                else -> null
             }
         }
     }
-    val ident = extractCfgPredicateKey(tokens) ?: return null
-    if (ident == "true") return true
-    if (ident == "false") return false
-    if (ident in profile.enabledCfgFlags) return true
-    if (ident in profile.disabledCfgFlags) return false
-    if (ident in setOf("miri", "doc", "rustdoc", "doctest", "bootstrap")) return false
-    if (ident == "test") return if (forRuntimeCfgMacro) false else null
-    if (ident == "unix" || ident == "windows" || ident == "wasm") {
-        profile.targetFamilies?.let { return ident in it }
-        if (dirContainsSegment(relDir, ident)) return true
+
+    private fun extractPredicateKey(endExclusive: Int): String? {
+        if (endExclusive <= 0 || endExclusive % 3 != 1) return null
+        val segments = ArrayList<String>((endExclusive + 2) / 3)
+        var idx = 0
+        while (idx < endExclusive) {
+            segments += cleanIdentAt(idx) ?: return null
+            if (idx + 1 < endExclusive && !isDoubleColonAt(idx + 1)) return null
+            idx += 3
+        }
+        return segments.joinToString("::")
     }
-    return resolveUnknownCfgOutcome(profile, forRuntimeCfgMacro)
+
+    companion object {
+        private val ALWAYS_FALSE_CFG_FLAGS = setOf("miri", "doc", "rustdoc", "doctest", "bootstrap")
+        private val POINTER_WIDTHS_16_OR_32 = setOf(16, 32)
+        private val ATOMIC_WIDTHS_64 = setOf("8", "16", "32", "64", "ptr")
+        private val ATOMIC_WIDTHS_32 = setOf("8", "16", "32", "ptr")
+        private val ATOMIC_WIDTHS_16 = setOf("8", "16", "ptr")
+
+        private fun unquoteCfgStringLiteral(tt: TokenTree.Literal): String? {
+            val decoded = tt.value.strValue().value
+            if (decoded != null) return decoded
+            val raw = tt.value.toString()
+            if (raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')) {
+                return raw.substring(1, raw.length - 1)
+            }
+            if (raw.startsWith('r')) {
+                val quoteStart = raw.indexOf('"')
+                val quoteEnd = raw.lastIndexOf('"')
+                if (quoteStart > 0 && quoteEnd > quoteStart) {
+                    val prefixHashes = quoteStart - 1
+                    val suffixHashes = raw.length - 1 - quoteEnd
+                    val validPrefix = (1 until quoteStart).all { raw[it] == '#' }
+                    val validSuffix = (quoteEnd + 1 until raw.length).all { raw[it] == '#' }
+                    if (prefixHashes == suffixHashes && validPrefix && validSuffix) {
+                        return raw.substring(quoteStart + 1, quoteEnd)
+                    }
+                }
+            }
+            return null
+        }
+    }
 }
 
 internal fun isRawPointerLiteralMacroBranches(branches: List<MacroRuleBranch>): Boolean {
@@ -684,26 +587,8 @@ internal fun isRawPointerLiteralMacroBranches(branches: List<MacroRuleBranch>): 
     return branches.all { branch ->
         !branch.isRepetition &&
             branch.paramNames.size == 1 &&
-            tokenTreesEndWithAsPtrCall(branch.bodyTokens.clone().toList())
+            MacroDeclarativeTokenScanner.endsWithAsPtrCall(branch.bodyTokens.clone().toList())
     }
-}
-
-private fun tokenTreesEndWithAsPtrCall(rawTrees: List<TokenTree>): Boolean {
-    var trees = rawTrees
-    while (trees.size == 1 && trees[0] is TokenTree.Group) {
-        val g = (trees[0] as TokenTree.Group).value
-        if (g.delimiter() == Delimiter.Brace || g.delimiter() == Delimiter.Parenthesis || g.delimiter() == Delimiter.None) {
-            trees = g.stream().clone().toList()
-        } else {
-            break
-        }
-    }
-    if (trees.size < 4) return false
-    val last = trees.last() as? TokenTree.Group ?: return false
-    if (last.value.delimiter() != Delimiter.Parenthesis || !last.value.stream().isEmpty()) return false
-    val methodIdent = (trees[trees.size - 2] as? TokenTree.Ident)?.value?.toString() ?: return false
-    val dotPunct = (trees[trees.size - 3] as? TokenTree.Punct)?.value?.asChar() ?: return false
-    return dotPunct == '.' && (methodIdent == "as_ptr" || methodIdent == "as_mut_ptr")
 }
 
 internal fun hasCfgTestModAttribute(attrs: List<Attribute>): Boolean {
@@ -774,43 +659,17 @@ internal class MacroRulesCollector(
 
     companion object {
         internal fun buildMacroRuleBranch(patternStream: TokenStream, bodyStream: TokenStream): MacroRuleBranch {
-            val patternAst = parseMacroPattern(patternStream.clone())
-            val params = extractPatternParams(patternStream.clone())
-            val isRep = hasRepetitionPattern(patternStream.clone())
+            val patternAst = MacroPatternTokenParser(patternStream.clone().toList()).parsePattern()
+            val params = MacroPat.collectMetavarList(patternAst)
+            val isRep = patternAst.any { it is MacroPat.Repetition }
             return MacroRuleBranch(patternAst, params, isRep, stripTemplateSpans(bodyStream))
         }
 
-        internal fun parseMacroRulesBranches(tokens: TokenStream): List<MacroRuleBranch> {
-            val list = tokens.clone().toList()
-            val branches = mutableListOf<MacroRuleBranch>()
-            var idx = 0
-            while (idx < list.size) {
-                val patternGroup = list[idx] as? TokenTree.Group
-                if (patternGroup == null) {
-                    idx++
-                    continue
-                }
-                if (idx + 3 < list.size) {
-                    val eqPunct = list[idx + 1] as? TokenTree.Punct
-                    val gtPunct = list[idx + 2] as? TokenTree.Punct
-                    val bodyGroup = list[idx + 3] as? TokenTree.Group
-                    if (eqPunct?.value?.asChar() == '=' &&
-                        gtPunct?.value?.asChar() == '>' &&
-                        bodyGroup != null
-                    ) {
-                        branches.add(buildMacroRuleBranch(patternGroup.value.stream(), bodyGroup.value.stream()))
-                        idx += 4
-                        val sep = (list.getOrNull(idx) as? TokenTree.Punct)?.value?.asChar()
-                        if (sep == ';' || sep == ',') {
-                            idx++
-                        }
-                        continue
-                    }
-                }
-                idx++
-            }
-            return branches
-        }
+        internal fun parseMacroRulesBranches(tokens: TokenStream): List<MacroRuleBranch> =
+            MacroPatternTokenParser(tokens.clone().toList()).parseBranches()
+
+        internal fun parseMacroPattern(patternStream: TokenStream): List<MacroPat> =
+            MacroPatternTokenParser(patternStream.clone().toList()).parsePattern()
 
         private fun stripTemplateSpans(stream: TokenStream): TokenStream {
             val callSite = Span.callSite()
@@ -828,125 +687,99 @@ internal class MacroRulesCollector(
                 }
             return TokenStream.fromTokenTrees(out)
         }
+    }
+}
 
-        internal fun parseMacroPattern(patternStream: TokenStream): List<MacroPat> {
-            val trees = patternStream.clone().toList()
-            val out = mutableListOf<MacroPat>()
-            var i = 0
-            while (i < trees.size) {
-                val tt = trees[i]
-                if (tt is TokenTree.Punct && tt.value.asChar() == '$' && i + 1 < trees.size) {
-                    val next = trees[i + 1]
-                    if (next is TokenTree.Ident) {
-                        val name = next.value.toString()
-                        var frag = "tt"
+private class MacroPatternTokenParser(
+    trees: List<TokenTree>,
+) : RustTokenCursor(trees) {
+    fun parseBranches(): List<MacroRuleBranch> {
+        val branches = mutableListOf<MacroRuleBranch>()
+        var idx = 0
+        while (idx < size) {
+            val patternGroup = groupAt(idx)
+            if (patternGroup != null &&
+                idx + 3 < size &&
+                punctCharAt(idx + 1) == '=' &&
+                punctCharAt(idx + 2) == '>'
+            ) {
+                val bodyGroup = groupAt(idx + 3)
+                if (bodyGroup != null) {
+                    branches.add(MacroRulesCollector.buildMacroRuleBranch(patternGroup.stream(), bodyGroup.stream()))
+                    idx += 4
+                    val sep = punctCharAt(idx)
+                    if (sep == ';' || sep == ',') {
+                        idx++
+                    }
+                    continue
+                }
+            }
+            idx++
+        }
+        return branches
+    }
+
+    fun parsePattern(): List<MacroPat> {
+        val out = mutableListOf<MacroPat>()
+        var i = 0
+        while (i < size) {
+            if (punctCharAt(i) == '$' && i + 1 < size) {
+                val metavarName = identAt(i + 1)
+                if (metavarName != null) {
+                    var frag = "tt"
+                    i += 2
+                    val specIdent = if (punctCharAt(i) == ':') identAt(i + 1) else null
+                    if (specIdent != null) {
+                        frag = specIdent
                         i += 2
-                        if (i + 1 < trees.size &&
-                            (trees[i] as? TokenTree.Punct)?.value?.asChar() == ':' &&
-                            trees[i + 1] is TokenTree.Ident
-                        ) {
-                            frag = (trees[i + 1] as TokenTree.Ident).value.toString()
-                            i += 2
-                        }
-                        out.add(MacroPat.Metavar(name, frag))
-                        continue
-                    } else if (next is TokenTree.Group && next.value.delimiter() == Delimiter.Parenthesis) {
-                        val innerPat = parseMacroPattern(next.value.stream())
-                        i += 2
-                        var sep: MacroPat.LiteralToken? = null
-                        var op = '*'
-                        if (i < trees.size) {
-                            val t1 = trees[i]
-                            if (t1 is TokenTree.Punct &&
-                                (t1.value.asChar() == '*' || t1.value.asChar() == '+' || t1.value.asChar() == '?')
-                            ) {
-                                op = t1.value.asChar()
-                                i++
-                            } else if (i + 1 < trees.size && trees[i + 1] is TokenTree.Punct) {
-                                val p2 = (trees[i + 1] as TokenTree.Punct).value.asChar()
-                                if (p2 == '*' || p2 == '+') {
-                                    when (t1) {
-                                        is TokenTree.Punct -> {
-                                            sep = MacroPat.LiteralToken(t1.value.asChar().toString(), isPunct = true)
-                                            op = p2
-                                            i += 2
-                                        }
-                                        is TokenTree.Ident -> {
-                                            sep = MacroPat.LiteralToken(t1.value.toString(), isPunct = false)
-                                            op = p2
-                                            i += 2
-                                        }
-                                        else -> {}
-                                    }
+                    }
+                    out.add(MacroPat.Metavar(metavarName, frag))
+                    continue
+                }
+                val repGroup = groupAt(i + 1, Delimiter.Parenthesis)
+                if (repGroup != null) {
+                    val innerPat = MacroPatternTokenParser(repGroup.stream().toList()).parsePattern()
+                    i += 2
+                    var sep: MacroPat.LiteralToken? = null
+                    var op = '*'
+                    val p1 = punctCharAt(i)
+                    if (p1 == '*' || p1 == '+' || p1 == '?') {
+                        op = p1
+                        i++
+                    } else {
+                        val p2 = punctCharAt(i + 1)
+                        if (p2 == '*' || p2 == '+') {
+                            when (val sepToken = trees.getOrNull(i)) {
+                                is TokenTree.Punct -> {
+                                    sep = MacroPat.LiteralToken(sepToken.value.asChar().toString(), isPunct = true)
+                                    op = p2
+                                    i += 2
                                 }
+                                is TokenTree.Ident -> {
+                                    sep = MacroPat.LiteralToken(sepToken.value.toString(), isPunct = false)
+                                    op = p2
+                                    i += 2
+                                }
+                                else -> {}
                             }
                         }
-                        out.add(MacroPat.Repetition(innerPat, sep, op))
-                        continue
                     }
-                }
-                when (tt) {
-                    is TokenTree.Group -> {
-                        out.add(MacroPat.GroupPat(tt.value.delimiter(), parseMacroPattern(tt.value.stream())))
-                    }
-                    is TokenTree.Punct -> {
-                        out.add(MacroPat.LiteralToken(tt.value.asChar().toString(), isPunct = true))
-                    }
-                    is TokenTree.Ident -> {
-                        out.add(MacroPat.LiteralToken(tt.value.toString(), isPunct = false))
-                    }
-                    is TokenTree.Literal -> {
-                        out.add(MacroPat.LiteralToken(tt.value.toString(), isPunct = false))
-                    }
-                }
-                i++
-            }
-            return out
-        }
-
-        private fun hasRepetitionPattern(patternStream: TokenStream): Boolean {
-            val trees = patternStream.clone().toList()
-            for (i in 0 until trees.size - 1) {
-                val tt = trees[i]
-                val next = trees[i + 1]
-                if (tt is TokenTree.Punct && tt.value.asChar() == '$' &&
-                    next is TokenTree.Group && next.value.delimiter() == Delimiter.Parenthesis
-                ) {
-                    return true
+                    out.add(MacroPat.Repetition(innerPat, sep, op))
+                    continue
                 }
             }
-            return false
-        }
-
-        private fun extractPatternParams(patternStream: TokenStream): List<String> {
-            val params = mutableListOf<String>()
-            val trees = patternStream.clone().toList()
-            var i = 0
-            while (i < trees.size) {
-                val tt = trees[i]
-                if (tt is TokenTree.Punct && tt.value.asChar() == '$' && i + 1 < trees.size) {
-                    val next = trees[i + 1]
-                    if (next is TokenTree.Ident) {
-                        params.add(next.value.toString())
-                        i += 2
-                        if (i + 1 < trees.size &&
-                            (trees[i] as? TokenTree.Punct)?.value?.asChar() == ':'
-                        ) {
-                            i += 2
-                        }
-                        continue
-                    } else if (next is TokenTree.Group) {
-                        params.addAll(extractPatternParams(next.value.stream()))
-                        i += 2
-                        continue
-                    }
-                } else if (tt is TokenTree.Group) {
-                    params.addAll(extractPatternParams(tt.value.stream()))
+            when (val tt = trees[i]) {
+                is TokenTree.Group -> {
+                    val inner = MacroPatternTokenParser(tt.value.stream().toList()).parsePattern()
+                    out.add(MacroPat.GroupPat(tt.value.delimiter(), inner))
                 }
-                i++
+                is TokenTree.Punct -> out.add(MacroPat.LiteralToken(tt.value.asChar().toString(), isPunct = true))
+                is TokenTree.Ident -> out.add(MacroPat.LiteralToken(tt.value.toString(), isPunct = false))
+                is TokenTree.Literal -> out.add(MacroPat.LiteralToken(tt.value.toString(), isPunct = false))
             }
-            return params
+            i++
         }
+        return out
     }
 }
 
@@ -1375,10 +1208,10 @@ internal class MacroRulesFileExpander(
                 meta is Meta.NameValue && meta.path.isIdent("doc")
             }
         val docTargetIndex =
-            expanded.indexOfFirst { !isDocOnlyCfgAttribute(itemAttrs(it)) }.let { if (it >= 0) it else 0 }
+            expanded.indexOfFirst { !itemHasDocOnlyCfg(it) }.let { if (it >= 0) it else 0 }
         return expanded.mapIndexed { idx, item ->
             val extra = if (idx == docTargetIndex) docAttrs + nonDocAttrs else nonDocAttrs
-            if (extra.isEmpty()) item else prependItemAttrs(item, extra)
+            if (extra.isEmpty()) item else item.withPrependedAttributes(extra)
         }
     }
 
@@ -1397,7 +1230,7 @@ internal class MacroRulesFileExpander(
 
     private fun attachWrapperSpansToFirstExpandedItem(wrapperSpans: List<Span>, expanded: List<Item>) {
         if (wrapperSpans.isEmpty() || expanded.isEmpty()) return
-        val targetItem = expanded.firstOrNull { !isDocOnlyCfgAttribute(itemAttrs(it)) } ?: expanded.first()
+        val targetItem = expanded.firstOrNull { !itemHasDocOnlyCfg(it) } ?: expanded.first()
         val targetOffset = collectHeaderSourceSpans(targetItem).firstOrNull()?.startOffset() ?: return
         val bucket = macroWrapperSpansByTargetOffset.getOrPut(targetOffset) { mutableListOf() }
         for (sp in wrapperSpans) {
@@ -1416,70 +1249,12 @@ internal class MacroRulesFileExpander(
                 meta is Meta.NameValue && meta.path.isIdent("doc")
             }
         val docTargetIndex =
-            expanded.indexOfFirst { !isDocOnlyCfgAttribute(implItemAttrs(it)) }.let { if (it >= 0) it else 0 }
+            expanded.indexOfFirst { !implItemHasDocOnlyCfg(it) }.let { if (it >= 0) it else 0 }
         return expanded.mapIndexed { idx, item ->
             val extra = if (idx == docTargetIndex) docAttrs + nonDocAttrs else nonDocAttrs
-            if (extra.isEmpty()) item else prependImplItemAttrs(item, extra)
+            if (extra.isEmpty()) item else item.withPrependedAttributes(extra)
         }
     }
-
-    private fun itemAttrs(item: Item): List<Attribute> =
-        when (item) {
-            is Item.Const -> item.attrs
-            is Item.Enum -> item.attrs
-            is Item.ExternCrate -> item.attrs
-            is Item.Fn -> item.attrs
-            is Item.ForeignMod -> item.attrs
-            is Item.Impl -> item.attrs
-            is Item.Macro -> item.attrs
-            is Item.Mod -> item.attrs
-            is Item.Static -> item.attrs
-            is Item.Struct -> item.attrs
-            is Item.Trait -> item.attrs
-            is Item.TraitAlias -> item.attrs
-            is Item.ItemType -> item.attrs
-            is Item.Union -> item.attrs
-            is Item.Use -> item.attrs
-            is Item.Verbatim -> emptyList()
-        }
-
-    private fun prependItemAttrs(item: Item, prefixAttrs: List<Attribute>): Item =
-        when (item) {
-            is Item.Const -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Enum -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.ExternCrate -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Fn -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.ForeignMod -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Impl -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Macro -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Mod -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Static -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Struct -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Trait -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.TraitAlias -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.ItemType -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Union -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Use -> item.copy(attrs = prefixAttrs + item.attrs)
-            is Item.Verbatim -> item
-        }
-
-    private fun implItemAttrs(item: ImplItem): List<Attribute> =
-        when (item) {
-            is ImplItem.Const -> item.attrs
-            is ImplItem.Fn -> item.attrs
-            is ImplItem.AssocType -> item.attrs
-            is ImplItem.Macro -> item.attrs
-            is ImplItem.Verbatim -> emptyList()
-        }
-
-    private fun prependImplItemAttrs(item: ImplItem, prefixAttrs: List<Attribute>): ImplItem =
-        when (item) {
-            is ImplItem.Const -> item.copy(attrs = prefixAttrs + item.attrs)
-            is ImplItem.Fn -> item.copy(attrs = prefixAttrs + item.attrs)
-            is ImplItem.AssocType -> item.copy(attrs = prefixAttrs + item.attrs)
-            is ImplItem.Macro -> item.copy(attrs = prefixAttrs + item.attrs)
-            is ImplItem.Verbatim -> item
-        }
 
     private fun expandAndFoldBlockStmts(stmts: List<Stmt>, depth: Int): List<Stmt> {
         if (depth > MAX_MACRO_EXPANSION_DEPTH || activeExpansionDepth > MAX_MACRO_EXPANSION_DEPTH) {
@@ -1582,20 +1357,20 @@ internal class MacroRulesFileExpander(
 
     private fun expandMacroToTokenStream(def: MacroRulesDef, invocation: Macro): TokenStream? {
         val inputTrees = invocation.tokens.clone().toList()
+        val matcher = MacroFragmentTokenCursor(inputTrees)
         for (branch in def.branches) {
             val env = MacroMatchEnv()
-            val consumed = matchPatternSequence(branch.pattern, 0, inputTrees, 0, env)
-            if (consumed == inputTrees.size) {
+            if (matcher.matchSequence(branch.pattern, 0, 0, env) == inputTrees.size) {
                 return substituteMacroTokensWithEnv(branch.bodyTokens.clone(), env)
             }
         }
         if (inputTrees.any { it is TokenTree.Group && it.value.delimiter() == Delimiter.None }) {
-            val flattenedTrees = flattenTopLevelNoneGroups(inputTrees)
+            val flattenedTrees = RustTokenCursor.flattenNoneDelimitedGroupList(inputTrees)
+            val flattenedMatcher = MacroFragmentTokenCursor(flattenedTrees)
             for (branch in def.branches) {
-                if (hasTtMetavar(branch.pattern)) continue
+                if (MacroPat.hasTtMetavar(branch.pattern)) continue
                 val env = MacroMatchEnv()
-                val consumed = matchPatternSequence(branch.pattern, 0, flattenedTrees, 0, env)
-                if (consumed == flattenedTrees.size) {
+                if (flattenedMatcher.matchSequence(branch.pattern, 0, 0, env) == flattenedTrees.size) {
                     return substituteMacroTokensWithEnv(branch.bodyTokens.clone(), env)
                 }
             }
@@ -1606,262 +1381,396 @@ internal class MacroRulesFileExpander(
     companion object {
         private const val MAX_MACRO_EXPANSION_DEPTH = 64
 
-        private fun matchPatternSequence(
-            pats: List<MacroPat>,
-            patIdx: Int,
-            input: List<TokenTree>,
-            inIdx: Int,
+        internal fun substituteMacroTokensWithEnv(
+            template: TokenStream,
             env: MacroMatchEnv,
-            trailingStopPats: List<MacroPat> = emptyList(),
-        ): Int? {
-            if (patIdx == pats.size) {
-                return inIdx
-            }
-            return when (val pat = pats[patIdx]) {
-                is MacroPat.LiteralToken -> {
-                    if (inIdx >= input.size) return null
-                    if (!tokenMatchesLiteral(input[inIdx], pat)) return null
-                    if (!pat.isPunct && input[inIdx] is TokenTree.Ident) {
-                        val kw = pat.text
-                        if (kw !in env.matchedKeywordSpans) {
-                            env.matchedKeywordSpans[kw] = input[inIdx].span()
-                        }
-                    }
-                    matchPatternSequence(pats, patIdx + 1, input, inIdx + 1, env, trailingStopPats)
-                }
-                is MacroPat.GroupPat -> {
-                    if (inIdx >= input.size) return null
-                    val grp = input[inIdx] as? TokenTree.Group ?: return null
-                    if (grp.value.delimiter() != pat.delimiter) return null
-                    val innerTrees = grp.value.stream().toList()
-                    val innerConsumed = matchPatternSequence(pat.inner, 0, innerTrees, 0, env)
-                    if (innerConsumed != innerTrees.size) return null
-                    matchPatternSequence(pats, patIdx + 1, input, inIdx + 1, env, trailingStopPats)
-                }
-                is MacroPat.Metavar -> {
-                    val stopPats = collectLeadingStopPats(pats, patIdx + 1, trailingStopPats)
-                    val spanLen = consumeFragmentLength(pat.fragSpec, input, inIdx, stopPats) ?: return null
-                    env.singles[pat.name] = input.subList(inIdx, inIdx + spanLen)
-                    matchPatternSequence(pats, patIdx + 1, input, inIdx + spanLen, env, trailingStopPats)
-                }
-                is MacroPat.Repetition -> {
-                    var curIdx = inIdx
-                    var count = 0
-                    val nextAfterRepStops = collectLeadingStopPats(pats, patIdx + 1, trailingStopPats)
-                    val immediateNext = pats.getOrNull(patIdx + 1)
-                    val groupIters = mutableListOf<MacroMatchEnv>()
-                    while (curIdx < input.size) {
-                        if (immediateNext is MacroPat.LiteralToken &&
-                            tokenMatchesLiteral(input[curIdx], immediateNext) &&
-                            !(count > 0 && pat.sep == immediateNext)
-                        ) {
-                            break
-                        }
-                        var iterStart = curIdx
-                        if (count > 0 && pat.sep != null) {
-                            if (!tokenMatchesLiteral(input[iterStart], pat.sep)) {
-                                break
-                            }
-                            iterStart++
-                            if (iterStart >= input.size) {
-                                break
-                            }
-                        }
-                        val childEnv = MacroMatchEnv()
-                        val afterIter =
-                            matchRepetitionIteration(
-                                innerPats = pat.inner,
-                                repOp = pat.op,
-                                input = input,
-                                startIdx = iterStart,
-                                repSep = pat.sep,
-                                nextAfterRepStops = nextAfterRepStops,
-                                childEnv = childEnv,
-                            )
-                        if (afterIter == null || afterIter <= iterStart) {
-                            break
-                        }
-                        env.repetitions.add(childEnv)
-                        groupIters.add(childEnv)
-                        curIdx = afterIter
-                        count++
-                        if (pat.op == '?') break
-                    }
-                    if (pat.op == '+' && count == 0) return null
-                    env.repetitionGroups.add(
-                        RepetitionGroup(
-                            directVars = collectDirectPatMetavars(pat.inner),
-                            allVars = collectAllPatMetavars(pat.inner),
-                            iterations = groupIters,
-                        ),
-                    )
-                    matchPatternSequence(pats, patIdx + 1, input, curIdx, env, trailingStopPats)
-                }
-            }
-        }
+            repIndexStack: List<Int> = emptyList(),
+            repLenStack: List<Int> = emptyList(),
+        ): TokenStream =
+            MacroTemplateTokenCursor(template.clone().toList()).substituteWithEnv(env, repIndexStack, repLenStack)
+    }
+}
 
-        private fun collectLeadingStopPats(
-            pats: List<MacroPat>,
-            startPatIdx: Int,
-            trailingStopPats: List<MacroPat>,
-        ): List<MacroPat> {
-            val stops = mutableListOf<MacroPat>()
-            var idx = startPatIdx
-            while (idx < pats.size) {
-                when (val p = pats[idx]) {
-                    is MacroPat.LiteralToken,
-                    is MacroPat.GroupPat,
-                    -> {
-                        stops.add(p)
-                        return stops
-                    }
-                    is MacroPat.Repetition -> {
-                        stops.addAll(collectLeadingStopPats(p.inner, 0, emptyList()))
-                        if (p.op == '+') {
-                            return stops
-                        }
-                    }
-                    is MacroPat.Metavar -> {
-                        if (p.fragSpec == "vis") {
-                            stops.add(MacroPat.LiteralToken("pub", isPunct = false))
-                        } else {
-                            return stops
-                        }
-                    }
+/**
+ * [RustTokenCursor] subclass matching `macro_rules!` patterns and consuming fragment specifiers
+ * (`ident`, `tt`, `lifetime`, `literal`, `block`, `vis`, `ty`, `path`, `item`, `stmt`, `expr`, `pat`, `meta`).
+ */
+private class MacroFragmentTokenCursor(
+    trees: List<TokenTree>,
+) : RustTokenCursor(trees) {
+    fun matchSequence(
+        pats: List<MacroPat>,
+        patIdx: Int,
+        inIdx: Int,
+        env: MacroMatchEnv,
+        trailingStopPats: List<MacroPat> = emptyList(),
+    ): Int? {
+        if (patIdx == pats.size) return inIdx
+        return when (val pat = pats[patIdx]) {
+            is MacroPat.LiteralToken -> {
+                if (inIdx >= size || !MacroPat.tokenMatchesLiteral(trees[inIdx], pat)) return null
+                if (!pat.isPunct && trees[inIdx] is TokenTree.Ident && pat.text !in env.matchedKeywordSpans) {
+                    env.matchedKeywordSpans[pat.text] = trees[inIdx].span()
                 }
-                idx++
+                matchSequence(pats, patIdx + 1, inIdx + 1, env, trailingStopPats)
             }
-            stops.addAll(trailingStopPats)
-            return stops
-        }
-
-        private fun matchRepetitionIteration(
-            innerPats: List<MacroPat>,
-            repOp: Char,
-            input: List<TokenTree>,
-            startIdx: Int,
-            repSep: MacroPat.LiteralToken?,
-            nextAfterRepStops: List<MacroPat>,
-            childEnv: MacroMatchEnv,
-        ): Int? {
-            val iterTrailingStops =
-                if (repOp == '?') {
-                    nextAfterRepStops
-                } else {
-                    buildList {
-                        if (repSep != null) {
-                            add(repSep)
-                        } else {
-                            val restartStops = collectLeadingStopPats(innerPats, 0, emptyList())
-                            addAll(restartStops)
-                        }
-                        addAll(nextAfterRepStops)
-                    }
+            is MacroPat.GroupPat -> {
+                val grp = groupAt(inIdx, pat.delimiter) ?: return null
+                val innerTrees = grp.stream().toList()
+                if (MacroFragmentTokenCursor(innerTrees).matchSequence(pat.inner, 0, 0, env) != innerTrees.size) {
+                    return null
                 }
-            return matchPatternSequence(innerPats, 0, input, startIdx, childEnv, iterTrailingStops)
-        }
-
-        private fun consumeFragmentLength(
-            fragSpec: String,
-            input: List<TokenTree>,
-            startIdx: Int,
-            stopPats: List<MacroPat>,
-        ): Int? {
-            if (fragSpec == "vis") {
-                return consumeVisLength(input, startIdx)
+                matchSequence(pats, patIdx + 1, inIdx + 1, env, trailingStopPats)
             }
-            if (startIdx >= input.size) return null
-            return when (fragSpec) {
-                "ident" -> if (input[startIdx] is TokenTree.Ident) 1 else null
-                "tt" -> 1
-                "lifetime" -> {
-                    val p = input[startIdx] as? TokenTree.Punct
-                    if (p?.value?.asChar() == '\'' && startIdx + 1 < input.size && input[startIdx + 1] is TokenTree.Ident) 2 else null
-                }
-                "literal" -> {
-                    if (input[startIdx] is TokenTree.Literal) {
-                        1
-                    } else if ((input[startIdx] as? TokenTree.Punct)?.value?.asChar() == '-' &&
-                        startIdx + 1 < input.size && input[startIdx + 1] is TokenTree.Literal
+            is MacroPat.Metavar -> {
+                val stopPats = collectLeadingStopPats(pats, patIdx + 1, trailingStopPats)
+                val spanLen = consumeFragmentLength(pat.fragSpec, inIdx, stopPats) ?: return null
+                env.singles[pat.name] = trees.subList(inIdx, inIdx + spanLen)
+                matchSequence(pats, patIdx + 1, inIdx + spanLen, env, trailingStopPats)
+            }
+            is MacroPat.Repetition -> {
+                var curIdx = inIdx
+                var count = 0
+                val nextAfterRepStops = collectLeadingStopPats(pats, patIdx + 1, trailingStopPats)
+                val immediateNext = pats.getOrNull(patIdx + 1)
+                val groupIters = mutableListOf<MacroMatchEnv>()
+                while (curIdx < size) {
+                    if (immediateNext is MacroPat.LiteralToken &&
+                        MacroPat.tokenMatchesLiteral(trees[curIdx], immediateNext) &&
+                        !(count > 0 && pat.sep == immediateNext)
                     ) {
-                        2
-                    } else {
-                        null
+                        break
                     }
-                }
-                "block" -> {
-                    val g = input[startIdx] as? TokenTree.Group
-                    if (g != null && g.value.delimiter() == Delimiter.Brace) 1 else null
-                }
-                "ty" -> consumeSingleTypeLength(input, startIdx)
-                "path" -> consumeTypePathOrMacro(input, startIdx, allowMacroBang = false)?.let { it - startIdx }
-                "item" -> consumeSingleItemLength(input, startIdx)
-                else -> {
-                    // expr, pat, pat_param, stmt, meta
-                    val literalOrGroupStops =
-                        stopPats.filter { it is MacroPat.LiteralToken || it is MacroPat.GroupPat }
-                    if (fragSpec == "stmt" && literalOrGroupStops.isEmpty()) {
-                        consumeSingleStmtLength(input, startIdx)
-                    } else {
-                        var idx = startIdx
-                        var angleDepth = 0
-                        var inClosureParams = false
-                        while (idx < input.size) {
-                            val tt = input[idx]
-                            if (angleDepth == 0 && !inClosureParams) {
-                                if (literalOrGroupStops.any { stop -> tokenMatchesStopPat(tt, stop) }) {
-                                    break
-                                }
-                                val punctChar = (tt as? TokenTree.Punct)?.value?.asChar()
-                                if (fragSpec == "stmt" && punctChar == ';') {
-                                    idx++
-                                    break
-                                }
-                                val isFatArrow =
-                                    tt is TokenTree.Punct &&
-                                        punctChar == '=' &&
-                                        tt.value.spacing() == Spacing.Joint &&
-                                        (input.getOrNull(idx + 1) as? TokenTree.Punct)?.value?.asChar() == '>'
-                                if (fragSpec != "stmt" && (punctChar == ',' || punctChar == ';' || isFatArrow)) {
-                                    break
-                                }
-                            }
-                            if (tt is TokenTree.Punct) {
-                                val ch = tt.value.asChar()
-                                val isJoint = tt.value.spacing() == Spacing.Joint
-                                val nextCh = (input.getOrNull(idx + 1) as? TokenTree.Punct)?.value?.asChar()
-                                if (ch == '|' && angleDepth == 0) {
-                                    if (isJoint && (nextCh == '|' || nextCh == '=')) {
-                                        idx += 2
-                                        continue
-                                    }
-                                    if (inClosureParams) {
-                                        inClosureParams = false
-                                    } else if (canOpenClosureParamList(input, startIdx, idx)) {
-                                        inClosureParams = true
-                                    }
-                                } else if (ch == '<' && hasMatchingClosingAngle(input, idx)) {
-                                    angleDepth++
-                                } else if (ch == '>' && angleDepth > 0 && !isPartOfRArrow(input, idx)) {
-                                    angleDepth--
-                                }
-                            }
-                            idx++
-                        }
-                        if (idx <= startIdx) {
-                            null
-                        } else if (fragSpec == "expr") {
-                            val hasNonLiteralStop =
-                                stopPats.any { it !is MacroPat.LiteralToken && it !is MacroPat.GroupPat }
-                            resolveValidExprFragmentLength(input, startIdx, idx, allowPrefixShrink = hasNonLiteralStop)
-                        } else {
-                            idx - startIdx
-                        }
+                    var iterStart = curIdx
+                    if (count > 0 && pat.sep != null) {
+                        if (!MacroPat.tokenMatchesLiteral(trees[iterStart], pat.sep)) break
+                        iterStart++
+                        if (iterStart >= size) break
                     }
+                    val childEnv = MacroMatchEnv()
+                    val afterIter =
+                        matchRepetitionIteration(
+                            innerPats = pat.inner,
+                            repOp = pat.op,
+                            startIdx = iterStart,
+                            repSep = pat.sep,
+                            nextAfterRepStops = nextAfterRepStops,
+                            childEnv = childEnv,
+                        )
+                    if (afterIter == null || afterIter <= iterStart) break
+                    env.repetitions.add(childEnv)
+                    groupIters.add(childEnv)
+                    curIdx = afterIter
+                    count++
+                    if (pat.op == '?') break
                 }
+                if (pat.op == '+' && count == 0) return null
+                env.repetitionGroups.add(
+                    RepetitionGroup(
+                        directVars = MacroPat.collectMetavarSet(pat.inner, includeRepetitions = false),
+                        allVars = MacroPat.collectMetavarSet(pat.inner, includeRepetitions = true),
+                        iterations = groupIters,
+                    ),
+                )
+                matchSequence(pats, patIdx + 1, curIdx, env, trailingStopPats)
             }
         }
+    }
 
+    private fun matchRepetitionIteration(
+        innerPats: List<MacroPat>,
+        repOp: Char,
+        startIdx: Int,
+        repSep: MacroPat.LiteralToken?,
+        nextAfterRepStops: List<MacroPat>,
+        childEnv: MacroMatchEnv,
+    ): Int? {
+        val iterTrailingStops =
+            if (repOp == '?') {
+                nextAfterRepStops
+            } else {
+                buildList {
+                    if (repSep != null) {
+                        add(repSep)
+                    } else {
+                        addAll(collectLeadingStopPats(innerPats, 0, emptyList()))
+                    }
+                    addAll(nextAfterRepStops)
+                }
+            }
+        return matchSequence(innerPats, 0, startIdx, childEnv, iterTrailingStops)
+    }
+
+    private fun consumeFragmentLength(
+        fragSpec: String,
+        startIdx: Int,
+        stopPats: List<MacroPat>,
+    ): Int? {
+        if (fragSpec == "vis") return copyOptionalPubVisibility(startIdx) - startIdx
+        if (startIdx >= size) return null
+        return when (fragSpec) {
+            "ident" -> if (trees[startIdx] is TokenTree.Ident) 1 else null
+            "tt" -> 1
+            "lifetime" -> if (punctCharAt(startIdx) == '\'' && trees.getOrNull(startIdx + 1) is TokenTree.Ident) 2 else null
+            "literal" ->
+                when {
+                    trees[startIdx] is TokenTree.Literal -> 1
+                    punctCharAt(startIdx) == '-' && trees.getOrNull(startIdx + 1) is TokenTree.Literal -> 2
+                    else -> null
+                }
+            "block" -> if (groupAt(startIdx, Delimiter.Brace) != null) 1 else null
+            "ty" -> consumeSingleTypeLength(startIdx)
+            "path" -> consumeTypePathOrMacro(startIdx, allowMacroBang = false)?.let { it - startIdx }
+            "item" -> consumeSingleItemLength(startIdx)
+            else -> consumeDelimitedOrExprFragmentLength(fragSpec, startIdx, stopPats)
+        }
+    }
+
+    private fun consumeDelimitedOrExprFragmentLength(
+        fragSpec: String,
+        startIdx: Int,
+        stopPats: List<MacroPat>,
+    ): Int? {
+        val literalOrGroupStops = stopPats.filter { it is MacroPat.LiteralToken || it is MacroPat.GroupPat }
+        if (fragSpec == "stmt" && literalOrGroupStops.isEmpty()) {
+            return consumeSingleStmtLength(startIdx)
+        }
+        var idx = startIdx
+        var angleDepth = 0
+        var inClosureParams = false
+        while (idx < size) {
+            val tt = trees[idx]
+            val ch = punctCharAt(idx)
+            if (angleDepth == 0 && !inClosureParams) {
+                if (literalOrGroupStops.any { stop -> tokenMatchesStopPat(tt, stop) }) break
+                if (fragSpec == "stmt" && ch == ';') {
+                    idx++
+                    break
+                }
+                if (fragSpec != "stmt" && (ch == ',' || ch == ';' || isFatArrowAt(idx))) break
+            }
+            if (ch != null) {
+                val isJoint = punctSpacingAt(idx) == Spacing.Joint
+                val nextCh = punctCharAt(idx + 1)
+                if (ch == '|' && angleDepth == 0) {
+                    if (isJoint && (nextCh == '|' || nextCh == '=')) {
+                        idx += 2
+                        continue
+                    }
+                    if (inClosureParams) {
+                        inClosureParams = false
+                    } else if (canOpenClosureParamList(startIdx, idx)) {
+                        inClosureParams = true
+                    }
+                } else if (ch == '<' && hasMatchingClosingAngle(idx)) {
+                    angleDepth++
+                } else if (ch == '>' && angleDepth > 0 && !isRArrowEndAt(idx)) {
+                    angleDepth--
+                }
+            }
+            idx++
+        }
+        if (idx <= startIdx) return null
+        if (fragSpec == "expr") {
+            val hasNonLiteralStop = stopPats.any { it !is MacroPat.LiteralToken && it !is MacroPat.GroupPat }
+            return resolveValidExprFragmentLength(startIdx, idx, allowPrefixShrink = hasNonLiteralStop)
+        }
+        return idx - startIdx
+    }
+
+    private fun resolveValidExprFragmentLength(
+        startIdx: Int,
+        maxEndIdx: Int,
+        allowPrefixShrink: Boolean,
+    ): Int? {
+        if (isValidMacroExprTokens(trees.subList(startIdx, maxEndIdx))) {
+            return maxEndIdx - startIdx
+        }
+        if (!allowPrefixShrink) return null
+        var candidateEnd = maxEndIdx - 1
+        while (candidateEnd > startIdx) {
+            if (isValidMacroExprTokens(trees.subList(startIdx, candidateEnd))) {
+                return candidateEnd - startIdx
+            }
+            candidateEnd--
+        }
+        return null
+    }
+
+    private fun canOpenClosureParamList(startIdx: Int, pipeIdx: Int): Boolean {
+        if (pipeIdx <= startIdx) return true
+        val prevPunct = punctCharAt(pipeIdx - 1)
+        if (prevPunct != null) return prevPunct != '?' && prevPunct != '>'
+        val prevIdent = identAt(pipeIdx - 1)
+        return prevIdent != null && prevIdent in CLOSURE_PREFIX_KEYWORDS
+    }
+
+    private fun consumeSingleItemLength(startIdx: Int): Int? {
+        if (startIdx >= size) return null
+        var idx = startIdx
+        while (punctCharAt(idx) == '#' && groupAt(idx + 1, Delimiter.Bracket) != null) {
+            idx += 2
+        }
+        if (idx >= size) return null
+        val probeIdx = copyOptionalPubVisibility(idx)
+        val headIdent = identAt(probeIdx)
+        val isConstOrStaticValue =
+            when (headIdent) {
+                "static", "type", "use" -> true
+                "const" -> identAt(probeIdx + 1) !in CONST_FN_FOLLOW_KEYWORDS
+                else -> false
+            }
+        while (idx < size) {
+            if (punctCharAt(idx) == ';') return (idx + 1) - startIdx
+            if (!isConstOrStaticValue && groupAt(idx, Delimiter.Brace) != null) return (idx + 1) - startIdx
+            idx++
+        }
+        return if (idx > startIdx) idx - startIdx else null
+    }
+
+    private fun consumeSingleStmtLength(startIdx: Int): Int? {
+        if (startIdx >= size) return null
+        var idx = startIdx
+        while (idx < size) {
+            if (punctCharAt(idx) == ';') return (idx + 1) - startIdx
+            idx++
+        }
+        return size - startIdx
+    }
+
+    private fun consumeSingleTypeLength(startIdx: Int): Int? {
+        if (startIdx >= size) return null
+        var idx = startIdx
+        while (idx < size) {
+            if (punctCharAt(idx) == '&') {
+                idx++
+                if (punctCharAt(idx) == '\'' && trees.getOrNull(idx + 1) is TokenTree.Ident) {
+                    idx += 2
+                }
+                if (identAt(idx) == "mut") {
+                    idx++
+                }
+                continue
+            }
+            if (punctCharAt(idx) == '*') {
+                val qual = identAt(idx + 1)
+                if (qual == "const" || qual == "mut") {
+                    idx += 2
+                    continue
+                }
+            }
+            if (identAt(idx) == "for" && punctCharAt(idx + 1) == '<' && hasMatchingClosingAngle(idx + 1)) {
+                idx = skipBalancedAngles(idx + 1) ?: size
+                continue
+            }
+            break
+        }
+        if (idx >= size) return null
+        val coreGrp = groupAt(idx)
+        if (coreGrp != null && (coreGrp.delimiter() == Delimiter.Bracket || coreGrp.delimiter() == Delimiter.Parenthesis)) {
+            return (idx + 1) - startIdx
+        }
+        if (punctCharAt(idx) == '!') return (idx + 1) - startIdx
+        tryConsumeBareFnType(idx)?.let { return it - startIdx }
+        val coreIdent = identAt(idx)
+        if (coreIdent == "impl" || coreIdent == "dyn") {
+            val boundsEnd = consumeTypeParamBounds(idx + 1) ?: return null
+            return boundsEnd - startIdx
+        }
+        val pathEnd = consumeTypePathOrMacro(idx, allowMacroBang = true) ?: return null
+        return pathEnd - startIdx
+    }
+
+    private fun tryConsumeBareFnType(startIdx: Int): Int? {
+        var idx = startIdx
+        if (identAt(idx) == "unsafe") idx++
+        if (identAt(idx) == "extern") {
+            idx++
+            if (trees.getOrNull(idx) is TokenTree.Literal) idx++
+        }
+        if (identAt(idx) != "fn") return null
+        idx++
+        if (groupAt(idx, Delimiter.Parenthesis) == null) return null
+        idx++
+        if (punctCharAt(idx) == '-' && punctCharAt(idx + 1) == '>') {
+            idx += 2
+            val retLen = consumeSingleTypeLength(idx) ?: return null
+            idx += retLen
+        }
+        return idx
+    }
+
+    private fun consumeTypeParamBounds(startIdx: Int): Int? {
+        var idx = consumeSingleTypeParamBound(startIdx) ?: return null
+        while (punctCharAt(idx) == '+') {
+            idx = consumeSingleTypeParamBound(idx + 1) ?: break
+        }
+        return idx
+    }
+
+    private fun consumeSingleTypeParamBound(startIdx: Int): Int? {
+        if (startIdx >= size) return null
+        var idx = startIdx
+        if (groupAt(idx, Delimiter.Parenthesis) != null) return idx + 1
+        if (punctCharAt(idx) == '\'' && trees.getOrNull(idx + 1) is TokenTree.Ident) return idx + 2
+        if (punctCharAt(idx) == '?' || punctCharAt(idx) == '~') idx++
+        if (identAt(idx) == "for" && punctCharAt(idx + 1) == '<' && hasMatchingClosingAngle(idx + 1)) {
+            idx = skipBalancedAngles(idx + 1) ?: size
+        }
+        return consumeTypePathOrMacro(idx, allowMacroBang = false, allowAllParenthesizedArgs = true)
+    }
+
+    private fun consumeTypePathOrMacro(
+        startIdx: Int,
+        allowMacroBang: Boolean,
+        allowAllParenthesizedArgs: Boolean = false,
+    ): Int? {
+        if (startIdx >= size) return null
+        var idx = startIdx
+        if (punctCharAt(idx) == '<' && hasMatchingClosingAngle(idx)) {
+            idx = skipBalancedAngles(idx) ?: size
+            if (punctCharAt(idx) != ':' || punctCharAt(idx + 1) != ':') return null
+            idx += 2
+        } else if (punctCharAt(idx) == ':' && punctCharAt(idx + 1) == ':') {
+            idx += 2
+        }
+        var lastSegName = identAt(idx) ?: return null
+        idx++
+        while (idx < size) {
+            if (allowMacroBang && punctCharAt(idx) == '!' && groupAt(idx + 1) != null) {
+                return idx + 2
+            }
+            if (punctCharAt(idx) == '<' && hasMatchingClosingAngle(idx)) {
+                idx = skipBalancedAngles(idx) ?: size
+                continue
+            }
+            if (groupAt(idx, Delimiter.Parenthesis) != null &&
+                (allowAllParenthesizedArgs || lastSegName.startsWith("Fn"))
+            ) {
+                idx++
+                if (punctCharAt(idx) == '-' && punctCharAt(idx + 1) == '>') {
+                    idx += 2
+                    val retLen = consumeSingleTypeLength(idx) ?: return null
+                    idx += retLen
+                }
+                continue
+            }
+            val nextSegName =
+                if (punctCharAt(idx) == ':' && punctCharAt(idx + 1) == ':') identAt(idx + 2) else null
+            if (nextSegName != null) {
+                lastSegName = nextSegName
+                idx += 3
+                continue
+            }
+            break
+        }
+        return idx
+    }
+
+    companion object {
+        private val CLOSURE_PREFIX_KEYWORDS =
+            setOf("move", "async", "static", "const", "return", "break", "yield")
+        private val CONST_FN_FOLLOW_KEYWORDS = setOf("fn", "unsafe", "async", "extern")
         private val NON_EXPR_SINGLE_IDENT_KEYWORDS =
             setOf(
                 "as",
@@ -1901,416 +1810,263 @@ internal class MacroRulesFileExpander(
                 "yield",
             )
 
+        private fun collectLeadingStopPats(
+            pats: List<MacroPat>,
+            startPatIdx: Int,
+            trailingStopPats: List<MacroPat>,
+        ): List<MacroPat> {
+            val stops = mutableListOf<MacroPat>()
+            var idx = startPatIdx
+            while (idx < pats.size) {
+                when (val p = pats[idx]) {
+                    is MacroPat.LiteralToken,
+                    is MacroPat.GroupPat,
+                    -> {
+                        stops.add(p)
+                        return stops
+                    }
+                    is MacroPat.Repetition -> {
+                        stops.addAll(collectLeadingStopPats(p.inner, 0, emptyList()))
+                        if (p.op == '+') return stops
+                    }
+                    is MacroPat.Metavar -> {
+                        if (p.fragSpec == "vis") {
+                            stops.add(MacroPat.LiteralToken("pub", isPunct = false))
+                        } else {
+                            return stops
+                        }
+                    }
+                }
+                idx++
+            }
+            stops.addAll(trailingStopPats)
+            return stops
+        }
+
+        private fun tokenMatchesStopPat(tt: TokenTree, stop: MacroPat): Boolean =
+            when (stop) {
+                is MacroPat.LiteralToken -> MacroPat.tokenMatchesLiteral(tt, stop)
+                is MacroPat.GroupPat -> tt is TokenTree.Group && tt.value.delimiter() == stop.delimiter
+                else -> false
+            }
+
         private fun isValidMacroExprTokens(tokens: List<TokenTree>): Boolean {
             if (tokens.isEmpty()) return false
             if (tokens.size == 1) {
                 when (val single = tokens[0]) {
                     is TokenTree.Literal -> return true
-                    is TokenTree.Ident -> {
-                        val raw = single.value.toString()
-                        if (raw !in NON_EXPR_SINGLE_IDENT_KEYWORDS) return true
-                    }
+                    is TokenTree.Ident -> if (single.value.toString() !in NON_EXPR_SINGLE_IDENT_KEYWORDS) return true
                     else -> {}
                 }
             }
             val normalized = normalizeLetOrPatternsForSyn(TokenStream.fromTokenTrees(tokens))
             return parse2(ExprParse::parse, normalized).getOrNull() != null
         }
+    }
+}
 
-        private fun resolveValidExprFragmentLength(
-            input: List<TokenTree>,
-            startIdx: Int,
-            maxEndIdx: Int,
-            allowPrefixShrink: Boolean,
-        ): Int? {
-            if (isValidMacroExprTokens(input.subList(startIdx, maxEndIdx))) {
-                return maxEndIdx - startIdx
-            }
-            if (!allowPrefixShrink) return null
-            var candidateEnd = maxEndIdx - 1
-            while (candidateEnd > startIdx) {
-                if (isValidMacroExprTokens(input.subList(startIdx, candidateEnd))) {
-                    return candidateEnd - startIdx
-                }
-                candidateEnd--
-            }
-            return null
-        }
-
-        private val CLOSURE_PREFIX_KEYWORDS =
-            setOf("move", "async", "static", "const", "return", "break", "yield")
-
-        private fun canOpenClosureParamList(
-            input: List<TokenTree>,
-            startIdx: Int,
-            pipeIdx: Int,
-        ): Boolean {
-            if (pipeIdx <= startIdx) return true
-            val prev = input[pipeIdx - 1]
-            if (prev is TokenTree.Punct) {
-                val ch = prev.value.asChar()
-                return ch != '?' && ch != '>'
-            }
-            return prev is TokenTree.Ident && prev.value.toString() in CLOSURE_PREFIX_KEYWORDS
-        }
-
-        private fun tokenMatchesStopPat(tt: TokenTree, stop: MacroPat): Boolean =
-            when (stop) {
-                is MacroPat.LiteralToken -> tokenMatchesLiteral(tt, stop)
-                is MacroPat.GroupPat -> tt is TokenTree.Group && tt.value.delimiter() == stop.delimiter
-                else -> false
-            }
-
-        private fun consumeVisLength(input: List<TokenTree>, startIdx: Int): Int {
-            if (startIdx >= input.size) return 0
-            val first = input[startIdx] as? TokenTree.Ident ?: return 0
-            if (first.value.toString() != "pub") return 0
-            val second = input.getOrNull(startIdx + 1) as? TokenTree.Group
-            return if (second != null && second.value.delimiter() == Delimiter.Parenthesis) 2 else 1
-        }
-
-        private fun consumeSingleItemLength(input: List<TokenTree>, startIdx: Int): Int? {
-            if (startIdx >= input.size) return null
-            var idx = startIdx
-            // Outer attributes: #[...]
-            while (idx + 1 < input.size &&
-                (input[idx] as? TokenTree.Punct)?.value?.asChar() == '#' &&
-                (input[idx + 1] as? TokenTree.Group)?.value?.delimiter() == Delimiter.Bracket
-            ) {
-                idx += 2
-            }
-            if (idx >= input.size) return null
-
-            // Visibility + item modifiers to determine whether `{ ... }` is a const/static initializer
-            val probeIdx = idx + consumeVisLength(input, idx)
-            var isConstOrStaticValue = false
-            val headIdent = (input.getOrNull(probeIdx) as? TokenTree.Ident)?.value?.toString()
-            if (headIdent == "static" || headIdent == "type" || headIdent == "use") {
-                isConstOrStaticValue = true
-            } else if (headIdent == "const") {
-                val afterConst = (input.getOrNull(probeIdx + 1) as? TokenTree.Ident)?.value?.toString()
-                if (afterConst != "fn" && afterConst != "unsafe" && afterConst != "async" && afterConst != "extern") {
-                    isConstOrStaticValue = true
-                }
-            }
-
-            while (idx < input.size) {
-                val tt = input[idx]
-                if (tt is TokenTree.Punct && tt.value.asChar() == ';') {
-                    return (idx + 1) - startIdx
-                }
-                if (!isConstOrStaticValue && tt is TokenTree.Group && tt.value.delimiter() == Delimiter.Brace) {
-                    return (idx + 1) - startIdx
-                }
-                idx++
-            }
-            return if (idx > startIdx) idx - startIdx else null
-        }
-
-        private fun consumeSingleStmtLength(input: List<TokenTree>, startIdx: Int): Int? {
-            if (startIdx >= input.size) return null
-            var idx = startIdx
-            while (idx < input.size) {
-                val tt = input[idx]
-                if (tt is TokenTree.Punct && tt.value.asChar() == ';') {
-                    return (idx + 1) - startIdx
-                }
-                idx++
-            }
-            return input.size - startIdx
-        }
-
-        private fun consumeSingleTypeLength(input: List<TokenTree>, startIdx: Int): Int? {
-            if (startIdx >= input.size) return null
-            var idx = startIdx
-            while (idx < input.size) {
-                val tt = input[idx]
-                if (tt is TokenTree.Punct && tt.value.asChar() == '&') {
-                    idx++
-                    if (idx + 1 < input.size &&
-                        (input[idx] as? TokenTree.Punct)?.value?.asChar() == '\'' &&
-                        input[idx + 1] is TokenTree.Ident
-                    ) {
-                        idx += 2
+/**
+ * [RustTokenCursor] subclass performing `macro_rules!` template metavar collection,
+ * RFC 3086 `${ignore(...)}` / `${index(...)}` / `${len(...)}` / `${count(...)}` evaluation,
+ * and repetition-group substitution.
+ */
+private class MacroTemplateTokenCursor(
+    trees: List<TokenTree>,
+) : RustTokenCursor(trees) {
+    fun substituteWithEnv(
+        env: MacroMatchEnv,
+        repIndexStack: List<Int> = emptyList(),
+        repLenStack: List<Int> = emptyList(),
+    ): TokenStream {
+        val out = mutableListOf<TokenTree>()
+        var i = 0
+        while (i < size) {
+            val tt = trees[i]
+            if (punctCharAt(i) == '$' && i + 1 < size) {
+                val varIdent = (trees[i + 1] as? TokenTree.Ident)?.value
+                if (varIdent != null) {
+                    val varName = varIdent.toString()
+                    if (varName == "crate") {
+                        out.add(TokenTree.Ident(PmIdent.new("crate", varIdent.span())))
+                        i += 2
+                        continue
                     }
-                    if (idx < input.size && (input[idx] as? TokenTree.Ident)?.value?.toString() == "mut") {
-                        idx++
-                    }
-                    continue
-                }
-                if (tt is TokenTree.Punct && tt.value.asChar() == '*' && idx + 1 < input.size) {
-                    val qual = (input[idx + 1] as? TokenTree.Ident)?.value?.toString()
-                    if (qual == "const" || qual == "mut") {
-                        idx += 2
+                    val replacement = env.singles[varName]
+                    if (replacement != null) {
+                        out.addAll(replacement)
+                        i += 2
                         continue
                     }
                 }
-                if (tt is TokenTree.Ident && tt.value.toString() == "for" &&
-                    idx + 1 < input.size && (input[idx + 1] as? TokenTree.Punct)?.value?.asChar() == '<' &&
-                    hasMatchingClosingAngle(input, idx + 1)
-                ) {
-                    idx = skipBalancedAngles(input, idx + 1)
-                    continue
-                }
-                break
-            }
-            if (idx >= input.size) return null
-            val core = input[idx]
-            if (core is TokenTree.Group &&
-                (core.value.delimiter() == Delimiter.Bracket || core.value.delimiter() == Delimiter.Parenthesis)
-            ) {
-                return (idx + 1) - startIdx
-            }
-            if (core is TokenTree.Punct && core.value.asChar() == '!') {
-                return (idx + 1) - startIdx
-            }
-            val bareFnEnd = tryConsumeBareFnType(input, idx)
-            if (bareFnEnd != null) {
-                return bareFnEnd - startIdx
-            }
-            if (core is TokenTree.Ident && (core.value.toString() == "impl" || core.value.toString() == "dyn")) {
-                idx++
-                val boundsEnd = consumeTypeParamBounds(input, idx) ?: return null
-                return boundsEnd - startIdx
-            }
-            val pathEnd = consumeTypePathOrMacro(input, idx, allowMacroBang = true) ?: return null
-            return pathEnd - startIdx
-        }
-
-        private fun tryConsumeBareFnType(input: List<TokenTree>, startIdx: Int): Int? {
-            var idx = startIdx
-            if ((input.getOrNull(idx) as? TokenTree.Ident)?.value?.toString() == "unsafe") {
-                idx++
-            }
-            if ((input.getOrNull(idx) as? TokenTree.Ident)?.value?.toString() == "extern") {
-                idx++
-                if (input.getOrNull(idx) is TokenTree.Literal) {
-                    idx++
-                }
-            }
-            if ((input.getOrNull(idx) as? TokenTree.Ident)?.value?.toString() != "fn") {
-                return null
-            }
-            idx++
-            val paramsGroup = input.getOrNull(idx) as? TokenTree.Group ?: return null
-            if (paramsGroup.value.delimiter() != Delimiter.Parenthesis) return null
-            idx++
-            if (idx + 1 < input.size &&
-                (input[idx] as? TokenTree.Punct)?.value?.asChar() == '-' &&
-                (input[idx + 1] as? TokenTree.Punct)?.value?.asChar() == '>'
-            ) {
-                idx += 2
-                val retLen = consumeSingleTypeLength(input, idx) ?: return null
-                idx += retLen
-            }
-            return idx
-        }
-
-        private fun consumeTypeParamBounds(input: List<TokenTree>, startIdx: Int): Int? {
-            var idx = consumeSingleTypeParamBound(input, startIdx) ?: return null
-            while (idx < input.size && (input[idx] as? TokenTree.Punct)?.value?.asChar() == '+') {
-                val nextBoundEnd = consumeSingleTypeParamBound(input, idx + 1) ?: break
-                idx = nextBoundEnd
-            }
-            return idx
-        }
-
-        private fun consumeSingleTypeParamBound(input: List<TokenTree>, startIdx: Int): Int? {
-            if (startIdx >= input.size) return null
-            var idx = startIdx
-            if ((input[idx] as? TokenTree.Group)?.value?.delimiter() == Delimiter.Parenthesis) {
-                return idx + 1
-            }
-            if ((input[idx] as? TokenTree.Punct)?.value?.asChar() == '\'' &&
-                idx + 1 < input.size && input[idx + 1] is TokenTree.Ident
-            ) {
-                return idx + 2
-            }
-            if ((input[idx] as? TokenTree.Punct)?.value?.asChar() == '?' ||
-                (input[idx] as? TokenTree.Punct)?.value?.asChar() == '~'
-            ) {
-                idx++
-            }
-            if ((input.getOrNull(idx) as? TokenTree.Ident)?.value?.toString() == "for" &&
-                idx + 1 < input.size && (input[idx + 1] as? TokenTree.Punct)?.value?.asChar() == '<' &&
-                hasMatchingClosingAngle(input, idx + 1)
-            ) {
-                idx = skipBalancedAngles(input, idx + 1)
-            }
-            return consumeTypePathOrMacro(input, idx, allowMacroBang = false, allowAllParenthesizedArgs = true)
-        }
-
-        private fun consumeTypePathOrMacro(
-            input: List<TokenTree>,
-            startIdx: Int,
-            allowMacroBang: Boolean,
-            allowAllParenthesizedArgs: Boolean = false,
-        ): Int? {
-            if (startIdx >= input.size) return null
-            var idx = startIdx
-            if ((input[idx] as? TokenTree.Punct)?.value?.asChar() == '<' && hasMatchingClosingAngle(input, idx)) {
-                idx = skipBalancedAngles(input, idx)
-                if (idx + 1 >= input.size ||
-                    (input[idx] as? TokenTree.Punct)?.value?.asChar() != ':' ||
-                    (input[idx + 1] as? TokenTree.Punct)?.value?.asChar() != ':'
-                ) {
-                    return null
-                }
-                idx += 2
-            } else if (idx + 1 < input.size &&
-                (input[idx] as? TokenTree.Punct)?.value?.asChar() == ':' &&
-                (input[idx + 1] as? TokenTree.Punct)?.value?.asChar() == ':'
-            ) {
-                idx += 2
-            }
-            val firstIdent = input.getOrNull(idx) as? TokenTree.Ident ?: return null
-            var lastSegName = firstIdent.value.toString()
-            idx++
-            while (idx < input.size) {
-                val tt = input[idx]
-                if (allowMacroBang &&
-                    tt is TokenTree.Punct && tt.value.asChar() == '!' &&
-                    input.getOrNull(idx + 1) is TokenTree.Group
-                ) {
-                    return idx + 2
-                }
-                if (tt is TokenTree.Punct && tt.value.asChar() == '<' && hasMatchingClosingAngle(input, idx)) {
-                    idx = skipBalancedAngles(input, idx)
-                    continue
-                }
-                if (tt is TokenTree.Group && tt.value.delimiter() == Delimiter.Parenthesis &&
-                    (allowAllParenthesizedArgs || lastSegName.startsWith("Fn"))
-                ) {
-                    idx++
-                    if (idx + 1 < input.size &&
-                        (input[idx] as? TokenTree.Punct)?.value?.asChar() == '-' &&
-                        (input[idx + 1] as? TokenTree.Punct)?.value?.asChar() == '>'
-                    ) {
-                        idx += 2
-                        val retLen = consumeSingleTypeLength(input, idx) ?: return null
-                        idx += retLen
+                val braceGrp = groupAt(i + 1, Delimiter.Brace)
+                if (braceGrp != null) {
+                    val evaluated =
+                        MacroTemplateTokenCursor(braceGrp.stream().toList())
+                            .tryEvaluateMetavarExpr(env, repIndexStack, repLenStack)
+                    if (evaluated != null) {
+                        out.addAll(evaluated)
+                        i += 2
+                        continue
                     }
+                }
+                val parenGrp = groupAt(i + 1, Delimiter.Parenthesis)
+                if (parenGrp != null) {
+                    val adv = repetitionHeaderAdvance(i)
+                    val sepToken = if (adv == 4) trees[i + 2] else null
+                    val innerTrees = parenGrp.stream().toList()
+                    val innerCursor = MacroTemplateTokenCursor(innerTrees)
+                    var matchedGroup: RepetitionGroup? = null
+                    val targetIterations =
+                        if (env.repetitionGroups.isNotEmpty()) {
+                            val directVars = innerCursor.collectTemplateMetavars(includeRepetitions = false)
+                            val allVars = innerCursor.collectTemplateMetavars(includeRepetitions = true)
+                            matchedGroup =
+                                env.repetitionGroups.firstOrNull { grp ->
+                                    directVars.isNotEmpty() && grp.directVars.intersect(directVars).isNotEmpty()
+                                } ?: env.repetitionGroups.firstOrNull { grp ->
+                                    allVars.isNotEmpty() && grp.allVars.intersect(allVars).isNotEmpty()
+                                }
+                            matchedGroup?.iterations.orEmpty()
+                        } else {
+                            env.repetitions
+                        }
+                    val nextLenStack = repLenStack + targetIterations.size
+                    for ((repIdx, childEnv) in targetIterations.withIndex()) {
+                        if (repIdx > 0 && sepToken != null) {
+                            out.add(sepToken)
+                        }
+                        val mergedEnv = mergeRepetitionIterationEnv(env, childEnv, matchedGroup)
+                        val innerSub =
+                            innerCursor.substituteWithEnv(
+                                mergedEnv,
+                                repIndexStack = repIndexStack + repIdx,
+                                repLenStack = nextLenStack,
+                            )
+                        out.addAll(innerSub.toList())
+                    }
+                    i += adv
                     continue
                 }
-                if (tt is TokenTree.Punct && tt.value.asChar() == ':' &&
-                    idx + 2 < input.size &&
-                    (input[idx + 1] as? TokenTree.Punct)?.value?.asChar() == ':' &&
-                    input[idx + 2] is TokenTree.Ident
-                ) {
-                    lastSegName = (input[idx + 2] as TokenTree.Ident).value.toString()
-                    idx += 3
+            }
+            if (tt is TokenTree.Group) {
+                val inner =
+                    MacroTemplateTokenCursor(tt.value.stream().toList())
+                        .substituteWithEnv(env, repIndexStack, repLenStack)
+                val newGroup = Group(tt.value.delimiter(), inner)
+                newGroup.setSpan(tt.value.span())
+                out.add(TokenTree.Group(newGroup))
+            } else if (tt is TokenTree.Ident && tt.span().endExclusiveOffset() <= tt.span().startOffset()) {
+                val kwSpan = env.matchedKeywordSpans[tt.value.toString()]
+                out.add(if (kwSpan != null) tt.setSpan(kwSpan) else tt)
+            } else {
+                out.add(tt)
+            }
+            i++
+        }
+        return TokenStream.fromTokenTrees(out)
+    }
+
+    fun collectTemplateMetavars(includeRepetitions: Boolean): Set<String> {
+        val vars = linkedSetOf<String>()
+        var i = 0
+        while (i < size) {
+            if (punctCharAt(i) == '$' && i + 1 < size) {
+                val name = identAt(i + 1)
+                if (name != null) {
+                    if (name != "crate") vars.add(name)
+                    i += 2
                     continue
                 }
-                break
-            }
-            return idx
-        }
-
-        private fun skipBalancedAngles(input: List<TokenTree>, openIdx: Int): Int {
-            var depth = 1
-            var idx = openIdx + 1
-            while (idx < input.size && depth > 0) {
-                val c = (input[idx] as? TokenTree.Punct)?.value?.asChar()
-                if (c == '<') {
-                    depth++
-                } else if (c == '>' && !isPartOfRArrow(input, idx)) {
-                    depth--
+                if (!includeRepetitions && groupAt(i + 1, Delimiter.Parenthesis) != null) {
+                    i += repetitionHeaderAdvance(i)
+                    continue
                 }
-                idx++
-            }
-            return idx
-        }
-
-        private fun isPartOfRArrow(trees: List<TokenTree>, gtIdx: Int): Boolean {
-            if (gtIdx <= 0) return false
-            val prev = trees[gtIdx - 1] as? TokenTree.Punct ?: return false
-            return prev.value.asChar() == '-' && prev.value.spacing() == Spacing.Joint
-        }
-
-        private fun tokenMatchesLiteral(tt: TokenTree, pat: MacroPat.LiteralToken): Boolean =
-            when (tt) {
-                is TokenTree.Punct -> pat.isPunct && tt.value.asChar().toString() == pat.text
-                is TokenTree.Ident -> !pat.isPunct && tt.value.toString() == pat.text
-                is TokenTree.Literal -> !pat.isPunct && tt.value.toString() == pat.text
-                is TokenTree.Group ->
-                    tt.value.delimiter() == Delimiter.None &&
-                        tt.value
-                            .stream()
-                            .toList()
-                            .singleOrNull()
-                            ?.let { tokenMatchesLiteral(it, pat) } == true
-            }
-
-        private fun hasTtMetavar(pats: List<MacroPat>): Boolean =
-            pats.any { p ->
-                when (p) {
-                    is MacroPat.Metavar -> p.fragSpec == "tt"
-                    is MacroPat.GroupPat -> hasTtMetavar(p.inner)
-                    is MacroPat.Repetition -> hasTtMetavar(p.inner)
-                    is MacroPat.LiteralToken -> false
+                val braceGrp = groupAt(i + 1, Delimiter.Brace)
+                if (braceGrp != null) {
+                    val ignored = MacroTemplateTokenCursor(braceGrp.stream().toList()).extractIgnoredMetavarName()
+                    if (ignored != null && ignored != "crate") {
+                        vars.add(ignored)
+                    }
+                    i += 2
+                    continue
                 }
             }
-
-        private fun flattenTopLevelNoneGroups(trees: List<TokenTree>): List<TokenTree> {
-            val out = mutableListOf<TokenTree>()
-            for (tt in trees) {
-                if (tt is TokenTree.Group && tt.value.delimiter() == Delimiter.None) {
-                    out.addAll(flattenTopLevelNoneGroups(tt.value.stream().toList()))
-                } else {
-                    out.add(tt)
-                }
+            val grp = groupAt(i)
+            if (grp != null) {
+                vars.addAll(MacroTemplateTokenCursor(grp.stream().toList()).collectTemplateMetavars(includeRepetitions))
             }
-            return out
+            i++
         }
+        return vars
+    }
 
-        private fun collectDirectPatMetavars(pats: List<MacroPat>): Set<String> {
-            val vars = linkedSetOf<String>()
-            for (p in pats) {
-                when (p) {
-                    is MacroPat.Metavar -> vars.add(p.name)
-                    is MacroPat.GroupPat -> vars.addAll(collectDirectPatMetavars(p.inner))
-                    is MacroPat.Repetition, is MacroPat.LiteralToken -> {}
-                }
-            }
-            return vars
+    private fun repetitionHeaderAdvance(dollarIdx: Int): Int {
+        val c1 = punctCharAt(dollarIdx + 2)
+        if (c1 == '*' || c1 == '+' || c1 == '?') return 3
+        val t1 = trees.getOrNull(dollarIdx + 2)
+        val c2 = punctCharAt(dollarIdx + 3)
+        if ((t1 is TokenTree.Punct || t1 is TokenTree.Ident) && (c2 == '*' || c2 == '+')) {
+            return 4
         }
+        return 2
+    }
 
-        private fun collectAllPatMetavars(pats: List<MacroPat>): Set<String> {
-            val vars = linkedSetOf<String>()
-            for (p in pats) {
-                when (p) {
-                    is MacroPat.Metavar -> vars.add(p.name)
-                    is MacroPat.GroupPat -> vars.addAll(collectAllPatMetavars(p.inner))
-                    is MacroPat.Repetition -> vars.addAll(collectAllPatMetavars(p.inner))
-                    is MacroPat.LiteralToken -> {}
-                }
-            }
-            return vars
+    private fun extractIgnoredMetavarName(): String? {
+        if (size != 2 || identAt(0) != "ignore") return null
+        val argGroup = groupAt(1, Delimiter.Parenthesis) ?: return null
+        val args = RustTokenCursor(argGroup.stream().toList())
+        return when {
+            args.size == 1 -> args.cleanIdentAt(0)
+            args.size == 2 && args.punctCharAt(0) == '$' -> args.cleanIdentAt(1)
+            else -> null
         }
+    }
 
-        private fun extractIgnoredMetavarName(braceStream: TokenStream): String? {
-            val inner = braceStream.clone().toList()
-            if (inner.size != 2 || (inner[0] as? TokenTree.Ident)?.value?.toString() != "ignore") {
-                return null
+    private fun tryEvaluateMetavarExpr(
+        env: MacroMatchEnv,
+        repIndexStack: List<Int>,
+        repLenStack: List<Int>,
+    ): List<TokenTree>? {
+        if (size != 2) return null
+        val op = identAt(0) ?: return null
+        val argGroup = groupAt(1, Delimiter.Parenthesis) ?: return null
+        val args = RustTokenCursor(argGroup.stream().toList())
+        return when (op) {
+            "ignore" -> emptyList()
+            "index" -> {
+                val depth = parseOptionalDepthArg(args) ?: return null
+                val idxVal = repIndexStack.getOrNull(repIndexStack.lastIndex - depth) ?: 0
+                listOf(TokenTree.Literal(Literal.usizeUnsuffixed(idxVal.toULong())))
             }
-            val argGroup = inner[1] as? TokenTree.Group ?: return null
-            if (argGroup.value.delimiter() != Delimiter.Parenthesis) return null
-            val args = argGroup.value.stream().toList()
-            return when {
-                args.size == 1 && args[0] is TokenTree.Ident ->
-                    (args[0] as TokenTree.Ident).value.toString().removePrefix("r#")
-                args.size == 2 &&
-                    (args[0] as? TokenTree.Punct)?.value?.asChar() == '$' &&
-                    args[1] is TokenTree.Ident ->
-                    (args[1] as TokenTree.Ident).value.toString().removePrefix("r#")
-                else -> null
+            "len" -> {
+                val depth = parseOptionalDepthArg(args) ?: return null
+                val lenVal = repLenStack.getOrNull(repLenStack.lastIndex - depth) ?: 0
+                listOf(TokenTree.Literal(Literal.usizeUnsuffixed(lenVal.toULong())))
             }
+            "count" -> {
+                var pos = 0
+                if (args.punctCharAt(pos) == '$') pos++
+                val targetVar = args.cleanIdentAt(pos) ?: return null
+                pos++
+                val maxDepth =
+                    when {
+                        pos == args.size -> null
+                        pos + 2 == args.size && args.punctCharAt(pos) == ',' && args.trees[pos + 1] is TokenTree.Literal ->
+                            (args.trees[pos + 1] as TokenTree.Literal).value.toString().toIntOrNull() ?: return null
+                        else -> return null
+                    }
+                val cnt = countMetavarOccurrences(env, targetVar, maxDepth)
+                listOf(TokenTree.Literal(Literal.usizeUnsuffixed(cnt.toULong())))
+            }
+            else -> null
         }
+    }
 
-        private fun parseOptionalDepthArg(args: List<TokenTree>): Int? {
-            if (args.isEmpty()) return 0
-            if (args.size == 1 && args[0] is TokenTree.Literal) {
-                return (args[0] as TokenTree.Literal).value.toString().toIntOrNull()
+    companion object {
+        private fun parseOptionalDepthArg(args: RustTokenCursor): Int? {
+            if (args.size == 0) return 0
+            if (args.size == 1 && args.trees[0] is TokenTree.Literal) {
+                return (args.trees[0] as TokenTree.Literal).value.toString().toIntOrNull()
             }
             return null
         }
@@ -2336,350 +2092,27 @@ internal class MacroRulesFileExpander(
             return if (varName in env.singles) 1 else 0
         }
 
-        private fun tryEvaluateMetavarExpr(
-            braceStream: TokenStream,
+        private fun mergeRepetitionIterationEnv(
             env: MacroMatchEnv,
-            repIndexStack: List<Int>,
-            repLenStack: List<Int>,
-        ): List<TokenTree>? {
-            val inner = braceStream.clone().toList()
-            if (inner.size != 2) return null
-            val op = (inner[0] as? TokenTree.Ident)?.value?.toString() ?: return null
-            val argGroup = inner[1] as? TokenTree.Group ?: return null
-            if (argGroup.value.delimiter() != Delimiter.Parenthesis) return null
-            val args = argGroup.value.stream().toList()
-            return when (op) {
-                "ignore" -> emptyList()
-                "index" -> {
-                    val depth = parseOptionalDepthArg(args) ?: return null
-                    val idxVal = repIndexStack.getOrNull(repIndexStack.lastIndex - depth) ?: 0
-                    listOf(TokenTree.Literal(Literal.usizeUnsuffixed(idxVal.toULong())))
-                }
-                "len" -> {
-                    val depth = parseOptionalDepthArg(args) ?: return null
-                    val lenVal = repLenStack.getOrNull(repLenStack.lastIndex - depth) ?: 0
-                    listOf(TokenTree.Literal(Literal.usizeUnsuffixed(lenVal.toULong())))
-                }
-                "count" -> {
-                    val targetVar: String
-                    val maxDepth: Int?
-                    var pos = 0
-                    if ((args.getOrNull(pos) as? TokenTree.Punct)?.value?.asChar() == '$') {
-                        pos++
-                    }
-                    val varIdent = (args.getOrNull(pos) as? TokenTree.Ident)?.value?.toString()?.removePrefix("r#") ?: return null
-                    targetVar = varIdent
-                    pos++
-                    if (pos == args.size) {
-                        maxDepth = null
-                    } else if (pos + 1 < args.size &&
-                        (args[pos] as? TokenTree.Punct)?.value?.asChar() == ',' &&
-                        args[pos + 1] is TokenTree.Literal &&
-                        pos + 2 == args.size
-                    ) {
-                        maxDepth = (args[pos + 1] as TokenTree.Literal).value.toString().toIntOrNull() ?: return null
-                    } else {
-                        return null
-                    }
-                    val cnt = countMetavarOccurrences(env, targetVar, maxDepth)
-                    listOf(TokenTree.Literal(Literal.usizeUnsuffixed(cnt.toULong())))
-                }
-                else -> null
-            }
-        }
-
-        private fun collectDirectTemplateMetavars(stream: TokenStream): Set<String> {
-            val vars = linkedSetOf<String>()
-            val trees = stream.clone().toList()
-            var i = 0
-            while (i < trees.size) {
-                val tt = trees[i]
-                if (tt is TokenTree.Punct && tt.value.asChar() == '$' && i + 1 < trees.size) {
-                    val next = trees[i + 1]
-                    if (next is TokenTree.Ident) {
-                        val name = next.value.toString()
-                        if (name != "crate") vars.add(name)
-                        i += 2
-                        continue
-                    } else if (next is TokenTree.Group && next.value.delimiter() == Delimiter.Parenthesis) {
-                        i += templateRepetitionHeaderAdvance(trees, i)
-                        continue
-                    } else if (next is TokenTree.Group && next.value.delimiter() == Delimiter.Brace) {
-                        val ignored = extractIgnoredMetavarName(next.value.stream())
-                        if (ignored != null && ignored != "crate") {
-                            vars.add(ignored)
-                        }
-                        i += 2
-                        continue
-                    }
-                }
-                if (tt is TokenTree.Group) {
-                    vars.addAll(collectDirectTemplateMetavars(tt.value.stream()))
-                }
-                i++
-            }
-            return vars
-        }
-
-        private fun collectAllTemplateMetavars(stream: TokenStream): Set<String> {
-            val vars = linkedSetOf<String>()
-            val trees = stream.clone().toList()
-            var i = 0
-            while (i < trees.size) {
-                val tt = trees[i]
-                if (tt is TokenTree.Punct && tt.value.asChar() == '$' && i + 1 < trees.size) {
-                    val next = trees[i + 1]
-                    if (next is TokenTree.Ident) {
-                        val name = next.value.toString()
-                        if (name != "crate") vars.add(name)
-                        i += 2
-                        continue
-                    } else if (next is TokenTree.Group && next.value.delimiter() == Delimiter.Brace) {
-                        val ignored = extractIgnoredMetavarName(next.value.stream())
-                        if (ignored != null && ignored != "crate") {
-                            vars.add(ignored)
-                        }
-                        i += 2
-                        continue
-                    }
-                }
-                if (tt is TokenTree.Group) {
-                    vars.addAll(collectAllTemplateMetavars(tt.value.stream()))
-                }
-                i++
-            }
-            return vars
-        }
-
-        private fun templateRepetitionHeaderAdvance(trees: List<TokenTree>, dollarIdx: Int): Int {
-            if (dollarIdx + 2 < trees.size) {
-                val t1 = trees[dollarIdx + 2]
-                if (t1 is TokenTree.Punct) {
-                    val c1 = t1.value.asChar()
-                    if (c1 == '*' || c1 == '+' || c1 == '?') {
-                        return 3
-                    }
-                }
-                if (dollarIdx + 3 < trees.size &&
-                    (t1 is TokenTree.Punct || t1 is TokenTree.Ident) &&
-                    trees[dollarIdx + 3] is TokenTree.Punct
-                ) {
-                    val c2 = (trees[dollarIdx + 3] as TokenTree.Punct).value.asChar()
-                    if (c2 == '*' || c2 == '+') {
-                        return 4
-                    }
+            childEnv: MacroMatchEnv,
+            matchedGroup: RepetitionGroup?,
+        ): MacroMatchEnv {
+            val mergedSingles = LinkedHashMap<String, List<TokenTree>>(env.singles)
+            mergedSingles.putAll(childEnv.singles)
+            val mergedKeywords = LinkedHashMap<String, Span>(env.matchedKeywordSpans)
+            mergedKeywords.putAll(childEnv.matchedKeywordSpans)
+            val mergedGroups = ArrayList<RepetitionGroup>(childEnv.repetitionGroups)
+            for (parentGrp in env.repetitionGroups) {
+                if (parentGrp !== matchedGroup && mergedGroups.none { it.allVars == parentGrp.allVars }) {
+                    mergedGroups.add(parentGrp)
                 }
             }
-            return 2
-        }
-
-        internal fun substituteMacroTokensWithEnv(
-            template: TokenStream,
-            env: MacroMatchEnv,
-            repIndexStack: List<Int> = emptyList(),
-            repLenStack: List<Int> = emptyList(),
-        ): TokenStream {
-            val out = mutableListOf<TokenTree>()
-            val trees = template.clone().toList()
-            var i = 0
-            while (i < trees.size) {
-                val tt = trees[i]
-                if (tt is TokenTree.Punct && tt.value.asChar() == '$' && i + 1 < trees.size) {
-                    val next = trees[i + 1]
-                    if (next is TokenTree.Ident) {
-                        val varName = next.value.toString()
-                        if (varName == "crate") {
-                            out.add(TokenTree.Ident(PmIdent.new("crate", next.value.span())))
-                            i += 2
-                            continue
-                        }
-                        val replacement = env.singles[varName]
-                        if (replacement != null) {
-                            out.addAll(replacement)
-                            i += 2
-                            continue
-                        }
-                    } else if (next is TokenTree.Group && next.value.delimiter() == Delimiter.Brace) {
-                        val evaluated = tryEvaluateMetavarExpr(next.value.stream(), env, repIndexStack, repLenStack)
-                        if (evaluated != null) {
-                            out.addAll(evaluated)
-                            i += 2
-                            continue
-                        }
-                    } else if (next is TokenTree.Group && next.value.delimiter() == Delimiter.Parenthesis) {
-                        var sepToken: TokenTree? = null
-                        val adv = templateRepetitionHeaderAdvance(trees, i)
-                        if (adv == 4) {
-                            sepToken = trees[i + 2]
-                        }
-                        val innerStream = next.value.stream()
-                        var matchedGroup: RepetitionGroup? = null
-                        val targetIterations =
-                            if (env.repetitionGroups.isNotEmpty()) {
-                                val directVars = collectDirectTemplateMetavars(innerStream.clone())
-                                val allVars = collectAllTemplateMetavars(innerStream.clone())
-                                matchedGroup =
-                                    env.repetitionGroups.firstOrNull { grp ->
-                                        directVars.isNotEmpty() && grp.directVars.intersect(directVars).isNotEmpty()
-                                    } ?: env.repetitionGroups.firstOrNull { grp ->
-                                        allVars.isNotEmpty() && grp.allVars.intersect(allVars).isNotEmpty()
-                                    }
-                                matchedGroup?.iterations.orEmpty()
-                            } else {
-                                env.repetitions
-                            }
-                        val nextLenStack = repLenStack + targetIterations.size
-                        for ((repIdx, childEnv) in targetIterations.withIndex()) {
-                            if (repIdx > 0 && sepToken != null) {
-                                out.add(sepToken)
-                            }
-                            val mergedSingles = LinkedHashMap<String, List<TokenTree>>(env.singles)
-                            mergedSingles.putAll(childEnv.singles)
-                            val mergedKeywords = LinkedHashMap<String, Span>(env.matchedKeywordSpans)
-                            mergedKeywords.putAll(childEnv.matchedKeywordSpans)
-                            val mergedGroups = ArrayList<RepetitionGroup>(childEnv.repetitionGroups)
-                            for (parentGrp in env.repetitionGroups) {
-                                if (parentGrp !== matchedGroup && mergedGroups.none { it.allVars == parentGrp.allVars }) {
-                                    mergedGroups.add(parentGrp)
-                                }
-                            }
-                            val mergedEnv =
-                                MacroMatchEnv(
-                                    singles = mergedSingles,
-                                    repetitions = childEnv.repetitions,
-                                    repetitionGroups = mergedGroups,
-                                    matchedKeywordSpans = mergedKeywords,
-                                )
-                            val innerSub =
-                                substituteMacroTokensWithEnv(
-                                    innerStream.clone(),
-                                    mergedEnv,
-                                    repIndexStack = repIndexStack + repIdx,
-                                    repLenStack = nextLenStack,
-                                )
-                            out.addAll(innerSub.toList())
-                        }
-                        i += adv
-                        continue
-                    }
-                }
-                if (tt is TokenTree.Group) {
-                    val inner = substituteMacroTokensWithEnv(tt.value.stream(), env, repIndexStack, repLenStack)
-                    val newGroup = Group(tt.value.delimiter(), inner)
-                    newGroup.setSpan(tt.value.span())
-                    out.add(TokenTree.Group(newGroup))
-                } else if (tt is TokenTree.Ident && tt.span().endExclusiveOffset() <= tt.span().startOffset()) {
-                    val kwSpan = env.matchedKeywordSpans[tt.value.toString()]
-                    out.add(if (kwSpan != null) tt.setSpan(kwSpan) else tt)
-                } else {
-                    out.add(tt)
-                }
-                i++
-            }
-            return TokenStream.fromTokenTrees(out)
-        }
-
-        internal fun splitMacroArguments(stream: TokenStream): List<List<TokenTree>> {
-            val trees = stream.clone().toList()
-            if (trees.isEmpty()) return emptyList()
-            val commaArgs = splitByPunct(trees, ',')
-            if (commaArgs.size > 1) return commaArgs
-            val semiArgs = splitByPunct(trees, ';')
-            if (semiArgs.size > 1) return semiArgs
-            return commaArgs
-        }
-
-        internal fun splitTopLevelCommaClauses(trees: List<TokenTree>): List<List<TokenTree>> =
-            splitByPunct(trees, ',')
-
-        private fun hasMatchingClosingAngle(trees: List<TokenTree>, openIdx: Int): Boolean {
-            if (openIdx > 0 && (trees[openIdx - 1] as? TokenTree.Punct)?.value?.asChar() == '<') {
-                return false
-            }
-            if (openIdx + 1 < trees.size) {
-                val nextPunct = (trees[openIdx + 1] as? TokenTree.Punct)?.value?.asChar()
-                if (nextPunct == '=' || nextPunct == '<' || nextPunct == '-') return false
-            }
-            val isTurbofish =
-                openIdx >= 2 &&
-                    (trees[openIdx - 1] as? TokenTree.Punct)?.value?.asChar() == ':' &&
-                    (trees[openIdx - 2] as? TokenTree.Punct)?.value?.asChar() == ':'
-            val afterUpperIdent =
-                (trees.getOrNull(openIdx - 1) as? TokenTree.Ident)
-                    ?.value
-                    ?.toString()
-                    ?.firstOrNull()
-                    ?.isUpperCase() == true
-            val allowLiterals = isTurbofish || afterUpperIdent
-            var depth = 1
-            for (j in (openIdx + 1) until trees.size) {
-                when (val t = trees[j]) {
-                    is TokenTree.Literal -> if (!allowLiterals) return false
-                    is TokenTree.Punct -> {
-                        val ch = t.value.asChar()
-                        if (ch == ';') return false
-                        val nextCh = (trees.getOrNull(j + 1) as? TokenTree.Punct)?.value?.asChar()
-                        if ((ch == '=' && nextCh == '>') ||
-                            (ch == '&' && nextCh == '&') ||
-                            (ch == '|' && nextCh == '|') ||
-                            (ch == '=' && nextCh == '=') ||
-                            (ch == '!' && nextCh == '=') ||
-                            (ch == '<' && nextCh == '=') ||
-                            (ch == '>' && nextCh == '=')
-                        ) {
-                            return false
-                        }
-                        if (ch == '<') {
-                            depth++
-                        } else if (ch == '>' && !isPartOfRArrow(trees, j)) {
-                            depth--
-                            if (depth == 0) return true
-                        }
-                    }
-                    else -> {}
-                }
-            }
-            return false
-        }
-
-        private fun splitByPunct(trees: List<TokenTree>, sep: Char): List<List<TokenTree>> {
-            val args = mutableListOf<List<TokenTree>>()
-            val current = mutableListOf<TokenTree>()
-            var angleDepth = 0
-            for ((idx, tt) in trees.withIndex()) {
-                if (tt is TokenTree.Punct) {
-                    val ch = tt.value.asChar()
-                    if (ch == '<' && hasMatchingClosingAngle(trees, idx)) {
-                        angleDepth++
-                    } else if (ch == '>' && angleDepth > 0 && !isPartOfRArrow(trees, idx)) {
-                        angleDepth--
-                    } else if (ch == sep && angleDepth == 0) {
-                        if (current.isNotEmpty()) {
-                            args.add(current.toList())
-                            current.clear()
-                        }
-                        continue
-                    }
-                }
-                current.add(tt)
-            }
-            if (current.isNotEmpty()) {
-                args.add(current.toList())
-            }
-            return args
-        }
-
-        internal fun substituteMacroTokens(
-            template: TokenStream,
-            bindings: Map<String, List<TokenTree>>,
-            repetitionBindings: List<Map<String, List<TokenTree>>> = emptyList(),
-        ): TokenStream {
-            val env =
-                MacroMatchEnv(
-                    singles = LinkedHashMap(bindings),
-                    repetitions = repetitionBindings.map { MacroMatchEnv(singles = LinkedHashMap(it)) }.toMutableList(),
-                )
-            return substituteMacroTokensWithEnv(template, env)
+            return MacroMatchEnv(
+                singles = mergedSingles,
+                repetitions = childEnv.repetitions,
+                repetitionGroups = mergedGroups,
+                matchedKeywordSpans = mergedKeywords,
+            )
         }
     }
 }
@@ -2705,218 +2138,249 @@ private fun collectExternalMacroDefs(sourceText: String): Map<String, MacroRules
     return result
 }
 
-private fun hasSkippedMacroAttrs(
-    attrGroups: List<List<TokenTree>>,
-    skipCfgTest: Boolean,
-): Boolean {
-    for (attrTokens in attrGroups) {
-        val firstIdent = (attrTokens.firstOrNull() as? TokenTree.Ident)?.value?.toString()
-        if (firstIdent == "rustc_builtin_macro") return true
-        if (attrTokens.size == 2 &&
-            firstIdent == "cfg" &&
-            (attrTokens[1] as? TokenTree.Group)?.value?.delimiter() == Delimiter.Parenthesis
-        ) {
-            val inner = (attrTokens[1] as TokenTree.Group).value.stream().toList()
-            if (isDocOnlyCfgPredicateTokens(inner)) return true
-            if (skipCfgTest && inner.size == 1 && (inner[0] as? TokenTree.Ident)?.value?.toString() == "test") {
-                return true
-            }
-        }
-    }
-    return false
-}
-
-private fun hasSkippedExternalMacroAttrs(attrGroups: List<List<TokenTree>>): Boolean =
-    hasSkippedMacroAttrs(attrGroups, skipCfgTest = true)
-
 internal fun tryExtractDeclarativeMacro2FromTokens(
     trees: List<TokenTree>,
     skipCfgTest: Boolean,
-): MacroRulesDef? {
-    val attrGroups = mutableListOf<List<TokenTree>>()
-    var idx = 0
-    while (idx + 1 < trees.size &&
-        (trees[idx] as? TokenTree.Punct)?.value?.asChar() == '#' &&
-        (trees[idx + 1] as? TokenTree.Group)?.value?.delimiter() == Delimiter.Bracket
-    ) {
-        attrGroups += (trees[idx + 1] as TokenTree.Group).value.stream().toList()
-        idx += 2
-    }
-    if (hasSkippedMacroAttrs(attrGroups, skipCfgTest)) return null
-    if ((trees.getOrNull(idx) as? TokenTree.Ident)?.value?.toString() == "pub") {
-        idx++
-        if ((trees.getOrNull(idx) as? TokenTree.Group)?.value?.delimiter() == Delimiter.Parenthesis) {
-            idx++
-        }
-    }
-    if ((trees.getOrNull(idx) as? TokenTree.Ident)?.value?.toString() != "macro") return null
-    val macroName = (trees.getOrNull(idx + 1) as? TokenTree.Ident)?.value?.toString()?.removePrefix("r#") ?: return null
-    val firstGroup = (trees.getOrNull(idx + 2) as? TokenTree.Group)?.value ?: return null
-    val branches =
-        when (firstGroup.delimiter()) {
-            Delimiter.Parenthesis -> {
-                val bodyGroup = (trees.getOrNull(idx + 3) as? TokenTree.Group)?.value ?: return null
-                if (bodyGroup.delimiter() != Delimiter.Brace) return null
-                listOf(MacroRulesCollector.buildMacroRuleBranch(firstGroup.stream(), bodyGroup.stream()))
-            }
-            Delimiter.Brace -> MacroRulesCollector.parseMacroRulesBranches(firstGroup.stream())
-            Delimiter.Bracket, Delimiter.None -> return null
-        }
-    if (branches.isEmpty()) return null
-    return MacroRulesDef(macroName, branches)
-}
+): MacroRulesDef? = MacroDeclarativeTokenScanner(trees).tryExtractDeclarativeMacro2(skipCfgTest)
 
 internal fun collectMacroRulesFromTokenTrees(
     trees: List<TokenTree>,
     out: MutableMap<String, MacroRulesDef>,
 ) {
-    val pendingAttrs = mutableListOf<List<TokenTree>>()
-    var i = 0
-    while (i < trees.size) {
-        val cur = trees[i]
-        if (cur is TokenTree.Punct && cur.value.asChar() == '#') {
-            if ((trees.getOrNull(i + 1) as? TokenTree.Punct)?.value?.asChar() == '!' &&
-                (trees.getOrNull(i + 2) as? TokenTree.Group)?.value?.delimiter() == Delimiter.Bracket
-            ) {
-                i += 3
-                continue
-            }
-            val attrGrp = trees.getOrNull(i + 1) as? TokenTree.Group
-            if (attrGrp != null && attrGrp.value.delimiter() == Delimiter.Bracket) {
-                pendingAttrs += attrGrp.value.stream().toList()
-                i += 2
-                continue
-            }
-        }
-        var afterVis = i
-        if ((cur as? TokenTree.Ident)?.value?.toString() == "pub") {
-            afterVis++
-            if ((trees.getOrNull(afterVis) as? TokenTree.Group)?.value?.delimiter() == Delimiter.Parenthesis) {
-                afterVis++
-            }
-        }
-        if ((cur as? TokenTree.Ident)?.value?.toString() == "macro_rules" &&
-            (trees.getOrNull(i + 1) as? TokenTree.Punct)?.value?.asChar() == '!' &&
-            trees.getOrNull(i + 2) is TokenTree.Ident &&
-            trees.getOrNull(i + 3) is TokenTree.Group
-        ) {
-            val macroName = (trees[i + 2] as TokenTree.Ident).value.toString().removePrefix("r#")
-            val bodyGroup = (trees[i + 3] as TokenTree.Group).value
-            if (!hasSkippedExternalMacroAttrs(pendingAttrs) && macroName != "offset_of" && macroName !in out) {
-                val branches = MacroRulesCollector.parseMacroRulesBranches(bodyGroup.stream())
-                if (branches.isNotEmpty() && !isRawPointerLiteralMacroBranches(branches)) {
-                    out[macroName] = MacroRulesDef(macroName, branches)
-                }
-            }
-            i += 4
-            if ((trees.getOrNull(i) as? TokenTree.Punct)?.value?.asChar() == ';') {
-                i++
-            }
-            pendingAttrs.clear()
-            continue
-        }
-        if ((trees.getOrNull(afterVis) as? TokenTree.Ident)?.value?.toString() == "macro" &&
-            trees.getOrNull(afterVis + 1) is TokenTree.Ident &&
-            trees.getOrNull(afterVis + 2) is TokenTree.Group
-        ) {
-            val macroName = (trees[afterVis + 1] as TokenTree.Ident).value.toString().removePrefix("r#")
-            val firstGroup = (trees[afterVis + 2] as TokenTree.Group).value
-            var nextIdx: Int? = null
-            val branches: List<MacroRuleBranch> =
-                when (firstGroup.delimiter()) {
-                    Delimiter.Parenthesis -> {
-                        val bodyGrp = (trees.getOrNull(afterVis + 3) as? TokenTree.Group)?.value
-                        if (bodyGrp != null && bodyGrp.delimiter() == Delimiter.Brace) {
-                            nextIdx = afterVis + 4
-                            listOf(MacroRulesCollector.buildMacroRuleBranch(firstGroup.stream(), bodyGrp.stream()))
-                        } else {
-                            emptyList()
-                        }
-                    }
-                    Delimiter.Brace -> {
-                        nextIdx = afterVis + 3
-                        MacroRulesCollector.parseMacroRulesBranches(firstGroup.stream())
-                    }
-                    Delimiter.Bracket, Delimiter.None -> emptyList()
-                }
-            if (nextIdx != null) {
-                if (!hasSkippedExternalMacroAttrs(pendingAttrs) && macroName != "offset_of" && macroName !in out && branches.isNotEmpty()) {
-                    if (!isRawPointerLiteralMacroBranches(branches)) {
-                        out[macroName] = MacroRulesDef(macroName, branches)
-                    }
-                }
-                i = nextIdx
-                pendingAttrs.clear()
-                continue
-            }
-        }
-        if ((trees.getOrNull(afterVis) as? TokenTree.Ident)?.value?.toString() == "mod" &&
-            trees.getOrNull(afterVis + 1) is TokenTree.Ident
-        ) {
-            val modBody = trees.getOrNull(afterVis + 2)
-            if (modBody is TokenTree.Group && modBody.value.delimiter() == Delimiter.Brace) {
-                if (!hasSkippedExternalMacroAttrs(pendingAttrs)) {
-                    collectMacroRulesFromTokenTrees(modBody.value.stream().toList(), out)
-                }
-                i = afterVis + 3
-                pendingAttrs.clear()
-                continue
-            }
-            if ((modBody as? TokenTree.Punct)?.value?.asChar() == ';') {
-                i = afterVis + 3
-                pendingAttrs.clear()
-                continue
-            }
-        }
-        if ((cur is TokenTree.Punct && cur.value.asChar() == ';') ||
-            (cur is TokenTree.Group && cur.value.delimiter() == Delimiter.Brace)
-        ) {
-            pendingAttrs.clear()
-        }
-        i++
-    }
+    MacroDeclarativeTokenScanner(trees).collectMacroRules(out)
 }
 
 public fun extractMacroUseModuleNames(rustSource: String): List<String> {
     if (!rustSource.contains("macro_use")) return emptyList()
     val lexed = TokenStream.fromString(rustSource)
     if (lexed.isFailure()) return emptyList()
-    val trees = lexed.getOrThrow().toList()
-    val names = mutableListOf<String>()
-    var i = 0
-    while (i < trees.size) {
-        if ((trees[i] as? TokenTree.Punct)?.value?.asChar() == '#' &&
-            (trees.getOrNull(i + 1) as? TokenTree.Group)?.value?.delimiter() == Delimiter.Bracket
-        ) {
-            val attrTokens = (trees[i + 1] as TokenTree.Group).value.stream().toList()
-            val firstAttrIdent = (attrTokens.firstOrNull() as? TokenTree.Ident)?.value?.toString()
-            if (firstAttrIdent == "macro_use") {
-                var j = i + 2
-                while (j + 1 < trees.size &&
-                    (trees[j] as? TokenTree.Punct)?.value?.asChar() == '#' &&
-                    (trees[j + 1] as? TokenTree.Group)?.value?.delimiter() == Delimiter.Bracket
-                ) {
-                    j += 2
+    return MacroDeclarativeTokenScanner(lexed.getOrThrow().toList()).extractMacroUseModules()
+}
+
+private class MacroDeclarativeTokenScanner(
+    trees: List<TokenTree>,
+) : RustTokenCursor(trees) {
+    fun tryExtractDeclarativeMacro2(skipCfgTest: Boolean): MacroRulesDef? {
+        val attrGroups = mutableListOf<List<TokenTree>>()
+        var idx = 0
+        while (true) {
+            val afterAttr = consumeAttribute(idx, attrGroups, allowInnerAttr = false) ?: break
+            idx = afterAttr
+        }
+        if (hasSkippedMacroAttrs(attrGroups, skipCfgTest)) return null
+        idx = copyOptionalPubVisibility(idx)
+        return parseDeclarativeMacro2At(idx)?.first
+    }
+
+    fun collectMacroRules(out: MutableMap<String, MacroRulesDef>) {
+        val pendingAttrs = mutableListOf<List<TokenTree>>()
+        var i = 0
+        while (i < size) {
+            val afterAttr = consumeAttribute(i, pendingAttrs)
+            if (afterAttr != null) {
+                i = afterAttr
+                continue
+            }
+            val afterVis = copyOptionalPubVisibility(i)
+            if (identAt(i) == "macro_rules" &&
+                punctCharAt(i + 1) == '!' &&
+                trees.getOrNull(i + 2) is TokenTree.Ident
+            ) {
+                val macroName = cleanIdentAt(i + 2)
+                val bodyGroup = groupAt(i + 3)
+                if (macroName != null && bodyGroup != null) {
+                    registerParsedMacroDef(
+                        macroName = macroName,
+                        branches = MacroRulesCollector.parseMacroRulesBranches(bodyGroup.stream()),
+                        pendingAttrs = pendingAttrs,
+                        out = out,
+                    )
+                    i += 4
+                    if (punctCharAt(i) == ';') i++
+                    pendingAttrs.clear()
+                    continue
                 }
-                if ((trees.getOrNull(j) as? TokenTree.Ident)?.value?.toString() == "pub") {
-                    j++
-                    if ((trees.getOrNull(j) as? TokenTree.Group)?.value?.delimiter() == Delimiter.Parenthesis) {
-                        j++
+            }
+            val declMacro2 = parseDeclarativeMacro2At(afterVis)
+            if (declMacro2 != null) {
+                val (parsedDef, nextIdx) = declMacro2
+                if (parsedDef != null) {
+                    registerParsedMacroDef(parsedDef.name, parsedDef.branches, pendingAttrs, out)
+                }
+                i = nextIdx
+                pendingAttrs.clear()
+                continue
+            }
+            if (identAt(afterVis) == "mod" && trees.getOrNull(afterVis + 1) is TokenTree.Ident) {
+                val modBrace = groupAt(afterVis + 2, Delimiter.Brace)
+                if (modBrace != null) {
+                    if (!hasSkippedMacroAttrs(pendingAttrs, skipCfgTest = true)) {
+                        MacroDeclarativeTokenScanner(modBrace.stream().toList()).collectMacroRules(out)
                     }
+                    i = afterVis + 3
+                    pendingAttrs.clear()
+                    continue
                 }
-                if ((trees.getOrNull(j) as? TokenTree.Ident)?.value?.toString() == "mod") {
-                    val modName = (trees.getOrNull(j + 1) as? TokenTree.Ident)?.value?.toString()
-                    if (modName != null && (trees.getOrNull(j + 2) as? TokenTree.Punct)?.value?.asChar() == ';') {
-                        names += modName.removePrefix("r#")
+                if (punctCharAt(afterVis + 2) == ';') {
+                    i = afterVis + 3
+                    pendingAttrs.clear()
+                    continue
+                }
+            }
+            if (punctCharAt(i) == ';' || groupAt(i, Delimiter.Brace) != null) {
+                pendingAttrs.clear()
+            }
+            i++
+        }
+    }
+
+    fun extractMacroUseModules(): List<String> {
+        val names = mutableListOf<String>()
+        var i = 0
+        while (i < size) {
+            val attrGrp = if (punctCharAt(i) == '#') groupAt(i + 1, Delimiter.Bracket) else null
+            if (attrGrp != null) {
+                val attrFirstIdent = RustTokenCursor(attrGrp.stream().toList()).identAt(0)
+                if (attrFirstIdent == "macro_use") {
+                    var j = i + 2
+                    while (punctCharAt(j) == '#' && groupAt(j + 1, Delimiter.Bracket) != null) {
+                        j += 2
+                    }
+                    j = copyOptionalPubVisibility(j)
+                    val modName = if (identAt(j) == "mod") cleanIdentAt(j + 1) else null
+                    if (modName != null && punctCharAt(j + 2) == ';') {
+                        names += modName
                         i = j + 3
                         continue
                     }
                 }
             }
+            i++
         }
-        i++
+        return names.distinct()
     }
-    return names.distinct()
+
+    fun collectHeaderSpans(fallbackSpan: Span): List<Span> {
+        val byStart = linkedMapOf<Int, Span>()
+        var prevIdentText: String? = null
+        var angleDepth = 0
+        for (idx in 0 until size) {
+            val tt = trees[idx]
+            when (tt) {
+                is TokenTree.Group -> {
+                    when (tt.value.delimiter()) {
+                        Delimiter.Brace -> break
+                        Delimiter.Parenthesis -> if (angleDepth == 0 && prevIdentText != "pub") break
+                        else -> {}
+                    }
+                    prevIdentText = null
+                }
+                is TokenTree.Punct -> {
+                    val ch = tt.value.asChar()
+                    if (ch == '<') {
+                        angleDepth++
+                    } else if (ch == '>' && angleDepth > 0) {
+                        angleDepth--
+                    } else if (angleDepth == 0 &&
+                        ((isSingleColonAt(idx) && prevIdentText != null) || ch == '=' || ch == ';')
+                    ) {
+                        break
+                    }
+                    prevIdentText = null
+                }
+                is TokenTree.Ident -> prevIdentText = tt.value.toString()
+                is TokenTree.Literal -> prevIdentText = null
+            }
+            val sp = tt.span()
+            val start = sp.startOffset()
+            if (sp.endExclusiveOffset() > start && start >= 0 && start !in byStart) {
+                byStart[start] = sp
+            }
+        }
+        if (byStart.isEmpty()) {
+            val start = fallbackSpan.startOffset()
+            if (fallbackSpan.endExclusiveOffset() > start && start >= 0) {
+                byStart[start] = fallbackSpan
+            }
+        }
+        return byStart.values.sortedBy { it.startOffset() }
+    }
+
+    private fun parseDeclarativeMacro2At(macroKwIdx: Int): Pair<MacroRulesDef?, Int>? {
+        if (identAt(macroKwIdx) != "macro") return null
+        val macroName = cleanIdentAt(macroKwIdx + 1) ?: return null
+        val firstGroup = groupAt(macroKwIdx + 2) ?: return null
+        return when (firstGroup.delimiter()) {
+            Delimiter.Parenthesis -> {
+                val bodyGrp = groupAt(macroKwIdx + 3, Delimiter.Brace) ?: return null
+                val branch = MacroRulesCollector.buildMacroRuleBranch(firstGroup.stream(), bodyGrp.stream())
+                MacroRulesDef(macroName, listOf(branch)) to (macroKwIdx + 4)
+            }
+            Delimiter.Brace -> {
+                val branches = MacroRulesCollector.parseMacroRulesBranches(firstGroup.stream())
+                val def = if (branches.isNotEmpty()) MacroRulesDef(macroName, branches) else null
+                def to (macroKwIdx + 3)
+            }
+            Delimiter.Bracket, Delimiter.None -> null
+        }
+    }
+
+    private fun registerParsedMacroDef(
+        macroName: String,
+        branches: List<MacroRuleBranch>,
+        pendingAttrs: List<List<TokenTree>>,
+        out: MutableMap<String, MacroRulesDef>,
+    ) {
+        if (!hasSkippedMacroAttrs(pendingAttrs, skipCfgTest = true) &&
+            macroName != "offset_of" &&
+            macroName !in out &&
+            branches.isNotEmpty() &&
+            !isRawPointerLiteralMacroBranches(branches)
+        ) {
+            out[macroName] = MacroRulesDef(macroName, branches)
+        }
+    }
+
+    companion object {
+        fun endsWithAsPtrCall(rawTrees: List<TokenTree>): Boolean {
+            var curTrees = rawTrees
+            while (curTrees.size == 1 && curTrees[0] is TokenTree.Group) {
+                val g = (curTrees[0] as TokenTree.Group).value
+                val delim = g.delimiter()
+                if (delim == Delimiter.Brace || delim == Delimiter.Parenthesis || delim == Delimiter.None) {
+                    curTrees = g.stream().clone().toList()
+                } else {
+                    break
+                }
+            }
+            val cursor = RustTokenCursor(curTrees)
+            if (cursor.size < 4) return false
+            val callParens = cursor.groupAt(cursor.size - 1, Delimiter.Parenthesis) ?: return false
+            if (!callParens.stream().isEmpty()) return false
+            val methodIdent = cursor.identAt(cursor.size - 2) ?: return false
+            return cursor.punctCharAt(cursor.size - 3) == '.' && (methodIdent == "as_ptr" || methodIdent == "as_mut_ptr")
+        }
+
+        private fun hasSkippedMacroAttrs(
+            attrGroups: List<List<TokenTree>>,
+            skipCfgTest: Boolean,
+        ): Boolean {
+            for (attrTokens in attrGroups) {
+                val attrCursor = RustTokenCursor(attrTokens)
+                val firstIdent = attrCursor.identAt(0)
+                if (firstIdent == "rustc_builtin_macro") return true
+                val cfgParen = if (attrCursor.size == 2 && firstIdent == "cfg") attrCursor.groupAt(1, Delimiter.Parenthesis) else null
+                if (cfgParen != null) {
+                    val inner = cfgParen.stream().toList()
+                    if (isDocOnlyCfgPredicateTokens(inner)) return true
+                    if (skipCfgTest && inner.size == 1 && RustTokenCursor(inner).identAt(0) == "test") {
+                        return true
+                    }
+                }
+            }
+            return false
+        }
+    }
 }
 
 internal data class ExpandedFileMacroRules(
@@ -2930,57 +2394,8 @@ internal data class ExpandedFileMacroRules(
  * declaration bodies, parameter groups, or initializer separators), avoiding AST-variant dispatch
  * and skipping synthesized zero-width `Span.callSite()` tokens injected by `macro_rules!` templates.
  */
-internal fun collectHeaderSourceSpans(node: ToTokens): List<Span> {
-    val byStart = linkedMapOf<Int, Span>()
-    var prevIdentText: String? = null
-    var angleDepth = 0
-    for (tt in node.toTokenStream()) {
-        when (tt) {
-            is TokenTree.Group -> {
-                when (tt.value.delimiter()) {
-                    Delimiter.Brace -> break
-                    Delimiter.Parenthesis -> if (angleDepth == 0 && prevIdentText != "pub") break
-                    else -> {}
-                }
-                prevIdentText = null
-            }
-            is TokenTree.Punct -> {
-                val ch = tt.value.asChar()
-                if (ch == '<') {
-                    angleDepth++
-                } else if (ch == '>' && angleDepth > 0) {
-                    angleDepth--
-                } else if (angleDepth == 0 &&
-                    ((ch == ':' && tt.value.spacing() != Spacing.Joint && prevIdentText != null) || ch == '=' || ch == ';')
-                ) {
-                    break
-                }
-                prevIdentText = null
-            }
-            is TokenTree.Ident -> {
-                prevIdentText = tt.value.toString()
-            }
-            is TokenTree.Literal -> {
-                prevIdentText = null
-            }
-        }
-        val sp = tt.span()
-        val start = sp.startOffset()
-        val end = sp.endExclusiveOffset()
-        if (end > start && start >= 0 && start !in byStart) {
-            byStart[start] = sp
-        }
-    }
-    if (byStart.isEmpty()) {
-        val fallback = node.span()
-        val start = fallback.startOffset()
-        val end = fallback.endExclusiveOffset()
-        if (end > start && start >= 0) {
-            byStart[start] = fallback
-        }
-    }
-    return byStart.values.sortedBy { it.startOffset() }
-}
+internal fun collectHeaderSourceSpans(node: ToTokens): List<Span> =
+    MacroDeclarativeTokenScanner(node.toTokenStream().toList()).collectHeaderSpans(node.span())
 
 internal fun expandFileMacroRules(
     file: File,

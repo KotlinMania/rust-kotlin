@@ -280,14 +280,8 @@ internal fun KotlinJ2KEmitter.renderUnOpDerefPointerPunning(
         srcKind == NumericKind.F32 && dstKind == NumericKind.I32 -> "$atom.toRawBits()"
         srcKind == NumericKind.F64 && dstKind == NumericKind.U64 -> "$atom.toRawBits().toULong()"
         srcKind == NumericKind.F64 && dstKind == NumericKind.I64 -> "$atom.toRawBits()"
-        srcKind == NumericKind.F128 && dstKind == NumericKind.U128 -> {
-            usesU128 = true
-            "U128($atom.high, $atom.low)"
-        }
-        srcKind == NumericKind.F128 && dstKind == NumericKind.I128 -> {
-            usesI128 = true
-            "I128($atom.high.toLong(), $atom.low)"
-        }
+        srcKind == NumericKind.F128 && dstKind == NumericKind.U128 -> "U128($atom.high, $atom.low)"
+        srcKind == NumericKind.F128 && dstKind == NumericKind.I128 -> "I128($atom.high.toLong(), $atom.low)"
         srcKind == NumericKind.U128 && dstKind == NumericKind.F128 -> "F128.fromBits($rval)"
         srcKind == NumericKind.I128 && dstKind == NumericKind.F128 -> "F128.fromBits($atom.high.toULong(), $atom.low)"
         srcKind == NumericKind.U32 && dstKind == NumericKind.F32 -> "${kotlinF32TypeName()}.fromBits($atom.toInt())"
@@ -637,10 +631,8 @@ internal fun KotlinJ2KEmitter.renderStaticPrimitiveCall(
                 return renderFloatFromBitsArg(nonUnitArgs[0], NumericKind.U32, NumericKind.I32, kotlinF32TypeName(), indent, selfTypeName)
             NumericKind.F64 ->
                 return renderFloatFromBitsArg(nonUnitArgs[0], NumericKind.U64, NumericKind.I64, "Double", indent, selfTypeName)
-            NumericKind.F128 -> {
-                usesU128 = true
+            NumericKind.F128 ->
                 return renderFloatFromBitsArg(nonUnitArgs[0], NumericKind.U128, NumericKind.U128, "F128", indent, selfTypeName)
-            }
             else -> Unit
         }
     }

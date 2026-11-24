@@ -4,6 +4,7 @@ import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.procmacro2.Group
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
+import io.github.kotlinmania.syn.Attribute
 import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.Fields
@@ -47,52 +48,93 @@ internal fun isSynResultReturnType(output: ReturnType): Boolean {
     return !isStdFmt
 }
 
-internal fun itemHasDocOnlyCfg(item: Item): Boolean =
-    when (item) {
-        is Item.Const -> isDocOnlyCfgAttribute(item.attrs)
-        is Item.Enum -> isDocOnlyCfgAttribute(item.attrs)
-        is Item.ExternCrate -> isDocOnlyCfgAttribute(item.attrs)
-        is Item.Fn -> isDocOnlyCfgAttribute(item.attrs)
-        is Item.ForeignMod -> isDocOnlyCfgAttribute(item.attrs)
-        is Item.Impl -> isDocOnlyCfgAttribute(item.attrs)
-        is Item.Macro -> isDocOnlyCfgAttribute(item.attrs)
-        is Item.Mod -> isDocOnlyCfgAttribute(item.attrs)
-        is Item.Static -> isDocOnlyCfgAttribute(item.attrs)
-        is Item.Struct -> isDocOnlyCfgAttribute(item.attrs)
-        is Item.Trait -> isDocOnlyCfgAttribute(item.attrs)
-        is Item.TraitAlias -> isDocOnlyCfgAttribute(item.attrs)
-        is Item.ItemType -> isDocOnlyCfgAttribute(item.attrs)
-        is Item.Union -> isDocOnlyCfgAttribute(item.attrs)
-        is Item.Use -> isDocOnlyCfgAttribute(item.attrs)
-        is Item.Verbatim -> false
+internal val Item.attributes: List<Attribute>
+    get() =
+        when (this) {
+            is Item.Const -> attrs
+            is Item.Enum -> attrs
+            is Item.ExternCrate -> attrs
+            is Item.Fn -> attrs
+            is Item.ForeignMod -> attrs
+            is Item.Impl -> attrs
+            is Item.Macro -> attrs
+            is Item.Mod -> attrs
+            is Item.Static -> attrs
+            is Item.Struct -> attrs
+            is Item.Trait -> attrs
+            is Item.TraitAlias -> attrs
+            is Item.ItemType -> attrs
+            is Item.Union -> attrs
+            is Item.Use -> attrs
+            is Item.Verbatim -> emptyList()
+        }
+
+internal fun Item.withPrependedAttributes(prefixAttrs: List<Attribute>): Item =
+    when (this) {
+        is Item.Const -> copy(attrs = prefixAttrs + attrs)
+        is Item.Enum -> copy(attrs = prefixAttrs + attrs)
+        is Item.ExternCrate -> copy(attrs = prefixAttrs + attrs)
+        is Item.Fn -> copy(attrs = prefixAttrs + attrs)
+        is Item.ForeignMod -> copy(attrs = prefixAttrs + attrs)
+        is Item.Impl -> copy(attrs = prefixAttrs + attrs)
+        is Item.Macro -> copy(attrs = prefixAttrs + attrs)
+        is Item.Mod -> copy(attrs = prefixAttrs + attrs)
+        is Item.Static -> copy(attrs = prefixAttrs + attrs)
+        is Item.Struct -> copy(attrs = prefixAttrs + attrs)
+        is Item.Trait -> copy(attrs = prefixAttrs + attrs)
+        is Item.TraitAlias -> copy(attrs = prefixAttrs + attrs)
+        is Item.ItemType -> copy(attrs = prefixAttrs + attrs)
+        is Item.Union -> copy(attrs = prefixAttrs + attrs)
+        is Item.Use -> copy(attrs = prefixAttrs + attrs)
+        is Item.Verbatim -> this
     }
 
-internal fun implItemHasDocOnlyCfg(item: ImplItem): Boolean =
-    when (item) {
-        is ImplItem.Const -> isDocOnlyCfgAttribute(item.attrs)
-        is ImplItem.Fn -> isDocOnlyCfgAttribute(item.attrs)
-        is ImplItem.AssocType -> isDocOnlyCfgAttribute(item.attrs)
-        is ImplItem.Macro -> isDocOnlyCfgAttribute(item.attrs)
-        is ImplItem.Verbatim -> false
+internal val ImplItem.attributes: List<Attribute>
+    get() =
+        when (this) {
+            is ImplItem.Const -> attrs
+            is ImplItem.Fn -> attrs
+            is ImplItem.AssocType -> attrs
+            is ImplItem.Macro -> attrs
+            is ImplItem.Verbatim -> emptyList()
+        }
+
+internal fun ImplItem.withPrependedAttributes(prefixAttrs: List<Attribute>): ImplItem =
+    when (this) {
+        is ImplItem.Const -> copy(attrs = prefixAttrs + attrs)
+        is ImplItem.Fn -> copy(attrs = prefixAttrs + attrs)
+        is ImplItem.AssocType -> copy(attrs = prefixAttrs + attrs)
+        is ImplItem.Macro -> copy(attrs = prefixAttrs + attrs)
+        is ImplItem.Verbatim -> this
     }
 
-internal fun traitItemHasDocOnlyCfg(item: TraitItem): Boolean =
-    when (item) {
-        is TraitItem.Const -> isDocOnlyCfgAttribute(item.attrs)
-        is TraitItem.Fn -> isDocOnlyCfgAttribute(item.attrs)
-        is TraitItem.AssocType -> isDocOnlyCfgAttribute(item.attrs)
-        is TraitItem.Macro -> isDocOnlyCfgAttribute(item.attrs)
-        is TraitItem.Verbatim -> false
-    }
+internal val TraitItem.attributes: List<Attribute>
+    get() =
+        when (this) {
+            is TraitItem.Const -> attrs
+            is TraitItem.Fn -> attrs
+            is TraitItem.AssocType -> attrs
+            is TraitItem.Macro -> attrs
+            is TraitItem.Verbatim -> emptyList()
+        }
 
-internal fun foreignItemHasDocOnlyCfg(item: ForeignItem): Boolean =
-    when (item) {
-        is ForeignItem.Fn -> isDocOnlyCfgAttribute(item.attrs)
-        is ForeignItem.Static -> isDocOnlyCfgAttribute(item.attrs)
-        is ForeignItem.ItemType -> isDocOnlyCfgAttribute(item.attrs)
-        is ForeignItem.Macro -> isDocOnlyCfgAttribute(item.attrs)
-        is ForeignItem.Verbatim -> false
-    }
+internal val ForeignItem.attributes: List<Attribute>
+    get() =
+        when (this) {
+            is ForeignItem.Fn -> attrs
+            is ForeignItem.Static -> attrs
+            is ForeignItem.ItemType -> attrs
+            is ForeignItem.Macro -> attrs
+            is ForeignItem.Verbatim -> emptyList()
+        }
+
+internal fun itemHasDocOnlyCfg(item: Item): Boolean = isDocOnlyCfgAttribute(item.attributes)
+
+internal fun implItemHasDocOnlyCfg(item: ImplItem): Boolean = isDocOnlyCfgAttribute(item.attributes)
+
+internal fun traitItemHasDocOnlyCfg(item: TraitItem): Boolean = isDocOnlyCfgAttribute(item.attributes)
+
+internal fun foreignItemHasDocOnlyCfg(item: ForeignItem): Boolean = isDocOnlyCfgAttribute(item.attributes)
 
 internal enum class NumericKind {
     I8,

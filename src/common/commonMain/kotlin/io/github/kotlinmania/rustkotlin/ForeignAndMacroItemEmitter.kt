@@ -5,7 +5,6 @@ import io.github.kotlinmania.procmacro2.Group
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.rustkotlin.reused.starlark.AssignCount
-import io.github.kotlinmania.syn.Attribute
 import io.github.kotlinmania.syn.FnArg
 import io.github.kotlinmania.syn.ForeignItem
 import io.github.kotlinmania.syn.GenericParam
@@ -700,89 +699,213 @@ internal fun KotlinJ2KEmitter.resolveStdlibFfiSymbolImport(
 internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
     rawInputSegStrings: List<String>,
     inTypePosition: Boolean = false,
-): Pair<String, List<String>>? {
-    val rawSegStrings = rewriteCrateRootAliasAndReexportSegments(rawInputSegStrings)
-    if (rawSegStrings.size < 2) return null
-    val firstRaw = rawSegStrings.first().removePrefix("r#")
-    if (firstRaw in inspector.localInlineModuleNames) return null
-    val secondCleanEarly = rawSegStrings.getOrNull(1)?.removePrefix("r#")
-    val thirdCleanEarly = rawSegStrings.getOrNull(2)?.removePrefix("r#")
-    if (!headerContext.rawAbiMode &&
-        headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true &&
-        rawSegStrings.size in 4..5 &&
-        firstRaw in setOf("core", "std", "crate") &&
-        secondCleanEarly == "sync" &&
-        thirdCleanEarly == "atomic"
-    ) {
+): Pair<String, List<String>>? =
+    CrossModulePathTargetResolver(this).resolve(rawInputSegStrings, inTypePosition)
+
+internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
+    rawSegsInput: List<String>,
+    boundRawAlias: String? = null,
+    isSelfImport: Boolean = false,
+    forceTypeLeaf: Boolean = false,
+): String? =
+    KotlinImportPathResolver(this).resolve(rawSegsInput, boundRawAlias, isSelfImport, forceTypeLeaf)
+
+/**
+ * Shared base class for single-file Rust module, crate, stdlib, and `use`-tree path resolution.
+ *
+ * Centralizes crate-root alias rewriting, stdlib `core`/`alloc`/`std`/FFI special-case targets,
+ * Kotlin segment casing, intermediate enum/type segment detection, and crate subpackage lookup
+ * across [CrossModulePathTargetResolver] and [KotlinImportPathResolver].
+ */
+internal open class RustModulePathResolver(
+    protected val emitter: KotlinJ2KEmitter,
+) {
+    protected val headerContext
+        get() = emitter.headerContext
+
+    protected val inspector
+        get() = emitter.inspector
+
+    protected val scopeBuilder
+        get() = emitter.scopeBuilder
+
+    protected fun qualifyInCrate(nsPrefix: String, subPkg: String, tail: String): String =
+        if (subPkg.isEmpty()) "$nsPrefix.$tail" else "$nsPrefix.$subPkg.$tail"
+
+    protected fun cleanDotPrefix(raw: String?): String? =
+        raw
+            ?.trim()
+            ?.removeSuffix(".")
+            ?.takeIf { it.isNotEmpty() }
+
+    protected fun cleanConfiguredCrateNamespace(crateKey: String): String? =
+        cleanDotPrefix(headerContext.crateNamespaces[crateKey])
+
+    protected fun isInRustLangCrate(): Boolean =
+        headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true
+
+    protected fun tryResolveCoreMemIntrinsic(
+        firstClean: String,
+        secondClean: String?,
+        thirdClean: String?,
+        requireCoreWhenCrateRoot: Boolean,
+    ): String? {
+        if (secondClean != "intrinsics" || thirdClean == null || thirdClean !in CORE_MEM_INTRINSICS) {
+            return null
+        }
         val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-        if (rawSegStrings.size == 5) {
-            val ownerSym = rawSegStrings[3].removePrefix("r#")
-            if (ownerSym.firstOrNull()?.isUpperCase() == true) {
-                return "$coreNs.sync.atomic.${rustTypeIdentToKotlin(ownerSym)}" to listOf(rawSegStrings[4])
-            }
-        } else {
-            val sym = rawSegStrings[3].removePrefix("r#")
-            val ktSym = if (sym.firstOrNull()?.isUpperCase() == true) rustTypeIdentToKotlin(sym) else rustFunctionIdentToKotlin(sym)
-            return "$coreNs.sync.atomic.$ktSym" to emptyList()
+        val validRoot =
+            firstClean == "core" ||
+                firstClean == "std" ||
+                (firstClean == "crate" && (!requireCoreWhenCrateRoot || emitter.currentNamespacePrefix() == coreNs))
+        return if (validRoot) "$coreNs.mem.${rustFunctionIdentToKotlin(thirdClean)}" else null
+    }
+
+    protected fun tryResolveStdlibRcOrArc(
+        firstClean: String,
+        secondClean: String?,
+        symClean: String,
+    ): String? {
+        if (headerContext.rawAbiMode || !isInRustLangCrate()) return null
+        if (firstClean !in ALLOC_STD_CRATE_ROOTS) return null
+        val pkg = headerContext.packageName.orEmpty()
+        if (firstClean == "crate" &&
+            !pkg.startsWith("io.github.kotlinmania.rustlang.std") &&
+            !pkg.startsWith("io.github.kotlinmania.rustlang.alloc")
+        ) {
+            return null
         }
-    }
-    val coreMemIntrinsics =
-        setOf("transmute", "transmute_unchecked", "size_of", "size_of_val", "align_of", "align_of_val", "needs_drop", "forget")
-    if (rawSegStrings.size == 3 &&
-        firstRaw in setOf("core", "std", "crate") &&
-        secondCleanEarly == "intrinsics" &&
-        thirdCleanEarly != null &&
-        thirdCleanEarly in coreMemIntrinsics
-    ) {
-        return "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.mem.${rustFunctionIdentToKotlin(thirdCleanEarly)}" to emptyList()
-    }
-    if (!headerContext.rawAbiMode &&
-        headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true &&
-        rawSegStrings.size in 3..4 &&
-        firstRaw in setOf("alloc", "std", "crate") &&
-        (
-            firstRaw != "crate" ||
-                headerContext.packageName.startsWith("io.github.kotlinmania.rustlang.std") ||
-                headerContext.packageName.startsWith("io.github.kotlinmania.rustlang.alloc")
-        )
-    ) {
-        val symSeg = rawSegStrings[2].removePrefix("r#")
+        if (symClean in inspector.declaredTypeNames) return null
         val allocNs = CoreIntrinsicLowering.resolveAllocNamespace(headerContext)
-        if (secondCleanEarly == "sync" && symSeg in setOf("Arc", "Weak") && symSeg !in inspector.declaredTypeNames) {
-            return "$allocNs.rcs.arc.$symSeg" to rawSegStrings.drop(3)
-        }
-        if (secondCleanEarly == "rc" && symSeg in setOf("Rc", "Weak") && symSeg !in inspector.declaredTypeNames) {
-            return "$allocNs.rcs.rc.$symSeg" to rawSegStrings.drop(3)
+        return when {
+            secondClean == "sync" && symClean in ARC_WEAK_SYMBOLS -> "$allocNs.rcs.arc.$symClean"
+            secondClean == "rc" && symClean in RC_WEAK_SYMBOLS -> "$allocNs.rcs.rc.$symClean"
+            else -> null
         }
     }
-    if (firstRaw == "std" || firstRaw == "alloc" || firstRaw == "Self" || firstRaw in PRIMITIVE_TYPE_NAMES) return null
-    if (rawSegStrings.dropLast(1).any { it.removePrefix("r#") in STDLIB_PRELUDE_REEXPORT_MODULES }) {
+
+    protected fun tryResolveFfiLeafSymbol(rustLeaf: String): String? {
+        if (rustLeaf == "CString") {
+            return emitter.resolveStdlibFfiSymbolImport("CString", isAllocCString = true)
+        }
+        if (rustLeaf in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS) {
+            return emitter.resolveStdlibFfiSymbolImport(rustLeaf)
+        }
         return null
     }
-    val secondClean = rawSegStrings.getOrNull(1)?.removePrefix("r#")
-    val thirdClean = rawSegStrings.getOrNull(2)?.removePrefix("r#")
-    if (secondClean == "string" &&
-        thirdClean == "String" &&
-        (
-            firstRaw == "alloc" ||
-                firstRaw == "std" ||
-                (
-                    firstRaw == "crate" &&
-                        (
-                            headerContext.packageName == "io.github.kotlinmania.rustlang.alloc" ||
-                                headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.alloc.") == true
-                        )
+
+    protected fun isIntermediateTypeSegment(
+        segment: String,
+        idx: Int,
+        segments: List<String>,
+        baseSegs: List<String> = emptyList(),
+    ): Boolean {
+        if (segment.firstOrNull()?.isUpperCase() != true) return false
+        if (headerContext.crateSubpackageRawLeafNames.isNotEmpty()) {
+            val mappedPrefix =
+                segments.take(idx + 1).map { rustModuleIdentToKotlin(it.removePrefix("r#").replace('-', '_')) }
+            val candidateSubpkg = (baseSegs + mappedPrefix).filter { it.isNotEmpty() }.joinToString(".")
+            if (candidateSubpkg.isNotEmpty() &&
+                headerContext.crateSubpackageRawLeafNames[candidateSubpkg] == segment.removePrefix("r#")
+            ) {
+                return false
+            }
+        }
+        val kt = rustTypeIdentToKotlin(segment)
+        if (kt in inspector.declaredTypeNames ||
+            kt in headerContext.crateSymbolSubpackages ||
+            headerContext.externalCrateSymbolPackages.values.any { kt in it }
+        ) {
+            return true
+        }
+        if (headerContext.crateSymbolSubpackages.isNotEmpty()) return false
+        return idx == segments.lastIndex - 1 && segments.last() == "*"
+    }
+
+    protected fun mapImportLeafIdent(
+        s: String,
+        boundRawAlias: String? = null,
+        isSelfImport: Boolean = false,
+        forceTypeLeaf: Boolean = false,
+    ): String =
+        when {
+            s == "*" -> "*"
+            forceTypeLeaf || emitter.isImportedTypeLeaf(s, boundRawAlias, isSelfImport) -> rustTypeIdentToKotlin(s)
+            emitter.isKnownFunctionLeafIdent(s) -> rustFunctionIdentToKotlin(s)
+            emitter.isImportedScreamingConstLeaf(s, boundRawAlias, isSelfImport) -> rustConstIdentToKotlin(s)
+            s.first().isUpperCase() -> rustTypeIdentToKotlin(s)
+            else -> rustValueIdentToKotlin(s)
+        }
+
+    protected fun mapRelativeUseTail(
+        relSegs: List<String>,
+        baseSegs: List<String> = emptyList(),
+        boundRawAlias: String? = null,
+        isSelfImport: Boolean = false,
+        forceTypeLeaf: Boolean = false,
+    ): List<String> =
+        relSegs.mapIndexed { idx, s ->
+            if (idx == relSegs.lastIndex) {
+                mapImportLeafIdent(s, boundRawAlias, isSelfImport, forceTypeLeaf)
+            } else if (isIntermediateTypeSegment(s, idx, relSegs, baseSegs)) {
+                rustTypeIdentToKotlin(s)
+            } else {
+                rustModuleIdentToKotlin(s)
+            }
+        }
+
+    protected fun resolveIntermediateTypeUsePath(
+        nsPrefix: String,
+        relSegs: List<String>,
+        mappedRelSegs: List<String>,
+        baseSegs: List<String> = emptyList(),
+    ): String? {
+        if (relSegs.size < 2 || headerContext.crateSymbolSubpackages.isEmpty()) return null
+        val interTypeIdx =
+            (0 until relSegs.lastIndex).firstOrNull { idx ->
+                isIntermediateTypeSegment(relSegs[idx], idx, relSegs, baseSegs)
+            } ?: return null
+        val typeKt = mappedRelSegs[interTypeIdx]
+        val targetPrefix = (baseSegs + mappedRelSegs.take(interTypeIdx)).joinToString(".")
+        val candidates = headerContext.crateSymbolSubpackages[typeKt].orEmpty()
+        val resolvedSub =
+            if (targetPrefix in candidates) {
+                targetPrefix
+            } else {
+                emitter.resolveBestSubpackageAmong(
+                    candidates.filter { targetPrefix.isEmpty() || it.startsWith("$targetPrefix.") },
                 )
-        )
-    ) {
-        return null
+            } ?: return null
+        return qualifyInCrate(nsPrefix, resolvedSub, mappedRelSegs.drop(interTypeIdx).joinToString("."))
     }
-    if (firstRaw == "core") {
-        val isCrateCoreModule =
-            headerContext.crateSubpackageRawLeafNames["core"] == "core" ||
-                "core" in inspector.localExternalModuleNames
-        val secondRaw = rawSegStrings.getOrNull(1)?.removePrefix("r#")
-        val stdlibCoreSubmodules =
+
+    protected fun resolveFlattenedOrChildSubpackage(
+        explicitModule: String,
+        candidates: List<String>,
+    ): String? {
+        emitter.resolveFlattenedInlineModuleSubpackage(explicitModule, candidates)?.let { return it }
+        return emitter.resolveBestSubpackageAmong(
+            candidates.filter { explicitModule.isEmpty() || it.startsWith("$explicitModule.") },
+        )
+    }
+
+    companion object {
+        internal val CORE_MEM_INTRINSICS =
+            setOf(
+                "transmute",
+                "transmute_unchecked",
+                "size_of",
+                "size_of_val",
+                "align_of",
+                "align_of_val",
+                "needs_drop",
+                "forget",
+            )
+        private val ALLOC_STD_CRATE_ROOTS = setOf("alloc", "std", "crate")
+        private val ARC_WEAK_SYMBOLS = setOf("Arc", "Weak")
+        private val RC_WEAK_SYMBOLS = setOf("Rc", "Weak")
+        internal val CORE_STD_CRATE_ROOTS = setOf("core", "std", "crate")
+        internal val STDLIB_CORE_SUBMODULES =
             setOf(
                 "ffi",
                 "mem",
@@ -814,302 +937,390 @@ internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
                 "borrow",
                 "error",
             )
-        if (!isCrateCoreModule || secondRaw in STDLIB_MACRO_OR_PRIMITIVE_MODULES || secondRaw in stdlibCoreSubmodules) {
-            val inCoreCrate = currentNamespacePrefix() == CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-            val leafClean = rawSegStrings.last().removePrefix("r#")
-            val coreIntrinsicOrPreludeLeaves =
-                setOf(
-                    "Option",
-                    "Some",
-                    "None",
-                    "Result",
-                    "Ok",
-                    "Err",
-                    "Vec",
-                    "Box",
-                    "Rc",
-                    "Arc",
-                    "Cow",
-                    "PhantomData",
-                    "ManuallyDrop",
-                    "MaybeUninit",
-                    "Cell",
-                    "RefCell",
-                    "OnceCell",
-                    "Iter",
-                    "IterMut",
-                    "IntoIter",
-                    "Range",
-                    "RangeInclusive",
-                    "min",
-                    "max",
-                    "once",
-                    "empty",
-                    "drop",
-                    "transmute",
-                    "transmute_unchecked",
-                    "size_of",
-                    "size_of_val",
-                    "align_of",
-                    "align_of_val",
-                    "needs_drop",
-                    "forget",
-                )
-            if (inCoreCrate &&
-                rawSegStrings.size >= 3 &&
-                secondRaw !in setOf("intrinsics", "ffi") &&
-                secondRaw !in STDLIB_MACRO_OR_PRIMITIVE_MODULES &&
-                leafClean !in coreIntrinsicOrPreludeLeaves
-            ) {
-                return resolveCrossModulePathTarget(listOf("crate") + rawSegStrings.drop(1), inTypePosition)
-            }
-            return null
-        }
+        internal val CORE_INTRINSIC_OR_PRELUDE_LEAVES =
+            setOf(
+                "Option",
+                "Some",
+                "None",
+                "Result",
+                "Ok",
+                "Err",
+                "Vec",
+                "Box",
+                "Rc",
+                "Arc",
+                "Cow",
+                "PhantomData",
+                "ManuallyDrop",
+                "MaybeUninit",
+                "Cell",
+                "RefCell",
+                "OnceCell",
+                "Iter",
+                "IterMut",
+                "IntoIter",
+                "Range",
+                "RangeInclusive",
+                "min",
+                "max",
+                "once",
+                "empty",
+                "drop",
+                "transmute",
+                "transmute_unchecked",
+                "size_of",
+                "size_of_val",
+                "align_of",
+                "align_of_val",
+                "needs_drop",
+                "forget",
+            )
+    }
+}
+
+private class CrossModulePathTargetResolver(
+    emitter: KotlinJ2KEmitter,
+) : RustModulePathResolver(emitter) {
+    private sealed class BranchDecision {
+        object Continue : BranchDecision()
+
+        data class Done(
+            val target: Pair<String, List<String>>?,
+        ) : BranchDecision()
     }
 
-    val nsPrefix = currentNamespacePrefix()
-    if (scopeBuilder.isImportedModuleInScope(firstRaw)) {
+    fun resolve(
+        rawInputSegStrings: List<String>,
+        inTypePosition: Boolean,
+    ): Pair<String, List<String>>? {
+        val rawSegStrings = emitter.rewriteCrateRootAliasAndReexportSegments(rawInputSegStrings)
+        if (rawSegStrings.size < 2) return null
+        val firstRaw = rawSegStrings.first().removePrefix("r#")
+        if (firstRaw in inspector.localInlineModuleNames) return null
+        tryResolveEarlyStdlibTarget(rawSegStrings, firstRaw)?.let { return it }
+        if (shouldRejectEarlyCrossModulePath(rawSegStrings, firstRaw)) return null
+        if (firstRaw == "core") {
+            val coreDecision = evaluateCoreRootBranch(rawSegStrings, inTypePosition)
+            if (coreDecision is BranchDecision.Done) return coreDecision.target
+        }
+        val nsPrefix = emitter.currentNamespacePrefix()
+        if (scopeBuilder.isImportedModuleInScope(firstRaw)) {
+            return resolveScopedImportedModuleTarget(firstRaw, rawSegStrings.drop(1), nsPrefix, inTypePosition)
+        }
+        val navDecision = evaluateSelfOrRelativeNavBranch(rawSegStrings, firstRaw, nsPrefix, inTypePosition)
+        if (navDecision is BranchDecision.Done) return navDecision.target
+        if (firstRaw.firstOrNull()?.isLowerCase() == true) {
+            return resolveLowercaseExternalCrateTarget(rawSegStrings, firstRaw, inTypePosition)
+        }
+        return null
+    }
+
+    private fun tryResolveEarlyStdlibTarget(
+        rawSegStrings: List<String>,
+        firstRaw: String,
+    ): Pair<String, List<String>>? {
+        val secondClean = rawSegStrings.getOrNull(1)?.removePrefix("r#")
+        val thirdClean = rawSegStrings.getOrNull(2)?.removePrefix("r#")
+        if (!headerContext.rawAbiMode &&
+            isInRustLangCrate() &&
+            rawSegStrings.size in 4..5 &&
+            firstRaw in CORE_STD_CRATE_ROOTS &&
+            secondClean == "sync" &&
+            thirdClean == "atomic"
+        ) {
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+            if (rawSegStrings.size == 5) {
+                val ownerSym = rawSegStrings[3].removePrefix("r#")
+                if (ownerSym.firstOrNull()?.isUpperCase() == true) {
+                    return "$coreNs.sync.atomic.${rustTypeIdentToKotlin(ownerSym)}" to listOf(rawSegStrings[4])
+                }
+            } else {
+                val sym = rawSegStrings[3].removePrefix("r#")
+                val ktSym =
+                    if (sym.firstOrNull()?.isUpperCase() == true) {
+                        rustTypeIdentToKotlin(sym)
+                    } else {
+                        rustFunctionIdentToKotlin(sym)
+                    }
+                return "$coreNs.sync.atomic.$ktSym" to emptyList()
+            }
+        }
+        if (rawSegStrings.size == 3) {
+            tryResolveCoreMemIntrinsic(firstRaw, secondClean, thirdClean, requireCoreWhenCrateRoot = false)?.let {
+                return it to emptyList()
+            }
+        }
+        if (rawSegStrings.size in 3..4) {
+            val symSeg = rawSegStrings[2].removePrefix("r#")
+            tryResolveStdlibRcOrArc(firstRaw, secondClean, symSeg)?.let {
+                return it to rawSegStrings.drop(3)
+            }
+        }
+        return null
+    }
+
+    private fun shouldRejectEarlyCrossModulePath(
+        rawSegStrings: List<String>,
+        firstRaw: String,
+    ): Boolean {
+        if (firstRaw == "std" || firstRaw == "alloc" || firstRaw == "Self" || firstRaw in PRIMITIVE_TYPE_NAMES) {
+            return true
+        }
+        if (rawSegStrings.dropLast(1).any { it.removePrefix("r#") in STDLIB_PRELUDE_REEXPORT_MODULES }) {
+            return true
+        }
+        val secondClean = rawSegStrings.getOrNull(1)?.removePrefix("r#")
+        val thirdClean = rawSegStrings.getOrNull(2)?.removePrefix("r#")
+        val pkg = headerContext.packageName
+        val isAllocCratePkg =
+            pkg == "io.github.kotlinmania.rustlang.alloc" ||
+                pkg?.startsWith("io.github.kotlinmania.rustlang.alloc.") == true
+        return secondClean == "string" && thirdClean == "String" && firstRaw == "crate" && isAllocCratePkg
+    }
+
+    private fun evaluateCoreRootBranch(
+        rawSegStrings: List<String>,
+        inTypePosition: Boolean,
+    ): BranchDecision {
+        val isCrateCoreModule =
+            headerContext.crateSubpackageRawLeafNames["core"] == "core" ||
+                "core" in inspector.localExternalModuleNames
+        val secondRaw = rawSegStrings.getOrNull(1)?.removePrefix("r#")
+        if (!isCrateCoreModule || secondRaw in STDLIB_MACRO_OR_PRIMITIVE_MODULES || secondRaw in STDLIB_CORE_SUBMODULES) {
+            val inCoreCrate = emitter.currentNamespacePrefix() == CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+            val leafClean = rawSegStrings.last().removePrefix("r#")
+            if (inCoreCrate &&
+                rawSegStrings.size >= 3 &&
+                secondRaw !in INTRINSICS_OR_FFI &&
+                secondRaw !in STDLIB_MACRO_OR_PRIMITIVE_MODULES &&
+                leafClean !in CORE_INTRINSIC_OR_PRELUDE_LEAVES
+            ) {
+                return BranchDecision.Done(resolve(listOf("crate") + rawSegStrings.drop(1), inTypePosition))
+            }
+            return BranchDecision.Done(null)
+        }
+        return BranchDecision.Continue
+    }
+
+    private fun resolveScopedImportedModuleTarget(
+        firstRaw: String,
+        rest: List<String>,
+        nsPrefix: String?,
+        inTypePosition: Boolean,
+    ): Pair<String, List<String>>? {
         val modBinding = scopeBuilder.resolveModuleBinding(firstRaw) ?: return null
         val importedPath = modBinding.importedPath ?: return null
-        val rest = rawSegStrings.drop(1)
         val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-        if (firstRaw == "intrinsics" &&
-            rest.size == 1 &&
-            rest[0].removePrefix("r#") in coreMemIntrinsics &&
-            (importedPath == "core.intrinsics" || importedPath == "std.intrinsics" || importedPath == "$coreNs.intrinsics")
-        ) {
-            return "$coreNs.mem.${rustFunctionIdentToKotlin(rest[0].removePrefix("r#"))}" to emptyList()
+        if (firstRaw == "intrinsics" && rest.size == 1) {
+            val intrinsicName = rest[0].removePrefix("r#")
+            if (intrinsicName in CORE_MEM_INTRINSICS &&
+                (importedPath == "core.intrinsics" || importedPath == "std.intrinsics" || importedPath == "$coreNs.intrinsics")
+            ) {
+                return "$coreNs.mem.${rustFunctionIdentToKotlin(intrinsicName)}" to emptyList()
+            }
         }
         if (rest.size == 1 &&
             !headerContext.rawAbiMode &&
             (importedPath.endsWith(".os.raw") || importedPath.endsWith(".ffi"))
         ) {
-            val cLeaf = rest[0].removePrefix("r#")
-            if (cLeaf == "CString") {
-                resolveStdlibFfiSymbolImport("CString", isAllocCString = true)?.let { return it to emptyList() }
-            }
-            if (cLeaf in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS) {
-                resolveStdlibFfiSymbolImport(cLeaf)?.let { return it to emptyList() }
-            }
+            tryResolveFfiLeafSymbol(rest[0].removePrefix("r#"))?.let { return it to emptyList() }
         }
-        val isSameCrateImport =
-            nsPrefix != null && (importedPath == nsPrefix || importedPath.startsWith("$nsPrefix."))
+        val isSameCrateImport = nsPrefix != null && (importedPath == nsPrefix || importedPath.startsWith("$nsPrefix."))
         if (isSameCrateImport && rest.isNotEmpty()) {
             if (importedPath == nsPrefix) {
-                for (trailingCount in 0..1) {
-                    if (rest.size <= trailingCount) continue
-                    val effectiveRest = rest.dropLast(trailingCount)
-                    val midSegs = effectiveRest.dropLast(1)
-                    if (midSegs.all { it.removePrefix("r#").firstOrNull()?.isLowerCase() == true }) {
-                        val resolved =
-                            resolveKotlinImportPath(
-                                listOf("crate") + effectiveRest,
-                                forceTypeLeaf = inTypePosition || trailingCount > 0,
-                            )
-                        if (resolved != null) {
-                            return resolved to rest.takeLast(trailingCount)
-                        }
-                    }
-                }
-                return null
+                return resolvePeeledImportTarget(listOf("crate"), rest, inTypePosition)
             }
-            val boundSubpkg = importedPath.removePrefix("$nsPrefix.")
-            val boundExistsInCrate =
-                boundSubpkg in headerContext.crateSubpackageRawLeafNames ||
-                    headerContext.crateSubpackageRawLeafNames.keys.any { it.startsWith("$boundSubpkg.") } ||
-                    headerContext.crateSymbolSubpackages.values.any { pkgs ->
-                        pkgs.any { it == boundSubpkg || it.startsWith("$boundSubpkg.") }
-                    }
-            var resolvedBoundSubpkg: String? = if (boundExistsInCrate) boundSubpkg else null
-            if (resolvedBoundSubpkg == null) {
-                var anc = boundSubpkg
-                while ('.' in anc) {
-                    anc = anc.substringBeforeLast('.')
-                    val ancExists =
-                        anc in headerContext.crateSubpackageRawLeafNames ||
-                            headerContext.crateSymbolSubpackages.values.any { anc in it }
-                    if (ancExists) {
-                        resolvedBoundSubpkg = anc
-                        break
-                    }
-                }
-                if (resolvedBoundSubpkg == null && headerContext.crateSymbolSubpackages.values.any { "" in it }) {
-                    resolvedBoundSubpkg = ""
-                }
-            }
-            if (resolvedBoundSubpkg == null) return null
-            var modSubpkg = resolvedBoundSubpkg
-            var idx = 0
-            while (idx < rest.lastIndex) {
-                val segClean = rest[idx].removePrefix("r#")
-                val nextSub = "$modSubpkg.${rustModuleIdentToKotlin(segClean.replace('-', '_'))}"
-                if (headerContext.crateSubpackageRawLeafNames[nextSub] == segClean ||
-                    headerContext.crateSubpackageRawLeafNames.keys.any { it.startsWith("$nextSub.") }
-                ) {
-                    modSubpkg = nextSub
-                    idx++
-                } else {
-                    break
-                }
-            }
-            val symRaw = rest[idx]
-            val trailing = rest.drop(idx + 1)
-            val symKt =
-                when {
-                    inTypePosition || trailing.isNotEmpty() -> rustTypeIdentToKotlin(symRaw)
-                    isKnownFunctionLeafIdent(symRaw) -> rustFunctionIdentToKotlin(symRaw)
-                    isImportedScreamingConstLeaf(symRaw, null, false) -> rustConstIdentToKotlin(symRaw)
-                    symRaw.first().isUpperCase() -> rustTypeIdentToKotlin(symRaw)
-                    else -> rustValueIdentToKotlin(symRaw)
-                }
-            val candidateSymKts =
-                if (!inTypePosition && trailing.isEmpty()) {
-                    listOf(
-                        symKt,
-                        rustConstIdentToKotlin(symRaw),
-                        rustFunctionIdentToKotlin(symRaw),
-                        rustTypeIdentToKotlin(symRaw),
-                        rustValueIdentToKotlin(symRaw),
-                    ).distinct()
-                } else {
-                    listOf(symKt)
-                }
-            for (candSymKt in candidateSymKts) {
-                val symCandidates = headerContext.crateSymbolSubpackages[candSymKt].orEmpty()
-                val scopedCandidates =
-                    when {
-                        modSubpkg in symCandidates -> listOf(modSubpkg)
-                        modSubpkg.isEmpty() -> symCandidates
-                        else -> symCandidates.filter { it.startsWith("$modSubpkg.") }
-                    }
-                val finalSubpkg = resolveBestSubpackageAmong(scopedCandidates)
-                if (finalSubpkg != null) {
-                    return (if (finalSubpkg.isEmpty()) "$nsPrefix.$candSymKt" else "$nsPrefix.$finalSubpkg.$candSymKt") to trailing
-                }
-            }
-            if (trailing.isEmpty() && !inTypePosition) {
-                val childModSubpkg =
-                    if (modSubpkg.isEmpty()) {
-                        rustModuleIdentToKotlin(symRaw.removePrefix("r#").replace('-', '_'))
-                    } else {
-                        "$modSubpkg.${rustModuleIdentToKotlin(symRaw.removePrefix("r#").replace('-', '_'))}"
-                    }
-                if (childModSubpkg in headerContext.crateSubpackageRawLeafNames &&
-                    headerContext.crateSymbolSubpackages["call"]?.contains(childModSubpkg) == true
-                ) {
-                    return "$nsPrefix.$childModSubpkg.call as ${symRaw.removePrefix("r#")}" to emptyList()
-                }
-            }
-            resolveExternalDepReexportPkg(modSubpkg, symKt, nsPrefix)?.let { resolvedExt ->
-                return resolvedExt to trailing
-            }
-            return (if (modSubpkg.isEmpty()) "$nsPrefix.$symKt" else "$nsPrefix.$modSubpkg.$symKt") to trailing
+            return resolveSameCrateBoundSubpackageTarget(importedPath.removePrefix("$nsPrefix."), rest, nsPrefix, inTypePosition)
         }
-        val matchedExtCrate: Pair<String, List<String>>? =
-            if (importedPath in headerContext.crateNamespaces) {
-                importedPath to emptyList()
-            } else {
-                headerContext.crateNamespaces.entries
-                    .mapNotNull { (k, v) ->
-                        val cleanNs = v.trim().removeSuffix(".")
-                        when {
-                            cleanNs.isEmpty() || cleanNs == nsPrefix -> null
-                            importedPath == cleanNs -> Triple(k, cleanNs.length, emptyList<String>())
-                            importedPath.startsWith("$cleanNs.") -> {
-                                val subSegs =
-                                    importedPath
-                                        .removePrefix("$cleanNs.")
-                                        .split('.')
-                                        .filter { it.isNotEmpty() }
-                                Triple(k, cleanNs.length, subSegs)
-                            }
-                            importedPath.startsWith("$k.") -> {
-                                val subSegs =
-                                    importedPath
-                                        .removePrefix("$k.")
-                                        .split('.')
-                                        .filter { it.isNotEmpty() }
-                                Triple(k, k.length, subSegs)
-                            }
-                            else -> null
-                        }
-                    }.maxByOrNull { it.second }
-                    ?.let { it.first to it.third }
-            }
+        val matchedExtCrate = matchImportedExternalCrate(importedPath, nsPrefix)
         if (matchedExtCrate != null && rest.isNotEmpty()) {
-            for (trailingCount in 0..1) {
-                if (rest.size <= trailingCount) continue
-                val effectiveRest = rest.dropLast(trailingCount)
-                val midSegs = effectiveRest.dropLast(1)
-                if (midSegs.all { it.removePrefix("r#").firstOrNull()?.isLowerCase() == true }) {
-                    val resolved =
-                        resolveKotlinImportPath(
-                            listOf(matchedExtCrate.first) + matchedExtCrate.second + effectiveRest,
-                            forceTypeLeaf = inTypePosition || trailingCount > 0,
-                        )
-                    if (resolved != null) {
-                        return resolved to rest.takeLast(trailingCount)
-                    }
+            return resolvePeeledImportTarget(listOf(matchedExtCrate.first) + matchedExtCrate.second, rest, inTypePosition)
+        }
+        return null
+    }
+
+    private fun resolvePeeledImportTarget(
+        prefixSegs: List<String>,
+        rest: List<String>,
+        inTypePosition: Boolean,
+    ): Pair<String, List<String>>? {
+        for (trailingCount in 0..1) {
+            if (rest.size <= trailingCount) continue
+            val effectiveRest = rest.dropLast(trailingCount)
+            val midSegs = effectiveRest.dropLast(1)
+            val allMidLower = midSegs.all { it.removePrefix("r#").firstOrNull()?.isLowerCase() == true }
+            if (allMidLower) {
+                val resolved =
+                    emitter.resolveKotlinImportPath(
+                        prefixSegs + effectiveRest,
+                        forceTypeLeaf = inTypePosition || trailingCount > 0,
+                    )
+                if (resolved != null) {
+                    return resolved to rest.takeLast(trailingCount)
                 }
             }
         }
         return null
     }
 
-    val firstModKt = rustModuleIdentToKotlin(firstRaw.replace('-', '_'))
-    val curSub = currentSubpackageString()
-    val childSubpkg = if (curSub.isEmpty()) firstModKt else "$curSub.$firstModKt"
-    val isChildCrateMod =
-        firstRaw != "crate" &&
-            firstRaw != "super" &&
-            firstRaw != "self" &&
-            firstRaw !in headerContext.selfCrateAliases &&
-            (
-                firstRaw in inspector.localExternalModuleNames ||
-                    (
-                        headerContext.isModuleRootSource &&
-                            nsPrefix != null &&
-                            firstModKt.isNotEmpty() &&
-                            headerContext.crateSubpackageRawLeafNames[childSubpkg] == firstRaw
-                    )
-            )
-    val isSelfOrRelNav =
-        firstRaw == "crate" ||
-            firstRaw == "super" ||
-            firstRaw == "self" ||
-            firstRaw in headerContext.selfCrateAliases ||
-            isChildCrateMod
-    if (isSelfOrRelNav) {
+    private fun resolveSameCrateBoundSubpackageTarget(
+        boundSubpkg: String,
+        rest: List<String>,
+        nsPrefix: String,
+        inTypePosition: Boolean,
+    ): Pair<String, List<String>>? {
+        val subpkgLeafMap = headerContext.crateSubpackageRawLeafNames
+        val symSubpkgMap = headerContext.crateSymbolSubpackages
+        val boundExistsInCrate =
+            boundSubpkg in subpkgLeafMap ||
+                subpkgLeafMap.keys.any { it.startsWith("$boundSubpkg.") } ||
+                symSubpkgMap.values.any { pkgs -> pkgs.any { it == boundSubpkg || it.startsWith("$boundSubpkg.") } }
+        var resolvedBoundSubpkg: String? = if (boundExistsInCrate) boundSubpkg else null
+        if (resolvedBoundSubpkg == null) {
+            var anc = boundSubpkg
+            while ('.' in anc) {
+                anc = anc.substringBeforeLast('.')
+                if (anc in subpkgLeafMap || symSubpkgMap.values.any { anc in it }) {
+                    resolvedBoundSubpkg = anc
+                    break
+                }
+            }
+            if (resolvedBoundSubpkg == null && symSubpkgMap.values.any { "" in it }) {
+                resolvedBoundSubpkg = ""
+            }
+        }
+        var modSubpkg = resolvedBoundSubpkg ?: return null
+        var idx = 0
+        while (idx < rest.lastIndex) {
+            val segClean = rest[idx].removePrefix("r#")
+            val nextSub = "$modSubpkg.${rustModuleIdentToKotlin(segClean.replace('-', '_'))}"
+            if (subpkgLeafMap[nextSub] == segClean || subpkgLeafMap.keys.any { it.startsWith("$nextSub.") }) {
+                modSubpkg = nextSub
+                idx++
+            } else {
+                break
+            }
+        }
+        val symRaw = rest[idx]
+        val trailing = rest.drop(idx + 1)
+        val symKt = mapImportLeafIdent(symRaw, forceTypeLeaf = inTypePosition || trailing.isNotEmpty())
+        val candidateSymKts =
+            if (!inTypePosition && trailing.isEmpty()) {
+                listOf(
+                    symKt,
+                    rustConstIdentToKotlin(symRaw),
+                    rustFunctionIdentToKotlin(symRaw),
+                    rustTypeIdentToKotlin(symRaw),
+                    rustValueIdentToKotlin(symRaw),
+                ).distinct()
+            } else {
+                listOf(symKt)
+            }
+        for (candSymKt in candidateSymKts) {
+            val symCandidates = symSubpkgMap[candSymKt].orEmpty()
+            val scopedCandidates =
+                when {
+                    modSubpkg in symCandidates -> listOf(modSubpkg)
+                    modSubpkg.isEmpty() -> symCandidates
+                    else -> symCandidates.filter { it.startsWith("$modSubpkg.") }
+                }
+            val finalSubpkg = emitter.resolveBestSubpackageAmong(scopedCandidates)
+            if (finalSubpkg != null) {
+                return qualifyInCrate(nsPrefix, finalSubpkg, candSymKt) to trailing
+            }
+        }
+        if (trailing.isEmpty() && !inTypePosition) {
+            val leafModKt = rustModuleIdentToKotlin(symRaw.removePrefix("r#").replace('-', '_'))
+            val childModSubpkg = if (modSubpkg.isEmpty()) leafModKt else "$modSubpkg.$leafModKt"
+            if (childModSubpkg in subpkgLeafMap && symSubpkgMap["call"]?.contains(childModSubpkg) == true) {
+                return "$nsPrefix.$childModSubpkg.call as ${symRaw.removePrefix("r#")}" to emptyList()
+            }
+        }
+        emitter.resolveExternalDepReexportPkg(modSubpkg, symKt, nsPrefix)?.let { return it to trailing }
+        return qualifyInCrate(nsPrefix, modSubpkg, symKt) to trailing
+    }
+
+    private fun matchImportedExternalCrate(
+        importedPath: String,
+        nsPrefix: String?,
+    ): Pair<String, List<String>>? {
+        if (importedPath in headerContext.crateNamespaces) {
+            return importedPath to emptyList()
+        }
+        return headerContext.crateNamespaces.entries
+            .mapNotNull { (k, v) ->
+                val cleanNs = v.trim().removeSuffix(".")
+                when {
+                    cleanNs.isEmpty() || cleanNs == nsPrefix -> null
+                    importedPath == cleanNs -> Triple(k, cleanNs.length, emptyList<String>())
+                    importedPath.startsWith("$cleanNs.") -> {
+                        val subSegs = importedPath.removePrefix("$cleanNs.").split('.').filter { it.isNotEmpty() }
+                        Triple(k, cleanNs.length, subSegs)
+                    }
+                    importedPath.startsWith("$k.") -> {
+                        val subSegs = importedPath.removePrefix("$k.").split('.').filter { it.isNotEmpty() }
+                        Triple(k, k.length, subSegs)
+                    }
+                    else -> null
+                }
+            }.maxByOrNull { it.second }
+            ?.let { it.first to it.third }
+    }
+
+    private fun evaluateSelfOrRelativeNavBranch(
+        rawSegStrings: List<String>,
+        firstRaw: String,
+        nsPrefix: String?,
+        inTypePosition: Boolean,
+    ): BranchDecision {
+        val firstModKt = rustModuleIdentToKotlin(firstRaw.replace('-', '_'))
+        val curSub = emitter.currentSubpackageString()
+        val childSubpkg = if (curSub.isEmpty()) firstModKt else "$curSub.$firstModKt"
+        val isChildCrateMod =
+            firstRaw !in NAV_KEYWORDS &&
+                firstRaw !in headerContext.selfCrateAliases &&
+                (
+                    firstRaw in inspector.localExternalModuleNames ||
+                        (
+                            headerContext.isModuleRootSource &&
+                                nsPrefix != null &&
+                                firstModKt.isNotEmpty() &&
+                                headerContext.crateSubpackageRawLeafNames[childSubpkg] == firstRaw
+                        )
+                )
+        val isSelfOrRelNav =
+            firstRaw in NAV_KEYWORDS || firstRaw in headerContext.selfCrateAliases || isChildCrateMod
+        if (!isSelfOrRelNav) return BranchDecision.Continue
         val effectiveSegs = if (isChildCrateMod) listOf("self") + rawSegStrings else rawSegStrings
         val navCount =
             effectiveSegs
                 .takeWhile {
                     val c = it.removePrefix("r#")
-                    c == "crate" || c == "super" || c == "self" || c in headerContext.selfCrateAliases
+                    c in NAV_KEYWORDS || c in headerContext.selfCrateAliases
                 }.size
                 .coerceAtLeast(1)
         val afterNav = effectiveSegs.drop(navCount)
-        if (afterNav.isEmpty()) return null
+        if (afterNav.isEmpty()) return BranchDecision.Done(null)
         if (afterNav.size == 1) {
-            val direct = resolveKotlinImportPath(effectiveSegs, forceTypeLeaf = inTypePosition) ?: return null
-            return direct to emptyList()
+            val direct = emitter.resolveKotlinImportPath(effectiveSegs, forceTypeLeaf = inTypePosition)
+            return BranchDecision.Done(direct?.let { it to emptyList() })
         }
         val hasCrateInventory =
             headerContext.crateSubpackageRawLeafNames.isNotEmpty() ||
                 headerContext.crateSymbolSubpackages.isNotEmpty()
-        // Try longest module prefix first, then peel 1 trailing member (e.g. `core::GUID::from_u128`).
         for (trailingCount in 0..1) {
             if (afterNav.size <= trailingCount) continue
             val candidateSegs = effectiveSegs.dropLast(trailingCount)
             val midSegs = afterNav.dropLast(1 + trailingCount)
             val resolved =
-                resolveKotlinImportPath(
+                emitter.resolveKotlinImportPath(
                     candidateSegs,
                     forceTypeLeaf = inTypePosition || trailingCount > 0,
                 ) ?: continue
             if (midSegs.isEmpty()) {
-                return resolved to effectiveSegs.takeLast(trailingCount)
+                return BranchDecision.Done(resolved to effectiveSegs.takeLast(trailingCount))
             }
+            val allMidLower = midSegs.all { it.removePrefix("r#").firstOrNull()?.isLowerCase() == true }
             if (nsPrefix != null && resolved.startsWith("$nsPrefix.") && hasCrateInventory) {
                 val afterNs = resolved.removePrefix("$nsPrefix.")
                 val candSubpkg = afterNs.substringBeforeLast('.', missingDelimiterValue = "")
@@ -1119,267 +1330,237 @@ internal fun KotlinJ2KEmitter.resolveCrossModulePathTarget(
                     headerContext.crateSubpackageRawLeafNames[candSubpkg] == expectedRawLeaf ||
                     headerContext.crateSymbolSubpackages[symSimple]?.contains(candSubpkg) == true
                 ) {
-                    return resolved to rawSegStrings.takeLast(trailingCount)
+                    return BranchDecision.Done(resolved to rawSegStrings.takeLast(trailingCount))
                 }
-                if (midSegs.all { it.removePrefix("r#").firstOrNull()?.isLowerCase() == true }) {
-                    val bestSub = resolveBestSubpackageForSymbol(symSimple)
+                if (allMidLower) {
+                    val bestSub = emitter.resolveBestSubpackageForSymbol(symSimple)
                     if (bestSub != null) {
-                        val relocated = if (bestSub.isEmpty()) "$nsPrefix.$symSimple" else "$nsPrefix.$bestSub.$symSimple"
-                        return relocated to rawSegStrings.takeLast(trailingCount)
+                        return BranchDecision.Done(qualifyInCrate(nsPrefix, bestSub, symSimple) to rawSegStrings.takeLast(trailingCount))
                     }
                 }
-            } else if (midSegs.all { it.removePrefix("r#").firstOrNull()?.isLowerCase() == true }) {
-                return resolved to rawSegStrings.takeLast(trailingCount)
+            } else if (allMidLower) {
+                return BranchDecision.Done(resolved to rawSegStrings.takeLast(trailingCount))
             }
         }
-        return null
+        return BranchDecision.Done(null)
     }
 
-    if (firstRaw.firstOrNull()?.isLowerCase() == true) {
+    private fun resolveLowercaseExternalCrateTarget(
+        rawSegStrings: List<String>,
+        firstRaw: String,
+        inTypePosition: Boolean,
+    ): Pair<String, List<String>>? {
         val firstAsType = rustTypeIdentToKotlin(firstRaw)
         if (firstAsType in inspector.declaredTypeNames ||
             firstRaw in inspector.declaredTypeNames ||
-            firstAsType in activeTypeParamNames ||
-            resolveImportedUppercaseTypeBinding(firstRaw) != null ||
+            firstAsType in emitter.activeTypeParamNames ||
+            emitter.resolveImportedUppercaseTypeBinding(firstRaw) != null ||
             firstAsType in headerContext.crateSymbolSubpackages ||
             firstRaw in headerContext.crateSymbolSubpackages
         ) {
             return null
         }
-        if (!inTypePosition && rawSegStrings.size == 2) {
-            val modKt = rustModuleIdentToKotlin(firstRaw)
-            val isKnownExternalCrate =
-                modKt in headerContext.crateNamespaces ||
-                    firstRaw in headerContext.crateNamespaces ||
-                    firstRaw in STDLIB_CRATE_ROOTS ||
-                    (
-                        !headerContext.isBatchCrateOutput &&
-                            !headerContext.projectGroup.isNullOrBlank() &&
-                            firstRaw !in STDLIB_UNIMPORTED_SUBMODULES
-                    )
-            if (!isKnownExternalCrate) {
-                return null
-            }
+        if (!inTypePosition && rawSegStrings.size == 2 && !isKnownExternalCrateRoot(firstRaw)) {
+            return null
         }
         val midSegs = rawSegStrings.drop(1).dropLast(1)
         if (midSegs.all { it.removePrefix("r#").firstOrNull()?.isLowerCase() == true }) {
-            val resolved = resolveKotlinImportPath(rawSegStrings, forceTypeLeaf = inTypePosition) ?: return null
+            val resolved = emitter.resolveKotlinImportPath(rawSegStrings, forceTypeLeaf = inTypePosition) ?: return null
             return resolved to emptyList()
         }
+        val penultClean = if (rawSegStrings.size >= 3) rawSegStrings[rawSegStrings.size - 2].removePrefix("r#") else null
         if (!inTypePosition &&
-            rawSegStrings.size >= 3 &&
+            penultClean != null &&
+            penultClean.firstOrNull()?.isUpperCase() == true &&
             rawSegStrings.drop(1).dropLast(2).all { it.removePrefix("r#").firstOrNull()?.isLowerCase() == true } &&
-            rawSegStrings[rawSegStrings.size - 2].removePrefix("r#").firstOrNull()?.isUpperCase() == true
+            isKnownExternalCrateRoot(firstRaw)
         ) {
-            val modKt = rustModuleIdentToKotlin(firstRaw)
-            val isKnownExternalCrate =
-                modKt in headerContext.crateNamespaces ||
-                    firstRaw in headerContext.crateNamespaces ||
-                    firstRaw in STDLIB_CRATE_ROOTS ||
-                    (
-                        !headerContext.isBatchCrateOutput &&
-                            !headerContext.projectGroup.isNullOrBlank() &&
-                            firstRaw !in STDLIB_UNIMPORTED_SUBMODULES
-                    )
-            if (isKnownExternalCrate) {
-                val resolved = resolveKotlinImportPath(rawSegStrings.dropLast(1), forceTypeLeaf = true) ?: return null
-                return resolved to listOf(rawSegStrings.last())
+            val resolved = emitter.resolveKotlinImportPath(rawSegStrings.dropLast(1), forceTypeLeaf = true) ?: return null
+            return resolved to listOf(rawSegStrings.last())
+        }
+        return null
+    }
+
+    private fun isKnownExternalCrateRoot(firstRaw: String): Boolean {
+        val modKt = rustModuleIdentToKotlin(firstRaw)
+        return modKt in headerContext.crateNamespaces ||
+            firstRaw in headerContext.crateNamespaces ||
+            firstRaw in STDLIB_CRATE_ROOTS ||
+            (
+                !headerContext.isBatchCrateOutput &&
+                    !headerContext.projectGroup.isNullOrBlank() &&
+                    firstRaw !in STDLIB_UNIMPORTED_SUBMODULES
+            )
+    }
+
+    companion object {
+        private val INTRINSICS_OR_FFI = setOf("intrinsics", "ffi")
+        private val NAV_KEYWORDS = setOf("crate", "super", "self")
+    }
+}
+
+private class KotlinImportPathResolver(
+    emitter: KotlinJ2KEmitter,
+) : RustModulePathResolver(emitter) {
+    fun resolve(
+        rawSegsInput: List<String>,
+        boundRawAlias: String? = null,
+        isSelfImport: Boolean = false,
+        forceTypeLeaf: Boolean = false,
+    ): String? {
+        val rewrittenSegs = emitter.rewriteCrateRootAliasAndReexportSegments(rawSegsInput)
+        if (rewrittenSegs.isEmpty()) return null
+        val segs =
+            if (rewrittenSegs.first().removePrefix("r#") == "netc" &&
+                FfiInteropCollector.resolveLibcNamespace(headerContext) != null
+            ) {
+                listOf("libc") + rewrittenSegs.drop(1)
+            } else {
+                rewrittenSegs
             }
+        val root = segs.first()
+        if (root in PRIMITIVE_TYPE_NAMES) return null
+        if (root.firstOrNull()?.isUpperCase() == true && segs.size > 1) {
+            tryResolveUppercaseRootUsePath(segs, root, boundRawAlias, isSelfImport, forceTypeLeaf)?.let { return it }
         }
-    }
-    return null
-}
-
-private fun KotlinJ2KEmitter.isIntermediateTypeSegmentInUsePath(
-    segment: String,
-    idx: Int,
-    segments: List<String>,
-    baseSegs: List<String> = emptyList(),
-): Boolean {
-    if (segment.firstOrNull()?.isUpperCase() != true) return false
-    if (headerContext.crateSubpackageRawLeafNames.isNotEmpty()) {
-        val candidateSubpkg =
-            (baseSegs + segments.take(idx + 1).map { rustModuleIdentToKotlin(it.removePrefix("r#").replace('-', '_')) })
-                .filter { it.isNotEmpty() }
-                .joinToString(".")
-        if (candidateSubpkg.isNotEmpty() &&
-            headerContext.crateSubpackageRawLeafNames[candidateSubpkg] == segment.removePrefix("r#")
-        ) {
-            return false
+        if (root == "self") {
+            return resolveSelfUsePath(segs.drop(1), boundRawAlias, isSelfImport, forceTypeLeaf)
         }
-    }
-    val kt = rustTypeIdentToKotlin(segment)
-    if (kt in inspector.declaredTypeNames ||
-        kt in headerContext.crateSymbolSubpackages ||
-        headerContext.externalCrateSymbolPackages.values.any { kt in it }
-    ) {
-        return true
-    }
-    if (headerContext.crateSymbolSubpackages.isNotEmpty()) return false
-    return idx == segments.lastIndex - 1 && segments.last() == "*"
-}
-
-internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
-    rawSegsInput: List<String>,
-    boundRawAlias: String? = null,
-    isSelfImport: Boolean = false,
-    forceTypeLeaf: Boolean = false,
-): String? {
-    val rewrittenSegs = rewriteCrateRootAliasAndReexportSegments(rawSegsInput)
-    if (rewrittenSegs.isEmpty()) return null
-    val segs =
-        if (rewrittenSegs.first().removePrefix("r#") == "netc" &&
-            FfiInteropCollector.resolveLibcNamespace(headerContext) != null
-        ) {
-            listOf("libc") + rewrittenSegs.drop(1)
+        if (root == "super") {
+            return resolveSuperUsePath(segs, boundRawAlias, isSelfImport, forceTypeLeaf)
+        }
+        if (root in inspector.localExternalModuleNames) {
+            return resolve(listOf("self") + segs, boundRawAlias, isSelfImport, forceTypeLeaf)
+        }
+        tryRedirectImplicitLocalOrCrateRoot(segs, root, boundRawAlias, isSelfImport, forceTypeLeaf)?.let { return it }
+        if (root in IGNORED_USE_ROOTS) return null
+        if (root in STDLIB_CRATE_ROOTS && segs.getOrNull(1) in STDLIB_MACRO_OR_PRIMITIVE_MODULES) return null
+        if (!isSelfImport) {
+            tryResolveEarlyStdlibOrFfiUsePath(segs, forceTypeLeaf)?.let { return it }
+        }
+        if (root == "libc" && FfiInteropCollector.resolveLibcNamespace(headerContext) == null) return null
+        if (!isSelfImport && headerContext.rawAbiMode && segs.last().removePrefix("r#") == "c_void") return null
+        val isCrateSelfRoot = root == "crate" || root in headerContext.selfCrateAliases
+        val mapped =
+            if (isCrateSelfRoot) {
+                listOf(rustModuleIdentToKotlin(root)) +
+                    mapRelativeUseTail(segs.drop(1), emptyList(), boundRawAlias, isSelfImport, forceTypeLeaf)
+            } else {
+                mapRelativeUseTail(segs, emptyList(), boundRawAlias, isSelfImport, forceTypeLeaf)
+            }
+        if (mapped.size < 2) return null
+        return if (isCrateSelfRoot) {
+            resolveCrateRootUsePath(segs, mapped)
         } else {
-            rewrittenSegs
+            resolveExternalCrateUsePath(segs, root, mapped, isSelfImport)
         }
-    val root = segs.first()
-    if (root in PRIMITIVE_TYPE_NAMES) return null
-    // A same-file type or an imported type's members retain type casing.
-    // Resolve an unqualified type glob through an unambiguous lexical glob use;
-    // this does not inspect any other Rust file or invent a cross-file symbol table.
-    if (root.firstOrNull()?.isUpperCase() == true && segs.size > 1) {
+    }
+
+    private fun tryResolveUppercaseRootUsePath(
+        segs: List<String>,
+        root: String,
+        boundRawAlias: String?,
+        isSelfImport: Boolean,
+        forceTypeLeaf: Boolean,
+    ): String? {
         val rootTypeKt = rustTypeIdentToKotlin(root)
-        fun formatUpperTail(tailSegs: List<String>): String =
-            tailSegs.joinToString(".") { seg ->
-                val cleanSeg = seg.removePrefix("r#")
-                when {
-                    cleanSeg == "*" -> "*"
-                    isImportedScreamingConstLeaf(cleanSeg, boundRawAlias, isSelfImport) -> rustConstIdentToKotlin(cleanSeg)
-                    else -> rustTypeIdentToKotlin(cleanSeg)
-                }
-            }
         if (rootTypeKt in inspector.declaredTypeNames) {
-            return resolveKotlinImportPath(listOf("self") + segs, boundRawAlias, isSelfImport, forceTypeLeaf)
+            return resolve(listOf("self") + segs, boundRawAlias, isSelfImport, forceTypeLeaf)
         }
         val scopedImportedPath = scopeBuilder.resolveModuleBinding(root)?.importedPath?.takeIf { '.' in it }
         if (scopedImportedPath != null) {
-            return "$scopedImportedPath.${formatUpperTail(segs.drop(1))}"
+            return "$scopedImportedPath.${formatUppercaseUseTail(segs.drop(1), boundRawAlias, isSelfImport)}"
         }
-        val importedPkg = importedSimpleNameToPkg[rootTypeKt]
+        val importedPkg = emitter.importedSimpleNameToPkg[rootTypeKt]
         if (importedPkg != null) {
-            return "$importedPkg.${formatUpperTail(segs)}"
+            return "$importedPkg.${formatUppercaseUseTail(segs, boundRawAlias, isSelfImport)}"
         }
         if (headerContext.crateSymbolSubpackages[rootTypeKt]?.isNotEmpty() == true) {
-            val subPkg = resolveBestSubpackageForSymbol(rootTypeKt)
-            val nsPrefix = currentNamespacePrefix()
+            val subPkg = emitter.resolveBestSubpackageForSymbol(rootTypeKt)
+            val nsPrefix = emitter.currentNamespacePrefix()
             if (nsPrefix != null) {
-                val ownerPkg = if (subPkg.isNullOrEmpty()) nsPrefix else "$nsPrefix.$subPkg"
-                return "$ownerPkg.${formatUpperTail(segs)}"
+                return qualifyInCrate(nsPrefix, subPkg.orEmpty(), formatUppercaseUseTail(segs, boundRawAlias, isSelfImport))
             }
         }
         val importedGlobs = mutableListOf<UseLeaf>()
-        inspector.allUseItems.forEach { collectUseLeaves(it.tree, emptyList(), importedGlobs) }
+        inspector.allUseItems.forEach { emitter.collectUseLeaves(it.tree, emptyList(), importedGlobs) }
         val packages =
             importedGlobs
-                .filter {
-                    it.segments.lastOrNull() == "*" && it.segments
-                        .firstOrNull()
-                        ?.firstOrNull()
-                        ?.isLowerCase() == true
-                }.mapNotNull { resolveKotlinImportPath(it.segments, isSelfImport = it.isSelfImport) }
+                .filter { leaf ->
+                    val firstChar = leaf.segments.firstOrNull()?.firstOrNull()
+                    leaf.segments.lastOrNull() == "*" && firstChar?.isLowerCase() == true
+                }.mapNotNull { resolve(it.segments, isSelfImport = it.isSelfImport) }
                 .map { it.removeSuffix(".*") }
                 .distinct()
-        if (packages.size == 1) {
-            return "${packages.single()}.${formatUpperTail(segs)}"
+        return if (packages.size == 1) {
+            "${packages.single()}.${formatUppercaseUseTail(segs, boundRawAlias, isSelfImport)}"
+        } else {
+            null
         }
     }
-    if (root == "self") {
-        val afterSelf = segs.drop(1)
+
+    private fun formatUppercaseUseTail(
+        tailSegs: List<String>,
+        boundRawAlias: String?,
+        isSelfImport: Boolean,
+    ): String =
+        tailSegs.joinToString(".") { seg ->
+            val cleanSeg = seg.removePrefix("r#")
+            when {
+                cleanSeg == "*" -> "*"
+                emitter.isImportedScreamingConstLeaf(cleanSeg, boundRawAlias, isSelfImport) -> rustConstIdentToKotlin(cleanSeg)
+                else -> rustTypeIdentToKotlin(cleanSeg)
+            }
+        }
+
+    private fun resolveSelfUsePath(
+        afterSelf: List<String>,
+        boundRawAlias: String?,
+        isSelfImport: Boolean,
+        forceTypeLeaf: Boolean,
+    ): String? {
         if (afterSelf.isEmpty()) return null
-        val rawCurPkg = headerContext.packageName?.trim()?.removeSuffix(".")
-        val curPkg = rawCurPkg?.takeIf { it.isNotEmpty() } ?: return null
-        val curSubpkg = currentSubpackageString()
+        val curPkg = cleanDotPrefix(headerContext.packageName) ?: return null
+        val curSubpkg = emitter.currentSubpackageString()
         val curSubSegs = if (curSubpkg.isEmpty()) emptyList() else curSubpkg.split('.')
         val isEnumGlobSelf =
             afterSelf.last() == "*" &&
                 afterSelf.size >= 2 &&
-                isIntermediateTypeSegmentInUsePath(afterSelf[afterSelf.lastIndex - 1], afterSelf.lastIndex - 1, afterSelf, curSubSegs)
+                isIntermediateTypeSegment(afterSelf[afterSelf.lastIndex - 1], afterSelf.lastIndex - 1, afterSelf, curSubSegs)
         if (afterSelf.last() == "*" && !isEnumGlobSelf && headerContext.crateSymbolSubpackages.isNotEmpty()) {
             return null
         }
-        val mappedTail =
-            afterSelf.mapIndexed { idx, s ->
-                if (idx == afterSelf.lastIndex) {
-                    when {
-                        s == "*" -> "*"
-                        forceTypeLeaf || isImportedTypeLeaf(s, boundRawAlias, isSelfImport) -> rustTypeIdentToKotlin(s)
-                        isKnownFunctionLeafIdent(s) -> rustFunctionIdentToKotlin(s)
-                        isImportedScreamingConstLeaf(s, boundRawAlias, isSelfImport) -> rustConstIdentToKotlin(s)
-                        s.first().isUpperCase() -> rustTypeIdentToKotlin(s)
-                        else -> rustValueIdentToKotlin(s)
-                    }
-                } else {
-                    if (isIntermediateTypeSegmentInUsePath(s, idx, afterSelf, curSubSegs)) {
-                        rustTypeIdentToKotlin(s)
-                    } else {
-                        rustModuleIdentToKotlin(s)
-                    }
-                }
-            }
-        val nsPrefix = currentNamespacePrefix()
-        if (nsPrefix != null && afterSelf.size >= 2 && headerContext.crateSymbolSubpackages.isNotEmpty()) {
-            val interTypeIdx =
-                afterSelf.indices.take(afterSelf.lastIndex).firstOrNull { idx ->
-                    isIntermediateTypeSegmentInUsePath(afterSelf[idx], idx, afterSelf, curSubSegs)
-                }
-            if (interTypeIdx != null) {
-                val typeKt = mappedTail[interTypeIdx]
-                val targetPrefix = (curSubSegs + mappedTail.take(interTypeIdx)).joinToString(".")
-                val candidates = headerContext.crateSymbolSubpackages[typeKt].orEmpty()
-                val resolvedSub =
-                    if (targetPrefix in candidates) {
-                        targetPrefix
-                    } else {
-                        resolveBestSubpackageAmong(
-                            candidates.filter { targetPrefix.isEmpty() || it.startsWith("$targetPrefix.") },
-                        )
-                    }
-                if (resolvedSub != null) {
-                    val tail = mappedTail.drop(interTypeIdx).joinToString(".")
-                    return if (resolvedSub.isEmpty()) "$nsPrefix.$tail" else "$nsPrefix.$resolvedSub.$tail"
-                }
-            }
-        }
-        if (nsPrefix != null && afterSelf.isNotEmpty() && mappedTail.last() != "*" && headerContext.crateSymbolSubpackages.isNotEmpty()) {
-            val explicitModule = (curSubSegs + mappedTail.dropLast(1)).joinToString(".")
+        val mappedTail = mapRelativeUseTail(afterSelf, curSubSegs, boundRawAlias, isSelfImport, forceTypeLeaf)
+        val nsPrefix = emitter.currentNamespacePrefix()
+        if (nsPrefix != null) {
+            resolveIntermediateTypeUsePath(nsPrefix, afterSelf, mappedTail, curSubSegs)?.let { return it }
             val leafSym = mappedTail.last()
-            val candidates = headerContext.crateSymbolSubpackages[leafSym]
-            if (candidates != null && explicitModule !in candidates) {
-                val flattenedSub = resolveFlattenedInlineModuleSubpackage(explicitModule, candidates)
-                if (flattenedSub != null) {
-                    return if (flattenedSub.isEmpty()) "$nsPrefix.$leafSym" else "$nsPrefix.$flattenedSub.$leafSym"
-                }
-                val prefixDot = if (explicitModule.isEmpty()) "" else "$explicitModule."
-                val childSub =
-                    resolveBestSubpackageAmong(
-                        candidates.filter { prefixDot.isEmpty() || it.startsWith(prefixDot) },
-                    )
-                if (childSub != null) {
-                    return if (childSub.isEmpty()) "$nsPrefix.$leafSym" else "$nsPrefix.$childSub.$leafSym"
+            if (leafSym != "*" && headerContext.crateSymbolSubpackages.isNotEmpty()) {
+                val explicitModule = (curSubSegs + mappedTail.dropLast(1)).joinToString(".")
+                val candidates = headerContext.crateSymbolSubpackages[leafSym]
+                if (candidates != null && explicitModule !in candidates) {
+                    resolveFlattenedOrChildSubpackage(explicitModule, candidates)?.let {
+                        return qualifyInCrate(nsPrefix, it, leafSym)
+                    }
                 }
             }
         }
         return "$curPkg.${mappedTail.joinToString(".")}"
     }
-    if (root == "super") {
-        var superCount = 0
-        while (superCount < segs.size && segs[superCount] == "super") {
-            superCount++
-        }
+
+    private fun resolveSuperUsePath(
+        segs: List<String>,
+        boundRawAlias: String?,
+        isSelfImport: Boolean,
+        forceTypeLeaf: Boolean,
+    ): String? {
+        val superCount = segs.takeWhile { it == "super" }.size
         val rem = segs.drop(superCount)
         if (rem.isEmpty()) return null
-        val nsPrefix = currentNamespacePrefix() ?: return null
-        val curSubpkg = currentSubpackageString()
+        val nsPrefix = emitter.currentNamespacePrefix() ?: return null
+        val curSubpkg = emitter.currentSubpackageString()
         val curSubSegs = if (curSubpkg.isEmpty()) emptyList() else curSubpkg.split('.')
-        var baseSegs =
-            if (superCount >= curSubSegs.size) {
-                emptyList()
-            } else {
-                curSubSegs.dropLast(superCount)
-            }
+        var baseSegs = if (superCount >= curSubSegs.size) emptyList() else curSubSegs.dropLast(superCount)
         if (baseSegs.size == 1 && headerContext.includedSubdirModuleMap.isNotEmpty()) {
             val includedSubdirs = headerContext.includedSubdirModuleMap.values
             val includedRoots = includedSubdirs.map(::rustModuleIdentToKotlin).toSet()
@@ -1398,252 +1579,164 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
         val isEnumGlobSuper =
             rem.last() == "*" &&
                 rem.size >= 2 &&
-                isIntermediateTypeSegmentInUsePath(rem[rem.lastIndex - 1], rem.lastIndex - 1, rem, baseSegs)
+                isIntermediateTypeSegment(rem[rem.lastIndex - 1], rem.lastIndex - 1, rem, baseSegs)
         if (rem.last() == "*" && !isEnumGlobSuper && headerContext.crateSymbolSubpackages.isNotEmpty()) {
             return null
         }
-        val mappedRem =
-            rem.mapIndexed { idx, s ->
-                if (idx == rem.lastIndex) {
-                    when {
-                        s == "*" -> "*"
-                        forceTypeLeaf || isImportedTypeLeaf(s, boundRawAlias, isSelfImport) -> rustTypeIdentToKotlin(s)
-                        isKnownFunctionLeafIdent(s) -> rustFunctionIdentToKotlin(s)
-                        isImportedScreamingConstLeaf(s, boundRawAlias, isSelfImport) -> rustConstIdentToKotlin(s)
-                        s.first().isUpperCase() -> rustTypeIdentToKotlin(s)
-                        else -> rustValueIdentToKotlin(s)
-                    }
-                } else {
-                    if (isIntermediateTypeSegmentInUsePath(s, idx, rem, baseSegs)) rustTypeIdentToKotlin(s) else rustModuleIdentToKotlin(s)
-                }
-            }
-        if (rem.size >= 2 && headerContext.crateSymbolSubpackages.isNotEmpty()) {
-            val interTypeIdx =
-                rem.indices.take(rem.lastIndex).firstOrNull { idx ->
-                    isIntermediateTypeSegmentInUsePath(rem[idx], idx, rem, baseSegs)
-                }
-            if (interTypeIdx != null) {
-                val typeKt = mappedRem[interTypeIdx]
-                val targetPrefix = (baseSegs + mappedRem.take(interTypeIdx)).joinToString(".")
-                val candidates = headerContext.crateSymbolSubpackages[typeKt].orEmpty()
-                val resolvedSub =
-                    if (targetPrefix in candidates) {
-                        targetPrefix
-                    } else {
-                        resolveBestSubpackageAmong(
-                            candidates.filter { targetPrefix.isEmpty() || it.startsWith("$targetPrefix.") },
-                        )
-                    }
-                if (resolvedSub != null) {
-                    val tail = mappedRem.drop(interTypeIdx).joinToString(".")
-                    return if (resolvedSub.isEmpty()) "$nsPrefix.$tail" else "$nsPrefix.$resolvedSub.$tail"
-                }
-            }
-        }
-        if (rem.isNotEmpty() && mappedRem.last() != "*" && headerContext.crateSymbolSubpackages.isNotEmpty()) {
+        val mappedRem = mapRelativeUseTail(rem, baseSegs, boundRawAlias, isSelfImport, forceTypeLeaf)
+        resolveIntermediateTypeUsePath(nsPrefix, rem, mappedRem, baseSegs)?.let { return it }
+        val leafSym = mappedRem.last()
+        if (leafSym != "*" && headerContext.crateSymbolSubpackages.isNotEmpty()) {
             val explicitModule = (baseSegs + mappedRem.dropLast(1)).joinToString(".")
-            val leafSym = mappedRem.last()
             val candidates = headerContext.crateSymbolSubpackages[leafSym]
             if (candidates != null && explicitModule !in candidates) {
-                val flattenedSub = resolveFlattenedInlineModuleSubpackage(explicitModule, candidates)
-                if (flattenedSub != null) {
-                    return if (flattenedSub.isEmpty()) "$nsPrefix.$leafSym" else "$nsPrefix.$flattenedSub.$leafSym"
-                }
-                val childSub =
-                    resolveBestSubpackageAmong(
-                        candidates.filter { explicitModule.isEmpty() || it.startsWith("$explicitModule.") },
-                    )
-                if (childSub != null) {
-                    return if (childSub.isEmpty()) "$nsPrefix.$leafSym" else "$nsPrefix.$childSub.$leafSym"
+                resolveFlattenedOrChildSubpackage(explicitModule, candidates)?.let {
+                    return qualifyInCrate(nsPrefix, it, leafSym)
                 }
                 if (rem.size == 1) {
-                    resolveExternalDepReexportPkg(explicitModule, leafSym, nsPrefix)?.let { return it }
-                    val best = resolveBestSubpackageForSymbol(leafSym)
-                    if (best != null) {
-                        return if (best.isEmpty()) "$nsPrefix.$leafSym" else "$nsPrefix.$best.$leafSym"
-                    }
+                    emitter.resolveExternalDepReexportPkg(explicitModule, leafSym, nsPrefix)?.let { return it }
+                    emitter.resolveBestSubpackageForSymbol(leafSym)?.let { return qualifyInCrate(nsPrefix, it, leafSym) }
                 }
             } else if (candidates == null && rem.size == 1) {
-                resolveExternalDepReexportPkg(explicitModule, leafSym, nsPrefix)?.let { return it }
+                emitter.resolveExternalDepReexportPkg(explicitModule, leafSym, nsPrefix)?.let { return it }
             }
         }
-        if (!isSelfImport &&
-            !headerContext.rawAbiMode &&
-            headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true &&
-            rem.isNotEmpty()
-        ) {
+        if (!isSelfImport && !headerContext.rawAbiMode && isInRustLangCrate()) {
             val resolvedModSegs = baseSegs + rem.dropLast(1).map { rustModuleIdentToKotlin(it.removePrefix("r#")) }
-            val superLeaf = rem.last().removePrefix("r#")
-            if (resolvedModSegs == listOf("os", "raw") || resolvedModSegs == listOf("ffi")) {
-                if (superLeaf == "CString") {
-                    resolveStdlibFfiSymbolImport("CString", isAllocCString = true)?.let { return it }
-                }
-                if (superLeaf in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS) {
-                    resolveStdlibFfiSymbolImport(superLeaf)?.let { return it }
-                }
+            if (resolvedModSegs == OS_RAW_SEGS || resolvedModSegs == FFI_SEGS) {
+                tryResolveFfiLeafSymbol(rem.last().removePrefix("r#"))?.let { return it }
             }
         }
-        if (baseSegs.isEmpty() && rem.isNotEmpty()) {
-            val flatHeadRaw = rem[0].removePrefix("r#")
-            if (flatHeadRaw in headerContext.crateFlatFileModules) {
-                return if (rem.size == 1 && isSelfImport) {
-                    nsPrefix
-                } else if (rem.size >= 2) {
-                    "$nsPrefix.${mappedRem.drop(1).joinToString(".")}"
-                } else {
-                    nsPrefix
-                }
-            }
+        if (baseSegs.isEmpty() && rem[0].removePrefix("r#") in headerContext.crateFlatFileModules) {
+            return if (rem.size >= 2) "$nsPrefix.${mappedRem.drop(1).joinToString(".")}" else nsPrefix
         }
-        val combined = baseSegs + mappedRem
-        return "$nsPrefix.${combined.joinToString(".")}"
+        return "$nsPrefix.${(baseSegs + mappedRem).joinToString(".")}"
     }
-    if (root in inspector.localExternalModuleNames) {
-        return resolveKotlinImportPath(listOf("self") + segs, boundRawAlias, isSelfImport, forceTypeLeaf)
-    }
-    if (root !in IGNORED_USE_ROOTS &&
-        root !in STDLIB_CRATE_ROOTS &&
-        root != "crate" &&
-        root !in headerContext.selfCrateAliases &&
-        root !in setOf("proc_macro", "serde_derive", "serde_derive_internals")
-    ) {
+
+    private fun tryRedirectImplicitLocalOrCrateRoot(
+        segs: List<String>,
+        root: String,
+        boundRawAlias: String?,
+        isSelfImport: Boolean,
+        forceTypeLeaf: Boolean,
+    ): String? {
+        if (root in IGNORED_USE_ROOTS ||
+            root in STDLIB_CRATE_ROOTS ||
+            root == "crate" ||
+            root in headerContext.selfCrateAliases ||
+            root in PROC_OR_SERDE_DERIVE_CRATES
+        ) {
+            return null
+        }
         val cleanRoot = root.removePrefix("r#")
         val rootCrateKey = rustModuleIdentToKotlin(cleanRoot)
         val isConfiguredExtCrate =
             cleanRoot in headerContext.crateNamespaces ||
                 rootCrateKey in headerContext.crateNamespaces ||
                 rootCrateKey in headerContext.externalCrateSymbolPackages
-        if (!isConfiguredExtCrate) {
-            if (segs.size == 1 && !isSelfImport) {
-                val leafKt =
-                    when {
-                        forceTypeLeaf || isImportedTypeLeaf(cleanRoot, boundRawAlias, isSelfImport) -> rustTypeIdentToKotlin(cleanRoot)
-                        isKnownFunctionLeafIdent(cleanRoot) -> rustFunctionIdentToKotlin(cleanRoot)
-                        isImportedScreamingConstLeaf(cleanRoot, boundRawAlias, isSelfImport) -> rustConstIdentToKotlin(cleanRoot)
-                        cleanRoot.firstOrNull()?.isUpperCase() == true -> rustTypeIdentToKotlin(cleanRoot)
-                        else -> rustValueIdentToKotlin(cleanRoot)
-                    }
-                val isKnownLocalCrateSymbol =
-                    leafKt in headerContext.crateSymbolSubpackages ||
-                        cleanRoot in inspector.declaredTypeNames ||
-                        rustTypeIdentToKotlin(cleanRoot) in inspector.declaredTypeNames ||
-                        cleanRoot in inspector.declaredTopLevelFnRawNames ||
-                        cleanRoot in inspector.declaredConstNames
-                if (isKnownLocalCrateSymbol) {
-                    return resolveKotlinImportPath(listOf("crate") + segs, boundRawAlias, isSelfImport, forceTypeLeaf)
-                }
-            } else if (segs.size >= 2) {
-                val targetModPkg =
-                    segs
-                        .dropLast(1)
-                        .joinToString(".") { rustModuleIdentToKotlin(it.removePrefix("r#")) }
-                val cleanLast = segs.last().removePrefix("r#")
-                val candidateLeafNames =
-                    if (cleanLast == "*") {
-                        emptyList()
-                    } else {
-                        listOf(
-                            rustTypeIdentToKotlin(cleanLast),
-                            rustFunctionIdentToKotlin(cleanLast),
-                            rustConstIdentToKotlin(cleanLast),
-                            rustValueIdentToKotlin(cleanLast),
-                        ).distinct()
-                    }
-                val verifiedInCrateSymbols =
-                    headerContext.crateSymbolSubpackages.isNotEmpty() &&
-                        if (cleanLast == "*") {
-                            headerContext.crateSymbolSubpackages.values.any { pkgs ->
-                                pkgs.any { it == targetModPkg || it.startsWith("$targetModPkg.") }
-                            }
-                        } else {
-                            candidateLeafNames.any { sym ->
-                                val pkgs = headerContext.crateSymbolSubpackages[sym].orEmpty()
-                                pkgs.any { it == targetModPkg || it.startsWith("$targetModPkg.") } ||
-                                    headerContext.crateStructFieldTypes.keys.any { k ->
-                                        k == "$targetModPkg.$sym" || k.startsWith("$targetModPkg.$sym.")
-                                    } ||
-                                    headerContext.crateFnReturnTypes.keys.any { k ->
-                                        k == "$targetModPkg.$sym" || k.startsWith("$targetModPkg.$sym.")
-                                    }
-                            }
-                        }
-                val rootKnownCrateModule =
-                    verifiedInCrateSymbols ||
-                        cleanRoot in headerContext.includedSubdirModuleMap ||
-                        cleanRoot in headerContext.crateSubpackageRawLeafNames.values ||
-                        rootCrateKey in headerContext.crateSubpackageRawLeafNames.keys
-                if (rootKnownCrateModule) {
-                    return resolveKotlinImportPath(listOf("crate") + segs, boundRawAlias, isSelfImport, forceTypeLeaf)
-                }
-                if (cleanRoot in inspector.localInlineModuleNames) {
-                    return resolveKotlinImportPath(listOf("self") + segs.drop(1), boundRawAlias, isSelfImport, forceTypeLeaf)
-                }
+        if (isConfiguredExtCrate) return null
+        if (segs.size == 1 && !isSelfImport) {
+            val leafKt = mapImportLeafIdent(cleanRoot, boundRawAlias, isSelfImport, forceTypeLeaf)
+            val isKnownLocalCrateSymbol =
+                leafKt in headerContext.crateSymbolSubpackages ||
+                    cleanRoot in inspector.declaredTypeNames ||
+                    rustTypeIdentToKotlin(cleanRoot) in inspector.declaredTypeNames ||
+                    cleanRoot in inspector.declaredTopLevelFnRawNames ||
+                    cleanRoot in inspector.declaredConstNames
+            return if (isKnownLocalCrateSymbol) {
+                resolve(listOf("crate") + segs, boundRawAlias, isSelfImport, forceTypeLeaf)
+            } else {
+                null
             }
         }
-    }
-    if (root in IGNORED_USE_ROOTS) return null
-    if (root in STDLIB_CRATE_ROOTS && segs.getOrNull(1) in STDLIB_MACRO_OR_PRIMITIVE_MODULES) {
+        if (segs.size >= 2) {
+            val targetModPkg = segs.dropLast(1).joinToString(".") { rustModuleIdentToKotlin(it.removePrefix("r#")) }
+            val cleanLast = segs.last().removePrefix("r#")
+            val verifiedInCrateSymbols = isVerifiedCrateSubmoduleSymbol(targetModPkg, cleanLast)
+            val rootKnownCrateModule =
+                verifiedInCrateSymbols ||
+                    cleanRoot in headerContext.includedSubdirModuleMap ||
+                    cleanRoot in headerContext.crateSubpackageRawLeafNames.values ||
+                    rootCrateKey in headerContext.crateSubpackageRawLeafNames.keys
+            if (rootKnownCrateModule) {
+                return resolve(listOf("crate") + segs, boundRawAlias, isSelfImport, forceTypeLeaf)
+            }
+            if (cleanRoot in inspector.localInlineModuleNames) {
+                return resolve(listOf("self") + segs.drop(1), boundRawAlias, isSelfImport, forceTypeLeaf)
+            }
+        }
         return null
     }
-    val cleanSegsEarly = segs.map { it.removePrefix("r#") }
-    if (!isSelfImport &&
-        !headerContext.rawAbiMode &&
-        cleanSegsEarly.size == 2 &&
-        cleanSegsEarly[0] == "libc" &&
-        cleanSegsEarly[1] in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS
-    ) {
-        resolveStdlibFfiSymbolImport(cleanSegsEarly[1])?.let { return it }
-    }
-    if (!isSelfImport &&
-        cleanSegsEarly.size == 3 &&
-        (
-            cleanSegsEarly[0] in setOf("core", "std") ||
-                (cleanSegsEarly[0] == "crate" && currentNamespacePrefix() == CoreIntrinsicLowering.resolveCoreNamespace(headerContext))
-        ) &&
-        cleanSegsEarly[1] == "intrinsics" &&
-        cleanSegsEarly[2] in
-        setOf("transmute", "transmute_unchecked", "size_of", "size_of_val", "align_of", "align_of_val", "needs_drop", "forget")
-    ) {
-        return "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.mem.${rustFunctionIdentToKotlin(cleanSegsEarly[2])}"
-    }
-    if (!isSelfImport &&
-        !headerContext.rawAbiMode &&
-        headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true &&
-        cleanSegsEarly.size in 4..5 &&
-        cleanSegsEarly[0] in setOf("core", "std", "crate") &&
-        cleanSegsEarly[1] == "sync" &&
-        cleanSegsEarly[2] == "atomic"
-    ) {
-        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-        if (cleanSegsEarly.size == 5 && cleanSegsEarly[3] == "Ordering") {
-            return "$coreNs.sync.atomic.Ordering.${rustTypeIdentToKotlin(cleanSegsEarly[4])}"
+
+    private fun isVerifiedCrateSubmoduleSymbol(targetModPkg: String, cleanLast: String): Boolean {
+        val symSubpkgMap = headerContext.crateSymbolSubpackages
+        if (symSubpkgMap.isEmpty()) return false
+        if (cleanLast == "*") {
+            return symSubpkgMap.values.any { pkgs -> pkgs.any { it == targetModPkg || it.startsWith("$targetModPkg.") } }
         }
-        if (cleanSegsEarly.size == 4 && cleanSegsEarly[3] != "*") {
-            val s = cleanSegsEarly[3]
-            val ktSym =
-                when {
-                    forceTypeLeaf || s.firstOrNull()?.isUpperCase() == true -> rustTypeIdentToKotlin(s)
-                    isKnownFunctionLeafIdent(s) -> rustFunctionIdentToKotlin(s)
-                    else -> rustValueIdentToKotlin(s)
+        val candidateLeafNames =
+            listOf(
+                rustTypeIdentToKotlin(cleanLast),
+                rustFunctionIdentToKotlin(cleanLast),
+                rustConstIdentToKotlin(cleanLast),
+                rustValueIdentToKotlin(cleanLast),
+            ).distinct()
+        return candidateLeafNames.any { sym ->
+            val pkgs = symSubpkgMap[sym].orEmpty()
+            pkgs.any { it == targetModPkg || it.startsWith("$targetModPkg.") } ||
+                headerContext.crateStructFieldTypes.keys.any { k ->
+                    k == "$targetModPkg.$sym" || k.startsWith("$targetModPkg.$sym.")
+                } ||
+                headerContext.crateFnReturnTypes.keys.any { k ->
+                    k == "$targetModPkg.$sym" || k.startsWith("$targetModPkg.$sym.")
                 }
-            return "$coreNs.sync.atomic.$ktSym"
         }
     }
-    if (root == "libc" && FfiInteropCollector.resolveLibcNamespace(headerContext) == null) {
-        return null
-    }
-    val lastRaw = segs.last()
-    if (!isSelfImport && !headerContext.rawAbiMode) {
+
+    private fun tryResolveEarlyStdlibOrFfiUsePath(
+        segs: List<String>,
+        forceTypeLeaf: Boolean,
+    ): String? {
         val cleanSegs = segs.map { it.removePrefix("r#") }
+        if (!headerContext.rawAbiMode &&
+            cleanSegs.size == 2 &&
+            cleanSegs[0] == "libc" &&
+            cleanSegs[1] in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS
+        ) {
+            emitter.resolveStdlibFfiSymbolImport(cleanSegs[1])?.let { return it }
+        }
+        if (cleanSegs.size == 3) {
+            tryResolveCoreMemIntrinsic(cleanSegs[0], cleanSegs[1], cleanSegs[2], requireCoreWhenCrateRoot = true)?.let {
+                return it
+            }
+        }
+        if (!headerContext.rawAbiMode &&
+            isInRustLangCrate() &&
+            cleanSegs.size in 4..5 &&
+            cleanSegs[0] in CORE_STD_CRATE_ROOTS &&
+            cleanSegs[1] == "sync" &&
+            cleanSegs[2] == "atomic"
+        ) {
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+            if (cleanSegs.size == 5 && cleanSegs[3] == "Ordering") {
+                return "$coreNs.sync.atomic.Ordering.${rustTypeIdentToKotlin(cleanSegs[4])}"
+            }
+            if (cleanSegs.size == 4 && cleanSegs[3] != "*") {
+                val s = cleanSegs[3]
+                val ktSym =
+                    when {
+                        forceTypeLeaf || s.firstOrNull()?.isUpperCase() == true -> rustTypeIdentToKotlin(s)
+                        emitter.isKnownFunctionLeafIdent(s) -> rustFunctionIdentToKotlin(s)
+                        else -> rustValueIdentToKotlin(s)
+                    }
+                return "$coreNs.sync.atomic.$ktSym"
+            }
+        }
+        if (headerContext.rawAbiMode) return null
         val isStdOrCrateFfi =
-            (cleanSegs.size == 3 && cleanSegs[0] in setOf("core", "std") && cleanSegs[1] == "ffi") ||
+            (cleanSegs.size == 3 && (cleanSegs[0] == "core" || cleanSegs[0] == "std") && cleanSegs[1] == "ffi") ||
                 (cleanSegs.size == 4 && cleanSegs[0] == "std" && cleanSegs[1] == "os" && cleanSegs[2] == "raw") ||
-                (
-                    cleanSegs.size == 3 &&
-                        cleanSegs[0] == "crate" &&
-                        cleanSegs[1] == "ffi" &&
-                        headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true
-                ) ||
+                (cleanSegs.size == 3 && cleanSegs[0] == "crate" && cleanSegs[1] == "ffi" && isInRustLangCrate()) ||
                 (
                     cleanSegs.size == 4 &&
                         cleanSegs[0] == "crate" &&
@@ -1652,224 +1745,54 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
                         headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.std") == true
                 )
         if (isStdOrCrateFfi) {
-            val leaf = cleanSegs.last()
-            if (leaf == "CString") {
-                resolveStdlibFfiSymbolImport("CString", isAllocCString = true)?.let { return it }
-            }
-            if (leaf in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS) {
-                resolveStdlibFfiSymbolImport(leaf)?.let { return it }
-            }
+            tryResolveFfiLeafSymbol(cleanSegs.last())?.let { return it }
         }
         if (cleanSegs.size == 3 && cleanSegs[0] == "alloc" && cleanSegs[1] == "ffi" && cleanSegs[2] == "CString") {
-            resolveStdlibFfiSymbolImport("CString", isAllocCString = true)?.let { return it }
+            emitter.resolveStdlibFfiSymbolImport("CString", isAllocCString = true)?.let { return it }
         }
-        if (cleanSegs.size == 3 &&
-            headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true &&
-            cleanSegs[0] in setOf("alloc", "std", "crate") &&
-            (
-                cleanSegs[0] != "crate" ||
-                    headerContext.packageName.startsWith("io.github.kotlinmania.rustlang.std") ||
-                    headerContext.packageName.startsWith("io.github.kotlinmania.rustlang.alloc")
-            )
-        ) {
-            val cleanLeaf = cleanSegs[2]
-            val allocNs = CoreIntrinsicLowering.resolveAllocNamespace(headerContext)
-            if (cleanLeaf !in inspector.declaredTypeNames) {
-                if (cleanSegs[1] == "sync" && cleanLeaf in setOf("Arc", "Weak")) {
-                    return "$allocNs.rcs.arc.$cleanLeaf"
-                }
-                if (cleanSegs[1] == "rc" && cleanLeaf in setOf("Rc", "Weak")) {
-                    return "$allocNs.rcs.rc.$cleanLeaf"
-                }
-            }
+        if (cleanSegs.size == 3) {
+            tryResolveStdlibRcOrArc(cleanSegs[0], cleanSegs[1], cleanSegs[2])?.let { return it }
         }
-    }
-    if (!isSelfImport && headerContext.rawAbiMode && lastRaw.removePrefix("r#") == "c_void") {
         return null
     }
-    val mapped =
-        segs.mapIndexed { idx, s ->
-            if (idx == segs.lastIndex) {
-                when {
-                    s == "*" -> "*"
-                    forceTypeLeaf || isImportedTypeLeaf(s, boundRawAlias, isSelfImport) -> rustTypeIdentToKotlin(s)
-                    isKnownFunctionLeafIdent(s) -> rustFunctionIdentToKotlin(s)
-                    isImportedScreamingConstLeaf(s, boundRawAlias, isSelfImport) -> rustConstIdentToKotlin(s)
-                    s.first().isUpperCase() -> rustTypeIdentToKotlin(s)
-                    else -> rustValueIdentToKotlin(s)
-                }
-            } else {
-                val isSelfRoot = root == "crate" || root in headerContext.selfCrateAliases
-                val relSegs = if (isSelfRoot) segs.drop(1) else segs
-                val relIdx = if (isSelfRoot) idx - 1 else idx
-                if (relIdx >= 0 && isIntermediateTypeSegmentInUsePath(s, relIdx, relSegs)) {
-                    rustTypeIdentToKotlin(s)
-                } else {
-                    rustModuleIdentToKotlin(s)
-                }
-            }
-        }
-    if (mapped.size < 2) return null
-    return if (root == "crate" || root in headerContext.selfCrateAliases) {
-        val nsPrefix = currentNamespacePrefix()
+
+    private fun resolveCrateRootUsePath(
+        segs: List<String>,
+        mapped: List<String>,
+    ): String? {
+        val nsPrefix = emitter.currentNamespacePrefix()
         val curPkg = headerContext.packageName.orEmpty()
-        if (nsPrefix != null &&
-            ".detect.os." in curPkg &&
-            mapped.last() == "Feature" &&
-            "detect" in segs
-        ) {
+        if (nsPrefix != null && ".detect.os." in curPkg && mapped.last() == "Feature" && "detect" in segs) {
             val osTailSegs = curPkg.substringAfter(".detect.os.").split('.').filter { it.isNotEmpty() }
-            val archSub =
-                osTailSegs.firstOrNull { cand ->
-                    "detect.arch.$cand" in headerContext.crateSubpackageRawLeafNames
-                }
-            if (archSub != null) {
-                return "$nsPrefix.detect.arch.$archSub.Feature"
-            }
+            val archSub = osTailSegs.firstOrNull { cand -> "detect.arch.$cand" in headerContext.crateSubpackageRawLeafNames }
+            if (archSub != null) return "$nsPrefix.detect.arch.$archSub.Feature"
         }
         val afterRoot = segs.drop(1)
+        val mappedTail = mapped.drop(1)
+        val leafSym = mappedTail.last()
         if (afterRoot.last() == "*" && headerContext.crateSymbolSubpackages.isNotEmpty()) {
-            val isRootOrPreludeGlob =
-                afterRoot.size == 1 ||
-                    (afterRoot.size == 2 && afterRoot[0] == "prelude")
+            val isRootOrPreludeGlob = afterRoot.size == 1 || (afterRoot.size == 2 && afterRoot[0] == "prelude")
             if (isRootOrPreludeGlob && nsPrefix != null && headerContext.packageName != nsPrefix) {
                 return "$nsPrefix.*"
             }
             if (afterRoot.size >= 2 &&
-                isIntermediateTypeSegmentInUsePath(afterRoot[afterRoot.lastIndex - 1], afterRoot.lastIndex - 1, afterRoot)
+                isIntermediateTypeSegment(afterRoot[afterRoot.lastIndex - 1], afterRoot.lastIndex - 1, afterRoot)
             ) {
                 val enumKt = rustTypeIdentToKotlin(afterRoot[afterRoot.lastIndex - 1])
-                val sub = resolveBestSubpackageForSymbol(enumKt)
+                val sub = emitter.resolveBestSubpackageForSymbol(enumKt)
                 if (nsPrefix != null && sub != null) {
-                    val ownerPkg = if (sub.isEmpty()) nsPrefix else "$nsPrefix.$sub"
-                    return "$ownerPkg.$enumKt.*"
+                    return qualifyInCrate(nsPrefix, sub, "$enumKt.*")
                 }
             }
             return null
         }
-        if (afterRoot.size == 1 && mapped.last() != "*" && nsPrefix != null && headerContext.crateSymbolSubpackages.isNotEmpty()) {
-            val rawLeaf = afterRoot[0].removePrefix("r#")
-            if (rawLeaf.firstOrNull()?.isLowerCase() == true && !isKnownFunctionLeafIdent(afterRoot[0])) {
-                val leafMod = rustModuleIdentToKotlin(rawLeaf.replace('-', '_'))
-                if (leafMod in headerContext.crateSubpackageRawLeafNames) {
-                    return "$nsPrefix.$leafMod"
-                }
-            }
-            val directSub =
-                if (rawLeaf.firstOrNull()?.isLowerCase() != true || isKnownFunctionLeafIdent(afterRoot[0])) {
-                    resolveBestSubpackageForSymbol(mapped.last())
-                } else {
-                    null
-                }
-            if (directSub != null) {
-                return if (directSub.isEmpty()) "$nsPrefix.${mapped.last()}" else "$nsPrefix.$directSub.${mapped.last()}"
-            }
-            if (rawLeaf.firstOrNull()?.isLowerCase() == true) {
-                val typeKt = rustTypeIdentToKotlin(afterRoot[0])
-                val typeSub = resolveBestSubpackageForSymbol(typeKt)
-                if (typeSub != null) {
-                    return if (typeSub.isEmpty()) "$nsPrefix.$typeKt" else "$nsPrefix.$typeSub.$typeKt"
-                }
-                val valSub = resolveBestSubpackageForSymbol(mapped.last())
-                if (valSub != null) {
-                    return if (valSub.isEmpty()) "$nsPrefix.${mapped.last()}" else "$nsPrefix.$valSub.${mapped.last()}"
-                }
-            }
-            if (mapped.last() !in inspector.declaredTypeNames &&
-                mapped.last() !in inspector.declaredConstNames.values &&
-                !isDeclaredTopLevelFnKotlinName(mapped.last())
-            ) {
-                for (extCrate in listOf("core", "alloc", "std")) {
-                    val extPkgs = headerContext.externalCrateSymbolPackages[extCrate]?.get(mapped.last())
-                    if (!extPkgs.isNullOrEmpty()) {
-                        return "${extPkgs.first()}.${mapped.last()}"
-                    }
-                }
-            }
+        if (afterRoot.size == 1 && leafSym != "*" && nsPrefix != null && headerContext.crateSymbolSubpackages.isNotEmpty()) {
+            resolveSingleSegmentCrateRootLeaf(nsPrefix, afterRoot[0], leafSym)?.let { return it }
         }
-        if (afterRoot.size >= 2 && nsPrefix != null && headerContext.crateSymbolSubpackages.isNotEmpty()) {
-            val interTypeIdx =
-                afterRoot.indices.take(afterRoot.lastIndex).firstOrNull { idx ->
-                    isIntermediateTypeSegmentInUsePath(afterRoot[idx], idx, afterRoot)
-                }
-            if (interTypeIdx != null) {
-                val typeKt = mapped[1 + interTypeIdx]
-                val targetPrefix = mapped.drop(1).take(interTypeIdx).joinToString(".")
-                val candidates = headerContext.crateSymbolSubpackages[typeKt].orEmpty()
-                val resolvedSub =
-                    if (targetPrefix in candidates) {
-                        targetPrefix
-                    } else {
-                        resolveBestSubpackageAmong(
-                            candidates.filter { targetPrefix.isEmpty() || it.startsWith("$targetPrefix.") },
-                        )
-                    }
-                if (resolvedSub != null) {
-                    val tail = mapped.drop(1 + interTypeIdx).joinToString(".")
-                    return if (resolvedSub.isEmpty()) "$nsPrefix.$tail" else "$nsPrefix.$resolvedSub.$tail"
-                }
-            }
-        }
-        // A module path names where the item is declared; the scanned crate metadata records the
-        // subpackage that declaration is emitted into (with split module roots, `op.rs` -> `op`).
-        if (afterRoot.size >= 2 && mapped.last() != "*" && nsPrefix != null) {
-            val explicitModule = mapped.drop(1).dropLast(1).joinToString(".")
-            val rawLastClean = afterRoot.last().removePrefix("r#")
-            if (rawLastClean.firstOrNull()?.isLowerCase() == true && !isKnownFunctionLeafIdent(rawLastClean)) {
-                val expectedLeafKt = rustModuleIdentToKotlin(rawLastClean.replace('-', '_'))
-                val exactChild = if (explicitModule.isEmpty()) expectedLeafKt else "$explicitModule.$expectedLeafKt"
-                if (exactChild in headerContext.crateSubpackageRawLeafNames) {
-                    return "$nsPrefix.$exactChild"
-                }
-            }
-            val normalizedExplicitModule =
-                if (explicitModule == "os.wasi.ffi" || explicitModule.startsWith("os.wasi.ffi.")) {
-                    explicitModule.replaceFirst("os.wasi.ffi", "os.unix.ffi")
-                } else {
-                    explicitModule
-                }
-            val candidates = headerContext.crateSymbolSubpackages[mapped.last()]
-            if (!candidates.isNullOrEmpty()) {
-                val sub =
-                    when {
-                        explicitModule in candidates -> explicitModule
-                        normalizedExplicitModule in candidates -> normalizedExplicitModule
-                        else ->
-                            resolveFlattenedInlineModuleSubpackage(explicitModule, candidates)
-                                ?: resolveFlattenedInlineModuleSubpackage(normalizedExplicitModule, candidates)
-                                ?: resolveBestSubpackageAmong(
-                                    candidates.filter { it.startsWith("$explicitModule.") },
-                                )
-                                ?: resolveBestSubpackageAmong(
-                                    candidates.filter { it.startsWith("$normalizedExplicitModule.") },
-                                )
-                    }
-                if (sub != null) {
-                    return if (sub.isEmpty()) "$nsPrefix.${mapped.last()}" else "$nsPrefix.$sub.${mapped.last()}"
-                }
-            }
-            resolveExternalDepReexportPkg(explicitModule, mapped.last(), nsPrefix)?.let { return it }
-            if (rawLastClean.firstOrNull()?.isLowerCase() == true && !isKnownFunctionLeafIdent(rawLastClean)) {
-                val expectedLeafKt = rustModuleIdentToKotlin(rawLastClean.replace('-', '_'))
-                val exactChild = if (explicitModule.isEmpty()) expectedLeafKt else "$explicitModule.$expectedLeafKt"
-                if (exactChild !in headerContext.crateSubpackageRawLeafNames) {
-                    val matchingModSubpkgs =
-                        headerContext.crateSubpackageRawLeafNames.entries
-                            .filter { (subKey, rawLeaf) ->
-                                rawLeaf == rawLastClean &&
-                                    (explicitModule.isEmpty() || subKey.startsWith("$explicitModule."))
-                            }.map { it.key }
-                    val bestModSub = resolveBestSubpackageAmong(matchingModSubpkgs)
-                    if (bestModSub != null) {
-                        return "$nsPrefix.$bestModSub"
-                    }
-                }
-            }
-            if (!candidates.isNullOrEmpty()) {
-                val best = resolveBestSubpackageForSymbol(mapped.last())
-                if (best != null) {
-                    return if (best.isEmpty()) "$nsPrefix.${mapped.last()}" else "$nsPrefix.$best.${mapped.last()}"
-                }
+        if (nsPrefix != null) {
+            resolveIntermediateTypeUsePath(nsPrefix, afterRoot, mappedTail)?.let { return it }
+            if (afterRoot.size >= 2 && leafSym != "*") {
+                resolveMultiSegmentCrateRootLeaf(nsPrefix, afterRoot, mappedTail, leafSym)?.let { return it }
             }
         }
         val includedPrefix =
@@ -1878,260 +1801,346 @@ internal fun KotlinJ2KEmitter.resolveKotlinImportPath(
                 ?.takeIf { it.isNotEmpty() }
         val tail =
             when {
-                segs.size >= 3 && segs[1] in headerContext.crateFlatFileModules -> mapped.last()
-                includedPrefix != null -> "$includedPrefix.${mapped.drop(1).joinToString(".")}"
-                else -> mapped.drop(1).joinToString(".")
+                segs.size >= 3 && segs[1] in headerContext.crateFlatFileModules -> leafSym
+                includedPrefix != null -> "$includedPrefix.${mappedTail.joinToString(".")}"
+                else -> mappedTail.joinToString(".")
             }
-        if (nsPrefix != null) "$nsPrefix.$tail" else tail
-    } else {
-        val rawCrateKey = mapped.first()
-        val isSelfProcMacro2 =
-            headerContext.projectNamespace == "io.github.kotlinmania.procmacro2" ||
-                headerContext.packageName == "io.github.kotlinmania.procmacro2" ||
-                headerContext.packageName?.startsWith("io.github.kotlinmania.procmacro2.") == true
-        val crateKey =
-            when {
-                root == "proc_macro" &&
-                    !isSelfProcMacro2 &&
-                    headerContext.crateNamespaces["procmacro"] == null &&
-                    headerContext.projectGroup == "io.github.kotlinmania" -> "procmacro2"
-                root == "serde_derive" &&
-                    headerContext.crateNamespaces["serdederive"] == null &&
-                    headerContext.projectGroup == "io.github.kotlinmania" -> "serderive"
-                root == "serde_derive_internals" &&
-                    headerContext.crateNamespaces["serdederiveinternals"] == null &&
-                    headerContext.projectGroup == "io.github.kotlinmania" -> "serderive.internals"
-                else -> rawCrateKey
+        return if (nsPrefix != null) "$nsPrefix.$tail" else tail
+    }
+
+    private fun resolveSingleSegmentCrateRootLeaf(
+        nsPrefix: String,
+        rawSeg: String,
+        leafSym: String,
+    ): String? {
+        val rawLeaf = rawSeg.removePrefix("r#")
+        val isLowerIdent = rawLeaf.firstOrNull()?.isLowerCase() == true
+        if (isLowerIdent && !emitter.isKnownFunctionLeafIdent(rawSeg)) {
+            val leafMod = rustModuleIdentToKotlin(rawLeaf.replace('-', '_'))
+            if (leafMod in headerContext.crateSubpackageRawLeafNames) {
+                return "$nsPrefix.$leafMod"
             }
-        val customCrateNs =
-            headerContext.crateNamespaces[crateKey]
-                ?.trim()
-                ?.removeSuffix(".")
-                ?.takeIf { it.isNotEmpty() }
+        }
+        if (!isLowerIdent || emitter.isKnownFunctionLeafIdent(rawSeg)) {
+            emitter.resolveBestSubpackageForSymbol(leafSym)?.let { return qualifyInCrate(nsPrefix, it, leafSym) }
+        }
+        if (isLowerIdent) {
+            val typeKt = rustTypeIdentToKotlin(rawSeg)
+            emitter.resolveBestSubpackageForSymbol(typeKt)?.let { return qualifyInCrate(nsPrefix, it, typeKt) }
+            emitter.resolveBestSubpackageForSymbol(leafSym)?.let { return qualifyInCrate(nsPrefix, it, leafSym) }
+        }
+        if (leafSym !in inspector.declaredTypeNames &&
+            leafSym !in inspector.declaredConstNames.values &&
+            !emitter.isDeclaredTopLevelFnKotlinName(leafSym)
+        ) {
+            for (extCrate in STDLIB_SEARCH_CRATES) {
+                val extPkgs = headerContext.externalCrateSymbolPackages[extCrate]?.get(leafSym)
+                if (!extPkgs.isNullOrEmpty()) {
+                    return "${extPkgs.first()}.$leafSym"
+                }
+            }
+        }
+        return null
+    }
+
+    private fun resolveMultiSegmentCrateRootLeaf(
+        nsPrefix: String,
+        afterRoot: List<String>,
+        mappedTail: List<String>,
+        leafSym: String,
+    ): String? {
+        val explicitModule = mappedTail.dropLast(1).joinToString(".")
+        val rawLastClean = afterRoot.last().removePrefix("r#")
+        val isLowerModuleCandidate =
+            rawLastClean.firstOrNull()?.isLowerCase() == true && !emitter.isKnownFunctionLeafIdent(rawLastClean)
+        val expectedLeafKt = if (isLowerModuleCandidate) rustModuleIdentToKotlin(rawLastClean.replace('-', '_')) else ""
+        val exactChild = if (explicitModule.isEmpty()) expectedLeafKt else "$explicitModule.$expectedLeafKt"
+        if (isLowerModuleCandidate && exactChild in headerContext.crateSubpackageRawLeafNames) {
+            return "$nsPrefix.$exactChild"
+        }
+        val normalizedExplicitModule =
+            if (explicitModule == "os.wasi.ffi" || explicitModule.startsWith("os.wasi.ffi.")) {
+                explicitModule.replaceFirst("os.wasi.ffi", "os.unix.ffi")
+            } else {
+                explicitModule
+            }
+        val candidates = headerContext.crateSymbolSubpackages[leafSym]
+        if (!candidates.isNullOrEmpty()) {
+            val sub =
+                when {
+                    explicitModule in candidates -> explicitModule
+                    normalizedExplicitModule in candidates -> normalizedExplicitModule
+                    else ->
+                        emitter.resolveFlattenedInlineModuleSubpackage(explicitModule, candidates)
+                            ?: emitter.resolveFlattenedInlineModuleSubpackage(normalizedExplicitModule, candidates)
+                            ?: emitter.resolveBestSubpackageAmong(candidates.filter { it.startsWith("$explicitModule.") })
+                            ?: emitter.resolveBestSubpackageAmong(candidates.filter { it.startsWith("$normalizedExplicitModule.") })
+                }
+            if (sub != null) return qualifyInCrate(nsPrefix, sub, leafSym)
+        }
+        emitter.resolveExternalDepReexportPkg(explicitModule, leafSym, nsPrefix)?.let { return it }
+        if (isLowerModuleCandidate && exactChild !in headerContext.crateSubpackageRawLeafNames) {
+            val matchingModSubpkgs =
+                headerContext.crateSubpackageRawLeafNames.entries
+                    .filter { (subKey, rawLeaf) ->
+                        rawLeaf == rawLastClean && (explicitModule.isEmpty() || subKey.startsWith("$explicitModule."))
+                    }.map { it.key }
+            emitter.resolveBestSubpackageAmong(matchingModSubpkgs)?.let { return "$nsPrefix.$it" }
+        }
+        if (!candidates.isNullOrEmpty()) {
+            emitter.resolveBestSubpackageForSymbol(leafSym)?.let { return qualifyInCrate(nsPrefix, it, leafSym) }
+        }
+        return null
+    }
+
+    private fun resolveExternalCrateUsePath(
+        segs: List<String>,
+        root: String,
+        mapped: List<String>,
+        isSelfImport: Boolean,
+    ): String? {
+        val crateKey = resolveEffectiveExternalCrateKey(root, mapped.first())
+        val customCrateNs = cleanConfiguredCrateNamespace(crateKey)
         val flattenSubmodules =
             headerContext.projectGroup == "io.github.kotlinmania" &&
                 crateKey in FLAT_KOTLINMANIA_CRATES &&
                 mapped.size > 2
         val effectiveTail = if (flattenSubmodules) mapped.last() else mapped.drop(1).joinToString(".")
         if (customCrateNs != null) {
-            val candidateCrates =
-                when (crateKey) {
-                    "std" -> if (isSelfImport) listOf("alloc", "core") else listOf("std", "alloc", "core")
-                    "alloc" -> if (isSelfImport) listOf("core") else listOf("alloc", "core")
-                    else -> if (isSelfImport) emptyList() else listOf(crateKey)
-                }
-            val anyCandidateExtPkgs = candidateCrates.any { headerContext.externalCrateSymbolPackages[it] != null }
-            val secondSeg = segs.getOrNull(1)?.removePrefix("r#")
-            if (root in STDLIB_CRATE_ROOTS &&
-                secondSeg in
-                setOf(
-                    "f32",
-                    "f64",
-                    "f16",
-                    "f128",
-                    "i8",
-                    "i16",
-                    "i32",
-                    "i64",
-                    "i128",
-                    "isize",
-                    "u8",
-                    "u16",
-                    "u32",
-                    "u64",
-                    "u128",
-                    "usize",
-                    "consts",
-                    "prelude",
-                )
-            ) {
-                return null
-            }
-            if (!anyCandidateExtPkgs &&
-                root in STDLIB_CRATE_ROOTS &&
-                secondSeg in
-                setOf(
-                    "convert",
-                    "marker",
-                    "default",
-                    "clone",
-                    "hash",
-                    "borrow",
-                    "iter",
-                    "option",
-                    "hint",
-                    "panic",
-                    "pin",
-                    "task",
-                    "error",
-                    "fmt",
-                )
-            ) {
-                return null
-            }
-            val mappedLeaf = mapped.lastOrNull()
-            fun resolveExternalPenultOwnerType(): String? {
-                if (mappedLeaf == null || mapped.size < 3 || mapped[mapped.size - 2].firstOrNull()?.isUpperCase() != true) {
-                    return null
-                }
-                val penultType = mapped[mapped.size - 2]
-                val ownerMidPath = mapped.drop(1).dropLast(2).joinToString(".")
-                for (searchCrate in candidateCrates) {
-                    val searchNs =
-                        headerContext.crateNamespaces[searchCrate]
-                            ?.trim()
-                            ?.removeSuffix(".")
-                            ?.takeIf { it.isNotEmpty() } ?: continue
-                    val searchExtPkgs = headerContext.externalCrateSymbolPackages[searchCrate] ?: continue
-                    val ownerCandidates = searchExtPkgs[penultType] ?: continue
-                    val exactOwnerPkg = if (ownerMidPath.isEmpty()) searchNs else "$searchNs.$ownerMidPath"
-                    val resolvedOwnerPkg =
-                        when {
-                            exactOwnerPkg in ownerCandidates -> exactOwnerPkg
-                            else ->
-                                ownerCandidates
-                                    .filter { it.startsWith("$exactOwnerPkg.") }
-                                    .minByOrNull { it.count { ch -> ch == '.' } }
-                                    ?: ownerCandidates.firstOrNull()
-                        }
-                    if (resolvedOwnerPkg != null) {
-                        return "$resolvedOwnerPkg.$penultType.$mappedLeaf"
-                    }
-                }
-                return null
-            }
-            if (anyCandidateExtPkgs && mappedLeaf != null && mappedLeaf != "*") {
-                val midPath = mapped.drop(1).dropLast(1).joinToString(".")
-                for (searchCrate in candidateCrates) {
-                    val searchNs =
-                        headerContext.crateNamespaces[searchCrate]
-                            ?.trim()
-                            ?.removeSuffix(".")
-                            ?.takeIf { it.isNotEmpty() } ?: continue
-                    val searchExtPkgs = headerContext.externalCrateSymbolPackages[searchCrate] ?: continue
-                    val candidates = searchExtPkgs[mappedLeaf]
-                    if (!candidates.isNullOrEmpty()) {
-                        val candidateMidPaths =
-                            buildList {
-                                add(midPath)
-                                if (searchCrate == "libm" && (midPath == "support" || midPath.startsWith("support."))) {
-                                    add("math.$midPath")
-                                }
-                            }
-                        for (candMidPath in candidateMidPaths) {
-                            val exactPkg = if (candMidPath.isEmpty()) searchNs else "$searchNs.$candMidPath"
-                            val resolvedPkg =
-                                when {
-                                    exactPkg in candidates -> exactPkg
-                                    else ->
-                                        candidates
-                                            .filter { it.startsWith("$exactPkg.") }
-                                            .minByOrNull { it.count { ch -> ch == '.' } }
-                                }
-                            if (resolvedPkg != null) {
-                                return "$resolvedPkg.$mappedLeaf"
-                            }
-                        }
-                    }
-                }
-                val cleanLastRaw = lastRaw.removePrefix("r#")
-                if (cleanLastRaw.firstOrNull()?.isLowerCase() == true && !isKnownFunctionLeafIdent(cleanLastRaw)) {
-                    val subTail = mapped.drop(1).joinToString(".")
-                    for (searchCrate in candidateCrates) {
-                        val searchNs =
-                            headerContext.crateNamespaces[searchCrate]
-                                ?.trim()
-                                ?.removeSuffix(".")
-                                ?.takeIf { it.isNotEmpty() } ?: continue
-                        val searchExtPkgs = headerContext.externalCrateSymbolPackages[searchCrate] ?: continue
-                        val candidateSubPkg = if (subTail.isEmpty()) searchNs else "$searchNs.$subTail"
-                        if (searchExtPkgs.values.any { pkgs ->
-                                pkgs.any { it == candidateSubPkg || it.startsWith("$candidateSubPkg.") }
-                            }
-                        ) {
-                            return candidateSubPkg
-                        }
-                    }
-                }
-                for (searchCrate in candidateCrates) {
-                    val searchExtPkgs = headerContext.externalCrateSymbolPackages[searchCrate] ?: continue
-                    val candidates = searchExtPkgs[mappedLeaf]
-                    if (!candidates.isNullOrEmpty()) {
-                        return "${candidates.first()}.$mappedLeaf"
-                    }
-                }
-                resolveExternalPenultOwnerType()?.let { return it }
-                if (root in STDLIB_CRATE_ROOTS) return null
-            } else if (root in STDLIB_CRATE_ROOTS && mappedLeaf == "*") {
-                val allowedWildcardSubmodules = setOf("alloc", "cell", "cmp", "ffi", "mem", "num", "ops", "ptr", "result", "sync", "atomic")
-                if (anyCandidateExtPkgs && mapped.size >= 4) {
-                    resolveExternalPenultOwnerType()?.let { return it }
-                }
-                val hasExternalWildcardPkg =
-                    anyCandidateExtPkgs &&
-                        mapped.size >= 3 &&
-                        candidateCrates.any { searchCrate ->
-                            val searchNs =
-                                headerContext.crateNamespaces[searchCrate]
-                                    ?.trim()
-                                    ?.removeSuffix(".")
-                                    ?.takeIf { it.isNotEmpty() } ?: return@any false
-                            val searchExtPkgs = headerContext.externalCrateSymbolPackages[searchCrate] ?: return@any false
-                            val subTail = mapped.drop(1).dropLast(1).joinToString(".")
-                            val candidateSubPkg = if (subTail.isEmpty()) searchNs else "$searchNs.$subTail"
-                            searchExtPkgs.values.any { pkgs -> candidateSubPkg in pkgs }
-                        }
-                if (!hasExternalWildcardPkg && (mapped.size != 3 || mapped[1] !in allowedWildcardSubmodules)) {
-                    return null
-                }
-            }
-            if (root in STDLIB_CRATE_ROOTS) {
-                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                if (mapped.size == 3 && mapped[1] == "mem" && mapped[2] == "MaybeUninit") {
-                    return "$coreNs.mem.maybeuninit.MaybeUninit"
-                }
-                if (mapped.size == 3 && mapped[1] == "cell" && mapped[2] == "OnceCell") {
-                    return "$coreNs.cell.once.OnceCell"
-                }
-            }
-            "$customCrateNs.$effectiveTail"
-        } else {
-            val joined = "$crateKey.$effectiveTail"
-            val groupPrefix =
-                headerContext.projectGroup
-                    ?.trim()
-                    ?.removeSuffix(".")
-                    ?.takeIf { it.isNotEmpty() }
-            if (groupPrefix != null && root in STDLIB_CRATE_ROOTS) {
-                if (mapped.size == 3 &&
-                    mapped[1] == "cell" &&
-                    mapped[2] == "OnceCell"
-                ) {
-                    "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.cell.once.OnceCell"
-                } else if (mapped.size == 3 &&
-                    mapped[1] == "cell" &&
-                    mapped[2] in setOf("Cell", "RefCell", "Ref", "RefMut")
-                ) {
-                    "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.cell.${mapped[2]}"
-                } else {
-                    null
-                }
-            } else if ((
-                    headerContext.isBatchCrateOutput ||
-                        headerContext.portLintDirective == "tests" ||
-                        headerContext.testClassName != null
-                ) &&
-                root !in STDLIB_CRATE_ROOTS &&
-                root !in headerContext.crateNamespaces &&
-                crateKey !in headerContext.crateNamespaces
-            ) {
-                null
-            } else if (groupPrefix != null && !joined.startsWith("$groupPrefix.")) {
-                "$groupPrefix.$joined"
-            } else {
-                joined
+            return resolveConfiguredExternalCrateUsePath(
+                segs = segs,
+                root = root,
+                crateKey = crateKey,
+                customCrateNs = customCrateNs,
+                mapped = mapped,
+                effectiveTail = effectiveTail,
+                isSelfImport = isSelfImport,
+            )
+        }
+        val joined = "$crateKey.$effectiveTail"
+        val groupPrefix = cleanDotPrefix(headerContext.projectGroup)
+        if (groupPrefix != null && root in STDLIB_CRATE_ROOTS) {
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+            return when {
+                mapped.size == 3 && mapped[1] == "cell" && mapped[2] == "OnceCell" -> "$coreNs.cell.once.OnceCell"
+                mapped.size == 3 && mapped[1] == "cell" && mapped[2] in STDLIB_CELL_TYPES -> "$coreNs.cell.${mapped[2]}"
+                else -> null
             }
         }
+        if ((
+                headerContext.isBatchCrateOutput ||
+                    headerContext.portLintDirective == "tests" ||
+                    headerContext.testClassName != null
+            ) &&
+            root !in STDLIB_CRATE_ROOTS &&
+            root !in headerContext.crateNamespaces &&
+            crateKey !in headerContext.crateNamespaces
+        ) {
+            return null
+        }
+        return if (groupPrefix != null && !joined.startsWith("$groupPrefix.")) "$groupPrefix.$joined" else joined
+    }
+
+    private fun resolveEffectiveExternalCrateKey(root: String, rawCrateKey: String): String {
+        val pkg = headerContext.packageName
+        val isSelfProcMacro2 =
+            headerContext.projectNamespace == "io.github.kotlinmania.procmacro2" ||
+                pkg == "io.github.kotlinmania.procmacro2" ||
+                pkg?.startsWith("io.github.kotlinmania.procmacro2.") == true
+        if (headerContext.projectGroup != "io.github.kotlinmania") return rawCrateKey
+        return when {
+            root == "proc_macro" && !isSelfProcMacro2 && headerContext.crateNamespaces["procmacro"] == null -> "procmacro2"
+            root == "serde_derive" && headerContext.crateNamespaces["serdederive"] == null -> "serderive"
+            root == "serde_derive_internals" && headerContext.crateNamespaces["serdederiveinternals"] == null ->
+                "serderive.internals"
+            else -> rawCrateKey
+        }
+    }
+
+    private fun resolveConfiguredExternalCrateUsePath(
+        segs: List<String>,
+        root: String,
+        crateKey: String,
+        customCrateNs: String,
+        mapped: List<String>,
+        effectiveTail: String,
+        isSelfImport: Boolean,
+    ): String? {
+        val candidateCrates =
+            when (crateKey) {
+                "std" -> if (isSelfImport) listOf("alloc", "core") else listOf("std", "alloc", "core")
+                "alloc" -> if (isSelfImport) listOf("core") else listOf("alloc", "core")
+                else -> if (isSelfImport) emptyList() else listOf(crateKey)
+            }
+        val anyCandidateExtPkgs = candidateCrates.any { headerContext.externalCrateSymbolPackages[it] != null }
+        val secondSeg = segs.getOrNull(1)?.removePrefix("r#")
+        if (root in STDLIB_CRATE_ROOTS && secondSeg in STDLIB_PRIMITIVE_OR_PRELUDE_SECOND_SEGS) {
+            return null
+        }
+        if (!anyCandidateExtPkgs && root in STDLIB_CRATE_ROOTS && secondSeg in STDLIB_UNINDEXED_SKIP_SECOND_SEGS) {
+            return null
+        }
+        val mappedLeaf = mapped.lastOrNull()
+        if (anyCandidateExtPkgs && mappedLeaf != null && mappedLeaf != "*") {
+            resolveIndexedExternalSymbol(candidateCrates, mapped, segs.last(), mappedLeaf)?.let { return it }
+            if (root in STDLIB_CRATE_ROOTS) return null
+        } else if (root in STDLIB_CRATE_ROOTS && mappedLeaf == "*") {
+            if (anyCandidateExtPkgs && mapped.size >= 4) {
+                resolveExternalPenultOwnerType(candidateCrates, mapped, mappedLeaf)?.let { return it }
+            }
+            val subTail = mapped.drop(1).dropLast(1).joinToString(".")
+            val hasExternalWildcardPkg =
+                anyCandidateExtPkgs &&
+                    mapped.size >= 3 &&
+                    candidateCrates.any { searchCrate ->
+                        val searchNs = cleanConfiguredCrateNamespace(searchCrate) ?: return@any false
+                        val searchExtPkgs = headerContext.externalCrateSymbolPackages[searchCrate] ?: return@any false
+                        val candidateSubPkg = if (subTail.isEmpty()) searchNs else "$searchNs.$subTail"
+                        searchExtPkgs.values.any { pkgs -> candidateSubPkg in pkgs }
+                    }
+            if (!hasExternalWildcardPkg && (mapped.size != 3 || mapped[1] !in STDLIB_ALLOWED_WILDCARD_SUBMODULES)) {
+                return null
+            }
+        }
+        if (root in STDLIB_CRATE_ROOTS) {
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+            if (mapped.size == 3 && mapped[1] == "mem" && mapped[2] == "MaybeUninit") {
+                return "$coreNs.mem.maybeuninit.MaybeUninit"
+            }
+            if (mapped.size == 3 && mapped[1] == "cell" && mapped[2] == "OnceCell") {
+                return "$coreNs.cell.once.OnceCell"
+            }
+        }
+        return "$customCrateNs.$effectiveTail"
+    }
+
+    private fun resolveIndexedExternalSymbol(
+        candidateCrates: List<String>,
+        mapped: List<String>,
+        lastRaw: String,
+        mappedLeaf: String,
+    ): String? {
+        val midPath = mapped.drop(1).dropLast(1).joinToString(".")
+        for (searchCrate in candidateCrates) {
+            val searchNs = cleanConfiguredCrateNamespace(searchCrate) ?: continue
+            val candidates = headerContext.externalCrateSymbolPackages[searchCrate]?.get(mappedLeaf)
+            if (!candidates.isNullOrEmpty()) {
+                val candidateMidPaths =
+                    buildList {
+                        add(midPath)
+                        if (searchCrate == "libm" && (midPath == "support" || midPath.startsWith("support."))) {
+                            add("math.$midPath")
+                        }
+                    }
+                for (candMidPath in candidateMidPaths) {
+                    val exactPkg = if (candMidPath.isEmpty()) searchNs else "$searchNs.$candMidPath"
+                    val resolvedPkg =
+                        if (exactPkg in candidates) {
+                            exactPkg
+                        } else {
+                            candidates
+                                .filter { it.startsWith("$exactPkg.") }
+                                .minByOrNull { it.count { ch -> ch == '.' } }
+                        }
+                    if (resolvedPkg != null) return "$resolvedPkg.$mappedLeaf"
+                }
+            }
+        }
+        val cleanLastRaw = lastRaw.removePrefix("r#")
+        if (cleanLastRaw.firstOrNull()?.isLowerCase() == true && !emitter.isKnownFunctionLeafIdent(cleanLastRaw)) {
+            val subTail = mapped.drop(1).joinToString(".")
+            for (searchCrate in candidateCrates) {
+                val searchNs = cleanConfiguredCrateNamespace(searchCrate) ?: continue
+                val searchExtPkgs = headerContext.externalCrateSymbolPackages[searchCrate] ?: continue
+                val candidateSubPkg = if (subTail.isEmpty()) searchNs else "$searchNs.$subTail"
+                if (searchExtPkgs.values.any { pkgs -> pkgs.any { it == candidateSubPkg || it.startsWith("$candidateSubPkg.") } }) {
+                    return candidateSubPkg
+                }
+            }
+        }
+        for (searchCrate in candidateCrates) {
+            val candidates = headerContext.externalCrateSymbolPackages[searchCrate]?.get(mappedLeaf)
+            if (!candidates.isNullOrEmpty()) return "${candidates.first()}.$mappedLeaf"
+        }
+        return resolveExternalPenultOwnerType(candidateCrates, mapped, mappedLeaf)
+    }
+
+    private fun resolveExternalPenultOwnerType(
+        candidateCrates: List<String>,
+        mapped: List<String>,
+        mappedLeaf: String,
+    ): String? {
+        if (mapped.size < 3 || mapped[mapped.size - 2].firstOrNull()?.isUpperCase() != true) {
+            return null
+        }
+        val penultType = mapped[mapped.size - 2]
+        val ownerMidPath = mapped.drop(1).dropLast(2).joinToString(".")
+        for (searchCrate in candidateCrates) {
+            val searchNs = cleanConfiguredCrateNamespace(searchCrate) ?: continue
+            val ownerCandidates = headerContext.externalCrateSymbolPackages[searchCrate]?.get(penultType) ?: continue
+            val exactOwnerPkg = if (ownerMidPath.isEmpty()) searchNs else "$searchNs.$ownerMidPath"
+            val resolvedOwnerPkg =
+                if (exactOwnerPkg in ownerCandidates) {
+                    exactOwnerPkg
+                } else {
+                    ownerCandidates
+                        .filter { it.startsWith("$exactOwnerPkg.") }
+                        .minByOrNull { it.count { ch -> ch == '.' } }
+                        ?: ownerCandidates.firstOrNull()
+                }
+            if (resolvedOwnerPkg != null) {
+                return "$resolvedOwnerPkg.$penultType.$mappedLeaf"
+            }
+        }
+        return null
+    }
+
+    companion object {
+        private val OS_RAW_SEGS = listOf("os", "raw")
+        private val FFI_SEGS = listOf("ffi")
+        private val PROC_OR_SERDE_DERIVE_CRATES = setOf("proc_macro", "serde_derive", "serde_derive_internals")
+        private val STDLIB_SEARCH_CRATES = listOf("core", "alloc", "std")
+        private val STDLIB_CELL_TYPES = setOf("Cell", "RefCell", "Ref", "RefMut")
+        private val STDLIB_PRIMITIVE_OR_PRELUDE_SECOND_SEGS =
+            setOf(
+                "f32",
+                "f64",
+                "f16",
+                "f128",
+                "i8",
+                "i16",
+                "i32",
+                "i64",
+                "i128",
+                "isize",
+                "u8",
+                "u16",
+                "u32",
+                "u64",
+                "u128",
+                "usize",
+                "consts",
+                "prelude",
+            )
+        private val STDLIB_UNINDEXED_SKIP_SECOND_SEGS =
+            setOf(
+                "convert",
+                "marker",
+                "default",
+                "clone",
+                "hash",
+                "borrow",
+                "iter",
+                "option",
+                "hint",
+                "panic",
+                "pin",
+                "task",
+                "error",
+                "fmt",
+            )
+        private val STDLIB_ALLOWED_WILDCARD_SUBMODULES =
+            setOf("alloc", "cell", "cmp", "ffi", "mem", "num", "ops", "ptr", "result", "sync", "atomic")
     }
 }
 
@@ -2376,26 +2385,6 @@ private val UNPORTED_RAND_TEST_IDENTS =
         "thread_rng",
     )
 
-private fun extractItemAttrs(item: Item): List<Attribute> =
-    when (item) {
-        is Item.Const -> item.attrs
-        is Item.Enum -> item.attrs
-        is Item.ExternCrate -> item.attrs
-        is Item.Fn -> item.attrs
-        is Item.ForeignMod -> item.attrs
-        is Item.Impl -> item.attrs
-        is Item.Macro -> item.attrs
-        is Item.Mod -> item.attrs
-        is Item.Static -> item.attrs
-        is Item.Struct -> item.attrs
-        is Item.Trait -> item.attrs
-        is Item.TraitAlias -> item.attrs
-        is Item.ItemType -> item.attrs
-        is Item.Union -> item.attrs
-        is Item.Use -> item.attrs
-        is Item.Verbatim -> emptyList()
-    }
-
 internal fun KotlinJ2KEmitter.itemDependsOnUnportedQuickcheckOrRand(item: Item): Boolean {
     val unportedQuickcheck = "quickcheck" !in headerContext.crateNamespaces
     val unportedRand = "rand" !in headerContext.crateNamespaces
@@ -2412,11 +2401,7 @@ internal fun KotlinJ2KEmitter.itemDependsOnUnportedQuickcheckOrRand(item: Item):
         if (unportedQuickcheck && macroName == "quickcheck") return true
         if (unportedRand && macroName == "rand") return true
     }
-    val inTestContext =
-        headerContext.portLintDirective == "tests" ||
-            headerContext.testClassName != null ||
-            currentModPathPrefix.any { it == "test" || it == "tests" || it == "stdtests" } ||
-            hasTestAttribute(extractItemAttrs(item))
+    val inTestContext = isQuickcheckOrRandTestContext(item)
     val importedQuickcheckGen =
         unportedQuickcheck &&
             inspector.allUseItems.any { useItem ->
@@ -2427,47 +2412,59 @@ internal fun KotlinJ2KEmitter.itemDependsOnUnportedQuickcheckOrRand(item: Item):
                         (leaf.segments.lastOrNull() == "*" || leaf.segments.lastOrNull()?.removePrefix("r#") == "Gen")
                 }
             }
+    return UnportedTestDepTokenScanner(
+        trees = item.toTokenStream().toList(),
+        unportedQuickcheck = unportedQuickcheck,
+        unportedRand = unportedRand,
+        inTestContext = inTestContext,
+        importedQuickcheckGen = importedQuickcheckGen,
+    ).matches()
+}
 
-    fun scanTokens(stream: TokenStream): Boolean {
-        val list = stream.toList()
-        var idx = 0
-        while (idx < list.size) {
-            when (val tt = list[idx]) {
+private class UnportedTestDepTokenScanner(
+    trees: List<TokenTree>,
+    private val unportedQuickcheck: Boolean,
+    private val unportedRand: Boolean,
+    private val inTestContext: Boolean,
+    private val importedQuickcheckGen: Boolean,
+) : RustTokenCursor(trees) {
+    fun matches(): Boolean {
+        for (idx in 0 until size) {
+            when (val tt = trees[idx]) {
                 is TokenTree.Ident -> {
-                    val raw = tt.value.toString().removePrefix("r#")
-                    val nextIsPathSep =
-                        (idx + 2 < list.size) &&
-                            list[idx + 1] is TokenTree.Punct &&
-                            (list[idx + 1] as TokenTree.Punct).value.asChar() == ':' &&
-                            list[idx + 2] is TokenTree.Punct &&
-                            (list[idx + 2] as TokenTree.Punct).value.asChar() == ':'
-                    if (unportedQuickcheck) {
-                        if ((raw == "quickcheck" && nextIsPathSep) ||
-                            (inTestContext && raw in UNPORTED_QUICKCHECK_IDENTS) ||
-                            (inTestContext && importedQuickcheckGen && raw == "Gen")
-                        ) {
-                            return true
-                        }
+                    val raw = cleanIdentAt(idx).orEmpty()
+                    val nextIsPathSep = punctCharAt(idx + 1) == ':' && punctCharAt(idx + 2) == ':'
+                    if (unportedQuickcheck &&
+                        (
+                            (raw == "quickcheck" && nextIsPathSep) ||
+                                (inTestContext && raw in UNPORTED_QUICKCHECK_IDENTS) ||
+                                (inTestContext && importedQuickcheckGen && raw == "Gen")
+                        )
+                    ) {
+                        return true
                     }
-                    if (unportedRand) {
-                        if ((raw == "rand" && nextIsPathSep) ||
-                            (inTestContext && raw in UNPORTED_RAND_TEST_IDENTS)
-                        ) {
-                            return true
-                        }
+                    if (unportedRand &&
+                        ((raw == "rand" && nextIsPathSep) || (inTestContext && raw in UNPORTED_RAND_TEST_IDENTS))
+                    ) {
+                        return true
                     }
                 }
-                is TokenTree.Group -> {
-                    if (scanTokens(tt.value.stream())) return true
-                }
+                is TokenTree.Group ->
+                    if (UnportedTestDepTokenScanner(
+                            trees = tt.value.stream().toList(),
+                            unportedQuickcheck = unportedQuickcheck,
+                            unportedRand = unportedRand,
+                            inTestContext = inTestContext,
+                            importedQuickcheckGen = importedQuickcheckGen,
+                        ).matches()
+                    ) {
+                        return true
+                    }
                 else -> {}
             }
-            idx++
         }
         return false
     }
-
-    return scanTokens(item.toTokenStream())
 }
 
 private const val OMITTED_QUICKCHECK_OR_RAND_COMMENT: String =
@@ -2477,26 +2474,7 @@ private fun KotlinJ2KEmitter.isQuickcheckOrRandTestContext(item: Item? = null): 
     headerContext.portLintDirective == "tests" ||
         headerContext.testClassName != null ||
         currentModPathPrefix.any { it == "test" || it == "tests" || it == "stdtests" } ||
-        (item != null && hasTestAttribute(extractItemAttrs(item)))
-
-private fun itemTokenStreamContainsAnyIdent(
-    stream: TokenStream,
-    idents: Set<String>,
-): Boolean {
-    if (idents.isEmpty()) return false
-    for (tt in stream.clone().toList()) {
-        when (tt) {
-            is TokenTree.Ident -> {
-                if (tt.value.toString().removePrefix("r#") in idents) return true
-            }
-            is TokenTree.Group -> {
-                if (itemTokenStreamContainsAnyIdent(tt.value.stream(), idents)) return true
-            }
-            else -> {}
-        }
-    }
-    return false
-}
+        (item != null && hasTestAttribute(item.attributes))
 
 private fun KotlinJ2KEmitter.declaredOmittedQuickcheckIdents(item: Item): Set<String> =
     when (item) {
@@ -2565,7 +2543,7 @@ internal fun KotlinJ2KEmitter.computeTransitivelyOmittedQuickcheckOrRandIdents(
                 !directHit &&
                     (
                         declared.any { it in omitted } ||
-                            itemTokenStreamContainsAnyIdent(item.toTokenStream(), omitted)
+                            RustTokenCursor.containsAnyIdentRecursive(item.toTokenStream(), omitted)
                     )
             if (directHit || transitiveHit) {
                 if (omitted.addAll(declared)) {
@@ -2582,7 +2560,7 @@ internal fun KotlinJ2KEmitter.shouldOmitItemForUnportedQuickcheckOrRand(item: It
     if (item is Item.Mod || item is Item.Use) return false
     if (!isQuickcheckOrRandTestContext(item) || currentOmittedTestIdents.isEmpty()) return false
     return declaredOmittedQuickcheckIdents(item).any { it in currentOmittedTestIdents } ||
-        itemTokenStreamContainsAnyIdent(item.toTokenStream(), currentOmittedTestIdents)
+        RustTokenCursor.containsAnyIdentRecursive(item.toTokenStream(), currentOmittedTestIdents)
 }
 
 internal fun indentBlockByFourSpaces(text: String): String =
@@ -2891,27 +2869,10 @@ internal fun KotlinJ2KEmitter.renderForwardToDeserializeAnyMembers(
     isInterface: Boolean,
     isLocalItem: Boolean,
 ): List<String> {
-    var angleDepth = 0
-    val keys = mutableListOf<String>()
-    for (tt in mac.tokens.clone().toList()) {
-        when (tt) {
-            is TokenTree.Punct -> {
-                when (tt.value.asChar()) {
-                    '<' -> angleDepth++
-                    '>' -> if (angleDepth > 0) angleDepth--
-                }
-            }
-            is TokenTree.Ident -> {
-                if (angleDepth == 0) {
-                    val raw = tt.value.toString().removePrefix("r#")
-                    if (raw in FORWARD_DESERIALIZE_KEYS) {
-                        keys += raw
-                    }
-                }
-            }
-            else -> {}
-        }
-    }
+    val keys =
+        RustTokenCursor(mac.tokens.clone().toList())
+            .collectTopLevelIdentsOutsideAngles()
+            .filter { it in FORWARD_DESERIALIZE_KEYS }
     if (keys.isEmpty()) return emptyList()
 
     val ownerParams = ownerGenerics?.params?.toList().orEmpty()

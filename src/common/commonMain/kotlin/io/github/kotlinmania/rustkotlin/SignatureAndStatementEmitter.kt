@@ -1536,55 +1536,48 @@ private fun isErasedOpsReferenceForwardingImpl(
 
 private fun prefixTopLevelTypeParamWithReified(typeParamsStr: String, tpKt: String): String {
     if (typeParamsStr.isEmpty() || tpKt.isEmpty()) return typeParamsStr
-    val sb = StringBuilder(typeParamsStr.length + 12)
-    var angleDepth = 0
-    var atSlotStart = false
-    var i = 0
-    while (i < typeParamsStr.length) {
-        val ch = typeParamsStr[i]
+    return ReifiedTypeParamRewriter(typeParamsStr, tpKt).rewrite()
+}
+
+private class ReifiedTypeParamRewriter(
+    source: String,
+    private val targetParam: String,
+) : KotlinTokenRewriter(source) {
+    private var angleDepth: Int = 0
+    private var atSlotStart: Boolean = false
+
+    override fun emitAt(index: Int, out: StringBuilder): Int {
+        val tok = tokens[index]
         when {
-            ch == '<' -> {
+            tok is KotlinLexToken.Punct && tok.ch == '<' -> {
                 angleDepth++
-                atSlotStart = (angleDepth == 1)
-                sb.append(ch)
-                i++
+                atSlotStart = angleDepth == 1
+                out.append(tok.rawText)
             }
-            ch == '>' -> {
+            tok is KotlinLexToken.Punct && tok.ch == '>' -> {
                 angleDepth = (angleDepth - 1).coerceAtLeast(0)
                 atSlotStart = false
-                sb.append(ch)
-                i++
+                out.append(tok.rawText)
             }
-            ch == ',' && angleDepth == 1 -> {
+            tok is KotlinLexToken.Punct && tok.ch == ',' && angleDepth == 1 -> {
                 atSlotStart = true
-                sb.append(ch)
-                i++
+                out.append(tok.rawText)
             }
-            angleDepth == 1 && atSlotStart && ch.isWhitespace() -> {
-                sb.append(ch)
-                i++
+            angleDepth == 1 && atSlotStart && (tok is KotlinLexToken.Whitespace || tok is KotlinLexToken.Newline) -> {
+                out.append(tok.rawText)
             }
             angleDepth == 1 && atSlotStart -> {
-                val afterIdx = i + tpKt.length
-                val matchesParam =
-                    typeParamsStr.startsWith(tpKt, i) &&
-                        (afterIdx == typeParamsStr.length || (!typeParamsStr[afterIdx].isLetterOrDigit() && typeParamsStr[afterIdx] != '_'))
-                if (matchesParam) {
-                    sb.append("reified ").append(tpKt)
-                    i = afterIdx
+                if (tok.rawText == targetParam) {
+                    out.append("reified ").append(tok.rawText)
                 } else {
-                    sb.append(ch)
-                    i++
+                    out.append(tok.rawText)
                 }
                 atSlotStart = false
             }
-            else -> {
-                sb.append(ch)
-                i++
-            }
+            else -> out.append(tok.rawText)
         }
+        return index + 1
     }
-    return sb.toString()
 }
 
 internal fun KotlinJ2KEmitter.isSingleCallExternForwardingWrapper(sig: Signature, block: Block?): Boolean {
@@ -3459,7 +3452,6 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
         }
     }
     if (typeAnnotation == "RustAny" && inferExprRenderedType(initExpr, selfTypeName) != "RustAny" && !rhs.startsWith("RustAny.from(")) {
-        usesRustAny = true
         rhs = "RustAny.from($rhs)"
     }
     if (rhs == "null" && typeAnnotation == null && !patText.startsWith("(")) {

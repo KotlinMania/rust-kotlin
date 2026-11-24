@@ -63,8 +63,6 @@ internal object TranslationSession {
     var crateStructFieldTypes: Map<String, String> = emptyMap()
     var crateFnReturnTypes: Map<String, String> = emptyMap()
     var sharedModuleFile: io.github.kotlinmania.syn.File? = null
-    var emittedInt128Support: Boolean = false
-    var emittedRustAnySupport: Boolean = false
 
     fun clear() {
         sourceLayoutFile = null
@@ -80,8 +78,6 @@ internal object TranslationSession {
         crateStructFieldTypes = emptyMap()
         crateFnReturnTypes = emptyMap()
         sharedModuleFile = null
-        emittedInt128Support = false
-        emittedRustAnySupport = false
     }
 
     fun <T> measure(stage: String, action: () -> T): T {

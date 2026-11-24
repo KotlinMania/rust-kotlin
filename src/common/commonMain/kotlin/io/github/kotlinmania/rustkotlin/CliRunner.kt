@@ -158,8 +158,6 @@ internal fun runSingleFileCommand(
     val prevFinalStructs = TranslationSession.finalStructs
     val prevSplitModRoots = TranslationSession.splitModuleRoots
     val prevCfgProfile = TranslationSession.cfgTargetProfile
-    val prevEmitted128 = TranslationSession.emittedInt128Support
-    val prevEmittedAny = TranslationSession.emittedRustAnySupport
     if (parsed.timings) {
         TranslationSession.timings = true
     }
@@ -167,8 +165,6 @@ internal fun runSingleFileCommand(
     TranslationSession.finalStructs = parsed.finalStructs
     TranslationSession.splitModuleRoots = parsed.splitModuleRoots
     TranslationSession.cfgTargetProfile = parsed.cfgTargetProfile
-    TranslationSession.emittedInt128Support = false
-    TranslationSession.emittedRustAnySupport = false
     try {
         if (parsed.action == CliActionKind.INSPECT) {
             executeInspect(
@@ -202,8 +198,6 @@ internal fun runSingleFileCommand(
         TranslationSession.finalStructs = prevFinalStructs
         TranslationSession.splitModuleRoots = prevSplitModRoots
         TranslationSession.cfgTargetProfile = prevCfgProfile
-        TranslationSession.emittedInt128Support = prevEmitted128
-        TranslationSession.emittedRustAnySupport = prevEmittedAny
     }
 }
 
@@ -933,7 +927,7 @@ private fun executeTranslate(
         } else {
             supportedDiscovered
         }
-    var resolvedProjectNamespaceForScaffold: String? = parsed.namespaceOverride ?: explicitRustKotlinProps?.projectNamespace
+    var resolvedProjectNamespaceForCatalog: String? = parsed.namespaceOverride ?: explicitRustKotlinProps?.projectNamespace
     val isBatchOutput =
         !parsed.toStdout &&
             parsed.classicOutputPath == null &&
@@ -944,8 +938,17 @@ private fun executeTranslate(
         parsed.rawAbiMode || parsed.splitModuleRoots || parsed.finalStructs || parsed.sourceRoot != null
     var cachedMetadataKey: String? = null
     var cachedMetadata = CrateRawAbiMetadata()
-    val emittedNapiModules = linkedSetOf<String>()
+    val rustLangImportingProjectRoots = linkedSetOf<String>()
     val batchFailures = mutableListOf<String>()
+
+    fun recordRustLangImportForWrittenPath(
+        path: String,
+        content: String,
+    ) {
+        if (emittedKotlinImportsRustLang(content)) {
+            extractProjectRootPrefixFromKotlinPath(path)?.let { rustLangImportingProjectRoots += it }
+        }
+    }
 
     fun isManualProtected(path: String): Boolean {
         val existing = readExistingOrNull(path) ?: return false
@@ -1053,8 +1056,8 @@ private fun executeTranslate(
                     ?.removeSuffix(".")
                     ?.takeIf { it.isNotEmpty() }
                 ?: inferredHeader.projectNamespace
-        if (resolvedProjectNamespaceForScaffold == null && finalNamespace != null) {
-            resolvedProjectNamespaceForScaffold = finalNamespace
+        if (resolvedProjectNamespaceForCatalog == null && finalNamespace != null) {
+            resolvedProjectNamespaceForCatalog = finalNamespace
         }
         val finalCrateNamespaces =
             if (parsed.crateNamespaces.isEmpty()) {
@@ -1242,10 +1245,10 @@ private fun executeTranslate(
                 }
             } else {
                 val wroteInline = writeOutputFile(testPath, inlineTests.text)
+                if (wroteInline) {
+                    recordRustLangImportForWrittenPath(testPath, inlineTests.text)
+                }
                 for (companion in inlineTests.companionFiles) {
-                    if (companion.kind is CompanionInteropKind.NapiCppSource) {
-                        emittedNapiModules += companion.ffiModuleName.ifEmpty { "ffi" }
-                    }
                     val companionPath = resolveCompanionOutputPath(testPath, companion)
                     writeOutputFile(companionPath, companion.content, quietSkipExisting = true)
                 }
@@ -1290,10 +1293,10 @@ private fun executeTranslate(
                     else -> {
                         val targetOut = requireNotNull(chunkPath)
                         val wroteChunk = writeOutputFile(targetOut, chunk.text)
+                        if (wroteChunk) {
+                            recordRustLangImportForWrittenPath(targetOut, chunk.text)
+                        }
                         for (companion in chunk.companionFiles) {
-                            if (companion.kind is CompanionInteropKind.NapiCppSource) {
-                                emittedNapiModules += companion.ffiModuleName.ifEmpty { "ffi" }
-                            }
                             val companionOutPath = resolveCompanionOutputPath(targetOut, companion)
                             writeOutputFile(companionOutPath, companion.content, quietSkipExisting = true)
                         }
@@ -1332,10 +1335,10 @@ private fun executeTranslate(
             else -> {
                 val targetOut = requireNotNull(outputPath)
                 val wroteTarget = writeOutputFile(targetOut, result.text)
+                if (wroteTarget) {
+                    recordRustLangImportForWrittenPath(targetOut, result.text)
+                }
                 for (companion in result.companionFiles) {
-                    if (companion.kind is CompanionInteropKind.NapiCppSource) {
-                        emittedNapiModules += companion.ffiModuleName.ifEmpty { "ffi" }
-                    }
                     val companionOutPath = resolveCompanionOutputPath(targetOut, companion)
                     writeOutputFile(companionOutPath, companion.content, quietSkipExisting = true)
                 }
@@ -1361,176 +1364,31 @@ private fun executeTranslate(
         }
     }
 
-    if (isBatchOutput && TranslationSession.emittedInt128Support && !parsed.toStdout) {
-        val normOutRoot = requireNotNull(parsed.outputTarget).replace('\\', '/').trimEnd('/')
-        val commonMarker = "src/common/commonMain/kotlin/"
-        val markerIdx =
-            when {
-                normOutRoot.startsWith(commonMarker) -> 0
-                normOutRoot.contains("/$commonMarker") -> normOutRoot.indexOf("/$commonMarker") + 1
-                else -> -1
+    if (!parsed.dryRun && !parsed.toStdout) {
+        for (projRootPrefix in rustLangImportingProjectRoots) {
+            val catalogPath = "${projRootPrefix}gradle/libs.versions.toml"
+            val existingToml = readExistingOrNull(catalogPath) ?: continue
+            val propsPath = "${projRootPrefix}gradle.properties"
+            val existingProps = readExistingOrNull(propsPath)
+            if (isRustLangSelfProject(resolvedProjectNamespaceForCatalog, existingProps)) {
+                continue
             }
-        val supportPkg =
-            resolvedProjectNamespaceForScaffold
-                ?: inferKotlinPackageName("$normOutRoot/Int128Support.kt")
-                ?: parsed.packageOverride
-        val supportOutPath =
-            if (markerIdx >= 0 && !supportPkg.isNullOrBlank()) {
-                val projRootPrefix = normOutRoot.substring(0, markerIdx)
-                "$projRootPrefix$commonMarker${supportPkg.replace('.', '/')}/Int128Support.kt"
-            } else {
-                "$normOutRoot/Int128Support.kt"
-            }
-        val supportContent = renderSynthesizedInt128SupportFile(supportPkg)
-        if (parsed.dryRun) {
-            if (!parsed.quiet) {
-                if (isManualProtected(supportOutPath)) {
-                    report("dry-run: skip manual $supportOutPath")
-                } else {
-                    report("dry-run: int128-support -> $supportOutPath")
+            var targetBundle: String? = null
+            if (existingProps != null && !isManualProtectedContent(existingProps)) {
+                val (updatedProps, bundleName) = ensureRustLangInGradleProperties(existingProps)
+                targetBundle = bundleName
+                if (updatedProps != existingProps) {
+                    writeForce(propsPath, updatedProps)
                 }
             }
-        } else {
-            val wroteSupport = writeOutputFile(supportOutPath, supportContent, quietSkipExisting = true)
-            if (wroteSupport && !parsed.quiet) {
-                report("int128-support -> $supportOutPath")
-            }
-        }
-    }
-
-    if (isBatchOutput && !parsed.toStdout) {
-        val normOutRoot = requireNotNull(parsed.outputTarget).replace('\\', '/').trimEnd('/')
-        val commonMarker = "src/common/commonMain/kotlin/"
-        val markerIdx =
-            when {
-                normOutRoot.startsWith(commonMarker) -> 0
-                normOutRoot.contains("/$commonMarker") -> normOutRoot.indexOf("/$commonMarker") + 1
-                else -> -1
-            }
-        val inferredCorePkg = inferKotlinPackageName("$normOutRoot/CoreMarker.kt") ?: parsed.packageOverride
-        if (markerIdx >= 0 && !inferredCorePkg.isNullOrBlank() && inferredCorePkg.endsWith(".core")) {
-            val projRootPrefix = normOutRoot.substring(0, markerIdx)
-            val projectNs = resolvedProjectNamespaceForScaffold ?: inferredCorePkg.substringBeforeLast('.')
-            val typeLayoutPath = "$projRootPrefix$commonMarker${inferredCorePkg.replace('.', '/')}/mem/TypeLayout.kt"
-            val typeLayoutContent = CoreIntrinsicFfiArtifacts.renderTypeLayoutSupportKotlin(inferredCorePkg)
-            val intrinsicsAnchor = "$projRootPrefix$commonMarker${inferredCorePkg.replace('.', '/')}/intrinsics/KmCoreIntrinsics.kt"
-            val kmCoreCompanions =
-                CoreIntrinsicFfiArtifacts.emitAllKmCoreCompanionFiles(
-                    coreNamespace = inferredCorePkg,
-                    ffiModuleName = "kmcore",
-                    projectNamespace = projectNs,
-                )
-            val constPtrPath = "$projRootPrefix$commonMarker${inferredCorePkg.replace('.', '/')}/ptr/ConstPtr.kt"
-            val constPtrContent = "package $inferredCorePkg.ptr\n\n${CoreIntrinsicFfiArtifacts.renderConstPtrClassHeader()}\n"
-            val mutPtrPath = "$projRootPrefix$commonMarker${inferredCorePkg.replace('.', '/')}/ptr/MutPtr.kt"
-            val mutPtrContent = "package $inferredCorePkg.ptr\n\n${CoreIntrinsicFfiArtifacts.renderMutPtrClassHeader()}\n"
-            val int128SupportPath = "$projRootPrefix$commonMarker${inferredCorePkg.replace('.', '/')}/Int128Support.kt"
-            val int128SupportContent =
-                renderSynthesizedInt128SupportFile(
-                    inferredCorePkg,
-                    coreIntrinsicsPackage = "$inferredCorePkg.intrinsics",
-                )
-            val rustAnySupportPath = "$projRootPrefix$commonMarker${inferredCorePkg.replace('.', '/')}/RustAnySupport.kt"
-            val rustAnySupportContent = renderSynthesizedAnySupportFile(inferredCorePkg)
-            val floatSupportPath = "$projRootPrefix$commonMarker${inferredCorePkg.replace('.', '/')}/FloatSupport.kt"
-            val floatSupportContent = renderSynthesizedFloatSupportFile(inferredCorePkg)
-            val supportFiles =
-                listOf(
-                    int128SupportPath to int128SupportContent,
-                    rustAnySupportPath to rustAnySupportContent,
-                    floatSupportPath to floatSupportContent,
-                )
-            if (parsed.dryRun) {
-                if (!parsed.quiet) {
-                    report("dry-run: core-type-layout -> $typeLayoutPath")
-                    if (parsed.splitModuleRoots) {
-                        report("dry-run: core-ptr -> $constPtrPath")
-                        report("dry-run: core-ptr -> $mutPtrPath")
-                    }
-                    for ((supPath, _) in supportFiles) {
-                        report("dry-run: core-support -> $supPath")
-                    }
-                    for (comp in kmCoreCompanions) {
-                        report("dry-run: core-intrinsic-companion -> ${resolveCompanionOutputPath(intrinsicsAnchor, comp)}")
+            if (!isManualProtectedContent(existingToml)) {
+                val updatedToml = ensureRustLangInLibsVersionsToml(existingToml, commonMainBundleName = targetBundle)
+                if (updatedToml != existingToml) {
+                    writeForce(catalogPath, updatedToml)
+                    if (!parsed.quiet) {
+                        report("rust-lang-kotlin -> $catalogPath")
                     }
                 }
-            } else {
-                var writtenScaffoldCount = 0
-                if (writeOutputFile(typeLayoutPath, typeLayoutContent, quietSkipExisting = true)) {
-                    writtenScaffoldCount++
-                }
-                for ((supPath, supContent) in supportFiles) {
-                    if (writeOutputFile(supPath, supContent, quietSkipExisting = true)) {
-                        writtenScaffoldCount++
-                    }
-                }
-                if (parsed.splitModuleRoots) {
-                    for ((ptrPath, ptrContent) in listOf(constPtrPath to constPtrContent, mutPtrPath to mutPtrContent)) {
-                        if (writeOutputFile(ptrPath, ptrContent, quietSkipExisting = true)) {
-                            writtenScaffoldCount++
-                        }
-                    }
-                }
-                for (comp in kmCoreCompanions) {
-                    val compOut = resolveCompanionOutputPath(intrinsicsAnchor, comp)
-                    if (writeOutputFile(compOut, comp.content, quietSkipExisting = true)) {
-                        writtenScaffoldCount++
-                    }
-                }
-                if (!parsed.quiet) {
-                    report("core-intrinsic-artifacts -> $projRootPrefix ($writtenScaffoldCount files)")
-                }
-            }
-        } else if (markerIdx >= 0 && emittedNapiModules.isNotEmpty() && !parsed.dryRun) {
-            val projRootPrefix = normOutRoot.substring(0, markerIdx)
-            val inlineHeaderPath = "${projRootPrefix}src/native/interop/cinterop/km_core_intrinsics_inline.h"
-            val inlineHeaderContent = CoreIntrinsicFfiArtifacts.renderKmCoreInlineHeader()
-            writeOutputFile(inlineHeaderPath, inlineHeaderContent, quietSkipExisting = true)
-            for (ffiMod in emittedNapiModules) {
-                if (ffiMod == "kmcore" && exists("${projRootPrefix}src/js/node-kmcore/src/kmcore_bindings.cpp")) {
-                    continue
-                }
-                val stem = "${ffiMod}_kmcore_intrinsics"
-                val napiBridgePath = "${projRootPrefix}src/js/node-$ffiMod/src/${stem}_bindings.cpp"
-                val napiBridgeContent = CoreIntrinsicFfiArtifacts.renderKmCoreNapiCpp(stem)
-                writeOutputFile(napiBridgePath, napiBridgeContent, quietSkipExisting = true)
-            }
-        }
-    }
-
-    if (isBatchOutput && TranslationSession.emittedRustAnySupport && !parsed.toStdout) {
-        val normOutRoot = requireNotNull(parsed.outputTarget).replace('\\', '/').trimEnd('/')
-        val commonMarker = "src/common/commonMain/kotlin/"
-        val markerIdx =
-            when {
-                normOutRoot.startsWith(commonMarker) -> 0
-                normOutRoot.contains("/$commonMarker") -> normOutRoot.indexOf("/$commonMarker") + 1
-                else -> -1
-            }
-        val supportPkg =
-            resolvedProjectNamespaceForScaffold
-                ?: inferKotlinPackageName("$normOutRoot/RustAnySupport.kt")
-                ?: parsed.packageOverride
-        val supportOutPath =
-            if (markerIdx >= 0 && !supportPkg.isNullOrBlank()) {
-                val projRootPrefix = normOutRoot.substring(0, markerIdx)
-                "$projRootPrefix$commonMarker${supportPkg.replace('.', '/')}/RustAnySupport.kt"
-            } else {
-                "$normOutRoot/RustAnySupport.kt"
-            }
-        val supportContent = renderSynthesizedAnySupportFile(supportPkg)
-        if (parsed.dryRun) {
-            if (!parsed.quiet) {
-                if (isManualProtected(supportOutPath)) {
-                    report("dry-run: skip manual $supportOutPath")
-                } else {
-                    report("dry-run: rust-any-support -> $supportOutPath")
-                }
-            }
-        } else {
-            val wroteAnySupport = writeOutputFile(supportOutPath, supportContent, quietSkipExisting = true)
-            if (wroteAnySupport && !parsed.quiet) {
-                report("rust-any-support -> $supportOutPath")
             }
         }
     }

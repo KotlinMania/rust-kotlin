@@ -64,6 +64,7 @@ serde-kotlin = { module = "io.github.kotlinmania:serde-kotlin", version.ref = "s
 [bundles]
 rust-kotlin-commonMain = [
   "km-io",
+  "rust-lang-kotlin",
   "serde-json-kotlin",
   "proc-macro2-kotlin",
   "quote-kotlin",

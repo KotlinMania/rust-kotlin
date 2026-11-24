@@ -352,109 +352,6 @@ internal fun buildNodeNapiLoaderJsBody(
     return sb.toString()
 }
 
-internal fun appendDynamicSymbolLookupBlock(
-    sb: StringBuilder,
-    ptrVarName: String,
-    ptrTypeDecl: String,
-    castTargetType: String,
-    cSymbolName: String,
-    isCpp: Boolean,
-    windowsDlls: Pair<String, String> = "ucrtbase.dll" to "msvcrt.dll",
-    extraPosixFallback: ((StringBuilder) -> Unit)? = null,
-) {
-    val nullLit = if (isCpp) "nullptr" else "NULL"
-    val symEsc = escapeCString(cSymbolName)
-    fun winCast(expr: String): String =
-        if (isCpp) {
-            "reinterpret_cast<$castTargetType>(reinterpret_cast<void*>($expr))"
-        } else {
-            "($castTargetType)(void*)$expr"
-        }
-    fun dlsymCast(expr: String): String =
-        if (isCpp) "reinterpret_cast<$castTargetType>($expr)" else "($castTargetType)$expr"
-
-    val firstVar = if (windowsDlls.first.startsWith("msvcrt")) "km_h_msvcrt" else "km_h_ucrt"
-    val secondVar = if (windowsDlls.second.startsWith("msvcrt")) "km_h_msvcrt" else "km_h_ucrt"
-
-    sb.append("    static $ptrTypeDecl $ptrVarName = $nullLit;\n")
-    sb.append("#ifdef _WIN32\n")
-    sb.append("    if ($ptrVarName == $nullLit) {\n")
-    sb.append("        HMODULE $firstVar = GetModuleHandleA(\"${windowsDlls.first}\");\n")
-    sb.append("        if ($firstVar == $nullLit) $firstVar = LoadLibraryA(\"${windowsDlls.first}\");\n")
-    sb.append("        if ($firstVar != $nullLit) $ptrVarName = ${winCast("GetProcAddress($firstVar, \"$symEsc\")")};\n")
-    if (!cSymbolName.startsWith("_")) {
-        sb.append("        if ($ptrVarName == $nullLit && $firstVar != $nullLit) $ptrVarName = ${winCast("GetProcAddress($firstVar, \"_$symEsc\")")};\n")
-    }
-    sb.append("        if ($ptrVarName == $nullLit) {\n")
-    sb.append("            HMODULE $secondVar = GetModuleHandleA(\"${windowsDlls.second}\");\n")
-    sb.append("            if ($secondVar == $nullLit) $secondVar = LoadLibraryA(\"${windowsDlls.second}\");\n")
-    sb.append("            if ($secondVar != $nullLit) $ptrVarName = ${winCast("GetProcAddress($secondVar, \"$symEsc\")")};\n")
-    if (!cSymbolName.startsWith("_")) {
-        sb.append("            if ($ptrVarName == $nullLit && $secondVar != $nullLit) $ptrVarName = ${winCast("GetProcAddress($secondVar, \"_$symEsc\")")};\n")
-    }
-    sb.append("        }\n")
-    sb.append("    }\n")
-    sb.append("#else\n")
-    sb.append("    if ($ptrVarName == $nullLit) {\n")
-    sb.append("        $ptrVarName = ${dlsymCast("dlsym(RTLD_DEFAULT, \"$symEsc\")")};\n")
-    extraPosixFallback?.invoke(sb)
-    sb.append("    }\n")
-    sb.append("#endif\n")
-}
-
-internal fun appendDynamicFunctionDispatch(
-    sb: StringBuilder,
-    fn: ForeignFnInteropSpec,
-    cRet: String,
-    callArgs: String,
-    hasReturn: Boolean,
-    isCpp: Boolean,
-) {
-    val nullLit = if (isCpp) "nullptr" else "NULL"
-    val failExpr = cFailureReturnExpr(fn, isCpp = isCpp)
-    fun castIntPtr(va: String): String =
-        if (isCpp) "static_cast<intptr_t>($va)" else "(intptr_t)$va"
-
-    if (!fn.isVariadic) {
-        if (hasReturn) {
-            sb.append("    $cRet km_res;\n")
-            sb.append("    if (km_fn_ptr != $nullLit) {\n")
-            sb.append("        km_res = km_fn_ptr($callArgs);\n")
-            sb.append("    } else {\n")
-            sb.append("        errno = ENOSYS;\n")
-            sb.append("        km_res = $failExpr;\n")
-            sb.append("    }\n")
-        } else {
-            sb.append("    if (km_fn_ptr != $nullLit) {\n")
-            sb.append("        km_fn_ptr($callArgs);\n")
-            sb.append("    } else {\n")
-            sb.append("        errno = ENOSYS;\n")
-            sb.append("    }\n")
-        }
-        return
-    }
-    val prefix = if (callArgs.isEmpty()) "" else "$callArgs, "
-    val va1 = castIntPtr("km_va0")
-    val va2 = "$va1, ${castIntPtr("km_va1")}"
-    val va3 = "$va2, ${castIntPtr("km_va2")}"
-    val va4 = "$va3, ${castIntPtr("km_va3")}"
-    val lhs = if (hasReturn) "km_res = " else ""
-    if (hasReturn) {
-        sb.append("    $cRet km_res = $failExpr;\n")
-    }
-    sb.append("    if (km_fn_ptr != $nullLit) {\n")
-    sb.append("        switch (km_vac) {\n")
-    sb.append("            case 0: ${lhs}km_fn_ptr($callArgs); break;\n")
-    sb.append("            case 1: ${lhs}km_fn_ptr($prefix$va1); break;\n")
-    sb.append("            case 2: ${lhs}km_fn_ptr($prefix$va2); break;\n")
-    sb.append("            case 3: ${lhs}km_fn_ptr($prefix$va3); break;\n")
-    sb.append("            default: ${lhs}km_fn_ptr($prefix$va4); break;\n")
-    sb.append("        }\n")
-    sb.append("    } else {\n")
-    sb.append("        errno = ENOSYS;\n")
-    sb.append("    }\n")
-}
-
 internal class FfiInteropCollector(
     private val source: String,
     internal val headerContext: FileHeaderContext,
@@ -605,7 +502,7 @@ internal class FfiInteropCollector(
             if (meta is Meta.List && meta.path.isIdent("link")) {
                 extractLinkLibraryNamesFromLinkArgs(meta.tokens, modLibs)
             } else if (meta is Meta.List && meta.path.isIdent("cfg_attr")) {
-                val cfgParts = MacroRulesFileExpander.splitMacroArguments(meta.tokens.clone())
+                val cfgParts = RustTokenCursor.splitMacroArguments(meta.tokens.clone())
                 for (part in cfgParts.drop(1)) {
                     if (part.size == 2 &&
                         (part[0] as? TokenTree.Ident)?.value?.toString() == "link" &&
@@ -1337,9 +1234,10 @@ internal class FfiInteropCollector(
     companion object {
         private val POINTEE_STOP_IDENTS = setOf("c_char", "FILE", "DIR", "c_void")
 
-        private fun unwrapOuterAliases(
+        private fun unwrapTypeAliases(
             ty: SynType,
             resolveTypeAliasTarget: (String) -> SynType?,
+            stopIdents: Set<String> = emptySet(),
         ): SynType {
             var cur = unwrapType(ty)
             var depth = 0
@@ -1347,6 +1245,7 @@ internal class FfiInteropCollector(
                 val lastSeg = cur.path.segments.last() ?: break
                 if (lastSeg.arguments !is PathArguments.None) break
                 val rawIdent = lastSeg.ident.toString().removePrefix("r#")
+                if (rawIdent in stopIdents) break
                 val target = resolveTypeAliasTarget(rawIdent) ?: break
                 cur = unwrapType(target)
                 depth++
@@ -1354,23 +1253,15 @@ internal class FfiInteropCollector(
             return cur
         }
 
+        private fun unwrapOuterAliases(
+            ty: SynType,
+            resolveTypeAliasTarget: (String) -> SynType?,
+        ): SynType = unwrapTypeAliases(ty, resolveTypeAliasTarget)
+
         private fun unwrapPointeeAliases(
             ty: SynType,
             resolveTypeAliasTarget: (String) -> SynType?,
-        ): SynType {
-            var cur = unwrapType(ty)
-            var depth = 0
-            while (depth < 8 && cur is SynType.Path && cur.qself == null) {
-                val lastSeg = cur.path.segments.last() ?: break
-                if (lastSeg.arguments !is PathArguments.None) break
-                val rawIdent = lastSeg.ident.toString().removePrefix("r#")
-                if (rawIdent in POINTEE_STOP_IDENTS) break
-                val target = resolveTypeAliasTarget(rawIdent) ?: break
-                cur = unwrapType(target)
-                depth++
-            }
-            return cur
-        }
+        ): SynType = unwrapTypeAliases(ty, resolveTypeAliasTarget, POINTEE_STOP_IDENTS)
 
         internal fun classifyAbiBridge(
             synType: SynType?,
@@ -1642,7 +1533,7 @@ internal fun extractLinkLibraryNamesFromLinkArgs(
     tokens: TokenStream,
     out: MutableSet<String>,
 ) {
-    for (part in MacroRulesFileExpander.splitMacroArguments(tokens.clone())) {
+    for (part in RustTokenCursor.splitMacroArguments(tokens.clone())) {
         if (part.size >= 3 &&
             (part[0] as? TokenTree.Ident)?.value?.toString() == "name" &&
             (part[1] as? TokenTree.Punct)?.value?.asChar() == '=' &&
@@ -1943,18 +1834,73 @@ private val C_RESERVED_PARAM_NAMES: Set<String> =
             "sin cos tan exp log pow sqrt ceil floor index rindex bcopy bzero bcmp"
     ).split(' ').toSet()
 
-internal fun jniMangleSegment(segment: String): String {
-    val sb = StringBuilder(segment.length + 8)
-    for (ch in segment) {
-        when (ch) {
-            '_' -> sb.append("_1")
-            ';' -> sb.append("_2")
-            '[' -> sb.append("_3")
-            else -> sb.append(ch)
+internal fun jniMangleSegment(segment: String): String =
+    buildString(segment.length + 4) {
+        for (ch in segment) {
+            when {
+                ch in 'a'..'z' || ch in 'A'..'Z' || ch in '0'..'9' -> append(ch)
+                ch == '_' -> append("_1")
+                ch == ';' -> append("_2")
+                ch == '[' -> append("_3")
+                else -> append("_0").append(ch.code.toString(16).padStart(4, '0'))
+            }
         }
     }
-    return sb.toString()
-}
+
+internal fun buildJniResourceLoaderBody(
+    jniObjectName: String,
+    jniLibName: String,
+    resourcePrefix: String,
+): String =
+    buildString {
+        append("    private fun loadNativeLibrary() {\n")
+        append("        val osRaw = System.getProperty(\"os.name\", \"\").lowercase()\n")
+        append("        val archRaw = System.getProperty(\"os.arch\", \"\").lowercase()\n")
+        append("        val hostPlatform =\n")
+        append("            when {\n")
+        append("                osRaw.contains(\"win\") -> \"windows\"\n")
+        append("                osRaw.contains(\"mac\") || osRaw.contains(\"darwin\") -> \"macos\"\n")
+        append("                else -> \"linux\"\n")
+        append("            }\n")
+        append("        val hostArch =\n")
+        append("            when {\n")
+        append("                archRaw == \"aarch64\" || archRaw == \"arm64\" -> \"aarch64\"\n")
+        append("                archRaw == \"amd64\" || archRaw == \"x86_64\" -> \"x86_64\"\n")
+        append("                else -> archRaw\n")
+        append("            }\n")
+        append("        val libFileName =\n")
+        append("            when (hostPlatform) {\n")
+        append("                \"windows\" -> \"").append(jniLibName).append(".dll\"\n")
+        append("                \"macos\" -> \"lib").append(jniLibName).append(".dylib\"\n")
+        append("                else -> \"lib").append(jniLibName).append(".so\"\n")
+        append("            }\n")
+        append("        val pathSep = System.getProperty(\"path.separator\", \":\")\n")
+        append("        val libPathProp = System.getProperty(\"java.library.path\", \"\")\n")
+        append("        for (dirEntry in libPathProp.split(pathSep)) {\n")
+        append("            if (dirEntry.isEmpty()) continue\n")
+        append("            val candidate = java.io.File(dirEntry, libFileName)\n")
+        append("            if (candidate.isFile) {\n")
+        append("                System.load(candidate.absolutePath)\n")
+        append("                return\n")
+        append("            }\n")
+        append("        }\n")
+        append("        val resourcePath = \"").append(resourcePrefix).append("/native/${'$'}hostPlatform-${'$'}hostArch/${'$'}libFileName\"\n")
+        append("        val stream = ").append(jniObjectName).append("::class.java.classLoader?.getResourceAsStream(resourcePath)\n")
+        append("        if (stream != null) {\n")
+        append("            val suffix = \".\" + libFileName.substringAfterLast('.')\n")
+        append("            val extracted = java.nio.file.Files.createTempFile(\"").append(jniLibName).append("-\", suffix).toFile()\n")
+        append("            extracted.deleteOnExit()\n")
+        append("            stream.use { input ->\n")
+        append("                extracted.outputStream().use { output ->\n")
+        append("                    input.copyTo(output)\n")
+        append("                }\n")
+        append("            }\n")
+        append("            System.load(extracted.absolutePath)\n")
+        append("            return\n")
+        append("        }\n")
+        append("        System.loadLibrary(\"").append(jniLibName).append("\")\n")
+        append("    }\n\n")
+    }
 
 internal fun escapeCString(raw: String): String =
     buildString(raw.length + 4) {
@@ -2048,21 +1994,15 @@ internal fun extractIdentifierTokens(
     includeBuiltins: Boolean = false,
 ): Set<String> {
     val out = linkedSetOf<String>()
-    val sb = StringBuilder()
-    for (ch in expr) {
-        if (ch.isLetterOrDigit() || ch == '_') {
-            sb.append(ch)
-        } else if (sb.isNotEmpty()) {
-            val tok = sb.toString()
-            sb.clear()
-            if (!tok.first().isDigit() && (includeBuiltins || tok !in BUILTIN_KOTLIN_IDENTS)) {
-                out += tok
+    for (token in KotlinSourceTokenizer.tokenize(expr)) {
+        val tok =
+            when (token) {
+                is KotlinLexToken.Ident -> token.rawText
+                is KotlinLexToken.BacktickIdent -> token.ident
+                is KotlinLexToken.StringIdentTemplate -> token.ident
+                else -> continue
             }
-        }
-    }
-    if (sb.isNotEmpty()) {
-        val tok = sb.toString()
-        if (!tok.first().isDigit() && (includeBuiltins || tok !in BUILTIN_KOTLIN_IDENTS)) {
+        if (tok.isNotEmpty() && !tok.first().isDigit() && (includeBuiltins || tok !in BUILTIN_KOTLIN_IDENTS)) {
             out += tok
         }
     }
@@ -2143,7 +2083,7 @@ internal fun parseInlineCMacro(
         (list[cursor] as TokenTree.Group).value.delimiter() == Delimiter.Bracket
     ) {
         val bracketGroup = list[cursor] as TokenTree.Group
-        val parts = MacroRulesFileExpander.splitMacroArguments(bracketGroup.value.stream())
+        val parts = RustTokenCursor.splitMacroArguments(bracketGroup.value.stream())
         for (part in parts) {
             parseSingleCaptureArg(part)?.let { captureArgs += it }
         }

@@ -1,24 +1,36 @@
 package io.github.kotlinmania.rustkotlin
 
+import io.github.kotlinmania.rustlang.core.ptr.ConstPtr
+import io.github.kotlinmania.rustlang.core.ptr.MutPtr
 import kotlin.test.Test
 import kotlin.test.assertContains
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 
 class OpaquePointerSupportTest {
     @Test
-    fun supportPreservesOnlyExplicitAddressCarriers() {
-        // Raw pointers live in core::ptr as non-nullable address carriers (0L == null).
-        val constOut = CoreIntrinsicFfiArtifacts.renderConstPtrClassHeader()
-        val mutOut = CoreIntrinsicFfiArtifacts.renderMutPtrClassHeader()
-        assertContains(constOut, "public class ConstPtr(")
-        assertContains(constOut, "public val rawAddress: Long,")
-        assertContains(mutOut, "public class MutPtr(")
-        assertContains(mutOut, "public val rawAddress: Long,")
-        assertFalse(constOut.contains("Any.value"))
-        assertFalse(constOut.contains("COpaquePointer"))
-        assertFalse(mutOut.contains("Any.value"))
-        assertFalse(mutOut.contains("COpaquePointer"))
-        ZeroUnderscoreIdentifierValidator.requireZeroViolations(constOut, "ConstPtr.kt")
-        ZeroUnderscoreIdentifierValidator.requireZeroViolations(mutOut, "MutPtr.kt")
+    fun supportImportsCoreAddressCarriersWithoutInliningDefinitions() {
+        val rustSource =
+            """
+            pub fn forward_ptrs(src: *const u8, dst: *mut u8) -> (*const u8, *mut u8) {
+                (src, dst)
+            }
+            """.trimIndent()
+        val kt =
+            renderSingleKotlinFile(
+                rustSource,
+                FileHeaderContext(packageName = "io.github.kotlinmania.sample"),
+            ).text
+        assertContains(kt, "import io.github.kotlinmania.rustlang.core.ptr.ConstPtr")
+        assertContains(kt, "import io.github.kotlinmania.rustlang.core.ptr.MutPtr")
+        assertFalse(kt.contains("class ConstPtr("))
+        assertFalse(kt.contains("class MutPtr("))
+        assertFalse(kt.contains("COpaquePointer"))
+        ZeroUnderscoreIdentifierValidator.requireZeroViolations(kt, "ForwardPtrs.kt")
+
+        val constPtr = ConstPtr(0x1234L)
+        val mutPtr = MutPtr(0x5678L)
+        assertEquals(0x1234L, constPtr.rawAddress)
+        assertEquals(0x5678L, mutPtr.rawAddress)
     }
 }
