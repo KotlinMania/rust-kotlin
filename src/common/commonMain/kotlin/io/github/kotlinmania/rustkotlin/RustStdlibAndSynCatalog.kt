@@ -173,7 +173,7 @@ internal fun matchesUnspecializedOwnerGenerics(
 internal fun declaresExtraNonImplicitImplTraitBounds(
     impl: Item.Impl,
     ownerDeclGenerics: Generics,
-    isImplicitTraitPath: (io.github.kotlinmania.syn.Path) -> Boolean,
+    isImplicitTraitPath: (Path) -> Boolean,
 ): Boolean {
     fun hasNonImplicitBound(bounds: List<TypeParamBound>): Boolean =
         bounds.any { b ->

@@ -1,9 +1,7 @@
 package io.github.kotlinmania.rustkotlin
 
-import io.github.kotlinmania.procmacro2.Group
 import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.ModContent
-import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.UseTree
 import io.github.kotlinmania.syn.Visibility
 

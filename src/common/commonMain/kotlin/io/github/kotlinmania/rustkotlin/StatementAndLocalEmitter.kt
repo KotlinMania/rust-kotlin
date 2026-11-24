@@ -16,7 +16,6 @@ import io.github.kotlinmania.syn.Macro
 import io.github.kotlinmania.syn.Member
 import io.github.kotlinmania.syn.ModContent
 import io.github.kotlinmania.syn.Pat
-import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.ReturnType
 import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
