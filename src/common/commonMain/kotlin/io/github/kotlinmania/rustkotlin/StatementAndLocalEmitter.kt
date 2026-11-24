@@ -2643,12 +2643,13 @@ internal fun KotlinJ2KEmitter.renderTupleStructDestructuringLocal(
             }
         }
         if (isMutBorrow) {
-            lines += BorrowedPlacePropertyDelegateTemplate.renderDirectReceiver(
-                indent = indent,
-                varName = ktVar,
-                receiverVar = receiverVar,
-                fieldProp = fieldProp,
-            )
+            lines +=
+                BorrowedPlacePropertyDelegateTemplate.renderDirectReceiver(
+                    indent = indent,
+                    varName = ktVar,
+                    receiverVar = receiverVar,
+                    fieldProp = fieldProp,
+                )
             currentBorrowedPlaceLocals = currentBorrowedPlaceLocals + ktVar
         } else {
             val kw = if (isMutBinding) "var" else "val"

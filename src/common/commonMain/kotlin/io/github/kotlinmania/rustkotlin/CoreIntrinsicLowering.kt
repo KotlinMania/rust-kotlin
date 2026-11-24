@@ -980,10 +980,10 @@ public object CoreIntrinsicLowering {
                     .renderSynthesizedBody(canonicalIntrinsicName, p0, p1, p2, layout0, layout1, intrPkg, memPkg, emitter)
             else ->
                 if (isSimdIntrinsicName(canonicalIntrinsicName)) {
-                        renderSynthesizedSimdIntrinsicFnBody(fnItem, canonicalIntrinsicName, typeParams, intrPkg, emitter)
-                    } else {
-                        null
-                    }
+                    renderSynthesizedSimdIntrinsicFnBody(fnItem, canonicalIntrinsicName, typeParams, intrPkg, emitter)
+                } else {
+                    null
+                }
         }
     }
 
@@ -2301,7 +2301,6 @@ public object CoreIntrinsicLowering {
         return null
     }
 
-
     private fun resolvePointeeTypeFromArg(
         explicitTypes: List<SynType>,
         callArgsList: List<Expr>,
@@ -2328,5 +2327,4 @@ public object CoreIntrinsicLowering {
             else -> "($countExpr).toLong()"
         }
     }
-
 }

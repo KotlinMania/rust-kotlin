@@ -1710,7 +1710,6 @@ private fun KotlinJ2KEmitter.appendDestructuredParamLines(
     }
 }
 
-
 internal abstract class ScopedMutationAstScanner(
     protected val emitter: KotlinJ2KEmitter,
     private val includeCompoundBinaryAssign: Boolean = true,
@@ -1850,7 +1849,6 @@ internal fun KotlinJ2KEmitter.computeReassignedParamShadows(
     return shadows
 }
 
-
 internal fun KotlinJ2KEmitter.blockReassignsIdent(block: Block, targetRawIdent: String): Boolean =
     IdentReassignmentScanner(this, targetRawIdent).also { it.visitBlock(block) }.mutated
 
@@ -1963,4 +1961,3 @@ internal fun KotlinJ2KEmitter.extractParamName(pat: Pat, index: Int): String =
         is Pat.Struct -> "structArg$index"
         else -> "arg$index"
     }
-

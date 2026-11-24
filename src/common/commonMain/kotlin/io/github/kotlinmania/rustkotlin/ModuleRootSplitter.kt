@@ -533,7 +533,6 @@ private fun extractChunkOwnerTypeName(selfTy: SynType, generics: Generics): Stri
     }
 }
 
-
 internal fun translateModuleRootIntoFocusedChunks(
     source: String,
     modulePascalName: String,

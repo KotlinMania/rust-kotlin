@@ -585,7 +585,6 @@ internal fun KotlinJ2KEmitter.forwardDeserializeExtraParams(key: String): Pair<L
         else -> emptyList<String>() to emptyList()
     }
 
-
 internal data class ForeignFnRenderContext(
     val emitter: KotlinJ2KEmitter,
     val foreign: ForeignItem.Fn,
@@ -627,7 +626,11 @@ internal sealed class ForeignFnEmissionStrategy {
                 if (TranslationSession.rawAbiMode) pNames[idx] else "${pNames[idx]}.rawAddress"
 
             fun alignArgToLong(idx: Int): String =
-                if (ctx.interopParams.getOrNull(idx)?.kotlinType?.substringAfterLast('.') == "Alignment") {
+                if (ctx.interopParams
+                        .getOrNull(idx)
+                        ?.kotlinType
+                        ?.substringAfterLast('.') == "Alignment"
+                ) {
                     "${pNames[idx]}.asUsize().toLong()"
                 } else {
                     "${pNames[idx]}.toLong()"
@@ -672,7 +675,11 @@ internal sealed class ForeignFnEmissionStrategy {
             val emitter = ctx.emitter
             val localSig = ctx.sig.replaceFirst("expect fun ", "fun ")
             val retSynTy = extractReturnSynType(ctx.foreign.sig.output)
-            val retBaseSimple = ctx.retRendered.substringBefore('<').substringAfterLast('.').trim()
+            val retBaseSimple =
+                ctx.retRendered
+                    .substringBefore('<')
+                    .substringAfterLast('.')
+                    .trim()
             val isReturnStructWithFields =
                 ctx.retDefault.endsWith("()") &&
                     (
@@ -741,7 +748,10 @@ internal fun KotlinJ2KEmitter.renderItemForeignMod(
         when (foreign) {
             is ForeignItem.Fn -> {
                 val vis = if (isLocalItem) "" else renderVisibility(foreign.vis)
-                val rawFnName = foreign.sig.ident.toString().removePrefix("r#")
+                val rawFnName =
+                    foreign.sig.ident
+                        .toString()
+                        .removePrefix("r#")
                 val fnName = resolveForeignFnKotlinName(rawFnName, isLocalItem)
                 val interopParams = mutableListOf<InteropParamSpec>()
                 scopeBuilder.enterDef()

@@ -2347,4 +2347,3 @@ internal fun KotlinJ2KEmitter.collectInlineModUses(modItem: Item.Mod, out: Mutab
         }
     }
 }
-

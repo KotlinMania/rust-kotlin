@@ -505,7 +505,6 @@ internal fun renderIntOrBitIntrinsicCall(
     )
 }
 
-
 internal data class FloatIntrinsicCallContext(
     val canonicalName: String,
     val renderedArgs: List<String>,
@@ -591,8 +590,7 @@ internal abstract class FloatIntrinsicLoweringRule(
     abstract fun renderCall(ctx: FloatIntrinsicCallContext): String?
 }
 
-private class FixedUnaryFloatIntrinsicRule :
-    FloatIntrinsicLoweringRule(CoreIntrinsicLowering.SUFFIXED_FLOAT_UNARY_KM.keys) {
+private class FixedUnaryFloatIntrinsicRule : FloatIntrinsicLoweringRule(CoreIntrinsicLowering.SUFFIXED_FLOAT_UNARY_KM.keys) {
     override fun renderSynthesizedBody(
         canonicalName: String,
         p0: String,
@@ -615,8 +613,7 @@ private class FixedUnaryFloatIntrinsicRule :
     }
 }
 
-private class FixedBinaryFloatIntrinsicRule :
-    FloatIntrinsicLoweringRule(CoreIntrinsicLowering.SUFFIXED_FLOAT_BINARY_KM.keys) {
+private class FixedBinaryFloatIntrinsicRule : FloatIntrinsicLoweringRule(CoreIntrinsicLowering.SUFFIXED_FLOAT_BINARY_KM.keys) {
     override fun renderSynthesizedBody(
         canonicalName: String,
         p0: String,
@@ -719,8 +716,7 @@ private object FixedMinMaxFloatIntrinsicRule :
     }
 }
 
-private class GenericUnaryFloatIntrinsicRule :
-    FloatIntrinsicLoweringRule(CoreIntrinsicLowering.GENERIC_FLOAT_UNARY_KM.keys) {
+private class GenericUnaryFloatIntrinsicRule : FloatIntrinsicLoweringRule(CoreIntrinsicLowering.GENERIC_FLOAT_UNARY_KM.keys) {
     override fun renderSynthesizedBody(
         canonicalName: String,
         p0: String,
@@ -742,8 +738,7 @@ private class GenericUnaryFloatIntrinsicRule :
     }
 }
 
-private class GenericBinaryFloatOpIntrinsicRule :
-    FloatIntrinsicLoweringRule(CoreIntrinsicLowering.GENERIC_FLOAT_BINARY_OP_NAMES.keys) {
+private class GenericBinaryFloatOpIntrinsicRule : FloatIntrinsicLoweringRule(CoreIntrinsicLowering.GENERIC_FLOAT_BINARY_OP_NAMES.keys) {
     override fun renderSynthesizedBody(
         canonicalName: String,
         p0: String,
