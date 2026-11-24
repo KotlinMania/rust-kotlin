@@ -20,10 +20,6 @@ internal data class CallableInteropEntry(
 /**
  * Extensible base class for emitting platform-specific `actual` Kotlin source files
  * (`NativeActuals.kt`, `JvmActuals.kt`, `AndroidActuals.kt`, `JsActuals.kt`, `WasmJsActuals.kt`, `WasmWasiActuals.kt`).
- *
- * Centralizes header generation, `foreignStatics` / `foreignFunctions` / `inlineFunctions`
- * deduplication, static `actual val`/`var` property formatting, `actual fun` wrapper formatting,
- * preamble injection, and `PhantomRawPointerTypeStripper` + import sorting finalization.
  */
 internal abstract class PlatformActualsKotlinEmitter(
     protected val collector: FfiInteropCollector,
@@ -33,6 +29,7 @@ internal abstract class PlatformActualsKotlinEmitter(
     protected val actualBlocks: MutableList<String> = mutableListOf()
     protected val emittedActuals: LinkedHashSet<String> = linkedSetOf()
     protected val ktStringType: String = if (collector.shadowsKotlinString(pkgName)) "kotlin.String" else "String"
+    protected val declaredSymbolsInModule: Set<String> by lazy { collector.declaredModuleSymbolNames() }
 
     protected abstract val fileOptIns: List<String>
 
@@ -45,6 +42,15 @@ internal abstract class PlatformActualsKotlinEmitter(
     protected open val addonAvailabilityGuard: String? = null
 
     protected open fun initializeImports() = Unit
+
+    protected open fun convertParamArg(param: InteropParamSpec, noStringConvEnabled: Boolean): String = param.kotlinName
+
+    protected open fun convertReturnExpr(
+        rawCall: String,
+        kotlinReturnType: String,
+        returnBridgeKind: CAbiBridgeKind,
+        returnDefaultExpr: String,
+    ): String = rawCall
 
     protected abstract fun renderBridgeableStatic(st: ForeignStaticInteropSpec): String
 
@@ -152,7 +158,7 @@ internal abstract class PlatformActualsKotlinEmitter(
                         kotlinReturnType = fn.kotlinReturnType,
                         returnBridgeKind = fn.returnBridgeKind,
                         returnDefaultExpr = fn.returnDefaultExpr,
-                        noStringConvEnabled = requiresNoStringConversionForInline(fn.params),
+                        noStringConvEnabled = requiresNoStringConversion(fn.params),
                         isVariadicCall = false,
                         isVariadicFallback = fn.isVariadic,
                         isBridgeable = collector.isBridgeableInlineInCWrapper(fn),
@@ -160,6 +166,22 @@ internal abstract class PlatformActualsKotlinEmitter(
                 )
             }
         }
+
+    protected fun renderStandardStaticProperty(
+        st: ForeignStaticInteropSpec,
+        getterCallee: String,
+        setterCallee: String? = null,
+    ): String {
+        val getBody = convertReturnExpr("$getterCallee()", st.kotlinType, st.bridgeKind, st.defaultExpr)
+        val setCall =
+            if (st.isMutable) {
+                val setArg = convertParamArg(st.asSetterParamSpec(), noStringConvEnabled = true)
+                "${setterCallee ?: st.setterWrapperSymbolName}($setArg)"
+            } else {
+                null
+            }
+        return renderStaticPropertyDecl(st, getBody, setCall)
+    }
 
     protected fun renderStaticPropertyDecl(
         st: ForeignStaticInteropSpec,
@@ -197,13 +219,11 @@ internal abstract class PlatformActualsKotlinEmitter(
         }
     }
 
-    protected fun renderStandardBridgeableCallable(
+    protected fun renderStandardCallable(
         entry: CallableInteropEntry,
         calleeExpr: String,
-        convertParam: (InteropParamSpec, Boolean) -> String,
-        convertReturn: (String, CallableInteropEntry) -> String,
     ): String {
-        val baseArgs = entry.params.map { convertParam(it, entry.noStringConvEnabled) }
+        val baseArgs = entry.params.map { convertParamArg(it, entry.noStringConvEnabled) }
         val allArgs =
             if (entry.isVariadicCall) {
                 appendVariadicKotlinArgs(baseArgs, stringifyArgs = stringifyVariadicArgs)
@@ -211,7 +231,7 @@ internal abstract class PlatformActualsKotlinEmitter(
                 baseArgs
             }
         val rawCall = "$calleeExpr(${allArgs.joinToString(", ")})"
-        val bodyExpr = convertReturn(rawCall, entry)
+        val bodyExpr = convertReturnExpr(rawCall, entry.kotlinReturnType, entry.returnBridgeKind, entry.returnDefaultExpr)
         return renderActualFunctionDecl(
             visibilityPrefix = entry.visibilityPrefix,
             kotlinName = entry.kotlinName,
@@ -229,10 +249,6 @@ internal abstract class PlatformActualsKotlinEmitter(
 /**
  * Extensible base class for emitting native host C/C++ bridge files
  * (`*_wrapper.c`, `*_jni.c`, and `*_bindings.cpp` N-API addons).
- *
- * Centralizes `#ifdef _WIN32` / `<dlfcn.h>` dynamic symbol headers, preamble emission,
- * deduplicated static/foreign/inline symbol iteration, Win32 DLL `LoadLibraryA` / `GetProcAddress`
- * and POSIX `dlsym` symbol resolution, variadic call dispatch, and Android `atexit` guards.
  */
 internal abstract class NativeHostBridgeSourceEmitter(
     protected val collector: FfiInteropCollector,
@@ -301,10 +317,8 @@ internal abstract class NativeHostBridgeSourceEmitter(
     }
 
     protected fun appendPreambles(sb: StringBuilder) {
-        if (collector.preambles.isNotEmpty()) {
-            for (chunk in collector.preambles) {
-                sb.append(chunk).append("\n\n")
-            }
+        for (chunk in collector.preambles) {
+            sb.append(chunk).append("\n\n")
         }
     }
 
@@ -335,6 +349,18 @@ internal abstract class NativeHostBridgeSourceEmitter(
         sb.append("#else\n")
     }
 
+    protected fun appendStaticSymbolPtrLookup(sb: StringBuilder, st: ForeignStaticInteropSpec): String {
+        val cType = cHeaderTypeForBridge(st.bridgeKind)
+        appendDynamicSymbolLookup(
+            sb = sb,
+            ptrVarName = "km_sym_ptr",
+            ptrTypeDecl = "$cType*",
+            castTargetType = "$cType*",
+            cSymbolName = st.cSymbolName,
+        )
+        return cType
+    }
+
     protected fun appendDynamicSymbolLookup(
         sb: StringBuilder,
         ptrVarName: String,
@@ -354,25 +380,22 @@ internal abstract class NativeHostBridgeSourceEmitter(
         fun dlsymCast(expr: String): String =
             if (isCpp) "reinterpret_cast<$castTargetType>($expr)" else "($castTargetType)$expr"
 
-        val firstVar = if (windowsDlls.first.startsWith("msvcrt")) "km_h_msvcrt" else "km_h_ucrt"
-        val secondVar = if (windowsDlls.second.startsWith("msvcrt")) "km_h_msvcrt" else "km_h_ucrt"
+        fun appendWinDllLookup(dllName: String, indent: String) {
+            val handleVar = if (dllName.startsWith("msvcrt")) "km_h_msvcrt" else "km_h_ucrt"
+            sb.append("${indent}HMODULE $handleVar = GetModuleHandleA(\"$dllName\");\n")
+            sb.append("${indent}if ($handleVar == $nullLit) $handleVar = LoadLibraryA(\"$dllName\");\n")
+            sb.append("${indent}if ($handleVar != $nullLit) $ptrVarName = ${winCast("GetProcAddress($handleVar, \"$symEsc\")")};\n")
+            if (!cSymbolName.startsWith("_")) {
+                sb.append("${indent}if ($ptrVarName == $nullLit && $handleVar != $nullLit) $ptrVarName = ${winCast("GetProcAddress($handleVar, \"_$symEsc\")")};\n")
+            }
+        }
 
         sb.append("    static $ptrTypeDecl $ptrVarName = $nullLit;\n")
         sb.append("#ifdef _WIN32\n")
         sb.append("    if ($ptrVarName == $nullLit) {\n")
-        sb.append("        HMODULE $firstVar = GetModuleHandleA(\"${windowsDlls.first}\");\n")
-        sb.append("        if ($firstVar == $nullLit) $firstVar = LoadLibraryA(\"${windowsDlls.first}\");\n")
-        sb.append("        if ($firstVar != $nullLit) $ptrVarName = ${winCast("GetProcAddress($firstVar, \"$symEsc\")")};\n")
-        if (!cSymbolName.startsWith("_")) {
-            sb.append("        if ($ptrVarName == $nullLit && $firstVar != $nullLit) $ptrVarName = ${winCast("GetProcAddress($firstVar, \"_$symEsc\")")};\n")
-        }
+        appendWinDllLookup(windowsDlls.first, "        ")
         sb.append("        if ($ptrVarName == $nullLit) {\n")
-        sb.append("            HMODULE $secondVar = GetModuleHandleA(\"${windowsDlls.second}\");\n")
-        sb.append("            if ($secondVar == $nullLit) $secondVar = LoadLibraryA(\"${windowsDlls.second}\");\n")
-        sb.append("            if ($secondVar != $nullLit) $ptrVarName = ${winCast("GetProcAddress($secondVar, \"$symEsc\")")};\n")
-        if (!cSymbolName.startsWith("_")) {
-            sb.append("            if ($ptrVarName == $nullLit && $secondVar != $nullLit) $ptrVarName = ${winCast("GetProcAddress($secondVar, \"_$symEsc\")")};\n")
-        }
+        appendWinDllLookup(windowsDlls.second, "            ")
         sb.append("        }\n")
         sb.append("    }\n")
         sb.append("#else\n")
@@ -418,11 +441,7 @@ internal abstract class NativeHostBridgeSourceEmitter(
             }
             sb.append("    errno = ENOSYS;\n")
             if (hasReturn) {
-                if (directReturnOnDispatch) {
-                    sb.append("    return $failExpr;\n")
-                } else {
-                    sb.append("    $cRet km_res = $failExpr;\n")
-                }
+                sb.append(if (directReturnOnDispatch) "    return $failExpr;\n" else "    $cRet km_res = $failExpr;\n")
             }
             sb.append("#endif\n")
         } else {
@@ -439,6 +458,25 @@ internal abstract class NativeHostBridgeSourceEmitter(
         }
     }
 
+    private fun appendVariadicSwitch(
+        sb: StringBuilder,
+        callArgs: String,
+        stmtPrefix: String,
+        stmtSuffix: String,
+    ) {
+        fun castIntPtr(va: String): String =
+            if (isCpp) "static_cast<intptr_t>($va)" else "(intptr_t)$va"
+
+        sb.append("        switch (km_vac) {\n")
+        for (arity in 0..4) {
+            val label = if (arity < 4) "case $arity" else "default"
+            val vaArgs = (0 until arity).joinToString(", ") { castIntPtr("km_va$it") }
+            val fullArgs = listOf(callArgs, vaArgs).filter(String::isNotEmpty).joinToString(", ")
+            sb.append("            $label: ${stmtPrefix}km_fn_ptr($fullArgs);$stmtSuffix\n")
+        }
+        sb.append("        }\n")
+    }
+
     private fun appendDynamicFunctionCall(
         sb: StringBuilder,
         fn: ForeignFnInteropSpec,
@@ -447,75 +485,46 @@ internal abstract class NativeHostBridgeSourceEmitter(
         hasReturn: Boolean,
         failExpr: String,
     ) {
-        fun castIntPtr(va: String): String =
-            if (isCpp) "static_cast<intptr_t>($va)" else "(intptr_t)$va"
-
         if (directReturnOnDispatch) {
             sb.append("    if (km_fn_ptr != $nullLit) {\n")
             if (fn.isVariadic) {
-                val vaPrefix = if (callArgs.isEmpty()) "" else "$callArgs, "
-                val retKw = if (hasReturn) "return " else ""
-                val brk = if (hasReturn) "" else " break;"
-                sb.append("        switch (km_vac) {\n")
-                sb.append("            case 0: ${retKw}km_fn_ptr($callArgs);$brk\n")
-                sb.append("            case 1: ${retKw}km_fn_ptr($vaPrefix${castIntPtr("km_va0")});$brk\n")
-                sb.append("            case 2: ${retKw}km_fn_ptr($vaPrefix${castIntPtr("km_va0")}, ${castIntPtr("km_va1")});$brk\n")
-                sb.append("            case 3: ${retKw}km_fn_ptr($vaPrefix${castIntPtr("km_va0")}, ${castIntPtr("km_va1")}, ${castIntPtr("km_va2")});$brk\n")
-                sb.append("            default: ${retKw}km_fn_ptr($vaPrefix${castIntPtr("km_va0")}, ${castIntPtr("km_va1")}, ${castIntPtr("km_va2")}, ${castIntPtr("km_va3")});$brk\n")
-                sb.append("        }\n")
-                if (!hasReturn) {
-                    sb.append("        return;\n")
-                }
+                appendVariadicSwitch(
+                    sb = sb,
+                    callArgs = callArgs,
+                    stmtPrefix = if (hasReturn) "return " else "",
+                    stmtSuffix = if (hasReturn) "" else " break;",
+                )
+                if (!hasReturn) sb.append("        return;\n")
             } else if (hasReturn) {
                 sb.append("        return km_fn_ptr($callArgs);\n")
             } else {
-                sb.append("        km_fn_ptr($callArgs);\n")
-                sb.append("        return;\n")
+                sb.append("        km_fn_ptr($callArgs);\n        return;\n")
             }
             sb.append("    }\n")
             sb.append("    errno = ENOSYS;\n")
-            if (hasReturn) {
-                sb.append("    return $failExpr;\n")
-            }
+            if (hasReturn) sb.append("    return $failExpr;\n")
             return
         }
 
         if (!fn.isVariadic) {
-            if (hasReturn) {
-                sb.append("    $cRet km_res;\n")
-                sb.append("    if (km_fn_ptr != $nullLit) {\n")
-                sb.append("        km_res = km_fn_ptr($callArgs);\n")
-                sb.append("    } else {\n")
-                sb.append("        errno = ENOSYS;\n")
-                sb.append("        km_res = $failExpr;\n")
-                sb.append("    }\n")
-            } else {
-                sb.append("    if (km_fn_ptr != $nullLit) {\n")
-                sb.append("        km_fn_ptr($callArgs);\n")
-                sb.append("    } else {\n")
-                sb.append("        errno = ENOSYS;\n")
-                sb.append("    }\n")
-            }
+            if (hasReturn) sb.append("    $cRet km_res;\n")
+            sb.append("    if (km_fn_ptr != $nullLit) {\n")
+            sb.append(if (hasReturn) "        km_res = km_fn_ptr($callArgs);\n" else "        km_fn_ptr($callArgs);\n")
+            sb.append("    } else {\n")
+            sb.append("        errno = ENOSYS;\n")
+            if (hasReturn) sb.append("        km_res = $failExpr;\n")
+            sb.append("    }\n")
             return
         }
 
-        val prefix = if (callArgs.isEmpty()) "" else "$callArgs, "
-        val va1 = castIntPtr("km_va0")
-        val va2 = "$va1, ${castIntPtr("km_va1")}"
-        val va3 = "$va2, ${castIntPtr("km_va2")}"
-        val va4 = "$va3, ${castIntPtr("km_va3")}"
-        val lhs = if (hasReturn) "km_res = " else ""
-        if (hasReturn) {
-            sb.append("    $cRet km_res = $failExpr;\n")
-        }
+        if (hasReturn) sb.append("    $cRet km_res = $failExpr;\n")
         sb.append("    if (km_fn_ptr != $nullLit) {\n")
-        sb.append("        switch (km_vac) {\n")
-        sb.append("            case 0: ${lhs}km_fn_ptr($callArgs); break;\n")
-        sb.append("            case 1: ${lhs}km_fn_ptr($prefix$va1); break;\n")
-        sb.append("            case 2: ${lhs}km_fn_ptr($prefix$va2); break;\n")
-        sb.append("            case 3: ${lhs}km_fn_ptr($prefix$va3); break;\n")
-        sb.append("            default: ${lhs}km_fn_ptr($prefix$va4); break;\n")
-        sb.append("        }\n")
+        appendVariadicSwitch(
+            sb = sb,
+            callArgs = callArgs,
+            stmtPrefix = if (hasReturn) "km_res = " else "",
+            stmtSuffix = " break;",
+        )
         sb.append("    } else {\n")
         sb.append("        errno = ENOSYS;\n")
         sb.append("    }\n")

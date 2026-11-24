@@ -23,7 +23,7 @@ internal fun FfiInteropCollector.buildDefFileContent(
             .map { it.wrapperSymbolName }
     val inlinePtrFns =
         inlineFunctions
-            .filter { isBridgeableInlineInCWrapper(it) && requiresNoStringConversionForInline(it.params) }
+            .filter { isBridgeableInlineInCWrapper(it) && requiresNoStringConversion(it.params) }
             .map { it.wrapperSymbolName }
     val pointerStringFns = (foreignPtrFns + inlinePtrFns).distinct()
     if (pointerStringFns.isNotEmpty()) {
@@ -32,17 +32,23 @@ internal fun FfiInteropCollector.buildDefFileContent(
     return sb.toString()
 }
 
+private fun formatCParamsDecl(params: List<InteropParamSpec>, isVariadic: Boolean = false): String {
+    val fixedParams = params.map { "${cHeaderTypeForParam(it)} ${it.cName}" }
+    val allParams =
+        if (isVariadic) {
+            fixedParams + listOf("int32_t km_vac", "int64_t km_va0", "int64_t km_va1", "int64_t km_va2", "int64_t km_va3")
+        } else {
+            fixedParams
+        }
+    return if (allParams.isEmpty()) "void" else allParams.joinToString(", ")
+}
+
 internal fun FfiInteropCollector.buildCHeaderContent(stemSnake: String): String {
     val guard = "${cSymbolPrefix.uppercase()}_${stemSnake.uppercase()}_WRAPPER_H"
     val sb = StringBuilder()
-    sb.append("#ifndef ").append(guard).append('\n')
-    sb.append("#define ").append(guard).append("\n\n")
-    sb.append("#include <stdbool.h>\n")
-    sb.append("#include <stddef.h>\n")
-    sb.append("#include <stdint.h>\n\n")
-    sb.append("#ifdef __cplusplus\n")
-    sb.append("extern \"C\" {\n")
-    sb.append("#endif\n\n")
+    sb.append("#ifndef $guard\n#define $guard\n\n")
+    sb.append("#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n\n")
+    sb.append("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
 
     val emittedPrototypes = linkedSetOf<String>()
     for (st in foreignStatics) {
@@ -56,34 +62,17 @@ internal fun FfiInteropCollector.buildCHeaderContent(stemSnake: String): String 
         }
     }
     for (fn in foreignFunctions) {
-        if (!isBridgeableInCWrapper(fn)) continue
-        if (!emittedPrototypes.add(fn.wrapperSymbolName)) continue
-        val fixedParams = fn.params.map { "${cHeaderTypeForParam(it)} ${it.cName}" }
-        val allParams =
-            if (fn.isVariadic) {
-                fixedParams + listOf("int32_t km_vac", "int64_t km_va0", "int64_t km_va1", "int64_t km_va2", "int64_t km_va3")
-            } else {
-                fixedParams
-            }
-        val paramsText = if (allParams.isEmpty()) "void" else allParams.joinToString(", ")
-        sb.append("${cHeaderTypeForReturn(fn)} ${fn.wrapperSymbolName}($paramsText);\n")
+        if (isBridgeableInCWrapper(fn) && emittedPrototypes.add(fn.wrapperSymbolName)) {
+            sb.append("${cHeaderTypeForReturn(fn)} ${fn.wrapperSymbolName}(${formatCParamsDecl(fn.params, fn.isVariadic)});\n")
+        }
     }
     for (fn in inlineFunctions) {
-        if (!isBridgeableInlineInCWrapper(fn)) continue
-        if (!emittedPrototypes.add(fn.wrapperSymbolName)) continue
-        val paramsText =
-            if (fn.params.isEmpty()) {
-                "void"
-            } else {
-                fn.params.joinToString(", ") { "${cHeaderTypeForParam(it)} ${it.cName}" }
-            }
-        sb.append("${cHeaderTypeForInlineReturn(fn)} ${fn.wrapperSymbolName}($paramsText);\n")
+        if (isBridgeableInlineInCWrapper(fn) && emittedPrototypes.add(fn.wrapperSymbolName)) {
+            sb.append("${cHeaderTypeForInlineReturn(fn)} ${fn.wrapperSymbolName}(${formatCParamsDecl(fn.params)});\n")
+        }
     }
 
-    sb.append("\n#ifdef __cplusplus\n")
-    sb.append("}\n")
-    sb.append("#endif\n\n")
-    sb.append("#endif /* ").append(guard).append(" */\n")
+    sb.append("\n#ifdef __cplusplus\n}\n#endif\n\n#endif /* $guard */\n")
     return sb.toString()
 }
 
@@ -108,8 +97,7 @@ private class CWrapperHostSourceEmitter(
         if (needsDynamicLookup) {
             sb.append("#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n")
         }
-        sb.append("#include \"").append(headerFileName).append("\"\n")
-        sb.append("#include <errno.h>\n")
+        sb.append("#include \"$headerFileName\"\n#include <errno.h>\n")
 
         val directForeignFunctions = collector.foreignFunctions.filter(collector::canCallDirectlyInCWrapper)
         val preambleIncludes = extractIncludedHeadersFromPreambles(collector.preambles)
@@ -122,7 +110,6 @@ private class CWrapperHostSourceEmitter(
         if (collector.foreignFunctions.any { collector.isBridgeableInCWrapper(it) && isAtexitForeignFn(it) }) {
             unguardedHeaders += "stdlib.h"
         }
-
         for (spec in inferredSpecs) {
             if (spec.guardCondition == null) {
                 unguardedHeaders += spec.header
@@ -131,57 +118,36 @@ private class CWrapperHostSourceEmitter(
                 winFallbackGroups.addAll(spec.windowsFallbackHeaders)
             }
         }
-
         for (hdr in unguardedHeaders) {
-            if (hdr !in preambleIncludes) {
-                sb.append("#include ").append(formatIncludeTarget(hdr)).append('\n')
-            }
+            if (hdr !in preambleIncludes) sb.append("#include ${formatIncludeTarget(hdr)}\n")
         }
         if (winFallbackGroups.isNotEmpty()) {
             sb.append("#ifdef _WIN32\n")
             for (hdr in winFallbackGroups) {
-                if (hdr !in preambleIncludes) {
-                    sb.append("#include ").append(formatIncludeTarget(hdr)).append('\n')
-                }
+                if (hdr !in preambleIncludes) sb.append("#include ${formatIncludeTarget(hdr)}\n")
             }
             sb.append("#endif\n")
         }
         for ((cond, hdrs) in guardedGroups) {
             val filtered = hdrs.filter { it !in preambleIncludes }
             if (filtered.isEmpty()) continue
-            sb.append("#if ").append(cond).append('\n')
-            for (hdr in filtered) {
-                sb.append("#include ").append(formatIncludeTarget(hdr)).append('\n')
-            }
+            sb.append("#if $cond\n")
+            for (hdr in filtered) sb.append("#include ${formatIncludeTarget(hdr)}\n")
             sb.append("#endif\n")
         }
-        if (needsDynamicLookup) {
-            appendWin32OrDlfcnDynamicHeaders(sb)
-        }
+        if (needsDynamicLookup) appendWin32OrDlfcnDynamicHeaders(sb)
         sb.append('\n')
         appendPreambles(sb)
-        if (collector.usesCppLanguage) {
-            sb.append("extern \"C\" {\n\n")
-        }
+        if (collector.usesCppLanguage) sb.append("extern \"C\" {\n\n")
     }
 
     override fun renderStaticGetter(st: ForeignStaticInteropSpec): String {
         val sb = StringBuilder()
         val cType = cHeaderTypeForBridge(st.bridgeKind)
-        val defaultLit = cDefaultFailureLiteral(st.bridgeKind)
         sb.append("$cType ${st.getterSymbolName}(void) {\n")
-        appendDynamicSymbolLookup(
-            sb = sb,
-            ptrVarName = "km_sym_ptr",
-            ptrTypeDecl = "$cType*",
-            castTargetType = "$cType*",
-            cSymbolName = st.cSymbolName,
-        )
-        sb.append("    if (km_sym_ptr != NULL) {\n")
-        sb.append("        return *km_sym_ptr;\n")
-        sb.append("    }\n")
-        sb.append("    return $defaultLit;\n")
-        sb.append("}\n")
+        appendStaticSymbolPtrLookup(sb, st)
+        sb.append("    if (km_sym_ptr != NULL) {\n        return *km_sym_ptr;\n    }\n")
+        sb.append("    return ${cDefaultFailureLiteral(st.bridgeKind)};\n}\n")
         return sb.toString()
     }
 
@@ -189,17 +155,8 @@ private class CWrapperHostSourceEmitter(
         val sb = StringBuilder()
         val cType = cHeaderTypeForBridge(st.bridgeKind)
         sb.append("void ${st.setterSymbolName}($cType km_val) {\n")
-        appendDynamicSymbolLookup(
-            sb = sb,
-            ptrVarName = "km_sym_ptr",
-            ptrTypeDecl = "$cType*",
-            castTargetType = "$cType*",
-            cSymbolName = st.cSymbolName,
-        )
-        sb.append("    if (km_sym_ptr != NULL) {\n")
-        sb.append("        *km_sym_ptr = km_val;\n")
-        sb.append("    }\n")
-        sb.append("}\n")
+        appendStaticSymbolPtrLookup(sb, st)
+        sb.append("    if (km_sym_ptr != NULL) {\n        *km_sym_ptr = km_val;\n    }\n}\n")
         return sb.toString()
     }
 
@@ -213,13 +170,7 @@ private class CWrapperHostSourceEmitter(
     private fun renderDirectForeignWrapperCFunction(fn: ForeignFnInteropSpec): String {
         val sb = StringBuilder()
         val retType = cHeaderTypeForReturn(fn)
-        val paramsText =
-            if (fn.params.isEmpty()) {
-                "void"
-            } else {
-                fn.params.joinToString(", ") { "${cHeaderTypeForParam(it)} ${it.cName}" }
-            }
-        sb.append("$retType ${fn.wrapperSymbolName}($paramsText) {\n")
+        sb.append("$retType ${fn.wrapperSymbolName}(${formatCParamsDecl(fn.params)}) {\n")
 
         val symGuard = symbolPlatformGuard(fn.cSymbolName)
         val callArgs =
@@ -232,22 +183,16 @@ private class CWrapperHostSourceEmitter(
             }
         val callExpr = "${fn.cSymbolName}($callArgs)"
 
-        if (symGuard != null) {
-            sb.append("#if ").append(symGuard).append('\n')
-        }
+        if (symGuard != null) sb.append("#if $symGuard\n")
         when (fn.returnBridgeKind) {
-            CAbiBridgeKind.VOID, CAbiBridgeKind.NEVER -> sb.append("    ").append(callExpr).append(";\n")
+            CAbiBridgeKind.VOID, CAbiBridgeKind.NEVER -> sb.append("    $callExpr;\n")
             else -> sb.append("    return ($retType)$callExpr;\n")
         }
         if (symGuard != null) {
             sb.append("#else\n")
-            for (param in fn.params) {
-                sb.append("    (void)").append(param.cName).append(";\n")
-            }
+            for (param in fn.params) sb.append("    (void)${param.cName};\n")
             sb.append("    errno = ENOSYS;\n")
-            if (hasNonVoidReturn(fn.returnBridgeKind)) {
-                sb.append("    return ").append(cFailureReturnExpr(fn)).append(";\n")
-            }
+            if (hasNonVoidReturn(fn.returnBridgeKind)) sb.append("    return ${cFailureReturnExpr(fn)};\n")
             sb.append("#endif\n")
         }
         sb.append("}\n")
@@ -257,20 +202,9 @@ private class CWrapperHostSourceEmitter(
     private fun renderDynamicForeignWrapperCFunction(fn: ForeignFnInteropSpec): String {
         val sb = StringBuilder()
         val retType = cHeaderTypeForReturn(fn)
-        val fixedParams = fn.params.map { "${cHeaderTypeForParam(it)} ${it.cName}" }
-        val allParams =
-            if (fn.isVariadic) {
-                fixedParams + listOf("int32_t km_vac", "int64_t km_va0", "int64_t km_va1", "int64_t km_va2", "int64_t km_va3")
-            } else {
-                fixedParams
-            }
-        val paramsText = if (allParams.isEmpty()) "void" else allParams.joinToString(", ")
-        val cParamTypes = formatCFunctionParamTypes(fn)
-        val callArgs = fn.params.joinToString(", ") { it.cName }
-        val hasReturn = hasNonVoidReturn(fn.returnBridgeKind)
         val isAtexit = isAtexitForeignFn(fn)
 
-        sb.append("$retType ${fn.wrapperSymbolName}($paramsText) {\n")
+        sb.append("$retType ${fn.wrapperSymbolName}(${formatCParamsDecl(fn.params, fn.isVariadic)}) {\n")
         if (isAtexit) {
             val cbName = fn.params[0].cName
             appendAtexitGuardPrefix(
@@ -284,13 +218,11 @@ private class CWrapperHostSourceEmitter(
             sb = sb,
             fn = fn,
             cRet = retType,
-            cParamTypes = cParamTypes,
-            callArgs = callArgs,
-            hasReturn = hasReturn,
+            cParamTypes = formatCFunctionParamTypes(fn),
+            callArgs = fn.params.joinToString(", ") { it.cName },
+            hasReturn = hasNonVoidReturn(fn.returnBridgeKind),
         )
-        if (isAtexit) {
-            sb.append("#endif\n")
-        }
+        if (isAtexit) sb.append("#endif\n")
         sb.append("}\n")
         return sb.toString()
     }
@@ -298,39 +230,23 @@ private class CWrapperHostSourceEmitter(
     override fun renderInlineFunction(fn: InlineCFunctionSpec): String =
         renderInlineWrapperCFunction(fn)
 
-    override fun emitFileFooter(
-        sb: StringBuilder,
-        emittedSymbols: Set<String>,
-    ) {
-        if (collector.usesCppLanguage) {
-            sb.append("} /* extern \"C\" */\n")
-        }
+    override fun emitFileFooter(sb: StringBuilder, emittedSymbols: Set<String>) {
+        if (collector.usesCppLanguage) sb.append("} /* extern \"C\" */\n")
     }
 }
 
 internal fun renderInlineWrapperCFunction(fn: InlineCFunctionSpec): String {
     val sb = StringBuilder()
-    val retType = cHeaderTypeForInlineReturn(fn)
-    val paramsText =
-        if (fn.params.isEmpty()) {
-            "void"
-        } else {
-            fn.params.joinToString(", ") { "${cHeaderTypeForParam(it)} ${it.cName}" }
-        }
-    sb.append("$retType ${fn.wrapperSymbolName}($paramsText) {\n")
+    sb.append("${cHeaderTypeForInlineReturn(fn)} ${fn.wrapperSymbolName}(${formatCParamsDecl(fn.params)}) {\n")
     for (param in fn.params) {
         if (!containsCIdentifier(fn.rawBody, param.cName)) {
-            sb.append("    (void)").append(param.cName).append(";\n")
+            sb.append("    (void)${param.cName};\n")
         }
     }
     val bodyTrimmed = fn.rawBody.trim()
     if (bodyTrimmed.isNotEmpty()) {
         for (line in bodyTrimmed.lines()) {
-            if (line.isBlank()) {
-                sb.append('\n')
-            } else {
-                sb.append("    ").append(line.trimEnd()).append('\n')
-            }
+            sb.append(if (line.isBlank()) "\n" else "    ${line.trimEnd()}\n")
         }
     }
     sb.append("}\n")
@@ -347,23 +263,25 @@ private class NativeActualsEmitter(
     pkgName: String?,
     private val cinteropPkg: String,
 ) : PlatformActualsKotlinEmitter(collector, pkgName) {
-    private val declaredInFile: Set<String> =
-        buildSet {
-            addAll(collector.localDeclaredTypeNames)
-            addAll(collector.headerContext.moduleDeclaredTypeNames)
-            for (fn in collector.foreignFunctions) add(fn.kotlinName)
-            for (fn in collector.inlineFunctions) add(fn.kotlinName)
-            for (st in collector.foreignStatics) add(st.kotlinName)
-        }
-
     override val fileOptIns: List<String> = listOf("ExperimentalForeignApi::class", "ExperimentalUnsignedTypes::class")
 
     override fun initializeImports() {
         imports += "kotlinx.cinterop.ExperimentalForeignApi"
     }
 
+    override fun convertParamArg(param: InteropParamSpec, noStringConvEnabled: Boolean): String =
+        collector.renderNativeParamConversion(param, noStringConvEnabled, imports)
+
+    override fun convertReturnExpr(
+        rawCall: String,
+        kotlinReturnType: String,
+        returnBridgeKind: CAbiBridgeKind,
+        returnDefaultExpr: String,
+    ): String =
+        collector.renderNativeReturnConversion(rawCall, kotlinReturnType, returnBridgeKind, returnDefaultExpr, pkgName, imports)
+
     private fun resolveCinteropCallee(wrapperSym: String): Pair<String, String> =
-        if (wrapperSym in declaredInFile) {
+        if (wrapperSym in declaredSymbolsInModule) {
             val alias = "cinterop${toPascalCaseIdentifierPart(wrapperSym)}"
             alias to "$cinteropPkg.$wrapperSym as $alias"
         } else {
@@ -373,55 +291,17 @@ private class NativeActualsEmitter(
     override fun renderBridgeableStatic(st: ForeignStaticInteropSpec): String {
         val (getterCallee, getterImport) = resolveCinteropCallee(st.getterWrapperSymbolName)
         val setterPair = if (st.isMutable) resolveCinteropCallee(st.setterWrapperSymbolName) else null
-        val getBody =
-            collector.renderNativeReturnConversion(
-                rawCall = "$getterCallee()",
-                kotlinReturnType = st.kotlinType,
-                returnBridgeKind = st.bridgeKind,
-                returnDefaultExpr = st.defaultExpr,
-                pkgName = pkgName,
-                importsOut = imports,
-            )
-        val setCall =
-            if (st.isMutable) {
-                val valParam = InteropParamSpec(kotlinName = "value", kotlinType = st.kotlinType, cName = "value", bridgeKind = st.bridgeKind)
-                val setArg = collector.renderNativeParamConversion(valParam, noStringConvEnabled = true, importsOut = imports)
-                "${setterPair?.first ?: st.setterWrapperSymbolName}($setArg)"
-            } else {
-                null
-            }
-        val rendered = renderStaticPropertyDecl(st, getBody, setCall)
+        val rendered = renderStandardStaticProperty(st, getterCallee, setterPair?.first)
         val renderedTokens = extractIdentifierTokens(rendered)
-        if (getterCallee in renderedTokens) {
-            imports += getterImport
-        }
-        if (setterPair != null && setterPair.first in renderedTokens) {
-            imports += setterPair.second
-        }
+        if (getterCallee in renderedTokens) imports += getterImport
+        if (setterPair != null && setterPair.first in renderedTokens) imports += setterPair.second
         return rendered
     }
 
     override fun renderBridgeableCallable(entry: CallableInteropEntry): String {
         val (calleeIdent, calleeImport) = resolveCinteropCallee(entry.wrapperSymbolName)
-        val rendered =
-            renderStandardBridgeableCallable(
-                entry = entry,
-                calleeExpr = calleeIdent,
-                convertParam = { p, noStr -> collector.renderNativeParamConversion(p, noStr, imports) },
-                convertReturn = { rawCall, e ->
-                    collector.renderNativeReturnConversion(
-                        rawCall = rawCall,
-                        kotlinReturnType = e.kotlinReturnType,
-                        returnBridgeKind = e.returnBridgeKind,
-                        returnDefaultExpr = e.returnDefaultExpr,
-                        pkgName = pkgName,
-                        importsOut = imports,
-                    )
-                },
-            )
-        if (calleeIdent in extractIdentifierTokens(rendered)) {
-            imports += calleeImport
-        }
+        val rendered = renderStandardCallable(entry, calleeIdent)
+        if (calleeIdent in extractIdentifierTokens(rendered)) imports += calleeImport
         return rendered
     }
 }
@@ -454,15 +334,12 @@ internal fun FfiInteropCollector.renderWasmWasiScalarReturn(
         if (numericKind != null) {
             conversionMethodForNumericKind(numericKind)
         } else {
-            when (kind) {
-                CAbiBridgeKind.I8 -> "toByte"
-                CAbiBridgeKind.U8 -> "toUByte"
-                CAbiBridgeKind.I16 -> "toShort"
-                CAbiBridgeKind.U16 -> "toUShort"
-                CAbiBridgeKind.U32 -> "toUInt"
-                CAbiBridgeKind.U64 -> "toULong"
-                else -> null
-            }
+            bridgeDescriptorFor(kind).defaultReturnConv
+                ?: when (kind) {
+                    CAbiBridgeKind.I8 -> "toByte"
+                    CAbiBridgeKind.I16 -> "toShort"
+                    else -> null
+                }
         }
     return if (conversion == null) rawCall else "$rawCall.$conversion()"
 }
@@ -477,9 +354,7 @@ private class WasmWasiActualsEmitter(
     private val module: String = computeFfiModuleNameLower(collector.headerContext)
     private val emittedImports = linkedSetOf<String>()
 
-    override val fileOptIns: List<String> =
-        listOf("ExperimentalUnsignedTypes::class", "ExperimentalWasmInterop::class")
-
+    override val fileOptIns: List<String> = listOf("ExperimentalUnsignedTypes::class", "ExperimentalWasmInterop::class")
     override val leadingComment: String =
         "// The host must provide the C companion wrapper exports in import module $module."
 
@@ -499,24 +374,25 @@ private class WasmWasiActualsEmitter(
     }
 
     private fun renderWasmWasiStatic(st: ForeignStaticInteropSpec): String {
+        val isScalar = wasmWasiScalarType(st.bridgeKind) !in listOf(null, "Unit")
+        val unsupportedExpr =
+            "throw UnsupportedOperationException(\"WasmWasi foreign static ${st.cSymbolName} requires a host memory/aggregate ABI adapter\")"
         val getter =
-            if (wasmWasiScalarType(st.bridgeKind) !in listOf(null, "Unit")) {
+            if (isScalar) {
                 val callee = importFunction(st.getterSymbolName, emptyList(), st.bridgeKind)
                 collector.renderWasmWasiScalarReturn("$callee()", st.kotlinType, st.bridgeKind)
             } else {
-                "throw UnsupportedOperationException(\"WasmWasi foreign static ${st.cSymbolName} requires a host memory/aggregate ABI adapter\")"
+                unsupportedExpr
             }
         val setter =
-            if (st.isMutable) {
-                if (wasmWasiScalarType(st.bridgeKind) !in listOf(null, "Unit")) {
-                    val param = InteropParamSpec("value", "value", st.kotlinType, bridgeKind = st.bridgeKind)
+            when {
+                !st.isMutable -> null
+                isScalar -> {
+                    val param = st.asSetterParamSpec()
                     val callee = importFunction(st.setterSymbolName, listOf(param), CAbiBridgeKind.VOID)
                     "$callee(${collector.renderWasmWasiScalarArgument(param)})"
-                } else {
-                    "throw UnsupportedOperationException(\"WasmWasi foreign static ${st.cSymbolName} requires a host memory/aggregate ABI adapter\")"
                 }
-            } else {
-                null
+                else -> unsupportedExpr
             }
         return renderStaticPropertyDecl(st, getter, setter)
     }
@@ -537,7 +413,7 @@ private class WasmWasiActualsEmitter(
             )
         }
         val callee = importFunction(entry.wrapperSymbolName, entry.params, entry.returnBridgeKind)
-        val signature = entry.params.joinToString(", ") { "${it.kotlinName}: ${it.kotlinType}" }
+        val signature = formatKotlinActualParamsSig(entry.params, isVariadic = false)
         val call = "$callee(${entry.params.joinToString(", ") { collector.renderWasmWasiScalarArgument(it) }})"
         return if (entry.returnBridgeKind == CAbiBridgeKind.NEVER) {
             "${entry.visibilityPrefix}actual fun ${entry.kotlinName}($signature): Nothing {\n" +
@@ -563,9 +439,7 @@ internal fun wasmJsInteropTypeForParam(
     ktStringType: String = "String",
 ): String =
     when {
-        param.bridgeKind == CAbiBridgeKind.CONST_CSTR &&
-            !noStringConvEnabled &&
-            (param.kotlinType == "String?" || param.kotlinType == "String") -> "$ktStringType?"
+        param.isDirectStringBridge(noStringConvEnabled) -> "$ktStringType?"
         param.bridgeKind == CAbiBridgeKind.BY_VALUE_OBJECT -> ktStringType
         else -> bridgeDescriptorFor(param.bridgeKind).wasmJsType ?: ktStringType
     }
@@ -612,48 +486,38 @@ private class WasmJsActualsEmitter(
     override val stringifyVariadicArgs: Boolean = true
     override val addonAvailabilityGuard: String = availPropName
 
+    override fun convertParamArg(param: InteropParamSpec, noStringConvEnabled: Boolean): String =
+        collector.renderJsOrWasmParamConversion(param, noStringConvEnabled)
+
+    override fun convertReturnExpr(
+        rawCall: String,
+        kotlinReturnType: String,
+        returnBridgeKind: CAbiBridgeKind,
+        returnDefaultExpr: String,
+    ): String =
+        collector.renderWasmJsReturnConversion(rawCall, kotlinReturnType, returnBridgeKind, returnDefaultExpr, pkgName, imports)
+
+    private fun registerExternalIfNeeded(wrapperSymbol: String, paramTypes: List<String>, returnType: String) {
+        if (emittedExternals.add(wrapperSymbol)) {
+            externalDecls += renderWasmJsExternalDecl(wrapperSymbol, paramTypes, returnType, ffiModName)
+        }
+    }
+
     override fun renderBridgeableStatic(st: ForeignStaticInteropSpec): String {
         usesAddon = true
-        if (emittedExternals.add(st.getterWrapperSymbolName)) {
-            externalDecls +=
-                renderWasmJsExternalDecl(
-                    wrapperSymbolName = st.getterWrapperSymbolName,
-                    paramTypes = emptyList(),
-                    returnType = wasmJsInteropTypeForReturn(st.bridgeKind, ktStringType),
-                    ffiModName = ffiModName,
-                )
+        registerExternalIfNeeded(st.getterWrapperSymbolName, emptyList(), wasmJsInteropTypeForReturn(st.bridgeKind, ktStringType))
+        if (st.isMutable) {
+            val setterType = wasmJsInteropTypeForParam(st.asSetterParamSpec(), noStringConvEnabled = true, ktStringType = ktStringType)
+            registerExternalIfNeeded(st.setterWrapperSymbolName, listOf(setterType), "Unit")
         }
-        val setCall =
-            if (st.isMutable) {
-                val valParam = InteropParamSpec(kotlinName = "value", kotlinType = st.kotlinType, cName = "value", bridgeKind = st.bridgeKind)
-                if (emittedExternals.add(st.setterWrapperSymbolName)) {
-                    externalDecls +=
-                        renderWasmJsExternalDecl(
-                            wrapperSymbolName = st.setterWrapperSymbolName,
-                            paramTypes = listOf(wasmJsInteropTypeForParam(valParam, noStringConvEnabled = true, ktStringType = ktStringType)),
-                            returnType = "Unit",
-                            ffiModName = ffiModName,
-                        )
-                }
-                val setArg = collector.renderJsOrWasmParamConversion(valParam, noStringConvEnabled = true)
-                "wasm${toPascalCaseIdentifierPart(st.setterWrapperSymbolName)}($setArg)"
-            } else {
-                null
-            }
-        val convertedGet =
-            collector.renderWasmJsReturnConversion(
-                rawCall = "wasm${toPascalCaseIdentifierPart(st.getterWrapperSymbolName)}()",
-                kotlinReturnType = st.kotlinType,
-                returnBridgeKind = st.bridgeKind,
-                returnDefaultExpr = st.defaultExpr,
-                pkgName = pkgName,
-                importsOut = imports,
-            )
-        return renderStaticPropertyDecl(st, convertedGet, setCall)
+        return renderStandardStaticProperty(
+            st = st,
+            getterCallee = "wasm${toPascalCaseIdentifierPart(st.getterWrapperSymbolName)}",
+            setterCallee = "wasm${toPascalCaseIdentifierPart(st.setterWrapperSymbolName)}",
+        )
     }
 
     override fun onBeforeDedupBridgeableCallable(entry: CallableInteropEntry) {
-        if (!emittedExternals.add(entry.wrapperSymbolName)) return
         val baseParamTypes = entry.params.map { wasmJsInteropTypeForParam(it, entry.noStringConvEnabled, ktStringType) }
         val allParamTypes =
             if (entry.isVariadicCall) {
@@ -661,43 +525,24 @@ private class WasmJsActualsEmitter(
             } else {
                 baseParamTypes
             }
-        externalDecls +=
-            renderWasmJsExternalDecl(
-                wrapperSymbolName = entry.wrapperSymbolName,
-                paramTypes = allParamTypes,
-                returnType = wasmJsInteropTypeForReturn(entry.returnBridgeKind, ktStringType),
-                ffiModName = ffiModName,
-            )
+        registerExternalIfNeeded(entry.wrapperSymbolName, allParamTypes, wasmJsInteropTypeForReturn(entry.returnBridgeKind, ktStringType))
     }
 
     override fun renderBridgeableCallable(entry: CallableInteropEntry): String {
         usesAddon = true
-        return renderStandardBridgeableCallable(
-            entry = entry,
-            calleeExpr = "wasm${toPascalCaseIdentifierPart(entry.wrapperSymbolName)}",
-            convertParam = { p, noStr -> collector.renderJsOrWasmParamConversion(p, noStr) },
-            convertReturn = { rawCall, e ->
-                collector.renderWasmJsReturnConversion(
-                    rawCall = rawCall,
-                    kotlinReturnType = e.kotlinReturnType,
-                    returnBridgeKind = e.returnBridgeKind,
-                    returnDefaultExpr = e.returnDefaultExpr,
-                    pkgName = pkgName,
-                    importsOut = imports,
-                )
-            },
-        )
+        return renderStandardCallable(entry, "wasm${toPascalCaseIdentifierPart(entry.wrapperSymbolName)}")
     }
 
     override fun prependPreambleBlocks(blocks: MutableList<String>) {
         if (!usesAddon) return
         val initJs = "() => { ${buildNodeNapiLoaderJsBody(ffiModName, returnBooleanStatus = true)}}"
-        val loaderBlock =
+        blocks.add(
+            0,
             "@JsFun(\"$initJs\")\n" +
                 "private external fun init${stemPascal}NapiAddon(): Boolean\n\n" +
                 "private val $availPropName: Boolean = init${stemPascal}NapiAddon()\n\n" +
-                externalDecls.joinToString("\n\n")
-        blocks.add(0, loaderBlock)
+                externalDecls.joinToString("\n\n"),
+        )
     }
 }
 
@@ -709,43 +554,34 @@ internal fun FfiInteropCollector.renderWasmJsReturnConversion(
     pkgName: String?,
     importsOut: MutableSet<String>,
 ): String =
-    renderLongOrScalarBridgeReturnConversion(
+    renderBridgeReturnConversion(
         rawCall = rawCall,
         kotlinReturnType = kotlinReturnType,
         returnBridgeKind = returnBridgeKind,
         returnDefaultExpr = returnDefaultExpr,
         pkgName = pkgName,
         importsOut = importsOut,
-        subIntBase = rawCall,
-        i64Base = "$rawCall.toLong()",
-        u64Base = "$rawCall.toULong()",
-        ptrLongExpr = "$rawCall.toLong()",
-        boolExpr = rawCall,
-        f32Expr = "$rawCall.toFloat()",
-        f64Expr = rawCall,
-        signedSubIntKeepsRaw = false,
-        fallbackNonScalar = returnDefaultExpr,
+        profile =
+            BridgeReturnConversionProfile(
+                subIntBase = rawCall,
+                i64Base = "$rawCall.toLong()",
+                u64Base = "$rawCall.toULong()",
+                ptrLongExpr = "$rawCall.toLong()",
+                boolExpr = rawCall,
+                f32Expr = "$rawCall.toFloat()",
+                f64Expr = rawCall,
+                fallbackNonScalar = returnDefaultExpr,
+            ),
     )
 
 internal fun FfiInteropCollector.renderPointerParamToCPointer(
     param: InteropParamSpec,
     importsOut: MutableSet<String>,
 ): String {
-    val ktType = param.kotlinType
-    val nonNullNumeric = if (!ktType.endsWith("?")) resolveNumericKind(ktType) else null
     importsOut += "kotlinx.cinterop.ByteVar"
     importsOut += "kotlinx.cinterop.toCPointer"
-    if (headerContext.rawAbiMode || ktType == "Long" || nonNullNumeric != null) {
-        return if (ktType == "Long" || nonNullNumeric == NumericKind.I64) {
-            "${param.kotlinName}.toCPointer<ByteVar>()"
-        } else {
-            "${param.kotlinName}.toLong().toCPointer<ByteVar>()"
-        }
-    }
-    if (param.bridgeKind == CAbiBridgeKind.CALLBACK_PTR) {
-        return "0L.toCPointer<ByteVar>()"
-    }
-    return "${param.kotlinName}.rawAddress.toCPointer<ByteVar>()"
+    val longAddr = renderPointerParamToLong(param)
+    return "$longAddr.toCPointer<ByteVar>()"
 }
 
 internal fun FfiInteropCollector.renderNativeParamConversion(
@@ -754,7 +590,7 @@ internal fun FfiInteropCollector.renderNativeParamConversion(
     importsOut: MutableSet<String>,
 ): String =
     when (param.bridgeKind) {
-        CAbiBridgeKind.CONST_CSTR -> {
+        CAbiBridgeKind.CONST_CSTR ->
             when {
                 !noStringConvEnabled -> param.kotlinName
                 param.kotlinType == "String?" -> {
@@ -767,7 +603,6 @@ internal fun FfiInteropCollector.renderNativeParamConversion(
                 }
                 else -> renderPointerParamToCPointer(param, importsOut)
             }
-        }
         CAbiBridgeKind.MUT_CSTR,
         CAbiBridgeKind.OPAQUE_PTR,
         CAbiBridgeKind.FILE_PTR,
@@ -793,58 +628,30 @@ internal fun FfiInteropCollector.renderNativeReturnConversion(
     pkgName: String?,
     importsOut: MutableSet<String>,
 ): String {
-    val retNonNullNumeric = if (!kotlinReturnType.endsWith("?")) resolveNumericKind(kotlinReturnType) else null
-    val isRawPointerReturn = headerContext.rawAbiMode || kotlinReturnType == "Long" || retNonNullNumeric != null
-    val desc = bridgeDescriptorFor(returnBridgeKind)
-    return when (returnBridgeKind) {
-        CAbiBridgeKind.VOID -> rawCall
-        CAbiBridgeKind.CALLBACK_PTR ->
-            if (isRawPointerReturn) {
-                importsOut += "kotlinx.cinterop.toLong"
-                if (retNonNullNumeric == NumericKind.I64 || kotlinReturnType == "Long" || retNonNullNumeric == null) {
-                    "$rawCall?.toLong() ?: 0L"
-                } else {
-                    "($rawCall?.toLong() ?: 0L).${conversionMethodForNumericKind(retNonNullNumeric)}()"
-                }
-            } else {
-                returnDefaultExpr
-            }
-        CAbiBridgeKind.CONST_CSTR,
-        CAbiBridgeKind.MUT_CSTR,
-        CAbiBridgeKind.OPAQUE_PTR,
-        CAbiBridgeKind.FILE_PTR,
-        CAbiBridgeKind.DIR_PTR,
-        -> {
-            importsOut += "kotlinx.cinterop.toLong"
-            if (isRawPointerReturn) {
-                if (retNonNullNumeric == NumericKind.I64 || kotlinReturnType == "Long" || retNonNullNumeric == null) {
-                    "$rawCall?.toLong() ?: 0L"
-                } else {
-                    "($rawCall?.toLong() ?: 0L).${conversionMethodForNumericKind(retNonNullNumeric)}()"
-                }
-            } else {
-                wrapLongAddressForPointerReturn(
-                    addrExpr = "$rawCall?.toLong() ?: 0L",
-                    kotlinReturnType = kotlinReturnType,
-                    returnBridgeKind = returnBridgeKind,
-                    returnDefaultExpr = returnDefaultExpr,
-                    pkgName = pkgName,
-                    importsOut = importsOut,
-                )
-            }
-        }
-        CAbiBridgeKind.I8, CAbiBridgeKind.U8,
-        CAbiBridgeKind.I16, CAbiBridgeKind.U16,
-        CAbiBridgeKind.I32, CAbiBridgeKind.U32,
-        CAbiBridgeKind.I64, CAbiBridgeKind.U64,
-        ->
-            if (retNonNullNumeric != null && retNonNullNumeric != desc.numericKind) {
-                "$rawCall.${conversionMethodForNumericKind(retNonNullNumeric)}()"
-            } else {
-                rawCall
-            }
-        else -> rawCall
-    }
+    val ptrLong = "$rawCall?.toLong() ?: 0L"
+    return renderBridgeReturnConversion(
+        rawCall = rawCall,
+        kotlinReturnType = kotlinReturnType,
+        returnBridgeKind = returnBridgeKind,
+        returnDefaultExpr = returnDefaultExpr,
+        pkgName = pkgName,
+        importsOut = importsOut,
+        profile =
+            BridgeReturnConversionProfile(
+                subIntBase = rawCall,
+                i64Base = rawCall,
+                u64Base = rawCall,
+                ptrLongExpr = ptrLong,
+                ptrLongReceiverExpr = "($ptrLong)",
+                boolExpr = rawCall,
+                f32Expr = rawCall,
+                f64Expr = rawCall,
+                nativeTypedIntegrals = true,
+                callbackConvertsNonLongNumeric = true,
+                pointerImport = "kotlinx.cinterop.toLong",
+                fallbackNonScalar = rawCall,
+            ),
+    )
 }
 
 internal fun inferRequiredHeaders(
@@ -854,9 +661,7 @@ internal fun inferRequiredHeaders(
     preambleIncludes: Set<String>,
 ): List<PlatformHeaderSpec> {
     val specs = mutableListOf<PlatformHeaderSpec>()
-    for (hdr in explicitHeaders) {
-        specs += classifyHeaderGuard(hdr)
-    }
+    explicitHeaders.mapTo(specs, ::classifyHeaderGuard)
     for (fn in foreignFunctions) {
         specs.addAll(headersForCSymbol(fn.cSymbolName))
         if (fn.returnBridgeKind == CAbiBridgeKind.FILE_PTR || fn.params.any { it.bridgeKind == CAbiBridgeKind.FILE_PTR }) {
@@ -868,13 +673,14 @@ internal fun inferRequiredHeaders(
     }
     for (fn in inlineFunctions) {
         for ((sym, hdrList) in C_SYMBOL_HEADERS) {
-            if (containsCIdentifier(fn.rawBody, sym)) {
-                specs.addAll(hdrList)
-            }
+            if (containsCIdentifier(fn.rawBody, sym)) specs.addAll(hdrList)
         }
     }
     return specs.filter { it.header !in preambleIncludes }.distinct()
 }
+
+private const val BSD_APPLE_GUARD =
+    "defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)"
 
 private fun classifyHeaderGuard(header: String): PlatformHeaderSpec {
     val target = formatIncludeTarget(header)
@@ -883,10 +689,7 @@ private fun classifyHeaderGuard(header: String): PlatformHeaderSpec {
         header.startsWith("linux/") || header == "sys/epoll.h" || header == "sys/eventfd.h" || header == "sys/signalfd.h" ->
             PlatformHeaderSpec(header, guardCondition = "defined(__linux__)")
         header == "sys/event.h" || header.startsWith("mach/") ->
-            PlatformHeaderSpec(
-                header,
-                guardCondition = "defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)",
-            )
+            PlatformHeaderSpec(header, guardCondition = BSD_APPLE_GUARD)
         header == "windows.h" || header == "winsock2.h" || header == "ws2tcpip.h" || header == "io.h" || header == "direct.h" ->
             PlatformHeaderSpec(header, guardCondition = "defined(_WIN32)")
         header in COMMON_POSIX_HEADERS ->
@@ -897,11 +700,10 @@ private fun classifyHeaderGuard(header: String): PlatformHeaderSpec {
 }
 
 internal fun symbolPlatformGuard(cSymbol: String): String? =
-    when {
-        cSymbol in LINUX_ONLY_SYMBOLS -> "defined(__linux__)"
-        cSymbol in BSD_APPLE_ONLY_SYMBOLS ->
-            "defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)"
-        cSymbol in POSIX_NON_WIN32_SYMBOLS -> "!defined(_WIN32)"
+    when (cSymbol) {
+        in LINUX_ONLY_SYMBOLS -> "defined(__linux__)"
+        in BSD_APPLE_ONLY_SYMBOLS -> BSD_APPLE_GUARD
+        in POSIX_NON_WIN32_SYMBOLS -> "!defined(_WIN32)"
         else -> null
     }
 
@@ -939,18 +741,13 @@ private val POSIX_NON_WIN32_SYMBOLS: Set<String> =
             "ftruncate truncate kill socketpair"
     ).split(' ').toSet()
 
-internal fun isDirectCallSafeSymbol(fn: ForeignFnInteropSpec): Boolean {
-    if (fn.dllName != null) return false
-    val expectedArity = DIRECT_C_SYMBOL_ARITY[fn.cSymbolName] ?: return false
-    return fn.params.size == expectedArity
-}
+internal fun isDirectCallSafeSymbol(fn: ForeignFnInteropSpec): Boolean =
+    fn.dllName == null && DIRECT_C_SYMBOL_ARITY[fn.cSymbolName] == fn.params.size
 
 private val DIRECT_C_SYMBOL_ARITY: Map<String, Int> =
     buildMap {
         fun reg(arity: Int, names: String) {
-            for (name in names.split(' ')) {
-                if (name.isNotEmpty()) put(name, arity)
-            }
+            for (name in names.split(' ')) if (name.isNotEmpty()) put(name, arity)
         }
         reg(0, "abort rand getchar tmpfile clock localeconv getpid geteuid getuid getegid getgid dlerror kqueue")
         reg(
@@ -960,8 +757,7 @@ private val DIRECT_C_SYMBOL_ARITY: Map<String, Int> =
                 "isalnum isalpha isblank iscntrl isdigit isgraph islower isprint ispunct isspace isupper isxdigit " +
                 "tolower toupper sin cos tan asin acos atan exp log log10 sqrt ceil floor fabs round trunc time " +
                 "mktime gmtime localtime asctime ctime raise umask close dup pipe chdir unlink rmdir isatty sleep " +
-                "usleep fsync sysconf unsetenv dlclose " +
-                "wait opendir readdir closedir rewinddir epoll_create epoll_create1",
+                "usleep fsync sysconf unsetenv dlclose wait opendir readdir closedir rewinddir epoll_create epoll_create1",
         )
         reg(
             2,
@@ -984,9 +780,7 @@ private val DIRECT_C_SYMBOL_ARITY: Map<String, Int> =
 private val C_SYMBOL_HEADERS: Map<String, List<PlatformHeaderSpec>> =
     buildMap {
         fun register(headers: List<PlatformHeaderSpec>, symbols: String) {
-            for (sym in symbols.split(' ')) {
-                if (sym.isNotEmpty()) put(sym, headers)
-            }
+            for (sym in symbols.split(' ')) if (sym.isNotEmpty()) put(sym, headers)
         }
         register(
             listOf(PlatformHeaderSpec("stdlib.h")),
@@ -1020,43 +814,23 @@ private val C_SYMBOL_HEADERS: Map<String, List<PlatformHeaderSpec>> =
             "stat fstat lstat mkdir chmod fchmod umask mkfifo mknod",
         )
         register(
-            listOf(
-                PlatformHeaderSpec(
-                    header = "unistd.h",
-                    guardCondition = "!defined(_WIN32)",
-                    windowsFallbackHeaders = listOf("io.h", "process.h", "direct.h"),
-                ),
-            ),
+            listOf(PlatformHeaderSpec("unistd.h", "!defined(_WIN32)", listOf("io.h", "process.h", "direct.h"))),
             "read write close lseek dup dup2 pipe chdir getcwd unlink rmdir access isatty getpid " +
                 "sleep usleep fsync ftruncate truncate link symlink readlink chown fchown geteuid getuid getegid getgid fork sysconf",
         )
-        register(listOf(PlatformHeaderSpec("stdlib.h"), PlatformHeaderSpec("unistd.h", guardCondition = "!defined(_WIN32)")), "setenv unsetenv")
-        register(listOf(PlatformHeaderSpec("sys/mman.h", guardCondition = "!defined(_WIN32)")), "mmap munmap mprotect msync mlock munlock")
+        register(listOf(PlatformHeaderSpec("stdlib.h"), PlatformHeaderSpec("unistd.h", "!defined(_WIN32)")), "setenv unsetenv")
+        register(listOf(PlatformHeaderSpec("sys/mman.h", "!defined(_WIN32)")), "mmap munmap mprotect msync mlock munlock")
         register(
-            listOf(
-                PlatformHeaderSpec(
-                    header = "sys/socket.h",
-                    guardCondition = "!defined(_WIN32)",
-                    windowsFallbackHeaders = listOf("winsock2.h", "ws2tcpip.h"),
-                ),
-            ),
+            listOf(PlatformHeaderSpec("sys/socket.h", "!defined(_WIN32)", listOf("winsock2.h", "ws2tcpip.h"))),
             "socket bind listen accept connect send recv sendto recvfrom setsockopt getsockopt shutdown getsockname getpeername socketpair",
         )
-        register(listOf(PlatformHeaderSpec("dlfcn.h", guardCondition = "!defined(_WIN32)")), "dlopen dlsym dlclose dlerror")
-        register(listOf(PlatformHeaderSpec("pthread.h", guardCondition = "!defined(_WIN32)")), "pthread_create pthread_join pthread_detach pthread_self pthread_equal pthread_kill")
-        register(listOf(PlatformHeaderSpec("semaphore.h", guardCondition = "!defined(_WIN32)")), "sem_init sem_destroy sem_wait sem_trywait sem_post")
-        register(listOf(PlatformHeaderSpec("poll.h", guardCondition = "!defined(_WIN32)")), "poll")
-        register(listOf(PlatformHeaderSpec("sys/ioctl.h", guardCondition = "!defined(_WIN32)")), "ioctl")
-        register(listOf(PlatformHeaderSpec("sys/wait.h", guardCondition = "!defined(_WIN32)")), "wait waitpid")
-        register(listOf(PlatformHeaderSpec("dirent.h", guardCondition = "!defined(_WIN32)")), "opendir readdir closedir rewinddir")
-        register(listOf(PlatformHeaderSpec("sys/epoll.h", guardCondition = "defined(__linux__)")), "epoll_create epoll_create1 epoll_ctl epoll_wait")
-        register(
-            listOf(
-                PlatformHeaderSpec(
-                    "sys/event.h",
-                    guardCondition = "defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)",
-                ),
-            ),
-            "kqueue kevent",
-        )
+        register(listOf(PlatformHeaderSpec("dlfcn.h", "!defined(_WIN32)")), "dlopen dlsym dlclose dlerror")
+        register(listOf(PlatformHeaderSpec("pthread.h", "!defined(_WIN32)")), "pthread_create pthread_join pthread_detach pthread_self pthread_equal pthread_kill")
+        register(listOf(PlatformHeaderSpec("semaphore.h", "!defined(_WIN32)")), "sem_init sem_destroy sem_wait sem_trywait sem_post")
+        register(listOf(PlatformHeaderSpec("poll.h", "!defined(_WIN32)")), "poll")
+        register(listOf(PlatformHeaderSpec("sys/ioctl.h", "!defined(_WIN32)")), "ioctl")
+        register(listOf(PlatformHeaderSpec("sys/wait.h", "!defined(_WIN32)")), "wait waitpid")
+        register(listOf(PlatformHeaderSpec("dirent.h", "!defined(_WIN32)")), "opendir readdir closedir rewinddir")
+        register(listOf(PlatformHeaderSpec("sys/epoll.h", "defined(__linux__)")), "epoll_create epoll_create1 epoll_ctl epoll_wait")
+        register(listOf(PlatformHeaderSpec("sys/event.h", BSD_APPLE_GUARD)), "kqueue kevent")
     }
