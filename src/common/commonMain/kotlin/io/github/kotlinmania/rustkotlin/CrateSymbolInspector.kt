@@ -2,6 +2,7 @@ package io.github.kotlinmania.rustkotlin
 
 import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.procmacro2.Group
+import io.github.kotlinmania.procmacro2.Ident
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.Attribute
@@ -164,9 +165,11 @@ internal fun unwrapSynType(ty: SynType): SynType =
         else -> ty
     }
 
+internal fun Ident.cleanIdent(): String = toString().removePrefix("r#")
+
 internal fun PathSegment.identText(): String = ident.toString()
 
-internal fun PathSegment.cleanIdent(): String = ident.toString().removePrefix("r#")
+internal fun PathSegment.cleanIdent(): String = ident.cleanIdent()
 
 internal fun Path.identStrings(): List<String> = segments.toList().map { it.ident.toString() }
 
