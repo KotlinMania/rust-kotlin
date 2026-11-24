@@ -16,10 +16,12 @@ import io.github.kotlinmania.syn.GenericParam
 import io.github.kotlinmania.syn.Generics
 import io.github.kotlinmania.syn.ImplItem
 import io.github.kotlinmania.syn.Item
+import io.github.kotlinmania.syn.Macro
 import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.ModContent
 import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
+import io.github.kotlinmania.syn.PathSegment
 import io.github.kotlinmania.syn.ReturnType
 import io.github.kotlinmania.syn.Signature
 import io.github.kotlinmania.syn.Stmt
@@ -161,6 +163,16 @@ internal fun unwrapSynType(ty: SynType): SynType =
         is SynType.Paren -> unwrapSynType(ty.elem)
         else -> ty
     }
+
+internal fun PathSegment.identText(): String = ident.toString()
+
+internal fun PathSegment.cleanIdent(): String = ident.toString().removePrefix("r#")
+
+internal fun Path.identStrings(): List<String> = segments.toList().map { it.ident.toString() }
+
+internal fun Path.cleanIdentStrings(): List<String> = segments.toList().map { it.cleanIdent() }
+
+internal fun Macro.clonedTokenList(): List<TokenTree> = tokens.clone().toList()
 
 internal fun Path.lastIdentText(): String? = segments.last()?.ident?.toString()
 

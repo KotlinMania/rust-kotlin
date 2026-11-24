@@ -168,88 +168,22 @@ internal fun cfgAttrPreferenceScore(attrs: List<Attribute>): Int {
 }
 
 private val UNSUPPORTED_RUST_TARGET_OS =
-    setOf(
-        "hermit",
-        "motor",
-        "solid_asp3",
-        "teeos",
-        "uefi",
-        "vexos",
-        "xous",
-        "zkvm",
-        "l4re",
-        "nuttx",
-        "psp",
-        "psx",
-        "trusty",
-        "vita",
-        "vxworks",
-        "espidf",
-        "horizon",
-        "hurd",
-        "cygwin",
-        "aix",
-        "haiku",
-        "illumos",
-        "netbsd",
-        "openbsd",
-        "dragonfly",
-        "freebsd",
-        "solaris",
-        "redox",
-        "fuchsia",
-        "nto",
-        "rtems",
-        "emscripten",
-        "wasi_p3",
-        "lynxos178",
-        "qurt",
-        "cuda",
-        "nvptx",
-        "amdgpu",
-        "helenos",
-        "freebsdlike",
-        "netbsdlike",
-        "solarish",
-        "managarm",
-        "zos",
+    wordSet(
+        "hermit motor solid_asp3 teeos uefi vexos xous zkvm l4re nuttx psp psx trusty vita vxworks",
+        "espidf horizon hurd cygwin aix haiku illumos netbsd openbsd dragonfly freebsd solaris redox",
+        "fuchsia nto rtems emscripten wasi_p3 lynxos178 qurt cuda nvptx amdgpu helenos freebsdlike",
+        "netbsdlike solarish managarm zos",
     )
 
-private val UNSUPPORTED_RUST_TARGET_ENV =
-    setOf(
-        "sgx",
-        "relibc",
-        "ohos",
-        "uclibc",
-        "newlib",
-        "p2",
-        "p3",
-    )
+private val UNSUPPORTED_RUST_TARGET_ENV = wordSet("sgx relibc ohos uclibc newlib p2 p3")
 
-private val UNSUPPORTED_RUST_TARGET_VENDOR =
-    setOf(
-        "fortanix",
-        "kmc",
-        "nintendo",
-        "sony",
-        "uwp",
-        "win7",
-    )
+private val UNSUPPORTED_RUST_TARGET_VENDOR = wordSet("fortanix kmc nintendo sony uwp win7")
 
 private val PRUNED_UNSUPPORTED_TARGET_PATH_SEGMENTS =
     UNSUPPORTED_RUST_TARGET_OS +
         UNSUPPORTED_RUST_TARGET_ENV +
         UNSUPPORTED_RUST_TARGET_VENDOR +
-        setOf(
-            "fortanix_sgx",
-            "solid",
-            "itron",
-            "wasip2",
-            "wasip3",
-            "wali",
-            "miri",
-            "switch",
-        )
+        wordSet("fortanix_sgx solid itron wasip2 wasip3 wali miri switch")
 
 internal fun isUnsupportedTargetRustRelPath(
     relPath: String,
@@ -307,16 +241,28 @@ private fun implItemDeclarationKey(item: ImplItem): String? =
         else -> null
     }
 
+private object MacroAstSyntaxParser {
+    fun wrapBraceStream(prefixCode: String, inner: TokenStream): TokenStream {
+        val prefix = TokenStream.fromString(prefixCode).getOrThrow().toList()
+        val group = TokenTree.Group(Group(Delimiter.Brace, inner))
+        return TokenStream.fromTokenTrees(prefix + group)
+    }
+
+    fun parseNormalizedFile(stream: TokenStream): File? =
+        parse2(FileParse::parse, stream).getOrNull()?.let(RustNextAstNormalizer::foldFile)
+
+    fun parseNormalizedImplItems(inner: TokenStream): List<ImplItem>? =
+        (parseNormalizedFile(wrapBraceStream("impl Dummy", inner))?.items?.singleOrNull() as? Item.Impl)?.items
+
+    fun parseNormalizedBlockStmts(inner: TokenStream): List<Stmt>? =
+        (parseNormalizedFile(wrapBraceStream("fn dummy()", inner))?.items?.singleOrNull() as? Item.Fn)?.block?.stmts
+}
+
 private object TokenBodyCfgSelector : CfgArmSelector<List<TokenTree>>() {
     override fun parseArmBody(bodyTokens: List<TokenTree>): List<List<TokenTree>> = listOf(bodyTokens)
 
-    override fun extractArmKeys(parsed: List<List<TokenTree>>): List<String>? {
-        val file =
-            parse2(FileParse::parse, TokenStream.fromTokenTrees(parsed.single()))
-                .getOrNull()
-                ?.let(RustNextAstNormalizer::foldFile) ?: return null
-        return file.items.mapNotNull(::itemDeclarationKey)
-    }
+    override fun extractArmKeys(parsed: List<List<TokenTree>>): List<String>? =
+        MacroAstSyntaxParser.parseNormalizedFile(TokenStream.fromTokenTrees(parsed.single()))?.items?.mapNotNull(::itemDeclarationKey)
 
     override fun shouldSkipWildcardArm(armKeys: List<String>, seenKeys: Set<String>): Boolean =
         ("mod:unsupported" in armKeys && seenKeys.any { it.startsWith("mod:") }) ||
@@ -324,16 +270,8 @@ private object TokenBodyCfgSelector : CfgArmSelector<List<TokenTree>>() {
 }
 
 private object ImplItemCfgSelector : CfgArmSelector<ImplItem>() {
-    override fun parseArmBody(bodyTokens: List<TokenTree>): List<ImplItem>? {
-        val wrapped = wrapImplDummyStream(TokenStream.fromTokenTrees(bodyTokens))
-        val dummy =
-            parse2(FileParse::parse, wrapped)
-                .getOrNull()
-                ?.let(RustNextAstNormalizer::foldFile)
-                ?.items
-                ?.singleOrNull() as? Item.Impl ?: return null
-        return dummy.items
-    }
+    override fun parseArmBody(bodyTokens: List<TokenTree>): List<ImplItem>? =
+        MacroAstSyntaxParser.parseNormalizedImplItems(TokenStream.fromTokenTrees(bodyTokens))
 
     override fun extractArmKeys(parsed: List<ImplItem>): List<String> =
         parsed.mapNotNull(::implItemDeclarationKey)
@@ -345,43 +283,11 @@ internal fun selectActiveCfgSelectBodies(innerTrees: List<TokenTree>): List<List
 private fun selectActiveCfgSelectImplItems(innerTrees: List<TokenTree>): List<ImplItem>? =
     parseCfgSelectArms(innerTrees)?.let(ImplItemCfgSelector::selectActive)
 
-private fun wrapImplDummyStream(inner: TokenStream): TokenStream {
-    val prefix = TokenStream.fromString("impl Dummy").getOrThrow().toList()
-    val group = TokenTree.Group(Group(Delimiter.Brace, inner))
-    return TokenStream.fromTokenTrees(prefix + group)
-}
-
 private val ARCHS_16_OR_32_BIT =
-    setOf(
-        "avr",
-        "msp430",
-        "arm",
-        "x86",
-        "mips",
-        "mips32r6",
-        "powerpc",
-        "riscv32",
-        "sparc",
-        "csky",
-        "hexagon",
-        "m68k",
-        "xtensa",
-        "wasm32",
-    )
+    wordSet("avr msp430 arm x86 mips mips32r6 powerpc riscv32 sparc csky hexagon m68k xtensa wasm32")
 
 private val ARCHS_64_BIT =
-    setOf(
-        "x86_64",
-        "aarch64",
-        "mips64",
-        "mips64r6",
-        "powerpc64",
-        "riscv64",
-        "s390x",
-        "sparc64",
-        "loongarch64",
-        "wasm64",
-    )
+    wordSet("x86_64 aarch64 mips64 mips64r6 powerpc64 riscv64 s390x sparc64 loongarch64 wasm64")
 
 private fun dirContainsSegment(relDir: String?, target: String): Boolean {
     if (relDir.isNullOrEmpty()) return false
@@ -620,44 +526,45 @@ internal class MacroRulesCollector(
     }
 
     override fun visitItemMod(i: Item.Mod) {
-        if (skipCfgTestModules && hasCfgTestModAttribute(i.attrs)) {
-            return
-        }
-        if (isDocOnlyCfgAttribute(i.attrs)) {
-            return
-        }
+        if ((skipCfgTestModules && hasCfgTestModAttribute(i.attrs)) || isDocOnlyCfgAttribute(i.attrs)) return
         super.visitItemMod(i)
     }
 
     override fun visitItemMacro(i: Item.Macro) {
-        if (isDocOnlyCfgAttribute(i.attrs)) {
-            return
-        }
-        if (i.mac.path.isIdent("macro_rules")) {
-            val macroName = i.ident?.toString()?.removePrefix("r#")
-            if (macroName != null && macroName != "offset_of" && macroName !in definitions) {
-                val branches = parseMacroRulesBranches(i.mac.tokens.clone())
-                if (branches.isNotEmpty() && !isRawPointerLiteralMacroBranches(branches)) {
-                    definitions[macroName] = MacroRulesDef(macroName, branches)
-                }
-            }
+        if (isDocOnlyCfgAttribute(i.attrs)) return
+        extractItemMacroDef(i, skipCfgTestModules)?.let { def ->
+            if (def.name !in definitions) definitions[def.name] = def
         }
         super.visitItemMacro(i)
     }
 
     override fun visitItem(i: Item) {
         if (i is Item.Verbatim) {
-            val extracted = tryExtractDeclarativeMacro2FromTokens(i.tokens.clone().toList(), skipCfgTestModules)
-            if (extracted != null && extracted.name != "offset_of" && extracted.name !in definitions) {
-                if (!isRawPointerLiteralMacroBranches(extracted.branches)) {
-                    definitions[extracted.name] = extracted
-                }
+            extractItemMacroDef(i, skipCfgTestModules)?.let { def ->
+                if (def.name !in definitions) definitions[def.name] = def
             }
         }
         super.visitItem(i)
     }
 
     companion object {
+        internal fun extractItemMacroDef(item: Item, skipCfgTestModules: Boolean): MacroRulesDef? =
+            when (item) {
+                is Item.Macro -> {
+                    val macroName = item.ident?.toString()?.removePrefix("r#")
+                    if (isDocOnlyCfgAttribute(item.attrs) || !item.mac.path.isIdent("macro_rules") || macroName == null || macroName == "offset_of") {
+                        null
+                    } else {
+                        val branches = parseMacroRulesBranches(item.mac.tokens.clone())
+                        if (branches.isNotEmpty() && !isRawPointerLiteralMacroBranches(branches)) MacroRulesDef(macroName, branches) else null
+                    }
+                }
+                is Item.Verbatim ->
+                    tryExtractDeclarativeMacro2FromTokens(item.tokens.clone().toList(), skipCfgTestModules)
+                        ?.takeIf { it.name != "offset_of" && !isRawPointerLiteralMacroBranches(it.branches) }
+                else -> null
+            }
+
         internal fun buildMacroRuleBranch(patternStream: TokenStream, bodyStream: TokenStream): MacroRuleBranch {
             val patternAst = MacroPatternTokenParser(patternStream.clone().toList()).parsePattern()
             val params = MacroPat.collectMetavarList(patternAst)
@@ -870,26 +777,18 @@ internal class MacroRulesFileExpander(
         return activeDefinitions[macName]
     }
 
-    private fun extractLocalMacroRulesDef(item: Item): MacroRulesDef? {
-        if (item is Item.Macro) {
-            if (isDocOnlyCfgAttribute(item.attrs)) return null
-            if (item.mac.path.isIdent("macro_rules")) {
-                val macroName = item.ident?.toString()?.removePrefix("r#")
-                if (macroName != null && macroName != "offset_of") {
-                    val branches = MacroRulesCollector.parseMacroRulesBranches(item.mac.tokens.clone())
-                    if (branches.isNotEmpty() && !isRawPointerLiteralMacroBranches(branches)) {
-                        return MacroRulesDef(macroName, branches)
-                    }
-                }
-            }
-        } else if (item is Item.Verbatim) {
-            val extracted = tryExtractDeclarativeMacro2FromTokens(item.tokens.clone().toList(), false)
-            if (extracted != null && extracted.name != "offset_of" && !isRawPointerLiteralMacroBranches(extracted.branches)) {
-                return extracted
-            }
+    private inline fun <T> withSavedMacroDefs(block: () -> T): T {
+        val savedDefs = activeDefinitions.toMap()
+        return try {
+            block()
+        } finally {
+            activeDefinitions.clear()
+            activeDefinitions.putAll(savedDefs)
         }
-        return null
     }
+
+    private fun extractLocalMacroRulesDef(item: Item): MacroRulesDef? =
+        MacroRulesCollector.extractItemMacroDef(item, skipCfgTestModules = false)
 
     override fun foldFile(file: File): File {
         val foldedAttrs = file.attrs.map(::foldAttribute)
@@ -900,13 +799,12 @@ internal class MacroRulesFileExpander(
     override fun foldItemMod(item: Item.Mod): Item.Mod {
         val content = item.content
         if (content is ModContent.Inline) {
-            val savedDefs = activeDefinitions.toMap()
-            val foldedShell = super.foldItemMod(item.copy(content = content.copy(items = emptyList())))
-            val expanded = expandAndFoldItemList(content.items, depth = activeExpansionDepth)
-            activeDefinitions.clear()
-            activeDefinitions.putAll(savedDefs)
-            val foldedContent = foldedShell.content as ModContent.Inline
-            return foldedShell.copy(content = foldedContent.copy(items = expanded))
+            return withSavedMacroDefs {
+                val foldedShell = super.foldItemMod(item.copy(content = content.copy(items = emptyList())))
+                val expanded = expandAndFoldItemList(content.items, depth = activeExpansionDepth)
+                val foldedContent = foldedShell.content as ModContent.Inline
+                foldedShell.copy(content = foldedContent.copy(items = expanded))
+            }
         }
         return super.foldItemMod(item)
     }
@@ -917,84 +815,62 @@ internal class MacroRulesFileExpander(
         return foldedShell.copy(items = expandedImplItems)
     }
 
-    override fun foldBlock(block: Block): Block {
-        val savedDefs = activeDefinitions.toMap()
-        val expandedStmts = expandAndFoldBlockStmts(block.stmts, depth = activeExpansionDepth)
-        activeDefinitions.clear()
-        activeDefinitions.putAll(savedDefs)
-        return block.copy(stmts = expandedStmts)
-    }
+    override fun foldBlock(block: Block): Block =
+        withSavedMacroDefs {
+            block.copy(stmts = expandAndFoldBlockStmts(block.stmts, depth = activeExpansionDepth))
+        }
 
-    override fun foldSignature(sig: Signature): Signature {
-        val folded = super.foldSignature(sig)
-        val args = folded.inputs.toList()
-        if (args.isEmpty()) return folded
+    private fun <A> retainPreferredCfgArgs(
+        args: List<A>,
+        attrsOf: (A) -> List<Attribute>,
+        cleanIdentOf: (A) -> String?,
+        retainByPredicate: ((A) -> Boolean) -> Unit,
+    ) {
+        if (args.isEmpty()) return
         val keptSet = linkedSetOf<Int>()
         for ((idx, arg) in args.withIndex()) {
-            if (!isDocOnlyCfgAttribute(fnArgAttrs(arg))) {
-                keptSet += idx
-            }
+            if (!isDocOnlyCfgAttribute(attrsOf(arg))) keptSet += idx
         }
         val byCleanIdent = linkedMapOf<String, MutableList<Int>>()
         for (idx in keptSet) {
-            val cleanIdent = fnArgCleanIdent(args[idx]) ?: continue
-            if (cleanIdent == "_") continue
-            byCleanIdent.getOrPut(cleanIdent) { mutableListOf() } += idx
+            val cleanIdent = cleanIdentOf(args[idx]) ?: continue
+            if (cleanIdent != "_") byCleanIdent.getOrPut(cleanIdent) { mutableListOf() } += idx
         }
         for ((_, group) in byCleanIdent) {
             if (group.size <= 1) continue
-            val winnerIdx = group.maxByOrNull { cfgAttrPreferenceScore(fnArgAttrs(args[it])) }!!
+            val winnerIdx = group.maxByOrNull { cfgAttrPreferenceScore(attrsOf(args[it])) }!!
             for (idx in group) {
                 if (idx != winnerIdx) keptSet.remove(idx)
             }
         }
         if (keptSet.size < args.size) {
             var idx = 0
-            folded.inputs.retain {
+            retainByPredicate {
                 val keep = idx in keptSet
                 idx++
                 keep
             }
+        }
+    }
+
+    override fun foldSignature(sig: Signature): Signature {
+        val folded = super.foldSignature(sig)
+        retainPreferredCfgArgs(folded.inputs.toList(), ::fnArgAttrs, ::fnArgCleanIdent) { pred ->
+            folded.inputs.retain(pred)
         }
         return folded
     }
 
     override fun foldTypeFnPtr(ty: SynType.FnPtr): SynType.FnPtr {
         val folded = super.foldTypeFnPtr(ty)
-        val args = folded.inputs.toList()
-        if (args.isEmpty()) return folded
-        val keptSet = linkedSetOf<Int>()
-        for ((idx, arg) in args.withIndex()) {
-            if (!isDocOnlyCfgAttribute(arg.attrs)) {
-                keptSet += idx
-            }
-        }
-        val byCleanIdent = linkedMapOf<String, MutableList<Int>>()
-        for (idx in keptSet) {
-            val cleanIdent =
-                args[idx]
-                    .name
-                    ?.ident
-                    ?.toString()
-                    ?.removePrefix("r#") ?: continue
-            if (cleanIdent == "_") continue
-            byCleanIdent.getOrPut(cleanIdent) { mutableListOf() } += idx
-        }
-        for ((_, group) in byCleanIdent) {
-            if (group.size <= 1) continue
-            val winnerIdx = group.maxByOrNull { cfgAttrPreferenceScore(args[it].attrs) }!!
-            for (idx in group) {
-                if (idx != winnerIdx) keptSet.remove(idx)
-            }
-        }
-        if (keptSet.size < args.size) {
-            var idx = 0
-            folded.inputs.retain {
-                val keep = idx in keptSet
-                idx++
-                keep
-            }
-        }
+        retainPreferredCfgArgs(
+            args = folded.inputs.toList(),
+            attrsOf = { it.attrs },
+            cleanIdentOf = { arg ->
+                val raw = arg.name?.ident?.toString()
+                raw?.removePrefix("r#")
+            },
+        ) { pred -> folded.inputs.retain(pred) }
         return folded
     }
 
@@ -1011,7 +887,13 @@ internal class MacroRulesFileExpander(
 
     override fun foldType(t: SynType): SynType {
         if (t is SynType.Macro && activeDefinitions.isNotEmpty() && activeExpansionDepth <= MAX_MACRO_EXPANSION_DEPTH) {
-            val expandedType = expandMacroTypeRecursive(t, depth = activeExpansionDepth)
+            val expandedType =
+                expandMacroSyntaxRecursive(
+                    mac = t.mac,
+                    depth = activeExpansionDepth,
+                    parseNode = { parse2(SynType.Companion::parse, it).getOrNull()?.let(RustNextAstNormalizer::foldType) },
+                    nestedMacroOf = { (it as? SynType.Macro)?.mac },
+                )
             if (expandedType != null) {
                 return withExpansionDepth(activeExpansionDepth + 1) { super.foldType(expandedType) }
             }
@@ -1023,10 +905,7 @@ internal class MacroRulesFileExpander(
         if (e is Expr.Macro && activeExpansionDepth <= MAX_MACRO_EXPANSION_DEPTH) {
             val exprCfgMacroName = resolveBuiltinCfgMacroName(e.mac)
             if (exprCfgMacroName == "cfg_select" || exprCfgMacroName == "cfg_if") {
-                val rawToks =
-                    e.mac.tokens
-                        .clone()
-                        .toList()
+                val rawToks = e.mac.clonedTokenList()
                 val selected =
                     if (exprCfgMacroName == "cfg_select") {
                         chooseSingleActiveCfgSelectBody(rawToks)
@@ -1038,12 +917,11 @@ internal class MacroRulesFileExpander(
                         if (selected.isEmpty()) {
                             parse2(ExprParse::parse, TokenStream.fromString("{}").getOrThrow()).getOrNull()
                         } else {
-                            parse2(ExprParse::parse, TokenStream.fromTokenTrees(selected)).getOrNull()
+                            val selectedStream = TokenStream.fromTokenTrees(selected)
+                            parse2(ExprParse::parse, selectedStream).getOrNull()
                                 ?: parse2(
                                     ExprParse::parse,
-                                    TokenStream.fromTokenTrees(
-                                        listOf(TokenTree.Group(Group(Delimiter.Brace, TokenStream.fromTokenTrees(selected)))),
-                                    ),
+                                    TokenStream.fromTokenTrees(listOf(TokenTree.Group(Group(Delimiter.Brace, selectedStream)))),
                                 ).getOrNull()
                         }
                     if (parsedExpr != null) {
@@ -1054,7 +932,13 @@ internal class MacroRulesFileExpander(
                 }
             }
             if (activeDefinitions.isNotEmpty()) {
-                val expandedExpr = expandMacroExprRecursive(e, depth = activeExpansionDepth)
+                val expandedExpr =
+                    expandMacroSyntaxRecursive(
+                        mac = e.mac,
+                        depth = activeExpansionDepth,
+                        parseNode = { parse2(ExprParse::parse, it).getOrNull()?.let(RustNextAstNormalizer::foldExpr) },
+                        nestedMacroOf = { (it as? Expr.Macro)?.mac },
+                    )
                 if (expandedExpr != null) {
                     return withExpansionDepth(activeExpansionDepth + 1) { super.foldExpr(expandedExpr) }
                 }
@@ -1063,32 +947,18 @@ internal class MacroRulesFileExpander(
         return super.foldExpr(e)
     }
 
-    private fun expandMacroTypeRecursive(typeMacro: SynType.Macro, depth: Int): SynType? {
+    private fun <N : Any> expandMacroSyntaxRecursive(
+        mac: Macro,
+        depth: Int,
+        parseNode: (TokenStream) -> N?,
+        nestedMacroOf: (N) -> Macro?,
+    ): N? {
         if (depth > MAX_MACRO_EXPANSION_DEPTH) return null
-        val def = resolveLocalMacroDefinition(typeMacro.mac) ?: return null
-        val substituted = expandMacroToTokenStream(def, typeMacro.mac) ?: return null
-        val parsedType =
-            parse2(SynType.Companion::parse, substituted.clone())
-                .getOrNull()
-                ?.let(RustNextAstNormalizer::foldType) ?: return null
-        if (parsedType is SynType.Macro) {
-            return expandMacroTypeRecursive(parsedType, depth + 1) ?: parsedType
-        }
-        return parsedType
-    }
-
-    private fun expandMacroExprRecursive(exprMacro: Expr.Macro, depth: Int): Expr? {
-        if (depth > MAX_MACRO_EXPANSION_DEPTH) return null
-        val def = resolveLocalMacroDefinition(exprMacro.mac) ?: return null
-        val substituted = expandMacroToTokenStream(def, exprMacro.mac) ?: return null
-        val parsedExpr =
-            parse2(ExprParse::parse, substituted.clone())
-                .getOrNull()
-                ?.let(RustNextAstNormalizer::foldExpr) ?: return null
-        if (parsedExpr is Expr.Macro) {
-            return expandMacroExprRecursive(parsedExpr, depth + 1) ?: parsedExpr
-        }
-        return parsedExpr
+        val def = resolveLocalMacroDefinition(mac) ?: return null
+        val substituted = expandMacroToTokenStream(def, mac) ?: return null
+        val parsed = parseNode(substituted.clone()) ?: return null
+        val nestedMac = nestedMacroOf(parsed) ?: return parsed
+        return expandMacroSyntaxRecursive(nestedMac, depth + 1, parseNode, nestedMacroOf) ?: parsed
     }
 
     private fun expandAndFoldItemList(items: List<Item>, depth: Int): List<Item> {
@@ -1107,30 +977,15 @@ internal class MacroRulesFileExpander(
                 val def = resolveLocalMacroDefinition(item.mac)
                 val builtinCfgName = if (def == null) resolveBuiltinCfgMacroName(item.mac) else null
                 if (builtinCfgName != null) {
-                    val rawTokens =
-                        item.mac.tokens
-                            .clone()
-                            .toList()
-                    val bodies =
-                        if (builtinCfgName == "cfg_select") {
-                            selectActiveCfgSelectBodies(rawTokens)
-                        } else {
-                            selectActiveCfgIfBodies(rawTokens)
-                        }
-                    if (bodies != null) {
-                        val tokens = TokenStream.fromTokenTrees(bodies.flatten())
-                        val parsed = parse2(FileParse::parse, tokens).getOrNull()
-                        if (parsed != null) {
-                            val normalized = RustNextAstNormalizer.foldFile(parsed)
-                            val expanded =
-                                withExpansionDepth(depth + 1) {
-                                    expandAndFoldItemList(normalized.items, depth + 1)
-                                }
-                            val propagated = propagateOuterAttrsToItems(item.attrs, expanded)
-                            attachWrapperSpansToFirstExpandedItem(collectTransitiveWrapperSpansForItem(item), propagated)
-                            result.addAll(propagated)
-                            continue
-                        }
+                    val rawTokens = item.mac.clonedTokenList()
+                    val bodies = if (builtinCfgName == "cfg_select") selectActiveCfgSelectBodies(rawTokens) else selectActiveCfgIfBodies(rawTokens)
+                    val normalized = bodies?.let { MacroAstSyntaxParser.parseNormalizedFile(TokenStream.fromTokenTrees(it.flatten())) }
+                    if (normalized != null) {
+                        val expanded = withExpansionDepth(depth + 1) { expandAndFoldItemList(normalized.items, depth + 1) }
+                        val propagated = propagateOuterAttrsToItems(item.attrs, expanded)
+                        attachWrapperSpansToFirstExpandedItem(collectTransitiveWrapperSpansForItem(item), propagated)
+                        result.addAll(propagated)
+                        continue
                     }
                 }
                 if (def != null) {
@@ -1159,30 +1014,17 @@ internal class MacroRulesFileExpander(
                 val def = resolveLocalMacroDefinition(item.mac)
                 val builtinCfgName = if (def == null) resolveBuiltinCfgMacroName(item.mac) else null
                 if (builtinCfgName != null) {
-                    val rawTokens =
-                        item.mac.tokens
-                            .clone()
-                            .toList()
+                    val rawTokens = item.mac.clonedTokenList()
                     val selectedItems =
                         if (builtinCfgName == "cfg_select") {
                             selectActiveCfgSelectImplItems(rawTokens)
                         } else {
                             selectActiveCfgIfBodies(rawTokens)?.let { bodies ->
-                                val wrapped = wrapImplDummyStream(TokenStream.fromTokenTrees(bodies.flatten()))
-                                (
-                                    parse2(FileParse::parse, wrapped)
-                                        .getOrNull()
-                                        ?.let(RustNextAstNormalizer::foldFile)
-                                        ?.items
-                                        ?.singleOrNull() as? Item.Impl
-                                )?.items
+                                MacroAstSyntaxParser.parseNormalizedImplItems(TokenStream.fromTokenTrees(bodies.flatten()))
                             }
                         }
                     if (selectedItems != null) {
-                        val expanded =
-                            withExpansionDepth(depth + 1) {
-                                expandAndFoldImplItemList(selectedItems, depth + 1)
-                            }
+                        val expanded = withExpansionDepth(depth + 1) { expandAndFoldImplItemList(selectedItems, depth + 1) }
                         result.addAll(propagateOuterAttrsToImplItems(item.attrs, expanded))
                         continue
                     }
@@ -1200,29 +1042,37 @@ internal class MacroRulesFileExpander(
         return result
     }
 
-    private fun propagateOuterAttrsToItems(outerAttrs: List<Attribute>, expanded: List<Item>): List<Item> {
+    private fun <N> propagateOuterAttrs(
+        outerAttrs: List<Attribute>,
+        expanded: List<N>,
+        isDocOnly: (N) -> Boolean,
+        prepend: (N, List<Attribute>) -> N,
+    ): List<N> {
         if (outerAttrs.isEmpty() || expanded.isEmpty()) return expanded
         val (docAttrs, nonDocAttrs) =
             outerAttrs.partition { attr ->
                 val meta = attr.meta
                 meta is Meta.NameValue && meta.path.isIdent("doc")
             }
-        val docTargetIndex =
-            expanded.indexOfFirst { !itemHasDocOnlyCfg(it) }.let { if (it >= 0) it else 0 }
-        return expanded.mapIndexed { idx, item ->
+        val firstNonDocIdx = expanded.indexOfFirst { !isDocOnly(it) }
+        val docTargetIndex = if (firstNonDocIdx >= 0) firstNonDocIdx else 0
+        return expanded.mapIndexed { idx, node ->
             val extra = if (idx == docTargetIndex) docAttrs + nonDocAttrs else nonDocAttrs
-            if (extra.isEmpty()) item else item.withPrependedAttributes(extra)
+            if (extra.isEmpty()) node else prepend(node, extra)
         }
     }
+
+    private fun propagateOuterAttrsToItems(outerAttrs: List<Attribute>, expanded: List<Item>): List<Item> =
+        propagateOuterAttrs(outerAttrs, expanded, ::itemHasDocOnlyCfg) { item, extra -> item.withPrependedAttributes(extra) }
+
+    private fun propagateOuterAttrsToImplItems(outerAttrs: List<Attribute>, expanded: List<ImplItem>): List<ImplItem> =
+        propagateOuterAttrs(outerAttrs, expanded, ::implItemHasDocOnlyCfg) { item, extra -> item.withPrependedAttributes(extra) }
 
     private fun collectTransitiveWrapperSpansForItem(item: Item): List<Span> {
         val ownSpans = collectHeaderSourceSpans(item)
         val out = mutableListOf<Span>()
-        val firstOwnOffset = ownSpans.firstOrNull()?.startOffset()
-        if (firstOwnOffset != null) {
-            macroWrapperSpansByTargetOffset[firstOwnOffset]?.let { inherited ->
-                out.addAll(inherited)
-            }
+        ownSpans.firstOrNull()?.startOffset()?.let { firstOwnOffset ->
+            macroWrapperSpansByTargetOffset[firstOwnOffset]?.let(out::addAll)
         }
         out.addAll(ownSpans)
         return out
@@ -1238,21 +1088,6 @@ internal class MacroRulesFileExpander(
             if (spStart != targetOffset && bucket.none { it.startOffset() == spStart }) {
                 bucket.add(sp)
             }
-        }
-    }
-
-    private fun propagateOuterAttrsToImplItems(outerAttrs: List<Attribute>, expanded: List<ImplItem>): List<ImplItem> {
-        if (outerAttrs.isEmpty() || expanded.isEmpty()) return expanded
-        val (docAttrs, nonDocAttrs) =
-            outerAttrs.partition { attr ->
-                val meta = attr.meta
-                meta is Meta.NameValue && meta.path.isIdent("doc")
-            }
-        val docTargetIndex =
-            expanded.indexOfFirst { !implItemHasDocOnlyCfg(it) }.let { if (it >= 0) it else 0 }
-        return expanded.mapIndexed { idx, item ->
-            val extra = if (idx == docTargetIndex) docAttrs + nonDocAttrs else nonDocAttrs
-            if (extra.isEmpty()) item else item.withPrependedAttributes(extra)
         }
     }
 
@@ -1274,10 +1109,7 @@ internal class MacroRulesFileExpander(
                 val def = resolveLocalMacroDefinition(stmt.mac)
                 val builtinCfgName = if (def == null) resolveBuiltinCfgMacroName(stmt.mac) else null
                 if (builtinCfgName != null) {
-                    val rawTokens =
-                        stmt.mac.tokens
-                            .clone()
-                            .toList()
+                    val rawTokens = stmt.mac.clonedTokenList()
                     val selectedBody =
                         if (builtinCfgName == "cfg_select") {
                             chooseSingleActiveCfgSelectBody(rawTokens)
@@ -1285,18 +1117,10 @@ internal class MacroRulesFileExpander(
                             selectActiveCfgIfBodies(rawTokens)?.firstOrNull()
                         }
                     if (selectedBody != null) {
-                        if (selectedBody.isEmpty()) {
-                            continue
-                        }
-                        val wrapped = buildWrappedStream("fn dummy()", Delimiter.Brace, TokenStream.fromTokenTrees(selectedBody))
-                        val parsedFile = parse2(FileParse::parse, wrapped).getOrNull()?.let(RustNextAstNormalizer::foldFile)
-                        val dummyFn = parsedFile?.items?.singleOrNull() as? Item.Fn
-                        if (dummyFn != null) {
-                            result.addAll(
-                                withExpansionDepth(depth + 1) {
-                                    expandAndFoldBlockStmts(dummyFn.block.stmts, depth + 1)
-                                },
-                            )
+                        if (selectedBody.isEmpty()) continue
+                        val parsedStmts = MacroAstSyntaxParser.parseNormalizedBlockStmts(TokenStream.fromTokenTrees(selectedBody))
+                        if (parsedStmts != null) {
+                            result.addAll(withExpansionDepth(depth + 1) { expandAndFoldBlockStmts(parsedStmts, depth + 1) })
                             continue
                         }
                     }
@@ -1317,63 +1141,41 @@ internal class MacroRulesFileExpander(
     private fun tryExpandMacroItem(def: MacroRulesDef, invocation: Macro, depth: Int): List<Item>? {
         val substitutedStream = expandMacroToTokenStream(def, invocation) ?: return null
         if (substitutedStream.isEmpty()) return emptyList()
-        val rawFile = parse2(FileParse::parse, substitutedStream).getOrNull() ?: return null
-        val parsedFile = RustNextAstNormalizer.foldFile(rawFile)
-        return withExpansionDepth(depth + 1) {
-            expandAndFoldItemList(parsedFile.items, depth + 1)
-        }
+        val parsedFile = MacroAstSyntaxParser.parseNormalizedFile(substitutedStream) ?: return null
+        return withExpansionDepth(depth + 1) { expandAndFoldItemList(parsedFile.items, depth + 1) }
     }
 
     private fun tryExpandMacroImplItem(def: MacroRulesDef, invocation: Macro, depth: Int): List<ImplItem>? {
         val substitutedStream = expandMacroToTokenStream(def, invocation) ?: return null
         if (substitutedStream.isEmpty()) return emptyList()
-        val wrappedTokens = buildWrappedStream("impl Dummy", Delimiter.Brace, substitutedStream)
-        val rawFile = parse2(FileParse::parse, wrappedTokens).getOrNull() ?: return null
-        val parsedFile = RustNextAstNormalizer.foldFile(rawFile)
-        val dummyImpl = parsedFile.items.singleOrNull() as? Item.Impl ?: return null
-        return withExpansionDepth(depth + 1) {
-            expandAndFoldImplItemList(dummyImpl.items, depth + 1)
-        }
+        val implItems = MacroAstSyntaxParser.parseNormalizedImplItems(substitutedStream) ?: return null
+        return withExpansionDepth(depth + 1) { expandAndFoldImplItemList(implItems, depth + 1) }
     }
 
     private fun tryExpandMacroStmts(def: MacroRulesDef, invocation: Macro, depth: Int): List<Stmt>? {
         val substitutedStream = expandMacroToTokenStream(def, invocation) ?: return null
         if (substitutedStream.isEmpty()) return emptyList()
-        val wrappedTokens = buildWrappedStream("fn dummy()", Delimiter.Brace, substitutedStream)
-        val rawFile = parse2(FileParse::parse, wrappedTokens).getOrNull() ?: return null
-        val parsedFile = RustNextAstNormalizer.foldFile(rawFile)
-        val dummyFn = parsedFile.items.singleOrNull() as? Item.Fn ?: return null
-        val fnBlock = dummyFn.block
-        return withExpansionDepth(depth + 1) {
-            expandAndFoldBlockStmts(fnBlock.stmts, depth + 1)
-        }
-    }
-
-    private fun buildWrappedStream(prefixCode: String, delimiter: Delimiter, inner: TokenStream): TokenStream {
-        val prefix = TokenStream.fromString(prefixCode).getOrThrow().toList()
-        val group = TokenTree.Group(Group(delimiter, inner))
-        return TokenStream.fromTokenTrees(prefix + group)
+        val fnStmts = MacroAstSyntaxParser.parseNormalizedBlockStmts(substitutedStream) ?: return null
+        return withExpansionDepth(depth + 1) { expandAndFoldBlockStmts(fnStmts, depth + 1) }
     }
 
     private fun expandMacroToTokenStream(def: MacroRulesDef, invocation: Macro): TokenStream? {
-        val inputTrees = invocation.tokens.clone().toList()
-        val matcher = MacroFragmentTokenCursor(inputTrees)
-        for (branch in def.branches) {
-            val env = MacroMatchEnv()
-            if (matcher.matchSequence(branch.pattern, 0, 0, env) == inputTrees.size) {
-                return substituteMacroTokensWithEnv(branch.bodyTokens.clone(), env)
-            }
-        }
-        if (inputTrees.any { it is TokenTree.Group && it.value.delimiter() == Delimiter.None }) {
-            val flattenedTrees = RustTokenCursor.flattenNoneDelimitedGroupList(inputTrees)
-            val flattenedMatcher = MacroFragmentTokenCursor(flattenedTrees)
+        fun tryMatch(trees: List<TokenTree>, skipTtMetavar: Boolean): TokenStream? {
+            val matcher = MacroFragmentTokenCursor(trees)
             for (branch in def.branches) {
-                if (MacroPat.hasTtMetavar(branch.pattern)) continue
+                if (skipTtMetavar && MacroPat.hasTtMetavar(branch.pattern)) continue
                 val env = MacroMatchEnv()
-                if (flattenedMatcher.matchSequence(branch.pattern, 0, 0, env) == flattenedTrees.size) {
+                if (matcher.matchSequence(branch.pattern, 0, 0, env) == trees.size) {
                     return substituteMacroTokensWithEnv(branch.bodyTokens.clone(), env)
                 }
             }
+            return null
+        }
+
+        val inputTrees = invocation.tokens.clone().toList()
+        tryMatch(inputTrees, skipTtMetavar = false)?.let { return it }
+        if (inputTrees.any { it is TokenTree.Group && it.value.delimiter() == Delimiter.None }) {
+            return tryMatch(RustTokenCursor.flattenNoneDelimitedGroupList(inputTrees), skipTtMetavar = true)
         }
         return null
     }
@@ -1768,46 +1570,12 @@ private class MacroFragmentTokenCursor(
     }
 
     companion object {
-        private val CLOSURE_PREFIX_KEYWORDS =
-            setOf("move", "async", "static", "const", "return", "break", "yield")
-        private val CONST_FN_FOLLOW_KEYWORDS = setOf("fn", "unsafe", "async", "extern")
+        private val CLOSURE_PREFIX_KEYWORDS = wordSet("move async static const return break yield")
+        private val CONST_FN_FOLLOW_KEYWORDS = wordSet("fn unsafe async extern")
         private val NON_EXPR_SINGLE_IDENT_KEYWORDS =
-            setOf(
-                "as",
-                "async",
-                "break",
-                "const",
-                "continue",
-                "crate",
-                "dyn",
-                "else",
-                "enum",
-                "extern",
-                "fn",
-                "for",
-                "if",
-                "impl",
-                "in",
-                "let",
-                "loop",
-                "match",
-                "mod",
-                "move",
-                "mut",
-                "pub",
-                "ref",
-                "return",
-                "static",
-                "struct",
-                "super",
-                "trait",
-                "type",
-                "union",
-                "unsafe",
-                "use",
-                "where",
-                "while",
-                "yield",
+            wordSet(
+                "as async break const continue crate dyn else enum extern fn for if impl in let loop match",
+                "mod move mut pub ref return static struct super trait type union unsafe use where while yield",
             )
 
         private fun collectLeadingStopPats(

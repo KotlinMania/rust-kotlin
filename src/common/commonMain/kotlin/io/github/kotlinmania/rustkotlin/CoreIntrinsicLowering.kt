@@ -21,8 +21,8 @@ import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.parse2
 
-private fun wordSet(vararg lines: String): Set<String> =
-    lines.flatMapTo(linkedSetOf()) { it.split(' ') }
+internal fun wordSet(vararg lines: String): Set<String> =
+    lines.flatMapTo(linkedSetOf()) { it.split(' ').filter(String::isNotEmpty) }
 
 internal fun List<SynType>.nonInferAt(idx: Int): SynType? =
     getOrNull(idx)?.takeUnless { it is SynType.Infer }

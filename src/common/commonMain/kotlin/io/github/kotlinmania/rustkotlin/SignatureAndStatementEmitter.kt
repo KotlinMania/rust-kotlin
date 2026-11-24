@@ -27,9 +27,6 @@ import io.github.kotlinmania.syn.WherePredicate
 import io.github.kotlinmania.syn.gen.Visit
 import io.github.kotlinmania.syn.span
 
-private fun sigWordSet(vararg lines: String): Set<String> =
-    lines.flatMapTo(linkedSetOf()) { it.split(' ') }
-
 internal data class TypeParamWitnessSpec(
     val keyTp: String,
     val actualTp: String,
@@ -40,41 +37,41 @@ internal data class TypeParamWitnessSpec(
 )
 
 internal val COMPANION_CAPABLE_VALUE_TYPES: Set<String> =
-    sigWordSet(
+    wordSet(
         "Byte Short Int Long UByte UShort UInt ULong Float Double Boolean Char String",
         "kotlin.Byte kotlin.Short kotlin.Int kotlin.Long kotlin.UByte kotlin.UShort kotlin.UInt kotlin.ULong",
         "kotlin.Float kotlin.Double kotlin.Boolean kotlin.Char kotlin.String I128 U128 F16 F128 RustChar",
     )
 
 private val ITERATOR_ASSOC_TRAITS: Set<String> =
-    sigWordSet("Iterator DoubleEndedIterator ExactSizeIterator FusedIterator AsyncIterator")
+    wordSet("Iterator DoubleEndedIterator ExactSizeIterator FusedIterator AsyncIterator")
 
 private val WITNESS_MUT_REF_SCALARS: Set<String> =
-    sigWordSet(
+    wordSet(
         "Byte UByte Short UShort Int UInt Long ULong I128 U128",
         "Float kotlin.Float Double Char RustChar ConstPtr MutPtr",
     )
 
 private val ZERO_ARG_SELF_PRODUCER_METHODS: Set<String> =
-    sigWordSet(
+    wordSet(
         "zero one min_value max_value nan infinity neg_infinity neg_zero",
         "epsilon min_positive_value max_finite min_finite",
     )
 
 private val EXTERNAL_OVERRIDABLE_STDLIB_TRAITS: Set<String> =
-    sigWordSet(
+    wordSet(
         "Read Write BufRead Seek Clone Iterator DoubleEndedIterator ExactSizeIterator",
         "BitOr BitAnd BitXor Not Add Sub Mul Div Rem Neg Shl Shr PanicPayload",
     )
 
 private val CORE_OPS_FORWARD_REF_TRAITS: Set<String> =
-    sigWordSet(
+    wordSet(
         "Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr Neg Not",
         "AddAssign SubAssign MulAssign DivAssign RemAssign BitAndAssign BitOrAssign BitXorAssign ShlAssign ShrAssign",
     )
 
 private val KOTLIN_BUILTIN_ARITH_TYPES: Set<String> =
-    sigWordSet("Byte Short Int Long UByte UShort UInt ULong Float Double")
+    wordSet("Byte Short Int Long UByte UShort UInt ULong Float Double")
 
 private fun collectCombinedWherePredicates(
     ownerWhere: WhereClause?,
