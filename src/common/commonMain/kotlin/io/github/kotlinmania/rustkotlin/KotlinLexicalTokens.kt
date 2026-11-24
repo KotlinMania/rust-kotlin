@@ -189,6 +189,29 @@ internal open class KotlinSourceTokenizer {
             }
         }
 
+        fun tryConsumeStringTemplate(activeStringMode: Char, tokStart: Int, tokLine: Int, tokCol: Int, depth: Int): Boolean {
+            if (source[i] != '$' || i + 1 >= n) return false
+            if (source[i + 1] == '{') {
+                val j = i + 2
+                advanceTo(j)
+                interpModes.add(activeStringMode)
+                interpBraces.add(1)
+                mode = 'C'
+                out += KotlinLexToken.TemplateExprOpen("\${", tokStart, j, tokLine, tokCol, depth)
+                return true
+            }
+            if (isKotlinIdentStart(source[i + 1])) {
+                var j = i + 2
+                while (j < n && isKotlinIdentPart(source[j])) j++
+                val raw = source.substring(tokStart, j)
+                val ident = source.substring(tokStart + 1, j)
+                advanceTo(j)
+                out += KotlinLexToken.StringIdentTemplate(raw, ident, tokStart, j, tokLine, tokCol, depth)
+                return true
+            }
+            return false
+        }
+
         while (i < n) {
             val depth = interpModes.size
             val tokStart = i
@@ -330,38 +353,20 @@ internal open class KotlinSourceTokenizer {
                     }
                 }
                 'S' -> {
-                    val ch = source[i]
                     when {
-                        ch == '"' -> {
+                        source[i] == '"' -> {
                             advanceTo(i + 1)
                             mode = 'C'
                             out += KotlinLexToken.StringClose("\"", tokStart, tokStart + 1, tokLine, tokCol, depth)
                         }
-                        ch == '$' && i + 1 < n && source[i + 1] == '{' -> {
-                            val j = i + 2
-                            advanceTo(j)
-                            interpModes.add('S')
-                            interpBraces.add(1)
-                            mode = 'C'
-                            out += KotlinLexToken.TemplateExprOpen("\${", tokStart, j, tokLine, tokCol, depth)
-                        }
-                        ch == '$' && i + 1 < n && isKotlinIdentStart(source[i + 1]) -> {
-                            var j = i + 2
-                            while (j < n && isKotlinIdentPart(source[j])) j++
-                            val raw = source.substring(tokStart, j)
-                            val ident = source.substring(tokStart + 1, j)
-                            advanceTo(j)
-                            out += KotlinLexToken.StringIdentTemplate(raw, ident, tokStart, j, tokLine, tokCol, depth)
-                        }
+                        tryConsumeStringTemplate('S', tokStart, tokLine, tokCol, depth) -> {}
                         else -> {
                             var j = i
                             while (j < n) {
                                 val c = source[j]
                                 if (c == '\\' && j + 1 < n) {
                                     j += 2
-                                } else if (c == '"') {
-                                    break
-                                } else if (c == '$' && j + 1 < n && (source[j + 1] == '{' || isKotlinIdentStart(source[j + 1]))) {
+                                } else if (c == '"' || (c == '$' && j + 1 < n && (source[j + 1] == '{' || isKotlinIdentStart(source[j + 1])))) {
                                     break
                                 } else {
                                     j++
@@ -374,44 +379,26 @@ internal open class KotlinSourceTokenizer {
                     }
                 }
                 else -> {
-                    val ch = source[i]
                     when {
-                        ch == '"' && i + 2 < n && source[i + 1] == '"' && source[i + 2] == '"' &&
+                        source[i] == '"' && i + 2 < n && source[i + 1] == '"' && source[i + 2] == '"' &&
                             (i + 3 >= n || source[i + 3] != '"') -> {
                             val j = i + 3
                             advanceTo(j)
                             mode = 'C'
-                            out += KotlinLexToken.StringClose("\"\"\"", tokStart, j, tokLine, tokCol, depth)
+                            out += KotlinLexToken.StringClose("\"\"\"", tokStart, tokStart + 1, tokLine, tokCol, depth)
                         }
-                        ch == '$' && i + 1 < n && source[i + 1] == '{' -> {
-                            val j = i + 2
-                            advanceTo(j)
-                            interpModes.add('R')
-                            interpBraces.add(1)
-                            mode = 'C'
-                            out += KotlinLexToken.TemplateExprOpen("\${", tokStart, j, tokLine, tokCol, depth)
-                        }
-                        ch == '$' && i + 1 < n && isKotlinIdentStart(source[i + 1]) -> {
-                            var j = i + 2
-                            while (j < n && isKotlinIdentPart(source[j])) j++
-                            val raw = source.substring(tokStart, j)
-                            val ident = source.substring(tokStart + 1, j)
-                            advanceTo(j)
-                            out += KotlinLexToken.StringIdentTemplate(raw, ident, tokStart, j, tokLine, tokCol, depth)
-                        }
+                        tryConsumeStringTemplate('R', tokStart, tokLine, tokCol, depth) -> {}
                         else -> {
                             var j = i
                             while (j < n) {
                                 val c = source[j]
-                                if (c == '"' && j + 2 < n && source[j + 1] == '"' && source[j + 2] == '"' &&
-                                    (j + 3 >= n || source[j + 3] != '"')
-                                ) {
+                                val isRawClose =
+                                    c == '"' && j + 2 < n && source[j + 1] == '"' && source[j + 2] == '"' &&
+                                        (j + 3 >= n || source[j + 3] != '"')
+                                if (isRawClose || (c == '$' && j + 1 < n && (source[j + 1] == '{' || isKotlinIdentStart(source[j + 1])))) {
                                     break
-                                } else if (c == '$' && j + 1 < n && (source[j + 1] == '{' || isKotlinIdentStart(source[j + 1]))) {
-                                    break
-                                } else {
-                                    j++
                                 }
+                                j++
                             }
                             val raw = source.substring(tokStart, j)
                             advanceTo(j)
@@ -433,7 +420,8 @@ internal fun isKotlinIdentPart(ch: Char): Boolean = ch == '_' || ch.isLetterOrDi
 
 /**
  * Extensible walker over [KotlinLexToken] streams with reusable balanced-delimiter,
- * type-argument `<...>`, identifier-collection, and top-level comma-splitting primitives.
+ * type-argument `<...>`, dotted-identifier, identifier-collection, and top-level
+ * comma-splitting primitives.
  */
 internal open class KotlinTokenWalker(
     val source: String,
@@ -451,20 +439,18 @@ internal open class KotlinTokenWalker(
         return k
     }
 
+    fun isTriviaToken(tok: KotlinLexToken): Boolean =
+        tok is KotlinLexToken.Whitespace ||
+            tok is KotlinLexToken.Newline ||
+            tok is KotlinLexToken.LineComment ||
+            tok is KotlinLexToken.BlockComment
+
     fun nextNonTriviaIndex(startIdx: Int, limit: Int = tokens.size): Int {
         var k = startIdx
-        while (k < limit) {
-            val t = tokens[k]
-            if (t !is KotlinLexToken.Whitespace &&
-                t !is KotlinLexToken.Newline &&
-                t !is KotlinLexToken.LineComment &&
-                t !is KotlinLexToken.BlockComment
-            ) {
-                return k
-            }
+        while (k < limit && isTriviaToken(tokens[k])) {
             k++
         }
-        return limit
+        return k
     }
 
     fun identTextAt(idx: Int): String? {
@@ -482,18 +468,31 @@ internal open class KotlinTokenWalker(
         return if (tok.interpolationDepth == 0) tok.ch else null
     }
 
-    fun findMatchingParenToken(openParenTokenIdx: Int): Int {
-        val openTok = tokens.getOrNull(openParenTokenIdx) as? KotlinLexToken.Punct ?: return -1
-        if (openTok.ch != '(') return -1
+    fun readDottedIdentifier(startIdx: Int, limit: Int = tokens.size): Pair<String, Int>? {
+        val first = identTextAt(startIdx) ?: return null
+        val sb = StringBuilder(first)
+        var cur = nextNonTriviaIndex(startIdx + 1, limit)
+        while (punctAt(cur) == '.') {
+            val segIdx = nextNonTriviaIndex(cur + 1, limit)
+            val seg = identTextAt(segIdx) ?: break
+            sb.append('.').append(seg)
+            cur = nextNonTriviaIndex(segIdx + 1, limit)
+        }
+        return sb.toString() to cur
+    }
+
+    private fun findMatchingPunctPairToken(openTokenIdx: Int, openCh: Char, closeCh: Char): Int {
+        val openTok = tokens.getOrNull(openTokenIdx) as? KotlinLexToken.Punct ?: return -1
+        if (openTok.ch != openCh) return -1
         val baseInterp = openTok.interpolationDepth
         var depth = 0
-        var k = openParenTokenIdx
+        var k = openTokenIdx
         while (k < tokens.size) {
             val tok = tokens[k]
             if (tok.interpolationDepth == baseInterp && tok is KotlinLexToken.Punct) {
                 when (tok.ch) {
-                    '(' -> depth++
-                    ')' -> {
+                    openCh -> depth++
+                    closeCh -> {
                         depth--
                         if (depth == 0) return k
                     }
@@ -504,27 +503,11 @@ internal open class KotlinTokenWalker(
         return -1
     }
 
-    fun findMatchingBracketToken(openBracketTokenIdx: Int): Int {
-        val openTok = tokens.getOrNull(openBracketTokenIdx) as? KotlinLexToken.Punct ?: return -1
-        if (openTok.ch != '[') return -1
-        val baseInterp = openTok.interpolationDepth
-        var depth = 0
-        var k = openBracketTokenIdx
-        while (k < tokens.size) {
-            val tok = tokens[k]
-            if (tok.interpolationDepth == baseInterp && tok is KotlinLexToken.Punct) {
-                when (tok.ch) {
-                    '[' -> depth++
-                    ']' -> {
-                        depth--
-                        if (depth == 0) return k
-                    }
-                }
-            }
-            k++
-        }
-        return -1
-    }
+    fun findMatchingParenToken(openParenTokenIdx: Int): Int =
+        findMatchingPunctPairToken(openParenTokenIdx, '(', ')')
+
+    fun findMatchingBracketToken(openBracketTokenIdx: Int): Int =
+        findMatchingPunctPairToken(openBracketTokenIdx, '[', ']')
 
     fun skipAnnotation(atTokenIdx: Int, limit: Int = tokens.size): Int {
         if (punctAt(atTokenIdx) != '@') return atTokenIdx
@@ -536,15 +519,7 @@ internal open class KotlinTokenWalker(
         if (identTextAt(k) != null && punctAt(nextNonTriviaIndex(k + 1, limit)) == ':') {
             k = nextNonTriviaIndex(nextNonTriviaIndex(k + 1, limit) + 1, limit)
         }
-        while (identTextAt(k) != null) {
-            val dotIdx = nextNonTriviaIndex(k + 1, limit)
-            if (punctAt(dotIdx) == '.') {
-                k = nextNonTriviaIndex(dotIdx + 1, limit)
-            } else {
-                k = dotIdx
-                break
-            }
-        }
+        readDottedIdentifier(k, limit)?.let { (_, afterDotted) -> k = afterDotted }
         if (punctAt(k) == '<') {
             val closeAngle = findMatchingTypeAngleToken(k)
             if (closeAngle > k) {
@@ -577,36 +552,15 @@ internal open class KotlinTokenWalker(
         var k = beforeIdx - 1
         while (k >= 0) {
             val t = tokens[k]
-            if (t !is KotlinLexToken.Whitespace &&
-                t !is KotlinLexToken.Newline &&
-                t !is KotlinLexToken.LineComment &&
-                t !is KotlinLexToken.BlockComment
-            ) {
-                return t
-            }
+            if (!isTriviaToken(t)) return t
             k--
         }
         return null
     }
 
     fun findMatchingBraceEndToken(openTokenIdx: Int): Int {
-        var k = openTokenIdx
-        var depth = 0
-        val baseInterp = tokens.getOrNull(openTokenIdx)?.interpolationDepth ?: 0
-        while (k < tokens.size) {
-            val tok = tokens[k]
-            if (tok.interpolationDepth == baseInterp && tok is KotlinLexToken.Punct) {
-                when (tok.ch) {
-                    '{' -> depth++
-                    '}' -> {
-                        depth--
-                        if (depth == 0) return k + 1
-                    }
-                }
-            }
-            k++
-        }
-        return tokens.size
+        val closeIdx = findMatchingPunctPairToken(openTokenIdx, '{', '}')
+        return if (closeIdx >= 0) closeIdx + 1 else tokens.size
     }
 
     fun findMatchingTypeAngleToken(openAngleTokenIdx: Int): Int {
@@ -637,6 +591,54 @@ internal open class KotlinTokenWalker(
             k++
         }
         return -1
+    }
+
+    fun splitTopLevelCommaTokenRanges(startIdx: Int, endExclusive: Int): List<IntRange> {
+        val clauses = mutableListOf<IntRange>()
+        var clauseStart = startIdx
+        walkTopLevelTokens(startIdx, endExclusive, trackBraces = true) { idx, _, isAtTopLevel ->
+            if (isAtTopLevel && punctAt(idx) == ',') {
+                if (clauseStart < idx) {
+                    clauses += clauseStart until idx
+                }
+                clauseStart = idx + 1
+            }
+            true
+        }
+        if (clauseStart < endExclusive) {
+            clauses += clauseStart until endExclusive
+        }
+        return clauses
+    }
+
+    inline fun walkTopLevelTokens(
+        startIdx: Int,
+        endExclusive: Int = tokens.size,
+        trackBraces: Boolean = false,
+        onToken: (idx: Int, tok: KotlinLexToken, isAtTopLevel: Boolean) -> Boolean,
+    ) {
+        val limit = minOf(endExclusive, tokens.size)
+        var angleDepth = 0
+        var parenDepth = 0
+        var bracketDepth = 0
+        var braceDepth = 0
+        for (idx in startIdx until limit) {
+            val tok = tokens[idx]
+            val atTop = angleDepth == 0 && parenDepth == 0 && bracketDepth == 0 && (!trackBraces || braceDepth == 0)
+            if (!onToken(idx, tok, atTop)) return
+            if (tok.interpolationDepth == 0 && tok is KotlinLexToken.Punct) {
+                when (tok.ch) {
+                    '<' -> angleDepth++
+                    '>' -> if (angleDepth > 0) angleDepth--
+                    '(' -> parenDepth++
+                    ')' -> if (parenDepth > 0) parenDepth--
+                    '[' -> bracketDepth++
+                    ']' -> if (bracketDepth > 0) bracketDepth--
+                    '{' -> if (trackBraces) braceDepth++
+                    '}' -> if (trackBraces && braceDepth > 0) braceDepth--
+                }
+            }
+        }
     }
 
     fun collectCodeIdentifiers(startTokenIdx: Int, endTokenExclusive: Int, out: MutableSet<String>) {
@@ -681,34 +683,10 @@ internal open class KotlinTokenWalker(
         fun splitTopLevelCommaList(segment: String): List<String> {
             if (segment.isBlank()) return emptyList()
             val walker = KotlinTokenWalker(segment)
-            val parts = mutableListOf<String>()
-            var partCharStart = 0
-            var angleDepth = 0
-            var parenDepth = 0
-            var bracketDepth = 0
-            var braceDepth = 0
-            for (tok in walker.tokens) {
-                if (tok.interpolationDepth != 0) continue
-                if (tok is KotlinLexToken.Punct) {
-                    when (tok.ch) {
-                        '<' -> angleDepth++
-                        '>' -> if (angleDepth > 0) angleDepth--
-                        '(' -> parenDepth++
-                        ')' -> if (parenDepth > 0) parenDepth--
-                        '[' -> bracketDepth++
-                        ']' -> if (bracketDepth > 0) bracketDepth--
-                        '{' -> braceDepth++
-                        '}' -> if (braceDepth > 0) braceDepth--
-                        ',' ->
-                            if (angleDepth == 0 && parenDepth == 0 && bracketDepth == 0 && braceDepth == 0) {
-                                parts += segment.substring(partCharStart, tok.start)
-                                partCharStart = tok.end
-                            }
-                    }
-                }
-            }
-            parts += segment.substring(partCharStart)
-            return parts.filter { it.isNotBlank() }
+            return walker
+                .splitTopLevelCommaTokenRanges(0, walker.tokens.size)
+                .map { range -> segment.substring(walker.tokens[range.first].start, walker.tokens[range.last].end) }
+                .filter { it.isNotBlank() }
         }
 
         fun findTopLevelCommaIndex(
