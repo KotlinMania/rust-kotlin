@@ -3,6 +3,7 @@ package io.github.kotlinmania.rustkotlin
 import io.github.kotlinmania.syn.GenericArgument
 import io.github.kotlinmania.syn.GenericParam
 import io.github.kotlinmania.syn.Generics
+import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
 import io.github.kotlinmania.syn.SynType

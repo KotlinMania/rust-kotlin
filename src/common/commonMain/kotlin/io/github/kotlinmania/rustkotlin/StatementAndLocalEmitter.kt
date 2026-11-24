@@ -2566,7 +2566,7 @@ private fun KotlinJ2KEmitter.renderAddressableLocal(
     return if (boundVarUsed) "$storageDecl\n${indent}$boundKeyword $boundName by $storage" else storageDecl
 }
 
-private fun KotlinJ2KEmitter.renderTupleStructDestructuringLocal(
+internal fun KotlinJ2KEmitter.renderTupleStructDestructuringLocal(
     pat: Pat.TupleStruct,
     initExpr: Expr?,
     rhs: String,

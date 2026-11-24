@@ -8,15 +8,18 @@ import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.File
 import io.github.kotlinmania.syn.FnArg
 import io.github.kotlinmania.syn.ForeignItem
+import io.github.kotlinmania.syn.GenericArgument
 import io.github.kotlinmania.syn.GenericParam
 import io.github.kotlinmania.syn.Generics
 import io.github.kotlinmania.syn.ImplItem
 import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.Path
+import io.github.kotlinmania.syn.PathArguments
 import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.TraitItem
 import io.github.kotlinmania.syn.TypeParamBound
+import io.github.kotlinmania.syn.WherePredicate
 import io.github.kotlinmania.syn.gen.Visit
 import io.github.kotlinmania.syn.span
 
@@ -57,7 +60,7 @@ internal fun translateRustSourceToKotlinArtifacts(
                 source = recognized.source,
                 trivia = trivia,
                 macroDefs = macroExpansion.definitions,
-                macroWrapperSpansByTargetOffset = macroWrapperSpansByTargetOffset,
+                macroWrapperSpansByTargetOffset = macroExpansion.macroWrapperSpansByTargetOffset,
                 headerContext = headerContext,
             )
         parentText to (emitter.emitCompanionFiles() + splitModCompanions)
