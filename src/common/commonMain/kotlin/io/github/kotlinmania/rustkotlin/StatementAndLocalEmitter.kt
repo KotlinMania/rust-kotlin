@@ -4,8 +4,6 @@ import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.procmacro2.Span
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
-import io.github.kotlinmania.rustkotlin.reused.starlark.AssignCount
-import io.github.kotlinmania.syn.BinOp
 import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.FieldValue
@@ -16,12 +14,52 @@ import io.github.kotlinmania.syn.Macro
 import io.github.kotlinmania.syn.Member
 import io.github.kotlinmania.syn.ModContent
 import io.github.kotlinmania.syn.Pat
+import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.ReturnType
 import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.UnOp
 import io.github.kotlinmania.syn.gen.Visit
 import io.github.kotlinmania.syn.span
+
+internal fun KotlinJ2KEmitter.singlePlainPathCleanIdent(expr: Expr?): String? {
+    val pathExpr = expr?.let(::unwrapParenOrGroupExpr) as? Expr.Path ?: return null
+    return if (pathExpr.qself == null && pathExpr.path.segments.size == 1) pathExpr.path.firstCleanIdent() else null
+}
+
+private fun KotlinJ2KEmitter.resolveDeclaredOrCrateStructFieldType(
+    ownerTypeName: String,
+    fieldProp: String?,
+    selfTypeName: String?,
+    fallbackDefaultValueField: Boolean = false,
+): String? {
+    val synMap = inspector.structFieldSynTypesByType[ownerTypeName]
+    val localRendered =
+        if (fieldProp != null) {
+            synMap?.get(fieldProp)?.let { renderType(it, selfTypeName) }
+        } else {
+            synMap?.values?.singleOrNull()?.let { renderType(it, selfTypeName) }
+        }
+    if (localRendered != null) return localRendered
+    val crateScoped =
+        scopedAbiKeysForRenderedType(ownerTypeName).firstNotNullOfOrNull { key ->
+            if (fieldProp != null) {
+                headerContext.crateStructFieldTypes["$key.$fieldProp"]
+            } else if (fallbackDefaultValueField) {
+                val fieldEntries = headerContext.crateStructFieldTypes.entries
+                headerContext.crateStructFieldTypes["$key.value"]
+                    ?: fieldEntries.singleOrNull { it.key.startsWith("$key.") }?.value
+            } else {
+                null
+            }
+        }
+    if (crateScoped != null) return crateScoped
+    return when {
+        fieldProp != null -> headerContext.crateStructFieldTypes["$ownerTypeName.$fieldProp"]
+        fallbackDefaultValueField -> headerContext.crateStructFieldTypes["$ownerTypeName.value"]
+        else -> null
+    }
+}
 
 internal object BorrowedPlacePropertyDelegateTemplate {
     fun renderWithCachedOwner(
@@ -63,66 +101,77 @@ internal object BorrowedPlacePropertyDelegateTemplate {
             appendLine("$indent            override fun getValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>): V = read()")
             appendLine("$indent            override fun setValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>, value: V) { write(value) }")
             appendLine("$indent        }")
-            if (extraSetupLine != null) {
-                appendLine(extraSetupLine)
-            }
+            if (extraSetupLine != null) appendLine(extraSetupLine)
             appendLine("$indent    place({ $targetAccess }, { $targetAccess = it })")
             append("$indent}")
         }
 }
 
-internal sealed class LocalStorageLoweringRule {
-    abstract fun tryRender(
-        emitter: KotlinJ2KEmitter,
-        local: Stmt.Local,
-        indent: String,
-        selfTypeName: String?,
-        remainingStmts: List<Stmt>,
-    ): String?
-
-    object Addressable : LocalStorageLoweringRule() {
-        override fun tryRender(
-            emitter: KotlinJ2KEmitter,
-            local: Stmt.Local,
-            indent: String,
-            selfTypeName: String?,
-            remainingStmts: List<Stmt>,
-        ): String? = emitter.renderAddressableLocal(local, indent, selfTypeName, remainingStmts)
-    }
-
-    object ScopedBorrowedPlace : LocalStorageLoweringRule() {
-        override fun tryRender(
-            emitter: KotlinJ2KEmitter,
-            local: Stmt.Local,
-            indent: String,
-            selfTypeName: String?,
-            remainingStmts: List<Stmt>,
-        ): String? = emitter.renderScopedBorrowedPlaceLocal(local, indent, selfTypeName, remainingStmts)
-    }
-
-    companion object {
-        private val RULES: List<LocalStorageLoweringRule> = listOf(Addressable, ScopedBorrowedPlace)
-
-        fun tryLower(
-            emitter: KotlinJ2KEmitter,
-            local: Stmt.Local,
-            indent: String,
-            selfTypeName: String?,
-            remainingStmts: List<Stmt>,
-        ): String? = RULES.firstNotNullOfOrNull { it.tryRender(emitter, local, indent, selfTypeName, remainingStmts) }
+private class StmtLeadingCfgScanner(
+    stmt: Stmt,
+) : RustTokenCursor(stmt.toTokenStream().toList()) {
+    inline fun forEachLeadingCfgPredicate(visit: (List<TokenTree>) -> Unit) {
+        var idx = 0
+        while (idx + 1 < size) {
+            val bracket = groupAt(idx + 1, Delimiter.Bracket)
+            if (punctCharAt(idx) != '#' || bracket == null) break
+            val attrCursor = RustTokenCursor(bracket.stream().toList())
+            val predGroup = attrCursor.groupAt(1, Delimiter.Parenthesis)
+            if (attrCursor.size == 2 && attrCursor.identAt(0) == "cfg" && predGroup != null) {
+                visit(predGroup.stream().toList())
+            }
+            idx += 2
+        }
     }
 }
 
-internal fun KotlinJ2KEmitter.deduplicateComplementaryCfgStmts(rawStmts: List<Stmt>): List<Stmt> {
-    val surviving = rawStmts.filterNot { isLeadingCfgStmtDisabled(it) }
-    if (surviving.size < 2) return surviving
-    var lastRawExecIdx = -1
-    for (i in surviving.indices.reversed()) {
-        if (surviving[i] !is Stmt.ItemStmt) {
-            lastRawExecIdx = i
-            break
+internal fun isLeadingCfgStmtDisabled(stmt: Stmt): Boolean {
+    StmtLeadingCfgScanner(stmt).forEachLeadingCfgPredicate { predTrees ->
+        if (isDocOnlyCfgPredicateTokens(predTrees)) return true
+    }
+    return false
+}
+
+private fun canonicalTokenSequenceKey(trees: List<TokenTree>): String =
+    trees.joinToString(" ") { tt ->
+        when (tt) {
+            is TokenTree.Ident -> "I:${tt.value}"
+            is TokenTree.Punct -> "P:${tt.value.asChar()}:${tt.value.spacing()}"
+            is TokenTree.Literal -> "L:${tt.value}"
+            is TokenTree.Group -> "G:${tt.value.delimiter()}(${canonicalTokenSequenceKey(tt.value.stream().toList())})"
         }
     }
+
+private fun extractLeadingCfgSignature(stmt: Stmt): Pair<Boolean, String>? {
+    var found: Pair<Boolean, String>? = null
+    StmtLeadingCfgScanner(stmt).forEachLeadingCfgPredicate { predTrees ->
+        if (found != null) return null
+        val predCursor = RustTokenCursor(predTrees)
+        val negGroup = predCursor.groupAt(1, Delimiter.Parenthesis)
+        found =
+            if (predCursor.size == 2 && predCursor.identAt(0) == "not" && negGroup != null) {
+                false to canonicalTokenSequenceKey(negGroup.stream().toList())
+            } else {
+                true to canonicalTokenSequenceKey(predTrees)
+            }
+    }
+    return found
+}
+
+internal fun KotlinJ2KEmitter.deduplicateComplementaryCfgStmts(rawStmts: List<Stmt>): List<Stmt> {
+    fun localIdentText(s: Stmt): String? {
+        val pat = (s as? Stmt.Local)?.pat as? Pat.Ident ?: return null
+        return pat.ident.toString()
+    }
+
+    fun itemFnIdentText(s: Stmt): String? {
+        val fnItem = (s as? Stmt.ItemStmt)?.item as? Item.Fn ?: return null
+        return fnItem.sig.ident.toString()
+    }
+
+    val surviving = rawStmts.filterNot(::isLeadingCfgStmtDisabled)
+    if (surviving.size < 2) return surviving
+    val lastRawExecIdx = surviving.indexOfLast { it !is Stmt.ItemStmt }
     val filtered = ArrayList<Stmt>(surviving.size)
     var i = 0
     while (i < surviving.size) {
@@ -132,16 +181,10 @@ internal fun KotlinJ2KEmitter.deduplicateComplementaryCfgStmts(rawStmts: List<St
             val sig1 = extractLeadingCfgSignature(cur)
             val sig2 = if (sig1 != null) extractLeadingCfgSignature(next) else null
             if (sig1 != null && sig2 != null && sig1.second == sig2.second && sig1.first != sig2.first) {
-                val sameLocalBinding =
-                    cur is Stmt.Local &&
-                        next is Stmt.Local &&
-                        (cur.pat as? Pat.Ident)?.ident?.toString() != null &&
-                        (cur.pat as? Pat.Ident)?.ident?.toString() == (next.pat as? Pat.Ident)?.ident?.toString()
-                val sameItemFnName =
-                    cur is Stmt.ItemStmt &&
-                        next is Stmt.ItemStmt &&
-                        (cur.item as? Item.Fn)?.sig?.ident?.toString() != null &&
-                        (cur.item as? Item.Fn)?.sig?.ident?.toString() == (next.item as? Item.Fn)?.sig?.ident?.toString()
+                val curIdent = localIdentText(cur)
+                val sameLocalBinding = curIdent != null && curIdent == localIdentText(next)
+                val curFn = itemFnIdentText(cur)
+                val sameItemFnName = curFn != null && curFn == itemFnIdentText(next)
                 val complementaryTail =
                     (i + 1 == lastRawExecIdx) &&
                         cur !is Stmt.Local &&
@@ -161,67 +204,457 @@ internal fun KotlinJ2KEmitter.deduplicateComplementaryCfgStmts(rawStmts: List<St
     return filtered
 }
 
-internal fun isLeadingCfgStmtDisabled(stmt: Stmt): Boolean {
-    val trees = stmt.toTokenStream().toList()
-    var idx = 0
-    while (idx + 1 < trees.size) {
-        val pound = (trees[idx] as? TokenTree.Punct)?.value?.asChar()
-        val bracket = (trees[idx + 1] as? TokenTree.Group)?.value
-        if (pound != '#' || bracket == null || bracket.delimiter() != Delimiter.Bracket) break
-        val attrTrees = bracket.stream().toList()
-        if (attrTrees.size == 2 &&
-            (attrTrees[0] as? TokenTree.Ident)?.value?.toString() == "cfg" &&
-            (attrTrees[1] as? TokenTree.Group)?.value?.delimiter() == Delimiter.Parenthesis
-        ) {
-            val predTrees = (attrTrees[1] as TokenTree.Group).value.stream().toList()
-            if (isDocOnlyCfgPredicateTokens(predTrees)) return true
-        }
-        idx += 2
-    }
-    return false
-}
-
-internal fun KotlinJ2KEmitter.extractLeadingCfgSignature(stmt: Stmt): Pair<Boolean, String>? {
-    val trees = stmt.toTokenStream().toList()
-    var found: Pair<Boolean, String>? = null
-    var idx = 0
-    while (idx + 1 < trees.size) {
-        val pound = (trees[idx] as? TokenTree.Punct)?.value?.asChar()
-        val bracket = (trees[idx + 1] as? TokenTree.Group)?.value
-        if (pound != '#' || bracket == null || bracket.delimiter() != Delimiter.Bracket) break
-        val attrTrees = bracket.stream().toList()
-        if (attrTrees.size == 2 &&
-            (attrTrees[0] as? TokenTree.Ident)?.value?.toString() == "cfg" &&
-            (attrTrees[1] as? TokenTree.Group)?.value?.delimiter() == Delimiter.Parenthesis
-        ) {
-            if (found != null) return null
-            val predTrees = (attrTrees[1] as TokenTree.Group).value.stream().toList()
-            found =
-                if (predTrees.size == 2 &&
-                    (predTrees[0] as? TokenTree.Ident)?.value?.toString() == "not" &&
-                    (predTrees[1] as? TokenTree.Group)?.value?.delimiter() == Delimiter.Parenthesis
-                ) {
-                    val innerPred = (predTrees[1] as TokenTree.Group).value.stream().toList()
-                    false to canonicalTokenSequenceKey(innerPred)
-                } else {
-                    true to canonicalTokenSequenceKey(predTrees)
+private class BlockEmissionScope(
+    val emitter: KotlinJ2KEmitter,
+    val stmts: List<Stmt>,
+    val selfTypeName: String?,
+) {
+    val lastExecutableIdx: Int = stmts.indexOfLast { it !is Stmt.ItemStmt }
+    val localScopeItems: List<Item> = stmts.mapNotNull { (it as? Stmt.ItemStmt)?.item }
+    val localAttachableNames: Set<String> =
+        localScopeItems
+            .mapNotNull { item ->
+                when (item) {
+                    is Item.Struct -> rustTypeIdentToKotlin(item.ident.toString())
+                    is Item.Enum -> rustTypeIdentToKotlin(item.ident.toString())
+                    is Item.Union -> rustTypeIdentToKotlin(item.ident.toString())
+                    else -> null
                 }
+            }.toSet()
+    val localBlockImpls: Map<String, List<Item.Impl>> =
+        buildMap<String, MutableList<Item.Impl>> {
+            for (item in localScopeItems) {
+                if (item is Item.Impl) {
+                    val ownerType = emitter.extractAttachableDirectOwnerTypeName(item, localScopeItems)
+                    if (ownerType != null && ownerType in localAttachableNames) {
+                        getOrPut(ownerType) { mutableListOf() }.add(item)
+                    }
+                }
+            }
         }
-        idx += 2
-    }
-    return found
-}
+    val localBlockSignatures = linkedMapOf<String, Int>()
 
-internal fun KotlinJ2KEmitter.canonicalTokenSequenceKey(trees: List<TokenTree>): String =
-    trees.joinToString(" ") { tt ->
-        when (tt) {
-            is TokenTree.Ident -> "I:${tt.value}"
-            is TokenTree.Punct -> "P:${tt.value.asChar()}:${tt.value.spacing()}"
-            is TokenTree.Literal -> "L:${tt.value}"
-            is TokenTree.Group ->
-                "G:${tt.value.delimiter()}(${canonicalTokenSequenceKey(tt.value.stream().toList())})"
+    private val savedBlockLocalFnRawNames = hashSetOf<String>()
+    private val savedBlockLocalInlineModNames = hashSetOf<String>()
+    private val prevBlockLocalFnReturnSynTypes = linkedMapOf<String, SynType?>()
+    private val prevBlockLocalTypeAliases = linkedMapOf<String, SynType?>()
+    private val savedBlockLocalExternFnNames = linkedSetOf<String>()
+
+    private fun recordLocalCallableReturn(cleanRaw: String, ktName: String, retTy: SynType) {
+        val map = emitter.inspector.topLevelFnReturnSynTypes
+        if (cleanRaw !in prevBlockLocalFnReturnSynTypes) prevBlockLocalFnReturnSynTypes[cleanRaw] = map[cleanRaw]
+        if (ktName !in prevBlockLocalFnReturnSynTypes) prevBlockLocalFnReturnSynTypes[ktName] = map[ktName]
+        map[cleanRaw] = retTy
+        map[ktName] = retTy
+    }
+
+    private fun registerLocalItemsAndScopes(prevLocalForeignRenames: Map<String, String>) {
+        val blockLocalForeignRenames = linkedMapOf<String, String>()
+        val blockFnParamKinds = linkedMapOf<String, List<NumericKind?>?>()
+
+        for (stmtItem in localScopeItems) {
+            if (itemHasDocOnlyCfg(stmtItem)) continue
+            when (stmtItem) {
+                is Item.Fn -> {
+                    val cleanRaw = stmtItem.sig.cleanFnName()
+                    if (cleanRaw !in emitter.inspector.declaredTopLevelFnRawNames) {
+                        savedBlockLocalFnRawNames += cleanRaw
+                        emitter.inspector.declaredTopLevelFnRawNames += cleanRaw
+                    }
+                    (stmtItem.sig.output as? ReturnType.TypeReturn)?.let { retOut ->
+                        recordLocalCallableReturn(cleanRaw, rustFunctionIdentToKotlin(stmtItem.sig.ident.toString()), retOut.ty)
+                    }
+                    emitter.extractFnParamNumericKinds(stmtItem, selfTypeName)?.let { (fnName, kinds) ->
+                        blockFnParamKinds[fnName] = if (fnName in blockFnParamKinds) null else kinds
+                    }
+                }
+                is Item.ForeignMod -> {
+                    for (foreign in stmtItem.items) {
+                        if (foreignItemHasDocOnlyCfg(foreign) || foreign !is ForeignItem.Fn) continue
+                        val cleanRaw = foreign.sig.cleanFnName()
+                        if (cleanRaw !in emitter.inspector.declaredTopLevelFnRawNames) {
+                            savedBlockLocalFnRawNames += cleanRaw
+                            emitter.inspector.declaredTopLevelFnRawNames += cleanRaw
+                        }
+                        val ktFn = rustFunctionIdentToKotlin(foreign.sig.ident.toString())
+                        val effectiveLocalKt =
+                            if (ktFn == emitter.currentEnclosingFunctionName) {
+                                "extern${ktFn.replaceFirstChar { it.uppercase() }}".also { blockLocalForeignRenames[cleanRaw] = it }
+                            } else {
+                                ktFn
+                            }
+                        if (effectiveLocalKt !in emitter.inspector.externFnKotlinNames) {
+                            savedBlockLocalExternFnNames += effectiveLocalKt
+                            emitter.inspector.externFnKotlinNames += effectiveLocalKt
+                        }
+                        val retOut = foreign.sig.output as? ReturnType.TypeReturn
+                        val foreignGenerics = foreign.sig.generics
+                        if (retOut != null && foreignGenerics.params.isEmpty()) {
+                            recordLocalCallableReturn(cleanRaw, effectiveLocalKt, retOut.ty)
+                        }
+                    }
+                }
+                is Item.Use -> emitter.registerUseItemInScope(stmtItem)
+                is Item.ItemType -> {
+                    val ktAlias = rustTypeIdentToKotlin(stmtItem.ident.toString())
+                    if (ktAlias !in prevBlockLocalTypeAliases) {
+                        prevBlockLocalTypeAliases[ktAlias] = emitter.inspector.typeAliasTargets[ktAlias]
+                    }
+                    emitter.inspector.typeAliasTargets[ktAlias] = stmtItem.ty
+                }
+                is Item.Mod ->
+                    if (stmtItem.content is ModContent.Inline) {
+                        val modRaw = stmtItem.ident.toString().removePrefix("r#")
+                        if (modRaw !in emitter.inspector.localInlineModuleNames) {
+                            savedBlockLocalInlineModNames += modRaw
+                            emitter.inspector.localInlineModuleNames += modRaw
+                        }
+                    }
+                else -> {}
+            }
+        }
+        if (blockLocalForeignRenames.isNotEmpty()) {
+            emitter.activeLocalForeignFnRenames = prevLocalForeignRenames + blockLocalForeignRenames
+        }
+        if (blockFnParamKinds.isNotEmpty()) {
+            val updated = emitter.currentFunctionParamNumericKinds.toMutableMap()
+            for ((fnName, kinds) in blockFnParamKinds) {
+                if (kinds == null) updated.remove(fnName) else updated[fnName] = kinds
+            }
+            emitter.currentFunctionParamNumericKinds = updated
         }
     }
+
+    private fun emitHoistedLocalItems(innerIndent: String, lines: MutableList<String>) {
+        val hoistedItems = mutableListOf<Pair<String?, String>>()
+        for (stmt in stmts) {
+            val itemInStmt = (stmt as? Stmt.ItemStmt)?.item ?: continue
+            if (itemHasDocOnlyCfg(itemInStmt) || itemInStmt is Item.Use) continue
+            if (itemInStmt is Item.Impl && emitter.extractAttachableDirectOwnerTypeName(itemInStmt, localScopeItems) in localAttachableNames) {
+                continue
+            }
+            val declName =
+                when (itemInStmt) {
+                    is Item.Struct -> rustTypeIdentToKotlin(itemInStmt.ident.toString())
+                    is Item.Enum -> rustTypeIdentToKotlin(itemInStmt.ident.toString())
+                    is Item.Union -> rustTypeIdentToKotlin(itemInStmt.ident.toString())
+                    is Item.Trait -> rustTypeIdentToKotlin(itemInStmt.ident.toString())
+                    is Item.ItemType -> rustTypeIdentToKotlin(itemInStmt.ident.toString())
+                    is Item.Fn -> rustFunctionIdentToKotlin(itemInStmt.sig.ident.toString())
+                    is Item.Const -> rustConstIdentToKotlin(itemInStmt.ident.toString())
+                    else -> null
+                }
+            val renderedItem =
+                emitter.renderStmt(
+                    stmt = stmt,
+                    indent = innerIndent,
+                    selfTypeName = selfTypeName,
+                    isTailReturn = false,
+                    localTypeImpls = localBlockImpls,
+                    localSignatures = localBlockSignatures,
+                )
+            if (renderedItem.isNotBlank()) hoistedItems += declName to renderedItem
+        }
+        if (hoistedItems.size <= 1) {
+            hoistedItems.forEach { lines += it.second }
+            return
+        }
+        val n = hoistedItems.size
+        val deps = Array(n) { hashSetOf<Int>() }
+        for (i in 0 until n) {
+            val renderedI = hoistedItems[i].second
+            for (j in 0 until n) {
+                val nameJ = hoistedItems[j].first
+                if (i != j && nameJ != null && emitter.containsWholeIdentifier(renderedI, nameJ)) deps[i] += j
+            }
+        }
+        val emitted = BooleanArray(n)
+        repeat(n) { _ ->
+            val picked =
+                (0 until n).firstOrNull { idx -> !emitted[idx] && deps[idx].all { d -> emitted[d] } }
+                    ?: (0 until n).first { idx -> !emitted[idx] }
+            emitted[picked] = true
+            lines += hoistedItems[picked].second
+        }
+    }
+
+    fun executeBlock(
+        innerIndent: String,
+        returnsValue: Boolean,
+        lines: MutableList<String>,
+        closeBraceTrivia: String,
+        trailingInjectedLines: List<String>,
+    ) {
+        val prevBorrowedPlaceLocals = emitter.currentBorrowedPlaceLocals
+        val prevAddressableLocals = emitter.currentAddressableLocals
+        val prevArrayElementTypes = emitter.currentAddressableArrayElementTypes
+        val prevSourceParameterTypes = emitter.currentSourceParameterTypes
+        val prevFnParamNumericKinds = emitter.currentFunctionParamNumericKinds
+        val prevLocalBlockItems = emitter.activeLocalBlockItems
+        val prevLocalForeignRenames = emitter.activeLocalForeignFnRenames
+        val blockEntryExpectedKind = emitter.currentExpectedNumericKind
+        val blockEntryTailExpectsUnitResultOk = emitter.currentTailExpectsUnitResultOk
+
+        emitter.currentExpectedNumericKind = null
+        emitter.currentTailExpectsUnitResultOk = false
+        emitter.activeLocalBlockItems = localScopeItems + prevLocalBlockItems
+        emitter.scopeBuilder.enterCompr()
+        try {
+            registerLocalItemsAndScopes(prevLocalForeignRenames)
+            emitHoistedLocalItems(innerIndent, lines)
+            renderStmtsRange(
+                startIdx = 0,
+                endIdx = stmts.size,
+                lines = lines,
+                innerIndent = innerIndent,
+                returnsValue = returnsValue,
+                effectiveLastExecIdx = lastExecutableIdx,
+                blockEntryExpectedKind = blockEntryExpectedKind,
+                blockEntryTailExpectsUnitResultOk = blockEntryTailExpectsUnitResultOk,
+            )
+            if (closeBraceTrivia.isNotBlank()) lines += closeBraceTrivia.trimEnd('\n')
+            lines.addAll(trailingInjectedLines)
+            if (emitter.headerContext.isBatchCrateOutput) emitter.sanitizeBatchBlockLocals(lines)
+        } finally {
+            emitter.inspector.declaredTopLevelFnRawNames.removeAll(savedBlockLocalFnRawNames)
+            emitter.inspector.externFnKotlinNames.removeAll(savedBlockLocalExternFnNames)
+            emitter.inspector.localInlineModuleNames.removeAll(savedBlockLocalInlineModNames)
+            val retTypesMap = emitter.inspector.topLevelFnReturnSynTypes
+            for ((fnKey, prevSyn) in prevBlockLocalFnReturnSynTypes) {
+                if (prevSyn == null) retTypesMap.remove(fnKey) else retTypesMap[fnKey] = prevSyn
+            }
+            val aliasMap = emitter.inspector.typeAliasTargets
+            for ((aliasKey, prevSyn) in prevBlockLocalTypeAliases) {
+                if (prevSyn == null) aliasMap.remove(aliasKey) else aliasMap[aliasKey] = prevSyn
+            }
+            emitter.currentExpectedNumericKind = blockEntryExpectedKind
+            emitter.currentTailExpectsUnitResultOk = blockEntryTailExpectsUnitResultOk
+            emitter.currentBorrowedPlaceLocals = prevBorrowedPlaceLocals
+            emitter.currentAddressableLocals = prevAddressableLocals
+            emitter.currentAddressableArrayElementTypes = prevArrayElementTypes
+            emitter.currentSourceParameterTypes = prevSourceParameterTypes
+            emitter.currentFunctionParamNumericKinds = prevFnParamNumericKinds
+            emitter.activeLocalBlockItems = prevLocalBlockItems
+            emitter.activeLocalForeignFnRenames = prevLocalForeignRenames
+            emitter.scopeBuilder.exitCompr()
+        }
+    }
+
+    fun renderStmtsRange(
+        startIdx: Int,
+        endIdx: Int,
+        lines: MutableList<String>,
+        innerIndent: String,
+        returnsValue: Boolean,
+        effectiveLastExecIdx: Int,
+        blockEntryExpectedKind: NumericKind?,
+        blockEntryTailExpectsUnitResultOk: Boolean,
+    ) {
+        var idx = startIdx
+        while (idx < endIdx) {
+            val stmt = stmts[idx]
+            if (stmt is Stmt.ItemStmt) {
+                idx++
+                continue
+            }
+            val refCellStep =
+                tryRenderRefCellBorrowGuardScope(
+                    idx = idx,
+                    endIdx = endIdx,
+                    innerIndent = innerIndent,
+                    returnsValue = returnsValue,
+                    effectiveLastExecIdx = effectiveLastExecIdx,
+                    blockEntryExpectedKind = blockEntryExpectedKind,
+                )
+            if (refCellStep != null) {
+                if (refCellStep.first.isNotBlank()) lines += refCellStep.first
+                idx = refCellStep.second
+                continue
+            }
+            if (stmt is Stmt.Local && stmt.init == null && stmt.pat is Pat.Ident && (stmt.pat as Pat.Ident).subpat == null && idx + 1 < endIdx) {
+                if (tryFoldUninitializedLocalWithNext(stmt, stmt.pat as Pat.Ident, stmts[idx + 1], idx, innerIndent, returnsValue, effectiveLastExecIdx, lines)) {
+                    idx += 2
+                    continue
+                }
+            }
+            val isLastExec = (idx == effectiveLastExecIdx)
+            val isTail = isLastExec && returnsValue
+            val isValueTailExpr =
+                isLastExec &&
+                    !returnsValue &&
+                    ((stmt is Stmt.ExprStmt && stmt.semiToken == null) || (stmt is Stmt.MacroStmt && stmt.semiToken == null))
+            val rendered =
+                try {
+                    if (isValueTailExpr) {
+                        emitter.currentExpectedNumericKind = blockEntryExpectedKind
+                        emitter.currentTailExpectsUnitResultOk = blockEntryTailExpectsUnitResultOk
+                    } else {
+                        emitter.currentExpectedNumericKind = null
+                        emitter.currentTailExpectsUnitResultOk = false
+                    }
+                    emitter.renderStmt(
+                        stmt = stmt,
+                        indent = innerIndent,
+                        selfTypeName = selfTypeName,
+                        isTailReturn = isTail,
+                        isLastExecutableStmt = isLastExec,
+                        localTypeImpls = localBlockImpls,
+                        localSignatures = localBlockSignatures,
+                        remainingStmts = if (idx + 1 < endIdx) stmts.subList(idx + 1, endIdx) else emptyList(),
+                    )
+                } finally {
+                    emitter.currentExpectedNumericKind = null
+                    emitter.currentTailExpectsUnitResultOk = false
+                }
+            if (rendered.isNotBlank()) lines += rendered
+            idx++
+        }
+    }
+
+    private fun tryFoldUninitializedLocalWithNext(
+        stmt: Stmt.Local,
+        identPat: Pat.Ident,
+        nextStmt: Stmt,
+        idx: Int,
+        innerIndent: String,
+        returnsValue: Boolean,
+        effectiveLastExecIdx: Int,
+        lines: MutableList<String>,
+    ): Boolean {
+        val rawVar = identPat.ident.toString().removePrefix("r#")
+        val nextMac =
+            when {
+                nextStmt is Stmt.MacroStmt -> nextStmt.mac
+                nextStmt is Stmt.Local && nextStmt.init?.diverge == null && nextStmt.init?.expr is Expr.Macro ->
+                    (nextStmt.init!!.expr as Expr.Macro).mac
+                else -> null
+            }
+        if (nextMac != null) {
+            val delim = emitter.extractDelimitedMacroParts(nextMac, innerIndent, selfTypeName)
+            if (delim != null && delim.second == rawVar) {
+                val trivia1 = emitter.renderLeadingTriviaForSpan(stmt.span(), innerIndent)
+                val trivia2 = emitter.renderLeadingTriviaForSpan(nextStmt.span(), innerIndent)
+                val ktVar = emitter.bindScopedValueIdent(rawVar, identPat.ident.span(), identPat.mutability != null)
+                val tryCall = emitter.renderSourceResultTry("${delim.first}(${delim.third})", "return")
+                if (nextStmt is Stmt.MacroStmt) {
+                    lines += "${trivia1}${trivia2}${innerIndent}val $ktVar = ($tryCall).content"
+                } else {
+                    val localNext = nextStmt as Stmt.Local
+                    val (tokPat, tokTy) = emitter.renderLocalPattern(localNext.pat, selfTypeName, includeCtorInTupleStruct = false, bindToScope = true)
+                    val tokKeyword = if (emitter.isMutablePattern(localNext.pat)) "var" else "val"
+                    val tokSuffix = if (tokTy != null) ": $tokTy" else ""
+                    lines += "${trivia1}${trivia2}${innerIndent}val ${ktVar}Group = $tryCall"
+                    lines += "${innerIndent}val $ktVar = ${ktVar}Group.content"
+                    lines += "${innerIndent}$tokKeyword $tokPat$tokSuffix = ${ktVar}Group.token"
+                }
+                return true
+            }
+        }
+        val (matchExpr, targetLocalStmt) =
+            when {
+                nextStmt is Stmt.ExprStmt && nextStmt.expr is Expr.Match && !(idx + 1 == effectiveLastExecIdx && returnsValue) ->
+                    (nextStmt.expr as Expr.Match) to null
+                nextStmt is Stmt.Local && nextStmt.init?.diverge == null && nextStmt.init?.expr is Expr.Match ->
+                    (nextStmt.init!!.expr as Expr.Match) to nextStmt
+                else -> return false
+            }
+        val folded =
+            emitter.tryRenderDeferredLocalResultMatchInit(
+                identPat = identPat,
+                rawVar = rawVar,
+                localStmt = stmt,
+                matchStmt = nextStmt,
+                matchExpr = matchExpr,
+                targetLocalStmt = targetLocalStmt,
+                innerIndent = innerIndent,
+                selfTypeName = selfTypeName,
+            ) ?: return false
+        lines.addAll(folded)
+        return true
+    }
+
+    private fun tryRenderRefCellBorrowGuardScope(
+        idx: Int,
+        endIdx: Int,
+        innerIndent: String,
+        returnsValue: Boolean,
+        effectiveLastExecIdx: Int,
+        blockEntryExpectedKind: NumericKind?,
+    ): Pair<String, Int>? {
+        val stmt = stmts[idx] as? Stmt.Local ?: return null
+        val init = stmt.init?.takeIf { it.diverge == null } ?: return null
+        val identPat = (emitter.unwrapTransparentPat(stmt.pat) as? Pat.Ident)?.takeIf { it.subpat == null } ?: return null
+        val initCall = emitter.unwrapParenOrGroupExpr(init.expr) as? Expr.MethodCall ?: return null
+        if (!initCall.args.isEmpty() || initCall.turbofish != null) return null
+        val callMethod = initCall.method.toString().removePrefix("r#")
+        if (callMethod != "borrow" && callMethod != "borrow_mut") return null
+        val recvTy = emitter.inferExprRenderedType(initCall.receiver, selfTypeName)?.removeSuffix("?")?.trim() ?: return null
+        if (recvTy.substringBefore('<').substringAfterLast('.') != "RefCell" || '<' !in recvTy || !recvTy.endsWith('>')) return null
+        val innerTy = recvTy.substringAfter('<').dropLast(1).trim()
+        val rawVar = identPat.ident.toString().removePrefix("r#")
+        val dropIdx = (idx + 1 until endIdx).firstOrNull { emitter.isDropOfLocalStmt(stmts[it], rawVar) }
+        val scopeEnd = dropIdx ?: endIdx
+        val nextIdx = if (dropIdx != null) dropIdx + 1 else endIdx
+        val cellRendered = emitter.renderExpr(initCall.receiver, innerIndent, selfTypeName)
+        val cellAtom = if (emitter.isAtomicPostfixReceiver(initCall.receiver, cellRendered)) cellRendered else "($cellRendered)"
+        val isMut = (callMethod == "borrow_mut")
+        val isStringMut = isMut && innerTy == "String"
+        val borrowFn = if (isMut) "borrowMut" else "borrow"
+        val useFn = if (isStringMut) "useMut" else "use"
+        val guardVarTy = if (isStringMut) "RefMut<String>" else innerTy
+        val triviaPrefix = emitter.renderLeadingTriviaForSpan(stmt.span(), innerIndent)
+        val guardCapturesTail = returnsValue && scopeEnd == endIdx && effectiveLastExecIdx in (idx + 1) until scopeEnd
+
+        val prevTyped = emitter.currentTypedLocals
+        val prevMutableLists = emitter.currentMutableListLocals
+        val prevSmartCast = emitter.currentSmartCastNonNullLocals
+        val scopeLines = mutableListOf<String>()
+        emitter.scopeBuilder.enterCompr()
+        val boundKtVar =
+            try {
+                val ktVar = emitter.bindScopedValueIdent(rawVar, identPat.ident.span(), mutable = false)
+                emitter.currentTypedLocals = prevTyped + (ktVar to guardVarTy)
+                if (!isStringMut && innerTy.startsWith("MutableList<")) {
+                    emitter.currentMutableListLocals = prevMutableLists + ktVar
+                }
+                val capturedTailKind =
+                    if (guardCapturesTail) {
+                        emitter.currentEnclosingReturnRenderedType?.let(emitter::resolveNumericKind) ?: blockEntryExpectedKind
+                    } else {
+                        null
+                    }
+                val capturedTailUnitResultOk =
+                    guardCapturesTail && (rustResultOkPayloadType(emitter.currentEnclosingReturnRenderedType) == "Unit")
+                renderStmtsRange(
+                    startIdx = idx + 1,
+                    endIdx = scopeEnd,
+                    lines = scopeLines,
+                    innerIndent = "$innerIndent    ",
+                    returnsValue = false,
+                    effectiveLastExecIdx = if (guardCapturesTail) effectiveLastExecIdx else -1,
+                    blockEntryExpectedKind = capturedTailKind,
+                    blockEntryTailExpectsUnitResultOk = capturedTailUnitResultOk,
+                )
+                if (emitter.headerContext.isBatchCrateOutput) emitter.sanitizeBatchBlockLocals(scopeLines)
+                ktVar
+            } finally {
+                emitter.currentTypedLocals = prevTyped
+                emitter.currentMutableListLocals = prevMutableLists
+                emitter.currentSmartCastNonNullLocals = prevSmartCast
+                emitter.scopeBuilder.exitCompr()
+            }
+
+        val returnPrefix = if (guardCapturesTail && !emitter.stmtAlwaysDiverges(stmts[effectiveLastExecIdx])) "return " else ""
+        val sb = StringBuilder()
+        sb.append(triviaPrefix).append("$innerIndent$returnPrefix$cellAtom.$borrowFn().$useFn { $boundKtVar ->\n")
+        for (line in scopeLines) {
+            sb.append(line)
+            if (!line.endsWith('\n')) sb.append('\n')
+        }
+        sb.append(innerIndent).append('}')
+        return sb.toString() to nextIdx
+    }
+}
 
 internal fun KotlinJ2KEmitter.renderBlock(
     block: Block,
@@ -241,299 +674,16 @@ internal fun KotlinJ2KEmitter.renderBlock(
     val lines = mutableListOf<String>()
     lines.addAll(leadingInjectedLines)
 
-    val effectiveRenderedRet =
-        if (returnType != null) {
-            currentEnclosingReturnRenderedType ?: renderType(returnType, selfTypeName)
-        } else {
-            null
-        }
+    val effectiveRenderedRet = if (returnType != null) currentEnclosingReturnRenderedType ?: renderType(returnType, selfTypeName) else null
     val returnsValue = effectiveRenderedRet != null && effectiveRenderedRet != "Unit"
 
-    var lastExecutableIdx = -1
-    for (i in stmts.indices.reversed()) {
-        if (stmts[i] !is Stmt.ItemStmt) {
-            lastExecutableIdx = i
-            break
-        }
-    }
-
-    val localBlockImpls = linkedMapOf<String, MutableList<Item.Impl>>()
-    val localAttachableNames =
-        stmts
-            .mapNotNull { stmt ->
-                when (val it = (stmt as? Stmt.ItemStmt)?.item) {
-                    is Item.Struct -> rustTypeIdentToKotlin(it.ident.toString())
-                    is Item.Enum -> rustTypeIdentToKotlin(it.ident.toString())
-                    is Item.Union -> rustTypeIdentToKotlin(it.ident.toString())
-                    else -> null
-                }
-            }.toSet()
-    val localScopeItems = stmts.mapNotNull { (it as? Stmt.ItemStmt)?.item }
-    for (stmt in stmts) {
-        val implItem = (stmt as? Stmt.ItemStmt)?.item as? Item.Impl ?: continue
-        val ownerType = extractAttachableDirectOwnerTypeName(implItem, localScopeItems)
-        if (ownerType != null && ownerType in localAttachableNames) {
-            localBlockImpls.getOrPut(ownerType) { mutableListOf() }.add(implItem)
-        }
-    }
-
-    val localBlockSignatures = linkedMapOf<String, Int>()
-    val prevBorrowedPlaceLocals = currentBorrowedPlaceLocals
-    val prevAddressableLocals = currentAddressableLocals
-    val prevArrayElementTypes = currentAddressableArrayElementTypes
-    val prevSourceParameterTypes = currentSourceParameterTypes
-    val prevFnParamNumericKinds = currentFunctionParamNumericKinds
-    val prevLocalBlockItems = activeLocalBlockItems
-    val prevLocalForeignRenames = activeLocalForeignFnRenames
-    val blockEntryExpectedKind = currentExpectedNumericKind
-    val blockEntryTailExpectsUnitResultOk = currentTailExpectsUnitResultOk
-    val savedBlockLocalFnRawNames = hashSetOf<String>()
-    val savedBlockLocalInlineModNames = hashSetOf<String>()
-    val prevBlockLocalFnReturnSynTypes = linkedMapOf<String, SynType?>()
-    val prevBlockLocalTypeAliases = linkedMapOf<String, SynType?>()
-    val savedBlockLocalExternFnNames = linkedSetOf<String>()
-    val blockLocalForeignRenames = linkedMapOf<String, String>()
-    currentExpectedNumericKind = null
-    currentTailExpectsUnitResultOk = false
-    activeLocalBlockItems = localScopeItems + prevLocalBlockItems
-    scopeBuilder.enterCompr()
-    try {
-        for (stmt in stmts) {
-            val stmtItem = (stmt as? Stmt.ItemStmt)?.item ?: continue
-            if (itemHasDocOnlyCfg(stmtItem)) continue
-            when (stmtItem) {
-                is Item.Fn -> {
-                    val cleanRaw =
-                        stmtItem.sig.ident
-                            .toString()
-                            .removePrefix("r#")
-                    if (cleanRaw !in inspector.declaredTopLevelFnRawNames) {
-                        savedBlockLocalFnRawNames += cleanRaw
-                        inspector.declaredTopLevelFnRawNames += cleanRaw
-                    }
-                    val retOut = stmtItem.sig.output as? ReturnType.TypeReturn
-                    if (retOut != null) {
-                        val ktFn = rustFunctionIdentToKotlin(stmtItem.sig.ident.toString())
-                        if (cleanRaw !in prevBlockLocalFnReturnSynTypes) {
-                            prevBlockLocalFnReturnSynTypes[cleanRaw] = inspector.topLevelFnReturnSynTypes[cleanRaw]
-                        }
-                        if (ktFn !in prevBlockLocalFnReturnSynTypes) {
-                            prevBlockLocalFnReturnSynTypes[ktFn] = inspector.topLevelFnReturnSynTypes[ktFn]
-                        }
-                        inspector.topLevelFnReturnSynTypes[cleanRaw] = retOut.ty
-                        inspector.topLevelFnReturnSynTypes[ktFn] = retOut.ty
-                    }
-                }
-                is Item.ForeignMod -> {
-                    for (foreign in stmtItem.items) {
-                        if (foreignItemHasDocOnlyCfg(foreign)) continue
-                        if (foreign is ForeignItem.Fn) {
-                            val cleanRaw =
-                                foreign.sig.ident
-                                    .toString()
-                                    .removePrefix("r#")
-                            if (cleanRaw !in inspector.declaredTopLevelFnRawNames) {
-                                savedBlockLocalFnRawNames += cleanRaw
-                                inspector.declaredTopLevelFnRawNames += cleanRaw
-                            }
-                            val ktFn = rustFunctionIdentToKotlin(foreign.sig.ident.toString())
-                            val effectiveLocalKt =
-                                if (ktFn == currentEnclosingFunctionName) {
-                                    "extern${ktFn.replaceFirstChar { c -> c.uppercase() }}".also { renamed ->
-                                        blockLocalForeignRenames[cleanRaw] = renamed
-                                    }
-                                } else {
-                                    ktFn
-                                }
-                            if (effectiveLocalKt !in inspector.externFnKotlinNames) {
-                                savedBlockLocalExternFnNames += effectiveLocalKt
-                                inspector.externFnKotlinNames += effectiveLocalKt
-                            }
-                            val retOut = foreign.sig.output as? ReturnType.TypeReturn
-                            if (retOut != null &&
-                                foreign.sig.generics.params
-                                    .isEmpty()
-                            ) {
-                                if (cleanRaw !in prevBlockLocalFnReturnSynTypes) {
-                                    prevBlockLocalFnReturnSynTypes[cleanRaw] = inspector.topLevelFnReturnSynTypes[cleanRaw]
-                                }
-                                if (effectiveLocalKt !in prevBlockLocalFnReturnSynTypes) {
-                                    prevBlockLocalFnReturnSynTypes[effectiveLocalKt] = inspector.topLevelFnReturnSynTypes[effectiveLocalKt]
-                                }
-                                inspector.topLevelFnReturnSynTypes[cleanRaw] = retOut.ty
-                                inspector.topLevelFnReturnSynTypes[effectiveLocalKt] = retOut.ty
-                            }
-                        }
-                    }
-                }
-                else -> {}
-            }
-        }
-        if (blockLocalForeignRenames.isNotEmpty()) {
-            activeLocalForeignFnRenames = prevLocalForeignRenames + blockLocalForeignRenames
-        }
-        val blockFnParamKinds = linkedMapOf<String, List<NumericKind?>?>()
-        for (stmt in stmts) {
-            val fnItem = (stmt as? Stmt.ItemStmt)?.item as? Item.Fn ?: continue
-            if (itemHasDocOnlyCfg(fnItem)) continue
-            val extracted = extractFnParamNumericKinds(fnItem, selfTypeName)
-            if (extracted != null) {
-                val (fnName, kinds) = extracted
-                blockFnParamKinds[fnName] = if (fnName in blockFnParamKinds) null else kinds
-            }
-        }
-        if (blockFnParamKinds.isNotEmpty()) {
-            val updated = currentFunctionParamNumericKinds.toMutableMap()
-            for ((fnName, kinds) in blockFnParamKinds) {
-                if (kinds == null) {
-                    updated.remove(fnName)
-                } else {
-                    updated[fnName] = kinds
-                }
-            }
-            currentFunctionParamNumericKinds = updated
-        }
-        // Hoist local item declarations (`fn`, `struct`, `enum`, `type`, `const`, `use`)
-        // before executable statements so forward calls/type references resolve in Kotlin,
-        // topologically ordering hoisted local types/functions so referenced helpers precede callers.
-        for (stmt in stmts) {
-            val itemInStmt = (stmt as? Stmt.ItemStmt)?.item ?: continue
-            if (itemHasDocOnlyCfg(itemInStmt)) continue
-            if (itemInStmt is Item.Use) {
-                registerUseItemInScope(itemInStmt)
-            } else if (itemInStmt is Item.ItemType) {
-                val ktAlias = rustTypeIdentToKotlin(itemInStmt.ident.toString())
-                if (ktAlias !in prevBlockLocalTypeAliases) {
-                    prevBlockLocalTypeAliases[ktAlias] = inspector.typeAliasTargets[ktAlias]
-                }
-                inspector.typeAliasTargets[ktAlias] = itemInStmt.ty
-            } else if (itemInStmt is Item.Mod && itemInStmt.content is ModContent.Inline) {
-                val modRaw = itemInStmt.ident.toString().removePrefix("r#")
-                if (modRaw !in inspector.localInlineModuleNames) {
-                    savedBlockLocalInlineModNames += modRaw
-                    inspector.localInlineModuleNames += modRaw
-                }
-            }
-        }
-        val hoistedItems = mutableListOf<Pair<String?, String>>()
-        for (stmt in stmts) {
-            val itemInStmt = (stmt as? Stmt.ItemStmt)?.item ?: continue
-            if (itemHasDocOnlyCfg(itemInStmt) || itemInStmt is Item.Use) continue
-            if (itemInStmt is Item.Impl) {
-                val ownerType = extractAttachableDirectOwnerTypeName(itemInStmt, localScopeItems)
-                if (ownerType != null && ownerType in localAttachableNames) {
-                    continue
-                }
-            }
-            val declName =
-                when (itemInStmt) {
-                    is Item.Struct -> rustTypeIdentToKotlin(itemInStmt.ident.toString())
-                    is Item.Enum -> rustTypeIdentToKotlin(itemInStmt.ident.toString())
-                    is Item.Union -> rustTypeIdentToKotlin(itemInStmt.ident.toString())
-                    is Item.Trait -> rustTypeIdentToKotlin(itemInStmt.ident.toString())
-                    is Item.ItemType -> rustTypeIdentToKotlin(itemInStmt.ident.toString())
-                    is Item.Fn -> rustFunctionIdentToKotlin(itemInStmt.sig.ident.toString())
-                    is Item.Const -> rustConstIdentToKotlin(itemInStmt.ident.toString())
-                    else -> null
-                }
-            val renderedItem =
-                renderStmt(
-                    stmt = stmt,
-                    indent = innerIndent,
-                    selfTypeName = selfTypeName,
-                    isTailReturn = false,
-                    localTypeImpls = localBlockImpls,
-                    localSignatures = localBlockSignatures,
-                )
-            if (renderedItem.isNotBlank()) {
-                hoistedItems += declName to renderedItem
-            }
-        }
-        if (hoistedItems.size <= 1) {
-            for ((_, renderedItem) in hoistedItems) {
-                lines += renderedItem
-            }
-        } else {
-            val n = hoistedItems.size
-            val deps = Array(n) { hashSetOf<Int>() }
-            for (i in 0 until n) {
-                val (_, renderedI) = hoistedItems[i]
-                for (j in 0 until n) {
-                    if (i == j) continue
-                    val nameJ = hoistedItems[j].first ?: continue
-                    if (containsWholeIdentifier(renderedI, nameJ)) {
-                        deps[i] += j
-                    }
-                }
-            }
-            val emitted = BooleanArray(n)
-            var remaining = n
-            while (remaining > 0) {
-                var picked = -1
-                for (i in 0 until n) {
-                    if (!emitted[i] && deps[i].all { emitted[it] }) {
-                        picked = i
-                        break
-                    }
-                }
-                if (picked < 0) {
-                    picked = (0 until n).first { !emitted[it] }
-                }
-                emitted[picked] = true
-                remaining--
-                lines += hoistedItems[picked].second
-            }
-        }
-        renderBlockStmtsInto(
-            stmts = stmts,
-            startIdx = 0,
-            endIdx = stmts.size,
-            lines = lines,
-            innerIndent = innerIndent,
-            selfTypeName = selfTypeName,
-            returnsValue = returnsValue,
-            lastExecutableIdx = lastExecutableIdx,
-            blockEntryExpectedKind = blockEntryExpectedKind,
-            blockEntryTailExpectsUnitResultOk = blockEntryTailExpectsUnitResultOk,
-            localBlockImpls = localBlockImpls,
-            localBlockSignatures = localBlockSignatures,
-        )
-        if (closeBraceTrivia.isNotBlank()) {
-            lines += closeBraceTrivia.trimEnd('\n')
-        }
-        lines.addAll(trailingInjectedLines)
-        if (headerContext.isBatchCrateOutput) {
-            sanitizeBatchBlockLocals(lines)
-        }
-    } finally {
-        inspector.declaredTopLevelFnRawNames.removeAll(savedBlockLocalFnRawNames)
-        inspector.externFnKotlinNames.removeAll(savedBlockLocalExternFnNames)
-        inspector.localInlineModuleNames.removeAll(savedBlockLocalInlineModNames)
-        for ((fnKey, prevSyn) in prevBlockLocalFnReturnSynTypes) {
-            if (prevSyn == null) {
-                inspector.topLevelFnReturnSynTypes.remove(fnKey)
-            } else {
-                inspector.topLevelFnReturnSynTypes[fnKey] = prevSyn
-            }
-        }
-        for ((aliasKey, prevSyn) in prevBlockLocalTypeAliases) {
-            if (prevSyn == null) {
-                inspector.typeAliasTargets.remove(aliasKey)
-            } else {
-                inspector.typeAliasTargets[aliasKey] = prevSyn
-            }
-        }
-        currentExpectedNumericKind = blockEntryExpectedKind
-        currentTailExpectsUnitResultOk = blockEntryTailExpectsUnitResultOk
-        currentBorrowedPlaceLocals = prevBorrowedPlaceLocals
-        currentAddressableLocals = prevAddressableLocals
-        currentAddressableArrayElementTypes = prevArrayElementTypes
-        currentSourceParameterTypes = prevSourceParameterTypes
-        currentFunctionParamNumericKinds = prevFnParamNumericKinds
-        activeLocalBlockItems = prevLocalBlockItems
-        activeLocalForeignFnRenames = prevLocalForeignRenames
-        scopeBuilder.exitCompr()
-    }
+    BlockEmissionScope(this, stmts, selfTypeName).executeBlock(
+        innerIndent = innerIndent,
+        returnsValue = returnsValue,
+        lines = lines,
+        closeBraceTrivia = closeBraceTrivia,
+        trailingInjectedLines = trailingInjectedLines,
+    )
 
     if (lines.isEmpty()) return "{}"
     if (allowExpressionBody && headerContext.isBatchCrateOutput && returnsValue && lines.size == 1) {
@@ -542,347 +692,44 @@ internal fun KotlinJ2KEmitter.renderBlock(
         if (single.startsWith(returnPrefix)) {
             val exprText = single.removePrefix(returnPrefix)
             if (!containsWholeIdentifier(exprText, "return") && !containsWholeIdentifier(exprText, "throw")) {
-                return if (exprText.contains('\n')) {
-                    "=\n$innerIndent$exprText"
-                } else {
-                    "= $exprText"
-                }
+                return if (exprText.contains('\n')) "=\n$innerIndent$exprText" else "= $exprText"
             }
         }
     }
-    val sb = StringBuilder()
-    sb.append("{\n")
+    val sb = StringBuilder("{\n")
     for (line in lines) {
         sb.append(line)
         if (!line.endsWith('\n')) sb.append('\n')
     }
-    sb.append(indent).append("}")
-    return sb.toString()
-}
-
-private fun KotlinJ2KEmitter.renderBlockStmtsInto(
-    stmts: List<Stmt>,
-    startIdx: Int,
-    endIdx: Int,
-    lines: MutableList<String>,
-    innerIndent: String,
-    selfTypeName: String?,
-    returnsValue: Boolean,
-    lastExecutableIdx: Int,
-    blockEntryExpectedKind: NumericKind?,
-    blockEntryTailExpectsUnitResultOk: Boolean,
-    localBlockImpls: Map<String, List<Item.Impl>>,
-    localBlockSignatures: MutableMap<String, Int>,
-) {
-    var idx = startIdx
-    while (idx < endIdx) {
-        val stmt = stmts[idx]
-        if (stmt is Stmt.ItemStmt) {
-            idx++
-            continue
-        }
-        val refCellStep =
-            tryRenderRefCellBorrowGuardScope(
-                stmts = stmts,
-                idx = idx,
-                endIdx = endIdx,
-                innerIndent = innerIndent,
-                selfTypeName = selfTypeName,
-                returnsValue = returnsValue,
-                lastExecutableIdx = lastExecutableIdx,
-                blockEntryExpectedKind = blockEntryExpectedKind,
-                localBlockImpls = localBlockImpls,
-                localBlockSignatures = localBlockSignatures,
-            )
-        if (refCellStep != null) {
-            val (renderedScope, nextIdx) = refCellStep
-            if (renderedScope.isNotBlank()) {
-                lines += renderedScope
-            }
-            idx = nextIdx
-            continue
-        }
-        if (stmt is Stmt.Local &&
-            stmt.init == null &&
-            stmt.pat is Pat.Ident &&
-            (stmt.pat as Pat.Ident).subpat == null &&
-            idx + 1 < endIdx
-        ) {
-            val identPat = stmt.pat as Pat.Ident
-            val rawVar = identPat.ident.toString().removePrefix("r#")
-            val nextStmt = stmts[idx + 1]
-            if (nextStmt is Stmt.MacroStmt) {
-                val delim = extractDelimitedMacroParts(nextStmt.mac, innerIndent, selfTypeName)
-                if (delim != null && delim.second == rawVar) {
-                    val trivia1 = renderLeadingTriviaForSpan(stmt.span(), innerIndent)
-                    val trivia2 = renderLeadingTriviaForSpan(nextStmt.span(), innerIndent)
-                    val assignCount = if (identPat.mutability != null) AssignCount.Any else AssignCount.AtMostOnce
-                    val ktVar =
-                        scopeBuilder
-                            .bindLocal(rawVar, rustValueIdentToKotlin(rawVar), identPat.ident.span(), assignCount = assignCount)
-                            .kotlinName
-                    lines += "${trivia1}${trivia2}${innerIndent}val $ktVar = (${renderSourceResultTry("${delim.first}(${delim.third})", "return")}).content"
-                    idx += 2
-                    continue
-                }
-            } else if (nextStmt is Stmt.Local && nextStmt.init?.diverge == null && nextStmt.init?.expr is Expr.Macro) {
-                val delim = extractDelimitedMacroParts((nextStmt.init!!.expr as Expr.Macro).mac, innerIndent, selfTypeName)
-                if (delim != null && delim.second == rawVar) {
-                    val trivia1 = renderLeadingTriviaForSpan(stmt.span(), innerIndent)
-                    val trivia2 = renderLeadingTriviaForSpan(nextStmt.span(), innerIndent)
-                    val assignCount = if (identPat.mutability != null) AssignCount.Any else AssignCount.AtMostOnce
-                    val ktVar =
-                        scopeBuilder
-                            .bindLocal(rawVar, rustValueIdentToKotlin(rawVar), identPat.ident.span(), assignCount = assignCount)
-                            .kotlinName
-                    val (tokPat, tokTy) = renderLocalPattern(nextStmt.pat, selfTypeName, includeCtorInTupleStruct = false, bindToScope = true)
-                    val tokKeyword = if (isMutablePattern(nextStmt.pat)) "var" else "val"
-                    val tokSuffix = if (tokTy != null) ": $tokTy" else ""
-                    lines += "${trivia1}${trivia2}${innerIndent}val ${ktVar}Group = ${renderSourceResultTry("${delim.first}(${delim.third})", "return")}"
-                    lines += "${innerIndent}val $ktVar = ${ktVar}Group.content"
-                    lines += "${innerIndent}$tokKeyword $tokPat$tokSuffix = ${ktVar}Group.token"
-                    idx += 2
-                    continue
-                }
-            } else if (nextStmt is Stmt.ExprStmt &&
-                nextStmt.expr is Expr.Match &&
-                !(idx + 1 == lastExecutableIdx && returnsValue)
-            ) {
-                val foldedLines =
-                    tryRenderDeferredLocalResultMatchInit(
-                        identPat = identPat,
-                        rawVar = rawVar,
-                        localStmt = stmt,
-                        matchStmt = nextStmt,
-                        matchExpr = nextStmt.expr as Expr.Match,
-                        targetLocalStmt = null,
-                        innerIndent = innerIndent,
-                        selfTypeName = selfTypeName,
-                    )
-                if (foldedLines != null) {
-                    lines.addAll(foldedLines)
-                    idx += 2
-                    continue
-                }
-            } else if (nextStmt is Stmt.Local &&
-                nextStmt.init?.diverge == null &&
-                nextStmt.init?.expr is Expr.Match
-            ) {
-                val foldedLines =
-                    tryRenderDeferredLocalResultMatchInit(
-                        identPat = identPat,
-                        rawVar = rawVar,
-                        localStmt = stmt,
-                        matchStmt = nextStmt,
-                        matchExpr = nextStmt.init!!.expr as Expr.Match,
-                        targetLocalStmt = nextStmt,
-                        innerIndent = innerIndent,
-                        selfTypeName = selfTypeName,
-                    )
-                if (foldedLines != null) {
-                    lines.addAll(foldedLines)
-                    idx += 2
-                    continue
-                }
-            }
-        }
-        val isLastExec = (idx == lastExecutableIdx)
-        val isTail = isLastExec && returnsValue
-        val isValueTailExpr =
-            isLastExec &&
-                !returnsValue &&
-                ((stmt is Stmt.ExprStmt && stmt.semiToken == null) || (stmt is Stmt.MacroStmt && stmt.semiToken == null))
-        val rendered =
-            try {
-                if (isValueTailExpr) {
-                    currentExpectedNumericKind = blockEntryExpectedKind
-                    currentTailExpectsUnitResultOk = blockEntryTailExpectsUnitResultOk
-                } else {
-                    currentExpectedNumericKind = null
-                    currentTailExpectsUnitResultOk = false
-                }
-                renderStmt(
-                    stmt = stmt,
-                    indent = innerIndent,
-                    selfTypeName = selfTypeName,
-                    isTailReturn = isTail,
-                    isLastExecutableStmt = isLastExec,
-                    localTypeImpls = localBlockImpls,
-                    localSignatures = localBlockSignatures,
-                    remainingStmts = if (idx + 1 < endIdx) stmts.subList(idx + 1, endIdx) else emptyList(),
-                )
-            } finally {
-                currentExpectedNumericKind = null
-                currentTailExpectsUnitResultOk = false
-            }
-        if (rendered.isNotBlank()) {
-            lines += rendered
-        }
-        idx++
-    }
-}
-
-private fun KotlinJ2KEmitter.tryRenderRefCellBorrowGuardScope(
-    stmts: List<Stmt>,
-    idx: Int,
-    endIdx: Int,
-    innerIndent: String,
-    selfTypeName: String?,
-    returnsValue: Boolean,
-    lastExecutableIdx: Int,
-    blockEntryExpectedKind: NumericKind?,
-    localBlockImpls: Map<String, List<Item.Impl>>,
-    localBlockSignatures: MutableMap<String, Int>,
-): Pair<String, Int>? {
-    val stmt = stmts[idx] as? Stmt.Local ?: return null
-    val init = stmt.init?.takeIf { it.diverge == null } ?: return null
-    val identPat = (unwrapTransparentPat(stmt.pat) as? Pat.Ident)?.takeIf { it.subpat == null } ?: return null
-    val initCall = unwrapParenOrGroupExpr(init.expr) as? Expr.MethodCall ?: return null
-    if (!initCall.args.isEmpty() || initCall.turbofish != null) return null
-    val callMethod = initCall.method.toString().removePrefix("r#")
-    if (callMethod != "borrow" && callMethod != "borrow_mut") return null
-    val recvTy = inferExprRenderedType(initCall.receiver, selfTypeName)?.removeSuffix("?")?.trim() ?: return null
-    if (recvTy.substringBefore('<').substringAfterLast('.') != "RefCell" || '<' !in recvTy || !recvTy.endsWith('>')) {
-        return null
-    }
-    val innerTy = recvTy.substringAfter('<').dropLast(1).trim()
-    val rawVar = identPat.ident.toString().removePrefix("r#")
-    val dropIdx = (idx + 1 until endIdx).firstOrNull { isDropOfLocalStmt(stmts[it], rawVar) }
-    val scopeEnd = dropIdx ?: endIdx
-    val nextIdx = if (dropIdx != null) dropIdx + 1 else endIdx
-    val cellRendered = renderExpr(initCall.receiver, innerIndent, selfTypeName)
-    val cellAtom = if (isAtomicPostfixReceiver(initCall.receiver, cellRendered)) cellRendered else "($cellRendered)"
-    val isMut = (callMethod == "borrow_mut")
-    val isStringMut = isMut && innerTy == "String"
-    val borrowFn = if (isMut) "borrowMut" else "borrow"
-    val useFn = if (isStringMut) "useMut" else "use"
-    val guardVarTy = if (isStringMut) "RefMut<String>" else innerTy
-    val triviaPrefix = renderLeadingTriviaForSpan(stmt.span(), innerIndent)
-    val guardCapturesTail = returnsValue && scopeEnd == endIdx && lastExecutableIdx in (idx + 1) until scopeEnd
-
-    val prevTyped = currentTypedLocals
-    val prevMutableLists = currentMutableListLocals
-    val prevSmartCast = currentSmartCastNonNullLocals
-    val scopeLines = mutableListOf<String>()
-    val lambdaBodyIndent = "$innerIndent    "
-    scopeBuilder.enterCompr()
-    val boundKtVar =
-        try {
-            val ktVar =
-                scopeBuilder
-                    .bindLocal(
-                        rawName = rawVar,
-                        baseKotlinName = rustValueIdentToKotlin(rawVar),
-                        span = identPat.ident.span(),
-                        assignCount = AssignCount.AtMostOnce,
-                    ).kotlinName
-            currentTypedLocals = prevTyped + (ktVar to guardVarTy)
-            if (!isStringMut && innerTy.startsWith("MutableList<")) {
-                currentMutableListLocals = prevMutableLists + ktVar
-            }
-            val capturedTailKind =
-                if (guardCapturesTail) {
-                    currentEnclosingReturnRenderedType?.let(this::resolveNumericKind) ?: blockEntryExpectedKind
-                } else {
-                    null
-                }
-            val capturedTailUnitResultOk =
-                guardCapturesTail && (rustResultOkPayloadType(currentEnclosingReturnRenderedType) == "Unit")
-            renderBlockStmtsInto(
-                stmts = stmts,
-                startIdx = idx + 1,
-                endIdx = scopeEnd,
-                lines = scopeLines,
-                innerIndent = lambdaBodyIndent,
-                selfTypeName = selfTypeName,
-                returnsValue = false,
-                lastExecutableIdx = if (guardCapturesTail) lastExecutableIdx else -1,
-                blockEntryExpectedKind = capturedTailKind,
-                blockEntryTailExpectsUnitResultOk = capturedTailUnitResultOk,
-                localBlockImpls = localBlockImpls,
-                localBlockSignatures = localBlockSignatures,
-            )
-            if (headerContext.isBatchCrateOutput) {
-                sanitizeBatchBlockLocals(scopeLines)
-            }
-            ktVar
-        } finally {
-            currentTypedLocals = prevTyped
-            currentMutableListLocals = prevMutableLists
-            currentSmartCastNonNullLocals = prevSmartCast
-            scopeBuilder.exitCompr()
-        }
-
-    val returnPrefix =
-        if (guardCapturesTail && !stmtAlwaysDiverges(stmts[lastExecutableIdx])) {
-            "return "
-        } else {
-            ""
-        }
-    val sb = StringBuilder()
-    sb.append(triviaPrefix)
-    sb
-        .append(innerIndent)
-        .append(returnPrefix)
-        .append(cellAtom)
-        .append('.')
-        .append(borrowFn)
-        .append("().")
-        .append(useFn)
-        .append(" { ")
-        .append(boundKtVar)
-        .append(" ->\n")
-    for (line in scopeLines) {
-        sb.append(line)
-        if (!line.endsWith('\n')) sb.append('\n')
-    }
-    sb.append(innerIndent).append('}')
-    return sb.toString() to nextIdx
+    return sb.append(indent).append("}").toString()
 }
 
 private fun KotlinJ2KEmitter.isDropOfLocalStmt(stmt: Stmt, rawVar: String): Boolean {
     val exprStmt = stmt as? Stmt.ExprStmt ?: return false
     val call = unwrapParenOrGroupExpr(exprStmt.expr) as? Expr.Call ?: return false
-    val path = (call.func as? Expr.Path)?.takeIf { it.qself == null } ?: return false
-    val segs =
-        path.path.segments
-            .toList()
-            .map { it.ident.toString().removePrefix("r#") }
-    if (segs.lastOrNull() != "drop" || segs.dropLast(1).any { it !in setOf("core", "std", "mem") }) {
-        return false
-    }
-    val arg =
-        call.args
-            .toList()
-            .singleOrNull()
-            ?.let { unwrapParenOrGroupExpr(it) } as? Expr.Path ?: return false
-    val argSegs = arg.path.segments.toList()
-    return arg.qself == null && argSegs.size == 1 && argSegs[0].ident.toString().removePrefix("r#") == rawVar
+    val path = (call.func as? Expr.Path)?.takeIf { it.qself == null }?.path ?: return false
+    val pathSegs = path.segments.toList()
+    val segs = pathSegs.map { it.ident.toString().removePrefix("r#") }
+    if (segs.lastOrNull() != "drop" || segs.dropLast(1).any { it !in setOf("core", "std", "mem") }) return false
+    val singleArg = call.args.toList().singleOrNull() ?: return false
+    return singlePlainPathCleanIdent(singleArg) == rawVar
 }
 
 private fun KotlinJ2KEmitter.stmtAlwaysDiverges(stmt: Stmt): Boolean =
-    when (stmt) {
-        is Stmt.ExprStmt -> exprAlwaysDiverges(stmt.expr)
-        else -> false
-    }
+    stmt is Stmt.ExprStmt && exprAlwaysDiverges(stmt.expr)
 
 private fun KotlinJ2KEmitter.exprAlwaysDiverges(expr: Expr): Boolean =
     when (val core = unwrapParenOrGroupExpr(expr)) {
         is Expr.Return, is Expr.Break, is Expr.Continue -> true
-        is Expr.Macro ->
-            core.mac.path.segments
-                .last()
-                ?.ident
-                ?.toString() in setOf("panic", "unreachable", "todo", "unimplemented")
-        is Expr.BlockExpr ->
-            core.block.stmts
-                .lastOrNull()
-                ?.let { stmtAlwaysDiverges(it) } == true
+        is Expr.Macro -> core.mac.path.lastIdentText() in setOf("panic", "unreachable", "todo", "unimplemented")
+        is Expr.BlockExpr -> {
+            val blockStmts = core.block.stmts
+            blockStmts.lastOrNull()?.let(::stmtAlwaysDiverges) == true
+        }
         is Expr.If -> {
             val elseExpr = core.elseBranch?.expr
-            elseExpr != null && core.thenBranch.stmts
-                .lastOrNull()
-                ?.let { stmtAlwaysDiverges(it) } == true && exprAlwaysDiverges(elseExpr)
+            val thenStmts = core.thenBranch.stmts
+            elseExpr != null && thenStmts.lastOrNull()?.let(::stmtAlwaysDiverges) == true && exprAlwaysDiverges(elseExpr)
         }
         is Expr.Match -> core.arms.isNotEmpty() && core.arms.all { exprAlwaysDiverges(it.body) }
         else -> false
@@ -891,37 +738,24 @@ private fun KotlinJ2KEmitter.exprAlwaysDiverges(expr: Expr): Boolean =
 internal fun KotlinJ2KEmitter.sanitizeBatchBlockLocals(lines: MutableList<String>) {
     val singleLineDeclRegex = Regex("^(\\s*)(val|var)\\s+([a-zA-Z_][a-zA-Z0-9_]*)(\\s*:\\s*[^=\\n]+)?\\s*=\\s*([^\\n]+)$")
     for (i in lines.indices.reversed()) {
-        val rawEntry = lines[i]
-        val entryLines = rawEntry.split('\n')
-        var firstCodeIdx = 0
-        while (firstCodeIdx < entryLines.size && entryLines[firstCodeIdx].trimStart().startsWith("//")) {
-            firstCodeIdx++
-        }
-        if (firstCodeIdx >= entryLines.size) continue
-        if (entryLines.size - firstCodeIdx != 1) continue
+        val entryLines = lines[i].split('\n')
+        val firstCodeIdx = entryLines.indexOfFirst { !it.trimStart().startsWith("//") }
+        if (firstCodeIdx < 0 || entryLines.size - firstCodeIdx != 1) continue
         val triviaPart = if (firstCodeIdx > 0) entryLines.subList(0, firstCodeIdx).joinToString("\n") else ""
-        val codeLine = entryLines[firstCodeIdx]
-        val match = singleLineDeclRegex.matchEntire(codeLine) ?: continue
-        val lineIndent = match.groupValues[1]
-        val kw = match.groupValues[2]
-        val ident = match.groupValues[3]
-        val typeSuffix = match.groupValues[4]
-        val rhs = match.groupValues[5]
+        val match = singleLineDeclRegex.matchEntire(entryLines[firstCodeIdx]) ?: continue
+        val groups = match.groupValues
+        val ident = groups[3]
         val afterText = if (i + 1 < lines.size) lines.subList(i + 1, lines.size).joinToString("\n") else ""
         if (!containsWholeIdentifier(afterText, ident)) {
-            if (triviaPart.isNotEmpty()) {
-                lines[i] = triviaPart
-            } else {
-                lines.removeAt(i)
-            }
+            if (triviaPart.isNotEmpty()) lines[i] = triviaPart else lines.removeAt(i)
             continue
         }
-        if (kw == "var") {
+        if (groups[2] == "var") {
             val isReassigned =
                 Regex("(?<![.\\w])${Regex.escape(ident)}\\s*(?:[+\\-*/%]?=(?![=>])|\\+\\+|--)").containsMatchIn(afterText) ||
                     Regex("(?:\\+\\+|--)\\s*${Regex.escape(ident)}\\b").containsMatchIn(afterText)
             if (!isReassigned) {
-                val updatedCode = "${lineIndent}val $ident$typeSuffix = $rhs"
+                val updatedCode = "${groups[1]}val $ident${groups[4]} = ${groups[5]}"
                 lines[i] = if (triviaPart.isNotEmpty()) "$triviaPart\n$updatedCode" else updatedCode
             }
         }
@@ -933,17 +767,13 @@ internal fun KotlinJ2KEmitter.extractDelimitedMacroParts(
     indent: String,
     selfTypeName: String?,
 ): Triple<String, String, String>? {
-    val lastSeg = mac.path.segments.last() ?: return null
-    val macroName = lastSeg.ident.toString()
+    val macroName = mac.path.lastIdentText() ?: return null
     if (macroName != "parenthesized" && macroName != "braced" && macroName != "bracketed") return null
-    val list = mac.tokens.clone().toList()
-    if (list.size < 3) return null
-    val targetIdent = (list[0] as? TokenTree.Ident)?.value?.toString()?.removePrefix("r#") ?: return null
-    val inKeyword = (list[1] as? TokenTree.Ident)?.value?.toString() ?: return null
-    if (inKeyword != "in") return null
-    val streamTokens = TokenStream.fromTokenTrees(list.subList(2, list.size))
-    val renderedStream = parseAndRenderTokenStreamAsExpr(streamTokens, indent, selfTypeName)
-    return Triple(macroName, targetIdent, renderedStream)
+    val cursor = RustTokenCursor(mac.tokens.clone().toList())
+    if (cursor.size < 3 || cursor.identAt(1) != "in") return null
+    val targetIdent = cursor.cleanIdentAt(0) ?: return null
+    val streamTokens = TokenStream.fromTokenTrees(cursor.trees.subList(2, cursor.size))
+    return Triple(macroName, targetIdent, parseAndRenderTokenStreamAsExpr(streamTokens, indent, selfTypeName))
 }
 
 internal fun KotlinJ2KEmitter.tryRenderDeferredLocalResultMatchInit(
@@ -971,81 +801,69 @@ internal fun KotlinJ2KEmitter.tryRenderDeferredLocalResultMatchInit(
     val errBodyUnwrapped =
         when (val eb = errArm.body) {
             is Expr.BlockExpr -> {
-                val onlyStmt = eb.block.stmts.singleOrNull()
-                (onlyStmt as? Stmt.ExprStmt)?.expr
+                val singleEbStmt = eb.block.stmts.singleOrNull()
+                (singleEbStmt as? Stmt.ExprStmt)?.expr
             }
             else -> eb
         } ?: return null
     if (errBodyUnwrapped !is Expr.Return) return null
     val assignsTarget =
         okBlock.stmts.any { s ->
-            s is Stmt.ExprStmt &&
-                s.expr is Expr.Assign &&
-                extractAssignedRootIdent((s.expr as Expr.Assign).left) == rawVar
+            s is Stmt.ExprStmt && s.expr is Expr.Assign && extractAssignedRootIdent((s.expr as Expr.Assign).left) == rawVar
         }
     if (!assignsTarget) return null
 
     val trivia1 = renderLeadingTriviaForSpan(localStmt.span(), innerIndent)
     val trivia2 = renderLeadingTriviaForSpan(matchStmt.span(), innerIndent)
     val subjectRendered = renderExpr(matchExpr.expr, innerIndent, selfTypeName)
-    val okSubPat = (unwrapTransparentPat(armPattern(okArm)) as Pat.TupleStruct).elems.toList().firstOrNull()
-    val errSubPat = (unwrapTransparentPat(armPattern(errArm)) as? Pat.TupleStruct)?.elems?.toList()?.firstOrNull()
+    val okTuple = unwrapTransparentPat(armPattern(okArm)) as Pat.TupleStruct
+    val okSubPat = okTuple.elems.toList().firstOrNull()
+    val errTuple = unwrapTransparentPat(armPattern(errArm)) as? Pat.TupleStruct
+    val errSubPat = errTuple?.elems?.toList()?.firstOrNull()
 
     val out = mutableListOf<String>()
     val okVar = scopeBuilder.bindLocal("_ok", "matchVal", matchExpr.expr.span()).kotlinName
-    if (usesTaggedCoreResult()) {
-        val errRender =
-            run {
-                scopeBuilder.enterCompr()
-                try {
-                    val errParam =
-                        if (errSubPat is Pat.Ident && errSubPat.subpat == null && errSubPat.ident.toString() != "_") {
-                            val rawErr = errSubPat.ident.toString().removePrefix("r#")
-                            scopeBuilder.bindLocal(rawErr, rustValueIdentToKotlin(rawErr), errSubPat.ident.span()).kotlinName
-                        } else {
-                            "err"
-                        }
-                    val renderedReturn = renderExpr(errBodyUnwrapped, "$innerIndent    ", selfTypeName)
-                    "{ val $errParam = matchResult.errValue(); $renderedReturn }"
-                } finally {
-                    scopeBuilder.exitCompr()
+    val taggedCore = usesTaggedCoreResult()
+    val errRender =
+        run {
+            scopeBuilder.enterCompr()
+            try {
+                val errParam =
+                    if (errSubPat is Pat.Ident && errSubPat.subpat == null && errSubPat.ident.toString() != "_") {
+                        val rawErr = errSubPat.ident.toString().removePrefix("r#")
+                        bindScopedValueIdent(rawErr, errSubPat.ident.span(), mutable = false)
+                    } else if (taggedCore) {
+                        "err"
+                    } else {
+                        null
+                    }
+                val renderedReturn = renderExpr(errBodyUnwrapped, "$innerIndent    ", selfTypeName)
+                when {
+                    taggedCore -> "{ val $errParam = matchResult.errValue(); $renderedReturn }"
+                    errParam != null -> "{ $errParam -> $renderedReturn }"
+                    else -> "{ $renderedReturn }"
                 }
+            } finally {
+                scopeBuilder.exitCompr()
             }
+        }
+    if (taggedCore) {
         val resultType = sourceResultName()
         out += "${trivia1}${trivia2}${innerIndent}val $okVar = when (val matchResult = $subjectRendered) { is $resultType.Ok<*, *> -> matchResult.okValue(); is $resultType.Err<*, *> -> $errRender }"
     } else {
-        val errRender =
-            run {
-                scopeBuilder.enterCompr()
-                try {
-                    val errParam =
-                        if (errSubPat is Pat.Ident && errSubPat.subpat == null && errSubPat.ident.toString() != "_") {
-                            val rawErr = errSubPat.ident.toString().removePrefix("r#")
-                            scopeBuilder.bindLocal(rawErr, rustValueIdentToKotlin(rawErr), errSubPat.ident.span()).kotlinName
-                        } else {
-                            null
-                        }
-                    val renderedReturn = renderExpr(errBodyUnwrapped, "$innerIndent    ", selfTypeName)
-                    if (errParam != null) "{ $errParam -> $renderedReturn }" else "{ $renderedReturn }"
-                } finally {
-                    scopeBuilder.exitCompr()
-                }
-            }
         out += "${trivia1}${trivia2}${innerIndent}val $okVar = $subjectRendered.getOrElse $errRender"
     }
-    if (okSubPat != null) {
-        out += extractMatchArmBindings(okSubPat, okVar, innerIndent, selfTypeName, bindToScope = true)
-    }
-    val kw = if (identPat.mutability != null) "var" else "val"
-    val assignCount = if (identPat.mutability != null) AssignCount.Any else AssignCount.AtMostOnce
+    if (okSubPat != null) out += extractMatchArmBindings(okSubPat, okVar, innerIndent, selfTypeName, bindToScope = true)
+
+    val isMut = identPat.mutability != null
+    val kw = if (isMut) "var" else "val"
     var boundVar = false
     for ((sIdx, s) in okBlock.stmts.withIndex()) {
         if (s is Stmt.ExprStmt && s.expr is Expr.Assign) {
             val assignExpr = s.expr as Expr.Assign
             if (!boundVar && extractAssignedRootIdent(assignExpr.left) == rawVar) {
-                val ktVar = scopeBuilder.bindLocal(rawVar, rustValueIdentToKotlin(rawVar), identPat.ident.span(), assignCount = assignCount).kotlinName
-                val rhsText = renderExpr(assignExpr.right, innerIndent, selfTypeName)
-                out += "$innerIndent$kw $ktVar = $rhsText"
+                val ktVar = bindScopedValueIdent(rawVar, identPat.ident.span(), isMut)
+                out += "$innerIndent$kw $ktVar = ${renderExpr(assignExpr.right, innerIndent, selfTypeName)}"
                 boundVar = true
                 continue
             }
@@ -1056,19 +874,13 @@ internal fun KotlinJ2KEmitter.tryRenderDeferredLocalResultMatchInit(
                 val tokKeyword = if (isMutablePattern(targetLocalStmt.pat)) "var" else "val"
                 val tokSuffix = if (tokTy != null) ": $tokTy" else ""
                 val tailVal = renderExpr(s.expr, innerIndent, selfTypeName)
-                if (tokPat != "_" && tokPat.isNotEmpty()) {
-                    out += "$innerIndent$tokKeyword $tokPat$tokSuffix = $tailVal"
-                }
+                if (tokPat != "_" && tokPat.isNotEmpty()) out += "$innerIndent$tokKeyword $tokPat$tokSuffix = $tailVal"
                 continue
             }
-            if (isSideEffectFreeExpr(s.expr)) {
-                continue
-            }
+            if (isSideEffectFreeExpr(s.expr)) continue
         }
         val renderedS = renderStmt(s, innerIndent, selfTypeName, isTailReturn = false)
-        if (renderedS.isNotBlank()) {
-            out += renderedS
-        }
+        if (renderedS.isNotBlank()) out += renderedS
     }
     return if (boundVar) out else null
 }
@@ -1083,10 +895,7 @@ internal fun KotlinJ2KEmitter.isStdlibResultArmPat(pat: Pat, variant: String): B
                     segs.last().ident.toString() == variant &&
                     segs.dropLast(1).all {
                         val prefix = it.ident.toString()
-                        prefix in IGNORED_PATH_PREFIXES ||
-                            prefix in STDLIB_PRELUDE_REEXPORT_MODULES ||
-                            prefix == "Result" ||
-                            prefix == "result"
+                        prefix in IGNORED_PATH_PREFIXES || prefix in STDLIB_PRELUDE_REEXPORT_MODULES || prefix == "Result" || prefix == "result"
                     }
             )
     if (!matchesPath) return false
@@ -1129,22 +938,15 @@ internal fun KotlinJ2KEmitter.renderStmt(
                         } else {
                             rawRendered
                         }
-                    if (rendered.isBlank() || rendered.trim() == "Unit") {
-                        ""
-                    } else if (!headerContext.isBatchCrateOutput && isLastExecutableStmt && !hasSemi && rendered.startsWith("error(")) {
-                        "${indent}return $rendered"
-                    } else {
-                        "$indent$rendered"
+                    when {
+                        rendered.isBlank() || rendered.trim() == "Unit" -> ""
+                        !headerContext.isBatchCrateOutput && isLastExecutableStmt && !hasSemi && rendered.startsWith("error(") -> "${indent}return $rendered"
+                        else -> "$indent$rendered"
                     }
                 }
             }
             is Stmt.MacroStmt -> {
-                val macName =
-                    stmt.mac.path.segments
-                        .last()
-                        ?.ident
-                        ?.toString()
-                        ?.removePrefix("r#")
+                val macName = stmt.mac.path.lastCleanIdent()
                 val savedMacTarget = currentExpectedParseTargetType
                 if (stmt.semiToken == null && isTailReturn && macName == "vec" && currentExpectedParseTargetType == null) {
                     currentExpectedParseTargetType = currentEnclosingReturnRenderedType
@@ -1167,17 +969,12 @@ internal fun KotlinJ2KEmitter.renderStmt(
                     } else {
                         rawRendered
                     }
-                if (rendered.isBlank()) {
-                    ""
-                } else if (stmt.semiToken == null &&
-                    !headerContext.isBatchCrateOutput &&
-                    (isTailReturn || (isLastExecutableStmt && rendered.startsWith("error(")))
-                ) {
-                    "${indent}return $rendered"
-                } else if (stmt.semiToken == null && isTailReturn && !rendered.startsWith("error(")) {
-                    "${indent}return $rendered"
-                } else {
-                    "$indent$rendered"
+                when {
+                    rendered.isBlank() -> ""
+                    stmt.semiToken == null && !headerContext.isBatchCrateOutput && (isTailReturn || (isLastExecutableStmt && rendered.startsWith("error("))) ->
+                        "${indent}return $rendered"
+                    stmt.semiToken == null && isTailReturn && !rendered.startsWith("error(") -> "${indent}return $rendered"
+                    else -> "$indent$rendered"
                 }
             }
         }
@@ -1207,32 +1004,22 @@ internal fun KotlinJ2KEmitter.renderTailReturnExpr(expr: Expr, indent: String, s
             currentTailExpectsUnitResultOk = savedTailOk
             currentExpectedParseTargetType = savedParseTarget
         }
-    val rendered =
-        if (enclosingUnitResultOkExpr() != null) {
-            coerceTailFmtUnitToResultOk(expr, rawRendered, selfTypeName)
-        } else {
-            rawRendered
-        }
+    val rendered = if (enclosingUnitResultOkExpr() != null) coerceTailFmtUnitToResultOk(expr, rawRendered, selfTypeName) else rawRendered
     if (rendered.isBlank()) return ""
-    if (headerContext.isBatchCrateOutput && rendered.trimStart().startsWith("error(")) {
-        return "$indent$rendered"
-    }
-    if (blockEndsWithUnconditionalDiverge(expr)) {
+    if ((headerContext.isBatchCrateOutput && rendered.trimStart().startsWith("error(")) || blockEndsWithUnconditionalDiverge(expr)) {
         return "$indent$rendered"
     }
     return "${indent}return $rendered"
 }
 
 private fun KotlinJ2KEmitter.blockEndsWithUnconditionalDiverge(expr: Expr): Boolean {
-    val u = unwrapParenOrGroupExpr(expr)
     val block =
-        when (u) {
+        when (val u = unwrapParenOrGroupExpr(expr)) {
             is Expr.BlockExpr -> u.block
             is Expr.Unsafe -> u.block
             else -> return false
         }
-    val lastStmt = block.stmts.lastOrNull { it !is Stmt.ItemStmt } ?: return false
-    if (lastStmt !is Stmt.ExprStmt) return false
+    val lastStmt = block.stmts.lastOrNull { it !is Stmt.ItemStmt } as? Stmt.ExprStmt ?: return false
     return when (val inner = unwrapParenOrGroupExpr(lastStmt.expr)) {
         is Expr.Return, is Expr.Break, is Expr.Continue, is Expr.Loop -> true
         is Expr.BlockExpr, is Expr.Unsafe -> blockEndsWithUnconditionalDiverge(inner)
@@ -1252,42 +1039,29 @@ internal fun KotlinJ2KEmitter.recordLocalInferredType(
     if (patText.startsWith("(")) {
         fun isConcreteTupleElemType(ty: String?): Boolean =
             !ty.isNullOrEmpty() &&
-                ty != "Any?" &&
-                ty != "Any" &&
-                ty != "*" &&
-                ty != "Nothing" &&
-                ty != "Nothing?" &&
+                ty !in setOf("Any?", "Any", "*", "Nothing", "Nothing?") &&
                 !ty.contains("uninferred", ignoreCase = true)
-        val unwrappedPat = pat?.let(this::unwrapTransparentPat)
+        val unwrappedPat = pat?.let(this::unwrapTransparentPat) as? Pat.Tuple ?: return
+        val patElems = unwrappedPat.elems.toList()
         val unwrappedInit = unwrapParenOrGroupExpr(initExpr)
-        if (unwrappedPat is Pat.Tuple && unwrappedInit is Expr.Tuple) {
-            val patElems = unwrappedPat.elems.toList()
+        if (unwrappedInit is Expr.Tuple) {
             val initElems = unwrappedInit.elems.toList()
-            val count = minOf(patElems.size, initElems.size)
-            for (idx in 0 until count) {
-                val pIdent = (unwrapTransparentPat(patElems[idx]) as? Pat.Ident)?.ident?.toString()?.removePrefix("r#") ?: continue
+            for (idx in 0 until minOf(patElems.size, initElems.size)) {
+                val pIdent = extractRawParamIdent(patElems[idx]) ?: continue
                 val ktName = scopeBuilder.resolveLocalKotlinName(pIdent) ?: rustValueIdentToKotlin(pIdent)
                 val elemExpr = initElems[idx]
-                val elemTy =
-                    inferExprRenderedType(elemExpr, selfTypeName)
-                        ?: inferExprNumericKind(elemExpr, selfTypeName)?.let(this::numericKindToPureTypeName)
-                if (isConcreteTupleElemType(elemTy)) {
-                    currentTypedLocals = currentTypedLocals + (ktName to elemTy!!)
-                }
+                val elemTy = inferExprRenderedType(elemExpr, selfTypeName) ?: inferExprNumericKind(elemExpr, selfTypeName)?.let(this::numericKindToPureTypeName)
+                if (isConcreteTupleElemType(elemTy)) currentTypedLocals = currentTypedLocals + (ktName to elemTy!!)
             }
-        } else if (unwrappedPat is Pat.Tuple) {
+        } else {
             val tupTy = inferExprRenderedType(initExpr, selfTypeName)?.removeSuffix("?")?.trim()
             if (tupTy != null && (tupTy.startsWith("Pair<") || tupTy.startsWith("Triple<")) && tupTy.endsWith(">")) {
                 val elemTypes = PhantomRawPointerTypeStripper.splitTopLevelCommaList(tupTy.substringAfter('<').dropLast(1))
-                val patElems = unwrappedPat.elems.toList()
-                val count = minOf(patElems.size, elemTypes.size)
-                for (idx in 0 until count) {
-                    val pIdent = (unwrapTransparentPat(patElems[idx]) as? Pat.Ident)?.ident?.toString()?.removePrefix("r#") ?: continue
+                for (idx in 0 until minOf(patElems.size, elemTypes.size)) {
+                    val pIdent = extractRawParamIdent(patElems[idx]) ?: continue
                     val ktName = scopeBuilder.resolveLocalKotlinName(pIdent) ?: rustValueIdentToKotlin(pIdent)
                     val elemTy = elemTypes[idx].trim()
-                    if (isConcreteTupleElemType(elemTy)) {
-                        currentTypedLocals = currentTypedLocals + (ktName to elemTy)
-                    }
+                    if (isConcreteTupleElemType(elemTy)) currentTypedLocals = currentTypedLocals + (ktName to elemTy)
                 }
             }
         }
@@ -1311,18 +1085,11 @@ internal fun KotlinJ2KEmitter.recordLocalInferredType(
     }
     val inferredRenderedTy = inferExprRenderedType(initExpr, selfTypeName)
     if (inferredRenderedTy != null) {
-        val adjustedTy =
-            if ((
-                    rhs.startsWith("MutableList(") ||
-                        rhs.startsWith("mutableListOf(") ||
-                        (rhs.startsWith("run { val repeatElem") && "; MutableList(" in rhs)
-                ) &&
-                inferredRenderedTy.startsWith("List<")
-            ) {
-                "Mutable$inferredRenderedTy"
-            } else {
-                inferredRenderedTy
-            }
+        val isMutListInit =
+            rhs.startsWith("MutableList(") ||
+                rhs.startsWith("mutableListOf(") ||
+                (rhs.startsWith("run { val repeatElem") && "; MutableList(" in rhs)
+        val adjustedTy = if (isMutListInit && inferredRenderedTy.startsWith("List<")) "Mutable$inferredRenderedTy" else inferredRenderedTy
         currentTypedLocals = currentTypedLocals + (patText to adjustedTy)
         return
     }
@@ -1345,60 +1112,43 @@ internal fun KotlinJ2KEmitter.inferUntypedLocalNumericKindFromRemainingStmts(
     if (unwrappedPat.mutability == null) return null
     val rawLocalIdent = unwrappedPat.ident.toString().removePrefix("r#")
     val coreInit = unwrapParenOrGroupExpr(initExpr)
-    val isUnsuffixedIntLit =
-        when (coreInit) {
-            is Expr.Lit -> (coreInit.lit as? Lit.Int)?.value?.suffix()?.isEmpty() == true
-            is Expr.Unary ->
-                coreInit.op is UnOp.Neg &&
-                    ((unwrapParenOrGroupExpr(coreInit.expr) as? Expr.Lit)?.lit as? Lit.Int)?.value?.suffix()?.isEmpty() == true
-            else -> false
+    val intLitExpr =
+        when {
+            coreInit is Expr.Lit -> coreInit
+            coreInit is Expr.Unary && coreInit.op is UnOp.Neg -> unwrapParenOrGroupExpr(coreInit.expr) as? Expr.Lit
+            else -> null
         }
-    if (!isUnsuffixedIntLit) return null
+    if ((intLitExpr?.lit as? Lit.Int)?.value?.suffix()?.isEmpty() != true) return null
     for (stmt in remainingStmts) {
         val expr = (stmt as? Stmt.ExprStmt)?.expr ?: continue
-        when (expr) {
-            is Expr.Assign -> {
-                if (extractAssignedRootIdent(expr.left) == rawLocalIdent) {
-                    inferExprNumericKind(expr.right, selfTypeName)?.let { return it }
-                }
-            }
-            is Expr.Binary -> {
-                val isCompoundAssign =
-                    when (expr.op) {
-                        is BinOp.BitOrAssign,
-                        is BinOp.BitAndAssign,
-                        is BinOp.BitXorAssign,
-                        is BinOp.AddAssign,
-                        is BinOp.SubAssign,
-                        is BinOp.MulAssign,
-                        is BinOp.DivAssign,
-                        is BinOp.RemAssign,
-                        -> true
-                        else -> false
-                    }
-                if (isCompoundAssign && extractAssignedRootIdent(expr.left) == rawLocalIdent) {
-                    inferExprNumericKind(expr.right, selfTypeName)?.let { return it }
-                }
-            }
-            else -> {}
+        when {
+            expr is Expr.Assign && extractAssignedRootIdent(expr.left) == rawLocalIdent ->
+                inferExprNumericKind(expr.right, selfTypeName)?.let { return it }
+            expr is Expr.Binary && isCompoundAssignOp(expr.op) && extractAssignedRootIdent(expr.left) == rawLocalIdent ->
+                inferExprNumericKind(expr.right, selfTypeName)?.let { return it }
         }
     }
     val lastStmt = remainingStmts.lastOrNull() as? Stmt.ExprStmt
-    if (lastStmt != null && lastStmt.semiToken == null) {
-        val tailCore = unwrapParenOrGroupExpr(lastStmt.expr)
-        if (tailCore is Expr.Path && tailCore.qself == null && tailCore.path.segments.size == 1) {
-            val tailIdent =
-                tailCore.path.segments
-                    .first()
-                    ?.ident
-                    ?.toString()
-                    ?.removePrefix("r#")
-            if (tailIdent == rawLocalIdent) {
-                currentEnclosingReturnRenderedType?.let(this::resolveNumericKind)?.let { return it }
-            }
-        }
+    if (lastStmt != null && lastStmt.semiToken == null && singlePlainPathCleanIdent(lastStmt.expr) == rawLocalIdent) {
+        return currentEnclosingReturnRenderedType?.let(this::resolveNumericKind)
     }
     return null
+}
+
+private inline fun <R> KotlinJ2KEmitter.withLocalInitRenderScope(
+    expectedTarget: String?,
+    block: () -> R,
+): R {
+    val prevParseTarget = currentExpectedParseTargetType
+    val prevInLocalInit = inLocalInitializerPosition
+    currentExpectedParseTargetType = expectedTarget
+    inLocalInitializerPosition = true
+    return try {
+        block()
+    } finally {
+        currentExpectedParseTargetType = prevParseTarget
+        inLocalInitializerPosition = prevInLocalInit
+    }
 }
 
 internal fun KotlinJ2KEmitter.renderStmtLocal(
@@ -1411,18 +1161,10 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
     val keyword = if (isMutablePattern(pat)) "var" else "val"
     val init = local.init
     if (init == null) {
-        val (patText, typeAnnotation) =
-            renderLocalPattern(
-                pat = pat,
-                selfTypeName = selfTypeName,
-                includeCtorInTupleStruct = false,
-                bindToScope = true,
-            )
+        val (patText, typeAnnotation) = renderLocalPattern(pat, selfTypeName, includeCtorInTupleStruct = false, bindToScope = true)
         if (typeAnnotation != null && !patText.startsWith("(")) {
             currentTypedLocals = currentTypedLocals + (patText to typeAnnotation)
-            if (typeAnnotation.endsWith("?")) {
-                currentNullableLocals = currentNullableLocals + patText
-            }
+            if (typeAnnotation.endsWith("?")) currentNullableLocals = currentNullableLocals + patText
         }
         val typeSuffix =
             when {
@@ -1434,7 +1176,7 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
     }
     val diverge = init.diverge
     val initExpr = init.expr
-    LocalStorageLoweringRule.tryLower(this, local, indent, selfTypeName, remainingStmts)?.let { return it }
+    LocalBindingLowering.tryLowerSpecialStorage(this, local, indent, selfTypeName, remainingStmts)?.let { return it }
     val explicitLocalAnnotation = extractLocalTypeAnnotation(pat, selfTypeName)
     val unwrappedInitExpr = unwrapParenOrGroupExpr(initExpr)
     val inferredArrayTarget =
@@ -1446,82 +1188,43 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
     val localNumKind =
         explicitLocalAnnotation?.removeSuffix("?")?.let(this::resolveNumericKind)
             ?: inferUntypedLocalNumericKindFromRemainingStmts(pat, initExpr, remainingStmts, selfTypeName)
-    val prevParseTarget = currentExpectedParseTargetType
-    currentExpectedParseTargetType = explicitLocalAnnotation ?: inferredArrayTarget
+    val expectedTarget = explicitLocalAnnotation ?: inferredArrayTarget
+
     if (diverge == null && initExpr is Expr.BlockExpr) {
         val blockStmts = initExpr.block.stmts
-        if (blockStmts.size == 1 && blockStmts[0] is Stmt.ExprStmt) {
-            val prevInLocalInit = inLocalInitializerPosition
-            inLocalInitializerPosition = true
-            val singleRhs =
-                try {
-                    renderTypedNumericInitializer(
-                        (blockStmts[0] as Stmt.ExprStmt).expr,
-                        localNumKind,
-                        indent,
-                        selfTypeName,
-                    )
-                } finally {
-                    currentExpectedParseTargetType = prevParseTarget
-                    inLocalInitializerPosition = prevInLocalInit
+        val singleExpr = (blockStmts.singleOrNull() as? Stmt.ExprStmt)?.expr
+        val (recordedExpr, renderedBlockRhs, rawRhsForRecord) =
+            withLocalInitRenderScope(expectedTarget) {
+                if (singleExpr != null) {
+                    val singleRhs = renderTypedNumericInitializer(singleExpr, localNumKind, indent, selfTypeName)
+                    Triple(singleExpr, singleRhs, singleRhs)
+                } else {
+                    val blockBody = renderBlock(initExpr.block, indent, selfTypeName)
+                    Triple(initExpr, "run $blockBody", blockBody)
                 }
-            val (patText, typeAnnotation) =
-                renderLocalPattern(
-                    pat = pat,
-                    selfTypeName = selfTypeName,
-                    includeCtorInTupleStruct = false,
-                    bindToScope = true,
-                )
-            recordLocalInferredType(patText, typeAnnotation, (blockStmts[0] as Stmt.ExprStmt).expr, singleRhs, selfTypeName, pat = pat)
-            val typeSuffix = if (typeAnnotation != null && !patText.startsWith("(")) ": $typeAnnotation" else ""
-            return "$indent$keyword $patText$typeSuffix = $singleRhs"
-        }
-        val prevInLocalInit = inLocalInitializerPosition
-        inLocalInitializerPosition = true
-        val blockBody =
-            try {
-                renderBlock(initExpr.block, indent, selfTypeName)
-            } finally {
-                currentExpectedParseTargetType = prevParseTarget
-                inLocalInitializerPosition = prevInLocalInit
             }
-        val (patText, typeAnnotation) =
-            renderLocalPattern(
-                pat = pat,
-                selfTypeName = selfTypeName,
-                includeCtorInTupleStruct = false,
-                bindToScope = true,
-            )
-        recordLocalInferredType(patText, typeAnnotation, initExpr, blockBody, selfTypeName, pat = pat)
+        val (patText, typeAnnotation) = renderLocalPattern(pat, selfTypeName, includeCtorInTupleStruct = false, bindToScope = true)
+        recordLocalInferredType(patText, typeAnnotation, recordedExpr, rawRhsForRecord, selfTypeName, pat = pat)
         val typeSuffix = if (typeAnnotation != null && !patText.startsWith("(")) ": $typeAnnotation" else ""
-        return "$indent$keyword $patText$typeSuffix = run $blockBody"
+        return "$indent$keyword $patText$typeSuffix = $renderedBlockRhs"
     }
-    val prevInLocalInit = inLocalInitializerPosition
-    inLocalInitializerPosition = true
+
     var rhs =
-        try {
+        withLocalInitRenderScope(expectedTarget) {
             renderTypedNumericInitializer(initExpr, localNumKind, indent, selfTypeName)
-        } finally {
-            currentExpectedParseTargetType = prevParseTarget
-            inLocalInitializerPosition = prevInLocalInit
         }
     val expectsMutableList = keyword == "var" || inferredArrayTarget?.startsWith("MutableList<") == true
     if (expectsMutableList && explicitLocalAnnotation == null && diverge == null) {
-        val unwrappedInit = unwrapParenOrGroupExpr(initExpr)
-        if (unwrappedInit is Expr.Repeat && rhs.startsWith("List(")) {
+        if (unwrappedInitExpr is Expr.Repeat && rhs.startsWith("List(")) {
             rhs = "Mutable$rhs"
-        } else if (unwrappedInit is Expr.Repeat && rhs.startsWith("run { val repeatElem") && "; List(" in rhs) {
+        } else if (unwrappedInitExpr is Expr.Repeat && rhs.startsWith("run { val repeatElem") && "; List(" in rhs) {
             rhs = rhs.replaceFirst("; List(", "; MutableList(")
-        } else if (unwrappedInit is Expr.Array && rhs.startsWith("listOf(")) {
+        } else if (unwrappedInitExpr is Expr.Array && rhs.startsWith("listOf(")) {
             rhs = "mutableListOf(" + rhs.removePrefix("listOf(")
         }
     }
-    if (pat is Pat.Wild) {
-        if (isSideEffectFreeExpr(initExpr)) {
-            return ""
-        }
-        return "$indent$rhs"
-    }
+    if (pat is Pat.Wild) return if (isSideEffectFreeExpr(initExpr)) "" else "$indent$rhs"
+
     val unwrappedPat = unwrapTransparentPat(pat)
     if (unwrappedPat is Pat.Struct && diverge == null) {
         return renderStructDestructuringLocal(unwrappedPat, rhs, local.span(), indent, selfTypeName)
@@ -1530,8 +1233,7 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
         renderTupleStructDestructuringLocal(unwrappedPat, initExpr, rhs, local.span(), indent, selfTypeName)?.let { return it }
     }
     val divergeBody =
-        if (diverge != null) {
-            val divergeExpr = diverge.expr
+        diverge?.expr?.let { divergeExpr ->
             if (divergeExpr is Expr.BlockExpr) {
                 val stmts = divergeExpr.block.stmts
                 if (stmts.size == 1) {
@@ -1542,45 +1244,24 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
             } else {
                 renderExpr(divergeExpr, indent, selfTypeName)
             }
-        } else {
-            null
         }
-    val (patText, rawTypeAnnotation) =
-        renderLocalPattern(
-            pat = pat,
-            selfTypeName = selfTypeName,
-            includeCtorInTupleStruct = false,
-            bindToScope = true,
-        )
+    val (patText, rawTypeAnnotation) = renderLocalPattern(pat, selfTypeName, includeCtorInTupleStruct = false, bindToScope = true)
     var typeAnnotation = rawTypeAnnotation
-    if (rhs == "mutableListOf()" && typeAnnotation == null) {
+    if ((rhs == "mutableListOf()" || rhs.startsWith("ArrayList(")) && typeAnnotation == null) {
         val inferredElem =
             inferEmptyListElementTypeFromReturn(currentEnclosingReturnRenderedType)
-                ?: inferEmptyListElementTypeFromRemainingStmts(pat, remainingStmts, selfTypeName)
+                ?: EmptyListLocalElemTypeInferrer(this, pat, selfTypeName).infer(remainingStmts)
         if (inferredElem != null) {
-            rhs = "mutableListOf<$inferredElem>()"
-        }
-    } else if (rhs.startsWith("ArrayList(") && typeAnnotation == null) {
-        val inferredElem =
-            inferEmptyListElementTypeFromReturn(currentEnclosingReturnRenderedType)
-                ?: inferEmptyListElementTypeFromRemainingStmts(pat, remainingStmts, selfTypeName)
-        if (inferredElem != null) {
-            rhs = "ArrayList<$inferredElem>(${rhs.removePrefix("ArrayList(")}"
+            rhs = if (rhs == "mutableListOf()") "mutableListOf<$inferredElem>()" else "ArrayList<$inferredElem>(${rhs.removePrefix("ArrayList(")}"
         }
     } else if (typeAnnotation == null && !patText.startsWith("(")) {
         val unwrappedRet =
             currentEnclosingReturnRenderedType?.let { ret ->
-                if (ret.startsWith("Result<") && ret.endsWith(">")) {
-                    rustResultOkPayloadType(ret) ?: ret
-                } else {
-                    ret
-                }
+                if (ret.startsWith("Result<") && ret.endsWith(">")) rustResultOkPayloadType(ret) ?: ret else ret
             }
         if (unwrappedRet != null && '<' in unwrappedRet) {
             val baseRet = unwrappedRet.substringBefore('<').trim()
-            if (rhs == "$baseRet.new()" || rhs == "$baseRet.default()") {
-                typeAnnotation = unwrappedRet
-            }
+            if (rhs == "$baseRet.new()" || rhs == "$baseRet.default()") typeAnnotation = unwrappedRet
         }
     }
     if (typeAnnotation == "RustAny" && inferExprRenderedType(initExpr, selfTypeName) != "RustAny" && !rhs.startsWith("RustAny.from(")) {
@@ -1588,35 +1269,20 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
     }
     if (rhs == "null" && typeAnnotation == null && !patText.startsWith("(")) {
         val inferredNullTy = inferExprRenderedType(initExpr, selfTypeName)?.trim()
-        if (
-            !inferredNullTy.isNullOrEmpty() &&
-            inferredNullTy != "Nothing?" &&
-            inferredNullTy != "Nothing" &&
-            inferredNullTy != "Any?" &&
-            inferredNullTy != "Any"
-        ) {
+        if (!inferredNullTy.isNullOrEmpty() && inferredNullTy !in setOf("Nothing?", "Nothing", "Any?", "Any")) {
             typeAnnotation = if (inferredNullTy.endsWith("?")) inferredNullTy else "$inferredNullTy?"
         }
     }
     if (rhs == "null" && typeAnnotation != null && !typeAnnotation.endsWith("?")) {
         typeAnnotation = "$typeAnnotation?"
     }
-    val somePayload =
-        if (!hasDeclaredOptionEnum() && diverge == null) {
-            unwrapUnqualifiedOptionSomeArg(unwrappedInitExpr)
-        } else {
-            null
-        }
+    val somePayload = if (!hasDeclaredOptionEnum() && diverge == null) unwrapUnqualifiedOptionSomeArg(unwrappedInitExpr) else null
     if (somePayload != null && typeAnnotation == null && !patText.startsWith("(")) {
         val unwrappedLitExpr =
             when (val corePayload = unwrapParenOrGroupExpr(somePayload)) {
                 is Expr.Lit -> corePayload
                 is Expr.Unary ->
-                    if (corePayload.op is UnOp.Neg || corePayload.op is UnOp.NotOp) {
-                        unwrapParenOrGroupExpr(corePayload.expr) as? Expr.Lit
-                    } else {
-                        null
-                    }
+                    if (corePayload.op is UnOp.Neg || corePayload.op is UnOp.NotOp) unwrapParenOrGroupExpr(corePayload.expr) as? Expr.Lit else null
                 else -> null
             }
         val literalFallbackTy =
@@ -1680,312 +1346,159 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
         } else {
             val resTy = inferExprRenderedType(initExpr, selfTypeName)?.removeSuffix("?")?.trim()
             val payloadTy =
-                if (coreResultLetElseInfo.first.endsWith(".Ok")) {
-                    rustResultOkPayloadType(resTy)
-                } else if (coreResultLetElseInfo.first.endsWith(".Err")) {
-                    resolveEnclosingResultTypeArguments(resTy)?.second
-                } else {
-                    null
+                when {
+                    coreResultLetElseInfo.first.endsWith(".Ok") -> rustResultOkPayloadType(resTy)
+                    coreResultLetElseInfo.first.endsWith(".Err") -> resolveEnclosingResultTypeArguments(resTy)?.second
+                    else -> null
                 }
-            if (isUsableExplicitResultTypeArg(payloadTy)) {
-                currentTypedLocals = currentTypedLocals + (patText to payloadTy!!)
-            }
+            if (isUsableExplicitResultTypeArg(payloadTy)) currentTypedLocals = currentTypedLocals + (patText to payloadTy!!)
         }
     }
     val typeSuffix = if (typeAnnotation != null && !patText.startsWith("(")) ": $typeAnnotation" else ""
-    return if (coreResultLetElseInfo != null && divergeBody != null) {
-        val divergeVariant =
-            when {
-                coreResultLetElseInfo.first == "ControlFlow.Break" -> "ControlFlow.Continue"
-                coreResultLetElseInfo.first == "ControlFlow.Continue" -> "ControlFlow.Break"
-                coreResultLetElseInfo.first.endsWith(".Ok") -> "${sourceResultName()}.Err"
-                else -> "${sourceResultName()}.Ok"
-            }
-        val tryVar = scopeBuilder.bindLocal("_try", "tryResult", initExpr.span()).kotlinName
-        "$indent$keyword $patText$typeSuffix = when (val $tryVar = $rhs) { is ${coreResultLetElseInfo.first}<*, *> -> $tryVar.${coreResultLetElseInfo.second}; is $divergeVariant<*, *> -> $divergeBody }"
-    } else if (divergeBody != null) {
-        "$indent$keyword $patText$typeSuffix = $rhs ?: $divergeBody"
-    } else if (headerContext.isBatchCrateOutput && rhs.contains('\n')) {
-        "$indent$keyword $patText$typeSuffix =\n$indent    ${rhs.replace("\n", "\n    ")}"
-    } else {
-        "$indent$keyword $patText$typeSuffix = $rhs"
-    }
-}
-
-internal fun KotlinJ2KEmitter.renderStructDestructuringLocal(
-    structPat: Pat.Struct,
-    rhs: String,
-    span: Span,
-    indent: String,
-    selfTypeName: String?,
-): String {
-    val structTypeName =
-        structPat.path.segments
-            .last()
-            ?.ident
-            ?.toString()
-            ?.let { if (it == "Self") selfTypeName?.substringBefore('<')?.trim() else rustTypeIdentToKotlin(it) }
-    val isSimpleRhs =
-        rhs.all { it.isLetterOrDigit() || it == '_' } ||
-            (rhs.startsWith("this.") && rhs.removePrefix("this.").all { it.isLetterOrDigit() || it == '_' })
-    val lines = mutableListOf<String>()
-    val receiverVar =
-        if (isSimpleRhs) {
-            rhs
-        } else {
-            val tmp = scopeBuilder.bindLocal("_struct", "structVal", span).kotlinName
-            lines += "${indent}val $tmp = $rhs"
-            tmp
-        }
-    for (fp in structPat.fields.toList()) {
-        val fieldProp = renderMemberName(fp.member)
-        val subPat = unwrapTransparentPat(fp.pat)
-        if (subPat is Pat.Ident && subPat.subpat == null) {
-            val raw = subPat.ident.toString().removePrefix("r#")
-            if (raw != "_") {
-                val kw = if (subPat.mutability != null) "var" else "val"
-                val assignCount = if (subPat.mutability != null) AssignCount.Any else AssignCount.AtMostOnce
-                val ktVar = scopeBuilder.bindLocal(raw, rustValueIdentToKotlin(raw), subPat.ident.span(), assignCount = assignCount).kotlinName
-                if (structTypeName != null) {
-                    val fieldTy =
-                        inspector.structFieldSynTypesByType[structTypeName]?.get(fieldProp)?.let { renderType(it, selfTypeName) }
-                            ?: headerContext.crateStructFieldTypes["$structTypeName.$fieldProp"]
-                    if (fieldTy != null) {
-                        currentTypedLocals = currentTypedLocals + (ktVar to fieldTy)
-                        if (fieldTy.endsWith("?")) {
-                            currentNullableLocals = currentNullableLocals + ktVar
-                        }
-                    }
-                    if (fieldProp in inspector.vecFieldsByType[structTypeName].orEmpty()) {
-                        currentMutableListLocals = currentMutableListLocals + ktVar
-                    }
-                    if (fieldProp in inspector.nullableFieldsByType[structTypeName].orEmpty()) {
-                        currentNullableLocals = currentNullableLocals + ktVar
-                    }
+    return when {
+        coreResultLetElseInfo != null && divergeBody != null -> {
+            val divergeVariant =
+                when {
+                    coreResultLetElseInfo.first == "ControlFlow.Break" -> "ControlFlow.Continue"
+                    coreResultLetElseInfo.first == "ControlFlow.Continue" -> "ControlFlow.Break"
+                    coreResultLetElseInfo.first.endsWith(".Ok") -> "${sourceResultName()}.Err"
+                    else -> "${sourceResultName()}.Ok"
                 }
-                lines += "$indent$kw $ktVar = $receiverVar.$fieldProp"
-            }
-        } else {
-            lines += extractMatchArmBindings(fp.pat, "$receiverVar.$fieldProp", indent, selfTypeName, bindToScope = true)
+            val tryVar = scopeBuilder.bindLocal("_try", "tryResult", initExpr.span()).kotlinName
+            "$indent$keyword $patText$typeSuffix = when (val $tryVar = $rhs) { is ${coreResultLetElseInfo.first}<*, *> -> $tryVar.${coreResultLetElseInfo.second}; is $divergeVariant<*, *> -> $divergeBody }"
         }
+        divergeBody != null -> "$indent$keyword $patText$typeSuffix = $rhs ?: $divergeBody"
+        headerContext.isBatchCrateOutput && rhs.contains('\n') ->
+            "$indent$keyword $patText$typeSuffix =\n$indent    ${rhs.replace("\n", "\n    ")}"
+        else -> "$indent$keyword $patText$typeSuffix = $rhs"
     }
-    return lines.joinToString("\n")
 }
 
 internal fun KotlinJ2KEmitter.inferEmptyListElementTypeFromReturn(enclosingRet: String?): String? {
     if (enclosingRet == null) return null
     val unwrappedResult =
-        if (enclosingRet.substringBefore('<').substringAfterLast('.').trim() == "Result" && enclosingRet.endsWith(">")) {
+        if (enclosingRet.simpleKotlinTypeName() == "Result" && enclosingRet.endsWith(">")) {
             rustResultOkPayloadType(enclosingRet) ?: enclosingRet
         } else {
             enclosingRet
         }
-    return when {
-        unwrappedResult.startsWith("List<") && unwrappedResult.endsWith(">") ->
-            unwrappedResult.removePrefix("List<").removeSuffix(">").trim()
-        unwrappedResult.startsWith("MutableList<") && unwrappedResult.endsWith(">") ->
-            unwrappedResult.removePrefix("MutableList<").removeSuffix(">").trim()
-        unwrappedResult.startsWith("ArrayList<") && unwrappedResult.endsWith(">") ->
-            unwrappedResult.removePrefix("ArrayList<").removeSuffix(">").trim()
-        unwrappedResult.startsWith("ArrayDeque<") && unwrappedResult.endsWith(">") ->
-            unwrappedResult.removePrefix("ArrayDeque<").removeSuffix(">").trim()
-        unwrappedResult.startsWith("IntoIter<") && unwrappedResult.endsWith(">") ->
-            unwrappedResult.removePrefix("IntoIter<").removeSuffix(">").trim()
-        else -> null
+    for (prefix in listOf("List<", "MutableList<", "ArrayList<", "ArrayDeque<", "IntoIter<")) {
+        if (unwrappedResult.startsWith(prefix) && unwrappedResult.endsWith(">")) {
+            return unwrappedResult.removePrefix(prefix).removeSuffix(">").trim()
+        }
     }
+    return null
 }
 
-private fun KotlinJ2KEmitter.inferEmptyListElementTypeFromRemainingStmts(
-    pat: Pat,
-    remainingStmts: List<Stmt>,
-    selfTypeName: String?,
-): String? {
-    if (remainingStmts.isEmpty()) return null
-    val identPat = unwrapTransparentPat(pat) as? Pat.Ident ?: return null
-    if (identPat.subpat != null) return null
-    val rawLocalName = identPat.ident.toString().removePrefix("r#")
-    if (rawLocalName == "_") return null
+private class EmptyListLocalElemTypeInferrer(
+    private val emitter: KotlinJ2KEmitter,
+    private val pat: Pat,
+    private val selfTypeName: String?,
+) : Visit() {
+    private var rawLocalName: String = ""
+    private val ifLetBoundTypes = linkedMapOf<String, String>()
+    private var inferred: String? = null
 
-    fun isTargetLocalPath(e: Expr): Boolean {
-        val u = unwrapParenOrGroupExpr(e) as? Expr.Path ?: return false
-        return u.qself == null &&
-            u.path.segments.len() == 1 &&
-            u.path.segments
-                .first()
-                ?.ident
-                ?.toString()
-                ?.removePrefix("r#") == rawLocalName
+    fun infer(remainingStmts: List<Stmt>): String? {
+        if (remainingStmts.isEmpty()) return null
+        val identPat = (emitter.unwrapTransparentPat(pat) as? Pat.Ident)?.takeIf { it.subpat == null } ?: return null
+        rawLocalName = identPat.ident.toString().removePrefix("r#")
+        if (rawLocalName == "_") return null
+        for (stmt in remainingStmts) {
+            if (inferred != null) break
+            visitStmt(stmt)
+        }
+        return inferred
     }
 
-    fun isConcreteElemType(ty: String?): Boolean =
-        ty != null &&
-            ty.isNotBlank() &&
-            ty != "Any" &&
-            ty != "Any?" &&
-            ty != "Nothing" &&
-            ty != "Unit" &&
-            ty != "_" &&
-            !ty.contains("RustAny")
+    private fun isConcreteElemType(ty: String?): Boolean =
+        !ty.isNullOrBlank() && ty !in setOf("Any", "Any?", "Nothing", "Unit", "_") && !ty.contains("RustAny")
 
-    fun resolveStructFieldElem(typeName: String, fieldName: String? = null): String? {
-        val synMap = inspector.structFieldSynTypesByType[typeName]
-        val localRendered =
-            if (fieldName != null) {
-                synMap?.get(fieldName)?.let { renderType(it, selfTypeName) }
+    private fun resolveOwnerKt(rawName: String?): String? =
+        when (rawName) {
+            null -> null
+            "Self" -> selfTypeName?.substringBefore('<')?.trim()
+            else -> rustTypeIdentToKotlin(rawName)
+        }
+
+    private fun resolveStructFieldElem(typeName: String, fieldName: String? = null): String? {
+        val rendered = emitter.resolveDeclaredOrCrateStructFieldType(typeName, fieldName, selfTypeName, fallbackDefaultValueField = true)
+        return rendered?.let(emitter::inferEmptyListElementTypeFromReturn)?.takeIf(::isConcreteElemType)
+    }
+
+    override fun visitExprLet(e: Expr.Let) {
+        super.visitExprLet(e)
+        val tsPat = emitter.unwrapTransparentPat(e.pat) as? Pat.TupleStruct
+        val singleSub = tsPat?.elems?.toList()?.singleOrNull()
+        val subIdent = (singleSub?.let(emitter::unwrapTransparentPat) as? Pat.Ident)?.takeIf { it.subpat == null }
+        val innerIdent =
+            if (tsPat != null && emitter.isOptionSomeTupleStructPat(tsPat)) {
+                subIdent?.ident?.toString()?.removePrefix("r#")
             } else {
-                synMap?.values?.singleOrNull()?.let { renderType(it, selfTypeName) }
+                null
             }
-        val rendered =
-            localRendered
-                ?: scopedAbiKeysForRenderedType(typeName).firstNotNullOfOrNull { key ->
-                    if (fieldName != null) {
-                        headerContext.crateStructFieldTypes["$key.$fieldName"]
-                    } else {
-                        headerContext.crateStructFieldTypes["$key.value"]
-                            ?: headerContext.crateStructFieldTypes.entries
-                                .singleOrNull { it.key.startsWith("$key.") }
-                                ?.value
-                    }
-                }
-                ?: if (fieldName != null) {
-                    headerContext.crateStructFieldTypes["$typeName.$fieldName"]
-                } else {
-                    headerContext.crateStructFieldTypes["$typeName.value"]
-                }
-        return rendered?.let(::inferEmptyListElementTypeFromReturn)?.takeIf(::isConcreteElemType)
-    }
-
-    val ifLetBoundTypes = linkedMapOf<String, String>()
-    var inferred: String? = null
-    val visitor =
-        object : Visit() {
-            override fun visitExprLet(e: Expr.Let) {
-                super.visitExprLet(e)
-                val tsPat = unwrapTransparentPat(e.pat) as? Pat.TupleStruct
-                val innerIdent =
-                    if (tsPat != null && isOptionSomeTupleStructPat(tsPat)) {
-                        (
-                            tsPat.elems
-                                .toList()
-                                .singleOrNull()
-                                ?.let(::unwrapTransparentPat) as? Pat.Ident
-                        )?.takeIf { it.subpat == null }
-                            ?.ident
-                            ?.toString()
-                            ?.removePrefix("r#")
-                    } else {
-                        null
-                    }
-                if (innerIdent != null) {
-                    val scrutineeTy = inferExprRenderedType(e.expr, selfTypeName)
-                    if (scrutineeTy != null && scrutineeTy.endsWith("?")) {
-                        val unwrapped = scrutineeTy.removeSuffix("?").trim()
-                        if (isConcreteElemType(unwrapped)) {
-                            ifLetBoundTypes[innerIdent] = unwrapped
-                        }
-                    }
-                }
-            }
-
-            override fun visitExprMethodCall(e: Expr.MethodCall) {
-                if (inferred == null &&
-                    e.method.toString().removePrefix("r#") == "push" &&
-                    e.args.size == 1 &&
-                    isTargetLocalPath(e.receiver)
-                ) {
-                    val arg = e.args[0]
-                    val argIdent =
-                        (unwrapParenOrGroupExpr(arg) as? Expr.Path)
-                            ?.takeIf { it.qself == null && it.path.segments.len() == 1 }
-                            ?.path
-                            ?.segments
-                            ?.first()
-                            ?.ident
-                            ?.toString()
-                            ?.removePrefix("r#")
-                    val candidate =
-                        argIdent?.let { ifLetBoundTypes[it] }
-                            ?: inferExprRenderedType(arg, selfTypeName)
-                    if (isConcreteElemType(candidate)) {
-                        inferred = candidate
-                    }
-                }
-                super.visitExprMethodCall(e)
-            }
-
-            override fun visitExprCall(e: Expr.Call) {
-                if (inferred == null && e.args.size == 1 && isTargetLocalPath(e.args[0])) {
-                    val callPath = (unwrapParenOrGroupExpr(e.func) as? Expr.Path)?.takeIf { it.qself == null }
-                    val segs =
-                        callPath
-                            ?.path
-                            ?.segments
-                            ?.toList()
-                            .orEmpty()
-                    val ownerRaw =
-                        when {
-                            segs.size == 1 && segs[0]
-                                .ident
-                                .toString()
-                                .firstOrNull()
-                                ?.isUpperCase() == true ->
-                                segs[0].ident.toString()
-                            segs.size >= 2 && segs[segs.lastIndex - 1]
-                                .ident
-                                .toString()
-                                .firstOrNull()
-                                ?.isUpperCase() == true ->
-                                segs[segs.lastIndex - 1].ident.toString()
-                            else -> null
-                        }
-                    val ownerKt =
-                        when (ownerRaw) {
-                            null -> null
-                            "Self" -> selfTypeName?.substringBefore('<')?.trim()
-                            else -> rustTypeIdentToKotlin(ownerRaw)
-                        }
-                    if (ownerKt != null) {
-                        inferred = resolveStructFieldElem(ownerKt)
-                    }
-                }
-                super.visitExprCall(e)
-            }
-
-            override fun visitExprStruct(e: Expr.Struct) {
-                if (inferred == null) {
-                    val rawCtor =
-                        e.path.segments
-                            .last()
-                            ?.ident
-                            ?.toString()
-                    val ownerKt =
-                        when (rawCtor) {
-                            null -> null
-                            "Self" -> selfTypeName?.substringBefore('<')?.trim()
-                            else -> rustTypeIdentToKotlin(rawCtor)
-                        }
-                    if (ownerKt != null) {
-                        val fieldCount = e.fields.len()
-                        for (fv: FieldValue in e.fields.toList()) {
-                            if (!isTargetLocalPath(fv.expr)) continue
-                            val fieldName =
-                                when (val m = fv.member) {
-                                    is Member.Named -> rustFieldIdentToKotlin(m.ident.toString())
-                                    is Member.Unnamed -> tupleFieldPropertyName(m.index.index.toInt(), fieldCount)
-                                }
-                            inferred = resolveStructFieldElem(ownerKt, fieldName)
-                            if (inferred != null) break
-                        }
-                    }
-                }
-                super.visitExprStruct(e)
+        if (innerIdent != null) {
+            val scrutineeTy = emitter.inferExprRenderedType(e.expr, selfTypeName)
+            if (scrutineeTy != null && scrutineeTy.endsWith("?")) {
+                val unwrapped = scrutineeTy.removeSuffix("?").trim()
+                if (isConcreteElemType(unwrapped)) ifLetBoundTypes[innerIdent] = unwrapped
             }
         }
-    for (stmt in remainingStmts) {
-        if (inferred != null) break
-        visitor.visitStmt(stmt)
     }
-    return inferred
+
+    override fun visitExprMethodCall(e: Expr.MethodCall) {
+        if (inferred == null &&
+            e.method.toString().removePrefix("r#") == "push" &&
+            e.args.size == 1 &&
+            emitter.singlePlainPathCleanIdent(e.receiver) == rawLocalName
+        ) {
+            val arg = e.args[0]
+            val argIdent = emitter.singlePlainPathCleanIdent(arg)
+            val candidate = argIdent?.let { ifLetBoundTypes[it] } ?: emitter.inferExprRenderedType(arg, selfTypeName)
+            if (isConcreteElemType(candidate)) inferred = candidate
+        }
+        super.visitExprMethodCall(e)
+    }
+
+    override fun visitExprCall(e: Expr.Call) {
+        if (inferred == null && e.args.size == 1 && emitter.singlePlainPathCleanIdent(e.args[0]) == rawLocalName) {
+            val callPath = (emitter.unwrapParenOrGroupExpr(e.func) as? Expr.Path)?.takeIf { it.qself == null }?.path
+            val segs = callPath?.segments?.toList().orEmpty()
+            val firstRaw = segs.firstOrNull()?.ident?.toString()
+            val penultRaw = if (segs.size >= 2) segs[segs.lastIndex - 1].ident.toString() else null
+            val ownerRaw =
+                when {
+                    segs.size == 1 && firstRaw?.firstOrNull()?.isUpperCase() == true -> firstRaw
+                    penultRaw?.firstOrNull()?.isUpperCase() == true -> penultRaw
+                    else -> null
+                }
+            resolveOwnerKt(ownerRaw)?.let { inferred = resolveStructFieldElem(it) }
+        }
+        super.visitExprCall(e)
+    }
+
+    override fun visitExprStruct(e: Expr.Struct) {
+        if (inferred == null) {
+            val ownerKt = resolveOwnerKt(e.path.lastIdentText())
+            if (ownerKt != null) {
+                val fieldCount = e.fields.len()
+                for (fv: FieldValue in e.fields.toList()) {
+                    if (emitter.singlePlainPathCleanIdent(fv.expr) != rawLocalName) continue
+                    val fieldName =
+                        when (val m = fv.member) {
+                            is Member.Named -> rustFieldIdentToKotlin(m.ident.toString())
+                            is Member.Unnamed -> {
+                                val memberIdx = m.index.index.toInt()
+                                tupleFieldPropertyName(memberIdx, fieldCount)
+                            }
+                        }
+                    inferred = resolveStructFieldElem(ownerKt, fieldName)
+                    if (inferred != null) break
+                }
+            }
+        }
+        super.visitExprStruct(e)
+    }
 }
 
 internal fun KotlinJ2KEmitter.isSideEffectFreeExpr(expr: Expr): Boolean =
@@ -1995,7 +1508,7 @@ internal fun KotlinJ2KEmitter.isSideEffectFreeExpr(expr: Expr): Boolean =
         is Expr.Paren -> isSideEffectFreeExpr(expr.expr)
         is Expr.Group -> isSideEffectFreeExpr(expr.expr)
         is Expr.Field -> isSideEffectFreeExpr(expr.base)
-        is Expr.Tuple -> expr.elems.toList().all { isSideEffectFreeExpr(it) }
+        is Expr.Tuple -> expr.elems.toList().all(::isSideEffectFreeExpr)
         else -> false
     }
 
@@ -2005,8 +1518,8 @@ internal fun KotlinJ2KEmitter.isMutablePattern(pat: Pat): Boolean =
         is Pat.TypeAscription -> isMutablePattern(pat.pat)
         is Pat.Reference -> pat.mutability != null || isMutablePattern(pat.pat)
         is Pat.Guard -> isMutablePattern(pat.pat)
-        is Pat.TupleStruct -> pat.elems.toList().any { isMutablePattern(it) }
-        is Pat.Tuple -> pat.elems.toList().any { isMutablePattern(it) }
+        is Pat.TupleStruct -> pat.elems.toList().any(::isMutablePattern)
+        is Pat.Tuple -> pat.elems.toList().any(::isMutablePattern)
         else -> false
     }
 
@@ -2022,8 +1535,7 @@ internal fun KotlinJ2KEmitter.renderLocalPattern(
             val baseName = rustValueIdentToKotlin(raw)
             val emittedName =
                 if (bindToScope && raw != "_" && !raw.first().isUpperCase()) {
-                    val assignCount = if (pat.mutability != null) AssignCount.Any else AssignCount.AtMostOnce
-                    scopeBuilder.bindLocal(raw, baseName, pat.ident.span(), assignCount = assignCount).kotlinName
+                    bindScopedValueIdent(raw, pat.ident.span(), pat.mutability != null, baseName)
                 } else {
                     baseName
                 }
@@ -2059,16 +1571,13 @@ internal fun KotlinJ2KEmitter.renderLocalPattern(
                                             val baseName = rustValueIdentToKotlin(raw)
                                             val ktName =
                                                 if (bindToScope && !raw.first().isUpperCase()) {
-                                                    val assignCount = if (p.mutability != null) AssignCount.Any else AssignCount.AtMostOnce
-                                                    scopeBuilder.bindLocal(raw, baseName, p.ident.span(), assignCount = assignCount).kotlinName
+                                                    bindScopedValueIdent(raw, p.ident.span(), p.mutability != null, baseName)
                                                 } else {
                                                     baseName
                                                 }
                                             if (bindToScope && renderedElemTy != null) {
                                                 currentTypedLocals = currentTypedLocals + (ktName to renderedElemTy)
-                                                if (renderedElemTy.endsWith("?")) {
-                                                    currentNullableLocals = currentNullableLocals + ktName
-                                                }
+                                                if (renderedElemTy.endsWith("?")) currentNullableLocals = currentNullableLocals + ktName
                                             }
                                             ktName
                                         }
@@ -2117,18 +1626,25 @@ internal fun KotlinJ2KEmitter.collectPatternBindingNames(
     bindToScope: Boolean,
     out: MutableList<String>,
 ) {
+    fun appendCtorPathSegments(path: Path) {
+        if (!includeCtorInTupleStruct) return
+        for (seg in path.segments.toList()) {
+            val id = seg.ident.toString()
+            if (id !in IGNORED_PATH_PREFIXES) {
+                out += if (id.first().isUpperCase()) rustTypeIdentToKotlin(id) else rustValueIdentToKotlin(id)
+            }
+        }
+    }
     when (pat) {
         is Pat.Ident -> {
             val raw = pat.ident.toString().removePrefix("r#")
             if (raw != "_") {
-                if (raw.first().isUpperCase()) {
-                    out += rustTypeIdentToKotlin(raw)
-                } else if (bindToScope) {
-                    val assignCount = if (pat.mutability != null) AssignCount.Any else AssignCount.AtMostOnce
-                    out += scopeBuilder.bindLocal(raw, rustValueIdentToKotlin(raw), pat.ident.span(), assignCount = assignCount).kotlinName
-                } else {
-                    out += rustValueIdentToKotlin(raw)
-                }
+                out +=
+                    when {
+                        raw.first().isUpperCase() -> rustTypeIdentToKotlin(raw)
+                        bindToScope -> bindScopedValueIdent(raw, pat.ident.span(), pat.mutability != null)
+                        else -> rustValueIdentToKotlin(raw)
+                    }
             }
             pat.subpat?.let { collectPatternBindingNames(it, selfTypeName, includeCtorInTupleStruct, bindToScope, out) }
         }
@@ -2142,427 +1658,462 @@ internal fun KotlinJ2KEmitter.collectPatternBindingNames(
             if (elems.size >= 2) {
                 val perElem =
                     elems.map { sub ->
-                        val subOut = mutableListOf<String>()
-                        collectPatternBindingNames(sub, selfTypeName, includeCtorInTupleStruct, bindToScope, subOut)
-                        subOut
+                        mutableListOf<String>().also { collectPatternBindingNames(sub, selfTypeName, includeCtorInTupleStruct, bindToScope, it) }
                     }
                 if (perElem.any { it.isNotEmpty() }) {
                     for (subOut in perElem) {
-                        if (subOut.isEmpty()) {
-                            out += "_"
-                        } else {
-                            out.addAll(subOut)
-                        }
+                        if (subOut.isEmpty()) out += "_" else out.addAll(subOut)
                     }
                 }
             } else {
-                for (sub in elems) {
-                    collectPatternBindingNames(sub, selfTypeName, includeCtorInTupleStruct, bindToScope, out)
-                }
+                elems.forEach { collectPatternBindingNames(it, selfTypeName, includeCtorInTupleStruct, bindToScope, out) }
             }
         }
         is Pat.TupleStruct -> {
-            if (includeCtorInTupleStruct) {
-                for (seg in pat.path.segments.toList()) {
-                    val id = seg.ident.toString()
-                    if (id !in IGNORED_PATH_PREFIXES) {
-                        out += if (id.first().isUpperCase()) rustTypeIdentToKotlin(id) else rustValueIdentToKotlin(id)
-                    }
-                }
-            }
-            for (sub in pat.elems.toList()) {
-                collectPatternBindingNames(sub, selfTypeName, includeCtorInTupleStruct, bindToScope, out)
-            }
+            appendCtorPathSegments(pat.path)
+            pat.elems.toList().forEach { collectPatternBindingNames(it, selfTypeName, includeCtorInTupleStruct, bindToScope, out) }
         }
         is Pat.Struct -> {
-            if (includeCtorInTupleStruct) {
-                for (seg in pat.path.segments.toList()) {
-                    val id = seg.ident.toString()
-                    if (id !in IGNORED_PATH_PREFIXES) {
-                        out += if (id.first().isUpperCase()) rustTypeIdentToKotlin(id) else rustValueIdentToKotlin(id)
-                    }
-                }
-            }
-            for (fp in pat.fields.toList()) {
-                collectPatternBindingNames(fp.pat, selfTypeName, includeCtorInTupleStruct, bindToScope, out)
-            }
+            appendCtorPathSegments(pat.path)
+            pat.fields.toList().forEach { collectPatternBindingNames(it.pat, selfTypeName, includeCtorInTupleStruct, bindToScope, out) }
         }
-        is Pat.Slice -> {
-            for (sub in pat.elems.toList()) {
-                collectPatternBindingNames(sub, selfTypeName, includeCtorInTupleStruct, bindToScope, out)
-            }
-        }
-        is Pat.Path -> {
-            if (includeCtorInTupleStruct) {
-                for (seg in pat.path.segments.toList()) {
-                    val id = seg.ident.toString()
-                    if (id !in IGNORED_PATH_PREFIXES) {
-                        out += if (id.first().isUpperCase()) rustTypeIdentToKotlin(id) else rustValueIdentToKotlin(id)
-                    }
-                }
-            }
-        }
+        is Pat.Slice -> pat.elems.toList().forEach { collectPatternBindingNames(it, selfTypeName, includeCtorInTupleStruct, bindToScope, out) }
+        is Pat.Path -> appendCtorPathSegments(pat.path)
         else -> {}
     }
 }
 
+private sealed class LocalBindingLowering {
+    abstract fun tryRender(
+        emitter: KotlinJ2KEmitter,
+        local: Stmt.Local,
+        indent: String,
+        selfTypeName: String?,
+        remainingStmts: List<Stmt>,
+    ): String?
+
+    companion object {
+        private val STORAGE_RULES: List<LocalBindingLowering> =
+            listOf(AddressableLocalLowering, ScopedBorrowedPlaceLocalLowering)
+
+        fun tryLowerSpecialStorage(
+            emitter: KotlinJ2KEmitter,
+            local: Stmt.Local,
+            indent: String,
+            selfTypeName: String?,
+            remainingStmts: List<Stmt>,
+        ): String? = STORAGE_RULES.firstNotNullOfOrNull { it.tryRender(emitter, local, indent, selfTypeName, remainingStmts) }
+    }
+}
+
 /** Keep a non-escaping pointer/reference alias attached to its source storage. */
-private fun KotlinJ2KEmitter.renderScopedBorrowedPlaceLocal(
-    local: Stmt.Local,
-    indent: String,
-    selfTypeName: String?,
-    remainingStmts: List<Stmt>,
-): String? {
-    if (headerContext.rawAbiMode || local.init?.diverge != null) return null
-    val binding = unwrapTransparentPat(local.pat) as? Pat.Ident ?: return null
-    if (binding.mutability != null || binding.byRef != null || binding.subpat != null) return null
-    val init = local.init?.expr ?: return null
-    val projection = borrowedPlaceProjection(init, selfTypeName, addressArgument = true) ?: return null
-    val raw = binding.ident.toString().removePrefix("r#")
-    var dereferences = 0
-    var escapes = false
-    val visitor =
-        object : Visit() {
-            override fun visitExprUnary(e: Expr.Unary) {
-                val operand = unwrapParenOrGroupExpr(e.expr) as? Expr.Path
-                if (e.op is UnOp.Deref && operand != null && operand.qself == null && operand.path.isIdent(raw)) {
-                    dereferences++
-                    return
+private object ScopedBorrowedPlaceLocalLowering : LocalBindingLowering() {
+    override fun tryRender(
+        emitter: KotlinJ2KEmitter,
+        local: Stmt.Local,
+        indent: String,
+        selfTypeName: String?,
+        remainingStmts: List<Stmt>,
+    ): String? {
+        if (emitter.headerContext.rawAbiMode || local.init?.diverge != null) return null
+        val binding = emitter.unwrapTransparentPat(local.pat) as? Pat.Ident ?: return null
+        if (binding.mutability != null || binding.byRef != null || binding.subpat != null) return null
+        val init = local.init?.expr ?: return null
+        val projection = emitter.borrowedPlaceProjection(init, selfTypeName, addressArgument = true) ?: return null
+        val raw = binding.ident.toString().removePrefix("r#")
+        var dereferences = 0
+        var escapes = false
+        val visitor =
+            object : Visit() {
+                override fun visitExprUnary(e: Expr.Unary) {
+                    if (e.op is UnOp.Deref && emitter.singlePlainPathCleanIdent(e.expr) == raw) {
+                        dereferences++
+                        return
+                    }
+                    super.visitExprUnary(e)
                 }
-                super.visitExprUnary(e)
+
+                override fun visitExprPath(e: Expr.Path) {
+                    if (e.qself == null && e.path.isIdent(raw)) escapes = true
+                    super.visitExprPath(e)
+                }
+
+                override fun visitExprReference(e: Expr.Reference) {
+                    if (raw in emitter.collectUsedRawIdentsInExpr(e.expr)) escapes = true
+                    super.visitExprReference(e)
+                }
+
+                override fun visitExprRawAddr(e: Expr.RawAddr) {
+                    if (raw in emitter.collectUsedRawIdentsInExpr(e.expr)) escapes = true
+                    super.visitExprRawAddr(e)
+                }
+
+                override fun visitMacro(m: Macro) {
+                    // Token-only macro arguments have not been resolved to expressions.
+                    // Do not classify a hidden pointer use as a dereference.
+                    if (emitter.containsWholeIdentifier(m.tokens.toString(), raw)) escapes = true
+                    super.visitMacro(m)
+                }
             }
-            override fun visitExprPath(e: Expr.Path) {
-                if (e.qself == null && e.path.isIdent(raw)) escapes = true
-                super.visitExprPath(e)
-            }
-            override fun visitExprReference(e: Expr.Reference) {
-                if (raw in collectUsedRawIdentsInExpr(e.expr)) escapes = true
-                super.visitExprReference(e)
-            }
-            override fun visitExprRawAddr(e: Expr.RawAddr) {
-                if (raw in collectUsedRawIdentsInExpr(e.expr)) escapes = true
-                super.visitExprRawAddr(e)
-            }
-            override fun visitMacro(m: Macro) {
-                // Token-only macro arguments have not been resolved to expressions.
-                // Do not classify a hidden pointer use as a dereference.
-                if (containsWholeIdentifier(m.tokens.toString(), raw)) escapes = true
-                super.visitMacro(m)
+        remainingStmts.forEach(visitor::visitStmt)
+        if (escapes) {
+            val call = emitter.unwrapParenOrGroupExpr(init) as? Expr.MethodCall ?: return null
+            val recvRendered = emitter.inferExprRenderedType(call.receiver, selfTypeName)?.removeSuffix("?")
+            val ownerType = recvRendered?.simpleKotlinTypeName() ?: return null
+            val handleType = emitter.mutablePlaceAccessorType(ownerType, call.method.toString()) ?: return null
+            val (name, _) = emitter.renderLocalPattern(local.pat, selfTypeName, includeCtorInTupleStruct = false, bindToScope = true)
+            emitter.currentTypedLocals = emitter.currentTypedLocals + (name to handleType)
+            return "${indent}val $name = ${emitter.renderExpr(init, indent, selfTypeName)}"
+        }
+        if (dereferences == 0) return null
+        val (receiver, fields) = projection
+        val owner =
+            "(${emitter.renderExpr(receiver, indent, selfTypeName)})" +
+                fields.dropLast(1).joinToString("") { ".$it" }
+        val (name, _) = emitter.renderLocalPattern(local.pat, selfTypeName, includeCtorInTupleStruct = false, bindToScope = true)
+        emitter.currentBorrowedPlaceLocals = emitter.currentBorrowedPlaceLocals + name
+        var valueType = emitter.inferExprRenderedType(receiver, selfTypeName)
+        for (field in fields) {
+            val ownerType = valueType?.removeSuffix("?")?.simpleKotlinTypeName()
+            val fieldMap = emitter.inspector.structFieldSynTypesByType[ownerType]
+            valueType = fieldMap?.get(field)?.let { emitter.renderType(it, ownerType) }
+        }
+        valueType?.let { emitter.currentTypedLocals = emitter.currentTypedLocals + (name to it) }
+        return BorrowedPlacePropertyDelegateTemplate.renderWithCachedOwner(
+            indent = indent,
+            varName = name,
+            ownerExpr = owner,
+            leafField = fields.last(),
+        )
+    }
+}
+
+private class AddressableLocalUsageScanner(
+    private val emitter: KotlinJ2KEmitter,
+    private val raw: String,
+    private val selfTypeName: String?,
+) : Visit() {
+    var rawAddressTaken: Boolean = false
+    var mutRefTaken: Boolean = false
+    var asPtrMethodCalled: Boolean = false
+    var totalPathMentions: Int = 0
+    var storageOnlyMentions: Int = 0
+    var mentionedInMacro: Boolean = false
+    var directReassigned: Boolean = false
+    private var currentMatchScrutinee: Expr? = null
+
+    private fun isSelfIdentPath(expr: Expr?): Boolean = emitter.singlePlainPathCleanIdent(expr) == raw
+
+    private fun tokenStreamContainsSelfIdent(stream: TokenStream): Boolean =
+        stream.clone().toList().any { tt ->
+            when (tt) {
+                is TokenTree.Ident -> tt.value.toString().removePrefix("r#") == raw
+                is TokenTree.Group -> tokenStreamContainsSelfIdent(tt.value.stream())
+                else -> false
             }
         }
-    for (stmt in remainingStmts) visitor.visitStmt(stmt)
-    if (escapes) {
-        val call = unwrapParenOrGroupExpr(init) as? Expr.MethodCall ?: return null
-        val ownerType =
-            inferExprRenderedType(call.receiver, selfTypeName)
-                ?.removeSuffix("?")
-                ?.substringBefore('<')
-                ?.substringAfterLast('.') ?: return null
-        val handleType = mutablePlaceAccessorType(ownerType, call.method.toString()) ?: return null
-        val (name, _) = renderLocalPattern(local.pat, selfTypeName, includeCtorInTupleStruct = false, bindToScope = true)
-        currentTypedLocals = currentTypedLocals + (name to handleType)
-        return "${indent}val $name = ${renderExpr(init, indent, selfTypeName)}"
+
+    override fun visitExprPath(e: Expr.Path) {
+        if (e.qself == null && e.path.isIdent(raw)) totalPathMentions++
+        super.visitExprPath(e)
     }
-    if (dereferences == 0) return null
-    val (receiver, fields) = projection
-    val owner =
-        "(${renderExpr(receiver, indent, selfTypeName)})" +
-            fields.dropLast(1).joinToString(separator = "", transform = { ".$it" })
-    val (name, _) = renderLocalPattern(local.pat, selfTypeName, includeCtorInTupleStruct = false, bindToScope = true)
-    currentBorrowedPlaceLocals = currentBorrowedPlaceLocals + name
-    var valueType = inferExprRenderedType(receiver, selfTypeName)
-    for (field in fields) {
-        val ownerType = valueType?.removeSuffix("?")?.substringBefore('<')?.substringAfterLast('.')
-        valueType = inspector.structFieldSynTypesByType[ownerType]?.get(field)?.let { renderType(it, ownerType) }
+
+    override fun visitExprMacro(e: Expr.Macro) {
+        if (tokenStreamContainsSelfIdent(e.mac.tokens)) mentionedInMacro = true
+        super.visitExprMacro(e)
     }
-    valueType?.let { currentTypedLocals = currentTypedLocals + (name to it) }
-    // Infer V from the actual storage, preserving nullable pointees and generic
-    // substitutions instead of guessing it from an erased raw-pointer type.
-    return BorrowedPlacePropertyDelegateTemplate.renderWithCachedOwner(
-        indent = indent,
-        varName = name,
-        ownerExpr = owner,
-        leafField = fields.last(),
-    )
+
+    override fun visitStmtMacro(s: Stmt.MacroStmt) {
+        if (tokenStreamContainsSelfIdent(s.mac.tokens)) mentionedInMacro = true
+        super.visitStmtMacro(s)
+    }
+
+    override fun visitExprMatch(e: Expr.Match) {
+        val prevScrutinee = currentMatchScrutinee
+        val subj = emitter.unwrapParenOrGroupExpr(e.expr)
+        if (subj is Expr.Reference && subj.mutability != null) {
+            currentMatchScrutinee = subj
+            if (isSelfIdentPath(subj.expr) && e.arms.any { emitter.matchArmMutatesTupleVariantBinding(it) }) {
+                directReassigned = true
+            }
+        }
+        super.visitExprMatch(e)
+        currentMatchScrutinee = prevScrutinee
+    }
+
+    override fun visitExprAssign(e: Expr.Assign) {
+        if (isSelfIdentPath(e.left)) directReassigned = true
+        super.visitExprAssign(e)
+    }
+
+    override fun visitExprBinary(e: Expr.Binary) {
+        if (emitter.isCompoundAssignOp(e.op) && isSelfIdentPath(e.left)) directReassigned = true
+        super.visitExprBinary(e)
+    }
+
+    override fun visitExprReference(e: Expr.Reference) {
+        if (e.mutability != null && e !== currentMatchScrutinee && isSelfIdentPath(e.expr)) {
+            mutRefTaken = true
+            storageOnlyMentions++
+        }
+        super.visitExprReference(e)
+    }
+
+    override fun visitExprCast(e: Expr.Cast) {
+        val reference = emitter.unwrapParenOrGroupExpr(e.expr) as? Expr.Reference
+        if (e.ty is SynType.Ptr && isSelfIdentPath(reference?.expr)) {
+            rawAddressTaken = true
+            if (reference?.mutability == null) storageOnlyMentions++
+        }
+        super.visitExprCast(e)
+    }
+
+    override fun visitExprMethodCall(e: Expr.MethodCall) {
+        val unwrappedRecv = emitter.unwrapParenOrGroupExpr(e.receiver)
+        val target = (unwrappedRecv as? Expr.Reference)?.expr ?: unwrappedRecv
+        if (e.method.toString() in setOf("as_ptr", "as_mut_ptr") && e.args.isEmpty() && isSelfIdentPath(target)) {
+            asPtrMethodCalled = true
+            if (unwrappedRecv !is Expr.Reference || unwrappedRecv.mutability == null) storageOnlyMentions++
+        }
+        super.visitExprMethodCall(e)
+    }
+
+    override fun visitExprCall(e: Expr.Call) {
+        val calleeLeaf = (e.func as? Expr.Path)?.path?.lastCleanIdent()
+        val minVarargAddrIdx =
+            when (calleeLeaf) {
+                "ioctl", "fcntl" -> 2
+                "syscall", "prctl" -> 1
+                else -> Int.MAX_VALUE
+            }
+        for ((argIdx, argExpr) in e.args.toList().withIndex()) {
+            val reference = emitter.unwrapParenOrGroupExpr(argExpr) as? Expr.Reference
+            if (reference != null && isSelfIdentPath(reference.expr)) {
+                val isPtrParam =
+                    argIdx >= minVarargAddrIdx || emitter.resolveCalleeExprParamSynType(e.func, argIdx, selfTypeName) is SynType.Ptr
+                if (isPtrParam) {
+                    rawAddressTaken = true
+                    if (reference.mutability == null) storageOnlyMentions++
+                }
+            }
+        }
+        super.visitExprCall(e)
+    }
+
+    override fun visitExprRawAddr(e: Expr.RawAddr) {
+        if (isSelfIdentPath(e.expr)) {
+            rawAddressTaken = true
+            storageOnlyMentions++
+        }
+        super.visitExprRawAddr(e)
+    }
 }
 
 /** Address-taken scalar locals have one allocation for direct accesses and escaping borrows. */
-private fun KotlinJ2KEmitter.renderAddressableLocal(
-    local: Stmt.Local,
-    indent: String,
-    selfTypeName: String?,
-    remainingStmts: List<Stmt>,
-): String? {
-    if (headerContext.rawAbiMode || local.init?.diverge != null) return null
-    val binding = unwrapTransparentPat(local.pat) as? Pat.Ident ?: return null
-    val raw = binding.ident.toString().removePrefix("r#")
-    var rawAddressTaken = false
-    var mutRefTaken = false
-    var asPtrMethodCalled = false
-    var totalPathMentions = 0
-    var storageOnlyMentions = 0
-    var mentionedInMacro = false
-    var directReassigned = false
-    var currentMatchScrutinee: Expr? = null
+private object AddressableLocalLowering : LocalBindingLowering() {
+    private val LITERAL_CODEC_TYPES: Map<String, String> =
+        mapOf(
+            "BOOL" to "Boolean",
+            "I8" to "Byte",
+            "U8" to "UByte",
+            "I16" to "Short",
+            "U16" to "UShort",
+            "I32" to "Int",
+            "U32" to "UInt",
+            "I64" to "Long",
+            "U64" to "ULong",
+        )
 
-    fun isSelfIdentPath(expr: Expr?): Boolean {
-        val place = expr?.let { unwrapParenOrGroupExpr(it) } as? Expr.Path
-        return place?.qself == null && place?.path?.isIdent(raw) == true
-    }
+    override fun tryRender(
+        emitter: KotlinJ2KEmitter,
+        local: Stmt.Local,
+        indent: String,
+        selfTypeName: String?,
+        remainingStmts: List<Stmt>,
+    ): String? {
+        if (emitter.headerContext.rawAbiMode || local.init?.diverge != null) return null
+        val binding = emitter.unwrapTransparentPat(local.pat) as? Pat.Ident ?: return null
+        val raw = binding.ident.toString().removePrefix("r#")
+        val usage = AddressableLocalUsageScanner(emitter, raw, selfTypeName).also { remainingStmts.forEach(it::visitStmt) }
+        if (!usage.rawAddressTaken && !usage.mutRefTaken && !usage.asPtrMethodCalled) return null
 
-    fun tokenStreamContainsSelfIdent(stream: TokenStream): Boolean {
-        for (tt in stream.clone().toList()) {
-            when (tt) {
-                is TokenTree.Ident -> if (tt.value.toString().removePrefix("r#") == raw) return true
-                is TokenTree.Group -> if (tokenStreamContainsSelfIdent(tt.value.stream())) return true
-                else -> {}
-            }
-        }
-        return false
-    }
-
-    val visitor =
-        object : Visit() {
-            override fun visitExprPath(e: Expr.Path) {
-                if (e.qself == null && e.path.isIdent(raw)) {
-                    totalPathMentions++
-                }
-                super.visitExprPath(e)
-            }
-            override fun visitExprMacro(e: Expr.Macro) {
-                if (tokenStreamContainsSelfIdent(e.mac.tokens)) mentionedInMacro = true
-                super.visitExprMacro(e)
-            }
-            override fun visitStmtMacro(s: Stmt.MacroStmt) {
-                if (tokenStreamContainsSelfIdent(s.mac.tokens)) mentionedInMacro = true
-                super.visitStmtMacro(s)
-            }
-            override fun visitExprMatch(e: Expr.Match) {
-                val prevScrutinee = currentMatchScrutinee
-                val subj = unwrapParenOrGroupExpr(e.expr)
-                if (subj is Expr.Reference && subj.mutability != null) {
-                    currentMatchScrutinee = subj
-                    if (isSelfIdentPath(subj.expr) && e.arms.any { matchArmMutatesTupleVariantBinding(it) }) {
-                        directReassigned = true
-                    }
-                }
-                super.visitExprMatch(e)
-                currentMatchScrutinee = prevScrutinee
-            }
-            override fun visitExprAssign(e: Expr.Assign) {
-                if (isSelfIdentPath(e.left)) {
-                    directReassigned = true
-                }
-                super.visitExprAssign(e)
-            }
-            override fun visitExprBinary(e: Expr.Binary) {
-                if (isCompoundAssignOp(e.op) && isSelfIdentPath(e.left)) {
-                    directReassigned = true
-                }
-                super.visitExprBinary(e)
-            }
-            override fun visitExprReference(e: Expr.Reference) {
-                if (e.mutability != null &&
-                    e !== currentMatchScrutinee &&
-                    isSelfIdentPath(e.expr)
-                ) {
-                    mutRefTaken = true
-                    storageOnlyMentions++
-                }
-                super.visitExprReference(e)
-            }
-            override fun visitExprCast(e: Expr.Cast) {
-                val reference = unwrapParenOrGroupExpr(e.expr) as? Expr.Reference
-                if (e.ty is SynType.Ptr && isSelfIdentPath(reference?.expr)) {
-                    rawAddressTaken = true
-                    if (reference?.mutability == null) {
-                        storageOnlyMentions++
-                    }
-                }
-                super.visitExprCast(e)
-            }
-            override fun visitExprMethodCall(e: Expr.MethodCall) {
-                val unwrappedRecv = unwrapParenOrGroupExpr(e.receiver)
-                val target = (unwrappedRecv as? Expr.Reference)?.expr ?: unwrappedRecv
-                if (e.method.toString() in setOf("as_ptr", "as_mut_ptr") && e.args.isEmpty() && isSelfIdentPath(target)) {
-                    asPtrMethodCalled = true
-                    if (unwrappedRecv !is Expr.Reference || unwrappedRecv.mutability == null) {
-                        storageOnlyMentions++
-                    }
-                }
-                super.visitExprMethodCall(e)
-            }
-            override fun visitExprCall(e: Expr.Call) {
-                val calleeLeaf =
-                    (e.func as? Expr.Path)
-                        ?.path
-                        ?.segments
-                        ?.toList()
-                        ?.lastOrNull()
-                        ?.ident
-                        ?.toString()
-                        ?.removePrefix("r#")
-                val minVarargAddrIdx =
-                    when (calleeLeaf) {
-                        "ioctl", "fcntl" -> 2
-                        "syscall", "prctl" -> 1
-                        else -> Int.MAX_VALUE
-                    }
-                for ((argIdx, argExpr) in e.args.toList().withIndex()) {
-                    val reference = unwrapParenOrGroupExpr(argExpr) as? Expr.Reference
-                    if (reference != null && isSelfIdentPath(reference.expr)) {
-                        val isPtrParam =
-                            argIdx >= minVarargAddrIdx ||
-                                resolveCalleeExprParamSynType(e.func, argIdx, selfTypeName) is SynType.Ptr
-                        if (isPtrParam) {
-                            rawAddressTaken = true
-                            if (reference.mutability == null) {
-                                storageOnlyMentions++
-                            }
-                        }
-                    }
-                }
-                super.visitExprCall(e)
-            }
-            override fun visitExprRawAddr(e: Expr.RawAddr) {
-                if (isSelfIdentPath(e.expr)) {
-                    rawAddressTaken = true
-                    storageOnlyMentions++
-                }
-                super.visitExprRawAddr(e)
-            }
-        }
-    for (stmt in remainingStmts) visitor.visitStmt(stmt)
-    if (!rawAddressTaken && !mutRefTaken && !asPtrMethodCalled) return null
-    val boundVarUsed = mentionedInMacro || totalPathMentions > storageOnlyMentions
-    val boundKeyword = if (mentionedInMacro || directReassigned) "var" else "val"
-    val init =
-        local.init?.expr ?: if (rawAddressTaken) {
-            error("Address-taken uninitialized local $raw needs definite-initialization storage lowering")
-        } else {
-            return null
-        }
-    val annotation = (local.pat as? Pat.TypeAscription)?.ty
-    val literal = (unwrapParenOrGroupExpr(init) as? Expr.Lit)?.lit
-    val literalCodec =
-        when (literal) {
-            is Lit.Bool -> "BOOL"
-            is Lit.Int ->
-                when (literal.value.suffix()) {
-                    "", "i32" -> "I32"
-                    "u32" -> "U32"
-                    "i8" -> "I8"
-                    "u8" -> "U8"
-                    "i16" -> "I16"
-                    "u16" -> "U16"
-                    "i64" -> "I64"
-                    "u64" -> "U64"
-                    else -> null
-                }
-            else -> null
-        }
-    val sourceType = annotation ?: sourceInitializerType(init)
-    if (asPtrMethodCalled && sourceType is SynType.Array) {
-        rawAddressTaken = true
-    }
-    if (!rawAddressTaken && !mutRefTaken) return null
-    if (!rawAddressTaken && literalCodec == null && (sourceType == null || !shouldUseAddressBackedMutableReference(sourceType, selfTypeName))) {
-        return null
-    }
-    // An explicit Rust type wins over the initializer. Never infer pointer width from Long.
-    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    var arrayElementLayoutExpr: String? = null
-    val arrayElemRendered = if (sourceType is SynType.Array) renderType(sourceType.elem, selfTypeName) else null
-    val arrayPrimFactory =
-        if (sourceType is SynType.Array && arrayElemRendered != null) {
-            primitiveArrayLayoutFactory(sourceType.elem, arrayElemRendered, activeCfgProfile.pointerWidth.toLong())
-        } else {
-            null
-        }
-    var codec =
-        when {
-            sourceType is SynType.Array && arrayPrimFactory != null -> ""
-            sourceType is SynType.Array -> {
-                if (!rawAddressTaken) {
-                    null
-                } else {
-                    val elemRendered = arrayElemRendered ?: renderType(sourceType.elem, selfTypeName)
-                    val elemLayout =
-                        sourcePointerLayout(sourceType.elem, selfTypeName) ?: run {
-                            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
-                            "UnresolvedTypeLayout<$elemRendered>()"
-                        }
-                    arrayElementLayoutExpr = elemLayout
-                    ""
-                }
-            }
-            sourceType != null -> sourcePointerLayout(sourceType, selfTypeName)
-            else ->
-                literalCodec?.let {
-                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.PrimitiveLayouts")
-                    "PrimitiveLayouts.$it"
-                }
-        }
-    if (codec == null) {
-        val allowAddressBackedMutRef =
-            mutRefTaken && sourceType != null && shouldUseAddressBackedMutableReference(sourceType, selfTypeName)
-        if (!rawAddressTaken && !allowAddressBackedMutRef) {
-            return null
-        }
-        val fallbackRendered =
-            sourceType?.let { renderType(it, selfTypeName) }
-                ?: inferExprRenderedType(init, selfTypeName)
-                ?: "Any?"
-        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
-        codec = "UnresolvedTypeLayout<$fallbackRendered>()"
-    }
-    val previousTarget = currentExpectedParseTargetType
-    val type =
-        sourceType?.let { renderType(it, selfTypeName) } ?: when (literalCodec) {
-            "BOOL" -> "Boolean"
-            "I8" -> "Byte"
-            "U8" -> "UByte"
-            "I16" -> "Short"
-            "U16" -> "UShort"
-            "I32" -> "Int"
-            "U32" -> "UInt"
-            "I64" -> "Long"
-            "U64" -> "ULong"
-            else -> inferExprRenderedType(init, selfTypeName) ?: "Any?"
-        }
-    currentExpectedParseTargetType = type
-    val rhs =
-        try {
-            renderTypedNumericInitializer(init, resolveNumericKind(type), indent, selfTypeName)
-        } finally {
-            currentExpectedParseTargetType = previousTarget
-        }
-    val (boundName, _) = renderLocalPattern(local.pat, selfTypeName, includeCtorInTupleStruct = false, bindToScope = true)
-    val storage = "localStorageL${local.span().start().line}C${local.span().start().column}"
-    currentAddressableLocals = currentAddressableLocals + (boundName to storage)
-    recordLocalInferredType(boundName, type, init, rhs, selfTypeName, null, pat = local.pat)
-    if (sourceType is SynType.Array) {
-        currentAddressableArrayElementTypes = currentAddressableArrayElementTypes + (boundName to sourceType.elem)
-        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.AddressableArrayLocal")
-        val storageInit =
-            if (arrayPrimFactory != null) {
-                val factoryMethod = "from" + arrayPrimFactory.replaceFirstChar { it.uppercaseChar() }
-                "AddressableArrayLocal.$factoryMethod($rhs)"
+        val boundVarUsed = usage.mentionedInMacro || usage.totalPathMentions > usage.storageOnlyMentions
+        val boundKeyword = if (usage.mentionedInMacro || usage.directReassigned) "var" else "val"
+        val init =
+            local.init?.expr ?: if (usage.rawAddressTaken) {
+                error("Address-taken uninitialized local $raw needs definite-initialization storage lowering")
             } else {
-                val elemRendered = arrayElemRendered ?: renderType(sourceType.elem, selfTypeName)
-                val elemLayout =
-                    arrayElementLayoutExpr ?: sourcePointerLayout(sourceType.elem, selfTypeName) ?: run {
-                        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
-                        "UnresolvedTypeLayout<$elemRendered>()"
-                    }
-                "AddressableArrayLocal.fromList($rhs, $elemLayout)"
+                return null
             }
-        val storageDecl = "${indent}val $storage = $storageInit"
+        val annotation = (local.pat as? Pat.TypeAscription)?.ty
+        val literal = (emitter.unwrapParenOrGroupExpr(init) as? Expr.Lit)?.lit
+        val literalCodec =
+            when (literal) {
+                is Lit.Bool -> "BOOL"
+                is Lit.Int ->
+                    when (literal.value.suffix()) {
+                        "", "i32" -> "I32"
+                        "u32" -> "U32"
+                        "i8" -> "I8"
+                        "u8" -> "U8"
+                        "i16" -> "I16"
+                        "u16" -> "U16"
+                        "i64" -> "I64"
+                        "u64" -> "U64"
+                        else -> null
+                    }
+                else -> null
+            }
+        val sourceType = annotation ?: emitter.sourceInitializerType(init)
+        val rawAddressTaken = usage.rawAddressTaken || (usage.asPtrMethodCalled && sourceType is SynType.Array)
+        if (!rawAddressTaken && !usage.mutRefTaken) return null
+        if (!rawAddressTaken && literalCodec == null && (sourceType == null || !emitter.shouldUseAddressBackedMutableReference(sourceType, selfTypeName))) {
+            return null
+        }
+
+        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
+
+        fun unresolvedLayout(renderedTy: String): String {
+            CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.mem.UnresolvedTypeLayout")
+            return "UnresolvedTypeLayout<$renderedTy>()"
+        }
+
+        val arrayElemRendered = if (sourceType is SynType.Array) emitter.renderType(sourceType.elem, selfTypeName) else null
+        val arrayPrimFactory =
+            if (sourceType is SynType.Array && arrayElemRendered != null) {
+                emitter.primitiveArrayLayoutFactory(sourceType.elem, arrayElemRendered, emitter.activeCfgProfile.pointerWidth.toLong())
+            } else {
+                null
+            }
+        var arrayElementLayoutExpr: String? = null
+        var codec =
+            when {
+                sourceType is SynType.Array && arrayPrimFactory != null -> ""
+                sourceType is SynType.Array ->
+                    if (!rawAddressTaken) {
+                        null
+                    } else {
+                        val elemRendered = arrayElemRendered ?: emitter.renderType(sourceType.elem, selfTypeName)
+                        arrayElementLayoutExpr = emitter.sourcePointerLayout(sourceType.elem, selfTypeName) ?: unresolvedLayout(elemRendered)
+                        ""
+                    }
+                sourceType != null -> emitter.sourcePointerLayout(sourceType, selfTypeName)
+                else ->
+                    literalCodec?.let {
+                        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.mem.PrimitiveLayouts")
+                        "PrimitiveLayouts.$it"
+                    }
+            }
+        if (codec == null) {
+            val allowAddressBackedMutRef =
+                usage.mutRefTaken && sourceType != null && emitter.shouldUseAddressBackedMutableReference(sourceType, selfTypeName)
+            if (!rawAddressTaken && !allowAddressBackedMutRef) return null
+            val fallbackRendered = sourceType?.let { emitter.renderType(it, selfTypeName) } ?: emitter.inferExprRenderedType(init, selfTypeName) ?: "Any?"
+            codec = unresolvedLayout(fallbackRendered)
+        }
+        val previousTarget = emitter.currentExpectedParseTargetType
+        val type =
+            sourceType?.let { emitter.renderType(it, selfTypeName) }
+                ?: literalCodec?.let { LITERAL_CODEC_TYPES[it] }
+                ?: emitter.inferExprRenderedType(init, selfTypeName)
+                ?: "Any?"
+        emitter.currentExpectedParseTargetType = type
+        val rhs =
+            try {
+                emitter.renderTypedNumericInitializer(init, emitter.resolveNumericKind(type), indent, selfTypeName)
+            } finally {
+                emitter.currentExpectedParseTargetType = previousTarget
+            }
+        val (boundName, _) = emitter.renderLocalPattern(local.pat, selfTypeName, includeCtorInTupleStruct = false, bindToScope = true)
+        val startPos = local.span().start()
+        val storage = "localStorageL${startPos.line}C${startPos.column}"
+        emitter.currentAddressableLocals = emitter.currentAddressableLocals + (boundName to storage)
+        emitter.recordLocalInferredType(boundName, type, init, rhs, selfTypeName, null, pat = local.pat)
+        val storageDecl =
+            if (sourceType is SynType.Array) {
+                emitter.currentAddressableArrayElementTypes = emitter.currentAddressableArrayElementTypes + (boundName to sourceType.elem)
+                CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.mem.AddressableArrayLocal")
+                val storageInit =
+                    if (arrayPrimFactory != null) {
+                        "AddressableArrayLocal.from${arrayPrimFactory.replaceFirstChar { it.uppercaseChar() }}($rhs)"
+                    } else {
+                        val elemRendered = arrayElemRendered ?: emitter.renderType(sourceType.elem, selfTypeName)
+                        val elemLayout = arrayElementLayoutExpr ?: emitter.sourcePointerLayout(sourceType.elem, selfTypeName) ?: unresolvedLayout(elemRendered)
+                        "AddressableArrayLocal.fromList($rhs, $elemLayout)"
+                    }
+                "${indent}val $storage = $storageInit"
+            } else {
+                CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.mem.AddressableLocal")
+                "${indent}val $storage = AddressableLocal($rhs, $codec)"
+            }
         return if (boundVarUsed) "$storageDecl\n${indent}$boundKeyword $boundName by $storage" else storageDecl
     }
-    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.AddressableLocal")
-    val storageDecl = "${indent}val $storage = AddressableLocal($rhs, $codec)"
-    return if (boundVarUsed) "$storageDecl\n${indent}$boundKeyword $boundName by $storage" else storageDecl
+}
+
+private fun KotlinJ2KEmitter.bindDestructuringReceiverIfNeeded(
+    rhs: String,
+    isSimple: Boolean,
+    rawPrefix: String,
+    baseName: String,
+    span: Span,
+    indent: String,
+    lines: MutableList<String>,
+): String =
+    if (isSimple) {
+        rhs
+    } else {
+        val tmp = scopeBuilder.bindLocal(rawPrefix, baseName, span).kotlinName
+        lines += "${indent}val $tmp = $rhs"
+        tmp
+    }
+
+internal fun KotlinJ2KEmitter.renderStructDestructuringLocal(
+    structPat: Pat.Struct,
+    rhs: String,
+    span: Span,
+    indent: String,
+    selfTypeName: String?,
+): String {
+    val structTypeName =
+        structPat.path.lastIdentText()?.let {
+            if (it == "Self") selfTypeName?.substringBefore('<')?.trim() else rustTypeIdentToKotlin(it)
+        }
+    val isSimpleRhs =
+        rhs.all { it.isLetterOrDigit() || it == '_' } ||
+            (rhs.startsWith("this.") && rhs.removePrefix("this.").all { it.isLetterOrDigit() || it == '_' })
+    val lines = mutableListOf<String>()
+    val receiverVar = bindDestructuringReceiverIfNeeded(rhs, isSimpleRhs, "_struct", "structVal", span, indent, lines)
+    for (fp in structPat.fields.toList()) {
+        val fieldProp = renderMemberName(fp.member)
+        val subPat = unwrapTransparentPat(fp.pat)
+        if (subPat is Pat.Ident && subPat.subpat == null) {
+            val raw = subPat.ident.toString().removePrefix("r#")
+            if (raw != "_") {
+                val isMut = subPat.mutability != null
+                val kw = if (isMut) "var" else "val"
+                val ktVar = bindScopedValueIdent(raw, subPat.ident.span(), isMut)
+                if (structTypeName != null) {
+                    val fieldTy =
+                        inspector.structFieldSynTypesByType[structTypeName]?.get(fieldProp)?.let { renderType(it, selfTypeName) }
+                            ?: headerContext.crateStructFieldTypes["$structTypeName.$fieldProp"]
+                    if (fieldTy != null) {
+                        currentTypedLocals = currentTypedLocals + (ktVar to fieldTy)
+                        if (fieldTy.endsWith("?")) currentNullableLocals = currentNullableLocals + ktVar
+                    }
+                    if (fieldProp in inspector.vecFieldsByType[structTypeName].orEmpty()) {
+                        currentMutableListLocals = currentMutableListLocals + ktVar
+                    }
+                    if (fieldProp in inspector.nullableFieldsByType[structTypeName].orEmpty()) {
+                        currentNullableLocals = currentNullableLocals + ktVar
+                    }
+                }
+                lines += "$indent$kw $ktVar = $receiverVar.$fieldProp"
+            }
+        } else {
+            lines += extractMatchArmBindings(fp.pat, "$receiverVar.$fieldProp", indent, selfTypeName, bindToScope = true)
+        }
+    }
+    return lines.joinToString("\n")
 }
 
 internal fun KotlinJ2KEmitter.renderTupleStructDestructuringLocal(
@@ -2588,51 +2139,28 @@ internal fun KotlinJ2KEmitter.renderTupleStructDestructuringLocal(
         }
     }
     val rhsTrimmed = rhs.trim()
-    if (bindings.isEmpty()) {
-        return if (initExpr != null && !isSideEffectFreeExpr(initExpr)) "$indent$rhsTrimmed" else ""
-    }
-    val rawPathLast =
-        pat.path.segments
-            .last()
-            ?.ident
-            ?.toString()
+    if (bindings.isEmpty()) return if (initExpr != null && !isSideEffectFreeExpr(initExpr)) "$indent$rhsTrimmed" else ""
+
+    val rawPathLast = pat.path.lastIdentText()
     val structTypeName =
         if (pat.path.segments.size == 1 && rawPathLast == "Self" && selfTypeName != null) {
             selfTypeName.substringBefore('<')
         } else {
             renderPathAsType(pat.path, selfTypeName).substringBefore('<')
         }
-    val unwrappedInit = initExpr?.let { unwrapParenOrGroupExpr(it) }
+    val unwrappedInit = initExpr?.let(::unwrapParenOrGroupExpr)
     val isMutBorrow =
-        when {
-            unwrappedInit is Expr.Reference && unwrappedInit.mutability != null -> true
-            unwrappedInit is Expr.Path &&
-                unwrappedInit.qself == null &&
-                unwrappedInit.path.isIdent("self") &&
-                currentReceiverIsMutBorrow -> true
-            else -> false
-        }
+        (unwrappedInit is Expr.Reference && unwrappedInit.mutability != null) ||
+            (unwrappedInit is Expr.Path && unwrappedInit.qself == null && unwrappedInit.path.isIdent("self") && currentReceiverIsMutBorrow)
+    val isSimpleRhs = rhsTrimmed == "this" || rhsTrimmed.matches(Regex("[A-Za-z_][A-Za-z0-9_]*"))
     val lines = mutableListOf<String>()
-    val receiverVar =
-        if (rhsTrimmed == "this" || rhsTrimmed.matches(Regex("[A-Za-z_][A-Za-z0-9_]*"))) {
-            rhsTrimmed
-        } else {
-            val tmp = scopeBuilder.bindLocal("_tupleStruct", "tupleStructVal", span).kotlinName
-            lines += "${indent}val $tmp = $rhsTrimmed"
-            tmp
-        }
+    val receiverVar = bindDestructuringReceiverIfNeeded(rhsTrimmed, isSimpleRhs, "_tupleStruct", "tupleStructVal", span, indent, lines)
     val arity = elems.size
     for ((idx, identPat, isMutBinding) in bindings) {
         val raw = identPat.ident.toString().removePrefix("r#")
         val fieldProp = tupleFieldPropertyName(idx, arity)
-        val fieldTy =
-            inspector.structFieldSynTypesByType[structTypeName]?.get(fieldProp)?.let { renderType(it, selfTypeName) }
-                ?: scopedAbiKeysForRenderedType(structTypeName).firstNotNullOfOrNull {
-                    headerContext.crateStructFieldTypes["$it.$fieldProp"]
-                }
-                ?: headerContext.crateStructFieldTypes["$structTypeName.$fieldProp"]
-        val assignCount = if (isMutBorrow || isMutBinding) AssignCount.Any else AssignCount.AtMostOnce
-        val ktVar = scopeBuilder.bindLocal(raw, rustValueIdentToKotlin(raw), identPat.ident.span(), assignCount = assignCount).kotlinName
+        val fieldTy = resolveDeclaredOrCrateStructFieldType(structTypeName, fieldProp, selfTypeName)
+        val ktVar = bindScopedValueIdent(raw, identPat.ident.span(), isMutBorrow || isMutBinding)
         if (fieldTy != null) {
             currentTypedLocals = currentTypedLocals + (ktVar to fieldTy)
             val fieldHead = fieldTy.substringBefore('<')
@@ -2643,13 +2171,7 @@ internal fun KotlinJ2KEmitter.renderTupleStructDestructuringLocal(
             }
         }
         if (isMutBorrow) {
-            lines +=
-                BorrowedPlacePropertyDelegateTemplate.renderDirectReceiver(
-                    indent = indent,
-                    varName = ktVar,
-                    receiverVar = receiverVar,
-                    fieldProp = fieldProp,
-                )
+            lines += BorrowedPlacePropertyDelegateTemplate.renderDirectReceiver(indent, ktVar, receiverVar, fieldProp)
             currentBorrowedPlaceLocals = currentBorrowedPlaceLocals + ktVar
         } else {
             val kw = if (isMutBinding) "var" else "val"
