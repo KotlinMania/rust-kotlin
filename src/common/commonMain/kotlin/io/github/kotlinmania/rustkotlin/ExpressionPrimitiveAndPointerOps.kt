@@ -1,6 +1,5 @@
 package io.github.kotlinmania.rustkotlin
 
-import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.GenericArgument
 import io.github.kotlinmania.syn.Item
@@ -10,56 +9,6 @@ import io.github.kotlinmania.syn.PathArguments
 import io.github.kotlinmania.syn.QSelf
 import io.github.kotlinmania.syn.RangeLimits
 import io.github.kotlinmania.syn.SynType
-internal fun KotlinJ2KEmitter.unwrapTryIntoUnwrapExpr(expr: Expr): Expr? {
-    val outer = unwrapParenOrGroupExpr(expr) as? Expr.MethodCall ?: return null
-    val outerMethod = outer.method.toString().removePrefix("r#")
-    val outerArgsOk =
-        (outerMethod == "unwrap" && outer.args.isEmpty()) ||
-            (outerMethod == "expect" && outer.args.toList().size == 1)
-    if (!outerArgsOk) return null
-    val inner = unwrapParenOrGroupExpr(outer.receiver) as? Expr.MethodCall ?: return null
-    val innerMethod = inner.method.toString().removePrefix("r#")
-    if (innerMethod != "try_into" || !inner.args.isEmpty()) return null
-    return inner.receiver
-}
-
-internal fun KotlinJ2KEmitter.transparentPointerField(type: String, selfTypeName: String?): Pair<String, String>? {
-    val owner = type.substringBefore('<').substringAfterLast('.')
-    val struct =
-        file.items.filterIsInstance<Item.Struct>().singleOrNull {
-            rustTypeIdentToKotlin(it.ident.toString()) == owner
-        } ?: return null
-    if (!struct.attrs.any { attr ->
-            val meta = attr.meta as? Meta.List
-            meta != null && meta.path.isIdent("repr") &&
-                meta.tokens.clone().toList().any {
-                    it is TokenTree.Ident && it.value.toString() == "transparent"
-                }
-        }
-    ) {
-        return null
-    }
-    val params = renderTypeArgumentsFromGenerics(struct.generics)
-    if (type.substringAfterLast('.') != owner + params) return null
-    val field = inspector.structFieldSynTypesByType[owner]?.entries?.singleOrNull() ?: return null
-    if (field.value !is SynType.Ptr) return null
-    return rustFieldIdentToKotlin(field.key) to renderType(field.value, selfTypeName)
-}
-
-internal fun KotlinJ2KEmitter.resolveRawPointerPointeeLayout(ptrExpr: Expr, selfTypeName: String?): String {
-    (sourceInitializerType(ptrExpr) as? SynType.Ptr)?.elem?.let { pointeeSyn ->
-        return CoreIntrinsicLowering.resolveTypeLayoutExpression(pointeeSyn, selfTypeName, this)
-    }
-    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    val memPkg = "$coreNs.mem"
-    val pointeeKt =
-        rawPointerPointeeType(inferExprRenderedType(ptrExpr, selfTypeName))?.trim()
-            ?: run {
-                CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
-                return "PrimitiveLayouts.U8"
-            }
-    return resolveRenderedTypeLayoutExpr(pointeeKt)
-}
 
 private val PRIMITIVE_LAYOUT_NAME_BY_KT_TYPE: Map<String, String> =
     mapOf(
@@ -82,16 +31,520 @@ private val PRIMITIVE_LAYOUT_NAME_BY_KT_TYPE: Map<String, String> =
         "Unit" to "UNIT",
     )
 
+/**
+ * Single authoritative catalog of Rust integer and floating-point primitive operations,
+ * their Kotlin / `core` / `libm` target names, extra-argument numeric kinds, and return-type
+ * shapes so both expression lowering and return-type inference query one source of truth.
+ */
+internal object PrimitiveNumericOpCatalog {
+    val integerBitCountMethods: Map<String, String> =
+        mapOf(
+            "count_ones" to "countOnes",
+            "count_zeros" to "countZeros",
+            "leading_zeros" to "leadingZeros",
+            "trailing_zeros" to "trailingZeros",
+            "leading_ones" to "leadingOnes",
+            "trailing_ones" to "trailingOnes",
+        )
+
+    val integerUnaryOpMethods: Map<String, String> =
+        mapOf(
+            "checked_neg" to "checkedNeg",
+            "checked_abs" to "checkedAbs",
+            "wrapping_neg" to "wrappingNeg",
+            "wrapping_abs" to "wrappingAbs",
+            "saturating_neg" to "saturatingNeg",
+            "saturating_abs" to "saturatingAbs",
+            "overflowing_neg" to "overflowingNeg",
+            "overflowing_abs" to "overflowingAbs",
+            "reverse_bits" to "reverseBits",
+        ) + integerBitCountMethods
+
+    val integerShiftOrPowMethods: Map<String, String> =
+        mapOf(
+            "checked_shl" to "checkedShl",
+            "checked_shr" to "checkedShr",
+            "checked_pow" to "checkedPow",
+            "wrapping_shl" to "wrappingShl",
+            "wrapping_shr" to "wrappingShr",
+            "overflowing_shl" to "overflowingShl",
+            "overflowing_shr" to "overflowingShr",
+            "rotate_left" to "rotateLeft",
+            "rotate_right" to "rotateRight",
+            "pow" to "pow",
+        )
+
+    val integerBinaryOpMethods: Map<String, String> =
+        mapOf(
+            "checked_add" to "checkedAdd",
+            "checked_sub" to "checkedSub",
+            "checked_mul" to "checkedMul",
+            "checked_div" to "checkedDiv",
+            "checked_rem" to "checkedRem",
+            "checked_div_euclid" to "checkedDivEuclid",
+            "checked_rem_euclid" to "checkedRemEuclid",
+            "wrapping_add" to "wrappingAdd",
+            "wrapping_sub" to "wrappingSub",
+            "wrapping_mul" to "wrappingMul",
+            "wrapping_div" to "wrappingDiv",
+            "wrapping_rem" to "wrappingRem",
+            "saturating_add" to "saturatingAdd",
+            "saturating_sub" to "saturatingSub",
+            "saturating_mul" to "saturatingMul",
+            "overflowing_add" to "overflowingAdd",
+            "overflowing_sub" to "overflowingSub",
+            "overflowing_mul" to "overflowingMul",
+            "div_euclid" to "divEuclid",
+            "rem_euclid" to "remEuclid",
+        )
+
+    private val allIntegerOpNames: Set<String> =
+        integerUnaryOpMethods.keys + integerShiftOrPowMethods.keys + integerBinaryOpMethods.keys
+
+    val signedOnlyIntegerMethods: Set<String> =
+        setOf("checked_abs", "wrapping_abs", "saturating_abs", "overflowing_abs", "saturating_neg")
+
+    val endian128Methods: Map<String, String> =
+        mapOf(
+            "to_be" to "toBe",
+            "from_be" to "fromBe",
+            "swap_bytes" to "swapBytes",
+            "to_le" to "toLe",
+            "from_le" to "fromLe",
+        )
+
+    val standaloneCheckedI32Ops: Map<String, String> =
+        mapOf(
+            "checked_add" to "+",
+            "checked_sub" to "-",
+            "checked_mul" to "*",
+        )
+
+    val floatStdlibBoolPredicates: Map<String, String> =
+        mapOf(
+            "is_nan" to "isNaN",
+            "is_infinite" to "isInfinite",
+            "is_finite" to "isFinite",
+        )
+
+    val floatCoreBoolPredicates: Map<String, String> =
+        mapOf(
+            "is_sign_positive" to "isSignPositive",
+            "is_sign_negative" to "isSignNegative",
+            "is_normal" to "isNormal",
+            "is_subnormal" to "isSubnormal",
+        )
+
+    val floatCoreSelfMethods: Map<String, String> =
+        mapOf(
+            "signum" to "signum",
+            "to_degrees" to "toDegrees",
+            "to_radians" to "toRadians",
+            "next_up" to "nextUp",
+            "next_down" to "nextDown",
+        )
+
+    val floatLibraryMethods: Map<String, String> =
+        floatCoreBoolPredicates + mapOf("classify" to "classify") + floatCoreSelfMethods
+
+    val floatKmUnaryBases: Map<String, String> =
+        mapOf(
+            "abs" to "kmFabs",
+            "floor" to "kmFloor",
+            "ceil" to "kmCeil",
+            "round" to "kmRound",
+            "round_ties_even" to "kmRoundTiesEven",
+            "trunc" to "kmTrunc",
+            "sqrt" to "kmSqrt",
+            "exp" to "kmExp",
+            "exp2" to "kmExp2",
+            "ln" to "kmLog",
+            "log2" to "kmLog2",
+            "log10" to "kmLog10",
+            "sin" to "kmSin",
+            "cos" to "kmCos",
+        )
+
+    val floatLibmUnaryOps: Set<String> =
+        setOf("tan", "asin", "acos", "atan", "cbrt", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh")
+
+    val floatLibmBinaryOps: Set<String> = setOf("atan2", "hypot")
+
+    val floatKmBinaryBases: Map<String, String> =
+        mapOf(
+            "powf" to "kmPow",
+            "copysign" to "kmCopysign",
+            "min" to "kmMinnum",
+            "max" to "kmMaxnum",
+        )
+
+    private val floatSameTypeReturnMethods: Set<String> =
+        (floatKmUnaryBases.keys - "round_ties_even") +
+            floatLibmUnaryOps +
+            floatLibmBinaryOps +
+            setOf("powf", "powi", "min", "max", "fract", "mul_add", "recip", "to_degrees", "to_radians", "signum", "log")
+
+    private val floatBoolReturnMethods: Set<String> =
+        floatStdlibBoolPredicates.keys + floatCoreBoolPredicates.keys
+
+    fun isFloatKind(kind: NumericKind): Boolean =
+        kind == NumericKind.F16 || kind == NumericKind.F32 || kind == NumericKind.F64 || kind == NumericKind.F128
+
+    fun isUnsignedKind(kind: NumericKind): Boolean =
+        kind == NumericKind.U8 || kind == NumericKind.U16 || kind == NumericKind.U32 || kind == NumericKind.U64 || kind == NumericKind.U128
+
+    fun floatSubpackage(kind: NumericKind): String =
+        when (kind) {
+            NumericKind.F16 -> "f16"
+            NumericKind.F128 -> "f128"
+            NumericKind.F32 -> "f32"
+            else -> "f64"
+        }
+
+    fun expectedExtraArgKind(methodName: String, defaultKind: NumericKind): NumericKind =
+        when {
+            methodName in integerShiftOrPowMethods -> NumericKind.U32
+            methodName == "powi" -> NumericKind.I32
+            else -> defaultKind
+        }
+
+    fun inferReturnRenderedType(
+        emitter: KotlinJ2KEmitter,
+        recvKind: NumericKind,
+        rawMethod: String,
+        turbofishType: SynType?,
+        selfTypeName: String?,
+    ): String? {
+        if ("core" !in emitter.headerContext.crateNamespaces) {
+            return if (recvKind == NumericKind.I32 && rawMethod in standaloneCheckedI32Ops && turbofishType == null) {
+                "Int?"
+            } else {
+                null
+            }
+        }
+        val primTy = emitter.numericKindToPureTypeName(recvKind)
+        if (isFloatKind(recvKind)) {
+            return when {
+                rawMethod in floatBoolReturnMethods -> "Boolean"
+                rawMethod == "classify" -> "FpCategory"
+                rawMethod == "to_int_unchecked" -> turbofishType?.let { emitter.renderType(it, selfTypeName) }
+                rawMethod in floatSameTypeReturnMethods -> primTy
+                else -> null
+            }
+        }
+        if (rawMethod !in allIntegerOpNames) return null
+        return when {
+            rawMethod.startsWith("checked_") -> "$primTy?"
+            rawMethod.startsWith("overflowing_") -> "Pair<$primTy, Boolean>"
+            rawMethod in integerBitCountMethods -> "UInt"
+            else -> primTy
+        }
+    }
+
+    fun extractPrimitiveOwnerRawName(
+        path: Path,
+        qself: QSelf?,
+        extraAllowedPrefixes: Set<String> = emptySet(),
+        requirePlainQSelfArgs: Boolean = false,
+    ): String? {
+        val segs = path.segments.toList()
+        if (segs.isEmpty()) return null
+        val allowedPrefixes = IGNORED_PATH_PREFIXES + setOf("core", "std", "primitive") + extraAllowedPrefixes
+        if (qself != null) {
+            if (segs.size != 1) return null
+            val qPath = unwrapSynType(qself.ty) as? SynType.Path ?: return null
+            val qSegs = qPath.path.segments.toList()
+            if (qSegs.isEmpty()) return null
+            if (requirePlainQSelfArgs && qSegs.any { it.arguments !is PathArguments.None }) return null
+            if (!qSegs.dropLast(1).all { it.ident.toString().removePrefix("r#") in allowedPrefixes }) return null
+            val lastQIdent = qSegs.last().ident.toString()
+            return lastQIdent.removePrefix("r#")
+        }
+        if (segs.size < 2) return null
+        if (!segs.dropLast(2).all { it.ident.toString().removePrefix("r#") in allowedPrefixes }) return null
+        return segs[segs.size - 2].ident.toString().removePrefix("r#")
+    }
+}
+
+/**
+ * Lowers concrete integer and floating-point (`F16`, `F32`, `F64`, `F128`) primitive operations
+ * to Kotlin stdlib, `rust-lang-kotlin` `core.num` / `core.intrinsics`, and `libm` calls,
+ * guarding against self-recursion when translating `core` or `libm` itself.
+ */
+private class ConcretePrimitiveOpEmitter(
+    private val emitter: KotlinJ2KEmitter,
+    private val coreNs: String,
+    private val recvKind: NumericKind,
+    private val recvAtom: String,
+    private val renderedRecv: String,
+    private val extraExprs: List<Expr>,
+    private val renderedExtras: List<String>,
+    private val turbofishType: SynType?,
+    private val selfTypeName: String?,
+) {
+    fun render(rawMethod: String): String? =
+        if (PrimitiveNumericOpCatalog.isFloatKind(recvKind)) {
+            FloatPrimitiveOpContext().render(rawMethod)
+        } else {
+            renderIntegerOp(rawMethod)
+        }
+
+    private fun emitCorePackageMemberCall(pkg: String, ktMethod: String, argsList: String): String? {
+        if (emitter.headerContext.packageName == pkg && emitter.currentEnclosingFunctionName == ktMethod) {
+            return null
+        }
+        if (emitter.headerContext.packageName != pkg) {
+            CoreIntrinsicLowering.registerCoreImport(emitter, "$pkg.$ktMethod")
+        }
+        return "$recvAtom.$ktMethod($argsList)"
+    }
+
+    private fun renderIntegerOp(rawMethod: String): String? {
+        if (turbofishType != null) return null
+        if (PrimitiveNumericOpCatalog.isUnsignedKind(recvKind) && rawMethod in PrimitiveNumericOpCatalog.signedOnlyIntegerMethods) {
+            return null
+        }
+        val numPkg = "$coreNs.num"
+        if (extraExprs.isEmpty()) {
+            val ktMethod = PrimitiveNumericOpCatalog.integerUnaryOpMethods[rawMethod] ?: return null
+            return emitCorePackageMemberCall(numPkg, ktMethod, "")
+        }
+        if (extraExprs.size == 1 && renderedExtras.size == 1) {
+            PrimitiveNumericOpCatalog.integerShiftOrPowMethods[rawMethod]?.let { shiftOrPowMethod ->
+                val rhs = emitter.coerceNumericArgIfNeeded(extraExprs[0], renderedExtras[0], NumericKind.U32, selfTypeName)
+                return emitCorePackageMemberCall(numPkg, shiftOrPowMethod, rhs)
+            }
+            PrimitiveNumericOpCatalog.integerBinaryOpMethods[rawMethod]?.let { binMethod ->
+                val rhs = emitter.coerceNumericArgIfNeeded(extraExprs[0], renderedExtras[0], recvKind, selfTypeName)
+                return emitCorePackageMemberCall(numPkg, binMethod, rhs)
+            }
+        }
+        return null
+    }
+
+    private inner class FloatPrimitiveOpContext {
+        private val isWrapperFloat = recvKind == NumericKind.F16 || recvKind == NumericKind.F128
+        private val useF32 = recvKind == NumericKind.F16 || recvKind == NumericKind.F32
+        private val sfx = if (useF32) "f32" else "f64"
+        private val unwrapSuffix =
+            when (recvKind) {
+                NumericKind.F16 -> ".toFloat()"
+                NumericKind.F128 -> ".toDouble()"
+                else -> ""
+            }
+        private val wrapPrefix =
+            when (recvKind) {
+                NumericKind.F16 -> "F16.fromFloat("
+                NumericKind.F128 -> "F128.fromDouble("
+                else -> ""
+            }
+        private val scalarExpr = if (unwrapSuffix.isEmpty()) renderedRecv else "$recvAtom$unwrapSuffix"
+        private val scalarAtom = if (unwrapSuffix.isEmpty()) recvAtom else "$recvAtom$unwrapSuffix"
+        private val intrinsicsPkg = "$coreNs.intrinsics"
+
+        private fun wrapResult(expr: String): String = if (wrapPrefix.isEmpty()) expr else "$wrapPrefix$expr)"
+
+        private fun scalarizeArg(argExpr: Expr, renderedArg: String): String {
+            val coerced = emitter.coerceNumericArgIfNeeded(argExpr, renderedArg, recvKind, selfTypeName)
+            if (unwrapSuffix.isEmpty()) return coerced
+            val atom = if (emitter.isAtomicPostfixReceiver(argExpr, coerced)) coerced else "($coerced)"
+            return "$atom$unwrapSuffix"
+        }
+
+        private fun registerIntrinsic(fn: String) {
+            if (emitter.headerContext.packageName != intrinsicsPkg) {
+                CoreIntrinsicLowering.registerCoreImport(emitter, "$intrinsicsPkg.$fn")
+            }
+        }
+
+        private fun emitLibmCall(rawMethod: String, argsList: String): String? {
+            val libmNs = emitter.resolveLibmNamespace(coreNs)
+            val fn = if (useF32) "${rawMethod}f" else rawMethod
+            val libmPkg = "$libmNs.math.$fn"
+            if (emitter.headerContext.packageName == libmPkg && emitter.currentEnclosingFunctionName == fn) {
+                return null
+            }
+            if (emitter.headerContext.packageName != libmPkg) {
+                CoreIntrinsicLowering.registerCoreImport(emitter, "$libmPkg.$fn")
+            }
+            return wrapResult("$fn($argsList)")
+        }
+
+        fun render(rawMethod: String): String? {
+            if (extraExprs.isEmpty() && rawMethod == "to_int_unchecked") {
+                return renderToIntUnchecked()
+            }
+            if (turbofishType != null) return null
+            if (extraExprs.isEmpty()) {
+                return renderUnaryFloatOp(rawMethod)
+            }
+            if (extraExprs.size == 1 && renderedExtras.size == 1) {
+                return renderBinaryFloatOp(rawMethod)
+            }
+            if (extraExprs.size == 2 && renderedExtras.size == 2 && rawMethod == "mul_add") {
+                val kmFma = "kmFma$sfx"
+                registerIntrinsic(kmFma)
+                val arg0Scalar = scalarizeArg(extraExprs[0], renderedExtras[0])
+                val arg1Scalar = scalarizeArg(extraExprs[1], renderedExtras[1])
+                return wrapResult("$kmFma($scalarExpr, $arg0Scalar, $arg1Scalar)")
+            }
+            return null
+        }
+
+        private fun renderToIntUnchecked(): String? {
+            val dstType =
+                turbofishType?.let { emitter.renderType(it, selfTypeName) }
+                    ?: emitter.currentExpectedParseTargetType
+                    ?: emitter.currentEnclosingReturnRenderedType
+            val dstKind = dstType?.let(emitter::resolveNumericKind) ?: return null
+            return when (dstKind) {
+                NumericKind.I8 -> "$scalarAtom.toInt().toByte()"
+                NumericKind.I16 -> "$scalarAtom.toInt().toShort()"
+                NumericKind.I32 -> "$scalarAtom.toInt()"
+                NumericKind.I64 -> "$scalarAtom.toLong()"
+                NumericKind.U8 -> "$scalarAtom.toInt().toUByte()"
+                NumericKind.U16 -> "$scalarAtom.toInt().toUShort()"
+                NumericKind.U32 -> "$scalarAtom.toUInt()"
+                NumericKind.U64 -> {
+                    val fn = if (useF32) "kmFloatToU64Unchecked" else "kmDoubleToU64Unchecked"
+                    registerIntrinsic(fn)
+                    "$fn($scalarExpr)"
+                }
+                NumericKind.U128 -> {
+                    val fn = if (useF32) "kmFloatToU128Unchecked" else "kmDoubleToU128Unchecked"
+                    registerIntrinsic(fn)
+                    if (emitter.headerContext.packageName != coreNs) {
+                        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.U128")
+                    }
+                    "$fn($scalarExpr).let { U128(it.hi, it.lo) }"
+                }
+                NumericKind.I128 -> {
+                    val fn = if (useF32) "kmFloatToU128Unchecked" else "kmDoubleToU128Unchecked"
+                    registerIntrinsic(fn)
+                    if (emitter.headerContext.packageName != coreNs) {
+                        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.I128")
+                    }
+                    val zeroLit = if (useF32) "0.0f" else "0.0"
+                    "($scalarExpr).let { v -> if (v < $zeroLit) $fn(-v).let { -I128(it.hi.toLong(), it.lo) } else $fn(v).let { I128(it.hi.toLong(), it.lo) } }"
+                }
+                else -> null
+            }
+        }
+
+        private fun renderUnaryFloatOp(rawMethod: String): String? {
+            PrimitiveNumericOpCatalog.floatLibraryMethods[rawMethod]?.let { ktMethod ->
+                val fPkg = "$coreNs.num.${PrimitiveNumericOpCatalog.floatSubpackage(recvKind)}"
+                return emitCorePackageMemberCall(fPkg, ktMethod, "")
+            }
+            PrimitiveNumericOpCatalog.floatKmUnaryBases[rawMethod]?.let { kmBase ->
+                val kmFn = "$kmBase$sfx"
+                registerIntrinsic(kmFn)
+                return wrapResult("$kmFn($scalarExpr)")
+            }
+            if (rawMethod in PrimitiveNumericOpCatalog.floatLibmUnaryOps) {
+                return emitLibmCall(rawMethod, scalarExpr)
+            }
+            PrimitiveNumericOpCatalog.floatStdlibBoolPredicates[rawMethod]?.let { stdPred ->
+                return "$recvAtom.$stdPred()"
+            }
+            return when (rawMethod) {
+                "to_bits" -> if (isWrapperFloat) "$recvAtom.toBits()" else null
+                "fract" -> {
+                    val kmTrunc = "kmTrunc$sfx"
+                    registerIntrinsic(kmTrunc)
+                    "$recvAtom.let { v -> ${wrapResult("v$unwrapSuffix - $kmTrunc(v$unwrapSuffix)")} }"
+                }
+                "recip" -> wrapResult("${if (useF32) "1.0f" else "1.0"} / $scalarAtom")
+                else -> null
+            }
+        }
+
+        private fun renderBinaryFloatOp(rawMethod: String): String? {
+            PrimitiveNumericOpCatalog.floatKmBinaryBases[rawMethod]?.let { kmBase ->
+                val kmFn = "$kmBase$sfx"
+                registerIntrinsic(kmFn)
+                val arg0Scalar = scalarizeArg(extraExprs[0], renderedExtras[0])
+                return wrapResult("$kmFn($scalarExpr, $arg0Scalar)")
+            }
+            if (rawMethod in PrimitiveNumericOpCatalog.floatLibmBinaryOps) {
+                val arg0Scalar = scalarizeArg(extraExprs[0], renderedExtras[0])
+                return emitLibmCall(rawMethod, "$scalarExpr, $arg0Scalar")
+            }
+            return when (rawMethod) {
+                "powi" -> {
+                    val intArg = emitter.coerceNumericArgIfNeeded(extraExprs[0], renderedExtras[0], NumericKind.I32, selfTypeName)
+                    val kmFn = "kmPowi$sfx"
+                    registerIntrinsic(kmFn)
+                    wrapResult("$kmFn($scalarExpr, $intArg)")
+                }
+                "log" -> {
+                    val kmLog = "kmLog$sfx"
+                    registerIntrinsic(kmLog)
+                    val arg0Scalar = scalarizeArg(extraExprs[0], renderedExtras[0])
+                    wrapResult("($kmLog($scalarExpr) / $kmLog($arg0Scalar))")
+                }
+                else -> null
+            }
+        }
+    }
+}
+
+internal fun KotlinJ2KEmitter.unwrapTryIntoUnwrapExpr(expr: Expr): Expr? {
+    val outer = unwrapParenOrGroupExpr(expr) as? Expr.MethodCall ?: return null
+    val outerMethod = outer.method.toString().removePrefix("r#")
+    val outerArgsOk =
+        (outerMethod == "unwrap" && outer.args.isEmpty()) ||
+            (outerMethod == "expect" && outer.args.toList().size == 1)
+    if (!outerArgsOk) return null
+    val inner = unwrapParenOrGroupExpr(outer.receiver) as? Expr.MethodCall ?: return null
+    val innerMethod = inner.method.toString().removePrefix("r#")
+    if (innerMethod != "try_into" || !inner.args.isEmpty()) return null
+    return inner.receiver
+}
+
+internal fun KotlinJ2KEmitter.transparentPointerField(type: String, selfTypeName: String?): Pair<String, String>? {
+    val owner = type.substringBefore('<').substringAfterLast('.')
+    val struct =
+        file.items.filterIsInstance<Item.Struct>().singleOrNull {
+            rustTypeIdentToKotlin(it.ident.toString()) == owner
+        } ?: return null
+    val hasReprTransparent =
+        struct.attrs.any { attr ->
+            val meta = attr.meta as? Meta.List ?: return@any false
+            if (!meta.path.isIdent("repr")) return@any false
+            val cursor = RustTokenCursor(meta.tokens.clone().toList())
+            (0 until cursor.size).any { cursor.identAt(it) == "transparent" }
+        }
+    if (!hasReprTransparent) return null
+    val params = renderTypeArgumentsFromGenerics(struct.generics)
+    if (type.substringAfterLast('.') != owner + params) return null
+    val field = inspector.structFieldSynTypesByType[owner]?.entries?.singleOrNull() ?: return null
+    if (field.value !is SynType.Ptr) return null
+    return rustFieldIdentToKotlin(field.key) to renderType(field.value, selfTypeName)
+}
+
+internal fun KotlinJ2KEmitter.resolveRawPointerPointeeLayout(ptrExpr: Expr, selfTypeName: String?): String {
+    (sourceInitializerType(ptrExpr) as? SynType.Ptr)?.elem?.let { pointeeSyn ->
+        return CoreIntrinsicLowering.resolveTypeLayoutExpression(pointeeSyn, selfTypeName, this)
+    }
+    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+    val memPkg = "$coreNs.mem"
+    val pointeeKt =
+        rawPointerPointeeType(inferExprRenderedType(ptrExpr, selfTypeName))?.trim()
+            ?: run {
+                CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
+                return "PrimitiveLayouts.U8"
+            }
+    return resolveRenderedTypeLayoutExpr(pointeeKt)
+}
+
 internal fun KotlinJ2KEmitter.resolveRenderedTypeLayoutExpr(targetKtRaw: String): String {
     val pointeeKt = targetKtRaw.trim().ifEmpty { "UByte" }
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
     val memPkg = "$coreNs.mem"
     val expectedLayoutTypes = setOf("TypeLayout<$pointeeKt>", "$memPkg.TypeLayout<$pointeeKt>")
-    currentTypedLocals
-        .filterValues { it in expectedLayoutTypes }
-        .keys
-        .singleOrNull()
-        ?.let { return it }
+    val matchingLocals = currentTypedLocals.filterValues { it in expectedLayoutTypes }.keys
+    matchingLocals.singleOrNull()?.let { return it }
     val candidateParam = StructLayoutComputer.typeLayoutParamName(pointeeKt)
     if (candidateParam in currentTypedLocals) return candidateParam
     PRIMITIVE_LAYOUT_NAME_BY_KT_TYPE[pointeeKt]?.let { layoutConst ->
@@ -234,23 +687,18 @@ internal fun KotlinJ2KEmitter.renderUnOpDerefPointerPunning(
     val srcInner = unwrapPtrCastChainToInnerRef(outerCast, selfTypeName) ?: return null
     if (dstPointee is SynType.Array) {
         val elemPath = unwrapSynType(dstPointee.elem) as? SynType.Path ?: return null
-        val elemRaw =
-            elemPath.path.segments
-                .last()
-                ?.ident
-                ?.toString()
-                ?.removePrefix("r#")
+        val elemSegs = elemPath.path.segments.toList()
+        val elemLastIdent = elemSegs.lastOrNull()?.ident?.toString()
+        val elemRaw = elemLastIdent?.removePrefix("r#")
         if ((elemRaw == "u8" || elemRaw == "c_uchar") && "core" in headerContext.crateNamespaces) {
             val srcKind = inferExprNumericKind(srcInner, selfTypeName)
             if (srcKind != null) {
                 val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
                 val subPkg =
-                    when (srcKind) {
-                        NumericKind.F16 -> ".num.f16"
-                        NumericKind.F32 -> ".num.f32"
-                        NumericKind.F64 -> ".num.f64"
-                        NumericKind.F128 -> ".num.f128"
-                        else -> ".num"
+                    if (PrimitiveNumericOpCatalog.isFloatKind(srcKind)) {
+                        ".num.${PrimitiveNumericOpCatalog.floatSubpackage(srcKind)}"
+                    } else {
+                        ".num"
                     }
                 val pkg = "$coreNs$subPkg"
                 if (headerContext.packageName == pkg && currentEnclosingFunctionName == "toNeBytes") {
@@ -313,20 +761,10 @@ internal fun KotlinJ2KEmitter.tryRender128BitEndianMethodCall(
     renderedRecv: String,
     guardSelfRecursion: Boolean,
 ): String? {
-    if ((primKind != NumericKind.U128 && primKind != NumericKind.I128) ||
-        "core" !in headerContext.crateNamespaces ||
-        rawMethod !in setOf("to_be", "from_be", "swap_bytes", "to_le", "from_le")
-    ) {
+    if ((primKind != NumericKind.U128 && primKind != NumericKind.I128) || "core" !in headerContext.crateNamespaces) {
         return null
     }
-    val ktMethod =
-        when (rawMethod) {
-            "to_be" -> "toBe"
-            "from_be" -> "fromBe"
-            "swap_bytes" -> "swapBytes"
-            "to_le" -> "toLe"
-            else -> "fromLe"
-        }
+    val ktMethod = PrimitiveNumericOpCatalog.endian128Methods[rawMethod] ?: return null
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
     if (guardSelfRecursion && headerContext.packageName == "$coreNs.num" && currentEnclosingFunctionName == ktMethod) {
         return null
@@ -412,28 +850,15 @@ internal fun KotlinJ2KEmitter.resolvePrimitiveAssociatedConstKind(
     path: Path,
     qself: QSelf?,
 ): NumericKind? {
-    val segs = path.segments.toList().map { it.ident.toString().removePrefix("r#") }
+    val rawSegs = path.segments.toList()
+    val segs = rawSegs.map { it.ident.toString().removePrefix("r#") }
     if (segs.isEmpty()) return null
     val allowedPrefixes = IGNORED_PATH_PREFIXES + setOf("core", "std", "primitive")
     val primKind =
-        when {
-            qself != null -> {
-                if (segs.size != 1) return null
-                val qPath = unwrapSynType(qself.ty) as? SynType.Path ?: return null
-                val qSegs =
-                    qPath.path.segments
-                        .toList()
-                        .map { it.ident.toString().removePrefix("r#") }
-                if (qSegs.isEmpty() || !qSegs.dropLast(1).all { it in allowedPrefixes }) return null
-                rustPrimitivePathNameToKind(qSegs.last())
-            }
-            segs.size >= 3 && segs[segs.size - 2] == "consts" && segs.dropLast(3).all { it in allowedPrefixes } ->
-                rustPrimitivePathNameToKind(segs[segs.size - 3])?.takeIf {
-                    it == NumericKind.F16 || it == NumericKind.F32 || it == NumericKind.F64 || it == NumericKind.F128
-                }
-            segs.size >= 2 && segs.dropLast(2).all { it in allowedPrefixes } ->
-                rustPrimitivePathNameToKind(segs[segs.size - 2])
-            else -> null
+        if (qself == null && segs.size >= 3 && segs[segs.size - 2] == "consts" && segs.dropLast(3).all { it in allowedPrefixes }) {
+            rustPrimitivePathNameToKind(segs[segs.size - 3])?.takeIf(PrimitiveNumericOpCatalog::isFloatKind)
+        } else {
+            PrimitiveNumericOpCatalog.extractPrimitiveOwnerRawName(path, qself)?.let(::rustPrimitivePathNameToKind)
         } ?: return null
     return when (segs.last()) {
         "BITS", "RADIX", "MANTISSA_DIGITS", "DIGITS" -> NumericKind.U32
@@ -446,28 +871,12 @@ internal fun KotlinJ2KEmitter.parseStaticPrimitiveCallSpec(expr: Expr.Call): Sta
     val fnPath = expr.func as? Expr.Path ?: return null
     val segs = fnPath.path.segments.toList()
     if (segs.isEmpty()) return null
-    val allowedPrefixes = IGNORED_PATH_PREFIXES + setOf("core", "std", "primitive")
-    val turbofishType =
-        (segs.last().arguments as? PathArguments.AngleBracketed)
-            ?.args
-            ?.toList()
-            ?.firstNotNullOfOrNull { (it as? GenericArgument.TypeArg)?.type }
-    val rawSegs = segs.map { it.ident.toString().removePrefix("r#") }
-    val methodName = rawSegs.last()
-    val primKind =
-        if (fnPath.qself != null) {
-            if (rawSegs.size != 1) return null
-            val qPath = unwrapSynType(fnPath.qself!!.ty) as? SynType.Path ?: return null
-            val qSegs =
-                qPath.path.segments
-                    .toList()
-                    .map { it.ident.toString().removePrefix("r#") }
-            if (qSegs.isEmpty() || !qSegs.dropLast(1).all { it in allowedPrefixes }) return null
-            rustPrimitivePathNameToKind(qSegs.last()) ?: return null
-        } else {
-            if (rawSegs.size < 2 || !rawSegs.dropLast(2).all { it in allowedPrefixes }) return null
-            rustPrimitivePathNameToKind(rawSegs[rawSegs.size - 2]) ?: return null
-        }
+    val ownerRaw = PrimitiveNumericOpCatalog.extractPrimitiveOwnerRawName(fnPath.path, fnPath.qself) ?: return null
+    val primKind = rustPrimitivePathNameToKind(ownerRaw) ?: return null
+    val angleArgs = (segs.last().arguments as? PathArguments.AngleBracketed)?.args?.toList()
+    val turbofishType = angleArgs?.firstNotNullOfOrNull { (it as? GenericArgument.TypeArg)?.type }
+    val lastIdent = segs.last().ident.toString()
+    val methodName = lastIdent.removePrefix("r#")
     return StaticPrimitiveCallSpec(primKind = primKind, methodName = methodName, turbofishType = turbofishType)
 }
 
@@ -476,144 +885,8 @@ internal fun KotlinJ2KEmitter.inferPrimitiveOpReturnRenderedType(
     rawMethod: String,
     turbofishType: SynType?,
     selfTypeName: String?,
-): String? {
-    val isCoreAvailable = "core" in headerContext.crateNamespaces
-    if (!isCoreAvailable) {
-        return if (recvKind == NumericKind.I32 &&
-            rawMethod in setOf("checked_add", "checked_sub", "checked_mul") &&
-            turbofishType == null
-        ) {
-            "Int?"
-        } else {
-            null
-        }
-    }
-    val primTy = numericKindToPureTypeName(recvKind)
-    val isFloat =
-        recvKind == NumericKind.F16 ||
-            recvKind == NumericKind.F32 ||
-            recvKind == NumericKind.F64 ||
-            recvKind == NumericKind.F128
-    return when {
-        !isFloat &&
-            rawMethod in
-            setOf(
-                "checked_add",
-                "checked_sub",
-                "checked_mul",
-                "checked_div",
-                "checked_rem",
-                "checked_div_euclid",
-                "checked_rem_euclid",
-                "checked_shl",
-                "checked_shr",
-                "checked_pow",
-                "checked_neg",
-                "checked_abs",
-            ) -> "$primTy?"
-        !isFloat &&
-            rawMethod in
-            setOf(
-                "overflowing_add",
-                "overflowing_sub",
-                "overflowing_mul",
-                "overflowing_shl",
-                "overflowing_shr",
-                "overflowing_neg",
-                "overflowing_abs",
-            ) -> "Pair<$primTy, Boolean>"
-        !isFloat &&
-            rawMethod in
-            setOf(
-                "wrapping_add",
-                "wrapping_sub",
-                "wrapping_mul",
-                "wrapping_div",
-                "wrapping_rem",
-                "wrapping_shl",
-                "wrapping_shr",
-                "wrapping_neg",
-                "wrapping_abs",
-                "saturating_add",
-                "saturating_sub",
-                "saturating_mul",
-                "saturating_neg",
-                "saturating_abs",
-                "div_euclid",
-                "rem_euclid",
-                "pow",
-                "reverse_bits",
-                "rotate_left",
-                "rotate_right",
-            ) -> primTy
-        !isFloat &&
-            rawMethod in
-            setOf(
-                "count_ones",
-                "count_zeros",
-                "leading_zeros",
-                "trailing_zeros",
-                "leading_ones",
-                "trailing_ones",
-            ) -> "UInt"
-        isFloat &&
-            rawMethod in
-            setOf(
-                "is_nan",
-                "is_infinite",
-                "is_finite",
-                "is_normal",
-                "is_subnormal",
-                "is_sign_positive",
-                "is_sign_negative",
-            ) -> "Boolean"
-        isFloat && rawMethod == "classify" -> "FpCategory"
-        isFloat && rawMethod == "to_int_unchecked" ->
-            turbofishType?.let { renderType(it, selfTypeName) }
-        isFloat &&
-            rawMethod in
-            setOf(
-                "abs",
-                "floor",
-                "ceil",
-                "round",
-                "trunc",
-                "sqrt",
-                "exp",
-                "exp2",
-                "ln",
-                "log",
-                "log2",
-                "log10",
-                "cbrt",
-                "sin",
-                "cos",
-                "tan",
-                "asin",
-                "acos",
-                "atan",
-                "atan2",
-                "hypot",
-                "sinh",
-                "cosh",
-                "tanh",
-                "asinh",
-                "acosh",
-                "atanh",
-                "powf",
-                "powi",
-                "min",
-                "max",
-                "fract",
-                "mul_add",
-                "recip",
-                "to_degrees",
-                "to_radians",
-                "signum",
-            ) -> primTy
-        else -> null
-    }
-}
+): String? =
+    PrimitiveNumericOpCatalog.inferReturnRenderedType(this, recvKind, rawMethod, turbofishType, selfTypeName)
 
 internal fun KotlinJ2KEmitter.renderStaticPrimitiveCall(
     expr: Expr.Call,
@@ -641,9 +914,7 @@ internal fun KotlinJ2KEmitter.renderStaticPrimitiveCall(
         nonUnitArgs.size == 2 &&
         "core" in headerContext.crateNamespaces
     ) {
-        if (spec.primKind in setOf(NumericKind.F16, NumericKind.F32, NumericKind.F64, NumericKind.F128)) {
-            return null
-        }
+        if (PrimitiveNumericOpCatalog.isFloatKind(spec.primKind)) return null
         val ktType = numericKindToPureTypeName(spec.primKind)
         if (headerContext.packageName == "$coreNs.num" && currentEnclosingFunctionName == "fromStrRadix") {
             return null
@@ -651,10 +922,8 @@ internal fun KotlinJ2KEmitter.renderStaticPrimitiveCall(
         if (headerContext.packageName != "$coreNs.num") {
             CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.num.fromStrRadix")
         }
-        if (spec.primKind == NumericKind.I128 || spec.primKind == NumericKind.U128) {
-            if (headerContext.packageName != coreNs) {
-                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.$ktType")
-            }
+        if ((spec.primKind == NumericKind.I128 || spec.primKind == NumericKind.U128) && headerContext.packageName != coreNs) {
+            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.$ktType")
         }
         usesSourceResult = true
         val savedKind = currentExpectedNumericKind
@@ -690,13 +959,7 @@ internal fun KotlinJ2KEmitter.renderStaticPrimitiveCall(
             currentExpectedNumericKind = savedKind
         }
     val extraExprs = nonUnitArgs.drop(1)
-    val extraExpectedKind =
-        when {
-            spec.methodName in setOf("wrapping_shl", "wrapping_shr", "checked_shl", "checked_shr", "overflowing_shl", "overflowing_shr", "rotate_left", "rotate_right", "pow", "checked_pow") ->
-                NumericKind.U32
-            spec.methodName == "powi" -> NumericKind.I32
-            else -> spec.primKind
-        }
+    val extraExpectedKind = PrimitiveNumericOpCatalog.expectedExtraArgKind(spec.methodName, spec.primKind)
     val extraRendered =
         try {
             currentExpectedNumericKind = extraExpectedKind
@@ -707,19 +970,19 @@ internal fun KotlinJ2KEmitter.renderStaticPrimitiveCall(
     if (spec.methodName == "to_bits" && spec.turbofishType == null && extraExprs.isEmpty()) {
         renderFloatToBitsExpr(nonUnitArgs[0], recvRendered, spec.primKind)?.let { return it }
     }
-    if (spec.turbofishType == null && extraExprs.isEmpty()) {
-        if (spec.methodName in setOf("to_be", "from_be", "swap_bytes", "to_le", "from_le") &&
-            (spec.primKind == NumericKind.U128 || spec.primKind == NumericKind.I128) &&
-            "core" in headerContext.crateNamespaces
-        ) {
-            return tryRender128BitEndianMethodCall(
-                rawMethod = spec.methodName,
-                primKind = spec.primKind,
-                recvExpr = nonUnitArgs[0],
-                renderedRecv = recvRendered,
-                guardSelfRecursion = true,
-            )
-        }
+    if (spec.turbofishType == null &&
+        extraExprs.isEmpty() &&
+        spec.methodName in PrimitiveNumericOpCatalog.endian128Methods &&
+        (spec.primKind == NumericKind.U128 || spec.primKind == NumericKind.I128) &&
+        "core" in headerContext.crateNamespaces
+    ) {
+        return tryRender128BitEndianMethodCall(
+            rawMethod = spec.methodName,
+            primKind = spec.primKind,
+            recvExpr = nonUnitArgs[0],
+            renderedRecv = recvRendered,
+            guardSelfRecursion = true,
+        )
     }
     return renderConcretePrimitiveOp(
         recvKind = spec.primKind,
@@ -744,11 +1007,8 @@ internal fun KotlinJ2KEmitter.renderConcreteNumericMethodCall(
     selfTypeName: String?,
 ): String? {
     val recvKind = inferExprNumericKind(expr.receiver, selfTypeName) ?: return null
-    val tfType =
-        expr.turbofish
-            ?.args
-            ?.toList()
-            ?.firstNotNullOfOrNull { (it as? GenericArgument.TypeArg)?.type }
+    val tfArgs = expr.turbofish?.args?.toList()
+    val tfType = tfArgs?.firstNotNullOfOrNull { (it as? GenericArgument.TypeArg)?.type }
     if (typeArgs.isNotEmpty() && rawMethod != "to_int_unchecked") return null
     return renderConcretePrimitiveOp(
         recvKind = recvKind,
@@ -772,366 +1032,35 @@ private fun KotlinJ2KEmitter.renderConcretePrimitiveOp(
     turbofishType: SynType?,
     selfTypeName: String?,
 ): String? {
-    val isCoreAvailable = "core" in headerContext.crateNamespaces
-    if (!isCoreAvailable) {
-        if (recvKind == NumericKind.I32 &&
-            rawMethod in setOf("checked_add", "checked_sub", "checked_mul") &&
-            extraExprs.size == 1 &&
-            renderedExtras.size == 1 &&
-            turbofishType == null
-        ) {
-            val opSym =
-                when (rawMethod) {
-                    "checked_add" -> "+"
-                    "checked_sub" -> "-"
-                    else -> "*"
-                }
+    if ("core" !in headerContext.crateNamespaces) {
+        val opSym = PrimitiveNumericOpCatalog.standaloneCheckedI32Ops[rawMethod]
+        if (recvKind == NumericKind.I32 && opSym != null && extraExprs.size == 1 && renderedExtras.size == 1 && turbofishType == null) {
             return "(($renderedRecv).toLong() $opSym (${renderedExtras[0]}).toLong()).takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }?.toInt()"
         }
         return null
     }
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
     val recvAtom = if (isAtomicPostfixReceiver(recvExpr, renderedRecv)) renderedRecv else "($renderedRecv)"
-    if (recvKind in setOf(NumericKind.F16, NumericKind.F32, NumericKind.F64, NumericKind.F128)) {
-        return renderFloatConcretePrimitiveOp(
-            coreNs = coreNs,
-            recvKind = recvKind,
-            rawMethod = rawMethod,
-            recvAtom = recvAtom,
-            renderedRecv = renderedRecv,
-            extraExprs = extraExprs,
-            renderedExtras = renderedExtras,
-            turbofishType = turbofishType,
-            selfTypeName = selfTypeName,
-        )
-    }
-    if (turbofishType != null) return null
-    val isUnsignedKind =
-        recvKind in setOf(NumericKind.U8, NumericKind.U16, NumericKind.U32, NumericKind.U64, NumericKind.U128)
-    if (isUnsignedKind && rawMethod in setOf("checked_abs", "wrapping_abs", "saturating_abs", "overflowing_abs", "saturating_neg")) {
-        return null
-    }
-    if (extraExprs.isEmpty()) {
-        val ktMethod = INTEGER_UNARY_OP_METHODS[rawMethod] ?: return null
-        if (headerContext.packageName == "$coreNs.num" && currentEnclosingFunctionName == ktMethod) {
-            return null
-        }
-        if (headerContext.packageName != "$coreNs.num") {
-            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.num.$ktMethod")
-        }
-        return "$recvAtom.$ktMethod()"
-    }
-    if (extraExprs.size == 1 && renderedExtras.size == 1) {
-        val shiftOrPowMethod = INTEGER_SHIFT_OR_POW_METHODS[rawMethod]
-        if (shiftOrPowMethod != null) {
-            if (headerContext.packageName == "$coreNs.num" && currentEnclosingFunctionName == shiftOrPowMethod) {
-                return null
-            }
-            if (headerContext.packageName != "$coreNs.num") {
-                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.num.$shiftOrPowMethod")
-            }
-            val rhs = coerceNumericArgIfNeeded(extraExprs[0], renderedExtras[0], NumericKind.U32, selfTypeName)
-            return "$recvAtom.$shiftOrPowMethod($rhs)"
-        }
-        val binMethod = INTEGER_BINARY_OP_METHODS[rawMethod]
-        if (binMethod != null) {
-            if (headerContext.packageName == "$coreNs.num" && currentEnclosingFunctionName == binMethod) {
-                return null
-            }
-            if (headerContext.packageName != "$coreNs.num") {
-                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.num.$binMethod")
-            }
-            val rhs = coerceNumericArgIfNeeded(extraExprs[0], renderedExtras[0], recvKind, selfTypeName)
-            return "$recvAtom.$binMethod($rhs)"
-        }
-    }
-    return null
+    return ConcretePrimitiveOpEmitter(
+        emitter = this,
+        coreNs = coreNs,
+        recvKind = recvKind,
+        recvAtom = recvAtom,
+        renderedRecv = renderedRecv,
+        extraExprs = extraExprs,
+        renderedExtras = renderedExtras,
+        turbofishType = turbofishType,
+        selfTypeName = selfTypeName,
+    ).render(rawMethod)
 }
 
-private val FLOAT_LIBRARY_METHODS: Map<String, String> =
-    mapOf(
-        "is_sign_positive" to "isSignPositive",
-        "is_sign_negative" to "isSignNegative",
-        "classify" to "classify",
-        "is_normal" to "isNormal",
-        "is_subnormal" to "isSubnormal",
-        "signum" to "signum",
-        "to_degrees" to "toDegrees",
-        "to_radians" to "toRadians",
-        "next_up" to "nextUp",
-        "next_down" to "nextDown",
-    )
-
-private val FLOAT_KM_UNARY_BASES: Map<String, String> =
-    mapOf(
-        "abs" to "kmFabs",
-        "floor" to "kmFloor",
-        "ceil" to "kmCeil",
-        "round" to "kmRound",
-        "round_ties_even" to "kmRoundTiesEven",
-        "trunc" to "kmTrunc",
-        "sqrt" to "kmSqrt",
-        "exp" to "kmExp",
-        "exp2" to "kmExp2",
-        "ln" to "kmLog",
-        "log2" to "kmLog2",
-        "log10" to "kmLog10",
-        "sin" to "kmSin",
-        "cos" to "kmCos",
-    )
-
-private val FLOAT_LIBM_UNARY_OPS: Set<String> =
-    setOf("tan", "asin", "acos", "atan", "cbrt", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh")
-
-private val FLOAT_KM_BINARY_BASES: Map<String, String> =
-    mapOf(
-        "powf" to "kmPow",
-        "copysign" to "kmCopysign",
-        "min" to "kmMinnum",
-        "max" to "kmMaxnum",
-    )
-
-private val INTEGER_UNARY_OP_METHODS: Map<String, String> =
-    mapOf(
-        "checked_neg" to "checkedNeg",
-        "checked_abs" to "checkedAbs",
-        "wrapping_neg" to "wrappingNeg",
-        "wrapping_abs" to "wrappingAbs",
-        "saturating_neg" to "saturatingNeg",
-        "saturating_abs" to "saturatingAbs",
-        "overflowing_neg" to "overflowingNeg",
-        "overflowing_abs" to "overflowingAbs",
-        "reverse_bits" to "reverseBits",
-        "count_ones" to "countOnes",
-        "count_zeros" to "countZeros",
-        "leading_zeros" to "leadingZeros",
-        "trailing_zeros" to "trailingZeros",
-        "leading_ones" to "leadingOnes",
-        "trailing_ones" to "trailingOnes",
-    )
-
-private val INTEGER_SHIFT_OR_POW_METHODS: Map<String, String> =
-    mapOf(
-        "checked_shl" to "checkedShl",
-        "checked_shr" to "checkedShr",
-        "checked_pow" to "checkedPow",
-        "wrapping_shl" to "wrappingShl",
-        "wrapping_shr" to "wrappingShr",
-        "overflowing_shl" to "overflowingShl",
-        "overflowing_shr" to "overflowingShr",
-        "rotate_left" to "rotateLeft",
-        "rotate_right" to "rotateRight",
-        "pow" to "pow",
-    )
-
-private val INTEGER_BINARY_OP_METHODS: Map<String, String> =
-    mapOf(
-        "checked_add" to "checkedAdd",
-        "checked_sub" to "checkedSub",
-        "checked_mul" to "checkedMul",
-        "checked_div" to "checkedDiv",
-        "checked_rem" to "checkedRem",
-        "checked_div_euclid" to "checkedDivEuclid",
-        "checked_rem_euclid" to "checkedRemEuclid",
-        "wrapping_add" to "wrappingAdd",
-        "wrapping_sub" to "wrappingSub",
-        "wrapping_mul" to "wrappingMul",
-        "wrapping_div" to "wrappingDiv",
-        "wrapping_rem" to "wrappingRem",
-        "saturating_add" to "saturatingAdd",
-        "saturating_sub" to "saturatingSub",
-        "saturating_mul" to "saturatingMul",
-        "overflowing_add" to "overflowingAdd",
-        "overflowing_sub" to "overflowingSub",
-        "overflowing_mul" to "overflowingMul",
-        "div_euclid" to "divEuclid",
-        "rem_euclid" to "remEuclid",
-    )
-
-private fun KotlinJ2KEmitter.resolveLibmNamespace(coreNs: String): String {
+internal fun KotlinJ2KEmitter.resolveLibmNamespace(coreNs: String): String {
     val pkg = headerContext.packageName?.trim().orEmpty()
     val defaultLibm = "io.github.kotlinmania.rustlang.libm"
     if (pkg == defaultLibm || pkg.startsWith("$defaultLibm.")) {
         return defaultLibm
     }
-    headerContext.crateNamespaces["libm"]
-        ?.trim()
-        ?.removeSuffix(".")
-        ?.takeIf { it.isNotEmpty() }
-        ?.let { return it }
+    val rawLibm = headerContext.crateNamespaces["libm"]?.trim()?.removeSuffix(".")
+    if (!rawLibm.isNullOrEmpty()) return rawLibm
     return if (coreNs.endsWith(".core")) "${coreNs.removeSuffix(".core")}.libm" else defaultLibm
-}
-
-private fun KotlinJ2KEmitter.renderFloatConcretePrimitiveOp(
-    coreNs: String,
-    recvKind: NumericKind,
-    rawMethod: String,
-    recvAtom: String,
-    renderedRecv: String,
-    extraExprs: List<Expr>,
-    renderedExtras: List<String>,
-    turbofishType: SynType?,
-    selfTypeName: String?,
-): String? {
-    val isWrapperFloat = recvKind == NumericKind.F16 || recvKind == NumericKind.F128
-    val useF32 = recvKind == NumericKind.F16 || recvKind == NumericKind.F32
-    val sfx = if (useF32) "f32" else "f64"
-    val unwrapSuffix =
-        when (recvKind) {
-            NumericKind.F16 -> ".toFloat()"
-            NumericKind.F128 -> ".toDouble()"
-            else -> ""
-        }
-    val wrapPrefix =
-        when (recvKind) {
-            NumericKind.F16 -> "F16.fromFloat("
-            NumericKind.F128 -> "F128.fromDouble("
-            else -> ""
-        }
-    fun wrapResult(expr: String): String = if (wrapPrefix.isEmpty()) expr else "$wrapPrefix$expr)"
-    fun scalarizeArg(argExpr: Expr, renderedArg: String): String {
-        val coerced = coerceNumericArgIfNeeded(argExpr, renderedArg, recvKind, selfTypeName)
-        if (unwrapSuffix.isEmpty()) return coerced
-        val atom = if (isAtomicPostfixReceiver(argExpr, coerced)) coerced else "($coerced)"
-        return "$atom$unwrapSuffix"
-    }
-    val scalarExpr = if (unwrapSuffix.isEmpty()) renderedRecv else "$recvAtom$unwrapSuffix"
-    val scalarAtom = if (unwrapSuffix.isEmpty()) recvAtom else "$recvAtom$unwrapSuffix"
-    val intrinsicsPkg = "$coreNs.intrinsics"
-    fun registerIntrinsic(fn: String) {
-        if (headerContext.packageName != intrinsicsPkg) {
-            CoreIntrinsicLowering.registerCoreImport(this, "$intrinsicsPkg.$fn")
-        }
-    }
-
-    if (extraExprs.isEmpty() && rawMethod == "to_int_unchecked") {
-        val dstType = turbofishType?.let { renderType(it, selfTypeName) } ?: currentExpectedParseTargetType ?: currentEnclosingReturnRenderedType
-        val dstKind = dstType?.let(this::resolveNumericKind) ?: return null
-        return when (dstKind) {
-            NumericKind.I8 -> "$scalarAtom.toInt().toByte()"
-            NumericKind.I16 -> "$scalarAtom.toInt().toShort()"
-            NumericKind.I32 -> "$scalarAtom.toInt()"
-            NumericKind.I64 -> "$scalarAtom.toLong()"
-            NumericKind.U8 -> "$scalarAtom.toInt().toUByte()"
-            NumericKind.U16 -> "$scalarAtom.toInt().toUShort()"
-            NumericKind.U32 -> "$scalarAtom.toUInt()"
-            NumericKind.U64 -> {
-                val fn = if (useF32) "kmFloatToU64Unchecked" else "kmDoubleToU64Unchecked"
-                registerIntrinsic(fn)
-                "$fn($scalarExpr)"
-            }
-            NumericKind.U128 -> {
-                val fn = if (useF32) "kmFloatToU128Unchecked" else "kmDoubleToU128Unchecked"
-                registerIntrinsic(fn)
-                if (headerContext.packageName != coreNs) {
-                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.U128")
-                }
-                "$fn($scalarExpr).let { U128(it.hi, it.lo) }"
-            }
-            NumericKind.I128 -> {
-                val fn = if (useF32) "kmFloatToU128Unchecked" else "kmDoubleToU128Unchecked"
-                registerIntrinsic(fn)
-                if (headerContext.packageName != coreNs) {
-                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.I128")
-                }
-                val zeroLit = if (useF32) "0.0f" else "0.0"
-                "($scalarExpr).let { v -> if (v < $zeroLit) $fn(-v).let { -I128(it.hi.toLong(), it.lo) } else $fn(v).let { I128(it.hi.toLong(), it.lo) } }"
-            }
-            else -> null
-        }
-    }
-    if (turbofishType != null) return null
-    if (extraExprs.isEmpty()) {
-        FLOAT_LIBRARY_METHODS[rawMethod]?.let { ktMethod ->
-            val fSub =
-                when (recvKind) {
-                    NumericKind.F16 -> "f16"
-                    NumericKind.F128 -> "f128"
-                    NumericKind.F32 -> "f32"
-                    else -> "f64"
-                }
-            val fPkg = "$coreNs.num.$fSub"
-            if (headerContext.packageName == fPkg && currentEnclosingFunctionName == ktMethod) {
-                return null
-            }
-            if (headerContext.packageName != fPkg) {
-                CoreIntrinsicLowering.registerCoreImport(this, "$fPkg.$ktMethod")
-            }
-            return "$recvAtom.$ktMethod()"
-        }
-        FLOAT_KM_UNARY_BASES[rawMethod]?.let { kmBase ->
-            val kmFn = "$kmBase$sfx"
-            registerIntrinsic(kmFn)
-            return wrapResult("$kmFn($scalarExpr)")
-        }
-        if (rawMethod in FLOAT_LIBM_UNARY_OPS) {
-            val libmNs = resolveLibmNamespace(coreNs)
-            val fn = if (useF32) "${rawMethod}f" else rawMethod
-            val libmPkg = "$libmNs.math.$fn"
-            if (headerContext.packageName == libmPkg && currentEnclosingFunctionName == fn) {
-                return null
-            }
-            if (headerContext.packageName != libmPkg) {
-                CoreIntrinsicLowering.registerCoreImport(this, "$libmPkg.$fn")
-            }
-            return wrapResult("$fn($scalarExpr)")
-        }
-        return when (rawMethod) {
-            "is_nan" -> "$recvAtom.isNaN()"
-            "is_infinite" -> "$recvAtom.isInfinite()"
-            "is_finite" -> "$recvAtom.isFinite()"
-            "to_bits" -> if (isWrapperFloat) "$recvAtom.toBits()" else null
-            "fract" -> {
-                val kmTrunc = "kmTrunc$sfx"
-                registerIntrinsic(kmTrunc)
-                "$recvAtom.let { v -> ${wrapResult("v$unwrapSuffix - $kmTrunc(v$unwrapSuffix)")} }"
-            }
-            "recip" -> wrapResult("${if (useF32) "1.0f" else "1.0"} / $scalarAtom")
-            else -> null
-        }
-    }
-    if (extraExprs.size == 1 && renderedExtras.size == 1) {
-        FLOAT_KM_BINARY_BASES[rawMethod]?.let { kmBase ->
-            val kmFn = "$kmBase$sfx"
-            registerIntrinsic(kmFn)
-            val arg0Scalar = scalarizeArg(extraExprs[0], renderedExtras[0])
-            return wrapResult("$kmFn($scalarExpr, $arg0Scalar)")
-        }
-        return when (rawMethod) {
-            "powi" -> {
-                val intArg = coerceNumericArgIfNeeded(extraExprs[0], renderedExtras[0], NumericKind.I32, selfTypeName)
-                val kmFn = "kmPowi$sfx"
-                registerIntrinsic(kmFn)
-                wrapResult("$kmFn($scalarExpr, $intArg)")
-            }
-            "log" -> {
-                val kmLog = "kmLog$sfx"
-                registerIntrinsic(kmLog)
-                val arg0Scalar = scalarizeArg(extraExprs[0], renderedExtras[0])
-                wrapResult("($kmLog($scalarExpr) / $kmLog($arg0Scalar))")
-            }
-            "atan2", "hypot" -> {
-                val libmNs = resolveLibmNamespace(coreNs)
-                val fn = if (useF32) "${rawMethod}f" else rawMethod
-                val libmPkg = "$libmNs.math.$fn"
-                if (headerContext.packageName == libmPkg && currentEnclosingFunctionName == fn) {
-                    return null
-                }
-                if (headerContext.packageName != libmPkg) {
-                    CoreIntrinsicLowering.registerCoreImport(this, "$libmPkg.$fn")
-                }
-                val arg0Scalar = scalarizeArg(extraExprs[0], renderedExtras[0])
-                wrapResult("$fn($scalarExpr, $arg0Scalar)")
-            }
-            else -> null
-        }
-    }
-    if (extraExprs.size == 2 && renderedExtras.size == 2 && rawMethod == "mul_add") {
-        val kmFma = "kmFma$sfx"
-        registerIntrinsic(kmFma)
-        val arg0Scalar = scalarizeArg(extraExprs[0], renderedExtras[0])
-        val arg1Scalar = scalarizeArg(extraExprs[1], renderedExtras[1])
-        return wrapResult("$kmFma($scalarExpr, $arg0Scalar, $arg1Scalar)")
-    }
-    return null
 }
