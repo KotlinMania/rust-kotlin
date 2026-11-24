@@ -4,7 +4,6 @@ import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.syn.Attribute
 import io.github.kotlinmania.syn.Expr
-import io.github.kotlinmania.syn.GenericArgument
 import io.github.kotlinmania.syn.Lit
 import io.github.kotlinmania.syn.Macro
 import io.github.kotlinmania.syn.Meta
@@ -165,6 +164,7 @@ internal data class CAbiBridgeDescriptor(
     val wasmJsType: String? = null,
     val jniKotlinType: String,
     val jniCType: String,
+    val kotlinScalarType: String? = null,
     val isPointerAddress: Boolean = false,
 )
 
@@ -217,19 +217,19 @@ private data class TargetCWidthProfile(
 
 internal val C_ABI_BRIDGE_DESCRIPTORS: Map<CAbiBridgeKind, CAbiBridgeDescriptor> =
     mapOf(
-        CAbiBridgeKind.VOID to CAbiBridgeDescriptor("void", "", wasmWasiScalarType = "Unit", wasmJsType = "Unit", jniKotlinType = "Unit", jniCType = "void"),
-        CAbiBridgeKind.NEVER to CAbiBridgeDescriptor("void", "", wasmWasiScalarType = "Unit", wasmJsType = "Unit", jniKotlinType = "Unit", jniCType = "void"),
-        CAbiBridgeKind.BOOL to CAbiBridgeDescriptor("bool", "false", wasmWasiScalarType = "Int", wasmJsType = "Boolean", jniKotlinType = "Boolean", jniCType = "jboolean"),
-        CAbiBridgeKind.I8 to CAbiBridgeDescriptor("int8_t", "-1", NumericKind.I8, "toByte", "Int", "Int", "Byte", "jbyte"),
-        CAbiBridgeKind.U8 to CAbiBridgeDescriptor("uint8_t", "0", NumericKind.U8, "toUByte", "Int", "Int", "Byte", "jbyte"),
-        CAbiBridgeKind.I16 to CAbiBridgeDescriptor("int16_t", "-1", NumericKind.I16, "toShort", "Int", "Int", "Short", "jshort"),
-        CAbiBridgeKind.U16 to CAbiBridgeDescriptor("uint16_t", "0", NumericKind.U16, "toUShort", "Int", "Int", "Short", "jshort"),
-        CAbiBridgeKind.I32 to CAbiBridgeDescriptor("int32_t", "-1", NumericKind.I32, null, "Int", "Int", "Int", "jint"),
-        CAbiBridgeKind.U32 to CAbiBridgeDescriptor("uint32_t", "0", NumericKind.U32, "toUInt", "Int", "Int", "Int", "jint"),
-        CAbiBridgeKind.I64 to CAbiBridgeDescriptor("int64_t", "-1", NumericKind.I64, null, "Long", null, "Long", "jlong"),
-        CAbiBridgeKind.U64 to CAbiBridgeDescriptor("uint64_t", "0", NumericKind.U64, "toULong", "Long", null, "Long", "jlong"),
-        CAbiBridgeKind.F32 to CAbiBridgeDescriptor("float", "0.0f", NumericKind.F32, null, "Float", "Double", "Float", "jfloat"),
-        CAbiBridgeKind.F64 to CAbiBridgeDescriptor("double", "0.0", NumericKind.F64, null, "Double", "Double", "Double", "jdouble"),
+        CAbiBridgeKind.VOID to CAbiBridgeDescriptor("void", "", wasmWasiScalarType = "Unit", wasmJsType = "Unit", jniKotlinType = "Unit", jniCType = "void", kotlinScalarType = "Unit"),
+        CAbiBridgeKind.NEVER to CAbiBridgeDescriptor("void", "", wasmWasiScalarType = "Unit", wasmJsType = "Unit", jniKotlinType = "Unit", jniCType = "void", kotlinScalarType = "Unit"),
+        CAbiBridgeKind.BOOL to CAbiBridgeDescriptor("bool", "false", wasmWasiScalarType = "Int", wasmJsType = "Boolean", jniKotlinType = "Boolean", jniCType = "jboolean", kotlinScalarType = "Boolean"),
+        CAbiBridgeKind.I8 to CAbiBridgeDescriptor("int8_t", "-1", NumericKind.I8, "toByte", "Int", "Int", "Byte", "jbyte", "Byte"),
+        CAbiBridgeKind.U8 to CAbiBridgeDescriptor("uint8_t", "0", NumericKind.U8, "toUByte", "Int", "Int", "Byte", "jbyte", "UByte"),
+        CAbiBridgeKind.I16 to CAbiBridgeDescriptor("int16_t", "-1", NumericKind.I16, "toShort", "Int", "Int", "Short", "jshort", "Short"),
+        CAbiBridgeKind.U16 to CAbiBridgeDescriptor("uint16_t", "0", NumericKind.U16, "toUShort", "Int", "Int", "Short", "jshort", "UShort"),
+        CAbiBridgeKind.I32 to CAbiBridgeDescriptor("int32_t", "-1", NumericKind.I32, null, "Int", "Int", "Int", "jint", "Int"),
+        CAbiBridgeKind.U32 to CAbiBridgeDescriptor("uint32_t", "0", NumericKind.U32, "toUInt", "Int", "Int", "Int", "jint", "UInt"),
+        CAbiBridgeKind.I64 to CAbiBridgeDescriptor("int64_t", "-1", NumericKind.I64, null, "Long", null, "Long", "jlong", "Long"),
+        CAbiBridgeKind.U64 to CAbiBridgeDescriptor("uint64_t", "0", NumericKind.U64, "toULong", "Long", null, "Long", "jlong", "ULong"),
+        CAbiBridgeKind.F32 to CAbiBridgeDescriptor("float", "0.0f", NumericKind.F32, null, "Float", "Double", "Float", "jfloat", "Float"),
+        CAbiBridgeKind.F64 to CAbiBridgeDescriptor("double", "0.0", NumericKind.F64, null, "Double", "Double", "Double", "jdouble", "Double"),
         CAbiBridgeKind.CONST_CSTR to CAbiBridgeDescriptor("const char*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
         CAbiBridgeKind.MUT_CSTR to CAbiBridgeDescriptor("char*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
         CAbiBridgeKind.OPAQUE_PTR to CAbiBridgeDescriptor("void*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
@@ -238,6 +238,11 @@ internal val C_ABI_BRIDGE_DESCRIPTORS: Map<CAbiBridgeKind, CAbiBridgeDescriptor>
         CAbiBridgeKind.CALLBACK_PTR to CAbiBridgeDescriptor("void*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
         CAbiBridgeKind.BY_VALUE_OBJECT to CAbiBridgeDescriptor("void*", "NULL", wasmJsType = "Unit", jniKotlinType = "Long", jniCType = "jlong"),
     )
+
+private val NUMERIC_KIND_TO_BRIDGE_KIND: Map<NumericKind, CAbiBridgeKind> =
+    C_ABI_BRIDGE_DESCRIPTORS.entries
+        .mapNotNull { (kind, desc) -> desc.numericKind?.let { it to kind } }
+        .toMap()
 
 internal fun bridgeDescriptorFor(kind: CAbiBridgeKind): CAbiBridgeDescriptor =
     C_ABI_BRIDGE_DESCRIPTORS.getValue(kind)
@@ -659,41 +664,41 @@ internal class FfiInteropCollector(
         val wrapperSymbol = "${cSymbolPrefixCamel}Inline${idx}${toPascalCaseIdentifierPart(basePrefix)}"
         usedWrapperSymbolNames += wrapperSymbol
 
+        fun resolveInlineBridgeTriple(
+            rustTy: SynType?,
+            explicitC: String?,
+            isParam: Boolean,
+            defaultKt: String,
+            defaultBridge: CAbiBridgeKind,
+        ): Triple<String, CAbiBridgeKind, String> {
+            val cleanC = explicitC?.trim()
+            val ktTy =
+                when {
+                    rustTy != null -> renderRustType(rustTy, isParam)
+                    cleanC != null -> inferKotlinTypeFromCType(cleanC, headerContext.rawAbiMode, activeCfgProfile)
+                    else -> defaultKt
+                }
+            val bridge =
+                when {
+                    rustTy != null -> if (isParam) classifyParamAbiBridge(rustTy, ktTy) else classifyReturnAbiBridge(rustTy, ktTy)
+                    cleanC != null -> classifyExplicitCTypeBridge(cleanC, activeCfgProfile)
+                    else -> defaultBridge
+                }
+            val finalC = cleanC?.takeIf { it.isNotEmpty() } ?: cHeaderTypeForBridge(bridge)
+            return Triple(ktTy, bridge, finalC)
+        }
+
         val paramSpecs =
             parsed.captureArgs.mapIndexed { pIdx, cap ->
                 val ktParamName = rustValueIdentToKotlin(cap.rawRustIdent).ifEmpty { "arg$pIdx" }
                 val cParamName = sanitizeCParamIdentifier(cap.rawRustIdent.removePrefix("r#").ifEmpty { "arg$pIdx" }, pIdx)
-                val explicitC = cap.explicitCType?.trim()
-                val ktType =
-                    when {
-                        cap.rustType != null -> renderRustType(cap.rustType, true)
-                        explicitC != null -> inferKotlinTypeFromCType(explicitC, headerContext.rawAbiMode, activeCfgProfile)
-                        else -> "Long"
-                    }
-                val bridge =
-                    when {
-                        cap.rustType != null -> classifyParamAbiBridge(cap.rustType, ktType)
-                        explicitC != null -> classifyExplicitCTypeBridge(explicitC, activeCfgProfile)
-                        else -> CAbiBridgeKind.I64
-                    }
-                val finalCType = explicitC?.takeIf { it.isNotEmpty() } ?: cHeaderTypeForBridge(bridge)
+                val (ktType, bridge, finalCType) =
+                    resolveInlineBridgeTriple(cap.rustType, cap.explicitCType, true, "Long", CAbiBridgeKind.I64)
                 InteropParamSpec(ktParamName, cParamName, ktType, finalCType, bridge)
             }
 
-        val ktReturnType =
-            when {
-                parsed.returnRustType != null -> renderRustType(parsed.returnRustType, false)
-                parsed.explicitCReturnType != null ->
-                    inferKotlinTypeFromCType(parsed.explicitCReturnType, headerContext.rawAbiMode, activeCfgProfile)
-                else -> "Unit"
-            }
-        val retBridge =
-            when {
-                parsed.returnRustType != null -> classifyReturnAbiBridge(parsed.returnRustType, ktReturnType)
-                parsed.explicitCReturnType != null -> classifyExplicitCTypeBridge(parsed.explicitCReturnType, activeCfgProfile)
-                else -> CAbiBridgeKind.VOID
-            }
-        val finalCRetType = parsed.explicitCReturnType?.takeIf { it.isNotEmpty() } ?: cHeaderTypeForBridge(retBridge)
+        val (ktReturnType, retBridge, finalCRetType) =
+            resolveInlineBridgeTriple(parsed.returnRustType, parsed.explicitCReturnType, false, "Unit", CAbiBridgeKind.VOID)
 
         inlineFunctions +=
             InlineCFunctionSpec(
@@ -1121,15 +1126,15 @@ internal class FfiInteropCollector(
             resolveTypeAliasTarget: (String) -> SynType?,
             stopIdents: Set<String> = emptySet(),
         ): SynType {
-            var cur = unwrapType(ty)
+            var cur = unwrapSynType(ty)
             var depth = 0
             while (depth < 8 && cur is SynType.Path && cur.qself == null) {
                 val lastSeg = cur.path.segments.last() ?: break
                 if (lastSeg.arguments !is PathArguments.None) break
-                val rawIdent = lastSeg.ident.toString().removePrefix("r#")
+                val rawIdent = lastSeg.cleanIdent()
                 if (rawIdent in stopIdents) break
                 val target = resolveTypeAliasTarget(rawIdent) ?: break
-                cur = unwrapType(target)
+                cur = unwrapSynType(target)
                 depth++
             }
             return cur
@@ -1161,43 +1166,27 @@ internal class FfiInteropCollector(
             if (unwrapped is SynType.FnPtr) return CAbiBridgeKind.CALLBACK_PTR
             if (unwrapped is SynType.Ptr) {
                 val elem = unwrapTypeAliases(unwrapped.elem, resolveTypeAliasTarget, POINTEE_STOP_IDENTS)
-                val elemPath = (elem as? SynType.Path)?.takeIf { it.qself == null }?.path
-                val elemSeg = elemPath?.segments?.last()
-                val elemIdent = elemSeg?.ident?.toString()?.removePrefix("r#")
+                val elemIdent = elem.unqualifiedPath()?.lastCleanIdent()
                 return pointeeBridgeKind(unwrapped.mutability is PointerMutability.Mut, elemIdent)
             }
             var unwrappedPathIdent: String? = null
             if (unwrapped is SynType.Path && unwrapped.qself == null) {
                 val lastSeg = unwrapped.path.segments.last()
-                val pathIdent = lastSeg?.ident?.toString()?.removePrefix("r#")
+                val pathIdent = lastSeg?.cleanIdent()
                 unwrappedPathIdent = pathIdent
                 if (pathIdent == "Option") {
-                    val args = (lastSeg.arguments as? PathArguments.AngleBracketed)?.args?.toList()
-                    val firstTypeArg = args?.mapNotNull { (it as? GenericArgument.TypeArg)?.type }?.firstOrNull()
+                    val firstTypeArg = lastSeg.arguments.firstAngleTypeArg()
                     if (firstTypeArg != null && unwrapTypeAliases(firstTypeArg, resolveTypeAliasTarget) is SynType.FnPtr) {
                         return CAbiBridgeKind.CALLBACK_PTR
                     }
                 }
                 val ptrAlias = (pathIdent?.let(resolvePointerAlias)) ?: resolvePointerAlias(renderedKotlinType)
-                if (ptrAlias != null) {
-                    return pointeeBridgeKind(ptrAlias.first, ptrAlias.second)
-                }
+                if (ptrAlias != null) return pointeeBridgeKind(ptrAlias.first, ptrAlias.second)
             }
             if (!renderedKotlinType.endsWith("?")) {
                 val numericKind = resolveNumericKind(renderedKotlinType) ?: unwrappedPathIdent?.let(resolveNumericKind)
-                when (numericKind) {
-                    NumericKind.I8 -> return CAbiBridgeKind.I8
-                    NumericKind.U8 -> return CAbiBridgeKind.U8
-                    NumericKind.I16 -> return CAbiBridgeKind.I16
-                    NumericKind.U16 -> return CAbiBridgeKind.U16
-                    NumericKind.I32 -> return CAbiBridgeKind.I32
-                    NumericKind.U32 -> return CAbiBridgeKind.U32
-                    NumericKind.I64 -> return CAbiBridgeKind.I64
-                    NumericKind.U64 -> return CAbiBridgeKind.U64
-                    NumericKind.F32 -> return CAbiBridgeKind.F32
-                    NumericKind.F64 -> return CAbiBridgeKind.F64
-                    NumericKind.I128, NumericKind.U128, NumericKind.F16, NumericKind.F128, null -> {}
-                }
+                val mappedBridge = numericKind?.let(NUMERIC_KIND_TO_BRIDGE_KIND::get)
+                if (mappedBridge != null) return mappedBridge
             }
             val widths = TargetCWidthProfile.from(cfgProfile)
             val simpleType = renderedKotlinType.substringAfterLast('.')
@@ -1273,41 +1262,17 @@ internal class FfiInteropCollector(
             cType: String,
             rawAbiMode: Boolean = false,
             cfgProfile: CfgTargetProfile = TranslationSession.cfgTargetProfile,
-        ): String =
-            when (classifyExplicitCTypeBridge(cType, cfgProfile)) {
-                CAbiBridgeKind.VOID, CAbiBridgeKind.NEVER -> "Unit"
-                CAbiBridgeKind.BOOL -> "Boolean"
-                CAbiBridgeKind.I8 -> "Byte"
-                CAbiBridgeKind.U8 -> "UByte"
-                CAbiBridgeKind.I16 -> "Short"
-                CAbiBridgeKind.U16 -> "UShort"
-                CAbiBridgeKind.I32 -> "Int"
-                CAbiBridgeKind.U32 -> "UInt"
-                CAbiBridgeKind.I64 -> "Long"
-                CAbiBridgeKind.U64 -> "ULong"
-                CAbiBridgeKind.F32 -> "Float"
-                CAbiBridgeKind.F64 -> "Double"
-                CAbiBridgeKind.CONST_CSTR -> if (rawAbiMode) "Long" else "ConstPtr"
-                CAbiBridgeKind.MUT_CSTR -> if (rawAbiMode) "Long" else "MutPtr"
-                CAbiBridgeKind.FILE_PTR,
-                CAbiBridgeKind.DIR_PTR,
-                CAbiBridgeKind.OPAQUE_PTR,
-                CAbiBridgeKind.CALLBACK_PTR,
-                CAbiBridgeKind.BY_VALUE_OBJECT,
-                ->
-                    when {
-                        rawAbiMode -> "Long"
-                        cType.replace(" ", "").startsWith("const") -> "ConstPtr"
-                        else -> "MutPtr"
-                    }
+        ): String {
+            val kind = classifyExplicitCTypeBridge(cType, cfgProfile)
+            bridgeDescriptorFor(kind).kotlinScalarType?.let { return it }
+            if (rawAbiMode) return "Long"
+            return when {
+                kind == CAbiBridgeKind.CONST_CSTR -> "ConstPtr"
+                kind == CAbiBridgeKind.MUT_CSTR -> "MutPtr"
+                cType.replace(" ", "").startsWith("const") -> "ConstPtr"
+                else -> "MutPtr"
             }
-
-        private fun unwrapType(ty: SynType): SynType =
-            when (ty) {
-                is SynType.Group -> unwrapType(ty.elem)
-                is SynType.Paren -> unwrapType(ty.elem)
-                else -> ty
-            }
+        }
 
         internal fun resolveLibcNamespace(headerContext: FileHeaderContext): String? {
             val fromCrate = headerContext.crateNamespaces["libc"]?.trim()?.removeSuffix(".")

@@ -1,19 +1,18 @@
 package io.github.kotlinmania.rustkotlin
 
+import io.github.kotlinmania.procmacro2.Ident
 import io.github.kotlinmania.procmacro2.TokenStream
-import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.Fields
 import io.github.kotlinmania.syn.FnArg
-import io.github.kotlinmania.syn.GenericArgument
 import io.github.kotlinmania.syn.GenericParam
 import io.github.kotlinmania.syn.Generics
 import io.github.kotlinmania.syn.ImplItem
 import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.Lit
+import io.github.kotlinmania.syn.LitInt
 import io.github.kotlinmania.syn.Member
-import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.ModContent
 import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
@@ -22,11 +21,51 @@ import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.TraitItem
 import io.github.kotlinmania.syn.TypeParamBound
+import io.github.kotlinmania.syn.UnOp
 import io.github.kotlinmania.syn.UseTree
+import io.github.kotlinmania.syn.WherePredicate
 import io.github.kotlinmania.syn.gen.Fold
 import io.github.kotlinmania.syn.gen.Visit
 import io.github.kotlinmania.syn.parse2
 import io.github.kotlinmania.syn.span
+import io.github.kotlinmania.syn.token.Const
+import io.github.kotlinmania.syn.token.Mut
+import io.github.kotlinmania.syn.token.Star
+
+private fun synPtrType(
+    elem: SynType,
+    isMut: Boolean,
+    star: Star = Star.default(),
+): SynType.Ptr =
+    SynType.Ptr(
+        star,
+        if (isMut) PointerMutability.Mut(Mut.default()) else PointerMutability.Const(Const.default()),
+        elem,
+    )
+
+private fun singleUnqualifiedPathIdent(type: SynType?): String? =
+    (type as? SynType.Path)
+        ?.takeIf { it.qself == null && it.path.segments.size == 1 }
+        ?.path
+        ?.lastIdentText()
+
+private val FIXED_SCALAR_CODECS: Map<String, String> =
+    mapOf(
+        "i8" to "I8",
+        "u8" to "U8",
+        "i16" to "I16",
+        "u16" to "U16",
+        "i32" to "I32",
+        "u32" to "U32",
+        "i64" to "I64",
+        "u64" to "U64",
+        "bool" to "BOOL",
+    )
+
+private val EXTENDED_SCALAR_POINTED_PRIMITIVES: Set<String> =
+    wordSet("isize usize i128 u128 f16 f32 f64 f128 char")
+
+private val ADDRESS_BACKED_SYS_ROOTS: Set<String> = wordSet("libc wasip1 windows_sys wasi")
 
 /** Keep pointer identity distinct from Kotlin's nullable pointee/value types. */
 internal fun rawPointerPointeeType(type: String?): String? {
@@ -56,29 +95,9 @@ internal fun isConstRawPointerRenderedType(type: String?): Boolean {
  * dictionary; neither a Kotlin value nor an erased cast supplies that evidence.
  */
 internal fun fixedScalarPointerCodec(pointee: SynType?): String? {
-    val path = (pointee as? SynType.Path)?.takeIf { it.qself == null }?.path ?: return null
-    // Do not recover Rust widths from rendered Kotlin types: isize and i64
-    // may both render as Long but have different layouts on a 32-bit target.
-    if (path.segments.size != 1) return null
-    val name =
-        when (
-            path.segments
-                .last()
-                ?.ident
-                .toString()
-        ) {
-            "i8" -> "I8"
-            "u8" -> "U8"
-            "i16" -> "I16"
-            "u16" -> "U16"
-            "i32" -> "I32"
-            "u32" -> "U32"
-            "i64" -> "I64"
-            "u64" -> "U64"
-            "bool" -> "BOOL"
-            else -> return null
-        }
-    return "PrimitiveLayouts.$name"
+    val ident = singleUnqualifiedPathIdent(pointee) ?: return null
+    val codec = FIXED_SCALAR_CODECS[ident] ?: return null
+    return "PrimitiveLayouts.$codec"
 }
 
 /** A mutable borrow transports an address, including for an erased generic T. */
@@ -93,25 +112,8 @@ internal fun mutableReferencePointeeType(type: String?): String? {
 }
 
 /** Explicit source alignment; single-field callers separately validate size and padding. */
-internal fun sourceStorageAlignment(item: Item.Struct): Int? {
-    for (attribute in item.attrs) {
-        val repr = attribute.meta as? Meta.List ?: continue
-        if (!repr.path.isIdent("repr")) continue
-        val tokens = repr.tokens.clone().toList()
-        for (index in 0 until tokens.size - 1) {
-            val name = tokens[index] as? TokenTree.Ident ?: continue
-            if (name.value.toString() != "align") continue
-            val group = tokens[index + 1] as? TokenTree.Group ?: return null
-            val alignment =
-                group.value
-                    .stream()
-                    .toString()
-                    .toIntOrNull() ?: return null
-            if (alignment > 0 && alignment and (alignment - 1) == 0) return alignment
-        }
-    }
-    return null
-}
+internal fun sourceStorageAlignment(item: Item.Struct): Int? =
+    StructLayoutComputer.parseStructRepr(item.attrs).explicitAlign?.toInt()
 
 /** Whether `&mut elemTy` requires an address-backed `RustMutableReference` carrier
  * rather than Kotlin's direct object/reference passing.
@@ -123,44 +125,20 @@ internal fun KotlinJ2KEmitter.shouldUseAddressBackedMutableReference(
     if (headerContext.rawAbiMode) return false
     val resolved = resolveLayoutType(elemTy, emptyMap())
     if (fixedScalarPointerCodec(resolved) != null) return true
-    val primitive =
-        (resolved as? SynType.Path)
-            ?.takeIf { it.qself == null && it.path.segments.size == 1 }
-            ?.path
-            ?.segments
-            ?.last()
-            ?.ident
-            ?.toString()
-    if (primitive in setOf("isize", "usize", "i128", "u128", "f16", "f32", "f64", "f128", "char")) return true
-    if (resolved is SynType.Ptr) return true
-    if (runtimeCellField(resolved) != null) return true
-    val firstRawSeg =
-        (resolved as? SynType.Path)
-            ?.path
-            ?.segments
-            ?.toList()
-            ?.firstOrNull()
-            ?.ident
-            ?.toString()
-            ?.removePrefix("r#")
-    if (firstRawSeg in setOf("libc", "wasip1", "windows_sys", "wasi")) return true
+    if (singleUnqualifiedPathIdent(resolved) in EXTENDED_SCALAR_POINTED_PRIMITIVES) return true
+    if (resolved is SynType.Ptr || runtimeCellField(resolved) != null) return true
+    val resolvedPath = (resolved as? SynType.Path)?.path
+    if (resolvedPath?.firstCleanIdent() in ADDRESS_BACKED_SYS_ROOTS) return true
     val rendered =
-        (resolved as? SynType.Path)
-            ?.path
-            ?.segments
-            ?.last()
-            ?.ident
-            ?.toString()
-            ?.let { if (it == "Self") selfTypeName else rustTypeIdentToKotlin(it) }
+        resolvedPath?.lastIdentText()?.let {
+            if (it == "Self") selfTypeName else rustTypeIdentToKotlin(it)
+        }
     val renderedPkg = rendered?.let { importedSimpleNameToPkg[it] }
     if (renderedPkg != null && (".libc" in renderedPkg || ".wasip1" in renderedPkg || ".windowssys" in renderedPkg)) {
         return true
     }
     val decl = transparentDeclaration(rendered)
-    if (decl != null && sourceTransparentField(decl, rendered ?: decl.ident.toString()) != null) {
-        return true
-    }
-    return false
+    return decl != null && sourceTransparentField(decl, rendered ?: decl.ident.toString()) != null
 }
 
 /** A same-file single-field representation proof. Explicit aligned wrappers
@@ -171,68 +149,32 @@ internal fun KotlinJ2KEmitter.sourceTransparentField(
     selfType: String,
 ): Pair<String, String>? {
     if (headerContext.rawAbiMode || headerContext.finalClasses) return null
-    val transparent =
-        item.attrs.any { attribute ->
-            val repr = attribute.meta as? Meta.List
-            repr != null && repr.path.isIdent("repr") &&
-                repr.tokens.clone().toList().any {
-                    it is TokenTree.Ident && it.value.toString() == "transparent"
-                }
-        }
-    val cLayout =
-        item.attrs.any { attribute ->
-            val repr = attribute.meta as? Meta.List
-            repr != null && repr.path.isIdent("repr") &&
-                repr.tokens.clone().toList().any {
-                    it is TokenTree.Ident && it.value.toString() == "C"
-                }
-        }
-    val field =
-        when (val fields = item.fields) {
-            is Fields.Named ->
-                fields.fields.named
-                    .toList()
-                    .singleOrNull()
-            is Fields.Unnamed ->
-                fields.fields.unnamed
-                    .toList()
-                    .singleOrNull()
-            is Fields.Unit -> null
-        } ?: return null
+    val repr = StructLayoutComputer.parseStructRepr(item.attrs)
+    val field = sourceSingleField(item) ?: return null
     val needsCellOrAssocWrapper =
         runtimeCellField(field.ty) != null || sourceAssociatedParameters(item.generics).isNotEmpty()
-    val hasExplicitWrapperRepr = transparent || (cLayout && sourceStorageAlignment(item) != null)
+    val hasExplicitWrapperRepr = repr.isTransparent || (repr.isReprC && repr.explicitAlign != null)
     if (!needsCellOrAssocWrapper && !(hasExplicitWrapperRepr && sameFileLayoutIndex().hasRawMemoryOrFfiUsage)) {
         return null
     }
     // Pointer-valued wrappers already preserve their address as a RustPointer
     // field. They must not allocate an unrelated pointer-sized storage object.
     if (field.ty is SynType.Ptr || field.ty is SynType.Reference) return null
-    val name =
-        field.ident?.toString()?.let(::rustFieldIdentToKotlin)
-            ?: tupleFieldPropertyName(0, 1)
+    val name = field.ident?.toString()?.let(::rustFieldIdentToKotlin) ?: tupleFieldPropertyName(0, 1)
     val associated = sourceAssociatedParameters(item.generics)
     val fieldType =
         object : Fold() {
             override fun foldType(t: SynType): SynType {
-                val projection =
-                    (t as? SynType.Path)
-                        ?.takeIf { it.qself == null }
-                        ?.path
-                        ?.segments
-                        ?.toList()
+                val projection = t.unqualifiedPath()?.segments?.toList()
                 val parameter =
                     associated.singleOrNull {
-                        projection?.size == 2 && projection.first().ident.toString() == it.owner && projection.last().ident.toString() == it.associated
+                        projection?.size == 2 &&
+                            projection.first().identText() == it.owner &&
+                            projection.last().identText() == it.associated
                     }
                 if (parameter != null) {
-                    return SynType.Path(
-                        null,
-                        Path.from(
-                            io.github.kotlinmania.procmacro2.Ident
-                                .new(parameter.associated, requireNotNull(projection).last().ident.span()),
-                        ),
-                    )
+                    val lastSpan = requireNotNull(projection).last().ident.span()
+                    return SynType.Path(null, Path.from(Ident.new(parameter.associated, lastSpan)))
                 }
                 return super.foldType(t)
             }
@@ -241,33 +183,18 @@ internal fun KotlinJ2KEmitter.sourceTransparentField(
 }
 
 private val RAW_MEMORY_AND_LAYOUT_IDENTS: Set<String> =
-    setOf(
-        "size_of",
-        "size_of_val",
-        "align_of",
-        "align_of_val",
-        "offset_of",
-        "transmute",
-        "transmute_copy",
-        "transmute_unchecked",
-        "zeroed",
-        "MaybeUninit",
-        "ManuallyDrop",
-        "UnsafeCell",
-        "SyncUnsafeCell",
-        "from_raw_parts",
-        "from_raw_parts_mut",
-        "read_unaligned",
-        "write_unaligned",
-        "read_volatile",
-        "write_volatile",
-        "addr_of",
-        "addr_of_mut",
-        "copy_nonoverlapping",
-        "NonNull",
-        "TypeLayout",
-        "PrimitiveLayouts",
+    wordSet(
+        "size_of size_of_val align_of align_of_val offset_of transmute transmute_copy transmute_unchecked",
+        "zeroed MaybeUninit ManuallyDrop UnsafeCell SyncUnsafeCell from_raw_parts from_raw_parts_mut",
+        "read_unaligned write_unaligned read_volatile write_volatile addr_of addr_of_mut",
+        "copy_nonoverlapping NonNull TypeLayout PrimitiveLayouts",
     )
+
+private val MANAGED_SLICE_BASES: Set<String> =
+    wordSet("List MutableList ArrayList String CharSequence LinearSliceView LinearMutSliceView ByteSlice MutByteSlice")
+
+private val VIEW_OFFSET_SLICE_BASES: Set<String> =
+    wordSet("LinearSliceView LinearMutSliceView ByteSlice MutByteSlice")
 
 private fun KotlinJ2KEmitter.extractManagedSliceAsPtrTarget(
     expr: Expr,
@@ -275,50 +202,28 @@ private fun KotlinJ2KEmitter.extractManagedSliceAsPtrTarget(
 ): Pair<Expr, String>? {
     var cur = unwrapParenOrGroupExpr(expr)
     if (cur is Expr.Cast) {
-        val targetTy = unwrapSynType(cur.ty)
-        val seg =
-            (targetTy as? SynType.Path)
-                ?.takeIf { it.qself == null }
-                ?.path
-                ?.segments
-                ?.toList()
-                ?.singleOrNull()
-        val rawCast = seg?.ident?.toString()?.removePrefix("r#")
-        if (rawCast !in setOf("usize", "isize")) return null
+        val rawCast = singleUnqualifiedPathIdent(unwrapSynType(cur.ty))?.removePrefix("r#")
+        if (rawCast != "usize" && rawCast != "isize") return null
         cur = unwrapParenOrGroupExpr(cur.expr)
     } else if (cur is Expr.MethodCall &&
-        cur.method.toString().removePrefix("r#") == "addr" &&
+        cur.method.cleanIdent() == "addr" &&
         cur.args.isEmpty() &&
         cur.turbofish == null
     ) {
         cur = unwrapParenOrGroupExpr(cur.receiver)
     }
     val mc = cur as? Expr.MethodCall ?: return null
-    if (mc.method.toString().removePrefix("r#") !in setOf("as_ptr", "as_mut_ptr") ||
-        !mc.args.isEmpty() ||
-        mc.turbofish != null
-    ) {
+    val mcMethod = mc.method.cleanIdent()
+    if ((mcMethod != "as_ptr" && mcMethod != "as_mut_ptr") || !mc.args.isEmpty() || mc.turbofish != null) {
         return null
     }
     val recvTy = inferExprRenderedType(mc.receiver, selfTypeName)?.removeSuffix("?")?.trim() ?: return null
-    val rawBase = recvTy.substringBefore('<').substringAfterLast('.').trim()
+    val rawBase = recvTy.simpleKotlinTypeName()
     val isManagedSlice =
-        rawBase in
-            setOf(
-                "List",
-                "MutableList",
-                "ArrayList",
-                "String",
-                "CharSequence",
-                "LinearSliceView",
-                "LinearMutSliceView",
-                "ByteSlice",
-                "MutByteSlice",
-            ) ||
+        rawBase in MANAGED_SLICE_BASES ||
             isPrimitiveArrayRenderedType(recvTy) ||
             (rawBase.endsWith("Slice") && rawBase != "Slice")
-    if (!isManagedSlice) return null
-    return mc.receiver to rawBase
+    return if (isManagedSlice) mc.receiver to rawBase else null
 }
 
 internal fun KotlinJ2KEmitter.tryRenderManagedSlicePointerDistance(
@@ -332,25 +237,17 @@ internal fun KotlinJ2KEmitter.tryRenderManagedSlicePointerDistance(
     val (baseSliceExpr, baseBase) = extractManagedSliceAsPtrTarget(basePtrExpr, selfTypeName) ?: return null
     val subRendered = renderExpr(subSliceExpr, indent, selfTypeName)
     val baseRendered = renderExpr(baseSliceExpr, indent, selfTypeName)
-    val isViewOffsetType =
-        subBase in setOf("LinearSliceView", "LinearMutSliceView", "ByteSlice", "MutByteSlice") ||
-            (subBase.endsWith("Slice") && subBase != "Slice")
+    val isViewOffsetType = subBase in VIEW_OFFSET_SLICE_BASES || (subBase.endsWith("Slice") && subBase != "Slice")
     val diffExpr =
         when {
-            isViewOffsetType && baseBase == subBase ->
-                "(($subRendered).offset - ($baseRendered).offset)"
-            subBase in setOf("String", "CharSequence") ->
-                "(($baseRendered).length - ($subRendered).length)"
-            else ->
-                "(($baseRendered).size - ($subRendered).size)"
+            isViewOffsetType && baseBase == subBase -> "(($subRendered).offset - ($baseRendered).offset)"
+            subBase == "String" || subBase == "CharSequence" -> "(($baseRendered).length - ($subRendered).length)"
+            else -> "(($baseRendered).size - ($subRendered).size)"
         }
     return when (mode) {
-        "sub", "wrapping_sub", "unchecked_sub", "offset_from", "offset_from_unsigned", "sub_ptr", "byte_offset_from" ->
-            diffExpr
-        "saturating_sub" ->
-            "($diffExpr).coerceAtLeast(0)"
-        "checked_sub" ->
-            "run { val kmSliceDiff = $diffExpr; if (kmSliceDiff >= 0) kmSliceDiff else null }"
+        "sub", "wrapping_sub", "unchecked_sub", "offset_from", "offset_from_unsigned", "sub_ptr", "byte_offset_from" -> diffExpr
+        "saturating_sub" -> "($diffExpr).coerceAtLeast(0)"
+        "checked_sub" -> "run { val kmSliceDiff = $diffExpr; if (kmSliceDiff >= 0) kmSliceDiff else null }"
         else -> null
     }
 }
@@ -529,31 +426,33 @@ internal fun KotlinJ2KEmitter.transparentDeclaration(owner: String?): Item.Struc
     return idx.structsByKtName[name]?.singleOrNull()
 }
 
+private val UNSAFE_CELL_PREFIXES: List<List<String>> =
+    listOf(listOf("crate", "cell"), listOf("core", "cell"), listOf("std", "cell"))
+
 private fun KotlinJ2KEmitter.runtimeCellField(type: SynType): SynType? {
     val path = (type as? SynType.Path)?.takeIf { it.qself == null }?.path ?: return null
     val segments = path.segments.toList()
-    val owner = segments.lastOrNull()?.ident?.toString() ?: return null
+    val owner = segments.lastOrNull()?.identText() ?: return null
     if (transparentDeclaration(owner) != null) return null
+
     fun imported(tree: UseTree, prefix: List<String>): Boolean =
         when (tree) {
             is UseTree.Path -> tree.tree?.let { imported(it, prefix + tree.ident.toString()) } ?: false
             is UseTree.Group -> tree.items.toList().any { imported(it, prefix) }
             is UseTree.Name ->
-                prefix in listOf(listOf("crate", "cell"), listOf("core", "cell"), listOf("std", "cell")) &&
-                    tree.ident.toString() == "UnsafeCell" && (tree.rename?.ident?.toString() ?: tree.ident.toString()) == owner
+                prefix in UNSAFE_CELL_PREFIXES &&
+                    tree.ident.toString() == "UnsafeCell" &&
+                    (tree.rename?.ident?.toString() ?: tree.ident.toString()) == owner
             is UseTree.Glob -> false
         }
-    val qualified = segments.dropLast(1).map { it.ident.toString() }
+
+    val qualified = segments.dropLast(1).map { it.identText() }
     val supported =
-        (owner == "UnsafeCell" && qualified in listOf(listOf("crate", "cell"), listOf("core", "cell"), listOf("std", "cell"))) ||
+        (owner == "UnsafeCell" && qualified in UNSAFE_CELL_PREFIXES) ||
             (segments.size == 1 && sameFileLayoutIndex().useItems.any { imported(it.tree, emptyList()) })
     if (!supported) return null
-    return (segments.last().arguments as? PathArguments.AngleBracketed)
-        ?.args
-        ?.toList()
-        ?.filterIsInstance<GenericArgument.TypeArg>()
-        ?.singleOrNull()
-        ?.type
+    val typeArgs = segments.last().arguments.angleTypeArgs()
+    return typeArgs.singleOrNull()
 }
 
 /** Receiverless functions which construct a transparent wrapper need layout
@@ -573,49 +472,45 @@ internal fun KotlinJ2KEmitter.transparentConstructorField(
     val visitor =
         object : Visit() {
             override fun visitExprStruct(e: Expr.Struct) {
-                if (e.path.segments
-                        .last()
-                        ?.ident
-                        .toString() in setOf("Self", owner)
-                ) {
-                    constructs = true
-                }
+                val lastIdent = e.path.lastIdentText()
+                if (lastIdent == "Self" || lastIdent == owner) constructs = true
                 super.visitExprStruct(e)
             }
+
             override fun visitExprCall(e: Expr.Call) {
-                val path = e.func as? Expr.Path
-                val segments =
-                    path
-                        ?.path
-                        ?.segments
-                        ?.toList()
-                        .orEmpty()
-                if (segments.lastOrNull()?.ident.toString() in setOf("Self", owner)) constructs = true
-                if (segments.size == 2 && segments.first().ident.toString() in setOf("Self", owner)) {
-                    val method = segments.last().ident.toString()
+                val fnPath = (e.func as? Expr.Path)?.path
+                val segments = fnPath?.segments?.toList().orEmpty()
+                val lastIdent = segments.lastOrNull()?.identText()
+                if (lastIdent == "Self" || lastIdent == owner) constructs = true
+                if (segments.size == 2 && (segments.first().identText() == "Self" || segments.first().identText() == owner)) {
+                    val method = segments.last().identText()
                     val called =
-                        sameFileLayoutIndex().implsBySelfIdent[owner].orEmpty().flatMap { it.items.filterIsInstance<ImplItem.Fn>() }.filter {
-                            it.sig.ident.toString() == method && it.sig.inputs.firstOrNull() !is FnArg.Receiver
-                        }
-                    if (called.any { transparentConstructorField(selfType, it.block, visiting.toMutableSet()) != null }) constructs = true
+                        sameFileLayoutIndex()
+                            .implsBySelfIdent[owner]
+                            .orEmpty()
+                            .flatMap { it.items.filterIsInstance<ImplItem.Fn>() }
+                            .filter { it.sig.ident.toString() == method && it.sig.inputs.firstOrNull() !is FnArg.Receiver }
+                    if (called.any { transparentConstructorField(selfType, it.block, visiting.toMutableSet()) != null }) {
+                        constructs = true
+                    }
                 }
                 super.visitExprCall(e)
             }
         }
     visitor.visitBlock(block)
-    return field.first.let { name -> name to transparentFactoryLayoutType(declaration, selfType) }.takeIf { constructs }
+    return if (constructs) field.first to transparentFactoryLayoutType(declaration, selfType) else null
 }
 
 private fun sourceSingleField(item: Item.Struct) =
     when (val fields = item.fields) {
-        is Fields.Named ->
-            fields.fields.named
-                .toList()
-                .singleOrNull()
-        is Fields.Unnamed ->
-            fields.fields.unnamed
-                .toList()
-                .singleOrNull()
+        is Fields.Named -> {
+            val named = fields.fields.named.toList()
+            named.singleOrNull()
+        }
+        is Fields.Unnamed -> {
+            val unnamed = fields.fields.unnamed.toList()
+            unnamed.singleOrNull()
+        }
         is Fields.Unit -> null
     }
 
@@ -629,51 +524,35 @@ internal fun KotlinJ2KEmitter.sourceAssociatedParameters(
     generics: Generics,
     ownerTypeSimpleName: String? = null,
 ): List<SourceAssociatedParameter> {
-    val declaredTypeParams =
-        generics.params
-            .toList()
-            .filterIsInstance<GenericParam.TypeParam>()
-            .map { it.ident.toString() }
+    val typeParams = generics.params.toList().filterIsInstance<GenericParam.TypeParam>()
+    val declaredTypeParams = typeParams.map { it.ident.toString() }
     val declaredTypeParamSet = declaredTypeParams.toSet()
     val boundsByParam = linkedMapOf<String, MutableList<TypeParamBound>>()
-    for (parameter in generics.params.toList().filterIsInstance<GenericParam.TypeParam>()) {
-        boundsByParam
-            .getOrPut(parameter.ident.toString()) { mutableListOf() }
-            .addAll(parameter.bounds.toList())
+    for (parameter in typeParams) {
+        val list = boundsByParam.getOrPut(parameter.ident.toString()) { mutableListOf() }
+        list.addAll(parameter.bounds.toList())
     }
-    for (pred in generics.whereClause
-        ?.predicates
-        ?.toList()
-        .orEmpty()) {
-        val tp = pred as? io.github.kotlinmania.syn.WherePredicate.TypePredicate ?: continue
-        val unwrapped = unwrapSynType(tp.boundedTy) as? SynType.Path ?: continue
-        if (unwrapped.qself != null || unwrapped.path.segments.size != 1) continue
-        val paramIdent =
-            unwrapped.path.segments
-                .first()
-                ?.ident
-                ?.toString() ?: continue
-        if (paramIdent !in declaredTypeParamSet) continue
-        boundsByParam.getOrPut(paramIdent) { mutableListOf() }.addAll(tp.bounds.toList())
+    val whereClause = generics.whereClause
+    val wherePreds = whereClause?.predicates?.toList().orEmpty()
+    for (pred in wherePreds) {
+        val tp = pred as? WherePredicate.TypePredicate ?: continue
+        val paramIdent = singleUnqualifiedPathIdent(unwrapSynType(tp.boundedTy)) ?: continue
+        if (paramIdent in declaredTypeParamSet) {
+            val list = boundsByParam.getOrPut(paramIdent) { mutableListOf() }
+            list.addAll(tp.bounds.toList())
+        }
     }
+    val ownerSimple = ownerTypeSimpleName ?: currentBoundedTypeName?.substringBefore('<')?.trim()
     return declaredTypeParams
         .flatMap { rawParamIdent ->
             boundsByParam[rawParamIdent]
                 .orEmpty()
                 .filterIsInstance<TypeParamBound.Trait>()
                 .filter { bound ->
-                    val bIdent =
-                        bound.path.segments
-                            .last()
-                            ?.ident
-                            ?.toString()
+                    val bIdent = bound.path.lastIdentText()
                     bIdent != "SimdElement" && bIdent != "MaskElement"
                 }.flatMap { bound ->
-                    val trait =
-                        bound.path.segments
-                            .last()
-                            ?.ident
-                            .toString()
+                    val trait = bound.path.lastIdentText().orEmpty()
                     val sameFileAssocs =
                         sameFileLayoutIndex()
                             .traitsByIdent[trait]
@@ -681,25 +560,16 @@ internal fun KotlinJ2KEmitter.sourceAssociatedParameters(
                             ?.items
                             ?.filterIsInstance<TraitItem.AssocType>()
                             .orEmpty()
-                            .filter { it.default == null }
-                            .map { rustTypeIdentToKotlin(it.ident.toString()) }
-                    val assocNames =
-                        sameFileAssocs.ifEmpty {
-                            lookupTraitDefaultlessAssocTypes(rustTypeIdentToKotlin(trait), bound.path)
-                        }
-                    val ownerSimple = ownerTypeSimpleName ?: currentBoundedTypeName?.substringBefore('<')?.trim()
-                    assocNames
-                        .filter { assocKt -> assocKt != ownerSimple }
-                        .map { assocKt ->
-                            SourceAssociatedParameter(rawParamIdent, trait, assocKt)
-                        }
+                            .mapNotNull { if (it.default == null) rustTypeIdentToKotlin(it.ident.toString()) else null }
+                    val assocNames = sameFileAssocs.ifEmpty { lookupTraitDefaultlessAssocTypes(rustTypeIdentToKotlin(trait), bound.path) }
+                    assocNames.mapNotNull { if (it != ownerSimple) SourceAssociatedParameter(rawParamIdent, trait, it) else null }
                 }
         }.distinct()
 }
 
-internal fun KotlinJ2KEmitter.sourceAssociatedArguments(path: io.github.kotlinmania.syn.Path, selfType: String?): List<String> {
+internal fun KotlinJ2KEmitter.sourceAssociatedArguments(path: Path, selfType: String?): List<String> {
     val segment = path.segments.last() ?: return emptyList()
-    val rawIdent = segment.ident.toString().removePrefix("r#")
+    val rawIdent = segment.cleanIdent()
     val declaration = transparentDeclaration(rawIdent)
     val enumDecl =
         if (declaration == null) {
@@ -711,29 +581,12 @@ internal fun KotlinJ2KEmitter.sourceAssociatedArguments(path: io.github.kotlinma
         }
     val declGenerics = declaration?.generics ?: enumDecl?.generics
     if (declGenerics == null) {
-        val rawFirstArgSyn =
-            (segment.arguments as? PathArguments.AngleBracketed)
-                ?.args
-                ?.toList()
-                ?.filterIsInstance<GenericArgument.TypeArg>()
-                ?.firstOrNull()
-                ?.type
+        val rawFirstArgSyn = segment.arguments.firstAngleTypeArg()
         val renderedFirst = rawFirstArgSyn?.let { renderType(it, selfType) }
         return resolveStdlibAssociatedArgs(rustTypeIdentToKotlin(rawIdent), rawFirstArgSyn, renderedFirst)
     }
-    val parameters =
-        declGenerics.params
-            .toList()
-            .filterIsInstance<GenericParam.TypeParam>()
-            .map { it.ident.toString() }
-    val arguments =
-        (segment.arguments as? PathArguments.AngleBracketed)
-            ?.args
-            ?.toList()
-            .orEmpty()
-            .filterIsInstance<GenericArgument.TypeArg>()
-            .map { it.type }
-    val substitutions = parameters.zip(arguments).toMap()
+    val parameters = declGenerics.typeParamIdentNames()
+    val substitutions = parameters.zip(segment.arguments.angleTypeArgs()).toMap()
     return sourceAssociatedParameters(declGenerics).map { parameter ->
         val actual = substitutions[parameter.owner]
         val binding = actual?.let { sourceAssociatedBinding(it, parameter.associated, parameter.trait) }
@@ -741,15 +594,7 @@ internal fun KotlinJ2KEmitter.sourceAssociatedArguments(path: io.github.kotlinma
             binding != null -> renderType(binding, selfType)
             parameter.trait == "ToOwned" && parameter.associated == "Owned" && actual != null -> {
                 val unwrappedActual = unwrapSynType(actual)
-                val pathIdent =
-                    (unwrappedActual as? SynType.Path)
-                        ?.takeIf { it.qself == null && it.path.segments.len() == 1 }
-                        ?.path
-                        ?.segments
-                        ?.last()
-                        ?.ident
-                        ?.toString()
-                        ?.removePrefix("r#")
+                val pathIdent = singleUnqualifiedPathIdent(unwrappedActual)?.removePrefix("r#")
                 when {
                     pathIdent == "str" -> "String"
                     unwrappedActual is SynType.Slice -> "MutableList<${renderType(unwrappedActual.elem, selfType)}>"
@@ -766,16 +611,9 @@ internal fun KotlinJ2KEmitter.sourceAssociatedArguments(path: io.github.kotlinma
 internal fun substituteSourceType(type: SynType, substitutions: Map<String, SynType>): SynType =
     object : Fold() {
         override fun foldType(t: SynType): SynType {
-            val path = (t as? SynType.Path)?.takeIf { it.qself == null }?.path
-            if (path != null && path.segments.size == 1) {
-                val name =
-                    path.segments
-                        .last()
-                        ?.ident
-                        .toString()
-                substitutions[name]?.let { replacement ->
-                    return replacement.deepCopy()
-                }
+            val singleName = singleUnqualifiedPathIdent(t)
+            if (singleName != null) {
+                substitutions[singleName]?.let { return it.deepCopy() }
             }
             return super.foldType(t)
         }
@@ -787,47 +625,24 @@ internal fun KotlinJ2KEmitter.sourceAssociatedBinding(
     trait: String? = null,
 ): SynType? {
     fun match(pattern: SynType, actual: SynType, parameters: Set<String>, bindings: MutableMap<String, SynType>): Boolean {
-        val p = pattern as? SynType.Path
-        val a = actual as? SynType.Path
-        if (p != null && p.qself == null && p.path.segments.size == 1) {
-            val name =
-                p.path.segments
-                    .last()
-                    ?.ident
-                    .toString()
-            if (name in parameters) {
-                val previous = bindings[name]
-                if (previous != null) return previous.toTokenStream().toString() == actual.toTokenStream().toString()
-                bindings[name] = actual
-                return true
-            }
+        val singlePatName = singleUnqualifiedPathIdent(pattern)
+        if (singlePatName != null && singlePatName in parameters) {
+            val previous = bindings[singlePatName]
+            if (previous != null) return previous.toTokenStream().toString() == actual.toTokenStream().toString()
+            bindings[singlePatName] = actual
+            return true
         }
         if (pattern is SynType.Ptr && actual is SynType.Ptr) {
-            return pattern.mutability.toTokenStream().toString() == actual.mutability.toTokenStream().toString() && match(pattern.elem, actual.elem, parameters, bindings)
+            return pattern.mutability.toTokenStream().toString() == actual.mutability.toTokenStream().toString() &&
+                match(pattern.elem, actual.elem, parameters, bindings)
         }
+        val p = pattern as? SynType.Path
+        val a = actual as? SynType.Path
         if (p != null && a != null && p.qself == null && a.qself == null) {
-            if (p.path.segments
-                    .toList()
-                    .map { it.ident.toString() } !=
-                a.path.segments
-                    .toList()
-                    .map { it.ident.toString() }
-            ) {
-                return false
-            }
-            val pa =
-                (
-                    p.path.segments
-                        .last()
-                        ?.arguments as? PathArguments.AngleBracketed
-                )?.args?.toList().orEmpty().filterIsInstance<GenericArgument.TypeArg>()
-            val aa =
-                (
-                    a.path.segments
-                        .last()
-                        ?.arguments as? PathArguments.AngleBracketed
-                )?.args?.toList().orEmpty().filterIsInstance<GenericArgument.TypeArg>()
-            return pa.size == aa.size && pa.zip(aa).all { (left, right) -> match(left.type, right.type, parameters, bindings) }
+            if (p.path.identStrings() != a.path.identStrings()) return false
+            val pa = p.path.lastAngleTypeArgs()
+            val aa = a.path.lastAngleTypeArgs()
+            return pa.size == aa.size && pa.zip(aa).all { (l, r) -> match(l, r, parameters, bindings) }
         }
         return pattern.toTokenStream().toString() == actual.toTokenStream().toString()
     }
@@ -835,26 +650,14 @@ internal fun KotlinJ2KEmitter.sourceAssociatedBinding(
         sameFileLayoutIndex()
             .traitImpls
             .mapNotNull { implementation ->
-                if (trait != null && implementation.traitPath
-                        ?.path
-                        ?.segments
-                        ?.last()
-                        ?.ident
-                        ?.toString() != trait
-                ) {
-                    return@mapNotNull null
-                }
+                if (trait != null && implementation.traitPath?.path?.lastIdentText() != trait) return@mapNotNull null
                 val binding =
-                    implementation.items.filterIsInstance<ImplItem.AssocType>().singleOrNull {
-                        it.ident.toString() == associated
-                    } ?: return@mapNotNull null
+                    implementation.items
+                        .filterIsInstance<ImplItem.AssocType>()
+                        .singleOrNull { it.ident.toString() == associated }
+                        ?: return@mapNotNull null
                 val substitutions = linkedMapOf<String, SynType>()
-                val parameters =
-                    implementation.generics.params
-                        .toList()
-                        .filterIsInstance<GenericParam.TypeParam>()
-                        .map { it.ident.toString() }
-                        .toSet()
+                val parameters = implementation.generics.typeParamIdentNames().toSet()
                 if (!match(implementation.selfType, owner, parameters, substitutions)) return@mapNotNull null
                 substituteSourceType(binding.ty, substitutions)
             }.distinctBy { it.toTokenStream().toString() }
@@ -866,68 +669,42 @@ internal fun KotlinJ2KEmitter.resolveLayoutType(
     substitutions: Map<String, SynType>,
     visiting: Set<String> = emptySet(),
 ): SynType {
+    fun resolveProjectionBinding(firstIdent: String, assocIdent: String): SynType? {
+        val owner = substitutions[firstIdent] ?: return null
+        return sourceAssociatedBinding(substituteSourceType(owner, substitutions - firstIdent), assocIdent)
+    }
+
     val substituted =
         object : Fold() {
             override fun foldType(t: SynType): SynType {
-                val projection =
-                    (t as? SynType.Path)
-                        ?.takeIf { it.qself == null }
-                        ?.path
-                        ?.segments
-                        ?.toList()
+                val projection = t.unqualifiedPath()?.segments?.toList()
                 if (projection?.size == 2) {
-                    val owner = substitutions[projection.first().ident.toString()]
-                    if (owner != null) {
-                        sourceAssociatedBinding(substituteSourceType(owner, substitutions - projection.first().ident.toString()), projection.last().ident.toString())?.let {
-                            return super.foldType(it)
-                        }
+                    resolveProjectionBinding(projection.first().identText(), projection.last().identText())?.let {
+                        return super.foldType(it)
                     }
                 }
                 return super.foldType(t)
             }
         }.foldType(substituteSourceType(type, substitutions))
-    val path = (substituted as? SynType.Path)?.takeIf { it.qself == null }?.path ?: return substituted
+    val path = substituted.unqualifiedPath() ?: return substituted
     val key = substituted.toTokenStream().toString()
     if (key in visiting) return substituted
     val segments = path.segments.toList()
     if (segments.size == 2) {
-        val owner = substitutions[segments.first().ident.toString()]
-        if (owner != null) {
-            sourceAssociatedBinding(substituteSourceType(owner, substitutions - segments.first().ident.toString()), segments.last().ident.toString())?.let {
-                return resolveLayoutType(it, substitutions, visiting + key)
-            }
+        resolveProjectionBinding(segments.first().identText(), segments.last().identText())?.let {
+            return resolveLayoutType(it, substitutions, visiting + key)
         }
     }
-    val alias =
-        sameFileLayoutIndex().typeAliasesByIdent[segments.last().ident.toString()]?.singleOrNull()
-            ?: return substituted
-    val arguments =
-        (segments.last().arguments as? PathArguments.AngleBracketed)
-            ?.args
-            ?.toList()
-            .orEmpty()
-            .filterIsInstance<GenericArgument.TypeArg>()
-            .map { it.type }
-    val parameters =
-        alias.generics.params
-            .toList()
-            .filterIsInstance<GenericParam.TypeParam>()
-            .map { it.ident.toString() }
-    return resolveLayoutType(alias.ty, substitutions + parameters.zip(arguments), visiting + key)
+    val alias = sameFileLayoutIndex().typeAliasesByIdent[segments.last().identText()]?.singleOrNull() ?: return substituted
+    val parameters = alias.generics.typeParamIdentNames()
+    return resolveLayoutType(alias.ty, substitutions + parameters.zip(segments.last().arguments.angleTypeArgs()), visiting + key)
 }
 
 internal fun KotlinJ2KEmitter.sourceStorageAlias(item: Item.ItemType): Item.Struct? {
-    val path = (item.ty as? SynType.Path)?.takeIf { it.qself == null }?.path ?: return null
-    val declaration =
-        transparentDeclaration(
-            path.segments
-                .last()
-                ?.ident
-                .toString(),
-        ) ?: return null
+    val path = item.ty.unqualifiedPath() ?: return null
+    val declaration = transparentDeclaration(path.lastIdentText()) ?: return null
     if (sourceAssociatedParameters(declaration.generics).isEmpty()) return null
-    if (sourceTransparentField(declaration, declaration.ident.toString()) == null) return null
-    return declaration
+    return declaration.takeIf { sourceTransparentField(declaration, declaration.ident.toString()) != null }
 }
 
 internal fun KotlinJ2KEmitter.sourceStorageAliasField(item: Item.ItemType, declaration: Item.Struct): SynType {
@@ -935,49 +712,19 @@ internal fun KotlinJ2KEmitter.sourceStorageAliasField(item: Item.ItemType, decla
     return resolveLayoutType(requireNotNull(sourceSingleField(declaration)).ty, substitutions)
 }
 
-private fun KotlinJ2KEmitter.layoutSubstitutions(type: SynType, declaration: Item.Struct, substitutions: Map<String, SynType>): Map<String, SynType> {
+private fun KotlinJ2KEmitter.layoutSubstitutions(
+    type: SynType,
+    declaration: Item.Struct,
+    substitutions: Map<String, SynType>,
+): Map<String, SynType> {
     val path = (type as? SynType.Path)?.path ?: return substitutions
-    val args =
-        (path.segments.last()?.arguments as? PathArguments.AngleBracketed)
-            ?.args
-            ?.toList()
-            .orEmpty()
-            .mapNotNull { (it as? GenericArgument.TypeArg)?.type?.let { t -> resolveLayoutType(t, substitutions) } }
-    val params =
-        declaration.generics.params
-            .toList()
-            .filterIsInstance<GenericParam.TypeParam>()
-            .map { it.ident.toString() }
+    val args = path.lastAngleTypeArgs().map { resolveLayoutType(it, substitutions) }
+    val params = declaration.generics.typeParamIdentNames()
     return params.zip(args).toMap()
 }
 
 private fun KotlinJ2KEmitter.layoutRenderedType(type: SynType, selfType: String?, substitutions: Map<String, SynType>): String =
     renderType(resolveLayoutType(type, substitutions), selfType)
-
-private fun KotlinJ2KEmitter.receiverPointerLayout(type: String, selfType: String?): String? {
-    if (selfType == null || currentTypedLocals["this"] != selfType) return null
-    val alias = sameFileLayoutIndex().typeAliasesByKtName[selfType.substringBefore('<').substringAfterLast('.')]?.singleOrNull()
-    val declaration = transparentDeclaration(selfType) ?: alias?.let { sourceStorageAlias(it) } ?: return null
-    var fieldName = sourceTransparentField(declaration, selfType)?.first ?: return null
-    var fieldType = if (alias != null) sourceStorageAliasField(alias, declaration) else sourceSingleField(declaration)?.ty ?: return null
-    var owner = "this"
-    val visited = linkedSetOf<String>()
-    while (visited.add(fieldType.toTokenStream().toString())) {
-        val rendered = renderType(fieldType, selfType)
-        if (rendered == type) return "$owner.fieldLayout"
-        owner += ".$fieldName"
-        val runtimeField = runtimeCellField(fieldType)
-        if (runtimeField != null) {
-            fieldName = "value"
-            fieldType = runtimeField
-            continue
-        }
-        val nested = transparentDeclaration(rendered) ?: return null
-        fieldName = sourceTransparentField(nested, rendered)?.first ?: return null
-        fieldType = resolveLayoutType(sourceSingleField(nested)?.ty ?: return null, layoutSubstitutions(fieldType, nested, emptyMap()))
-    }
-    return null
-}
 
 internal fun KotlinJ2KEmitter.sourcePointerLayout(
     type: SynType,
@@ -985,748 +732,552 @@ internal fun KotlinJ2KEmitter.sourcePointerLayout(
     available: Map<String, String> = emptyMap(),
     substitutions: Map<String, SynType> = emptyMap(),
     visiting: Set<String> = emptySet(),
-): String? {
-    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    val memPkg = "$coreNs.mem"
-    val layoutIdx = sameFileLayoutIndex()
-    val sourcePath = (type as? SynType.Path)?.takeIf { it.qself == null }?.path
-    val sourceType =
-        if (sourcePath?.isIdent("Self") == true) {
-            currentStandaloneImplSelfSynType ?: selfType
-                ?.substringBefore('<')
-                ?.substringAfterLast('.')
-                ?.let {
-                    layoutIdx.typeAliasesByKtName[it]?.singleOrNull()
-                }?.let {
-                    SynType.Path(
-                        null,
-                        io.github.kotlinmania.syn.Path
-                            .from(it.ident),
-                    )
-                } ?: type
-        } else {
-            type
-        }
-    val original = substituteSourceType(sourceType, substitutions)
-    val aliasPath = original as? SynType.Path
-    val aliasName =
-        aliasPath
-            ?.path
-            ?.segments
-            ?.last()
-            ?.ident
-            ?.toString()
-    val alias = aliasName?.let { layoutIdx.typeAliasesByIdent[it]?.singleOrNull() }
-    if (alias != null) {
-        val declaration = sourceStorageAlias(alias)
-        if (declaration != null) {
-            val aliasRendered = renderType(original, selfType)
-            if (aliasRendered in visiting) return null
-            val fieldType = sourceStorageAliasField(alias, declaration)
-            val aliasArguments =
-                (
-                    aliasPath.path.segments
-                        .last()
-                        ?.arguments as? PathArguments.AngleBracketed
-                )?.args?.toList().orEmpty().filterIsInstance<GenericArgument.TypeArg>().map { it.type }
-            val aliasParameters =
-                alias.generics.params
-                    .toList()
-                    .filterIsInstance<GenericParam.TypeParam>()
-                    .map { it.ident.toString() }
-            val fieldLayout = sourcePointerLayout(fieldType, selfType, available, substitutions + aliasParameters.zip(aliasArguments), visiting + aliasRendered) ?: return null
-            val fieldName = requireNotNull(sourceTransparentField(declaration, declaration.ident.toString())).first
-            CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.TransparentTypeLayout")
-            return "TransparentTypeLayout($fieldLayout, { ptr, layout -> $aliasRendered(ptr, layout) }, { it.$fieldName })"
-        }
-    }
-    val resolved = resolveLayoutType(sourceType, substitutions)
-    val rendered = renderType(resolved, selfType)
-    available[rendered]?.let { return it }
-    if (resolved is SynType.Tuple && resolved.elems.isEmpty()) {
-        CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
-        return "PrimitiveLayouts.UNIT"
-    }
-    if (resolved is SynType.Array) {
-        val elemRendered = renderType(resolved.elem, selfType)
-        val length = renderExpr(resolved.len, "", selfType)
-        val primFactory = primitiveArrayLayoutFactory(resolved.elem, elemRendered, activeCfgProfile.pointerWidth.toLong())
-        if (primFactory != null) {
-            CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveArrayLayouts")
-            return "PrimitiveArrayLayouts.$primFactory(($length).toInt())"
-        }
-        val elementLayout = sourcePointerLayout(resolved.elem, selfType, available, substitutions, visiting + rendered) ?: return null
-        CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.fixedListTypeLayout")
-        return "fixedListTypeLayout($elementLayout, ($length).toInt())"
-    }
-    if (resolved is SynType.Slice) {
-        val elementLayout = sourcePointerLayout(resolved.elem, selfType, available, substitutions, visiting + rendered) ?: return null
-        val sourceLayout = available.values.singleOrNull() ?: return null
-        CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.fixedListTypeLayout")
-        return "fixedListTypeLayout($elementLayout, (($sourceLayout).sizeBytes / ($elementLayout).strideBytes).toInt())"
-    }
-    val expectedLayoutTypes = setOf("TypeLayout<$rendered>", "$memPkg.TypeLayout<$rendered>")
-    if (currentTypedLocals["fieldLayout"] in expectedLayoutTypes) return "fieldLayout"
-    // A typed dictionary is explicit layout evidence even when it came from a
-    // generic call contract rather than a transparent field constructor. Do not
-    // select an arbitrary dictionary if the scope contains competing evidence.
-    currentTypedLocals
-        .filterValues { it in expectedLayoutTypes }
-        .keys
-        .singleOrNull()
-        ?.let { return it }
-    fixedScalarPointerCodec(resolved)?.let {
-        CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
-        return it
-    }
-    val primitive =
-        (resolved as? SynType.Path)
-            ?.takeIf { it.qself == null && it.path.segments.size == 1 }
-            ?.path
-            ?.segments
-            ?.last()
-            ?.ident
-            ?.toString()
-    when (primitive) {
-        "f16", "F16" -> {
-            CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
-            return "PrimitiveLayouts.F16_LAYOUT"
-        }
-        "f32" -> {
-            CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
-            return "PrimitiveLayouts.F32"
-        }
-        "f64" -> {
-            CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
-            return "PrimitiveLayouts.F64"
-        }
-        "f128", "F128" -> {
-            CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
-            return "PrimitiveLayouts.F128_LAYOUT"
-        }
-        "char" -> {
-            CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
-            return "PrimitiveLayouts.CHAR"
-        }
-        "isize", "usize" -> {
-            CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
-            val width = activeCfgProfile.pointerWidth
-            val constName =
-                if (headerContext.rawAbiMode) {
-                    "${if (primitive == "isize") "I" else "U"}$width"
-                } else {
-                    "${if (primitive == "isize") "ISIZE" else "USIZE"}$width"
-                }
-            return "PrimitiveLayouts.$constName"
-        }
-        "i128" -> {
-            CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
-            return "PrimitiveLayouts.i128Layout(::I128, { it.high }, { it.low })"
-        }
-        "u128" -> {
-            CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
-            return "PrimitiveLayouts.u128Layout(::U128, { it.high }, { it.low })"
-        }
-    }
-    receiverPointerLayout(rendered, selfType)?.let { return it }
-    if (resolved is SynType.Ptr) {
-        CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
-        val factory = if (resolved.mutability is io.github.kotlinmania.syn.PointerMutability.Mut) "mutPtrLayout" else "constPtrLayout"
-        return "PrimitiveLayouts.$factory<${renderType(resolved.elem, selfType)}>(${activeCfgProfile.pointerWidth}L)"
-    }
-    if (resolved is SynType.Reference && resolved.mutability != null && !headerContext.rawAbiMode) {
-        // Only select a thin reference representation for source-proven Sized
-        // scalar referents. Slices, str, trait objects, and ?Sized parameters
-        // require metadata as well as the address and must not use this codec.
-        val referent = resolveLayoutType(resolved.elem, substitutions)
-        val scalarName =
-            (referent as? SynType.Path)
-                ?.takeIf { it.qself == null && it.path.segments.size == 1 }
-                ?.path
-                ?.segments
-                ?.last()
-                ?.ident
-                ?.toString()
-        if (fixedScalarPointerCodec(referent) != null || scalarName in setOf("isize", "usize", "i128", "u128", "f16", "f32", "f64", "f128", "char")) {
-            val innerLayout = sourcePointerLayout(referent, selfType, available, substitutions, visiting + rendered) ?: return null
-            CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
-            return "PrimitiveLayouts.mutableReferenceLayout<${renderType(referent, selfType)}>($innerLayout, ${activeCfgProfile.pointerWidth}L)"
-        }
-        return null
-    }
-    if (rendered in visiting) return null
-    runtimeCellField(resolved)?.let { fieldType ->
-        val fieldLayout = sourcePointerLayout(fieldType, selfType, available, substitutions, visiting + rendered) ?: return null
-        CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.TransparentTypeLayout")
-        return "TransparentTypeLayout($fieldLayout, { ptr, layout -> $rendered(ptr, layout) }, { it.value })"
-    }
-    val declaration = transparentDeclaration(rendered)
-    if (declaration != null) {
-        val field = sourceTransparentField(declaration, rendered)
-        if (field != null) {
-            val nested = layoutSubstitutions(resolved, declaration, emptyMap())
-            val fieldLayout = sourcePointerLayout(sourceSingleField(declaration)?.ty ?: return null, selfType, available, nested, visiting + rendered) ?: return null
-            CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.TransparentTypeLayout")
-            val wrapper = "TransparentTypeLayout($fieldLayout, { ptr, layout -> $rendered(ptr, layout) }, { it.${field.first} })"
-            return sourceStorageAlignment(declaration)?.let {
-                CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.AlignedTypeLayout")
-                "AlignedTypeLayout($wrapper, ${it}L)"
-            } ?: wrapper
-        }
-        if (!headerContext.rawAbiMode && StructLayoutComputer.computeStructLayout(declaration, this) != null) {
-            val ownerBase = rustTypeIdentToKotlin(declaration.ident.toString())
-            val typeArgs =
-                (
-                    (resolved as? SynType.Path)
-                        ?.path
-                        ?.segments
-                        ?.last()
-                        ?.arguments as? PathArguments.AngleBracketed
-                )?.args
-                    ?.toList()
-                    .orEmpty()
-                    .filterIsInstance<GenericArgument.TypeArg>()
-                    .map { it.type }
-            val declParams =
-                declaration.generics.params
-                    .toList()
-                    .filterIsInstance<GenericParam.TypeParam>()
-                    .map { rustTypeIdentToKotlin(it.ident.toString()) }
-            val structLayout = StructLayoutComputer.computeStructLayout(declaration, this) ?: return null
-            val argExprs =
-                structLayout.requiredTypeLayoutParams.map { spec ->
-                    val paramLayoutName = spec.paramName
-                    val paramKt = paramLayoutName.removePrefix("typeLayout")
-                    val idx = declParams.indexOf(paramKt)
-                    val argSyn = typeArgs.getOrNull(idx) ?: return null
-                    val argLayout = sourcePointerLayout(argSyn, selfType, available, substitutions, visiting + rendered) ?: return null
-                    "$paramLayoutName = $argLayout"
-                }
-            val renderedTypeArgs = if (typeArgs.isEmpty()) "" else "<${typeArgs.joinToString(", ") { renderType(it, selfType) }}>"
-            return "$ownerBase.typeLayout$renderedTypeArgs(${argExprs.joinToString(", ")})"
-        }
-    }
-    return null
-}
+): String? = SourcePointerLayoutResolver(this).resolve(type, selfType, available, substitutions, visiting)
 
 internal fun KotlinJ2KEmitter.transparentFactoryLeaf(
     declaration: Item.Struct,
     selfType: String?,
-): Pair<SynType, Map<String, SynType>> {
-    var field = requireNotNull(sourceSingleField(declaration)).ty
-    val resolvedOwner = currentStandaloneImplSelfSynType?.let { resolveLayoutType(it, emptyMap()) }
-    var substitutions: Map<String, SynType> =
-        if (resolvedOwner != null && transparentDeclaration(renderType(resolvedOwner, selfType)) == declaration) {
-            layoutSubstitutions(resolvedOwner, declaration, emptyMap())
-        } else {
-            emptyMap()
-        }
-    val visiting = linkedSetOf<String>()
-    while (true) {
-        field = resolveLayoutType(field, substitutions)
-        val rendered = renderType(field, selfType)
-        if (!visiting.add(rendered)) return field to substitutions
-        val runtimeField = runtimeCellField(field)
-        if (runtimeField != null) {
-            field = runtimeField
-            continue
-        }
-        val nested = transparentDeclaration(rendered) ?: return field to emptyMap()
-        if (sourceTransparentField(nested, rendered) == null) return field to emptyMap()
-        substitutions = layoutSubstitutions(field, nested, emptyMap())
-        field = requireNotNull(sourceSingleField(nested)).ty
-    }
-}
+): Pair<SynType, Map<String, SynType>> = SourcePointerLayoutResolver(this).transparentFactoryLeaf(declaration, selfType)
 
-internal fun KotlinJ2KEmitter.transparentFactoryLayoutType(declaration: Item.Struct, selfType: String?): String {
-    val (leaf, substitutions) = transparentFactoryLeaf(declaration, selfType)
-    return layoutRenderedType(leaf, selfType, substitutions)
-}
+internal fun KotlinJ2KEmitter.transparentFactoryLayoutType(declaration: Item.Struct, selfType: String?): String =
+    SourcePointerLayoutResolver(this).transparentFactoryLayoutType(declaration, selfType)
 
-internal fun KotlinJ2KEmitter.transparentFactoryLayout(declaration: Item.Struct, selfType: String?): String {
-    val (leaf, substitutions) = transparentFactoryLeaf(declaration, selfType)
-    sourcePointerLayout(leaf, selfType, substitutions = substitutions)?.let { return it }
-    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
-    return "UnresolvedTypeLayout<${layoutRenderedType(leaf, selfType, substitutions)}>()"
-}
+internal fun KotlinJ2KEmitter.transparentFactoryLayout(declaration: Item.Struct, selfType: String?): String =
+    SourcePointerLayoutResolver(this).transparentFactoryLayout(declaration, selfType)
 
-internal fun KotlinJ2KEmitter.transparentConstructionLayout(
-    declaration: Item.Struct,
-    selfType: String?,
-): String {
-    val field =
-        sourceTransparentField(declaration, selfType ?: rustTypeIdentToKotlin(declaration.ident.toString()))
-            ?: error("Transparent construction requires a source-proven single field")
-    val ownerType = currentStandaloneImplSelfSynType
-    val resolvedOwner = ownerType?.let { resolveLayoutType(it, emptyMap()) }
-    val substitutions =
-        if (resolvedOwner != null && transparentDeclaration(renderType(resolvedOwner, selfType)) == declaration) {
-            layoutSubstitutions(resolvedOwner, declaration, emptyMap())
-        } else {
-            emptyMap()
-        }
-    sourcePointerLayout(requireNotNull(sourceSingleField(declaration)).ty, selfType, substitutions = substitutions)?.let { return it }
-    if (selfType?.substringBefore('<') == rustTypeIdentToKotlin(declaration.ident.toString()) && currentTypedLocals["this"] == selfType && currentTypedLocals["fieldLayout"] == null) {
-        return "this.fieldLayout"
-    }
-    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.UnresolvedTypeLayout")
-    return "UnresolvedTypeLayout<${field.second}>()"
-}
+internal fun KotlinJ2KEmitter.transparentConstructionLayout(declaration: Item.Struct, selfType: String?): String =
+    SourcePointerLayoutResolver(this).transparentConstructionLayout(declaration, selfType)
 
-internal fun KotlinJ2KEmitter.sourceInitializerType(expression: Expr): SynType? {
-    val source = unwrapParenOrGroupExpr(expression)
-    if (source is Expr.Path && source.qself == null && source.path.segments.size == 1) {
-        val raw =
-            source.path.segments
-                .last()
-                ?.ident
-                .toString()
-        val local = scopeBuilder.resolveLocalKotlinName(raw.removePrefix("r#")) ?: rustValueIdentToKotlin(raw)
-        currentSourceParameterTypes[local]?.let { return it }
+/**
+ * Resolves `TypeLayout<T>` expressions for raw pointers, `#[repr(transparent)]` wrappers,
+ * `UnsafeCell<T>` interiors, fixed-size arrays, and `StructLayoutComputer`-backed structs.
+ */
+private class SourcePointerLayoutResolver(
+    private val emitter: KotlinJ2KEmitter,
+) {
+    private val headerContext get() = emitter.headerContext
+    private val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+    private val memPkg = "$coreNs.mem"
+
+    private fun importMem(symbol: String, expr: String): String {
+        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.$symbol")
+        return expr
     }
-    val block =
-        when (source) {
-            is Expr.Const -> source.block
-            is Expr.BlockExpr -> source.block
-            is Expr.Unsafe -> source.block
-            else -> null
-        }
-    if (block != null) {
-        val tail = block.stmts.lastOrNull() as? Stmt.ExprStmt
-        return tail?.expr?.let { sourceInitializerType(it) }
-    }
-    if (source is Expr.Reference) {
-        return sourceInitializerType(source.expr)?.let {
-            SynType.Reference(source.andToken, null, source.mutability, it)
-        }
-    }
-    if (source is Expr.RawAddr) {
-        val place = unwrapParenOrGroupExpr(source.expr)
-        val elemType =
-            if (place is Expr.Unary && place.op is io.github.kotlinmania.syn.UnOp.Deref) {
-                (sourceInitializerType(place.expr) as? SynType.Ptr)?.elem
+
+    private fun primitiveLayouts(memberExpr: String): String =
+        importMem("PrimitiveLayouts", "PrimitiveLayouts.$memberExpr")
+
+    private fun receiverPointerLayout(type: String, selfType: String?): String? {
+        if (selfType == null || emitter.currentTypedLocals["this"] != selfType) return null
+        val selfSimple = selfType.simpleKotlinTypeName()
+        val alias = emitter.sameFileLayoutIndex().typeAliasesByKtName[selfSimple]?.singleOrNull()
+        val declaration = emitter.transparentDeclaration(selfType) ?: alias?.let(emitter::sourceStorageAlias) ?: return null
+        var fieldName = emitter.sourceTransparentField(declaration, selfType)?.first ?: return null
+        var fieldType =
+            if (alias != null) {
+                emitter.sourceStorageAliasField(alias, declaration)
             } else {
-                sourceInitializerType(place)
+                sourceSingleField(declaration)?.ty ?: return null
             }
-        if (elemType != null) {
-            return SynType.Ptr(
-                io.github.kotlinmania.syn.token.Star
-                    .default(),
-                source.mutability,
-                elemType,
-            )
-        }
-    }
-    if (source is Expr.Unary && source.op is io.github.kotlinmania.syn.UnOp.Deref) {
-        val innerTy = sourceInitializerType(source.expr)
-        if (innerTy is SynType.Ptr) return innerTy.elem
-        if (innerTy is SynType.Reference) return innerTy.elem
-    }
-    if (source is Expr.Field) {
-        val baseSyn = sourceInitializerType(source.base) ?: sourceReceiverExpressionType(source.base)
-        val ownerRaw =
-            (baseSyn as? SynType.Path)
-                ?.path
-                ?.segments
-                ?.last()
-                ?.ident
-                ?.toString()
-        val ownerKt = ownerRaw?.let { if (it == "Self") currentStandaloneImplSelfSynType?.let { s -> renderType(s, null).substringBefore('<') } else rustTypeIdentToKotlin(it) }
-        if (ownerKt != null) {
-            val fieldKt =
-                when (val m = source.member) {
-                    is Member.Named -> rustFieldIdentToKotlin(m.ident.toString())
-                    is Member.Unnamed -> tupleFieldPropertyName(m.index.index.toInt(), inspector.tupleStructArityByType[ownerKt] ?: 1)
-                }
-            inspector.structFieldSynTypesByType[ownerKt]?.get(fieldKt)?.let { return it }
-        }
-    }
-    if (source is Expr.Call) {
-        CoreIntrinsicLowering.inferCoreIntrinsicReturnSynType(source, this)?.let { return it }
-    }
-    if (source is Expr.MethodCall) {
-        val rawMethod = source.method.toString().removePrefix("r#")
-        if (rawMethod in setOf("cast", "cast_mut", "cast_const") && source.args.isEmpty()) {
-            val targetElem =
-                source.turbofish
-                    ?.args
-                    ?.toList()
-                    ?.filterIsInstance<GenericArgument.TypeArg>()
-                    ?.firstOrNull()
-                    ?.type
-                    ?: (sourceInitializerType(source.receiver) as? SynType.Ptr)?.elem
-            if (targetElem != null) {
-                val baseRecvTy = sourceInitializerType(source.receiver)
-                val mutability =
-                    when {
-                        rawMethod == "cast_mut" ->
-                            PointerMutability.Mut(
-                                io.github.kotlinmania.syn.token.Mut
-                                    .default(),
-                            )
-                        rawMethod == "cast_const" ->
-                            PointerMutability.Const(
-                                io.github.kotlinmania.syn.token.Const
-                                    .default(),
-                            )
-                        baseRecvTy is SynType.Ptr -> baseRecvTy.mutability
-                        else ->
-                            PointerMutability.Mut(
-                                io.github.kotlinmania.syn.token.Mut
-                                    .default(),
-                            )
-                    }
-                return SynType.Ptr(
-                    io.github.kotlinmania.syn.token.Star
-                        .default(),
-                    mutability,
-                    targetElem,
-                )
+        var owner = "this"
+        val visited = linkedSetOf<String>()
+        while (visited.add(fieldType.toTokenStream().toString())) {
+            val rendered = emitter.renderType(fieldType, selfType)
+            if (rendered == type) return "$owner.fieldLayout"
+            owner += ".$fieldName"
+            val runtimeField = emitter.runtimeCellField(fieldType)
+            if (runtimeField != null) {
+                fieldName = "value"
+                fieldType = runtimeField
+                continue
             }
-        }
-        if (rawMethod in setOf("as_ptr", "as_mut_ptr") && source.args.isEmpty()) {
-            fun unwrapPointerContainerElem(ty: SynType?): SynType? {
-                val u = ty?.let(::unwrapSynType) ?: return null
-                return when (u) {
-                    is SynType.Reference -> unwrapPointerContainerElem(u.elem) ?: u.elem
-                    is SynType.Slice -> u.elem
-                    is SynType.Array -> u.elem
-                    is SynType.Path -> {
-                        val lastSeg =
-                            u.path.segments
-                                .toList()
-                                .lastOrNull() ?: return null
-                        val ident = lastSeg.ident.toString().removePrefix("r#")
-                        val u8SynType = parse2(SynType.Companion::parse, TokenStream.fromString("u8").getOrThrow()).getOrThrow()
-                        if (ident == "str") {
-                            u8SynType
-                        } else if (ident in setOf("NonNull", "Vec", "Box", "Unique")) {
-                            val firstArg =
-                                (lastSeg.arguments as? PathArguments.AngleBracketed)
-                                    ?.args
-                                    ?.toList()
-                                    ?.filterIsInstance<GenericArgument.TypeArg>()
-                                    ?.firstOrNull()
-                                    ?.type
-                                    ?: return null
-                            when (val inner = unwrapSynType(firstArg)) {
-                                is SynType.Slice -> inner.elem
-                                is SynType.Array -> inner.elem
-                                is SynType.Path if inner.path.segments
-                                    .toList()
-                                    .lastOrNull()
-                                    ?.ident
-                                    ?.toString() == "str" -> u8SynType
-                                else -> firstArg
-                            }
-                        } else {
-                            null
-                        }
-                    }
-                    else -> null
-                }
-            }
-            val inferredElem =
-                sourceArrayLocal(source.receiver)?.second
-                    ?: unwrapPointerContainerElem(sourceInitializerType(source.receiver))
-            inferredElem?.let { elem ->
-                val mutability =
-                    if (rawMethod == "as_mut_ptr") {
-                        io.github.kotlinmania.syn.PointerMutability
-                            .Mut(
-                                io.github.kotlinmania.syn.token.Mut
-                                    .default(),
-                            )
-                    } else {
-                        io.github.kotlinmania.syn.PointerMutability
-                            .Const(
-                                io.github.kotlinmania.syn.token.Const
-                                    .default(),
-                            )
-                    }
-                return SynType.Ptr(
-                    io.github.kotlinmania.syn.token.Star
-                        .default(),
-                    mutability,
-                    elem,
-                )
-            }
-        }
-        if (rawMethod in
-            setOf(
-                "offset",
-                "add",
-                "sub",
-                "wrapping_offset",
-                "wrapping_add",
-                "wrapping_sub",
-                "byte_offset",
-                "byte_add",
-                "byte_sub",
-                "wrapping_byte_offset",
-                "wrapping_byte_add",
-                "wrapping_byte_sub",
-            ) && source.args.size == 1
-        ) {
-            sourceInitializerType(source.receiver)?.let { return it }
-        }
-        if (rawMethod == "cast_mut" && source.args.isEmpty()) {
-            (sourceInitializerType(source.receiver) as? SynType.Ptr)?.let { ptr ->
-                return SynType.Ptr(
-                    ptr.starToken,
-                    io.github.kotlinmania.syn.PointerMutability
-                        .Mut(
-                            io.github.kotlinmania.syn.token.Mut
-                                .default(),
-                        ),
-                    ptr.elem,
-                )
-            }
-        }
-        if (rawMethod == "cast_const" && source.args.isEmpty()) {
-            (sourceInitializerType(source.receiver) as? SynType.Ptr)?.let { ptr ->
-                return SynType.Ptr(
-                    ptr.starToken,
-                    io.github.kotlinmania.syn.PointerMutability
-                        .Const(
-                            io.github.kotlinmania.syn.token.Const
-                                .default(),
-                        ),
-                    ptr.elem,
-                )
-            }
-        }
-        if (rawMethod == "cast" && source.args.isEmpty()) {
-            val dest =
-                source.turbofish
-                    ?.args
-                    ?.toList()
-                    ?.firstNotNullOfOrNull { (it as? GenericArgument.TypeArg)?.type }
-            val recvPtr = sourceInitializerType(source.receiver) as? SynType.Ptr
-            if (dest != null && recvPtr != null) {
-                return SynType.Ptr(recvPtr.starToken, recvPtr.mutability, dest)
-            }
-        }
-        sourceReceiverMethodReturn(source.receiver, rawMethod)?.let { return it }
-    }
-    if (source is Expr.Cast) return source.ty
-    val call = source as? Expr.Call
-    val path =
-        (call?.func as? Expr.Path)
-            ?.takeIf { it.qself == null }
-            ?.path
-            ?.segments
-            ?.toList()
-    val last = path?.lastOrNull()
-    if (last?.ident?.toString() in setOf("null_mut", "null") &&
-        last?.ident?.toString() !in inspector.declaredTopLevelFnRawNames
-    ) {
-        val element =
-            (last?.arguments as? PathArguments.AngleBracketed)
-                ?.args
-                ?.toList()
-                ?.filterIsInstance<GenericArgument.TypeArg>()
-                ?.singleOrNull()
-                ?.type
-        if (element != null) {
-            val mutability =
-                if (requireNotNull(last).ident.toString() == "null_mut") {
-                    io.github.kotlinmania.syn.PointerMutability
-                        .Mut(
-                            io.github.kotlinmania.syn.token.Mut
-                                .default(),
-                        )
-                } else {
-                    io.github.kotlinmania.syn.PointerMutability
-                        .Const(
-                            io.github.kotlinmania.syn.token.Const
-                                .default(),
-                        )
-                }
-            return SynType.Ptr(
-                io.github.kotlinmania.syn.token.Star
-                    .default(),
-                mutability,
-                element,
-            )
-        }
-    }
-    if (path?.size == 1) {
-        // Tuple-struct construction, including function-local declarations, carries
-        // its source type even when the local binding has no annotation.
-        val declaration = transparentDeclaration(path.single().ident.toString())
-        if (declaration != null && declaration.generics.params.isEmpty()) {
-            return SynType.Path(null, Path.from(declaration.ident))
-        }
-    }
-    if (path?.size == 2) {
-        val owner = path.first().ident.toString()
-        val method = path.last().ident.toString()
-        val returns =
-            sameFileLayoutIndex()
-                .implsBySelfIdent[owner]
-                .orEmpty()
-                .flatMap { implementation ->
-                    implementation.items
-                        .filterIsInstance<io.github.kotlinmania.syn.ImplItem.Fn>()
-                        .filter {
-                            it.sig.ident.toString() == method && it.sig.inputs.firstOrNull() !is FnArg.Receiver
-                        }.mapNotNull { function ->
-                            val parameters =
-                                (
-                                    implementation.generics.params.toList() +
-                                        function.sig.generics.params
-                                            .toList()
-                                ).filterIsInstance<GenericParam.TypeParam>().map { it.ident.toString() }.toSet()
-                            val bindings = linkedMapOf<String, SynType>()
-                            fun bind(pattern: SynType, actual: SynType) {
-                                val parameter =
-                                    (pattern as? SynType.Path)
-                                        ?.takeIf { it.qself == null && it.path.segments.size == 1 }
-                                        ?.path
-                                        ?.segments
-                                        ?.last()
-                                        ?.ident
-                                        ?.toString()
-                                if (parameter in parameters) {
-                                    bindings[requireNotNull(parameter)] = actual
-                                    return
-                                }
-                                if (pattern is SynType.Ptr && actual is SynType.Ptr) bind(pattern.elem, actual.elem)
-                                if (pattern is SynType.Reference && actual is SynType.Reference) bind(pattern.elem, actual.elem)
-                            }
-                            val inputs =
-                                function.sig.inputs
-                                    .toList()
-                                    .filterIsInstance<FnArg.Typed>()
-                            inputs.zip(requireNotNull(call).args.toList()).forEach { (input, argument) ->
-                                sourceInitializerType(argument)?.let { bind(input.patType.ty, it) }
-                            }
-                            val result = extractReturnSynType(function.sig.output)
-                            val returned = if ((result as? SynType.Path)?.path?.isIdent("Self") == true) implementation.selfType else result
-                            returned?.let { substituteSourceType(it, bindings) }
-                        }
-                }.distinctBy { it.toTokenStream().toString() }
-        returns.singleOrNull()?.let { return it }
-    }
-    if (source is Expr.Repeat) return sourceInitializerType(source.expr)?.let { SynType.Array(it, source.len) }
-    if (source is Expr.Array) {
-        val elements = source.elems.toList()
-        val types = elements.map { sourceInitializerType(it) }
-        val element = types.firstOrNull()
-        if (element != null && types.all { it?.toTokenStream().toString() == element.toTokenStream().toString() }) {
-            val length =
-                Expr.Lit(
-                    emptyList(),
-                    Lit.Int(
-                        io.github.kotlinmania.syn.LitInt
-                            .new(elements.size.toString(), "", expression.span()),
-                    ),
-                )
-            return SynType.Array(element, length)
+            val nested = emitter.transparentDeclaration(rendered) ?: return null
+            fieldName = emitter.sourceTransparentField(nested, rendered)?.first ?: return null
+            val nestedFieldTy = sourceSingleField(nested)?.ty ?: return null
+            fieldType = emitter.resolveLayoutType(nestedFieldTy, emitter.layoutSubstitutions(fieldType, nested, emptyMap()))
         }
         return null
     }
-    val value = (source as? Expr.Lit)?.lit
-    val name =
-        when (value) {
-            is Lit.Bool -> "bool"
-            is Lit.Int ->
-                value.value
-                    .suffix()
-                    .ifEmpty { "i32" }
-                    .takeIf { it in setOf("i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128", "isize", "usize") }
-            else -> null
-        } ?: return null
-    return SynType.Path(
-        null,
-        Path.from(
-            io.github.kotlinmania.procmacro2.Ident
-                .new(name, expression.span()),
-        ),
-    )
-}
 
-private fun KotlinJ2KEmitter.sourceReceiverExpressionType(expression: Expr): SynType? {
-    val source = unwrapParenOrGroupExpr(expression)
-    if (source is Expr.Path && source.qself == null && source.path.isIdent("self")) return currentStandaloneImplSelfSynType
-    val field = source as? Expr.Field ?: return null
-    val base = sourceReceiverExpressionType(field.base) ?: return null
-    val ownerName =
-        (base as? SynType.Path)
-            ?.path
-            ?.segments
-            ?.last()
-            ?.ident
-            ?.toString() ?: return null
-    val alias = sameFileLayoutIndex().typeAliasesByIdent[ownerName]?.singleOrNull()
-    val declaration = transparentDeclaration(ownerName) ?: alias?.let { sourceStorageAlias(it) }
-    if (declaration != null) {
-        val expected = sourceTransparentField(declaration, ownerName)?.first ?: return null
-        val name =
-            when (val member = field.member) {
-                is Member.Named -> rustFieldIdentToKotlin(member.ident.toString())
-                is Member.Unnamed -> tupleFieldPropertyName(member.index.index.toInt(), 1)
+    fun resolve(
+        type: SynType,
+        selfType: String?,
+        available: Map<String, String> = emptyMap(),
+        substitutions: Map<String, SynType> = emptyMap(),
+        visiting: Set<String> = emptySet(),
+    ): String? {
+        val layoutIdx = emitter.sameFileLayoutIndex()
+        val sourcePath = type.unqualifiedPath()
+        val sourceType =
+            if (sourcePath?.isIdent("Self") == true) {
+                emitter.currentStandaloneImplSelfSynType
+                    ?: selfType
+                        ?.simpleKotlinTypeName()
+                        ?.let { layoutIdx.typeAliasesByKtName[it]?.singleOrNull() }
+                        ?.let { SynType.Path(null, Path.from(it.ident)) }
+                    ?: type
+            } else {
+                type
             }
-        if (expected != name) return null
-        return if (alias != null) {
-            sourceStorageAliasField(alias, declaration)
-        } else {
-            resolveLayoutType(sourceSingleField(declaration)?.ty ?: return null, layoutSubstitutions(base, declaration, emptyMap()))
+        val original = substituteSourceType(sourceType, substitutions)
+        val aliasPath = original as? SynType.Path
+        val alias = aliasPath?.path?.lastIdentText()?.let { layoutIdx.typeAliasesByIdent[it]?.singleOrNull() }
+        if (alias != null) {
+            val declaration = emitter.sourceStorageAlias(alias)
+            if (declaration != null) {
+                val aliasRendered = emitter.renderType(original, selfType)
+                if (aliasRendered in visiting) return null
+                val fieldType = emitter.sourceStorageAliasField(alias, declaration)
+                val aliasArguments = aliasPath.path.lastAngleTypeArgs()
+                val aliasParameters = alias.generics.typeParamIdentNames()
+                val fieldLayout =
+                    resolve(fieldType, selfType, available, substitutions + aliasParameters.zip(aliasArguments), visiting + aliasRendered)
+                        ?: return null
+                val fieldName = requireNotNull(emitter.sourceTransparentField(declaration, declaration.ident.toString())).first
+                return importMem(
+                    "TransparentTypeLayout",
+                    "TransparentTypeLayout($fieldLayout, { ptr, layout -> $aliasRendered(ptr, layout) }, { it.$fieldName })",
+                )
+            }
         }
-    }
-    return runtimeCellField(base)?.takeIf { (field.member as? Member.Named)?.ident?.toString() == "value" }
-}
-
-internal fun KotlinJ2KEmitter.sourceReceiverMethodReturn(receiver: Expr, method: String): SynType? {
-    if (method == "get") {
-        val cell = sourceReceiverExpressionType(receiver)?.let { runtimeCellField(it) }
-        if (cell != null) {
-            return SynType.Ptr(
-                io.github.kotlinmania.syn.token.Star
-                    .default(),
-                io.github.kotlinmania.syn.PointerMutability
-                    .Mut(
-                        io.github.kotlinmania.syn.token.Mut
-                            .default(),
-                    ),
-                cell,
+        val resolved = emitter.resolveLayoutType(sourceType, substitutions)
+        val rendered = emitter.renderType(resolved, selfType)
+        available[rendered]?.let { return it }
+        if (resolved is SynType.Tuple && resolved.elems.isEmpty()) return primitiveLayouts("UNIT")
+        if (resolved is SynType.Array) {
+            val elemRendered = emitter.renderType(resolved.elem, selfType)
+            val length = emitter.renderExpr(resolved.len, "", selfType)
+            val primFactory = emitter.primitiveArrayLayoutFactory(resolved.elem, elemRendered, emitter.activeCfgProfile.pointerWidth.toLong())
+            if (primFactory != null) {
+                return importMem("PrimitiveArrayLayouts", "PrimitiveArrayLayouts.$primFactory(($length).toInt())")
+            }
+            val elementLayout = resolve(resolved.elem, selfType, available, substitutions, visiting + rendered) ?: return null
+            return importMem("fixedListTypeLayout", "fixedListTypeLayout($elementLayout, ($length).toInt())")
+        }
+        if (resolved is SynType.Slice) {
+            val elementLayout = resolve(resolved.elem, selfType, available, substitutions, visiting + rendered) ?: return null
+            val sourceLayout = available.values.singleOrNull() ?: return null
+            return importMem(
+                "fixedListTypeLayout",
+                "fixedListTypeLayout($elementLayout, (($sourceLayout).sizeBytes / ($elementLayout).strideBytes).toInt())",
             )
         }
-    }
-    val path = (unwrapParenOrGroupExpr(receiver) as? Expr.Path)?.takeIf { it.qself == null }?.path ?: return null
-    if (!path.isIdent("self")) return null
-    val owner = currentStandaloneImplSelfSynType as? SynType.Path ?: return null
-    val ownerSegment = owner.path.segments.last() ?: return null
-    val arguments =
-        (ownerSegment.arguments as? PathArguments.AngleBracketed)
-            ?.args
-            ?.toList()
-            .orEmpty()
-            .filterIsInstance<GenericArgument.TypeArg>()
-            .map { it.type }
-    val results =
-        sameFileLayoutIndex()
-            .implsBySelfIdent[ownerSegment.ident.toString()]
-            .orEmpty()
-            .flatMap { implementation ->
-                val parameters =
-                    implementation.generics.params
-                        .toList()
-                        .filterIsInstance<GenericParam.TypeParam>()
-                        .map { it.ident.toString() }
-                val substitutions = parameters.zip(arguments).toMap() + ("Self" to owner)
-                implementation.items
-                    .filterIsInstance<ImplItem.Fn>()
-                    .filter {
-                        it.sig.ident.toString() == method && it.sig.inputs.firstOrNull() is FnArg.Receiver
-                    }.mapNotNull { function ->
-                        extractReturnSynType(function.sig.output)?.let { substituteSourceType(it, substitutions) }
+        val expectedLayoutTypes = setOf("TypeLayout<$rendered>", "$memPkg.TypeLayout<$rendered>")
+        if (emitter.currentTypedLocals["fieldLayout"] in expectedLayoutTypes) return "fieldLayout"
+        val matchingDict = emitter.currentTypedLocals.entries.singleOrNull { it.value in expectedLayoutTypes }
+        if (matchingDict != null) return matchingDict.key
+        fixedScalarPointerCodec(resolved)?.let { return importMem("PrimitiveLayouts", it) }
+        when (val primitive = singleUnqualifiedPathIdent(resolved)) {
+            "f16", "F16" -> return primitiveLayouts("F16_LAYOUT")
+            "f32" -> return primitiveLayouts("F32")
+            "f64" -> return primitiveLayouts("F64")
+            "f128", "F128" -> return primitiveLayouts("F128_LAYOUT")
+            "char" -> return primitiveLayouts("CHAR")
+            "isize", "usize" -> {
+                val width = emitter.activeCfgProfile.pointerWidth
+                val prefix =
+                    if (headerContext.rawAbiMode) {
+                        if (primitive == "isize") "I" else "U"
+                    } else {
+                        if (primitive == "isize") "ISIZE" else "USIZE"
                     }
-            }.distinctBy { it.toTokenStream().toString() }
-    return results.singleOrNull()
+                return primitiveLayouts("$prefix$width")
+            }
+            "i128" -> return primitiveLayouts("i128Layout(::I128, { it.high }, { it.low })")
+            "u128" -> return primitiveLayouts("u128Layout(::U128, { it.high }, { it.low })")
+        }
+        receiverPointerLayout(rendered, selfType)?.let { return it }
+        if (resolved is SynType.Ptr) {
+            val factory = if (resolved.mutability is PointerMutability.Mut) "mutPtrLayout" else "constPtrLayout"
+            return primitiveLayouts("$factory<${emitter.renderType(resolved.elem, selfType)}>(${emitter.activeCfgProfile.pointerWidth}L)")
+        }
+        if (resolved is SynType.Reference && resolved.mutability != null && !headerContext.rawAbiMode) {
+            val referent = emitter.resolveLayoutType(resolved.elem, substitutions)
+            val scalarName = singleUnqualifiedPathIdent(referent)
+            if (fixedScalarPointerCodec(referent) != null || scalarName in EXTENDED_SCALAR_POINTED_PRIMITIVES) {
+                val innerLayout = resolve(referent, selfType, available, substitutions, visiting + rendered) ?: return null
+                val ptrWidth = emitter.activeCfgProfile.pointerWidth
+                return primitiveLayouts("mutableReferenceLayout<${emitter.renderType(referent, selfType)}>($innerLayout, ${ptrWidth}L)")
+            }
+            return null
+        }
+        if (rendered in visiting) return null
+        emitter.runtimeCellField(resolved)?.let { fieldType ->
+            val fieldLayout = resolve(fieldType, selfType, available, substitutions, visiting + rendered) ?: return null
+            return importMem(
+                "TransparentTypeLayout",
+                "TransparentTypeLayout($fieldLayout, { ptr, layout -> $rendered(ptr, layout) }, { it.value })",
+            )
+        }
+        val declaration = emitter.transparentDeclaration(rendered) ?: return null
+        val field = emitter.sourceTransparentField(declaration, rendered)
+        if (field != null) {
+            val nested = emitter.layoutSubstitutions(resolved, declaration, emptyMap())
+            val singleTy = sourceSingleField(declaration)?.ty ?: return null
+            val fieldLayout = resolve(singleTy, selfType, available, nested, visiting + rendered) ?: return null
+            val wrapper =
+                importMem(
+                    "TransparentTypeLayout",
+                    "TransparentTypeLayout($fieldLayout, { ptr, layout -> $rendered(ptr, layout) }, { it.${field.first} })",
+                )
+            return sourceStorageAlignment(declaration)?.let { importMem("AlignedTypeLayout", "AlignedTypeLayout($wrapper, ${it}L)") }
+                ?: wrapper
+        }
+        if (!headerContext.rawAbiMode) {
+            val structLayout = StructLayoutComputer.computeStructLayout(declaration, emitter) ?: return null
+            val ownerBase = rustTypeIdentToKotlin(declaration.ident.toString())
+            val typeArgs = (resolved as? SynType.Path)?.path?.lastAngleTypeArgs().orEmpty()
+            val declParams = declaration.generics.typeParamIdentNames().map(::rustTypeIdentToKotlin)
+            val argExprs =
+                structLayout.requiredTypeLayoutParams.map { spec ->
+                    val paramLayoutName = spec.paramName
+                    val idx = declParams.indexOf(paramLayoutName.removePrefix("typeLayout"))
+                    val argSyn = typeArgs.getOrNull(idx) ?: return null
+                    val argLayout = resolve(argSyn, selfType, available, substitutions, visiting + rendered) ?: return null
+                    "$paramLayoutName = $argLayout"
+                }
+            val renderedTypeArgs = if (typeArgs.isEmpty()) "" else "<${typeArgs.joinToString(", ") { emitter.renderType(it, selfType) }}>"
+            return "$ownerBase.typeLayout$renderedTypeArgs(${argExprs.joinToString(", ")})"
+        }
+        return null
+    }
+
+    private fun initialOwnerSubstitutions(declaration: Item.Struct, selfType: String?): Map<String, SynType> {
+        val resolvedOwner = emitter.currentStandaloneImplSelfSynType?.let { emitter.resolveLayoutType(it, emptyMap()) } ?: return emptyMap()
+        return if (emitter.transparentDeclaration(emitter.renderType(resolvedOwner, selfType)) == declaration) {
+            emitter.layoutSubstitutions(resolvedOwner, declaration, emptyMap())
+        } else {
+            emptyMap()
+        }
+    }
+
+    fun transparentFactoryLeaf(declaration: Item.Struct, selfType: String?): Pair<SynType, Map<String, SynType>> {
+        var field = requireNotNull(sourceSingleField(declaration)).ty
+        var substitutions = initialOwnerSubstitutions(declaration, selfType)
+        val visiting = linkedSetOf<String>()
+        while (true) {
+            field = emitter.resolveLayoutType(field, substitutions)
+            val rendered = emitter.renderType(field, selfType)
+            if (!visiting.add(rendered)) return field to substitutions
+            val runtimeField = emitter.runtimeCellField(field)
+            if (runtimeField != null) {
+                field = runtimeField
+                continue
+            }
+            val nested = emitter.transparentDeclaration(rendered) ?: return field to emptyMap()
+            if (emitter.sourceTransparentField(nested, rendered) == null) return field to emptyMap()
+            substitutions = emitter.layoutSubstitutions(field, nested, emptyMap())
+            field = requireNotNull(sourceSingleField(nested)).ty
+        }
+    }
+
+    fun transparentFactoryLayoutType(declaration: Item.Struct, selfType: String?): String {
+        val (leaf, substitutions) = transparentFactoryLeaf(declaration, selfType)
+        return emitter.layoutRenderedType(leaf, selfType, substitutions)
+    }
+
+    fun transparentFactoryLayout(declaration: Item.Struct, selfType: String?): String {
+        val (leaf, substitutions) = transparentFactoryLeaf(declaration, selfType)
+        resolve(leaf, selfType, substitutions = substitutions)?.let { return it }
+        return importMem("UnresolvedTypeLayout", "UnresolvedTypeLayout<${emitter.layoutRenderedType(leaf, selfType, substitutions)}>()")
+    }
+
+    fun transparentConstructionLayout(declaration: Item.Struct, selfType: String?): String {
+        val declKt = rustTypeIdentToKotlin(declaration.ident.toString())
+        val field =
+            emitter.sourceTransparentField(declaration, selfType ?: declKt)
+                ?: error("Transparent construction requires a source-proven single field")
+        val substitutions = initialOwnerSubstitutions(declaration, selfType)
+        resolve(requireNotNull(sourceSingleField(declaration)).ty, selfType, substitutions = substitutions)?.let { return it }
+        if (selfType?.substringBefore('<') == declKt &&
+            emitter.currentTypedLocals["this"] == selfType &&
+            emitter.currentTypedLocals["fieldLayout"] == null
+        ) {
+            return "this.fieldLayout"
+        }
+        return importMem("UnresolvedTypeLayout", "UnresolvedTypeLayout<${field.second}>()")
+    }
+}
+
+internal fun KotlinJ2KEmitter.sourceInitializerType(expression: Expr): SynType? =
+    SourceAstTypeInferrer(this).inferInitializer(expression)
+
+internal fun KotlinJ2KEmitter.sourceReceiverMethodReturn(receiver: Expr, method: String): SynType? =
+    SourceAstTypeInferrer(this).inferReceiverMethodReturn(receiver, method)
+
+/**
+ * Infers unlowered `SynType` shapes directly from Rust AST expressions for pointer dereferences,
+ * raw address-of (`&raw const`/`&raw mut`), pointer casts/arithmetic, and `UnsafeCell::get`.
+ */
+private class SourceAstTypeInferrer(
+    private val emitter: KotlinJ2KEmitter,
+) {
+    fun inferInitializer(expression: Expr): SynType? {
+        val source = unwrapExprParens(expression)
+        if (source is Expr.Path && source.qself == null && source.path.segments.size == 1) {
+            val raw = source.path.lastIdentText().orEmpty()
+            val local = emitter.scopeBuilder.resolveLocalKotlinName(raw.removePrefix("r#")) ?: rustValueIdentToKotlin(raw)
+            emitter.currentSourceParameterTypes[local]?.let { return it }
+        }
+        val block =
+            when (source) {
+                is Expr.Const -> source.block
+                is Expr.BlockExpr -> source.block
+                is Expr.Unsafe -> source.block
+                else -> null
+            }
+        if (block != null) {
+            return (block.stmts.lastOrNull() as? Stmt.ExprStmt)?.expr?.let(::inferInitializer)
+        }
+        return when (source) {
+            is Expr.Reference -> inferInitializer(source.expr)?.let { SynType.Reference(source.andToken, null, source.mutability, it) }
+            is Expr.RawAddr -> {
+                val place = unwrapExprParens(source.expr)
+                val elemType =
+                    if (place is Expr.Unary && place.op is UnOp.Deref) {
+                        (inferInitializer(place.expr) as? SynType.Ptr)?.elem
+                    } else {
+                        inferInitializer(place)
+                    }
+                elemType?.let { SynType.Ptr(Star.default(), source.mutability, it) }
+            }
+            is Expr.Unary if source.op is UnOp.Deref -> {
+                when (val innerTy = inferInitializer(source.expr)) {
+                    is SynType.Ptr -> innerTy.elem
+                    is SynType.Reference -> innerTy.elem
+                    else -> null
+                }
+            }
+            is Expr.Field -> inferFieldInitializer(source)
+            is Expr.Call -> CoreIntrinsicLowering.inferCoreIntrinsicReturnSynType(source, emitter) ?: inferFnCallInitializer(source)
+            is Expr.MethodCall -> inferMethodCallInitializer(source)
+            is Expr.Cast -> source.ty
+            is Expr.Repeat -> inferInitializer(source.expr)?.let { SynType.Array(it, source.len) }
+            is Expr.Array -> inferArrayLiteralInitializer(source, expression)
+            is Expr.Lit -> inferLiteralInitializer(source.lit, expression)
+            else -> null
+        }
+    }
+
+    private fun inferFieldInitializer(source: Expr.Field): SynType? {
+        val baseSyn = inferInitializer(source.base) ?: inferReceiverExpression(source.base)
+        val ownerRaw = (baseSyn as? SynType.Path)?.path?.lastIdentText() ?: return null
+        val ownerKt =
+            if (ownerRaw == "Self") {
+                emitter.currentStandaloneImplSelfSynType?.let { emitter.renderType(it, null).substringBefore('<') }
+            } else {
+                rustTypeIdentToKotlin(ownerRaw)
+            } ?: return null
+        val fieldKt =
+            when (val m = source.member) {
+                is Member.Named -> rustFieldIdentToKotlin(m.ident.toString())
+                is Member.Unnamed -> tupleFieldPropertyName(m.index.index.toInt(), emitter.inspector.tupleStructArityByType[ownerKt] ?: 1)
+            }
+        return emitter.inspector.structFieldSynTypesByType[ownerKt]?.get(fieldKt)
+    }
+
+    private fun inferMethodCallInitializer(source: Expr.MethodCall): SynType? {
+        val rawMethod = source.method.cleanIdent()
+        if (rawMethod in POINTER_CAST_METHODS && source.args.isEmpty()) {
+            val baseRecvTy = inferInitializer(source.receiver)
+            val basePtr = baseRecvTy as? SynType.Ptr
+            val targetElem = source.firstTurbofishTypeArg() ?: basePtr?.elem
+            if (targetElem != null) {
+                val star = basePtr?.starToken ?: Star.default()
+                return when {
+                    rawMethod == "cast_mut" -> synPtrType(targetElem, isMut = true, star = star)
+                    rawMethod == "cast_const" -> synPtrType(targetElem, isMut = false, star = star)
+                    basePtr != null -> SynType.Ptr(star, basePtr.mutability, targetElem)
+                    else -> synPtrType(targetElem, isMut = true, star = star)
+                }
+            }
+        }
+        if ((rawMethod == "as_ptr" || rawMethod == "as_mut_ptr") && source.args.isEmpty()) {
+            val inferredElem =
+                emitter.sourceArrayLocal(source.receiver)?.second
+                    ?: unwrapPointerContainerElem(inferInitializer(source.receiver))
+            if (inferredElem != null) {
+                return synPtrType(inferredElem, isMut = rawMethod == "as_mut_ptr")
+            }
+        }
+        if (rawMethod in RAW_POINTER_ARITH_METHODS && source.args.size == 1) {
+            inferInitializer(source.receiver)?.let { return it }
+        }
+        return inferReceiverMethodReturn(source.receiver, rawMethod)
+    }
+
+    private fun unwrapPointerContainerElem(ty: SynType?): SynType? {
+        val u = ty?.let(::unwrapSynType) ?: return null
+        return when (u) {
+            is SynType.Reference -> unwrapPointerContainerElem(u.elem) ?: u.elem
+            is SynType.Slice -> u.elem
+            is SynType.Array -> u.elem
+            is SynType.Path -> {
+                val lastSeg = u.path.segments.last() ?: return null
+                val ident = lastSeg.cleanIdent()
+                if (ident == "str") return parseU8SynType()
+                if (ident !in POINTER_CONTAINER_WRAPPERS) return null
+                val firstArg = lastSeg.arguments.firstAngleTypeArg() ?: return null
+                when (val inner = unwrapSynType(firstArg)) {
+                    is SynType.Slice -> inner.elem
+                    is SynType.Array -> inner.elem
+                    is SynType.Path if inner.path.lastIdentText() == "str" -> parseU8SynType()
+                    else -> firstArg
+                }
+            }
+            else -> null
+        }
+    }
+
+    private fun inferFnCallInitializer(call: Expr.Call): SynType? {
+        val rawPath = call.func.unqualifiedPath() ?: return null
+        val path = rawPath.segments.toList()
+        val last = path.lastOrNull()
+        val lastIdent = last?.identText()
+        if ((lastIdent == "null_mut" || lastIdent == "null") && lastIdent !in emitter.inspector.declaredTopLevelFnRawNames) {
+            val element = last.arguments.angleTypeArgs().singleOrNull()
+            if (element != null) return synPtrType(element, isMut = lastIdent == "null_mut")
+        }
+        if (path.size == 1) {
+            val declaration = emitter.transparentDeclaration(path.single().identText())
+            if (declaration != null && declaration.generics.params.isEmpty()) {
+                return SynType.Path(null, Path.from(declaration.ident))
+            }
+        }
+        if (path.size == 2) {
+            val owner = path.first().identText()
+            val method = path.last().identText()
+            val returns =
+                emitter
+                    .sameFileLayoutIndex()
+                    .implsBySelfIdent[owner]
+                    .orEmpty()
+                    .flatMap { implementation ->
+                        implementation.items
+                            .filterIsInstance<ImplItem.Fn>()
+                            .filter { it.sig.ident.toString() == method && it.sig.inputs.firstOrNull() !is FnArg.Receiver }
+                            .mapNotNull { function ->
+                                inferAssociatedFnReturn(implementation, function, call)
+                            }
+                    }.distinctBy { it.toTokenStream().toString() }
+            return returns.singleOrNull()
+        }
+        return null
+    }
+
+    private fun inferAssociatedFnReturn(
+        implementation: Item.Impl,
+        function: ImplItem.Fn,
+        call: Expr.Call,
+    ): SynType? {
+        val parameters = (implementation.generics.typeParamIdentNames() + function.sig.generics.typeParamIdentNames()).toSet()
+        val bindings = linkedMapOf<String, SynType>()
+
+        fun bind(pattern: SynType, actual: SynType) {
+            val parameter = singleUnqualifiedPathIdent(pattern)
+            if (parameter != null && parameter in parameters) {
+                bindings[parameter] = actual
+                return
+            }
+            if (pattern is SynType.Ptr && actual is SynType.Ptr) bind(pattern.elem, actual.elem)
+            if (pattern is SynType.Reference && actual is SynType.Reference) bind(pattern.elem, actual.elem)
+        }
+
+        val inputList = function.sig.inputs.toList()
+        val inputs = inputList.filterIsInstance<FnArg.Typed>()
+        inputs.zip(call.args.toList()).forEach { (input, argument) ->
+            inferInitializer(argument)?.let { bind(input.patType.ty, it) }
+        }
+        val result = extractReturnSynType(function.sig.output)
+        val returned = if ((result as? SynType.Path)?.path?.isIdent("Self") == true) implementation.selfType else result
+        return returned?.let { substituteSourceType(it, bindings) }
+    }
+
+    private fun inferArrayLiteralInitializer(source: Expr.Array, expression: Expr): SynType? {
+        val elements = source.elems.toList()
+        val types = elements.map(::inferInitializer)
+        val element = types.firstOrNull() ?: return null
+        val elemTokens = element.toTokenStream().toString()
+        if (!types.all { it?.toTokenStream()?.toString() == elemTokens }) return null
+        val length = Expr.Lit(emptyList(), Lit.Int(LitInt.new(elements.size.toString(), "", expression.span())))
+        return SynType.Array(element, length)
+    }
+
+    private fun inferLiteralInitializer(value: Lit, expression: Expr): SynType? {
+        val name =
+            when (value) {
+                is Lit.Bool -> "bool"
+                is Lit.Int -> {
+                    val effectiveSuffix = value.value.suffix().ifEmpty { "i32" }
+                    effectiveSuffix.takeIf { it in INTEGER_LITERAL_SUFFIXES }
+                }
+                else -> null
+            } ?: return null
+        return SynType.Path(null, Path.from(Ident.new(name, expression.span())))
+    }
+
+    private fun inferReceiverExpression(expression: Expr): SynType? {
+        val source = unwrapExprParens(expression)
+        if (source is Expr.Path && source.qself == null && source.path.isIdent("self")) {
+            return emitter.currentStandaloneImplSelfSynType
+        }
+        val field = source as? Expr.Field ?: return null
+        val base = inferReceiverExpression(field.base) ?: return null
+        val ownerName = (base as? SynType.Path)?.path?.lastIdentText() ?: return null
+        val alias = emitter.sameFileLayoutIndex().typeAliasesByIdent[ownerName]?.singleOrNull()
+        val declaration = emitter.transparentDeclaration(ownerName) ?: alias?.let(emitter::sourceStorageAlias)
+        if (declaration != null) {
+            val expected = emitter.sourceTransparentField(declaration, ownerName)?.first ?: return null
+            val name =
+                when (val member = field.member) {
+                    is Member.Named -> rustFieldIdentToKotlin(member.ident.toString())
+                    is Member.Unnamed -> tupleFieldPropertyName(member.index.index.toInt(), 1)
+                }
+            if (expected != name) return null
+            return if (alias != null) {
+                emitter.sourceStorageAliasField(alias, declaration)
+            } else {
+                val singleTy = sourceSingleField(declaration)?.ty ?: return null
+                emitter.resolveLayoutType(singleTy, emitter.layoutSubstitutions(base, declaration, emptyMap()))
+            }
+        }
+        return emitter.runtimeCellField(base)?.takeIf { (field.member as? Member.Named)?.ident?.toString() == "value" }
+    }
+
+    fun inferReceiverMethodReturn(receiver: Expr, method: String): SynType? {
+        if (method == "get") {
+            val cell = inferReceiverExpression(receiver)?.let(emitter::runtimeCellField)
+            if (cell != null) return synPtrType(cell, isMut = true)
+        }
+        val path = unwrapExprParens(receiver).unqualifiedPath() ?: return null
+        if (!path.isIdent("self")) return null
+        val owner = emitter.currentStandaloneImplSelfSynType as? SynType.Path ?: return null
+        val ownerSegment = owner.path.segments.last() ?: return null
+        val arguments = ownerSegment.arguments.angleTypeArgs()
+        val results =
+            emitter
+                .sameFileLayoutIndex()
+                .implsBySelfIdent[ownerSegment.identText()]
+                .orEmpty()
+                .flatMap { implementation ->
+                    val parameters = implementation.generics.typeParamIdentNames()
+                    val substitutions = parameters.zip(arguments).toMap() + ("Self" to owner)
+                    implementation.items
+                        .filterIsInstance<ImplItem.Fn>()
+                        .filter { it.sig.ident.toString() == method && it.sig.inputs.firstOrNull() is FnArg.Receiver }
+                        .mapNotNull { fn -> extractReturnSynType(fn.sig.output)?.let { substituteSourceType(it, substitutions) } }
+                }.distinctBy { it.toTokenStream().toString() }
+        return results.singleOrNull()
+    }
+
+    companion object {
+        private val POINTER_CAST_METHODS = wordSet("cast cast_mut cast_const")
+        private val POINTER_CONTAINER_WRAPPERS = wordSet("NonNull Vec Box Unique")
+        private val INTEGER_LITERAL_SUFFIXES = wordSet("i8 u8 i16 u16 i32 u32 i64 u64 i128 u128 isize usize")
+
+        private fun parseU8SynType(): SynType =
+            parse2(SynType.Companion::parse, TokenStream.fromString("u8").getOrThrow()).getOrThrow()
+    }
 }
 
 internal fun KotlinJ2KEmitter.primitiveArrayLayoutFactory(
@@ -1736,50 +1287,26 @@ internal fun KotlinJ2KEmitter.primitiveArrayLayoutFactory(
 ): String? {
     val clean = elemRenderedType.trim()
     if (clean == "Boolean") return "booleanArray"
-    val unwrappedElem = unwrapSynType(elemSynType)
+    val elemPath = unwrapSynType(elemSynType).unqualifiedPath()
     val rawIdent =
-        (unwrappedElem as? SynType.Path)
-            ?.takeIf {
-                it.qself == null && it.path.segments.size == 1 &&
-                    it.path.segments
-                        .last()
-                        ?.arguments is PathArguments.None
-            }?.path
-            ?.segments
-            ?.last()
-            ?.ident
-            ?.toString()
+        if (elemPath != null && elemPath.segments.size == 1 && elemPath.segments.last()?.arguments is PathArguments.None) {
+            elemPath.lastIdentText()
+        } else {
+            null
+        }
     if (!headerContext.rawAbiMode && pointerWidthBits == 64L) {
         if (rawIdent == "usize") return "usize64Array"
         if (rawIdent == "isize") return "isize64Array"
     }
-    return when (resolveNumericKind(clean)) {
-        NumericKind.I8 -> "byteArray"
-        NumericKind.U8 -> "uByteArray"
-        NumericKind.I16 -> "shortArray"
-        NumericKind.U16 -> "uShortArray"
-        NumericKind.I32 -> "intArray"
-        NumericKind.U32 -> "uIntArray"
-        NumericKind.I64 -> "longArray"
-        NumericKind.U64 -> "uLongArray"
-        NumericKind.F32 -> "floatArray"
-        NumericKind.F64 -> "doubleArray"
-        NumericKind.I128, NumericKind.U128, NumericKind.F16, NumericKind.F128, null -> null
-    }
+    return PrimitiveArrayTypeCatalog.layoutFactoryForKind(resolveNumericKind(clean))
 }
 
 internal fun KotlinJ2KEmitter.sourceArrayLocal(receiver: Expr): Pair<String, SynType>? {
-    val unwrapped =
-        unwrapParenOrGroupExpr(receiver).let { node ->
-            if (node is Expr.Reference) unwrapParenOrGroupExpr(node.expr) else node
-        }
-    val path = (unwrapped as? Expr.Path)?.takeIf { it.qself == null && it.path.segments.size == 1 }?.path ?: return null
-    val raw =
-        path.segments
-            .last()
-            ?.ident
-            .toString()
-            .removePrefix("r#")
+    val unwrappedOuter = unwrapParenOrGroupExpr(receiver)
+    val unwrapped = if (unwrappedOuter is Expr.Reference) unwrapParenOrGroupExpr(unwrappedOuter.expr) else unwrappedOuter
+    val path = unwrapped.unqualifiedPath() ?: return null
+    if (path.segments.size != 1) return null
+    val raw = path.lastCleanIdent() ?: return null
     val name = scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
     val storage = currentAddressableLocals[name] ?: return null
     val element = currentAddressableArrayElementTypes[name] ?: return null

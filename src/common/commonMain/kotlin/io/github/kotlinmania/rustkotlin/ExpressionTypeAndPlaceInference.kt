@@ -7,12 +7,15 @@ import io.github.kotlinmania.syn.Fields
 import io.github.kotlinmania.syn.FnArg
 import io.github.kotlinmania.syn.ForeignItem
 import io.github.kotlinmania.syn.GenericArgument
+import io.github.kotlinmania.syn.GenericParam
+import io.github.kotlinmania.syn.Generics
 import io.github.kotlinmania.syn.ImplItem
 import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.Lit
 import io.github.kotlinmania.syn.Member
 import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.Pat
+import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
 import io.github.kotlinmania.syn.PathSegment
 import io.github.kotlinmania.syn.PointerMutability
@@ -40,29 +43,60 @@ internal fun PathArguments.firstAngleTypeArg(): SynType? {
     return ab.args.toList().firstNotNullOfOrNull { (it as? GenericArgument.TypeArg)?.type }
 }
 
+internal fun PathArguments.angleTypeArgs(): List<SynType> {
+    val ab = this as? PathArguments.AngleBracketed ?: return emptyList()
+    val argList = ab.args.toList()
+    return argList.mapNotNull { (it as? GenericArgument.TypeArg)?.type }
+}
+
+internal fun Path.lastAngleTypeArgs(): List<SynType> {
+    val lastSeg = segments.last() ?: return emptyList()
+    return lastSeg.arguments.angleTypeArgs()
+}
+
+internal fun SynType.unqualifiedPath(): Path? {
+    val tp = this as? SynType.Path ?: return null
+    return if (tp.qself == null) tp.path else null
+}
+
+internal fun Expr.unqualifiedPath(): Path? {
+    val ep = this as? Expr.Path ?: return null
+    return if (ep.qself == null) ep.path else null
+}
+
+internal fun Generics.typeParamIdentNames(): List<String> {
+    val typeParams = params.toList().filterIsInstance<GenericParam.TypeParam>()
+    return typeParams.map { it.ident.toString() }
+}
+
 internal object PrimitiveArrayTypeCatalog {
     private data class Spec(
         val arrayType: String,
         val elemType: String,
         val numericKind: NumericKind?,
+        val layoutFactory: String,
     )
 
     private val SPECS: List<Spec> =
         listOf(
-            Spec("BooleanArray", "Boolean", null),
-            Spec("ByteArray", "Byte", NumericKind.I8),
-            Spec("UByteArray", "UByte", NumericKind.U8),
-            Spec("ShortArray", "Short", NumericKind.I16),
-            Spec("UShortArray", "UShort", NumericKind.U16),
-            Spec("IntArray", "Int", NumericKind.I32),
-            Spec("UIntArray", "UInt", NumericKind.U32),
-            Spec("LongArray", "Long", NumericKind.I64),
-            Spec("ULongArray", "ULong", NumericKind.U64),
-            Spec("FloatArray", "Float", NumericKind.F32),
-            Spec("DoubleArray", "Double", NumericKind.F64),
+            Spec("BooleanArray", "Boolean", null, "booleanArray"),
+            Spec("ByteArray", "Byte", NumericKind.I8, "byteArray"),
+            Spec("UByteArray", "UByte", NumericKind.U8, "uByteArray"),
+            Spec("ShortArray", "Short", NumericKind.I16, "shortArray"),
+            Spec("UShortArray", "UShort", NumericKind.U16, "uShortArray"),
+            Spec("IntArray", "Int", NumericKind.I32, "intArray"),
+            Spec("UIntArray", "UInt", NumericKind.U32, "uIntArray"),
+            Spec("LongArray", "Long", NumericKind.I64, "longArray"),
+            Spec("ULongArray", "ULong", NumericKind.U64, "uLongArray"),
+            Spec("FloatArray", "Float", NumericKind.F32, "floatArray"),
+            Spec("DoubleArray", "Double", NumericKind.F64, "doubleArray"),
         )
 
     private val BY_ARRAY_TYPE: Map<String, Spec> = SPECS.associateBy { it.arrayType }
+    private val FACTORY_BY_KIND: Map<NumericKind, String> =
+        SPECS
+            .mapNotNull { spec -> spec.numericKind?.let { it to spec.layoutFactory } }
+            .toMap()
     private val ARRAY_BY_ELEM: Map<String, String> =
         SPECS.associate { it.elemType to it.arrayType } + ("kotlin.Float" to "FloatArray")
 
@@ -109,6 +143,12 @@ internal object PrimitiveArrayTypeCatalog {
 
     fun toArrayMethodName(arrayType: String): String? =
         if (arrayType in BY_ARRAY_TYPE) "to$arrayType" else null
+
+    fun isPrimitiveArrayType(type: String): Boolean =
+        type in BY_ARRAY_TYPE
+
+    fun layoutFactoryForKind(kind: NumericKind?): String? =
+        kind?.let(FACTORY_BY_KIND::get)
 }
 
 internal fun KotlinJ2KEmitter.resolveUnnamedTupleFieldSynType(
@@ -1165,12 +1205,15 @@ internal fun KotlinJ2KEmitter.resolvePointerSizedNumericKind(signed: Boolean): N
         NumericKind.I32
     }
 
-internal fun KotlinJ2KEmitter.unwrapParenOrGroupExpr(expr: Expr): Expr =
+internal fun unwrapExprParens(expr: Expr): Expr =
     when (expr) {
-        is Expr.Paren -> unwrapParenOrGroupExpr(expr.expr)
-        is Expr.Group -> unwrapParenOrGroupExpr(expr.expr)
+        is Expr.Paren -> unwrapExprParens(expr.expr)
+        is Expr.Group -> unwrapExprParens(expr.expr)
         else -> expr
     }
+
+internal fun KotlinJ2KEmitter.unwrapParenOrGroupExpr(expr: Expr): Expr =
+    unwrapExprParens(expr)
 
 internal fun KotlinJ2KEmitter.isNarrowComparisonLiteralOperand(operand: Expr, targetKind: NumericKind): Boolean {
     val isNarrowUnsigned = targetKind == NumericKind.U8 || targetKind == NumericKind.U16
