@@ -457,16 +457,20 @@ public data class FileHeaderContext(
     )
 }
 
-private class BoundedDiskCache<V : Any>(
+internal class BoundedDiskCache<V : Any>(
     private val maxEntries: Int = 128,
 ) {
     private var entries: Map<String, V> = emptyMap()
 
+    operator fun get(key: String): V? = entries[key]
+
+    fun put(key: String, value: V) {
+        entries = if (entries.size >= maxEntries) mapOf(key to value) else entries + (key to value)
+    }
+
     fun getOrPut(key: String, compute: () -> V): V {
         entries[key]?.let { return it }
-        val computed = compute()
-        entries = if (entries.size >= maxEntries) mapOf(key to computed) else entries + (key to computed)
-        return computed
+        return compute().also { put(key, it) }
     }
 }
 

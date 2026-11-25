@@ -1165,7 +1165,7 @@ private class KotlinImportPathResolver(
             }
         }
         val importedGlobs = mutableListOf<UseLeaf>()
-        inspector.allUseItems.forEach { emitter.collectUseLeaves(it.tree, emptyList(), importedGlobs) }
+        inspector.allUseItems.forEach { collectUseLeaves(it.tree, emptyList(), importedGlobs) }
         val packages =
             importedGlobs
                 .filter { leaf ->
@@ -1769,12 +1769,29 @@ internal fun KotlinJ2KEmitter.renderItemUse(
     bodyTextForPubUseFilter: String? = null,
 ): String = UseItemImportEmitter(this).render(item, indent, bodyTextForPubUseFilter)
 
-internal fun KotlinJ2KEmitter.collectUseLeaves(
+internal fun collectUseLeaves(
     tree: UseTree,
     prefix: List<String>,
     out: MutableList<UseLeaf>,
 ) {
-    UseItemImportEmitter.collectLeaves(tree, prefix, out)
+    when (tree) {
+        is UseTree.Path -> tree.tree?.let { collectUseLeaves(it, prefix + tree.ident.toString(), out) }
+        is UseTree.Name -> {
+            val seg = tree.ident.toString()
+            val alias =
+                tree.rename
+                    ?.ident
+                    ?.cleanIdent()
+                    ?.takeIf { it != "_" }
+            if (seg != "self") {
+                out.add(UseLeaf(segments = prefix + seg, alias = alias, isSelfImport = false))
+            } else if (prefix.isNotEmpty()) {
+                out.add(UseLeaf(segments = prefix, alias = alias, isSelfImport = true))
+            }
+        }
+        is UseTree.Glob -> out.add(UseLeaf(segments = prefix + "*", alias = null, isSelfImport = false))
+        is UseTree.Group -> tree.items.toList().forEach { collectUseLeaves(it, prefix, out) }
+    }
 }
 
 internal fun KotlinJ2KEmitter.collectInlineModUses(modItem: Item.Mod, out: MutableList<Item.Use>) {
@@ -1864,7 +1881,7 @@ private class UseItemImportEmitter(
 
     fun registerInScope(item: Item.Use) {
         val leaves = mutableListOf<UseLeaf>()
-        collectLeaves(item.tree, emptyList(), leaves)
+        collectUseLeaves(item.tree, emptyList(), leaves)
         for (leaf in leaves) {
             val lastSeg = leaf.segments.lastOrNull() ?: continue
             if (lastSeg == "*") continue
@@ -1992,7 +2009,7 @@ private class UseItemImportEmitter(
         bodyTextForPubUseFilter: String?,
     ): String {
         val rawLeaves = mutableListOf<UseLeaf>()
-        collectLeaves(item.tree, emptyList(), rawLeaves)
+        collectUseLeaves(item.tree, emptyList(), rawLeaves)
         val inRustLangPkg = headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true
         val lines = mutableListOf<String>()
         for (leaf in expandOsPreludeLeaves(rawLeaves)) {
@@ -2106,30 +2123,5 @@ private class UseItemImportEmitter(
         private val DROP_MARKER_LEAVES = wordSet("NoDrop TrivialDrop")
         private val CONST_PANIC_OR_ERROR_SUFFIXES =
             listOf(".panic.constPanic", ".panic.constAssert", ".io.constError", ".error.constError")
-
-        fun collectLeaves(
-            tree: UseTree,
-            prefix: List<String>,
-            out: MutableList<UseLeaf>,
-        ) {
-            when (tree) {
-                is UseTree.Path -> tree.tree?.let { collectLeaves(it, prefix + tree.ident.toString(), out) }
-                is UseTree.Name -> {
-                    val seg = tree.ident.toString()
-                    val alias =
-                        tree.rename
-                            ?.ident
-                            ?.cleanIdent()
-                            ?.takeIf { it != "_" }
-                    if (seg != "self") {
-                        out.add(UseLeaf(segments = prefix + seg, alias = alias, isSelfImport = false))
-                    } else if (prefix.isNotEmpty()) {
-                        out.add(UseLeaf(segments = prefix, alias = alias, isSelfImport = true))
-                    }
-                }
-                is UseTree.Glob -> out.add(UseLeaf(segments = prefix + "*", alias = null, isSelfImport = false))
-                is UseTree.Group -> tree.items.toList().forEach { collectLeaves(it, prefix, out) }
-            }
-        }
     }
 }

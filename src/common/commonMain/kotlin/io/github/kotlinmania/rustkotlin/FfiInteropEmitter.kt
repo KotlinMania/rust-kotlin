@@ -3,8 +3,6 @@ package io.github.kotlinmania.rustkotlin
 import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.syn.Attribute
-import io.github.kotlinmania.syn.Expr
-import io.github.kotlinmania.syn.Lit
 import io.github.kotlinmania.syn.Macro
 import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.PathArguments
@@ -1284,18 +1282,8 @@ internal class FfiInteropCollector(
             return null
         }
 
-        internal fun extractLinkNameAttribute(attrs: List<Attribute>): String? {
-            for (attr in attrs) {
-                val meta = attr.meta
-                if (meta is Meta.NameValue && meta.path.isIdent("link_name")) {
-                    val expr = meta.value
-                    if (expr is Expr.Lit && expr.lit is Lit.Str) {
-                        return (expr.lit as Lit.Str).value.value()
-                    }
-                }
-            }
-            return null
-        }
+        internal fun extractLinkNameAttribute(attrs: List<Attribute>): String? =
+            extractStringMetaAttribute(attrs, "link_name")
     }
 }
 
@@ -1305,9 +1293,7 @@ private fun extractImportLocalName(imp: String): String {
 }
 
 internal val UMBRELLA_LINK_LIBRARIES =
-    "c m dl pthread rt System gcc gcc_s stdc++ c++ msvcrt ucrtbase libcmt legacy_stdio_definitions"
-        .split(' ')
-        .toSet()
+    wordSet("c m dl pthread rt System gcc gcc_s stdc++ c++ msvcrt ucrtbase libcmt legacy_stdio_definitions")
 
 internal fun extractLinkLibraryNamesFromLinkArgs(
     tokens: TokenStream,

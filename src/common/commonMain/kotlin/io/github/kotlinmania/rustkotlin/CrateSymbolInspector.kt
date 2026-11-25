@@ -145,6 +145,19 @@ internal fun traitItemHasDocOnlyCfg(item: TraitItem): Boolean = isDocOnlyCfgAttr
 
 internal fun foreignItemHasDocOnlyCfg(item: ForeignItem): Boolean = isDocOnlyCfgAttribute(item.attributes)
 
+internal fun extractStringMetaAttribute(attrs: List<Attribute>, attrIdent: String): String? {
+    for (attr in attrs) {
+        val meta = attr.meta
+        if (meta is Meta.NameValue && meta.path.isIdent(attrIdent)) {
+            val expr = meta.value
+            if (expr is Expr.Lit && expr.lit is Lit.Str) {
+                return (expr.lit as Lit.Str).value.value()
+            }
+        }
+    }
+    return null
+}
+
 internal enum class NumericKind {
     I8,
     I16,

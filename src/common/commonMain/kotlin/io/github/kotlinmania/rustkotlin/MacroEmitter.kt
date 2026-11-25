@@ -2113,7 +2113,7 @@ private class ExprPathResolutionEmitter(
         val globPrims = linkedSetOf<String>()
         val leaves = mutableListOf<UseLeaf>()
         for (u in inspector.allUseItems) {
-            emitter.collectUseLeaves(u.tree, emptyList(), leaves)
+            collectUseLeaves(u.tree, emptyList(), leaves)
         }
         for (leaf in leaves) {
             val segs = leaf.segments.map { it.removePrefix("r#") }
