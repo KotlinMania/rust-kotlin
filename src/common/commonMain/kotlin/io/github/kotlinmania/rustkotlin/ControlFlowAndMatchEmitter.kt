@@ -111,7 +111,7 @@ internal abstract class MatchPatternTraversal(
                 "($subjectText)"
             }
         val recv =
-            if (alreadySmartCast || !isErasedResultOrControlFlowScrutinee(scrutineeTy, isCf)) {
+            if (alreadySmartCast || !isUntypedTaggedSumScrutinee(scrutineeTy, isCf)) {
                 subjectAtom
             } else {
                 "($subjectText as ${info.first}<*, *>)"
@@ -161,7 +161,7 @@ internal abstract class MatchPatternTraversal(
         return if (includeSubjectReceiver) "$subjectText == $exprText" else exprText
     }
 
-    protected fun renderGuardWithPatternAccess(
+    internal fun renderGuardWithPatternAccess(
         basePat: Pat,
         guardExpr: Expr,
         subjectText: String,
@@ -2051,15 +2051,7 @@ internal fun KotlinJ2KEmitter.renderBooleanMatchArm(
                 currentExpectedNumericKind = null
                 val guardPart =
                     armGuardExpr(arm)?.let { guardExpr ->
-                        val guardAccess = linkedMapOf<String, String>()
-                        PatternGuardAccessCollector(this, selfTypeName).collect(basePat, subjectText, guardAccess)
-                        val prevSubstitutions = activeGuardBindingSubstitutions
-                        activeGuardBindingSubstitutions = prevSubstitutions + guardAccess
-                        try {
-                            renderExpr(guardExpr, indent, selfTypeName)
-                        } finally {
-                            activeGuardBindingSubstitutions = prevSubstitutions
-                        }
+                        boolEmitter.renderGuardWithPatternAccess(basePat, guardExpr, subjectText, indent)
                     }
                 condPart to guardPart
             } finally {
@@ -2263,17 +2255,6 @@ internal fun KotlinJ2KEmitter.tupleIndexExpr(subjectText: String, idx: Int, arit
         arity == 3 && idx == 2 -> "$subjectText.third"
         else -> "$subjectText[$idx]"
     }
-
-private fun isErasedResultOrControlFlowScrutinee(
-    renderedType: String?,
-    isControlFlow: Boolean,
-): Boolean {
-    val clean = renderedType?.removeSuffix("?")?.trim() ?: return false
-    if (clean in setOf("Any", "RustAny", "*", "Nothing")) return true
-    if (clean.length == 1 && clean[0] in 'A'..'Z') return true
-    val base = clean.substringBefore('<').substringAfterLast('.').trim()
-    return if (isControlFlow) base != "ControlFlow" else base != "Result" && base != "RustResult"
-}
 
 internal fun KotlinJ2KEmitter.resolveScrutineeRenderedType(
     subjectText: String,

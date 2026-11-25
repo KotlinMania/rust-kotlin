@@ -9,16 +9,16 @@ import io.github.kotlinmania.syn.PathArguments
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.UnOp
 
-internal fun KotlinJ2KEmitter.lookupDeclaredTraitAst(ktTrait: String, traitPath: Path? = null): Item.Trait? {
-    inspector.declaredTraitsByName[ktTrait]?.let { return it }
-    val registry = CrateTraitAstRegistry.lookup(headerContext.crateTraitAstRegistryKey)
-    if (registry.isEmpty()) return null
-    val rawSegs =
-        traitPath
-            ?.segments
-            ?.toList()
-            ?.map { it.ident.toString().removePrefix("r#") }
-            .orEmpty()
+private fun <V> KotlinJ2KEmitter.lookupScopedTraitMetadata(
+    ktTrait: String,
+    traitPath: Path?,
+    localMap: Map<String, V>,
+    crateMap: Map<String, V>,
+    acceptDirectCrateValue: (V) -> Boolean = { true },
+): V? {
+    localMap[ktTrait]?.let { return it }
+    if (crateMap.isEmpty()) return null
+    val rawSegs = traitPath?.cleanIdentStrings().orEmpty()
     if (rawSegs.size >= 2) {
         val subHint =
             rawSegs
@@ -26,14 +26,22 @@ internal fun KotlinJ2KEmitter.lookupDeclaredTraitAst(ktTrait: String, traitPath:
                 .filterNot { it == "crate" || it == "self" || it == "super" }
                 .joinToString(".") { rustModuleIdentToKotlin(it.replace('-', '_')) }
         if (subHint.isNotEmpty()) {
-            registry["$subHint.$ktTrait"]?.let { return it }
+            crateMap["$subHint.$ktTrait"]?.let { return it }
         }
     }
     for (k in scopedAbiKeysForRenderedType(ktTrait)) {
-        registry[k]?.let { return it }
+        crateMap[k]?.let { return it }
     }
-    return registry[ktTrait]
+    return crateMap[ktTrait]?.takeIf(acceptDirectCrateValue)
 }
+
+internal fun KotlinJ2KEmitter.lookupDeclaredTraitAst(ktTrait: String, traitPath: Path? = null): Item.Trait? =
+    lookupScopedTraitMetadata(
+        ktTrait = ktTrait,
+        traitPath = traitPath,
+        localMap = inspector.declaredTraitsByName,
+        crateMap = CrateTraitAstRegistry.lookup(headerContext.crateTraitAstRegistryKey),
+    )
 
 internal fun KotlinJ2KEmitter.isSelfParameterizedTraitName(ktTrait: String): Boolean {
     if (ktTrait in inspector.declaredTraitsByName) {
@@ -46,7 +54,7 @@ internal fun KotlinJ2KEmitter.isSelfParameterizedTraitName(ktTrait: String): Boo
 }
 
 private val CORE_OPS_OUTPUT_ASSOC_TRAITS =
-    setOf("Add", "Sub", "Mul", "Div", "Rem", "BitAnd", "BitOr", "BitXor", "Shl", "Shr", "Neg", "Not")
+    wordSet("Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr Neg Not")
 
 private val STDLIB_DEFAULTLESS_ASSOC_TYPES: Map<String, List<String>> =
     mapOf(
@@ -72,31 +80,15 @@ private val STDLIB_DEFAULTLESS_ASSOC_TYPES: Map<String, List<String>> =
     )
 
 internal fun KotlinJ2KEmitter.lookupTraitDefaultlessAssocTypes(ktTrait: String, traitPath: Path? = null): List<String> {
-    inspector.traitDefaultlessAssocTypes[ktTrait]?.let { return it }
-    val rawSegs =
-        traitPath
-            ?.segments
-            ?.toList()
-            ?.map { it.ident.toString().removePrefix("r#") }
-            .orEmpty()
-    if (rawSegs.size >= 2) {
-        val subHint =
-            rawSegs
-                .dropLast(1)
-                .filterNot { it == "crate" || it == "self" || it == "super" }
-                .joinToString(".") { rustModuleIdentToKotlin(it.replace('-', '_')) }
-        if (subHint.isNotEmpty()) {
-            headerContext.crateTraitDefaultlessAssocTypes["$subHint.$ktTrait"]?.let { return it }
-        }
-    }
-    for (k in scopedAbiKeysForRenderedType(ktTrait)) {
-        headerContext.crateTraitDefaultlessAssocTypes[k]?.let { return it }
-    }
-    headerContext.crateTraitDefaultlessAssocTypes[ktTrait]?.takeIf { it.isNotEmpty() }?.let { return it }
+    lookupScopedTraitMetadata(
+        ktTrait = ktTrait,
+        traitPath = traitPath,
+        localMap = inspector.traitDefaultlessAssocTypes,
+        crateMap = headerContext.crateTraitDefaultlessAssocTypes,
+        acceptDirectCrateValue = List<String>::isNotEmpty,
+    )?.let { return it }
     if (ktTrait !in inspector.declaredTypeNames) {
-        if (ktTrait in CORE_OPS_OUTPUT_ASSOC_TRAITS) {
-            return listOf("Output")
-        }
+        if (ktTrait in CORE_OPS_OUTPUT_ASSOC_TRAITS) return listOf("Output")
         STDLIB_DEFAULTLESS_ASSOC_TYPES[ktTrait]?.let { return it }
     }
     return emptyList()
@@ -104,42 +96,17 @@ internal fun KotlinJ2KEmitter.lookupTraitDefaultlessAssocTypes(ktTrait: String, 
 
 internal fun KotlinJ2KEmitter.lookupTraitResultMethodNames(ktTrait: String, traitPath: Path? = null): Set<String> {
     inspector.traitResultMethods[ktTrait]?.let { return it }
-    val rawSegs =
-        traitPath
-            ?.segments
-            ?.toList()
-            ?.map { it.ident.toString().removePrefix("r#") }
-            .orEmpty()
-    if (rawSegs.size >= 2) {
-        val subHint =
-            rawSegs
-                .dropLast(1)
-                .filterNot { it == "crate" || it == "self" || it == "super" }
-                .joinToString(".") { rustModuleIdentToKotlin(it.replace('-', '_')) }
-        if (subHint.isNotEmpty()) {
-            headerContext.crateTraitResultMethods["$subHint.$ktTrait"]?.let { return it.toSet() }
-        }
-    }
-    for (k in scopedAbiKeysForRenderedType(ktTrait)) {
-        headerContext.crateTraitResultMethods[k]?.let { return it.toSet() }
-    }
-    return headerContext.crateTraitResultMethods[ktTrait].orEmpty().toSet()
+    return lookupScopedTraitMetadata(
+        ktTrait = ktTrait,
+        traitPath = traitPath,
+        localMap = emptyMap(),
+        crateMap = headerContext.crateTraitResultMethods,
+    )?.toSet().orEmpty()
 }
 
 internal fun KotlinJ2KEmitter.isFmtResultSynType(ty: SynType?): Boolean {
-    val pathTy = (ty?.let(::unwrapSynType) as? SynType.Path) ?: return false
-    if (pathTy.qself != null) return false
-    val rawSegments = pathTy.path.segments.toList()
-    if (rawSegments.isEmpty()) return false
-    val segNames =
-        rewriteCrateRootAliasAndReexportSegments(
-            rawSegments.map { it.ident.toString().removePrefix("r#") },
-        )
-    if (segNames.lastOrNull() != "Result") return false
-    val isStdFmt =
-        (segNames.size >= 3 && segNames[0] in setOf("core", "std", "alloc") && segNames[1] == "fmt") ||
-            (segNames.size == 2 && segNames[0] == "fmt")
-    return isStdFmt
+    val rawSegs = ty?.let(::unwrapSynType)?.unqualifiedPath()?.cleanIdentStrings() ?: return false
+    return rawSegs.isNotEmpty() && isStdFmtResultSegments(rewriteCrateRootAliasAndReexportSegments(rawSegs))
 }
 
 /** Resolve two Result payload types, expanding 1-arg `io::Result<T>` and 0-arg `fmt::Result` aliases when applicable. */
@@ -323,6 +290,33 @@ internal fun KotlinJ2KEmitter.renderSourceResultConstructor(call: Expr.Call, var
     return "${sourceResultName()}.$variant$typeArguments($value)"
 }
 
+internal fun renderTaggedTwoArmTry(
+    scrutineeExpr: String,
+    returnKeyword: String,
+    sumTypeName: String,
+    continueArmSimple: String,
+    continueAccessor: String,
+    earlyReturnArmSimple: String,
+    earlyReturnAccessor: String,
+    earlyReturnTypeArgs: String,
+    castEarlyPayloadTo: String?,
+    isUntypedScrutinee: Boolean,
+): String {
+    val payloadExpr =
+        if (isUntypedScrutinee && castEarlyPayloadTo != null) {
+            "(tryResult.$earlyReturnAccessor as $castEarlyPayloadTo)"
+        } else {
+            "tryResult.$earlyReturnAccessor"
+        }
+    val elseArm =
+        if (isUntypedScrutinee) {
+            "; else -> error(\"Unexpected $sumTypeName variant: \$tryResult\")"
+        } else {
+            ""
+        }
+    return "when (val tryResult = $scrutineeExpr) { is $sumTypeName.$continueArmSimple<*, *> -> tryResult.$continueAccessor; is $sumTypeName.$earlyReturnArmSimple<*, *> -> $returnKeyword $sumTypeName.$earlyReturnArmSimple$earlyReturnTypeArgs($payloadExpr)$elseArm }"
+}
+
 /** Lower Rust `?` propagation according to whether tagged core Result or Kotlin Result is active. */
 internal fun KotlinJ2KEmitter.renderSourceResultTry(expression: String, returnKeyword: String, sourceType: String? = null): String {
     val cleanSrc = sourceType?.removeSuffix("?")?.trim()
@@ -332,34 +326,24 @@ internal fun KotlinJ2KEmitter.renderSourceResultTry(expression: String, returnKe
     if (!usesTaggedCoreResult()) {
         return "$expression.getOrElse { $returnKeyword Result.failure(it) }"
     }
-    val result = sourceResultName()
-    val starArgs = "<*, *>"
-    val isUntypedScrutinee = sourceType != null && isUntypedResultScrutinee(sourceType)
     val enclosingPair =
         if (returnKeyword.startsWith("return")) {
             resolveEnclosingResultTypeArguments(currentEnclosingReturnRenderedType)
         } else {
             null
         }
-    val errTypeArgs =
-        if (enclosingPair != null) {
-            buildExplicitResultTypeArgsSuffix(enclosingPair.first, enclosingPair.second)
-        } else {
-            ""
-        }
-    val errPayloadExpr =
-        if (isUntypedScrutinee && enclosingPair != null && isUsableExplicitResultTypeArg(enclosingPair.second)) {
-            "(tryResult.errValue() as ${enclosingPair.second})"
-        } else {
-            "tryResult.errValue()"
-        }
-    val elseBranch =
-        if (isUntypedScrutinee) {
-            "; else -> error(\"Unexpected $result variant: \$tryResult\")"
-        } else {
-            ""
-        }
-    return "when (val tryResult = $expression) { is $result.Ok$starArgs -> tryResult.okValue(); is $result.Err$starArgs -> $returnKeyword $result.Err$errTypeArgs($errPayloadExpr)$elseBranch }"
+    return renderTaggedTwoArmTry(
+        scrutineeExpr = expression,
+        returnKeyword = returnKeyword,
+        sumTypeName = sourceResultName(),
+        continueArmSimple = "Ok",
+        continueAccessor = "okValue()",
+        earlyReturnArmSimple = "Err",
+        earlyReturnAccessor = "errValue()",
+        earlyReturnTypeArgs = buildExplicitResultTypeArgsSuffix(enclosingPair?.first, enclosingPair?.second),
+        castEarlyPayloadTo = enclosingPair?.second?.takeIf(::isUsableExplicitResultTypeArg),
+        isUntypedScrutinee = sourceType != null && isUntypedResultScrutinee(sourceType),
+    )
 }
 
 /** The typed derived-equality method preserves Rust's equality type constraints.
@@ -397,36 +381,35 @@ internal fun KotlinJ2KEmitter.renderSourceEquality(left: Expr, right: Expr, nega
     val rightOptElemKind =
         rightType?.takeIf { it.endsWith("?") }?.removeSuffix("?")?.let(this::resolveNumericKind)
             ?: rightSomeArg?.let { inferExprNumericKind(it, selfType) }
-    val lhs =
+    fun renderEqualitySide(
+        expr: Expr,
+        ownKind: NumericKind?,
+        ownSomeArg: Expr?,
+        otherType: String?,
+        otherKind: NumericKind?,
+        otherOptElemKind: NumericKind?,
+    ): String =
         when {
-            leftKind == null && rightKind != null -> {
-                val raw = withExpectedNumericKind(rightKind) { renderExpr(left, indent, selfType) }
-                if (raw != "null" && isNumericLiteralOperand(left)) coerceRenderedNumericExpr(left, raw, rightKind) else raw
+            ownKind == null && otherKind != null -> {
+                val raw = withExpectedNumericKind(otherKind) { renderExpr(expr, indent, selfType) }
+                if (raw != "null" && isNumericLiteralOperand(expr)) coerceRenderedNumericExpr(expr, raw, otherKind) else raw
             }
-            leftSomeArg != null && inferExprNumericKind(leftSomeArg, selfType) == null && rightOptElemKind != null -> {
+            ownSomeArg != null && inferExprNumericKind(ownSomeArg, selfType) == null && otherOptElemKind != null -> {
                 val raw =
-                    withExpectedNumericKind(rightOptElemKind) {
-                        withExpectedTargetIfUnconstrained(left, rightType) { renderExpr(left, indent, selfType) }
+                    withExpectedNumericKind(otherOptElemKind) {
+                        withExpectedTargetIfUnconstrained(expr, otherType) { renderExpr(expr, indent, selfType) }
                     }
-                if (raw != "null" && isNumericLiteralOperand(leftSomeArg)) coerceRenderedNumericExpr(leftSomeArg, raw, rightOptElemKind) else raw
+                if (raw != "null" && isNumericLiteralOperand(ownSomeArg)) {
+                    coerceRenderedNumericExpr(ownSomeArg, raw, otherOptElemKind)
+                } else {
+                    raw
+                }
             }
-            else -> withExpectedTargetIfUnconstrained(left, rightType) { renderExpr(left, indent, selfType) }
+            else -> withExpectedTargetIfUnconstrained(expr, otherType) { renderExpr(expr, indent, selfType) }
         }
-    val rhs =
-        when {
-            rightKind == null && leftKind != null -> {
-                val raw = withExpectedNumericKind(leftKind) { renderExpr(right, indent, selfType) }
-                if (raw != "null" && isNumericLiteralOperand(right)) coerceRenderedNumericExpr(right, raw, leftKind) else raw
-            }
-            rightSomeArg != null && inferExprNumericKind(rightSomeArg, selfType) == null && leftOptElemKind != null -> {
-                val raw =
-                    withExpectedNumericKind(leftOptElemKind) {
-                        withExpectedTargetIfUnconstrained(right, leftType) { renderExpr(right, indent, selfType) }
-                    }
-                if (raw != "null" && isNumericLiteralOperand(rightSomeArg)) coerceRenderedNumericExpr(rightSomeArg, raw, leftOptElemKind) else raw
-            }
-            else -> withExpectedTargetIfUnconstrained(right, leftType) { renderExpr(right, indent, selfType) }
-        }
+
+    val lhs = renderEqualitySide(left, leftKind, leftSomeArg, rightType, rightKind, rightOptElemKind)
+    val rhs = renderEqualitySide(right, rightKind, rightSomeArg, leftType, leftKind, leftOptElemKind)
     val cleanLeftType = leftType?.removeSuffix("?")?.trim()
     val cleanRightType = rightType?.removeSuffix("?")?.trim()
     if (cleanLeftType != null && cleanLeftType == cleanRightType && cleanLeftType in PRIMITIVE_ARRAY_TYPES) {
@@ -520,6 +503,11 @@ private fun KotlinJ2KEmitter.isSynthesizedDebugFinishCall(call: Expr.MethodCall,
     return recvTypeBase in DEBUG_BUILDER_TYPES
 }
 
+private fun KotlinJ2KEmitter.singleUnqualifiedCleanIdent(expr: Expr): String {
+    val path = unwrapParenOrGroupExpr(expr).unqualifiedPath() ?: return ""
+    return path.singleSegment()?.cleanIdent().orEmpty()
+}
+
 /** True when a Rust expression renders as Unit, Appendable, or StringBuilder in fmt::Write/fmt::Result positions. */
 internal fun KotlinJ2KEmitter.isFmtWriteOrUnitExpr(expr: Expr, selfTypeName: String?): Boolean {
     val core = unwrapParenOrGroupExpr(expr)
@@ -535,16 +523,7 @@ internal fun KotlinJ2KEmitter.isFmtWriteOrUnitExpr(expr: Expr, selfTypeName: Str
             return true
         }
         if (rawMethod == "write_fmt" && core.args.size == 1 && core.turbofish == null) {
-            val recvPathIdent =
-                (unwrapParenOrGroupExpr(core.receiver) as? Expr.Path)
-                    ?.takeIf { it.qself == null && it.path.segments.len() == 1 }
-                    ?.path
-                    ?.segments
-                    ?.first()
-                    ?.ident
-                    ?.toString()
-                    ?.removePrefix("r#")
-            if (isFmtStringBuilderReceiver(core.receiver, recvPathIdent.orEmpty(), selfTypeName)) {
+            if (isFmtStringBuilderReceiver(core.receiver, singleUnqualifiedCleanIdent(core.receiver), selfTypeName)) {
                 return true
             }
         }
@@ -554,16 +533,7 @@ internal fun KotlinJ2KEmitter.isFmtWriteOrUnitExpr(expr: Expr, selfTypeName: Str
                     inferExprRenderedType(core.receiver, selfTypeName)?.removeSuffix("?")?.trim() == "String"
             if (isStrRecv) {
                 val arg0 = core.args[0]
-                val arg0Ident =
-                    (unwrapParenOrGroupExpr(arg0) as? Expr.Path)
-                        ?.takeIf { it.qself == null && it.path.segments.len() == 1 }
-                        ?.path
-                        ?.segments
-                        ?.first()
-                        ?.ident
-                        ?.toString()
-                        ?.removePrefix("r#")
-                if (isFmtStringBuilderReceiver(arg0, arg0Ident.orEmpty(), selfTypeName)) {
+                if (isFmtStringBuilderReceiver(arg0, singleUnqualifiedCleanIdent(arg0), selfTypeName)) {
                     return true
                 }
             }
@@ -573,22 +543,13 @@ internal fun KotlinJ2KEmitter.isFmtWriteOrUnitExpr(expr: Expr, selfTypeName: Str
         }
     }
     if (core is Expr.Macro) {
-        val macroName =
-            core.mac.path.segments
-                .last()
-                ?.ident
-                ?.toString()
-                ?.removePrefix("r#")
-        if (macroName in setOf("write", "writeln")) {
+        if (core.mac.path.lastCleanIdent() in setOf("write", "writeln")) {
             return true
         }
     }
-    if (core is Expr.Call && core.func is Expr.Path && (core.func as Expr.Path).qself == null) {
-        val segs =
-            (core.func as Expr.Path)
-                .path.segments
-                .toList()
-                .map { it.ident.toString().removePrefix("r#") }
+    val callPath = (core as? Expr.Call)?.func?.unqualifiedPath()
+    if (core is Expr.Call && callPath != null) {
+        val segs = callPath.cleanIdentStrings()
         val tailPair = if (segs.size >= 2) "${segs[segs.lastIndex - 1]}.${segs.last()}" else segs.lastOrNull()
         if (tailPair != null && tailPair.endsWith(".fmt") && tailPair.removeSuffix(".fmt") in FMT_TRAIT_NAMES &&
             core.args.size == 2
@@ -597,16 +558,7 @@ internal fun KotlinJ2KEmitter.isFmtWriteOrUnitExpr(expr: Expr, selfTypeName: Str
         }
         if (tailPair == "Write.write_fmt" && core.args.size == 2) {
             val targetArg = core.args[0]
-            val targetIdent =
-                (unwrapParenOrGroupExpr(targetArg) as? Expr.Path)
-                    ?.takeIf { it.qself == null && it.path.segments.len() == 1 }
-                    ?.path
-                    ?.segments
-                    ?.first()
-                    ?.ident
-                    ?.toString()
-                    ?.removePrefix("r#")
-            if (isFmtStringBuilderReceiver(targetArg, targetIdent.orEmpty(), selfTypeName)) {
+            if (isFmtStringBuilderReceiver(targetArg, singleUnqualifiedCleanIdent(targetArg), selfTypeName)) {
                 return true
             }
         }

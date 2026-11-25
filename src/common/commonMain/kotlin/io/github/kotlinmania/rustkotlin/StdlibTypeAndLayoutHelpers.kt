@@ -124,14 +124,20 @@ private object StdlibSpecialTypeCatalog {
 private fun SynType.singleCleanPathIdent(): String? =
     unwrapSynType(this).unqualifiedPath()?.singleSegment()?.cleanIdent()
 
-/** True when a Result scrutinee has an erased or unknown Kotlin type that still needs `<*, *>` casts. */
-internal fun isUntypedResultScrutinee(renderedType: String?): Boolean {
+/** True when a Result or ControlFlow scrutinee has an erased or unknown Kotlin type that still needs `<*, *>` casts. */
+internal fun isUntypedTaggedSumScrutinee(
+    renderedType: String?,
+    isControlFlow: Boolean = false,
+): Boolean {
     val clean = renderedType?.removeSuffix("?")?.trim() ?: return false
     if (clean == "Any" || clean == "RustAny" || clean == "*" || clean == "Nothing") return true
     if (clean.length == 1 && clean[0] in 'A'..'Z') return true
     val simpleBase = clean.substringBefore('<').substringAfterLast('.').trim()
-    return simpleBase != "Result" && simpleBase != "RustResult"
+    return if (isControlFlow) simpleBase != "ControlFlow" else simpleBase != "Result" && simpleBase != "RustResult"
 }
+
+internal fun isUntypedResultScrutinee(renderedType: String?): Boolean =
+    isUntypedTaggedSumScrutinee(renderedType, isControlFlow = false)
 
 /** True when a rendered Result type argument can be emitted explicitly on `Result.Ok<T, E>` or `Result.Err<T, E>`. */
 internal fun isUsableExplicitResultTypeArg(typeArg: String?): Boolean {

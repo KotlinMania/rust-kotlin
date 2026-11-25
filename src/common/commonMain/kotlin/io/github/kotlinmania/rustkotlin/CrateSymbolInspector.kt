@@ -43,18 +43,16 @@ internal data class AssocTypeDecl(
     val generics: Generics,
 )
 
+internal fun isStdFmtResultSegments(segs: List<String>): Boolean =
+    segs.lastOrNull() == "Result" &&
+        (
+            (segs.size == 2 && segs[0] == "fmt") ||
+                (segs.size >= 3 && segs[0] in STDLIB_CRATE_ROOTS && segs[1] == "fmt")
+        )
+
 internal fun isSynResultReturnType(output: ReturnType): Boolean {
-    val ty = extractReturnSynType(output) as? SynType.Path ?: return false
-    if (ty.qself != null) return false
-    val segs =
-        ty.path.segments
-            .toList()
-            .map { it.ident.toString().removePrefix("r#") }
-    if (segs.lastOrNull() != "Result") return false
-    val isStdFmt =
-        (segs.size == 2 && segs[0] == "fmt") ||
-            (segs.size >= 3 && segs[0] in setOf("core", "std", "alloc") && segs[1] == "fmt")
-    return !isStdFmt
+    val segs = extractReturnSynType(output)?.unqualifiedPath()?.cleanIdentStrings() ?: return false
+    return segs.lastOrNull() == "Result" && !isStdFmtResultSegments(segs)
 }
 
 internal val Item.attributes: List<Attribute>
