@@ -365,7 +365,7 @@ private class BlockEmissionScope(
             val renderedI = hoistedItems[i].second
             for (j in 0 until n) {
                 val nameJ = hoistedItems[j].first
-                if (i != j && nameJ != null && emitter.containsWholeIdentifier(renderedI, nameJ)) deps[i] += j
+                if (i != j && nameJ != null && containsWholeIdentifier(renderedI, nameJ)) deps[i] += j
             }
         }
         val emitted = BooleanArray(n)
@@ -1751,7 +1751,7 @@ private object ScopedBorrowedPlaceLocalLowering : LocalBindingLowering() {
                 override fun visitMacro(m: Macro) {
                     // Token-only macro arguments have not been resolved to expressions.
                     // Do not classify a hidden pointer use as a dereference.
-                    if (emitter.containsWholeIdentifier(m.tokens.toString(), raw)) escapes = true
+                    if (containsWholeIdentifier(m.tokens.toString(), raw)) escapes = true
                     super.visitMacro(m)
                 }
             }

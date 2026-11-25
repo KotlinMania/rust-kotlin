@@ -2058,7 +2058,7 @@ private class UseItemImportEmitter(
             if (shouldFilterUnusedLeaf(item, localBoundIdent) &&
                 bodyTextForPubUseFilter != null &&
                 localBoundIdent != "*" &&
-                !emitter.containsWholeIdentifier(bodyTextForPubUseFilter, localBoundIdent)
+                !containsWholeIdentifier(bodyTextForPubUseFilter, localBoundIdent)
             ) {
                 continue
             }
@@ -2087,7 +2087,7 @@ private class UseItemImportEmitter(
             headerContext.externalCrateSymbolPackages.values.flatMap { symMap ->
                 symMap.entries.mapNotNull { (sym, pkgs) -> if (importPkg in pkgs) sym else null }
             }
-        return symbolsInPkg.isEmpty() || symbolsInPkg.any { emitter.containsWholeIdentifier(bodyTextForPubUseFilter, it) }
+        return symbolsInPkg.isEmpty() || symbolsInPkg.any { containsWholeIdentifier(bodyTextForPubUseFilter, it) }
     }
 
     private fun shouldFilterUnusedLeaf(item: Item.Use, localBoundIdent: String): Boolean =

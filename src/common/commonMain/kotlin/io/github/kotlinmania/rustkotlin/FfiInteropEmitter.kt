@@ -814,7 +814,7 @@ internal class FfiInteropCollector(
         if (fn.returnBridgeKind == CAbiBridgeKind.CALLBACK_PTR || fn.params.any { it.bridgeKind == CAbiBridgeKind.CALLBACK_PTR }) {
             return false
         }
-        return preambles.any { containsCIdentifier(it, fn.cSymbolName) } || isDirectCallSafeSymbol(fn)
+        return preambles.any { containsWholeIdentifier(it, fn.cSymbolName) } || isDirectCallSafeSymbol(fn)
     }
 
     internal fun finalizeActualsKotlinFile(
@@ -1735,20 +1735,6 @@ internal val BUILTIN_KOTLIN_IDENTS: Set<String> =
             "toULong toFloat toDouble error emptyArray intArrayOf longArrayOf byteArrayOf shortArrayOf " +
             "floatArrayOf doubleArrayOf ubyteArrayOf ushortArrayOf uintArrayOf ulongArrayOf booleanArrayOf"
     ).split(' ').toSet()
-
-internal fun containsCIdentifier(code: String, ident: String): Boolean {
-    if (ident.isEmpty()) return false
-    var idx = 0
-    while (true) {
-        val pos = code.indexOf(ident, idx)
-        if (pos < 0) return false
-        val beforeOk = pos == 0 || (!code[pos - 1].isLetterOrDigit() && code[pos - 1] != '_')
-        val afterPos = pos + ident.length
-        val afterOk = afterPos >= code.length || (!code[afterPos].isLetterOrDigit() && code[afterPos] != '_')
-        if (beforeOk && afterOk) return true
-        idx = pos + 1
-    }
-}
 
 /**
  * Token-cursor parser for `c!` / `cpp!` inline FFI blocks (`[mut x: T as "CType", ...] -> Ret as "CRet" { ... }`).

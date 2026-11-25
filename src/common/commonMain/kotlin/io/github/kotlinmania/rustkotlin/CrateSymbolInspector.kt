@@ -8,8 +8,10 @@ import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.Attribute
 import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
+import io.github.kotlinmania.syn.Field
 import io.github.kotlinmania.syn.Fields
 import io.github.kotlinmania.syn.File
+import io.github.kotlinmania.syn.FileParse
 import io.github.kotlinmania.syn.FnArg
 import io.github.kotlinmania.syn.ForeignItem
 import io.github.kotlinmania.syn.GenericArgument
@@ -17,6 +19,7 @@ import io.github.kotlinmania.syn.GenericParam
 import io.github.kotlinmania.syn.Generics
 import io.github.kotlinmania.syn.ImplItem
 import io.github.kotlinmania.syn.Item
+import io.github.kotlinmania.syn.Lit
 import io.github.kotlinmania.syn.Macro
 import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.ModContent
@@ -33,6 +36,7 @@ import io.github.kotlinmania.syn.UseTree
 import io.github.kotlinmania.syn.Variant
 import io.github.kotlinmania.syn.WherePredicate
 import io.github.kotlinmania.syn.gen.Visit
+import io.github.kotlinmania.syn.parse2
 
 internal data class AssocTypeDecl(
     val ty: SynType,
@@ -189,16 +193,159 @@ internal fun Path.firstCleanIdent(): String? = firstIdentText()?.removePrefix("r
 
 internal fun Path.firstKotlinTypeName(): String? = firstIdentText()?.let(::rustTypeIdentToKotlin)
 
+internal fun Path.singleSegment(): PathSegment? = if (segments.size == 1) segments.first() else null
+
 internal fun Signature.cleanFnName(): String = ident.toString().removePrefix("r#")
 
 internal fun Signature.hasSelfReceiver(): Boolean = inputs.toList().firstOrNull() is FnArg.Receiver
 
+internal fun Signature.hasNoGenericParams(): Boolean = generics.params.isEmpty()
+
+internal fun Signature.hasTypeParams(): Boolean = generics.typeParamIdentNames().isNotEmpty()
+
 internal fun Generics.wherePredicatesList(): List<WherePredicate> = whereClause?.predicates?.toList().orEmpty()
+
+internal fun Generics.kotlinTypeParamNames(): List<String> = typeParamIdentNames().map(::rustTypeIdentToKotlin)
+
+internal fun Generics.kotlinConstParamNames(): List<String> =
+    params.toList().mapNotNull { param ->
+        val raw = (param as? GenericParam.ConstParam)?.ident?.cleanIdent() ?: return@mapNotNull null
+        rustValueIdentToKotlin(raw)
+    }
 
 internal fun String.simpleKotlinTypeName(): String = substringBefore('<').substringAfterLast('.').trim()
 
 internal fun File.findStructByKotlinName(ownerName: String): Item.Struct? =
     items.filterIsInstance<Item.Struct>().singleOrNull { rustTypeIdentToKotlin(it.ident.toString()) == ownerName }
+
+internal fun extractSimpleSelfOwnerTypeName(selfTy: SynType, generics: Generics): String? {
+    val typeParams = generics.kotlinTypeParamNames().toSet()
+    return when (val u = unwrapSynType(selfTy)) {
+        is SynType.Reference -> extractSimpleSelfOwnerTypeName(u.elem, generics)
+        is SynType.Path -> {
+            val seg = u.unqualifiedPath()?.singleSegment() ?: return null
+            val name = rustTypeIdentToKotlin(seg.ident.toString())
+            if (name in typeParams) null else name
+        }
+        else -> null
+    }
+}
+
+internal fun extractTraitSupertraitBindings(
+    traitItem: Item.Trait,
+    allowRawAbi: Boolean = false,
+    isImplicitStdTraitExcluded: (String) -> Boolean,
+): List<Pair<String, Set<String>>> =
+    traitItem.supertraits.toList().mapNotNull { bound ->
+        val traitBound = bound as? TypeParamBound.Trait ?: return@mapNotNull null
+        if (traitBound.maybe != null) return@mapNotNull null
+        val lastSeg = traitBound.path.segments.last() ?: return@mapNotNull null
+        val raw = lastSeg.cleanIdent()
+        if (raw in IGNORED_TRAIT_BOUNDS) return@mapNotNull null
+        val kt = KotlinNamingPolicy.Default.toTypeIdentifier(raw, allowRawAbi = allowRawAbi)
+        if (kt in RUST_STD_IMPLICIT_SUPERTRAITS && isImplicitStdTraitExcluded(kt)) return@mapNotNull null
+        val angleArgs = (lastSeg.arguments as? PathArguments.AngleBracketed)?.args?.toList()
+        val boundAssocs =
+            angleArgs
+                ?.filterIsInstance<GenericArgument.AssocTypeArg>()
+                ?.mapTo(linkedSetOf()) {
+                    KotlinNamingPolicy.Default.toTypeIdentifier(it.assoc.ident.toString(), allowRawAbi = false)
+                }.orEmpty()
+        kt to boundAssocs
+    }
+
+internal fun closeTraitSupertraitMetadata(
+    selfParameterizedTraits: MutableSet<String>,
+    traitSupertraits: Map<String, List<String>>,
+    traitSupertraitBindings: Map<String, List<Pair<String, Set<String>>>>,
+    traitDefaultlessAssocTypes: MutableMap<String, List<String>>,
+    fallbackDefaultlessAssocTypes: Map<String, List<String>> = emptyMap(),
+    skipImplicitSupertrait: (String) -> Boolean = { false },
+) {
+    var selfClosedChanged = true
+    while (selfClosedChanged) {
+        selfClosedChanged = false
+        for ((ktTrait, superNames) in traitSupertraits) {
+            val simpleTrait = ktTrait.substringAfterLast('.')
+            if (simpleTrait in selfParameterizedTraits) continue
+            if (superNames.any { it in selfParameterizedTraits || it in KNOWN_SELF_PARAMETERIZED_TRAITS }) {
+                selfParameterizedTraits += simpleTrait
+                selfClosedChanged = true
+            }
+        }
+    }
+    var assocClosedChanged = true
+    while (assocClosedChanged) {
+        assocClosedChanged = false
+        for ((ktTrait, superBindings) in traitSupertraitBindings) {
+            val cur = traitDefaultlessAssocTypes[ktTrait].orEmpty().toMutableList()
+            var added = false
+            for ((superKt, boundAssocs) in superBindings) {
+                if (skipImplicitSupertrait(superKt)) continue
+                val inherited =
+                    (traitDefaultlessAssocTypes[superKt] ?: fallbackDefaultlessAssocTypes[superKt]).orEmpty()
+                for (assoc in inherited) {
+                    if (assoc !in boundAssocs && assoc !in cur) {
+                        cur += assoc
+                        added = true
+                    }
+                }
+            }
+            if (added) {
+                traitDefaultlessAssocTypes[ktTrait] = cur
+                assocClosedChanged = true
+            }
+        }
+    }
+}
+
+internal data class ParsedWindowsLinkMacro(
+    val dllName: String,
+    val customSymbol: String?,
+    val foreignFn: ForeignItem.Fn,
+)
+
+internal object WindowsLinkMacroParser {
+    fun isWindowsLinkPath(path: Path): Boolean {
+        val segs = path.identStrings()
+        return (segs.size == 2 && (segs[0] == "windows_link" || segs[0] == "windows_targets") && segs[1] == "link") ||
+            segs.lastOrNull() == "link"
+    }
+
+    fun parse(mac: Macro): ParsedWindowsLinkMacro? {
+        val trees = mac.clonedTokenList()
+        val fnIdx = trees.indexOfFirst { tt -> tt is TokenTree.Ident && tt.value.toString() == "fn" }
+        if (fnIdx < 0) return null
+        val leadingStrings = mutableListOf<String>()
+        for (i in 0 until fnIdx) {
+            val tt = trees[i]
+            if (tt is TokenTree.Literal) {
+                val lit = Lit.new(tt.value)
+                if (lit is Lit.Str) {
+                    leadingStrings += lit.value.value()
+                }
+            }
+        }
+        val fnTokens = trees.subList(fnIdx, trees.size)
+        val pubTokens = TokenStream.fromString("pub").getOrThrow().toList()
+        val hasTrailingSemi = (fnTokens.lastOrNull() as? TokenTree.Punct)?.value?.asChar() == ';'
+        val semiTokens = if (hasTrailingSemi) emptyList() else TokenStream.fromString(";").getOrThrow().toList()
+        val braceBody =
+            TokenTree.Group(
+                Group(Delimiter.Brace, TokenStream.fromTokenTrees(pubTokens + fnTokens + semiTokens)),
+            )
+        val externPrefix = TokenStream.fromString("extern \"C\"").getOrThrow().toList()
+        val wrappedStream = TokenStream.fromTokenTrees(externPrefix + braceBody)
+        val parsedFile = parse2(FileParse::parse, wrappedStream).getOrNull() ?: return null
+        val foreignMod = parsedFile.items.firstOrNull() as? Item.ForeignMod ?: return null
+        val foreignFn = foreignMod.items.firstOrNull() as? ForeignItem.Fn ?: return null
+        return ParsedWindowsLinkMacro(
+            dllName = leadingStrings.getOrNull(0).orEmpty(),
+            customSymbol = leadingStrings.getOrNull(2),
+            foreignFn = foreignFn,
+        )
+    }
+}
 
 internal fun isExternalIdentityTypeReexportAlias(
     i: Item.ItemType,
@@ -502,6 +649,18 @@ internal class CrateSymbolInspector(
         val implConsts: List<String>,
     )
 
+    private fun recordForeignFnReferencedTypes(sig: Signature) {
+        for (arg in sig.inputs.toList()) {
+            if (arg is FnArg.Typed) {
+                recordFfiReferencedType(arg.patType.ty)
+            }
+        }
+        val out = sig.output
+        if (out is ReturnType.TypeReturn) {
+            recordFfiReferencedType(out.ty)
+        }
+    }
+
     override fun visitItem(i: Item) {
         if (itemHasDocOnlyCfg(i)) return
         if (i is Item.ForeignMod) {
@@ -524,72 +683,27 @@ internal class CrateSymbolInspector(
                                 topLevelForeignFns += cleanRawFnIdent to foreignArity
                             }
                         }
-                        for (arg in foreign.sig.inputs.toList()) {
-                            if (arg is FnArg.Typed) {
-                                recordFfiReferencedType(arg.patType.ty)
-                            }
-                        }
+                        recordForeignFnReferencedTypes(foreign.sig)
                         val out = foreign.sig.output
-                        if (out is ReturnType.TypeReturn) {
-                            recordFfiReferencedType(out.ty)
-                            val genParams = foreign.sig.generics.params
-                            if (blockDepth == 0 && genParams.isEmpty()) {
-                                val cleanRawFn = rawFnIdent.removePrefix("r#")
-                                if (cleanRawFn !in topLevelFnReturnSynTypes) {
-                                    topLevelFnReturnSynTypes[cleanRawFn] = out.ty
-                                }
-                                val ktFn = rustFunctionIdentToKotlin(rawFnIdent)
-                                if (ktFn !in topLevelFnReturnSynTypes) {
-                                    topLevelFnReturnSynTypes[ktFn] = out.ty
-                                }
-                            }
+                        if (out is ReturnType.TypeReturn && blockDepth == 0 && foreign.sig.hasNoGenericParams()) {
+                            topLevelFnReturnSynTypes.putIfAbsentKey(cleanRawFnIdent, out.ty)
+                            topLevelFnReturnSynTypes.putIfAbsentKey(rustFunctionIdentToKotlin(rawFnIdent), out.ty)
                         }
                     }
                     is ForeignItem.Static -> recordFfiReferencedType(foreign.ty)
                     else -> {}
                 }
             }
-        } else if (i is Item.Macro) {
-            val pathSegs = i.mac.path.segments
-            val segs = pathSegs.toList().map { it.ident.toString() }
-            val isWinLink =
-                (segs.size == 2 && (segs[0] == "windows_link" || segs[0] == "windows_targets") && segs[1] == "link") ||
-                    segs.lastOrNull() == "link"
-            if (isWinLink) {
-                val macTokens = i.mac.tokens
-                val trees = macTokens.clone().toList()
-                val fnIdx = trees.indexOfFirst { tt -> tt is TokenTree.Ident && tt.value.toString() == "fn" }
-                if (fnIdx >= 0) {
-                    val fnTokens = trees.subList(fnIdx, trees.size)
-                    val pubTokens = TokenStream.fromString("pub").getOrThrow().toList()
-                    val hasTrailingSemi = (fnTokens.lastOrNull() as? TokenTree.Punct)?.value?.asChar() == ';'
-                    val semiTokens = if (hasTrailingSemi) emptyList() else TokenStream.fromString(";").getOrThrow().toList()
-                    val braceBody = TokenTree.Group(Group(Delimiter.Brace, TokenStream.fromTokenTrees(pubTokens + fnTokens + semiTokens)))
-                    val externPrefix = TokenStream.fromString("extern \"C\"").getOrThrow().toList()
-                    val wrappedStream = TokenStream.fromTokenTrees(externPrefix + braceBody)
-                    val parsedFile =
-                        io.github.kotlinmania.syn
-                            .parse2(io.github.kotlinmania.syn.FileParse::parse, wrappedStream)
-                            .getOrNull()
-                    val foreignMod = parsedFile?.items?.firstOrNull() as? Item.ForeignMod
-                    val foreignFn = foreignMod?.items?.firstOrNull() as? ForeignItem.Fn
-                    if (foreignFn != null) {
-                        val rawFnIdent = foreignFn.sig.ident.toString()
-                        if (blockDepth == 0) {
-                            declaredTopLevelFnRawNames += rawFnIdent.removePrefix("r#")
-                            externFnKotlinNames += rustFunctionIdentToKotlin(rawFnIdent)
-                        }
-                        for (arg in foreignFn.sig.inputs.toList()) {
-                            if (arg is FnArg.Typed) {
-                                recordFfiReferencedType(arg.patType.ty)
-                            }
-                        }
-                        val out = foreignFn.sig.output
-                        if (out is ReturnType.TypeReturn) {
-                            recordFfiReferencedType(out.ty)
-                        }
-                    }
+        } else if (i is Item.Macro && WindowsLinkMacroParser.isWindowsLinkPath(i.mac.path)) {
+            val parsed = WindowsLinkMacroParser.parse(i.mac)
+            if (parsed != null) {
+                val foreignFn = parsed.foreignFn
+                val rawFnIdent = foreignFn.sig.ident.toString()
+                if (blockDepth == 0) {
+                    declaredTopLevelFnRawNames += rawFnIdent.removePrefix("r#")
+                    externFnKotlinNames += rustFunctionIdentToKotlin(rawFnIdent)
                 }
+                recordForeignFnReferencedTypes(foreignFn.sig)
             }
         }
         super.visitItem(i)
@@ -608,34 +722,22 @@ internal class CrateSymbolInspector(
                     outerTopLevelFnArities += ktFn to arity
                 }
             }
-            val constParams =
-                i.sig.generics.params
-                    .toList()
-                    .mapNotNull {
-                        (it as? GenericParam.ConstParam)
-                            ?.ident
-                            ?.toString()
-                            ?.removePrefix("r#")
-                            ?.let(::rustValueIdentToKotlin)
-                    }
+            val constParams = i.sig.generics.kotlinConstParamNames()
             if (constParams.isNotEmpty()) {
                 val valueArity = i.sig.inputs.count { it is FnArg.Typed }
                 fnConstParamNames.putIfMissingKey(cleanRaw, ktFn, valueArity, constParams)
             }
-            val genParams = i.sig.generics.params
-            if (genParams.isEmpty()) {
-                val out = i.sig.output
-                if (out is ReturnType.TypeReturn) {
-                    if (cleanRaw !in topLevelFnReturnSynTypes) {
-                        topLevelFnReturnSynTypes[cleanRaw] = out.ty
-                    }
-                    if (ktFn !in topLevelFnReturnSynTypes) {
-                        topLevelFnReturnSynTypes[ktFn] = out.ty
-                    }
-                }
+            val out = i.sig.output
+            if (i.sig.hasNoGenericParams() && out is ReturnType.TypeReturn) {
+                topLevelFnReturnSynTypes.putIfAbsentKey(cleanRaw, out.ty)
+                topLevelFnReturnSynTypes.putIfAbsentKey(ktFn, out.ty)
             }
         }
         super.visitItemFn(i)
+    }
+
+    private fun <V> MutableMap<String, V>.putIfAbsentKey(key: String, value: V) {
+        if (key !in this) this[key] = value
     }
 
     private fun MutableMap<String, Pair<Int, List<String>>>.putIfMissingKey(
@@ -799,23 +901,7 @@ internal class CrateSymbolInspector(
                 }
                 structFieldSynTypesByType[name] = fieldTyMap
             }
-            is Fields.Named -> {
-                val names = mutableListOf<String>()
-                val fieldTyMap = linkedMapOf<String, SynType>()
-                val seen = hashSetOf<String>()
-                val namedFields = fields.fields.named.toList()
-                for ((idx, f) in namedFields.withIndex()) {
-                    if (isDocOnlyCfgAttribute(f.attrs)) continue
-                    val fName = rustFieldIdentToKotlin(f.ident?.toString() ?: "field$idx")
-                    if (seen.add(fName)) {
-                        names += fName
-                        fieldTyMap[fName] = f.ty
-                        classifyStructFieldType(name, fName, f.ty)
-                    }
-                }
-                structFieldNamesByType[name] = names
-                structFieldSynTypesByType[name] = fieldTyMap
-            }
+            is Fields.Named -> recordNamedStructOrUnionFields(name, fields.fields.named.toList())
             is Fields.Unit -> {
                 unitStructNames += name
                 structFieldNamesByType[name] = emptyList()
@@ -824,14 +910,31 @@ internal class CrateSymbolInspector(
         super.visitItemStruct(i)
     }
 
+    private fun recordNamedStructOrUnionFields(ownerType: String, namedFields: List<Field>) {
+        val names = mutableListOf<String>()
+        val fieldTyMap = linkedMapOf<String, SynType>()
+        val seen = hashSetOf<String>()
+        for ((idx, f) in namedFields.withIndex()) {
+            if (isDocOnlyCfgAttribute(f.attrs)) continue
+            val fName = rustFieldIdentToKotlin(f.ident?.toString() ?: "field$idx")
+            if (seen.add(fName)) {
+                names += fName
+                fieldTyMap[fName] = f.ty
+                classifyStructFieldType(ownerType, fName, f.ty)
+            }
+        }
+        structFieldNamesByType[ownerType] = names
+        structFieldSynTypesByType[ownerType] = fieldTyMap
+    }
+
     private fun classifyStructFieldType(ownerType: String, ktFieldName: String, ty: SynType) {
         val u = unwrapSynType(ty)
-        val path = (u as? SynType.Path)?.takeIf { it.qself == null }?.path ?: return
-        val segs = path.segments.toList()
+        val path = u.unqualifiedPath() ?: return
+        val segs = path.identStrings()
         if (segs.isEmpty()) return
-        val lastIdent = segs.last().ident.toString()
-        val hasSlicePrefix = segs.any { it.ident.toString() == "slice" }
-        val hasVecOrOptionPrefix = segs.any { it.ident.toString() == "vec" || it.ident.toString() == "option" }
+        val lastIdent = segs.last()
+        val hasSlicePrefix = "slice" in segs
+        val hasVecOrOptionPrefix = segs.any { it == "vec" || it == "option" }
         when {
             lastIdent == "Option" -> nullableFieldsByType.getOrPut(ownerType) { linkedSetOf() }.add(ktFieldName)
             lastIdent == "Vec" -> vecFieldsByType.getOrPut(ownerType) { linkedSetOf() }.add(ktFieldName)
@@ -850,10 +953,7 @@ internal class CrateSymbolInspector(
             attachableTypeNames += name
             recordTypeDefaultArgs(name, i.generics)
         }
-        val enumTypeParams =
-            i.generics.params
-                .toList()
-                .mapNotNull { (it as? GenericParam.TypeParam)?.ident?.toString()?.let(::rustTypeIdentToKotlin) }
+        val enumTypeParams = i.generics.kotlinTypeParamNames()
         for (v in i.variants.toList()) {
             val vName = rustTypeIdentToKotlin(v.ident.toString())
             enumVariantSimpleNames += vName
@@ -867,10 +967,8 @@ internal class CrateSymbolInspector(
                 genericUnitEnumVariants += vName
             }
             if (vFields is Fields.Unnamed) {
-                val fieldTys =
-                    vFields.fields.unnamed
-                        .toList()
-                        .map { it.ty }
+                val unnamed = vFields.fields.unnamed.toList()
+                val fieldTys = unnamed.map { it.ty }
                 tupleEnumVariantArity[name to vName] = fieldTys.size
                 enumVariantFieldTypes["$name.$vName"] = fieldTys
                 enumVariantFieldTypes[vName] = fieldTys
@@ -905,43 +1003,17 @@ internal class CrateSymbolInspector(
                 }
             }
         }
-        if (defaultlessAssocs.isNotEmpty() && blockDepth == 0) {
-            traitDefaultlessAssocTypes[ktTraitName] = defaultlessAssocs.distinct()
-        }
-        if (resultFnNames.isNotEmpty() && blockDepth == 0) {
-            traitResultMethods[ktTraitName] = resultFnNames
-        }
-        if (blockDepth == 0 && traitReferencesSelfOutsideReceiver(i)) {
-            selfParameterizedTraits += ktTraitName
-        }
         if (blockDepth == 0) {
-            val superEntries =
-                i.supertraits
-                    .toList()
-                    .mapNotNull { bound ->
-                        val path =
-                            (bound as? TypeParamBound.Trait)
-                                ?.takeIf { it.maybe == null }
-                                ?.path
-                                ?: return@mapNotNull null
-                        val lastSeg = path.segments.last() ?: return@mapNotNull null
-                        val raw =
-                            lastSeg.ident
-                                .toString()
-                                .removePrefix("r#")
-                        if (raw in IGNORED_TRAIT_BOUNDS) return@mapNotNull null
-                        val kt = rustTypeIdentToKotlin(raw)
-                        if (kt in RUST_STD_IMPLICIT_SUPERTRAITS && kt !in declaredTypeNames) return@mapNotNull null
-                        val boundAssocs =
-                            (lastSeg.arguments as? PathArguments.AngleBracketed)
-                                ?.args
-                                ?.toList()
-                                ?.filterIsInstance<GenericArgument.AssocTypeArg>()
-                                ?.map { rustTypeIdentToKotlin(it.assoc.ident.toString()) }
-                                ?.toSet()
-                                .orEmpty()
-                        kt to boundAssocs
-                    }
+            if (defaultlessAssocs.isNotEmpty()) {
+                traitDefaultlessAssocTypes[ktTraitName] = defaultlessAssocs.distinct()
+            }
+            if (resultFnNames.isNotEmpty()) {
+                traitResultMethods[ktTraitName] = resultFnNames
+            }
+            if (traitReferencesSelfOutsideReceiver(i)) {
+                selfParameterizedTraits += ktTraitName
+            }
+            val superEntries = extractTraitSupertraitBindings(i) { it !in declaredTypeNames }
             if (superEntries.isNotEmpty()) {
                 traitSupertraits[ktTraitName] = superEntries.map { it.first }.distinct()
                 traitSupertraitBindings[ktTraitName] = superEntries
@@ -957,21 +1029,7 @@ internal class CrateSymbolInspector(
             attachableTypeNames += name
             unionTypeNames += name
         }
-        val names = mutableListOf<String>()
-        val fieldTyMap = linkedMapOf<String, SynType>()
-        val seen = hashSetOf<String>()
-        val namedFields = i.fields.named.toList()
-        for ((idx, f) in namedFields.withIndex()) {
-            if (isDocOnlyCfgAttribute(f.attrs)) continue
-            val fName = rustFieldIdentToKotlin(f.ident?.toString() ?: "field$idx")
-            if (seen.add(fName)) {
-                names += fName
-                fieldTyMap[fName] = f.ty
-                classifyStructFieldType(name, fName, f.ty)
-            }
-        }
-        structFieldNamesByType[name] = names
-        structFieldSynTypesByType[name] = fieldTyMap
+        recordNamedStructOrUnionFields(name, i.fields.named.toList())
         super.visitItemUnion(i)
     }
 
@@ -1014,38 +1072,17 @@ internal class CrateSymbolInspector(
     }
 
     override fun visitItemImpl(i: Item.Impl) {
-        val ownerName = extractInspectorOwnerName(i.selfType, i.generics)
-        val implHasTypeParams =
-            i.generics.params
-                .toList()
-                .any { it is GenericParam.TypeParam }
-        val implConsts =
-            i.generics.params
-                .toList()
-                .mapNotNull {
-                    (it as? GenericParam.ConstParam)
-                        ?.ident
-                        ?.toString()
-                        ?.removePrefix("r#")
-                        ?.let(::rustValueIdentToKotlin)
-                }
+        val ownerName = extractSimpleSelfOwnerTypeName(i.selfType, i.generics)
+        val implHasTypeParams = i.generics.typeParamIdentNames().isNotEmpty()
+        val implConsts = i.generics.kotlinConstParamNames()
         for (implItem in i.items) {
             if (implItem is ImplItem.AssocType) {
                 val assocName = rustTypeIdentToKotlin(implItem.ident.toString())
                 if (ownerName != null) {
                     val assocMap = ownerAssocTypes.getOrPut(ownerName) { linkedMapOf() }
-                    val assocKey = implItem.ident.toString()
-                    if (assocKey !in assocMap) {
-                        assocMap[assocKey] = implItem.ty
-                    }
+                    assocMap.putIfAbsentKey(implItem.ident.toString(), implItem.ty)
                 }
-                val traitName =
-                    i.traitPath
-                        ?.path
-                        ?.segments
-                        ?.last()
-                        ?.ident
-                        ?.toString()
+                val traitName = i.traitPath?.path?.lastIdentText()
                 // IntoIterator's implementation-specific iterator is already
                 // lowered on its owning class. It must not shadow an imported
                 // IntoIter type with a package-global alias from another owner.
@@ -1056,23 +1093,12 @@ internal class CrateSymbolInspector(
                         (traitName in setOf("Fn", "FnMut", "FnOnce", "Future", "Index", "IndexMut") && assocName == "Output") ||
                         (traitName in setOf("TryFrom", "TryInto", "FromStr") && (assocName == "Err" || assocName == "Error"))
                 if (isBuiltinAssocType) continue
-                if (assocName !in associatedTypeDecls) {
-                    associatedTypeDecls[assocName] = AssocTypeDecl(implItem.ty, i.generics)
-                }
+                associatedTypeDecls.putIfAbsentKey(assocName, AssocTypeDecl(implItem.ty, i.generics))
             } else if (implItem is ImplItem.Fn && ownerName != null) {
                 if (isDocOnlyCfgAttribute(implItem.attrs)) continue
                 val fnKt = rustFunctionIdentToKotlin(implItem.sig.ident.toString())
                 val valueArity = implItem.sig.inputs.count { it is FnArg.Typed }
-                val fnConsts =
-                    implItem.sig.generics.params
-                        .toList()
-                        .mapNotNull {
-                            (it as? GenericParam.ConstParam)
-                                ?.ident
-                                ?.toString()
-                                ?.removePrefix("r#")
-                                ?.let(::rustValueIdentToKotlin)
-                        }
+                val fnConsts = implItem.sig.generics.kotlinConstParamNames()
                 if (implItem.sig.inputs.firstOrNull() is FnArg.Receiver) {
                     instanceMethodsByType.getOrPut(ownerName) { linkedSetOf() }.add(fnKt)
                     if (fnConsts.isNotEmpty() || implConsts.isNotEmpty()) {
@@ -1084,47 +1110,19 @@ internal class CrateSymbolInspector(
                     companionMethodsByType.getOrPut(ownerName) { linkedSetOf() }.add(fnKt)
                     val combinedConsts = (implConsts + fnConsts).distinct()
                     if (combinedConsts.isNotEmpty()) {
-                        val key = "$ownerName.$fnKt"
-                        if (key !in fnConstParamNames) {
-                            fnConstParamNames[key] = valueArity to combinedConsts
-                        }
+                        fnConstParamNames.putIfAbsentKey("$ownerName.$fnKt", valueArity to combinedConsts)
                     }
                 }
-                val fnHasTypeParams =
-                    implItem.sig.generics.params
-                        .toList()
-                        .any { it is GenericParam.TypeParam }
-                if (!implHasTypeParams && !fnHasTypeParams) {
-                    val out = implItem.sig.output
-                    if (out is ReturnType.TypeReturn) {
-                        val key = ownerName to fnKt
-                        if (key !in implMethodReturnSynTypes) {
-                            implMethodReturnSynTypes[key] = out.ty
-                        }
+                val fnHasTypeParams = implItem.sig.hasTypeParams()
+                val out = implItem.sig.output
+                if (!implHasTypeParams && !fnHasTypeParams && out is ReturnType.TypeReturn) {
+                    if ((ownerName to fnKt) !in implMethodReturnSynTypes) {
+                        implMethodReturnSynTypes[ownerName to fnKt] = out.ty
                     }
                 }
             }
         }
         super.visitItemImpl(i)
-    }
-
-    private fun extractInspectorOwnerName(selfTy: SynType, generics: Generics): String? {
-        val typeParams =
-            generics.params
-                .toList()
-                .mapNotNull { (it as? GenericParam.TypeParam)?.ident?.toString()?.let(::rustTypeIdentToKotlin) }
-                .toSet()
-        return when (val u = unwrapSynType(selfTy)) {
-            is SynType.Reference -> extractInspectorOwnerName(u.elem, generics)
-            is SynType.Path -> {
-                if (u.qself != null) return null
-                val segs = u.path.segments.toList()
-                if (segs.size != 1) return null
-                val name = rustTypeIdentToKotlin(segs[0].ident.toString())
-                if (name in typeParams) null else name
-            }
-            else -> null
-        }
     }
 }
 
@@ -1365,35 +1363,18 @@ internal fun describeUnemittedSubstantiveItems(
     expandedFile: File = originalFile,
 ): List<String> {
     val labels = mutableListOf<String>()
-    fun collectMacroRulesDefinitions(ast: File) {
-        for (item in ast.items) {
+    fun walkMacroItems(items: List<Item>, collectMacroRules: Boolean) {
+        for (item in items) {
             if (itemHasDocOnlyCfg(item)) continue
             when (item) {
                 is Item.Macro -> {
-                    if (item.mac.path.isIdent("macro_rules")) {
-                        val macroName = item.ident?.toString()?.removePrefix("r#") ?: "macro_rules"
+                    val isMacroRules = item.mac.path.isIdent("macro_rules")
+                    if (collectMacroRules && isMacroRules) {
+                        val macroName = item.ident?.cleanIdent() ?: "macro_rules"
                         labels += "$macroName!"
-                    }
-                }
-                is Item.Mod -> {
-                    val content = item.content
-                    if (content is ModContent.Inline) {
-                        collectMacroRulesDefinitions(File(shebang = null, attrs = emptyList(), items = content.items))
-                    }
-                }
-                else -> {}
-            }
-        }
-    }
-    fun collectUnexpandedMacroInvocations(ast: File) {
-        for (item in ast.items) {
-            if (itemHasDocOnlyCfg(item)) continue
-            when (item) {
-                is Item.Macro -> {
-                    if (!item.mac.path.isIdent("macro_rules")) {
-                        val macPath = item.mac.path
-                        val pathSegs = macPath.segments.toList()
-                        val pathText = pathSegs.joinToString("::") { it.ident.toString() }
+                    } else if (!collectMacroRules && !isMacroRules) {
+                        val pathSegs = item.mac.path.identStrings()
+                        val pathText = pathSegs.joinToString("::")
                         if (pathText != "windows_link::link" && pathText != "include") {
                             labels += "$pathText!"
                         }
@@ -1402,15 +1383,15 @@ internal fun describeUnemittedSubstantiveItems(
                 is Item.Mod -> {
                     val content = item.content
                     if (content is ModContent.Inline) {
-                        collectUnexpandedMacroInvocations(File(shebang = null, attrs = emptyList(), items = content.items))
+                        walkMacroItems(content.items, collectMacroRules)
                     }
                 }
                 else -> {}
             }
         }
     }
-    collectMacroRulesDefinitions(originalFile)
-    collectUnexpandedMacroInvocations(expandedFile)
+    walkMacroItems(originalFile.items, collectMacroRules = true)
+    walkMacroItems(expandedFile.items, collectMacroRules = false)
     return labels.distinct()
 }
 

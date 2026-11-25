@@ -66,17 +66,8 @@ internal fun translateRustSourceToKotlinArtifacts(
         parentText to (emitter.emitCompanionFiles() + splitModCompanions)
     }
 
-private val UNSIGNED_ARRAY_IDENTS =
-    listOf(
-        "UByteArray",
-        "UShortArray",
-        "UIntArray",
-        "ULongArray",
-        "ubyteArrayOf",
-        "ushortArrayOf",
-        "uintArrayOf",
-        "ulongArrayOf",
-    )
+private val UNSIGNED_ARRAY_IDENTS: Set<String> =
+    wordSet("UByteArray UShortArray UIntArray ULongArray ubyteArrayOf ushortArrayOf uintArrayOf ulongArrayOf")
 
 internal class IndexedFnEntry(
     val order: Int,
@@ -118,43 +109,16 @@ internal class KotlinJ2KEmitter(
             }
             sym.visitFile(file)
             sym.selfParameterizedTraits.addAll(headerContext.crateSelfParameterizedTraits)
-            var selfClosedChanged = true
-            while (selfClosedChanged) {
-                selfClosedChanged = false
-                for ((ktTrait, superNames) in sym.traitSupertraits) {
-                    if (ktTrait in sym.selfParameterizedTraits) continue
-                    if (superNames.any { it in sym.selfParameterizedTraits || it in KNOWN_SELF_PARAMETERIZED_TRAITS }) {
-                        sym.selfParameterizedTraits += ktTrait
-                        selfClosedChanged = true
-                    }
-                }
-            }
-            var assocClosedChanged = true
-            while (assocClosedChanged) {
-                assocClosedChanged = false
-                for ((ktTrait, superBindings) in sym.traitSupertraitBindings) {
-                    val cur = sym.traitDefaultlessAssocTypes[ktTrait].orEmpty().toMutableList()
-                    var addedHere = false
-                    for ((superKt, boundAssocs) in superBindings) {
-                        if (superKt in RUST_STD_IMPLICIT_SUPERTRAITS && superKt !in sym.declaredTraitsByName) continue
-                        val inherited =
-                            (
-                                sym.traitDefaultlessAssocTypes[superKt]
-                                    ?: headerContext.crateTraitDefaultlessAssocTypes[superKt]
-                            ).orEmpty()
-                        for (assoc in inherited) {
-                            if (assoc !in boundAssocs && assoc !in cur) {
-                                cur += assoc
-                                addedHere = true
-                            }
-                        }
-                    }
-                    if (addedHere) {
-                        sym.traitDefaultlessAssocTypes[ktTrait] = cur
-                        assocClosedChanged = true
-                    }
-                }
-            }
+            closeTraitSupertraitMetadata(
+                selfParameterizedTraits = sym.selfParameterizedTraits,
+                traitSupertraits = sym.traitSupertraits,
+                traitSupertraitBindings = sym.traitSupertraitBindings,
+                traitDefaultlessAssocTypes = sym.traitDefaultlessAssocTypes,
+                fallbackDefaultlessAssocTypes = headerContext.crateTraitDefaultlessAssocTypes,
+                skipImplicitSupertrait = { superKt ->
+                    superKt in RUST_STD_IMPLICIT_SUPERTRAITS && superKt !in sym.declaredTraitsByName
+                },
+            )
             sym.closeFfiReferencedTypeAliases()
             if (sharedModFile != null && sym.allUseItems.size > 1) {
                 val deduped =
@@ -283,31 +247,11 @@ internal class KotlinJ2KEmitter(
             includeDocExampleAnnotations = headerContext.isDocExample,
         )
 
+    private val ownerMatcher by lazy(LazyThreadSafetyMode.NONE) { BlanketImplAndOwnerMatcher(this) }
+
     internal fun emitFile(): String {
         val out = StringBuilder()
-
-        val allEnumItemsForVariantArity =
-            sameFileNestedItems(TranslationSession.sharedModuleFile?.items.orEmpty() + file.items)
-                .filterIsInstance<Item.Enum>()
-        for (enumItem in allEnumItemsForVariantArity) {
-            val enumKt = rustTypeIdentToKotlin(enumItem.ident.toString())
-            val explicitParams =
-                enumItem.generics.params
-                    .toList()
-                    .mapNotNull { (it as? GenericParam.TypeParam)?.ident?.toString()?.let(::rustTypeIdentToKotlin) }
-            val assocParams = sourceAssociatedParameters(enumItem.generics).map { it.associated }
-            val fullParams = (explicitParams + assocParams).distinct()
-            if (fullParams.size > explicitParams.size) {
-                for (v in enumItem.variants.toList()) {
-                    val vName = rustTypeIdentToKotlin(v.ident.toString())
-                    inspector.enumTypeParamsByVariant["$enumKt.$vName"] = fullParams
-                    val prevSimple = inspector.enumTypeParamsByVariant[vName]
-                    if (prevSimple == null || prevSimple.size == explicitParams.size) {
-                        inspector.enumTypeParamsByVariant[vName] = fullParams
-                    }
-                }
-            }
-        }
+        closeEnumVariantTypeParamArities()
 
         // Partition impl blocks into those belonging to a local type declared in this file
         // vs standalone/external impl blocks, and hoist all `use` imports to the top.
@@ -318,8 +262,7 @@ internal class KotlinJ2KEmitter(
         val sharedModFile = TranslationSession.sharedModuleFile
         if (sharedModFile != null) {
             for (sharedItem in sharedModFile.items) {
-                if (itemHasDocOnlyCfg(sharedItem)) continue
-                if (sharedItem is Item.Use) {
+                if (!itemHasDocOnlyCfg(sharedItem) && sharedItem is Item.Use) {
                     registerUseItemInScope(sharedItem)
                 }
             }
@@ -330,10 +273,8 @@ internal class KotlinJ2KEmitter(
                 if (sharedModFile == null || sharedModFile.items.none { it === item }) {
                     registerUseItemInScope(item)
                 }
+                continue
             }
-        }
-        for (item in file.items) {
-            if (itemHasDocOnlyCfg(item) || item is Item.Use) continue
             if (item is Item.Impl && !shouldOmitItemForUnportedQuickcheckOrRand(item)) {
                 val ownerType = extractAttachableDirectOwnerTypeName(item)
                 if (ownerType != null && ownerType in inspector.attachableTypeNames) {
@@ -347,7 +288,7 @@ internal class KotlinJ2KEmitter(
         val attachedBlanketImpls = mutableListOf<Item.Impl>()
         for (item in standaloneItems) {
             if (item is Item.Impl && item.traitPath != null) {
-                val matchedOwners = matchBlanketLocalIteratorImplOwners(item, localTypeImpls)
+                val matchedOwners = ownerMatcher.matchBlanketLocalIteratorImplOwners(item, localTypeImpls)
                 if (matchedOwners.isNotEmpty()) {
                     for (owner in matchedOwners) {
                         localTypeImpls.getOrPut(owner) { mutableListOf() }.add(item)
@@ -361,13 +302,7 @@ internal class KotlinJ2KEmitter(
         }
         for (item in standaloneItems) {
             if (item is Item.Impl) {
-                val tPath = item.traitPath?.path ?: continue
-                val traitKt =
-                    tPath.segments
-                        .last()
-                        ?.ident
-                        ?.toString()
-                        ?.let(::rustTypeIdentToKotlin) ?: continue
+                val traitKt = item.traitPath?.path?.lastKotlinTypeName() ?: continue
                 val selfDesc = describeSynTypeForDisambiguation(item.selfType)
                 if (traitKt.isNotEmpty() && selfDesc.isNotEmpty()) {
                     standaloneTraitImplKeys += (traitKt to selfDesc)
@@ -379,197 +314,10 @@ internal class KotlinJ2KEmitter(
             standaloneItems.clear()
             standaloneItems.addAll(sortedStandalone)
         }
-        val topLevelFnParamKinds = linkedMapOf<String, List<NumericKind?>?>()
-        val fnScanItems = TranslationSession.sharedModuleFile?.items ?: standaloneItems
-        for (item in fnScanItems) {
-            if (item is Item.Fn && !itemHasDocOnlyCfg(item)) {
-                val extracted = extractFnParamNumericKinds(item, selfTypeName = null)
-                if (extracted != null) {
-                    val (fnName, kinds) = extracted
-                    topLevelFnParamKinds[fnName] = if (fnName in topLevelFnParamKinds) null else kinds
-                    val arityKey = "$fnName#${kinds.size}"
-                    topLevelFnParamKinds[arityKey] = if (arityKey in topLevelFnParamKinds) null else kinds
-                }
-            } else if (item is Item.ForeignMod && !itemHasDocOnlyCfg(item)) {
-                val prevExtern = inExternAbiSignature
-                inExternAbiSignature = true
-                try {
-                    for (foreign in item.items) {
-                        if (foreign is ForeignItem.Fn && !foreignItemHasDocOnlyCfg(foreign)) {
-                            val extracted = extractSigParamNumericKinds(foreign.sig, selfTypeName = null)
-                            if (extracted != null) {
-                                val rawForeignFn =
-                                    foreign.sig.ident
-                                        .toString()
-                                        .removePrefix("r#")
-                                val fnName = inspector.collidingTopLevelForeignFnRenames[rawForeignFn] ?: extracted.first
-                                val kinds = extracted.second
-                                topLevelFnParamKinds[fnName] = if (fnName in topLevelFnParamKinds) null else kinds
-                                val arityKey = "$fnName#${kinds.size}"
-                                topLevelFnParamKinds[arityKey] = if (arityKey in topLevelFnParamKinds) null else kinds
-                            }
-                        }
-                    }
-                } finally {
-                    inExternAbiSignature = prevExtern
-                }
-            }
-        }
-        val implScanItems = TranslationSession.sharedModuleFile?.items ?: file.items
-        val implScanTraitByName = linkedMapOf<String, Item.Trait>()
-        implScanTraitByName.putAll(inspector.declaredTraitsByName)
-        for (item in implScanItems + file.items) {
-            if (item is Item.Trait && !itemHasDocOnlyCfg(item)) {
-                val tName = rustTypeIdentToKotlin(item.ident.toString())
-                if (tName !in implScanTraitByName) {
-                    implScanTraitByName[tName] = item
-                }
-            }
-        }
-        val implTraitsByOwner = linkedMapOf<String, MutableSet<String>>()
-        for (item in implScanItems) {
-            if (item is Item.Impl && item.generics.params.isEmpty() && !itemHasDocOnlyCfg(item)) {
-                val ownerType = extractDirectOwnerTypeName(item.selfType, item.generics) ?: continue
-                item.traitPath
-                    ?.path
-                    ?.segments
-                    ?.toList()
-                    ?.lastOrNull()
-                    ?.ident
-                    ?.toString()
-                    ?.let(::rustTypeIdentToKotlin)
-                    ?.let { implTraitsByOwner.getOrPut(ownerType) { linkedSetOf() }.add(it) }
-                for (implItem in item.items) {
-                    if (implItem is ImplItem.Fn && !implItemHasDocOnlyCfg(implItem)) {
-                        val extracted = extractSigParamNumericKinds(implItem.sig, ownerType)
-                        if (extracted != null) {
-                            val (fnName, kinds) = extracted
-                            val qualKey = "$ownerType.$fnName"
-                            topLevelFnParamKinds[qualKey] = if (qualKey in topLevelFnParamKinds) null else kinds
-                        }
-                    }
-                }
-            }
-        }
-        for ((ownerType, traitNames) in implTraitsByOwner) {
-            for (traitName in traitNames) {
-                val traitItem = implScanTraitByName[traitName] ?: continue
-                for (tItem in traitItem.items) {
-                    if (tItem is TraitItem.Fn && !traitItemHasDocOnlyCfg(tItem)) {
-                        val extracted = extractSigParamNumericKinds(tItem.sig, ownerType) ?: continue
-                        val (fnName, kinds) = extracted
-                        val qualKey = "$ownerType.$fnName"
-                        if (qualKey !in topLevelFnParamKinds) {
-                            topLevelFnParamKinds[qualKey] = kinds
-                        }
-                    }
-                }
-            }
-        }
-        for ((traitName, traitItem) in implScanTraitByName) {
-            for (tItem in traitItem.items) {
-                if (tItem is TraitItem.Fn && !traitItemHasDocOnlyCfg(tItem) && tItem.sig.inputs.none { it is FnArg.Receiver }) {
-                    val extracted = extractSigParamNumericKinds(tItem.sig, traitName) ?: continue
-                    val (fnName, kinds) = extracted
-                    val qualKey = "$traitName.$fnName"
-                    if (qualKey !in topLevelFnParamKinds) {
-                        topLevelFnParamKinds[qualKey] = kinds
-                    }
-                }
-            }
-        }
-        for (aliasName in inspector.typeAliasTargets.keys) {
-            var cur = aliasName
-            val seen = hashSetOf<String>()
-            while (seen.add(cur) && seen.size <= 8) {
-                val ty = inspector.typeAliasTargets[cur] ?: break
-                val u = unwrapSynType(ty) as? SynType.Path ?: break
-                if (u.qself != null) break
-                val next =
-                    u.path.segments
-                        .toList()
-                        .lastOrNull()
-                        ?.ident
-                        ?.toString()
-                        ?.removePrefix("r#")
-                        ?.let(::rustTypeIdentToKotlin) ?: break
-                if (next == cur) break
-                cur = next
-            }
-            if (cur != aliasName) {
-                val ownerPrefix = "$cur."
-                val snapshot = topLevelFnParamKinds.entries.map { it.key to it.value }
-                for ((k, v) in snapshot) {
-                    if (k.startsWith(ownerPrefix)) {
-                        val aliasKey = "$aliasName.${k.removePrefix(ownerPrefix)}"
-                        if (aliasKey !in topLevelFnParamKinds) {
-                            topLevelFnParamKinds[aliasKey] = v
-                        }
-                    }
-                }
-            }
-        }
-        for ((crateFnKey, kindCodes) in headerContext.crateFnParamNumericKinds) {
-            if (crateFnKey !in topLevelFnParamKinds) {
-                topLevelFnParamKinds[crateFnKey] = kindCodes.map { numericKindFromScannerCode(it.takeIf(String::isNotEmpty)) }
-            }
-        }
-        currentFunctionParamNumericKinds =
-            topLevelFnParamKinds.entries
-                .mapNotNull { (k, v) -> v?.let { k to it } }
-                .toMap()
+        val indexedTopLevelFnKeys = FileFunctionNumericParamIndexer(this).indexAndApply(standaloneItems)
 
         val renderedItems = mutableListOf<String>()
-
-        // Emit associated type aliases required for TypeParity if not already declared as types
-        val nestedAllItems = sameFileNestedItems(file.items)
-        val implementedOrImportedTraitNames =
-            buildSet {
-                for (it in nestedAllItems) {
-                    when (it) {
-                        is Item.Trait -> add(rustTypeIdentToKotlin(it.ident.toString()))
-                        is Item.Impl ->
-                            it.traitPath
-                                ?.path
-                                ?.segments
-                                ?.last()
-                                ?.ident
-                                ?.toString()
-                                ?.let { raw -> add(rustTypeIdentToKotlin(raw)) }
-                        else -> {}
-                    }
-                }
-                addAll(importedSimpleNameToPkg.keys)
-            }
-        for ((assocName, assocDecl) in inspector.associatedTypeDecls) {
-            val ownerBindings =
-                nestedAllItems.filterIsInstance<Item.Impl>().flatMap { implementation ->
-                    implementation.items
-                        .filterIsInstance<ImplItem.AssocType>()
-                        .filter { it.ident.toString() == assocName }
-                        .map { implementation.selfType }
-                }
-            if (ownerBindings.size > 1) continue
-            if (assocName !in inspector.declaredTypeNames &&
-                assocName !in implementedOrImportedTraitNames &&
-                assocName !in KOTLIN_STDLIB_SHADOWED_IMPORTS
-            ) {
-                val targetType = renderType(assocDecl.ty, selfTypeName = null)
-                if (targetType.isEmpty() || targetType == assocName) continue
-                val candidateParams =
-                    assocDecl.generics.params
-                        .toList()
-                        .mapNotNull { param ->
-                            (param as? GenericParam.TypeParam)?.ident?.toString()?.let(::rustTypeIdentToKotlin)
-                        }.distinct()
-                val strippedTarget = targetType.trim().removeSuffix("?")
-                if (strippedTarget in candidateParams || strippedTarget in activeTypeParamNames) continue
-                inspector.declaredTypeNames += assocName
-                val usedParams = candidateParams.filter { containsWholeIdentifier(targetType, it) }
-                val typeParamSuffix = if (usedParams.isEmpty()) "" else "<${usedParams.joinToString(", ")}>"
-                renderedItems += "public typealias $assocName$typeParamSuffix = $targetType"
-            }
-        }
+        emitMissingAssocTypeAliases(renderedItems)
 
         val pendingTopLevelTestFns = mutableListOf<String>()
         val topLevelTestSignatures = linkedMapOf<String, Int>()
@@ -603,33 +351,15 @@ internal class KotlinJ2KEmitter(
 
         val activeCoreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
         val srcPathNorm = headerContext.portLintSourcePath?.replace('\\', '/')
-        val isConstPtrSource =
-            srcPathNorm?.endsWith("/const_ptr.rs") == true ||
-                srcPathNorm == "const_ptr.rs" ||
-                (
-                    srcPathNorm == null &&
-                        standaloneItems.any { item ->
-                            item is Item.Impl &&
-                                item.traitPath == null &&
-                                unwrapSynType(item.selfType).let { u -> u is SynType.Ptr && u.mutability is PointerMutability.Const }
-                        }
-                )
-        val isMutPtrSource =
-            srcPathNorm?.endsWith("/mut_ptr.rs") == true ||
-                srcPathNorm == "mut_ptr.rs" ||
-                (
-                    srcPathNorm == null &&
-                        standaloneItems.any { item ->
-                            item is Item.Impl &&
-                                item.traitPath == null &&
-                                unwrapSynType(item.selfType).let { u -> u is SynType.Ptr && u.mutability is PointerMutability.Mut }
-                        }
-                )
         if (headerContext.packageName?.startsWith("$activeCoreNs.ptr.") == true) {
-            if (isConstPtrSource && "ConstPtr" !in inspector.declaredTypeNames) {
+            if (isRawPtrImplSource(srcPathNorm, standaloneItems, "const_ptr.rs", isMut = false) &&
+                "ConstPtr" !in inspector.declaredTypeNames
+            ) {
                 CoreIntrinsicLowering.registerCoreImport(this, "$activeCoreNs.ptr.ConstPtr")
             }
-            if (isMutPtrSource && "MutPtr" !in inspector.declaredTypeNames) {
+            if (isRawPtrImplSource(srcPathNorm, standaloneItems, "mut_ptr.rs", isMut = true) &&
+                "MutPtr" !in inspector.declaredTypeNames
+            ) {
                 CoreIntrinsicLowering.registerCoreImport(this, "$activeCoreNs.ptr.MutPtr")
             }
         }
@@ -637,13 +367,7 @@ internal class KotlinJ2KEmitter(
         if (usesCurrentThreadToken && topLevelSignatureCounts["currentThreadBoundToken()"] == null) {
             renderedItems.add(0, "internal expect fun currentThreadBoundToken(): Any")
         }
-        val usesExternalRustLangCore =
-            "core" in headerContext.crateNamespaces ||
-                headerContext.packageName == activeCoreNs ||
-                headerContext.packageName?.startsWith("$activeCoreNs.") == true
-
-        val inlineExpects = ffiCollector.renderInlineExpectDeclarations()
-        renderedItems.addAll(inlineExpects)
+        renderedItems.addAll(ffiCollector.renderInlineExpectDeclarations())
 
         val preMacroBodyEmpty =
             synthesizedSamDeclarations.isEmpty() &&
@@ -657,7 +381,7 @@ internal class KotlinJ2KEmitter(
                     buildSet {
                         addAll(inspector.declaredTypeNames)
                         addAll(inspector.declaredConstNames.values)
-                        addAll(topLevelFnParamKinds.keys)
+                        addAll(indexedTopLevelFnKeys)
                     }
                 emitStandaloneMacroApproximations(
                     originalFile = originalFile,
@@ -679,7 +403,12 @@ internal class KotlinJ2KEmitter(
                     add(PhantomRawPointerTypeStripper.strip(itemDecl))
                 }
             }
-        if (allBodyItems.isEmpty() && ffiCollector.emitCompanionFiles().isEmpty() && !headerContext.isDocExample && !headerContext.isModuleRootSource && !headerContext.isBatchCrateOutput) {
+        if (allBodyItems.isEmpty() &&
+            ffiCollector.emitCompanionFiles().isEmpty() &&
+            !headerContext.isDocExample &&
+            !headerContext.isModuleRootSource &&
+            !headerContext.isBatchCrateOutput
+        ) {
             val unemittedItems = describeUnemittedSubstantiveItems(originalFile = originalFile, expandedFile = file)
             if (unemittedItems.isNotEmpty()) {
                 throw IllegalArgumentException(
@@ -690,8 +419,7 @@ internal class KotlinJ2KEmitter(
         }
 
         val bodyTextForImports = stripKotlinCommentsAndStrings(allBodyItems.joinToString("\n\n"))
-        val needsUnsignedArrayOptIn =
-            UNSIGNED_ARRAY_IDENTS.any { containsWholeIdentifier(bodyTextForImports, it) }
+        val needsUnsignedArrayOptIn = UNSIGNED_ARRAY_IDENTS.any { containsWholeIdentifier(bodyTextForImports, it) }
 
         if (headerContext.portLintDirective != "none") {
             headerContext.portLintSourcePath?.let { relPath ->
@@ -710,672 +438,21 @@ internal class KotlinJ2KEmitter(
             out.append("package ").append(pkg).append("\n\n")
         }
 
-        val useImportLines =
-            inspector.allUseItems
-                .flatMap { renderItemUse(it, indent = "", bodyTextForPubUseFilter = bodyTextForImports).lines() }
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-
-        val extraImports = mutableListOf<String>()
-        if (usesSourceResult && usesTaggedCoreResult() && !hasDeclaredResultEnum()) {
-            extraImports +=
-                if (hasConflictingResultBinding()) {
-                    "import $activeCoreNs.result.Result as RustResult"
-                } else {
-                    "import $activeCoreNs.result.Result"
-                }
-        }
-        val combinedExtraTypeImports = linkedSetOf<String>()
-        combinedExtraTypeImports.addAll(extraTypePathImports)
-        for (macroImp in standaloneMacros.extraImports) {
-            val normalizedImp = if (macroImp.startsWith("import ")) macroImp else "import $macroImp"
-            combinedExtraTypeImports += normalizedImp
-        }
-        val activeAllocNs = CoreIntrinsicLowering.resolveAllocNamespace(headerContext)
-        val autoCoreSymbols =
-            if (headerContext.isDocExample) {
-                emptyList()
-            } else {
-                buildList {
-                    add("ConstPtr" to "$activeCoreNs.ptr")
-                    add("MutPtr" to "$activeCoreNs.ptr")
-                    add("TypeLayout" to "$activeCoreNs.mem")
-                    add("PrimitiveLayouts" to "$activeCoreNs.mem")
-                    add("PrimitiveArrayLayouts" to "$activeCoreNs.mem")
-                    add("fixedListTypeLayout" to "$activeCoreNs.mem")
-                    add("U128" to activeCoreNs)
-                    add("I128" to activeCoreNs)
-                    add("F16" to activeCoreNs)
-                    add("F128" to activeCoreNs)
-                    add("RustAny" to activeCoreNs)
-                    add("RustTypeId" to activeCoreNs)
-                    add("DebugStruct" to "$activeCoreNs.fmt")
-                    add("DebugTuple" to "$activeCoreNs.fmt")
-                    if (!headerContext.rawAbiMode) {
-                        for (ffiSym in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS.values.distinct()) {
-                            if (resolveBestSubpackageForSymbol(ffiSym) == null) {
-                                add(
-                                    ffiSym to
-                                        CoreIntrinsicLowering.defaultStdlibFfiSymbolPackage(
-                                            ffiSym,
-                                            activeCoreNs,
-                                            activeAllocNs,
-                                        ),
-                                )
-                            }
-                        }
-                        if (resolveBestSubpackageForSymbol("CString") == null) {
-                            add(
-                                "CString" to
-                                    CoreIntrinsicLowering.defaultStdlibFfiSymbolPackage(
-                                        "CString",
-                                        activeCoreNs,
-                                        activeAllocNs,
-                                    ),
-                            )
-                        }
-                    }
-                    if (usesExternalRustLangCore) {
-                        add("Ordering" to "$activeCoreNs.cmp")
-                        add("ParseIntError" to "$activeCoreNs.num.error")
-                        add("IntErrorKind" to "$activeCoreNs.num.error")
-                        add("TryFromIntError" to "$activeCoreNs.num.error")
-                        add("FpCategory" to "$activeCoreNs.num")
-                        add("Wrapping" to "$activeCoreNs.num.wrapping")
-                        add("Pin" to "$activeCoreNs.pin")
-                        add("ControlFlow" to "$activeCoreNs.ops.controlflow")
-                        add("Allocator" to "$activeCoreNs.alloc")
-                        add("AllocError" to "$activeCoreNs.alloc")
-                        add("Layout" to "$activeCoreNs.alloc.layout")
-                        add("transmute" to "$activeCoreNs.mem")
-                        add("transmuteUnchecked" to "$activeCoreNs.mem")
-                        add("sizeOf" to "$activeCoreNs.mem")
-                        add("alignOf" to "$activeCoreNs.mem")
-                    }
-                    if (usesExternalRustLangCore ||
-                        "core" in headerContext.crateNamespaces ||
-                        headerContext.packageName == activeCoreNs ||
-                        headerContext.packageName?.startsWith("$activeCoreNs.") == true
-                    ) {
-                        for (ptrFn in listOf(
-                            "nullMut",
-                            "nullVal",
-                            "withoutProvenance",
-                            "withoutProvenanceMut",
-                            "dangling",
-                            "danglingMut",
-                            "fromRef",
-                            "fromMut",
-                            "sliceFromRawParts",
-                            "sliceFromRawPartsMut",
-                            "copyNonoverlapping",
-                            "writeBytes",
-                            "dropInPlace",
-                        )) {
-                            add(ptrFn to "$activeCoreNs.ptr")
-                        }
-                    }
-                    if ("core" in headerContext.crateNamespaces || headerContext.scalarChar) {
-                        add("Cell" to "$activeCoreNs.cell")
-                        add("RefCell" to "$activeCoreNs.cell")
-                        add("Ref" to "$activeCoreNs.cell")
-                        add("RefMut" to "$activeCoreNs.cell")
-                        add("OnceCell" to "$activeCoreNs.cell.once")
-                        add("RustChar" to "$activeCoreNs.char")
-                        add("CharTryFromError" to "$activeCoreNs.char")
-                        add("RustCharIndex" to "$activeCoreNs.char")
-                        add("rustChars" to "$activeCoreNs.char")
-                        add("rustCharIndices" to "$activeCoreNs.char")
-                        for (asciiHelper in listOf(
-                            "isAscii",
-                            "isAsciiAlphabetic",
-                            "isAsciiUppercase",
-                            "isAsciiLowercase",
-                            "isAsciiAlphanumeric",
-                            "isAsciiDigit",
-                            "isAsciiHexdigit",
-                            "isAsciiPunctuation",
-                            "isAsciiGraphic",
-                            "isAsciiWhitespace",
-                            "isAsciiControl",
-                            "toAsciiLowercase",
-                            "toAsciiUppercase",
-                        )) {
-                            add(asciiHelper to "$activeCoreNs.char.methods")
-                        }
-                    }
-                    if ("core" in headerContext.crateNamespaces && !headerContext.rawAbiMode) {
-                        add("unreachableUnchecked" to "$activeCoreNs.hint")
-                        add("assertUnchecked" to "$activeCoreNs.hint")
-                        add("sizeOf" to "$activeCoreNs.mem")
-                        add("alignOf" to "$activeCoreNs.mem")
-                        add("sizeOfVal" to "$activeCoreNs.mem")
-                        add("alignOfVal" to "$activeCoreNs.mem")
-                        add("readUnaligned" to "$activeCoreNs.ptr")
-                        add("writeUnaligned" to "$activeCoreNs.ptr")
-                        add("min" to "$activeCoreNs.cmp")
-                        add("max" to "$activeCoreNs.cmp")
-                        add("clamp" to "$activeCoreNs.cmp")
-                    }
-                }
-            }
-        val stdlibOverloadExtImports = hashSetOf<String>()
-        for ((symSimple, symPkg) in autoCoreSymbols) {
-            if (headerContext.packageName != symPkg &&
-                symSimple !in inspector.declaredTypeNames &&
-                symSimple !in inspector.declaredConstNames.values &&
-                symSimple !in importedSimpleNameToPkg &&
-                (!isDeclaredTopLevelFnKotlinName(symSimple) || (symPkg == "$activeCoreNs.mem" && symSimple == "get")) &&
-                containsWholeIdentifier(bodyTextForImports, symSimple)
-            ) {
-                val imp = "import $symPkg.$symSimple"
-                if (symPkg == "$activeCoreNs.mem" && symSimple == "get") {
-                    stdlibOverloadExtImports += imp
-                }
-                if (imp !in combinedExtraTypeImports) {
-                    combinedExtraTypeImports += imp
-                }
-            }
-        }
-        val isInCoreOrUsingExternalCore =
-            usesExternalRustLangCore ||
-                "core" in headerContext.crateNamespaces ||
-                headerContext.packageName == activeCoreNs ||
-                headerContext.packageName?.startsWith("$activeCoreNs.") == true
-        if (isInCoreOrUsingExternalCore && !headerContext.rawAbiMode) {
-            for ((variantName, variantOwner) in listOf(
-                "Break" to "$activeCoreNs.ops.controlflow.ControlFlow",
-                "Continue" to "$activeCoreNs.ops.controlflow.ControlFlow",
-                "Less" to "$activeCoreNs.cmp.Ordering",
-                "Equal" to "$activeCoreNs.cmp.Ordering",
-                "Greater" to "$activeCoreNs.cmp.Ordering",
-            )) {
-                val ownerPkg = variantOwner.substringBeforeLast('.')
-                if (headerContext.packageName != ownerPkg &&
-                    variantName !in inspector.declaredTypeNames &&
-                    variantName !in inspector.declaredConstNames.values &&
-                    variantName !in inspector.enumVariantSimpleNames &&
-                    variantName !in inspector.importedEnumVariantSimpleNames &&
-                    variantName !in importedSimpleNameToPkg &&
-                    !isDeclaredTopLevelFnKotlinName(variantName) &&
-                    containsWholeIdentifier(bodyTextForImports, variantName)
-                ) {
-                    val imp = "import $variantOwner.$variantName"
-                    if (imp !in combinedExtraTypeImports) {
-                        combinedExtraTypeImports += imp
-                    }
-                }
-            }
-        }
-        if (isInCoreOrUsingExternalCore && !headerContext.rawAbiMode && headerContext.packageName != "$activeCoreNs.mem") {
-            val maxTupleDestructuringArity =
-                Regex("""\b(?:val|var)\s*\(([^()]+)\)\s*=""")
-                    .findAll(bodyTextForImports)
-                    .maxOfOrNull { match -> match.groupValues[1].count { it == ',' } + 1 }
-                    ?: 0
-            if (maxTupleDestructuringArity >= 6) {
-                for (compIdx in 6..minOf(maxTupleDestructuringArity, 12)) {
-                    val compImp = "import $activeCoreNs.mem.component$compIdx"
-                    if (compImp !in extraImports) {
-                        extraImports += compImp
-                    }
-                }
-            }
-        }
-        if (usesRustChar && headerContext.packageName != "$activeCoreNs.char" && "RustChar" !in inspector.declaredTypeNames) {
-            val rustCharImport = "import $activeCoreNs.char.RustChar"
-            if (rustCharImport !in combinedExtraTypeImports) {
-                combinedExtraTypeImports += rustCharImport
-            }
-        }
-        if (isInCoreOrUsingExternalCore && !headerContext.rawAbiMode) {
-            val mutPtrExts =
-                listOf(
-                    "isNull",
-                    "cast",
-                    "add",
-                    "sub",
-                    "offset",
-                    "byteAdd",
-                    "byteSub",
-                    "byteOffset",
-                    "wrappingAdd",
-                    "wrappingSub",
-                    "wrappingOffset",
-                    "wrappingByteAdd",
-                    "wrappingByteSub",
-                    "wrappingByteOffset",
-                    "read",
-                    "readUnaligned",
-                    "readVolatile",
-                    "write",
-                    "writeUnaligned",
-                    "writeVolatile",
-                    "writeBytes",
-                    "copyTo",
-                    "copyToNonoverlapping",
-                    "copyFrom",
-                    "copyFromNonoverlapping",
-                    "asRef",
-                    "asMut",
-                    "asUninitRef",
-                    "asUninitMut",
-                    "asUninitSlice",
-                    "asUninitSliceMut",
-                    "addr",
-                    "withAddr",
-                    "mapAddr",
-                    "exposeProvenance",
-                    "castConst",
-                    "castUninit",
-                    "castInit",
-                    "castSlice",
-                    "offsetFrom",
-                    "offsetFromUnsigned",
-                    "byteOffsetFrom",
-                    "byteOffsetFromUnsigned",
-                    "isAligned",
-                    "isAlignedTo",
-                    "alignOffset",
-                    "dropInPlace",
-                    "replace",
-                    "swap",
-                    "withMetadataOf",
-                    "toRawParts",
-                    "mask",
-                    "len",
-                    "splitAtMut",
-                )
-            val constPtrExts =
-                listOf(
-                    "isNull",
-                    "cast",
-                    "add",
-                    "sub",
-                    "offset",
-                    "byteAdd",
-                    "byteSub",
-                    "byteOffset",
-                    "wrappingAdd",
-                    "wrappingSub",
-                    "wrappingOffset",
-                    "wrappingByteAdd",
-                    "wrappingByteSub",
-                    "wrappingByteOffset",
-                    "read",
-                    "readUnaligned",
-                    "readVolatile",
-                    "copyTo",
-                    "copyToNonoverlapping",
-                    "asRef",
-                    "asUninitRef",
-                    "asUninitSlice",
-                    "addr",
-                    "withAddr",
-                    "mapAddr",
-                    "exposeProvenance",
-                    "castMut",
-                    "castUninit",
-                    "castInit",
-                    "castSlice",
-                    "offsetFrom",
-                    "offsetFromUnsigned",
-                    "byteOffsetFrom",
-                    "byteOffsetFromUnsigned",
-                    "isAligned",
-                    "isAlignedTo",
-                    "alignOffset",
-                    "withMetadataOf",
-                    "toRawParts",
-                    "mask",
-                    "len",
-                )
-            val numExts =
-                listOf(
-                    "uncheckedAdd",
-                    "uncheckedSub",
-                    "uncheckedMul",
-                    "checkedAdd",
-                    "checkedSub",
-                    "checkedMul",
-                    "checkedDiv",
-                    "checkedRem",
-                    "checkedAddUnsigned",
-                    "checkedSubUnsigned",
-                    "checkedAddSigned",
-                    "checkedSubSigned",
-                    "overflowingAdd",
-                    "overflowingSub",
-                    "overflowingMul",
-                    "overflowingAddUnsigned",
-                    "overflowingSubUnsigned",
-                    "overflowingAddSigned",
-                    "overflowingSubSigned",
-                    "wrappingAddUnsigned",
-                    "wrappingSubUnsigned",
-                    "wrappingAddSigned",
-                    "wrappingSubSigned",
-                    "saturatingAdd",
-                    "saturatingSub",
-                    "saturatingMul",
-                    "saturatingAddUnsigned",
-                    "saturatingSubUnsigned",
-                    "carryingAdd",
-                    "borrowingSub",
-                    "carryingMul",
-                    "carryingMulAdd",
-                    "wideningMul",
-                    "absDiff",
-                    "divCeil",
-                    "nextMultipleOf",
-                    "checkedNextMultipleOf",
-                    "isMultipleOf",
-                    "midpoint",
-                    "castSigned",
-                    "castUnsigned",
-                    "isPowerOfTwo",
-                    "nextPowerOfTwo",
-                    "checkedNextPowerOfTwo",
-                    "wrappingNextPowerOfTwo",
-                    "ilog",
-                    "ilog2",
-                    "ilog10",
-                    "checkedIlog",
-                    "checkedIlog2",
-                    "checkedIlog10",
-                    "isqrt",
-                    "checkedIsqrt",
-                )
-            val stdlibExts =
-                buildList {
-                    add("clone" to "$activeCoreNs.clone")
-                    add("len" to "$activeCoreNs.slice")
-                    add("iter" to "$activeCoreNs.slice")
-                    add("iterMut" to "$activeCoreNs.slice")
-                    add("splitAt" to "$activeCoreNs.slice")
-                    add("len" to "$activeCoreNs.str")
-                    add("isCharBoundary" to "$activeCoreNs.str")
-                    add("splitAt" to "$activeCoreNs.str")
-                    add("splitFirst" to "$activeCoreNs.slice")
-                    add("splitFirstMut" to "$activeCoreNs.slice")
-                    add("splitLast" to "$activeCoreNs.slice")
-                    add("splitLastMut" to "$activeCoreNs.slice")
-                    add("splitAtMut" to "$activeCoreNs.slice")
-                    add("chunksExact" to "$activeCoreNs.slice")
-                    add("chunksExactMut" to "$activeCoreNs.slice")
-                    if (Regex("""\bAtomic(?:Bool|Ptr|I8|U8|I16|U16|I32|U32|I64|U64|I128|U128|Isize|Usize)?\b""")
-                            .containsMatchIn(bodyTextForImports)
-                    ) {
-                        for (atomicExt in listOf(
-                            "load",
-                            "store",
-                            "swap",
-                            "compareExchange",
-                            "compareExchangeWeak",
-                            "fetchAdd",
-                            "fetchSub",
-                            "fetchAnd",
-                            "fetchOr",
-                            "fetchXor",
-                            "fetchNand",
-                            "fetchMax",
-                            "fetchMin",
-                            "fetchUpdate",
-                            "intoInner",
-                            "getMut",
-                            "asPtr",
-                        )) {
-                            add(atomicExt to "$activeCoreNs.sync.atomic")
-                        }
-                    }
-                    for (ext in numExts) {
-                        add(ext to "$activeCoreNs.num")
-                    }
-                    if (containsWholeIdentifier(bodyTextForImports, "MutPtr") ||
-                        containsWholeIdentifier(bodyTextForImports, "asMutPtr") ||
-                        containsWholeIdentifier(bodyTextForImports, "nullMut")
-                    ) {
-                        for (ext in mutPtrExts) {
-                            add(ext to "$activeCoreNs.ptr.mutptr")
-                        }
-                    }
-                    if (containsWholeIdentifier(bodyTextForImports, "ConstPtr") ||
-                        containsWholeIdentifier(bodyTextForImports, "asPtr")
-                    ) {
-                        for (ext in constPtrExts) {
-                            add(ext to "$activeCoreNs.ptr.constptr")
-                        }
-                    }
-                }
-            for ((extName, extPkg) in stdlibExts) {
-                if (headerContext.packageName != extPkg &&
-                    extName !in inspector.declaredTypeNames &&
-                    extName !in inspector.declaredConstNames.values &&
-                    extName !in importedSimpleNameToPkg &&
-                    (!isDeclaredTopLevelFnKotlinName(extName) || extName == "clone") &&
-                    Regex("\\.\\s*$extName\\s*[({<]").containsMatchIn(bodyTextForImports)
-                ) {
-                    val imp = "import $extPkg.$extName"
-                    stdlibOverloadExtImports += imp
-                    if (imp !in combinedExtraTypeImports) {
-                        combinedExtraTypeImports += imp
-                    }
-                }
-            }
-        }
-        if (containsWholeIdentifier(bodyTextForImports, "Byte") ||
-            containsWholeIdentifier(bodyTextForImports, "Short")
-        ) {
-            val expOps =
-                buildList {
-                    if (Regex("\\.\\s*inv\\s*\\(\\s*\\)").containsMatchIn(bodyTextForImports)) add("inv")
-                    if (Regex("\\band\\b").containsMatchIn(bodyTextForImports)) add("and")
-                    if (Regex("\\bor\\b").containsMatchIn(bodyTextForImports)) add("or")
-                    if (Regex("\\bxor\\b").containsMatchIn(bodyTextForImports)) add("xor")
-                }
-            for (op in expOps) {
-                if (!isDeclaredTopLevelFnKotlinName(op) && op !in importedSimpleNameToPkg) {
-                    val imp = "import kotlin.experimental.$op"
-                    if (imp !in combinedExtraTypeImports) {
-                        combinedExtraTypeImports += imp
-                    }
-                }
-            }
-        }
-        val nsPrefixForExt = currentNamespacePrefix()
-        for ((symSimple, symPkg) in importedSimpleNameToPkg.toList()) {
-            if (symSimple.firstOrNull()?.isUpperCase() == true && symPkg != headerContext.packageName) {
-                val camelFn = symSimple.replaceFirstChar { it.lowercaseChar() }
-                if (camelFn !in inspector.declaredTypeNames &&
-                    camelFn !in inspector.declaredConstNames.values &&
-                    camelFn !in importedSimpleNameToPkg &&
-                    !isDeclaredTopLevelFnKotlinName(camelFn) &&
-                    Regex("\\.\\s*$camelFn\\s*[({<]").containsMatchIn(bodyTextForImports)
-                ) {
-                    val relSub =
-                        when {
-                            nsPrefixForExt == null -> null
-                            symPkg == nsPrefixForExt -> ""
-                            symPkg.startsWith("$nsPrefixForExt.") -> symPkg.removePrefix("$nsPrefixForExt.")
-                            else -> null
-                        }
-                    val existsInPkg =
-                        (relSub != null && relSub in headerContext.crateSymbolSubpackages[camelFn].orEmpty()) ||
-                            headerContext.externalCrateSymbolPackages.values.any { symMap ->
-                                symPkg in symMap[camelFn].orEmpty()
-                            }
-                    if (existsInPkg) {
-                        val imp = "import $symPkg.$camelFn"
-                        if (imp !in combinedExtraTypeImports) {
-                            combinedExtraTypeImports += imp
-                        }
-                    }
-                }
-            }
-        }
-        extraImports.addAll(
-            combinedExtraTypeImports.filter { imp ->
-                val afterImport = imp.removePrefix("import ").trim()
-                val impPath = afterImport.substringBefore(" as ").trim()
-                val rawSimple = impPath.substringAfterLast('.')
-                val boundSimple =
-                    if (" as " in afterImport) {
-                        afterImport.substringAfter(" as ").trim()
-                    } else {
-                        rawSimple
-                    }
-                val targetPkg = impPath.substringBeforeLast('.', missingDelimiterValue = "")
-                val isSingleUpperTypeParam = boundSimple.length == 1 && boundSimple[0] in 'A'..'Z'
-                val isEnumVariantShadowed =
-                    (boundSimple in inspector.enumVariantSimpleNames || boundSimple in inspector.importedEnumVariantSimpleNames) &&
-                        !impPath.endsWith(".Result.$rawSimple") &&
-                        impPath != "Result.$rawSimple" &&
-                        !impPath.endsWith(".Option.$rawSimple") &&
-                        impPath != "Option.$rawSimple"
-                targetPkg != headerContext.packageName &&
-                    boundSimple !in inspector.declaredTypeNames &&
-                    !isSingleUpperTypeParam &&
-                    !isEnumVariantShadowed &&
-                    containsWholeIdentifier(bodyTextForImports, boundSimple)
-            },
-        )
-        val rawProjNs = headerContext.projectNamespace?.trim()?.removeSuffix(".")
-        val projNs = rawProjNs?.takeIf { it.isNotEmpty() }
-        val libcNs = FfiInteropCollector.resolveLibcNamespace(headerContext)
-        if (libcNs != null && headerContext.packageName != libcNs) {
-            if (projNs == libcNs &&
-                headerContext.crateSymbolSubpackages.isNotEmpty() &&
-                "CEnumRepr" !in inspector.declaredTypeNames &&
-                "CEnumRepr" !in importedSimpleNameToPkg &&
-                containsWholeIdentifier(bodyTextForImports, "CEnumRepr")
-            ) {
-                val cenumSub = resolveBestSubpackageForSymbol("CEnumRepr")
-                if (cenumSub != null) {
-                    val cenumPkg = if (cenumSub.isEmpty()) libcNs else "$libcNs.$cenumSub"
-                    if (headerContext.packageName != cenumPkg) {
-                        extraImports += "import $cenumPkg.CEnumRepr"
-                    }
-                }
-            }
-        }
-        if (usesQuoteUnderlyingSpan) {
-            val quoteNs =
-                headerContext.crateNamespaces["quote"]
-                    ?.trim()
-                    ?.removeSuffix(".")
-                    ?.takeIf { it.isNotEmpty() }
-                    ?: headerContext.projectGroup
-                        ?.trim()
-                        ?.removeSuffix(".")
-                        ?.takeIf { it.isNotEmpty() }
-                        ?.let { "$it.quote" }
-            if (quoteNs != null && headerContext.packageName != quoteNs) {
-                extraImports += "import $quoteNs.span as quoteSpan"
-            }
-        }
-        if (aliasedUnderlyingSelfCalls.isNotEmpty()) {
-            val fallbackPkg =
-                headerContext.projectNamespace
-                    ?.trim()
-                    ?.removeSuffix(".")
-                    ?.takeIf { it.isNotEmpty() }
-                    ?: headerContext.packageName
-                        ?.trim()
-                        ?.removeSuffix(".")
-                        ?.takeIf { it.isNotEmpty() }
-            if (fallbackPkg != null) {
-                for ((methodKt, aliasKt) in aliasedUnderlyingSelfCalls) {
-                    extraImports += "import $fallbackPkg.$methodKt as $aliasKt"
-                }
-            }
-        }
-
-        val seenImportedSimpleNames = hashSetOf<String>()
         val importLines =
-            (useImportLines + extraImports)
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .distinct()
-                .filter { line ->
-                    if (!headerContext.rawAbiMode && headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true) {
-                        val impTarget = line.removePrefix("import ").substringBefore(" as ").trim()
-                        if (impTarget.endsWith(".os.raw") || impTarget.endsWith(".ffi")) {
-                            return@filter false
-                        }
-                    }
-                    if (line.endsWith(".*")) {
-                        true
-                    } else {
-                        val afterImport = line.removePrefix("import ").trim()
-                        val boundName =
-                            if (" as " in afterImport) {
-                                afterImport.substringAfterLast(" as ").trim()
-                            } else {
-                                afterImport.substringAfterLast('.').trim()
-                            }
-                        val firstSeen = seenImportedSimpleNames.add(boundName)
-                        firstSeen || line in stdlibOverloadExtImports
-                    }
-                }.let { filtered ->
-                    if (headerContext.isBatchCrateOutput || TranslationSession.finalStructs) {
-                        sortImportsForKtlint(filtered)
-                    } else {
-                        filtered.sorted()
-                    }
-                }
-        ffiCollector.recordImportLines(importLines)
-        ffiCollector.recordLocalTypeNames(inspector.declaredTypeNames)
+            KotlinFileImportSynthesizer(this).synthesizeImports(
+                activeCoreNs = activeCoreNs,
+                bodyTextForImports = bodyTextForImports,
+                standaloneMacrosExtraImports = standaloneMacros.extraImports,
+            )
         if (importLines.isNotEmpty()) {
             out.append(importLines.joinToString("\n")).append("\n\n")
         }
 
-        val fileDocLines = mutableListOf<String>()
-        fileDocLines.addAll(extractDocLinesFromAttributes(file.attrs))
-        val rawInnerDocLines = mutableListOf<String>()
-        for (innerDoc in trivia.fileInnerDocs) {
-            val raw =
-                when (innerDoc.style) {
-                    TriviaStyle.InnerDocLine -> innerDoc.text.removePrefix("//!")
-                    TriviaStyle.InnerDocBlock -> innerDoc.text.removePrefix("/*!").removeSuffix("*/")
-                    else -> innerDoc.text
-                }
-            for (line in raw.split('\n')) {
-                rawInnerDocLines +=
-                    line.trimEnd('\r').let {
-                        if (innerDoc.style == TriviaStyle.InnerDocBlock) it.trim().removePrefix("*") else it
-                    }
-            }
-        }
-        for (sanitized in sanitizeDocLines(rawInnerDocLines)) {
-            if (sanitized.isNotEmpty()) {
-                fileDocLines += sanitized
-            }
-        }
-        if (allBodyItems.isNotEmpty()) {
-            for (origItem in originalFile.items) {
-                if (origItem is Item.Macro && origItem.mac.path.isIdent("macro_rules") && !itemHasDocOnlyCfg(origItem)) {
-                    val origMacroName = origItem.ident?.toString()?.removePrefix("r#")
-                    if (origMacroName != null && origMacroName in standaloneMacros.emittedMacroNames) {
-                        continue
-                    }
-                    val macroDocs = extractDocLinesFromAttributes(origItem.attrs)
-                    if (macroDocs.isNotEmpty()) {
-                        if (fileDocLines.isNotEmpty()) fileDocLines += ""
-                        fileDocLines.addAll(macroDocs)
-                    }
-                }
-            }
-        }
-        if (fileDocLines.isNotEmpty()) {
-            for (docLine in fileDocLines) {
-                if (docLine.isEmpty()) {
-                    out.append("//\n")
-                } else {
-                    out.append("// ").append(docLine).append('\n')
-                }
-            }
-            out.append('\n')
-        }
+        appendFileHeaderComments(
+            out = out,
+            emittedMacroNames = standaloneMacros.emittedMacroNames,
+            hasBodyItems = allBodyItems.isNotEmpty(),
+        )
 
         out.append(allBodyItems.joinToString("\n\n"))
         if (out.isNotEmpty() && !out.endsWith('\n')) {
@@ -1393,195 +470,143 @@ internal class KotlinJ2KEmitter(
         return ensureBlankLineBeforeKDocAfterLineComment(out.toString())
     }
 
+    private fun closeEnumVariantTypeParamArities() {
+        val allEnumItems =
+            sameFileNestedItems(TranslationSession.sharedModuleFile?.items.orEmpty() + file.items)
+                .filterIsInstance<Item.Enum>()
+        for (enumItem in allEnumItems) {
+            val enumKt = rustTypeIdentToKotlin(enumItem.ident.toString())
+            val explicitParams = enumItem.generics.kotlinTypeParamNames()
+            val assocParams = sourceAssociatedParameters(enumItem.generics).map { it.associated }
+            val fullParams = (explicitParams + assocParams).distinct()
+            if (fullParams.size > explicitParams.size) {
+                for (v in enumItem.variants.toList()) {
+                    val vName = rustTypeIdentToKotlin(v.ident.toString())
+                    inspector.enumTypeParamsByVariant["$enumKt.$vName"] = fullParams
+                    val prevSimple = inspector.enumTypeParamsByVariant[vName]
+                    if (prevSimple == null || prevSimple.size == explicitParams.size) {
+                        inspector.enumTypeParamsByVariant[vName] = fullParams
+                    }
+                }
+            }
+        }
+    }
+
+    private fun emitMissingAssocTypeAliases(renderedItems: MutableList<String>) {
+        val nestedAllItems = sameFileNestedItems(file.items)
+        val implementedOrImportedTraitNames =
+            buildSet {
+                for (it in nestedAllItems) {
+                    when (it) {
+                        is Item.Trait -> add(rustTypeIdentToKotlin(it.ident.toString()))
+                        is Item.Impl -> {
+                            val traitKt = it.traitPath?.path?.lastKotlinTypeName()
+                            if (traitKt != null) add(traitKt)
+                        }
+                        else -> {}
+                    }
+                }
+                addAll(importedSimpleNameToPkg.keys)
+            }
+        for ((assocName, assocDecl) in inspector.associatedTypeDecls) {
+            val bindingCount =
+                nestedAllItems.filterIsInstance<Item.Impl>().sumOf { implementation ->
+                    implementation.items.count { it is ImplItem.AssocType && it.ident.toString() == assocName }
+                }
+            if (bindingCount > 1) continue
+            if (assocName !in inspector.declaredTypeNames &&
+                assocName !in implementedOrImportedTraitNames &&
+                assocName !in KOTLIN_STDLIB_SHADOWED_IMPORTS
+            ) {
+                val targetType = renderType(assocDecl.ty, selfTypeName = null)
+                if (targetType.isEmpty() || targetType == assocName) continue
+                val candidateParams = assocDecl.generics.kotlinTypeParamNames().distinct()
+                val strippedTarget = targetType.trim().removeSuffix("?")
+                if (strippedTarget in candidateParams || strippedTarget in activeTypeParamNames) continue
+                inspector.declaredTypeNames += assocName
+                val usedParams = candidateParams.filter { containsWholeIdentifier(targetType, it) }
+                val typeParamSuffix = if (usedParams.isEmpty()) "" else "<${usedParams.joinToString(", ")}>"
+                renderedItems += "public typealias $assocName$typeParamSuffix = $targetType"
+            }
+        }
+    }
+
+    private fun isRawPtrImplSource(
+        srcPathNorm: String?,
+        standaloneItems: List<Item>,
+        fileName: String,
+        isMut: Boolean,
+    ): Boolean =
+        srcPathNorm?.endsWith("/$fileName") == true ||
+            srcPathNorm == fileName ||
+            (
+                srcPathNorm == null &&
+                    standaloneItems.any { item ->
+                        item is Item.Impl &&
+                            item.traitPath == null &&
+                            (unwrapSynType(item.selfType) as? SynType.Ptr)?.let { ptr ->
+                                (ptr.mutability is PointerMutability.Mut) == isMut
+                            } == true
+                    }
+            )
+
+    private fun appendFileHeaderComments(
+        out: StringBuilder,
+        emittedMacroNames: Set<String>,
+        hasBodyItems: Boolean,
+    ) {
+        val fileDocLines = mutableListOf<String>()
+        fileDocLines.addAll(extractDocLinesFromAttributes(file.attrs))
+        val rawInnerDocLines = mutableListOf<String>()
+        for (innerDoc in trivia.fileInnerDocs) {
+            val raw =
+                when (innerDoc.style) {
+                    TriviaStyle.InnerDocLine -> innerDoc.text.removePrefix("//!")
+                    TriviaStyle.InnerDocBlock -> innerDoc.text.removePrefix("/*!").removeSuffix("*/")
+                    else -> innerDoc.text
+                }
+            for (line in raw.split('\n')) {
+                val trimmed = line.trimEnd('\r')
+                rawInnerDocLines +=
+                    if (innerDoc.style == TriviaStyle.InnerDocBlock) trimmed.trim().removePrefix("*") else trimmed
+            }
+        }
+        for (sanitized in sanitizeDocLines(rawInnerDocLines)) {
+            if (sanitized.isNotEmpty()) {
+                fileDocLines += sanitized
+            }
+        }
+        if (hasBodyItems) {
+            for (origItem in originalFile.items) {
+                if (origItem is Item.Macro && origItem.mac.path.isIdent("macro_rules") && !itemHasDocOnlyCfg(origItem)) {
+                    val origMacroName = origItem.ident?.cleanIdent()
+                    if (origMacroName != null && origMacroName in emittedMacroNames) continue
+                    val macroDocs = extractDocLinesFromAttributes(origItem.attrs)
+                    if (macroDocs.isNotEmpty()) {
+                        if (fileDocLines.isNotEmpty()) fileDocLines += ""
+                        fileDocLines.addAll(macroDocs)
+                    }
+                }
+            }
+        }
+        if (fileDocLines.isNotEmpty()) {
+            for (docLine in fileDocLines) {
+                if (docLine.isEmpty()) out.append("//\n") else out.append("// ").append(docLine).append('\n')
+            }
+            out.append('\n')
+        }
+    }
+
     internal fun extractDirectOwnerTypeName(
         selfTy: SynType,
         generics: Generics,
         scopeItems: List<Item> = file.items,
-    ): String? {
-        val typeParamNames =
-            generics.params
-                .toList()
-                .mapNotNull { param ->
-                    (param as? GenericParam.TypeParam)?.ident?.toString()?.let { rustTypeIdentToKotlin(it) }
-                }.toSet()
-        return when (selfTy) {
-            is SynType.Path -> {
-                if (selfTy.qself != null) return null
-                val segments = selfTy.path.segments.toList()
-                if (segments.size != 1) return null
-                val rawSeg = segments[0].ident.toString()
-                if (rawSeg == "Box" && "Box" !in inspector.declaredTypeNames) {
-                    val args = (segments[0].arguments as? PathArguments.AngleBracketed)?.args?.toList().orEmpty()
-                    val firstTypeArg = args.filterIsInstance<GenericArgument.TypeArg>().firstOrNull()
-                    return if (firstTypeArg != null) extractDirectOwnerTypeName(firstTypeArg.type, generics, scopeItems) else null
-                }
-                if (rawSeg in PRIMITIVE_TYPE_NAMES) return null
-                val name = rustTypeIdentToKotlin(rawSeg)
-                val declarationGenerics = findDeclGenericsForOwnerRawName(rawSeg, scopeItems) ?: findDeclGenericsForOwnerRawName(rawSeg, file.items)
-                if (declarationGenerics != null && !matchesUnspecializedOwnerGenerics(segments[0].arguments, declarationGenerics)) {
-                    return null
-                }
-                if (name in typeParamNames) null else name
-            }
-            is SynType.Reference -> extractDirectOwnerTypeName(selfTy.elem, generics, scopeItems)
-            is SynType.Group -> extractDirectOwnerTypeName(selfTy.elem, generics, scopeItems)
-            is SynType.Paren -> extractDirectOwnerTypeName(selfTy.elem, generics, scopeItems)
-            else -> null
-        }
-    }
+    ): String? = ownerMatcher.extractDirectOwnerTypeName(selfTy, generics, scopeItems)
 
     internal fun extractAttachableDirectOwnerTypeName(
         impl: Item.Impl,
         scopeItems: List<Item> = file.items,
-    ): String? {
-        val ownerType = extractDirectOwnerTypeName(impl.selfType, impl.generics, scopeItems) ?: return null
-        val ownerDeclGenerics =
-            findDeclGenericsForOwnerKotlinName(ownerType, scopeItems)
-                ?: findDeclGenericsForOwnerKotlinName(ownerType, file.items)
-                ?: return ownerType
-        val ownerTypeParamNames = collectGenericTypeParamNames(ownerDeclGenerics).toSet()
-        val implTypeParamNames = collectGenericTypeParamNames(impl.generics)
-        if (implTypeParamNames.any { it !in ownerTypeParamNames }) {
-            return null
-        }
-        if (impl.traitPath != null && declaresExtraNonImplicitImplTraitBounds(impl, ownerDeclGenerics, this::isImplicitStdlibSupertraitPath)) {
-            return null
-        }
-        return ownerType
-    }
-
-    private fun findDeclGenericsForOwnerRawName(rawSeg: String, items: List<Item>): Generics? =
-        items.firstNotNullOfOrNull { declaration ->
-            when (declaration) {
-                is Item.Struct -> declaration.generics.takeIf { declaration.ident.toString() == rawSeg }
-                is Item.Enum -> declaration.generics.takeIf { declaration.ident.toString() == rawSeg }
-                is Item.Union -> declaration.generics.takeIf { declaration.ident.toString() == rawSeg }
-                else -> null
-            }
-        }
-
-    private fun findDeclGenericsForOwnerKotlinName(ownerType: String, items: List<Item>): Generics? =
-        items.firstNotNullOfOrNull { declaration ->
-            when (declaration) {
-                is Item.Struct -> declaration.generics.takeIf { rustTypeIdentToKotlin(declaration.ident.toString()) == ownerType }
-                is Item.Enum -> declaration.generics.takeIf { rustTypeIdentToKotlin(declaration.ident.toString()) == ownerType }
-                is Item.Union -> declaration.generics.takeIf { rustTypeIdentToKotlin(declaration.ident.toString()) == ownerType }
-                else -> null
-            }
-        }
-
-    internal fun classifySynRefKind(ty: SynType): String =
-        when (val u = unwrapSynType(ty)) {
-            is SynType.Reference -> if (u.mutability != null) "mut_ref" else "shared_ref"
-            else -> "owned"
-        }
-
-    internal fun matchBlanketLocalIteratorImplOwners(
-        item: Item.Impl,
-        localTypeImpls: Map<String, List<Item.Impl>>,
-    ): List<String> {
-        val traitPath = item.traitPath?.path ?: return emptyList()
-        val blanketTraitKt =
-            traitPath.segments
-                .last()
-                ?.ident
-                ?.toString()
-                ?.let(::rustTypeIdentToKotlin) ?: return emptyList()
-        if (blanketTraitKt !in inspector.declaredTraitsByName) return emptyList()
-        val selfPath =
-            (unwrapSynType(item.selfType) as? SynType.Path)
-                ?.takeIf { it.qself == null && it.path.segments.len() == 1 }
-                ?: return emptyList()
-        val firstSelfSeg = selfPath.path.segments.first() ?: return emptyList()
-        val blanketParam = rustTypeIdentToKotlin(firstSelfSeg.ident.toString())
-        val implTypeParams = collectGenericTypeParamNames(item.generics)
-        if (blanketParam !in implTypeParams) return emptyList()
-
-        val requiredStdTraits = linkedSetOf<String>()
-        var expectedItemSpec: Pair<String, String>? = null
-        fun inspectBoundList(bounds: List<TypeParamBound>): Boolean {
-            for (b in bounds) {
-                if (b !is TypeParamBound.Trait || b.maybe != null) continue
-                val lastSeg = b.path.segments.last() ?: continue
-                val rawName = lastSeg.ident.toString()
-                if (rawName in IGNORED_TRAIT_BOUNDS) continue
-                val ktName = rustTypeIdentToKotlin(rawName)
-                if (ktName !in RUST_STD_IMPLICIT_SUPERTRAITS) return false
-                requiredStdTraits += ktName
-                val angle = lastSeg.arguments as? PathArguments.AngleBracketed
-                if (angle != null) {
-                    for (ga in angle.args.toList()) {
-                        if (ga is GenericArgument.AssocTypeArg && ga.assoc.ident.toString() == "Item") {
-                            expectedItemSpec = renderType(ga.assoc.ty, null) to classifySynRefKind(ga.assoc.ty)
-                        }
-                    }
-                }
-            }
-            return true
-        }
-        for (gp in item.generics.params.toList()) {
-            if (gp is GenericParam.TypeParam && rustTypeIdentToKotlin(gp.ident.toString()) == blanketParam) {
-                if (!inspectBoundList(gp.bounds.toList())) return emptyList()
-            }
-        }
-        val implWherePredicates =
-            item.generics.whereClause
-                ?.predicates
-                ?.toList()
-                .orEmpty()
-        for (pred in implWherePredicates) {
-            if (pred is WherePredicate.TypePredicate && renderType(pred.boundedTy, null) == blanketParam) {
-                if (!inspectBoundList(pred.bounds.toList())) return emptyList()
-            }
-        }
-        val targetSpec = expectedItemSpec ?: return emptyList()
-        if (requiredStdTraits.isEmpty()) return emptyList()
-
-        val matched = mutableListOf<String>()
-        for (structName in inspector.attachableTypeNames) {
-            val wrapsTrait =
-                inspector.structFieldSynTypesByType[structName]
-                    ?.values
-                    ?.any { renderType(it, null).substringBefore('<').trim() == blanketTraitKt } == true
-            if (wrapsTrait) continue
-            val candidateImpls = localTypeImpls[structName].orEmpty()
-            val implementedTraits =
-                candidateImpls
-                    .mapNotNull { c ->
-                        if (isDocOnlyCfgAttribute(c.attrs)) return@mapNotNull null
-                        c.traitPath
-                            ?.path
-                            ?.segments
-                            ?.last()
-                            ?.ident
-                            ?.toString()
-                            ?.let(::rustTypeIdentToKotlin)
-                    }.toSet()
-            if (!implementedTraits.containsAll(requiredStdTraits)) continue
-            var candidateIterSpec: Pair<String, String>? = null
-            for (c in candidateImpls) {
-                if (isDocOnlyCfgAttribute(c.attrs)) continue
-                val rawT =
-                    c.traitPath
-                        ?.path
-                        ?.segments
-                        ?.last()
-                        ?.ident
-                        ?.toString()
-                if (rawT == "Iterator") {
-                    for (sub in c.items) {
-                        if (sub is ImplItem.AssocType && sub.ident.toString() == "Item") {
-                            candidateIterSpec = renderType(sub.ty, null) to classifySynRefKind(sub.ty)
-                        }
-                    }
-                }
-            }
-            if (candidateIterSpec == targetSpec) {
-                matched += structName
-            }
-        }
-        return matched
-    }
+    ): String? = ownerMatcher.extractAttachableDirectOwnerTypeName(impl, scopeItems)
 
     internal fun renderLeadingTriviaForSpan(span: Span, indent: String): String {
         val startByte = span.startOffset()
@@ -1603,20 +628,6 @@ internal class KotlinJ2KEmitter(
             sb.append(renderLeadingTriviaForSpan(sp, indent))
         }
         return sb.toString()
-    }
-
-    internal fun containsWholeIdentifier(text: String, ident: String): Boolean {
-        if (ident.isEmpty()) return false
-        var start = 0
-        while (true) {
-            val idx = text.indexOf(ident, start)
-            if (idx < 0) return false
-            val beforeOk = idx == 0 || (!text[idx - 1].isLetterOrDigit() && text[idx - 1] != '_')
-            val afterIdx = idx + ident.length
-            val afterOk = afterIdx >= text.length || (!text[afterIdx].isLetterOrDigit() && text[afterIdx] != '_')
-            if (beforeOk && afterOk) return true
-            start = idx + 1
-        }
     }
 
     internal fun stripKotlinCommentsAndStrings(text: String): String =
@@ -1689,13 +700,731 @@ internal class KotlinJ2KEmitter(
     }
 }
 
+internal fun containsWholeIdentifier(text: String, ident: String): Boolean {
+    if (ident.isEmpty()) return false
+    var start = 0
+    while (true) {
+        val idx = text.indexOf(ident, start)
+        if (idx < 0) return false
+        val beforeOk = idx == 0 || (!text[idx - 1].isLetterOrDigit() && text[idx - 1] != '_')
+        val afterIdx = idx + ident.length
+        val afterOk = afterIdx >= text.length || (!text[afterIdx].isLetterOrDigit() && text[afterIdx] != '_')
+        if (beforeOk && afterOk) return true
+        start = idx + 1
+    }
+}
+
+private class FileFunctionNumericParamIndexer(
+    private val emitter: KotlinJ2KEmitter,
+) {
+    private val inspector get() = emitter.inspector
+    private val headerContext get() = emitter.headerContext
+
+    fun indexAndApply(standaloneItems: List<Item>): Set<String> {
+        val topLevelFnParamKinds = linkedMapOf<String, List<NumericKind?>?>()
+        val fnScanItems = TranslationSession.sharedModuleFile?.items ?: standaloneItems
+        for (item in fnScanItems) {
+            if (item is Item.Fn && !itemHasDocOnlyCfg(item)) {
+                emitter.extractFnParamNumericKinds(item, selfTypeName = null)?.let { (fnName, kinds) ->
+                    topLevelFnParamKinds.recordTopLevelFn(fnName, kinds)
+                }
+            } else if (item is Item.ForeignMod && !itemHasDocOnlyCfg(item)) {
+                val prevExtern = emitter.inExternAbiSignature
+                emitter.inExternAbiSignature = true
+                try {
+                    for (foreign in item.items) {
+                        if (foreign is ForeignItem.Fn && !foreignItemHasDocOnlyCfg(foreign)) {
+                            emitter.extractSigParamNumericKinds(foreign.sig, selfTypeName = null)?.let { (defaultKtName, kinds) ->
+                                val rawForeignFn = foreign.sig.cleanFnName()
+                                val fnName = inspector.collidingTopLevelForeignFnRenames[rawForeignFn] ?: defaultKtName
+                                topLevelFnParamKinds.recordTopLevelFn(fnName, kinds)
+                            }
+                        }
+                    }
+                } finally {
+                    emitter.inExternAbiSignature = prevExtern
+                }
+            }
+        }
+        val implScanItems = TranslationSession.sharedModuleFile?.items ?: emitter.file.items
+        val implScanTraitByName = linkedMapOf<String, Item.Trait>()
+        implScanTraitByName.putAll(inspector.declaredTraitsByName)
+        for (item in implScanItems + emitter.file.items) {
+            if (item is Item.Trait && !itemHasDocOnlyCfg(item)) {
+                val tName = rustTypeIdentToKotlin(item.ident.toString())
+                if (tName !in implScanTraitByName) implScanTraitByName[tName] = item
+            }
+        }
+        val implTraitsByOwner = linkedMapOf<String, MutableSet<String>>()
+        for (item in implScanItems) {
+            if (item is Item.Impl && item.generics.params.isEmpty() && !itemHasDocOnlyCfg(item)) {
+                val ownerType = emitter.extractDirectOwnerTypeName(item.selfType, item.generics) ?: continue
+                val traitKt = item.traitPath?.path?.lastKotlinTypeName()
+                if (traitKt != null) {
+                    implTraitsByOwner.getOrPut(ownerType, ::linkedSetOf).add(traitKt)
+                }
+                for (implItem in item.items) {
+                    if (implItem is ImplItem.Fn && !implItemHasDocOnlyCfg(implItem)) {
+                        emitter.extractSigParamNumericKinds(implItem.sig, ownerType)?.let { (fnName, kinds) ->
+                            topLevelFnParamKinds.recordOverloadable("$ownerType.$fnName", kinds)
+                        }
+                    }
+                }
+            }
+        }
+        for ((ownerType, traitNames) in implTraitsByOwner) {
+            for (traitName in traitNames) {
+                val traitItem = implScanTraitByName[traitName] ?: continue
+                for (tItem in traitItem.items) {
+                    if (tItem is TraitItem.Fn && !traitItemHasDocOnlyCfg(tItem)) {
+                        val (fnName, kinds) = emitter.extractSigParamNumericKinds(tItem.sig, ownerType) ?: continue
+                        val qualKey = "$ownerType.$fnName"
+                        if (qualKey !in topLevelFnParamKinds) topLevelFnParamKinds[qualKey] = kinds
+                    }
+                }
+            }
+        }
+        for ((traitName, traitItem) in implScanTraitByName) {
+            for (tItem in traitItem.items) {
+                if (tItem is TraitItem.Fn && !traitItemHasDocOnlyCfg(tItem) && !tItem.sig.hasSelfReceiver()) {
+                    val (fnName, kinds) = emitter.extractSigParamNumericKinds(tItem.sig, traitName) ?: continue
+                    val qualKey = "$traitName.$fnName"
+                    if (qualKey !in topLevelFnParamKinds) topLevelFnParamKinds[qualKey] = kinds
+                }
+            }
+        }
+        for (aliasName in inspector.typeAliasTargets.keys) {
+            var cur = aliasName
+            val seen = hashSetOf<String>()
+            while (seen.add(cur) && seen.size <= 8) {
+                val ty = inspector.typeAliasTargets[cur] ?: break
+                val next =
+                    unwrapSynType(ty)
+                        .unqualifiedPath()
+                        ?.lastCleanIdent()
+                        ?.let(::rustTypeIdentToKotlin) ?: break
+                if (next == cur) break
+                cur = next
+            }
+            if (cur != aliasName) {
+                val ownerPrefix = "$cur."
+                for ((k, v) in topLevelFnParamKinds.entries.map { it.key to it.value }) {
+                    if (k.startsWith(ownerPrefix)) {
+                        val aliasKey = "$aliasName.${k.removePrefix(ownerPrefix)}"
+                        if (aliasKey !in topLevelFnParamKinds) topLevelFnParamKinds[aliasKey] = v
+                    }
+                }
+            }
+        }
+        for ((crateFnKey, kindCodes) in headerContext.crateFnParamNumericKinds) {
+            if (crateFnKey !in topLevelFnParamKinds) {
+                topLevelFnParamKinds[crateFnKey] =
+                    kindCodes.map { emitter.numericKindFromScannerCode(it.takeIf(String::isNotEmpty)) }
+            }
+        }
+        emitter.currentFunctionParamNumericKinds =
+            topLevelFnParamKinds.entries
+                .mapNotNull { (k, v) -> v?.let { k to it } }
+                .toMap()
+        return topLevelFnParamKinds.keys.toSet()
+    }
+
+    private fun MutableMap<String, List<NumericKind?>?>.recordOverloadable(
+        key: String,
+        kinds: List<NumericKind?>,
+    ) {
+        this[key] = if (key in this) null else kinds
+    }
+
+    private fun MutableMap<String, List<NumericKind?>?>.recordTopLevelFn(
+        fnName: String,
+        kinds: List<NumericKind?>,
+    ) {
+        recordOverloadable(fnName, kinds)
+        recordOverloadable("$fnName#${kinds.size}", kinds)
+    }
+}
+
+private class KotlinFileImportSynthesizer(
+    private val emitter: KotlinJ2KEmitter,
+) {
+    private val inspector get() = emitter.inspector
+    private val headerContext get() = emitter.headerContext
+
+    fun synthesizeImports(
+        activeCoreNs: String,
+        bodyTextForImports: String,
+        standaloneMacrosExtraImports: Set<String>,
+    ): List<String> {
+        val useImportLines =
+            inspector.allUseItems
+                .flatMap { emitter.renderItemUse(it, indent = "", bodyTextForPubUseFilter = bodyTextForImports).lines() }
+                .map(String::trim)
+                .filter(String::isNotEmpty)
+
+        val extraImports = mutableListOf<String>()
+        if (emitter.usesSourceResult && emitter.usesTaggedCoreResult() && !emitter.hasDeclaredResultEnum()) {
+            extraImports +=
+                if (emitter.hasConflictingResultBinding()) {
+                    "import $activeCoreNs.result.Result as RustResult"
+                } else {
+                    "import $activeCoreNs.result.Result"
+                }
+        }
+        val combinedExtraTypeImports = linkedSetOf<String>()
+        combinedExtraTypeImports.addAll(emitter.extraTypePathImports)
+        for (macroImp in standaloneMacrosExtraImports) {
+            combinedExtraTypeImports += if (macroImp.startsWith("import ")) macroImp else "import $macroImp"
+        }
+
+        val usesExternalCore =
+            "core" in headerContext.crateNamespaces ||
+                headerContext.packageName == activeCoreNs ||
+                headerContext.packageName?.startsWith("$activeCoreNs.") == true
+        val stdlibOverloadExtImports = hashSetOf<String>()
+        for ((symSimple, symPkg) in buildAutoCoreSymbols(activeCoreNs, usesExternalCore)) {
+            val isMemGet = symPkg == "$activeCoreNs.mem" && symSimple == "get"
+            if (canSynthesizeSymbolImport(symSimple, symPkg, allowDeclaredTopFn = isMemGet) &&
+                containsWholeIdentifier(bodyTextForImports, symSimple)
+            ) {
+                val imp = "import $symPkg.$symSimple"
+                if (isMemGet) stdlibOverloadExtImports += imp
+                combinedExtraTypeImports += imp
+            }
+        }
+        if (usesExternalCore && !headerContext.rawAbiMode) {
+            synthesizeCoreEnumVariantImports(activeCoreNs, bodyTextForImports, combinedExtraTypeImports)
+            if (headerContext.packageName != "$activeCoreNs.mem") {
+                val maxTupleArity =
+                    TUPLE_DESTRUCTURING_REGEX
+                        .findAll(bodyTextForImports)
+                        .maxOfOrNull { match -> match.groupValues[1].count { it == ',' } + 1 }
+                        ?: 0
+                for (compIdx in 6..minOf(maxTupleArity, 12)) {
+                    val compImp = "import $activeCoreNs.mem.component$compIdx"
+                    if (compImp !in extraImports) extraImports += compImp
+                }
+            }
+        }
+        if (emitter.usesRustChar &&
+            headerContext.packageName != "$activeCoreNs.char" &&
+            "RustChar" !in inspector.declaredTypeNames
+        ) {
+            combinedExtraTypeImports += "import $activeCoreNs.char.RustChar"
+        }
+        if (usesExternalCore && !headerContext.rawAbiMode) {
+            for ((extName, extPkg) in buildCoreExtensionSymbols(activeCoreNs, bodyTextForImports)) {
+                if (canSynthesizeSymbolImport(extName, extPkg, allowDeclaredTopFn = extName == "clone") &&
+                    hasMemberCallInBody(bodyTextForImports, extName)
+                ) {
+                    val imp = "import $extPkg.$extName"
+                    stdlibOverloadExtImports += imp
+                    combinedExtraTypeImports += imp
+                }
+            }
+        }
+        synthesizeExperimentalBitwiseImports(bodyTextForImports, combinedExtraTypeImports)
+        synthesizeImportedTypeExtensionImports(bodyTextForImports, combinedExtraTypeImports)
+
+        extraImports.addAll(
+            combinedExtraTypeImports.filter { imp ->
+                shouldRetainSynthesizedImport(imp, bodyTextForImports)
+            },
+        )
+        synthesizeSpecialFallbackImports(extraImports, bodyTextForImports)
+
+        val seenImportedSimpleNames = hashSetOf<String>()
+        val importLines =
+            (useImportLines + extraImports)
+                .map(String::trim)
+                .filter(String::isNotEmpty)
+                .distinct()
+                .filter { line ->
+                    if (!headerContext.rawAbiMode &&
+                        headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true
+                    ) {
+                        val impTarget = line.removePrefix("import ").substringBefore(" as ").trim()
+                        if (impTarget.endsWith(".os.raw") || impTarget.endsWith(".ffi")) {
+                            return@filter false
+                        }
+                    }
+                    if (line.endsWith(".*")) {
+                        true
+                    } else {
+                        val afterImport = line.removePrefix("import ").trim()
+                        val boundName =
+                            if (" as " in afterImport) {
+                                afterImport.substringAfterLast(" as ").trim()
+                            } else {
+                                afterImport.substringAfterLast('.').trim()
+                            }
+                        seenImportedSimpleNames.add(boundName) || line in stdlibOverloadExtImports
+                    }
+                }.let { filtered ->
+                    if (headerContext.isBatchCrateOutput || TranslationSession.finalStructs) {
+                        sortImportsForKtlint(filtered)
+                    } else {
+                        filtered.sorted()
+                    }
+                }
+        emitter.ffiCollector.recordImportLines(importLines)
+        emitter.ffiCollector.recordLocalTypeNames(inspector.declaredTypeNames)
+        return importLines
+    }
+
+    private fun canSynthesizeSymbolImport(
+        symSimple: String,
+        symPkg: String,
+        allowDeclaredTopFn: Boolean = false,
+    ): Boolean =
+        headerContext.packageName != symPkg &&
+            symSimple !in inspector.declaredTypeNames &&
+            symSimple !in inspector.declaredConstNames.values &&
+            symSimple !in emitter.importedSimpleNameToPkg &&
+            (allowDeclaredTopFn || !emitter.isDeclaredTopLevelFnKotlinName(symSimple))
+
+    private fun hasMemberCallInBody(bodyText: String, memberName: String): Boolean =
+        bodyText.contains(memberName) && Regex("\\.\\s*$memberName\\s*[({<]").containsMatchIn(bodyText)
+
+    private fun buildAutoCoreSymbols(
+        activeCoreNs: String,
+        usesExternalCore: Boolean,
+    ): List<Pair<String, String>> {
+        if (headerContext.isDocExample) return emptyList()
+        val activeAllocNs = CoreIntrinsicLowering.resolveAllocNamespace(headerContext)
+        return buildList {
+            add("ConstPtr" to "$activeCoreNs.ptr")
+            add("MutPtr" to "$activeCoreNs.ptr")
+            for (memSym in CORE_MEM_LAYOUT_IMPORTS) add(memSym to "$activeCoreNs.mem")
+            for (rootSym in CORE_ROOT_SCALAR_IMPORTS) add(rootSym to activeCoreNs)
+            add("DebugStruct" to "$activeCoreNs.fmt")
+            add("DebugTuple" to "$activeCoreNs.fmt")
+            if (!headerContext.rawAbiMode) {
+                for (ffiSym in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS.values.distinct() + "CString") {
+                    if (emitter.resolveBestSubpackageForSymbol(ffiSym) == null) {
+                        add(ffiSym to CoreIntrinsicLowering.defaultStdlibFfiSymbolPackage(ffiSym, activeCoreNs, activeAllocNs))
+                    }
+                }
+            }
+            if (usesExternalCore) {
+                add("Ordering" to "$activeCoreNs.cmp")
+                for (errSym in CORE_NUM_ERROR_IMPORTS) add(errSym to "$activeCoreNs.num.error")
+                add("FpCategory" to "$activeCoreNs.num")
+                add("Wrapping" to "$activeCoreNs.num.wrapping")
+                add("Pin" to "$activeCoreNs.pin")
+                add("ControlFlow" to "$activeCoreNs.ops.controlflow")
+                add("Allocator" to "$activeCoreNs.alloc")
+                add("AllocError" to "$activeCoreNs.alloc")
+                add("Layout" to "$activeCoreNs.alloc.layout")
+                for (memFn in CORE_MEM_FN_IMPORTS) add(memFn to "$activeCoreNs.mem")
+                for (ptrFn in CORE_PTR_FN_IMPORTS) add(ptrFn to "$activeCoreNs.ptr")
+            }
+            if ("core" in headerContext.crateNamespaces || headerContext.scalarChar) {
+                for (cellSym in CORE_CELL_IMPORTS) add(cellSym to "$activeCoreNs.cell")
+                add("OnceCell" to "$activeCoreNs.cell.once")
+                for (charSym in CORE_CHAR_IMPORTS) add(charSym to "$activeCoreNs.char")
+                for (asciiHelper in CORE_ASCII_HELPER_IMPORTS) add(asciiHelper to "$activeCoreNs.char.methods")
+            }
+            if ("core" in headerContext.crateNamespaces && !headerContext.rawAbiMode) {
+                add("unreachableUnchecked" to "$activeCoreNs.hint")
+                add("assertUnchecked" to "$activeCoreNs.hint")
+                add("sizeOf" to "$activeCoreNs.mem")
+                add("alignOf" to "$activeCoreNs.mem")
+                add("sizeOfVal" to "$activeCoreNs.mem")
+                add("alignOfVal" to "$activeCoreNs.mem")
+                add("readUnaligned" to "$activeCoreNs.ptr")
+                add("writeUnaligned" to "$activeCoreNs.ptr")
+                for (cmpFn in CORE_CMP_FN_IMPORTS) add(cmpFn to "$activeCoreNs.cmp")
+            }
+        }
+    }
+
+    private fun synthesizeCoreEnumVariantImports(
+        activeCoreNs: String,
+        bodyTextForImports: String,
+        combinedExtraTypeImports: MutableSet<String>,
+    ) {
+        val variants =
+            listOf(
+                "Break" to "$activeCoreNs.ops.controlflow.ControlFlow",
+                "Continue" to "$activeCoreNs.ops.controlflow.ControlFlow",
+                "Less" to "$activeCoreNs.cmp.Ordering",
+                "Equal" to "$activeCoreNs.cmp.Ordering",
+                "Greater" to "$activeCoreNs.cmp.Ordering",
+            )
+        for ((variantName, variantOwner) in variants) {
+            val ownerPkg = variantOwner.substringBeforeLast('.')
+            if (canSynthesizeSymbolImport(variantName, ownerPkg) &&
+                variantName !in inspector.enumVariantSimpleNames &&
+                variantName !in inspector.importedEnumVariantSimpleNames &&
+                containsWholeIdentifier(bodyTextForImports, variantName)
+            ) {
+                combinedExtraTypeImports += "import $variantOwner.$variantName"
+            }
+        }
+    }
+
+    private fun buildCoreExtensionSymbols(
+        activeCoreNs: String,
+        bodyTextForImports: String,
+    ): List<Pair<String, String>> =
+        buildList {
+            add("clone" to "$activeCoreNs.clone")
+            for (sliceExt in CORE_SLICE_EXT_IMPORTS) add(sliceExt to "$activeCoreNs.slice")
+            for (strExt in CORE_STR_EXT_IMPORTS) add(strExt to "$activeCoreNs.str")
+            if (ATOMIC_TYPE_IDENT_REGEX.containsMatchIn(bodyTextForImports)) {
+                for (atomicExt in CORE_ATOMIC_EXT_IMPORTS) add(atomicExt to "$activeCoreNs.sync.atomic")
+            }
+            for (ext in CORE_NUM_EXT_IMPORTS) add(ext to "$activeCoreNs.num")
+            if (containsWholeIdentifier(bodyTextForImports, "MutPtr") ||
+                containsWholeIdentifier(bodyTextForImports, "asMutPtr") ||
+                containsWholeIdentifier(bodyTextForImports, "nullMut")
+            ) {
+                for (ext in SHARED_RAW_PTR_EXT_IMPORTS) add(ext to "$activeCoreNs.ptr.mutptr")
+                for (ext in MUT_ONLY_RAW_PTR_EXT_IMPORTS) add(ext to "$activeCoreNs.ptr.mutptr")
+            }
+            if (containsWholeIdentifier(bodyTextForImports, "ConstPtr") ||
+                containsWholeIdentifier(bodyTextForImports, "asPtr")
+            ) {
+                for (ext in SHARED_RAW_PTR_EXT_IMPORTS) add(ext to "$activeCoreNs.ptr.constptr")
+                add("castMut" to "$activeCoreNs.ptr.constptr")
+            }
+        }
+
+    private fun synthesizeExperimentalBitwiseImports(
+        bodyTextForImports: String,
+        combinedExtraTypeImports: MutableSet<String>,
+    ) {
+        if (!containsWholeIdentifier(bodyTextForImports, "Byte") &&
+            !containsWholeIdentifier(bodyTextForImports, "Short")
+        ) {
+            return
+        }
+        val expOps =
+            buildList {
+                if (DOT_INV_CALL_REGEX.containsMatchIn(bodyTextForImports)) add("inv")
+                for (op in EXPERIMENTAL_INFIX_BITWISE_OPS) {
+                    if (containsWholeIdentifier(bodyTextForImports, op)) add(op)
+                }
+            }
+        for (op in expOps) {
+            if (!emitter.isDeclaredTopLevelFnKotlinName(op) && op !in emitter.importedSimpleNameToPkg) {
+                combinedExtraTypeImports += "import kotlin.experimental.$op"
+            }
+        }
+    }
+
+    private fun synthesizeImportedTypeExtensionImports(
+        bodyTextForImports: String,
+        combinedExtraTypeImports: MutableSet<String>,
+    ) {
+        val nsPrefixForExt = emitter.currentNamespacePrefix()
+        for ((symSimple, symPkg) in emitter.importedSimpleNameToPkg.toList()) {
+            if (symSimple.firstOrNull()?.isUpperCase() != true || symPkg == headerContext.packageName) continue
+            val camelFn = symSimple.replaceFirstChar { it.lowercaseChar() }
+            if (!canSynthesizeSymbolImport(camelFn, symPkg) || !hasMemberCallInBody(bodyTextForImports, camelFn)) {
+                continue
+            }
+            val relSub =
+                when {
+                    nsPrefixForExt == null -> null
+                    symPkg == nsPrefixForExt -> ""
+                    symPkg.startsWith("$nsPrefixForExt.") -> symPkg.removePrefix("$nsPrefixForExt.")
+                    else -> null
+                }
+            val existsInPkg =
+                (relSub != null && relSub in headerContext.crateSymbolSubpackages[camelFn].orEmpty()) ||
+                    headerContext.externalCrateSymbolPackages.values.any { symMap ->
+                        symPkg in symMap[camelFn].orEmpty()
+                    }
+            if (existsInPkg) {
+                combinedExtraTypeImports += "import $symPkg.$camelFn"
+            }
+        }
+    }
+
+    private fun shouldRetainSynthesizedImport(imp: String, bodyTextForImports: String): Boolean {
+        val afterImport = imp.removePrefix("import ").trim()
+        val impPath = afterImport.substringBefore(" as ").trim()
+        val rawSimple = impPath.substringAfterLast('.')
+        val boundSimple = if (" as " in afterImport) afterImport.substringAfter(" as ").trim() else rawSimple
+        val targetPkg = impPath.substringBeforeLast('.', missingDelimiterValue = "")
+        val isSingleUpperTypeParam = boundSimple.length == 1 && boundSimple[0] in 'A'..'Z'
+        val isEnumVariantShadowed =
+            (boundSimple in inspector.enumVariantSimpleNames || boundSimple in inspector.importedEnumVariantSimpleNames) &&
+                !impPath.endsWith(".Result.$rawSimple") &&
+                impPath != "Result.$rawSimple" &&
+                !impPath.endsWith(".Option.$rawSimple") &&
+                impPath != "Option.$rawSimple"
+        return targetPkg != headerContext.packageName &&
+            boundSimple !in inspector.declaredTypeNames &&
+            !isSingleUpperTypeParam &&
+            !isEnumVariantShadowed &&
+            containsWholeIdentifier(bodyTextForImports, boundSimple)
+    }
+
+    private fun synthesizeSpecialFallbackImports(
+        extraImports: MutableList<String>,
+        bodyTextForImports: String,
+    ) {
+        val projNs = headerContext.projectNamespace.nonBlankNormalizedNs()
+        val libcNs = FfiInteropCollector.resolveLibcNamespace(headerContext)
+        if (libcNs != null &&
+            headerContext.packageName != libcNs &&
+            projNs == libcNs &&
+            headerContext.crateSymbolSubpackages.isNotEmpty() &&
+            "CEnumRepr" !in inspector.declaredTypeNames &&
+            "CEnumRepr" !in emitter.importedSimpleNameToPkg &&
+            containsWholeIdentifier(bodyTextForImports, "CEnumRepr")
+        ) {
+            emitter.resolveBestSubpackageForSymbol("CEnumRepr")?.let { cenumSub ->
+                val cenumPkg = if (cenumSub.isEmpty()) libcNs else "$libcNs.$cenumSub"
+                if (headerContext.packageName != cenumPkg) {
+                    extraImports += "import $cenumPkg.CEnumRepr"
+                }
+            }
+        }
+        if (emitter.usesQuoteUnderlyingSpan) {
+            val quoteNs =
+                headerContext.crateNamespaces["quote"].nonBlankNormalizedNs()
+                    ?: headerContext.projectGroup.nonBlankNormalizedNs()?.let { "$it.quote" }
+            if (quoteNs != null && headerContext.packageName != quoteNs) {
+                extraImports += "import $quoteNs.span as quoteSpan"
+            }
+        }
+        if (emitter.aliasedUnderlyingSelfCalls.isNotEmpty()) {
+            val fallbackPkg = projNs ?: headerContext.packageName.nonBlankNormalizedNs()
+            if (fallbackPkg != null) {
+                for ((methodKt, aliasKt) in emitter.aliasedUnderlyingSelfCalls) {
+                    extraImports += "import $fallbackPkg.$methodKt as $aliasKt"
+                }
+            }
+        }
+    }
+
+    private fun String?.nonBlankNormalizedNs(): String? =
+        this?.trim()?.removeSuffix(".")?.takeIf(String::isNotEmpty)
+
+    private companion object {
+        val TUPLE_DESTRUCTURING_REGEX = Regex("""\b(?:val|var)\s*\(([^()]+)\)\s*=""")
+        val ATOMIC_TYPE_IDENT_REGEX =
+            Regex("""\bAtomic(?:Bool|Ptr|I8|U8|I16|U16|I32|U32|I64|U64|I128|U128|Isize|Usize)?\b""")
+        val DOT_INV_CALL_REGEX = Regex("""\.\s*inv\s*\(\s*\)""")
+        val EXPERIMENTAL_INFIX_BITWISE_OPS = listOf("and", "or", "xor")
+
+        val CORE_MEM_LAYOUT_IMPORTS =
+            wordSet("TypeLayout PrimitiveLayouts PrimitiveArrayLayouts fixedListTypeLayout")
+        val CORE_ROOT_SCALAR_IMPORTS = wordSet("U128 I128 F16 F128 RustAny RustTypeId")
+        val CORE_NUM_ERROR_IMPORTS = wordSet("ParseIntError IntErrorKind TryFromIntError")
+        val CORE_MEM_FN_IMPORTS = wordSet("transmute transmuteUnchecked sizeOf alignOf")
+        val CORE_CMP_FN_IMPORTS = wordSet("min max clamp")
+        val CORE_CELL_IMPORTS = wordSet("Cell RefCell Ref RefMut")
+        val CORE_CHAR_IMPORTS = wordSet("RustChar CharTryFromError RustCharIndex rustChars rustCharIndices")
+        val CORE_SLICE_EXT_IMPORTS =
+            wordSet(
+                "len iter iterMut splitAt splitFirst splitFirstMut splitLast splitLastMut",
+                "splitAtMut chunksExact chunksExactMut",
+            )
+        val CORE_STR_EXT_IMPORTS = wordSet("len isCharBoundary splitAt")
+        val CORE_PTR_FN_IMPORTS =
+            wordSet(
+                "nullMut nullVal withoutProvenance withoutProvenanceMut dangling danglingMut",
+                "fromRef fromMut sliceFromRawParts sliceFromRawPartsMut copyNonoverlapping writeBytes dropInPlace",
+            )
+        val CORE_ASCII_HELPER_IMPORTS =
+            wordSet(
+                "isAscii isAsciiAlphabetic isAsciiUppercase isAsciiLowercase isAsciiAlphanumeric",
+                "isAsciiDigit isAsciiHexdigit isAsciiPunctuation isAsciiGraphic isAsciiWhitespace",
+                "isAsciiControl toAsciiLowercase toAsciiUppercase",
+            )
+        val SHARED_RAW_PTR_EXT_IMPORTS =
+            wordSet(
+                "isNull cast add sub offset byteAdd byteSub byteOffset",
+                "wrappingAdd wrappingSub wrappingOffset wrappingByteAdd wrappingByteSub wrappingByteOffset",
+                "read readUnaligned readVolatile copyTo copyToNonoverlapping",
+                "asRef asUninitRef asUninitSlice addr withAddr mapAddr exposeProvenance",
+                "castUninit castInit castSlice offsetFrom offsetFromUnsigned byteOffsetFrom byteOffsetFromUnsigned",
+                "isAligned isAlignedTo alignOffset withMetadataOf toRawParts mask len",
+            )
+        val MUT_ONLY_RAW_PTR_EXT_IMPORTS =
+            wordSet(
+                "write writeUnaligned writeVolatile writeBytes copyFrom copyFromNonoverlapping",
+                "asMut asUninitMut asUninitSliceMut castConst dropInPlace replace swap splitAtMut",
+            )
+        val CORE_NUM_EXT_IMPORTS =
+            wordSet(
+                "uncheckedAdd uncheckedSub uncheckedMul checkedAdd checkedSub checkedMul checkedDiv checkedRem",
+                "checkedAddUnsigned checkedSubUnsigned checkedAddSigned checkedSubSigned",
+                "overflowingAdd overflowingSub overflowingMul overflowingAddUnsigned overflowingSubUnsigned",
+                "overflowingAddSigned overflowingSubSigned wrappingAddUnsigned wrappingSubUnsigned",
+                "wrappingAddSigned wrappingSubSigned saturatingAdd saturatingSub saturatingMul",
+                "saturatingAddUnsigned saturatingSubUnsigned carryingAdd borrowingSub carryingMul carryingMulAdd",
+                "wideningMul absDiff divCeil nextMultipleOf checkedNextMultipleOf isMultipleOf midpoint",
+                "castSigned castUnsigned isPowerOfTwo nextPowerOfTwo checkedNextPowerOfTwo wrappingNextPowerOfTwo",
+                "ilog ilog2 ilog10 checkedIlog checkedIlog2 checkedIlog10 isqrt checkedIsqrt",
+            )
+        val CORE_ATOMIC_EXT_IMPORTS =
+            wordSet(
+                "load store swap compareExchange compareExchangeWeak fetchAdd fetchSub fetchAnd fetchOr",
+                "fetchXor fetchNand fetchMax fetchMin fetchUpdate intoInner getMut asPtr",
+            )
+    }
+}
+
+private class BlanketImplAndOwnerMatcher(
+    private val emitter: KotlinJ2KEmitter,
+) {
+    private val inspector get() = emitter.inspector
+
+    fun extractDirectOwnerTypeName(
+        selfTy: SynType,
+        generics: Generics,
+        scopeItems: List<Item>,
+    ): String? {
+        val typeParamNames = generics.kotlinTypeParamNames().toSet()
+        return when (val unwrapped = unwrapSynType(selfTy)) {
+            is SynType.Reference -> extractDirectOwnerTypeName(unwrapped.elem, generics, scopeItems)
+            is SynType.Path -> {
+                val seg = unwrapped.unqualifiedPath()?.singleSegment() ?: return null
+                val rawSeg = seg.ident.toString()
+                if (rawSeg == "Box" && "Box" !in inspector.declaredTypeNames) {
+                    val innerTy = seg.arguments.firstAngleTypeArg() ?: return null
+                    return extractDirectOwnerTypeName(innerTy, generics, scopeItems)
+                }
+                if (rawSeg in PRIMITIVE_TYPE_NAMES) return null
+                val name = rustTypeIdentToKotlin(rawSeg)
+                val declarationGenerics =
+                    findDeclGenericsForOwner(scopeItems) { it == rawSeg }
+                        ?: findDeclGenericsForOwner(emitter.file.items) { it == rawSeg }
+                if (declarationGenerics != null &&
+                    !matchesUnspecializedOwnerGenerics(seg.arguments, declarationGenerics)
+                ) {
+                    return null
+                }
+                if (name in typeParamNames) null else name
+            }
+            else -> null
+        }
+    }
+
+    fun extractAttachableDirectOwnerTypeName(
+        impl: Item.Impl,
+        scopeItems: List<Item>,
+    ): String? {
+        val ownerType = extractDirectOwnerTypeName(impl.selfType, impl.generics, scopeItems) ?: return null
+        val ownerDeclGenerics =
+            findDeclGenericsForOwner(scopeItems) { rustTypeIdentToKotlin(it) == ownerType }
+                ?: findDeclGenericsForOwner(emitter.file.items) { rustTypeIdentToKotlin(it) == ownerType }
+                ?: return ownerType
+        val ownerTypeParamNames = emitter.collectGenericTypeParamNames(ownerDeclGenerics).toSet()
+        if (emitter.collectGenericTypeParamNames(impl.generics).any { it !in ownerTypeParamNames }) {
+            return null
+        }
+        if (impl.traitPath != null &&
+            declaresExtraNonImplicitImplTraitBounds(impl, ownerDeclGenerics, emitter::isImplicitStdlibSupertraitPath)
+        ) {
+            return null
+        }
+        return ownerType
+    }
+
+    fun matchBlanketLocalIteratorImplOwners(
+        item: Item.Impl,
+        localTypeImpls: Map<String, List<Item.Impl>>,
+    ): List<String> {
+        val blanketTraitKt = item.traitPath?.path?.lastKotlinTypeName() ?: return emptyList()
+        if (blanketTraitKt !in inspector.declaredTraitsByName) return emptyList()
+        val firstSelfSeg = unwrapSynType(item.selfType).unqualifiedPath()?.singleSegment() ?: return emptyList()
+        val blanketParam = rustTypeIdentToKotlin(firstSelfSeg.ident.toString())
+        if (blanketParam !in emitter.collectGenericTypeParamNames(item.generics)) return emptyList()
+
+        val requiredStdTraits = linkedSetOf<String>()
+        var expectedItemSpec: Pair<String, String>? = null
+        fun inspectBoundList(bounds: List<TypeParamBound>): Boolean {
+            for (b in bounds) {
+                if (b !is TypeParamBound.Trait || b.maybe != null) continue
+                val lastSeg = b.path.segments.last() ?: continue
+                val rawName = lastSeg.ident.toString()
+                if (rawName in IGNORED_TRAIT_BOUNDS) continue
+                val ktName = rustTypeIdentToKotlin(rawName)
+                if (ktName !in RUST_STD_IMPLICIT_SUPERTRAITS) return false
+                requiredStdTraits += ktName
+                val angle = lastSeg.arguments as? PathArguments.AngleBracketed ?: continue
+                for (ga in angle.args.toList()) {
+                    if (ga is GenericArgument.AssocTypeArg && ga.assoc.ident.toString() == "Item") {
+                        expectedItemSpec = emitter.renderType(ga.assoc.ty, null) to classifySynRefKind(ga.assoc.ty)
+                    }
+                }
+            }
+            return true
+        }
+        for (gp in item.generics.params.toList()) {
+            if (gp is GenericParam.TypeParam && rustTypeIdentToKotlin(gp.ident.toString()) == blanketParam) {
+                if (!inspectBoundList(gp.bounds.toList())) return emptyList()
+            }
+        }
+        for (pred in item.generics.wherePredicatesList()) {
+            if (pred is WherePredicate.TypePredicate && emitter.renderType(pred.boundedTy, null) == blanketParam) {
+                if (!inspectBoundList(pred.bounds.toList())) return emptyList()
+            }
+        }
+        val targetSpec = expectedItemSpec ?: return emptyList()
+        if (requiredStdTraits.isEmpty()) return emptyList()
+
+        return inspector.attachableTypeNames.filter { structName ->
+            val wrapsTrait =
+                inspector.structFieldSynTypesByType[structName]
+                    ?.values
+                    ?.any { emitter.renderType(it, null).substringBefore('<').trim() == blanketTraitKt } == true
+            if (wrapsTrait) return@filter false
+            val candidateImpls = localTypeImpls[structName].orEmpty()
+            val implementedTraits =
+                candidateImpls
+                    .mapNotNull { c ->
+                        if (isDocOnlyCfgAttribute(c.attrs)) null else c.traitPath?.path?.lastKotlinTypeName()
+                    }.toSet()
+            if (!implementedTraits.containsAll(requiredStdTraits)) return@filter false
+            var candidateIterSpec: Pair<String, String>? = null
+            for (c in candidateImpls) {
+                if (!isDocOnlyCfgAttribute(c.attrs) && c.traitPath?.path?.lastIdentText() == "Iterator") {
+                    for (sub in c.items) {
+                        if (sub is ImplItem.AssocType && sub.ident.toString() == "Item") {
+                            candidateIterSpec = emitter.renderType(sub.ty, null) to classifySynRefKind(sub.ty)
+                        }
+                    }
+                }
+            }
+            candidateIterSpec == targetSpec
+        }
+    }
+
+    private fun findDeclGenericsForOwner(
+        items: List<Item>,
+        matchesRawIdent: (String) -> Boolean,
+    ): Generics? =
+        items.firstNotNullOfOrNull { declaration ->
+            when (declaration) {
+                is Item.Struct -> declaration.generics.takeIf { matchesRawIdent(declaration.ident.toString()) }
+                is Item.Enum -> declaration.generics.takeIf { matchesRawIdent(declaration.ident.toString()) }
+                is Item.Union -> declaration.generics.takeIf { matchesRawIdent(declaration.ident.toString()) }
+                else -> null
+            }
+        }
+
+    private fun classifySynRefKind(ty: SynType): String =
+        when (val u = unwrapSynType(ty)) {
+            is SynType.Reference -> if (u.mutability != null) "mut_ref" else "shared_ref"
+            else -> "owned"
+        }
+}
+
 internal fun topologicallySortConstItems(items: List<Item>): List<Item> {
     val constIndices = mutableListOf<Int>()
     val constItems = mutableListOf<Item.Const>()
     val indexByRawName = linkedMapOf<String, Int>()
     for ((idx, item) in items.withIndex()) {
         if (item is Item.Const) {
-            val raw = item.ident.toString().removePrefix("r#")
+            val raw = item.ident.cleanIdent()
             if (raw != "_" && raw !in indexByRawName) {
                 val cIdx = constItems.size
                 constIndices += idx
@@ -1726,10 +1455,7 @@ internal fun topologicallySortConstItems(items: List<Item>): List<Item> {
                 }
 
                 override fun visitPath(p: Path) {
-                    val segs = p.segments.toList()
-                    if (segs.isNotEmpty()) {
-                        val lastIdent = segs.last().ident.toString()
-                        val raw = lastIdent.removePrefix("r#")
+                    p.lastCleanIdent()?.let { raw ->
                         val depIdx =
                             indexByRawName[raw]
                                 ?: indexByRawName[KotlinNamingPolicy.Default.toConstIdentifier(raw)]

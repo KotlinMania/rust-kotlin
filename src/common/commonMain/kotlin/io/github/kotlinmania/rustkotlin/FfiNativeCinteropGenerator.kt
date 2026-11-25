@@ -239,7 +239,7 @@ internal fun renderInlineWrapperCFunction(fn: InlineCFunctionSpec): String {
     val sb = StringBuilder()
     sb.append("${cHeaderTypeForInlineReturn(fn)} ${fn.wrapperSymbolName}(${formatCParamsDecl(fn.params)}) {\n")
     for (param in fn.params) {
-        if (!containsCIdentifier(fn.rawBody, param.cName)) {
+        if (!containsWholeIdentifier(fn.rawBody, param.cName)) {
             sb.append("    (void)${param.cName};\n")
         }
     }
@@ -673,7 +673,7 @@ internal fun inferRequiredHeaders(
     }
     for (fn in inlineFunctions) {
         for ((sym, hdrList) in C_SYMBOL_HEADERS) {
-            if (containsCIdentifier(fn.rawBody, sym)) specs.addAll(hdrList)
+            if (containsWholeIdentifier(fn.rawBody, sym)) specs.addAll(hdrList)
         }
     }
     return specs.filter { it.header !in preambleIncludes }.distinct()
