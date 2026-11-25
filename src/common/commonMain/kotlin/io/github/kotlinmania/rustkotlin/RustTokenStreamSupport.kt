@@ -203,6 +203,34 @@ internal open class RustTokenCursor(
     fun simplePathLeafIdent(startIdx: Int = 0): String? =
         findPathTailIdentIndex(startIdx)?.let(::cleanIdentAt)
 
+    fun extractPureColonPathSegments(
+        allowTrailingBang: Boolean = false,
+        allowTrailingEmptyParens: Boolean = false,
+    ): Pair<List<String>, Boolean>? {
+        if (size == 0) return null
+        var idx = if (isDoubleColonAt(0)) 2 else 0
+        val first = cleanIdentAt(idx) ?: return null
+        val segments = mutableListOf(first)
+        idx++
+        while (idx < size && isDoubleColonAt(idx)) {
+            val nextSeg = cleanIdentAt(idx + 2) ?: return null
+            segments += nextSeg
+            idx += 3
+        }
+        var hadBang = false
+        if (allowTrailingBang && idx < size && punctCharAt(idx) == '!') {
+            hadBang = true
+            idx++
+        }
+        if (allowTrailingEmptyParens && idx < size) {
+            val parenGrp = groupAt(idx, Delimiter.Parenthesis)
+            if (parenGrp != null && parenGrp.stream().isEmpty()) {
+                idx++
+            }
+        }
+        return if (idx == size) segments to hadBang else null
+    }
+
     fun skipFnQualifiersToFnKeyword(
         startIdx: Int,
         endIdx: Int = trees.size,

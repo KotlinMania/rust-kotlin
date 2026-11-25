@@ -1229,35 +1229,48 @@ internal class FfiInteropCollector(
             }
         }
 
+        private val IGNORED_C_TYPE_QUALIFIERS = setOf("const", "volatile", "restrict", "__restrict", "struct", "enum")
+
         private fun classifyExplicitCTypeBridge(
             cType: String,
             cfgProfile: CfgTargetProfile = TranslationSession.cfgTargetProfile,
         ): CAbiBridgeKind {
-            val norm = cType.replace(" ", "")
+            val cursor = RustTokenCursor(lexRustTokenTrees(cType))
+            val hasPointer = (0 until cursor.size).any { cursor.punctCharAt(it) == '*' }
+            val allIdents = (0 until cursor.size).mapNotNull(cursor::identAt)
+            val hasConst = "const" in allIdents
+            val coreIdents = allIdents.filter { it !in IGNORED_C_TYPE_QUALIFIERS }
+            if (hasPointer) {
+                return when (coreIdents) {
+                    listOf("char") -> if (hasConst) CAbiBridgeKind.CONST_CSTR else CAbiBridgeKind.MUT_CSTR
+                    listOf("FILE") -> CAbiBridgeKind.FILE_PTR
+                    listOf("DIR") -> CAbiBridgeKind.DIR_PTR
+                    else -> CAbiBridgeKind.OPAQUE_PTR
+                }
+            }
             val widths = TargetCWidthProfile.from(cfgProfile)
             val ptrSigned32Or64 = if (cfgProfile.pointerWidth == 64) CAbiBridgeKind.I64 else CAbiBridgeKind.I32
             val ptrUnsigned32Or64 = if (cfgProfile.pointerWidth == 64) CAbiBridgeKind.U64 else CAbiBridgeKind.U32
+            val isUnsigned = "unsigned" in coreIdents
+            val longCount = coreIdents.count { it == "long" }
             return when {
-                norm == "void" -> CAbiBridgeKind.VOID
-                norm == "bool" || norm == "_Bool" -> CAbiBridgeKind.BOOL
-                norm == "constchar*" -> CAbiBridgeKind.CONST_CSTR
-                norm == "char*" -> CAbiBridgeKind.MUT_CSTR
-                norm == "FILE*" || norm == "constFILE*" -> CAbiBridgeKind.FILE_PTR
-                norm == "DIR*" || norm == "constDIR*" -> CAbiBridgeKind.DIR_PTR
-                norm.endsWith("*") -> CAbiBridgeKind.OPAQUE_PTR
-                norm == "int8_t" || norm == "signedchar" || norm == "char" -> CAbiBridgeKind.I8
-                norm == "uint8_t" || norm == "unsignedchar" -> CAbiBridgeKind.U8
-                norm == "int16_t" || norm == "short" -> CAbiBridgeKind.I16
-                norm == "uint16_t" || norm == "unsignedshort" -> CAbiBridgeKind.U16
-                norm == "uint32_t" || norm == "unsignedint" || norm == "unsigned" -> CAbiBridgeKind.U32
-                norm == "long" -> widths.cLongSigned
-                norm == "unsignedlong" -> widths.cLongUnsigned
-                norm == "ssize_t" || norm == "intptr_t" || norm == "ptrdiff_t" -> ptrSigned32Or64
-                norm == "size_t" || norm == "uintptr_t" -> ptrUnsigned32Or64
-                norm == "int64_t" || norm == "longlong" -> CAbiBridgeKind.I64
-                norm == "uint64_t" || norm == "unsignedlonglong" -> CAbiBridgeKind.U64
-                norm == "float" -> CAbiBridgeKind.F32
-                norm == "double" -> CAbiBridgeKind.F64
+                coreIdents == listOf("void") -> CAbiBridgeKind.VOID
+                coreIdents == listOf("bool") || coreIdents == listOf("_Bool") -> CAbiBridgeKind.BOOL
+                coreIdents == listOf("int8_t") || coreIdents == listOf("signed", "char") || coreIdents == listOf("char") ->
+                    CAbiBridgeKind.I8
+                coreIdents == listOf("uint8_t") || coreIdents == listOf("unsigned", "char") -> CAbiBridgeKind.U8
+                coreIdents == listOf("int16_t") || (!isUnsigned && "short" in coreIdents) -> CAbiBridgeKind.I16
+                coreIdents == listOf("uint16_t") || (isUnsigned && "short" in coreIdents) -> CAbiBridgeKind.U16
+                coreIdents == listOf("uint32_t") || (isUnsigned && longCount == 0) -> CAbiBridgeKind.U32
+                longCount == 1 -> if (isUnsigned) widths.cLongUnsigned else widths.cLongSigned
+                longCount >= 2 -> if (isUnsigned) CAbiBridgeKind.U64 else CAbiBridgeKind.I64
+                coreIdents == listOf("ssize_t") || coreIdents == listOf("intptr_t") || coreIdents == listOf("ptrdiff_t") ->
+                    ptrSigned32Or64
+                coreIdents == listOf("size_t") || coreIdents == listOf("uintptr_t") -> ptrUnsigned32Or64
+                coreIdents == listOf("int64_t") -> CAbiBridgeKind.I64
+                coreIdents == listOf("uint64_t") -> CAbiBridgeKind.U64
+                coreIdents == listOf("float") -> CAbiBridgeKind.F32
+                coreIdents == listOf("double") -> CAbiBridgeKind.F64
                 else -> CAbiBridgeKind.I32
             }
         }
@@ -1273,7 +1286,7 @@ internal class FfiInteropCollector(
             return when {
                 kind == CAbiBridgeKind.CONST_CSTR -> "ConstPtr"
                 kind == CAbiBridgeKind.MUT_CSTR -> "MutPtr"
-                cType.replace(" ", "").startsWith("const") -> "ConstPtr"
+                RustTokenCursor(lexRustTokenTrees(cType)).identAt(0) == "const" -> "ConstPtr"
                 else -> "MutPtr"
             }
         }
@@ -1408,25 +1421,65 @@ internal fun extractHeaderCommentsFromSource(source: String, out: MutableSet<Str
     }
 }
 
+private val CPP_STDLIB_INCLUDE_HEADERS = setOf("iostream", "vector", "string")
+private val CPP_CAST_KEYWORDS = setOf("reinterpret_cast", "static_cast")
+
+private class CHostPreambleTokenScanner(
+    source: String,
+) : KotlinTokenWalker(source) {
+    fun collectIncludedHeaders(out: MutableSet<String>) {
+        var idx = 0
+        while (idx < tokens.size) {
+            if (punctAt(idx) == '#' && identTextAt(skipHorizontalWhitespace(idx + 1)) == "include") {
+                val targetIdx = skipHorizontalWhitespace(skipHorizontalWhitespace(idx + 1) + 1)
+                when {
+                    punctAt(targetIdx) == '<' -> {
+                        var closeIdx = targetIdx + 1
+                        while (closeIdx < tokens.size && tokens[closeIdx] !is KotlinLexToken.Newline && punctAt(closeIdx) != '>') {
+                            closeIdx++
+                        }
+                        if (punctAt(closeIdx) == '>' && closeIdx > targetIdx + 1) {
+                            val hdr = source.substring(tokens[targetIdx].end, tokens[closeIdx].start).trim()
+                            if (hdr.isNotEmpty()) out += hdr
+                            idx = closeIdx + 1
+                            continue
+                        }
+                    }
+                    tokens.getOrNull(targetIdx) is KotlinLexToken.StringOpen -> {
+                        var closeIdx = targetIdx + 1
+                        while (closeIdx < tokens.size && tokens[closeIdx] !is KotlinLexToken.StringClose) closeIdx++
+                        if (closeIdx < tokens.size && closeIdx > targetIdx) {
+                            val hdr = source.substring(tokens[targetIdx].end, tokens[closeIdx].start).trim()
+                            if (hdr.isNotEmpty()) out += hdr
+                            idx = closeIdx + 1
+                            continue
+                        }
+                    }
+                }
+            }
+            idx++
+        }
+    }
+
+    fun hasCppConstructs(): Boolean {
+        val headers = linkedSetOf<String>()
+        collectIncludedHeaders(headers)
+        if (headers.any { it in CPP_STDLIB_INCLUDE_HEADERS }) return true
+        for (idx in tokens.indices) {
+            when (identTextAt(idx)) {
+                "std" -> if (punctAt(idx + 1) == ':' && punctAt(idx + 2) == ':') return true
+                "namespace" -> if (identTextAt(nextNonTriviaIndex(idx + 1)) != null) return true
+                in CPP_CAST_KEYWORDS -> if (punctAt(nextNonTriviaIndex(idx + 1)) == '<') return true
+            }
+        }
+        return false
+    }
+}
+
 internal fun extractIncludedHeadersFromPreambles(preambles: List<String>): Set<String> {
     val found = linkedSetOf<String>()
     for (chunk in preambles) {
-        for (line in chunk.lineSequence()) {
-            val trimmed = line.trimStart()
-            if (!trimmed.startsWith('#')) continue
-            val afterHash = trimmed.substring(1).trimStart()
-            if (!afterHash.startsWith("include")) continue
-            val afterInclude = afterHash.substring(7).trimStart()
-            if (afterInclude.isEmpty()) continue
-            val close =
-                when (afterInclude[0]) {
-                    '<' -> '>'
-                    '"' -> '"'
-                    else -> continue
-                }
-            val closeIdx = afterInclude.indexOf(close, startIndex = 1)
-            if (closeIdx > 1) found += afterInclude.substring(1, closeIdx)
-        }
+        CHostPreambleTokenScanner(chunk).collectIncludedHeaders(found)
     }
     return found
 }
@@ -1435,13 +1488,7 @@ internal fun formatIncludeTarget(hdr: String): String =
     if (hdr.startsWith('<') || hdr.startsWith('"')) hdr else "<$hdr>"
 
 internal fun looksLikeCppCode(code: String): Boolean =
-    code.contains("std::") ||
-        code.contains("#include <iostream>") ||
-        code.contains("#include <vector>") ||
-        code.contains("#include <string>") ||
-        code.contains("namespace ") ||
-        code.contains("reinterpret_cast<") ||
-        code.contains("static_cast<")
+    CHostPreambleTokenScanner(code).hasCppConstructs()
 
 internal fun computeStemSnake(headerContext: FileHeaderContext): String {
     val rawRel = headerContext.portLintSourcePath

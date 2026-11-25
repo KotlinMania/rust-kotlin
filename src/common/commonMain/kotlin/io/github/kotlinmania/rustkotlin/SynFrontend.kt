@@ -213,6 +213,39 @@ internal open class RustLexicalSourceScanner(
         }
         return len
     }
+
+    protected fun findBalancedDelimiterEnd(
+        openIdx: Int,
+        openCh: Char,
+        closeCh: Char,
+    ): Int {
+        if (openIdx >= len || source[openIdx] != openCh) return -1
+        var depth = 1
+        var k = openIdx + 1
+        while (k < len && depth > 0) {
+            val skipped = tryScanCommentOrStringEnd(k)
+            if (skipped != null) {
+                k = skipped
+                continue
+            }
+            when (source[k]) {
+                '\'' -> {
+                    val tickEnd = scanEscapedCharLiteralEnd(k)
+                    k = if (tickEnd > k + 1 && tickEnd <= len && source[tickEnd - 1] == '\'') tickEnd else k + 1
+                }
+                openCh -> {
+                    depth++
+                    k++
+                }
+                closeCh -> {
+                    depth--
+                    k++
+                }
+                else -> k++
+            }
+        }
+        return if (depth == 0) k - 1 else -1
+    }
 }
 
 private class SupplementaryCharLiteralRewriter(

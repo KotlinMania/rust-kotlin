@@ -647,57 +647,80 @@ private fun unwrapSyntheticDoctestFunction(
     emittedLines: List<String>,
     wrapperFnKtName: String,
     stripTrailingSuccessUnit: Boolean,
-): List<String> {
-    val fnMarkerPublic = "public fun $wrapperFnKtName("
-    val fnMarkerBare = "fun $wrapperFnKtName("
-    val fnHeaderIdx = emittedLines.indexOfFirst { it.startsWith(fnMarkerPublic) || it.startsWith(fnMarkerBare) }
-    if (fnHeaderIdx < 0) return emittedLines
+): List<String> =
+    DoctestWrapperFunctionUnwrapper(emittedLines, wrapperFnKtName, stripTrailingSuccessUnit).unwrap()
 
-    val otherTopLevelDecls =
-        emittedLines.withIndex().any { (idx, line) ->
-            idx != fnHeaderIdx &&
-                line.isNotEmpty() &&
-                !line[0].isWhitespace() &&
-                !line.startsWith("import ") &&
-                !line.startsWith("//") &&
-                line != "}"
+private class DoctestWrapperFunctionUnwrapper(
+    private val emittedLines: List<String>,
+    private val wrapperFnKtName: String,
+    private val stripTrailingSuccessUnit: Boolean,
+) : KotlinTokenWalker(emittedLines.joinToString("\n")) {
+    fun unwrap(): List<String> {
+        val imports = mutableListOf<String>()
+        var idx = nextNonTriviaIndex(0)
+        while (identTextAt(idx) == "import") {
+            val importStart = tokens[idx].start
+            var endTok = idx + 1
+            while (endTok < tokens.size && tokens[endTok] !is KotlinLexToken.Newline) endTok++
+            val importEnd = tokens[endTok - 1].end
+            imports += source.substring(importStart, importEnd).trim()
+            idx = nextNonTriviaIndex(endTok)
         }
-    if (otherTopLevelDecls) return emittedLines
+        var funIdx = idx
+        if (identTextAt(funIdx) == "public") {
+            funIdx = nextNonTriviaIndex(funIdx + 1)
+        }
+        if (identTextAt(funIdx) != "fun") return emittedLines
+        val nameIdx = nextNonTriviaIndex(funIdx + 1)
+        if (identTextAt(nameIdx) != wrapperFnKtName) return emittedLines
+        val openParenIdx = nextNonTriviaIndex(nameIdx + 1)
+        val closeParenIdx = findMatchingParenToken(openParenIdx)
+        if (closeParenIdx < openParenIdx) return emittedLines
 
-    val imports = emittedLines.subList(0, fnHeaderIdx).filter { it.startsWith("import ") }
-    if (emittedLines[fnHeaderIdx].trimEnd().endsWith("{}")) return imports
-    val closingBraceIdx = emittedLines.lastIndexOf("}")
-    if (closingBraceIdx <= fnHeaderIdx) return emittedLines
+        var scan = nextNonTriviaIndex(closeParenIdx + 1)
+        while (scan < tokens.size && punctAt(scan) != '{') {
+            if (punctAt(scan) == '=' || punctAt(scan) == ';') return emittedLines
+            scan++
+        }
+        if (punctAt(scan) != '{') return emittedLines
+        val openBraceIdx = scan
+        val afterCloseBrace = findMatchingBraceEndToken(openBraceIdx)
+        val closeBraceIdx = afterCloseBrace - 1
+        if (closeBraceIdx <= openBraceIdx || punctAt(closeBraceIdx) != '}') return emittedLines
+        if (nextNonTriviaIndex(afterCloseBrace) < tokens.size) return emittedLines
 
-    val bodyLines =
-        emittedLines
-            .subList(fnHeaderIdx + 1, closingBraceIdx)
-            .map { line -> if (line.startsWith("    ")) line.substring(4) else line }
-            .toMutableList()
+        val rawBody = source.substring(tokens[openBraceIdx].end, tokens[closeBraceIdx].start)
+        if (rawBody.isBlank()) return imports
+        val bodyLines =
+            rawBody
+                .removePrefix("\n")
+                .lines()
+                .map { line -> if (line.startsWith("    ")) line.substring(4) else line }
+                .toMutableList()
 
-    if (stripTrailingSuccessUnit) {
+        if (stripTrailingSuccessUnit) {
+            while (bodyLines.lastOrNull()?.isBlank() == true) bodyLines.removeAt(bodyLines.lastIndex)
+            val lastTrimmed = bodyLines.lastOrNull()?.trim()
+            if (lastTrimmed == "return Result.success(Unit)" || lastTrimmed == "Result.success(Unit)") {
+                bodyLines.removeAt(bodyLines.lastIndex)
+            }
+        }
+        while (bodyLines.firstOrNull()?.isBlank() == true) bodyLines.removeAt(0)
         while (bodyLines.lastOrNull()?.isBlank() == true) bodyLines.removeAt(bodyLines.lastIndex)
-        val lastTrimmed = bodyLines.lastOrNull()?.trim()
-        if (lastTrimmed == "return Result.success(Unit)" || lastTrimmed == "Result.success(Unit)") {
-            bodyLines.removeAt(bodyLines.lastIndex)
-        }
-    }
 
-    while (bodyLines.firstOrNull()?.isBlank() == true) bodyLines.removeAt(0)
-    while (bodyLines.lastOrNull()?.isBlank() == true) bodyLines.removeAt(bodyLines.lastIndex)
-
-    return buildList {
-        if (imports.isNotEmpty()) {
-            addAll(imports)
-            if (bodyLines.isNotEmpty()) add("")
+        return buildList {
+            if (imports.isNotEmpty()) {
+                addAll(imports)
+                if (bodyLines.isNotEmpty()) add("")
+            }
+            addAll(bodyLines)
         }
-        addAll(bodyLines)
     }
 }
 
 private fun cleanEmittedKotlinDoctestLines(lines: List<String>): List<String> =
     lines.map { line ->
-        val quoteCleaned = CommentLexicalScanner(line).rewriteParseQuoteStringArguments()
+        val quoteCleaned = ParseQuoteStringArgRewriter(line).rewriteIfCandidate()
         val safeDelims = quoteCleaned.replace("*/", "* /").replace("/*", "/ *")
         CommentLexicalScanner(safeDelims).sanitizeProseVocabulary(convertCamelIdentifiersOnly = true)
     }
@@ -708,10 +731,12 @@ private fun isRustdocReferenceLinkDefinition(trimmed: String): Boolean {
     if (closeBracket <= 1) return false
     val target = trimmed.substring(closeBracket + 2).trim()
     if (target.isEmpty()) return false
-    val rootEnd = target.indexOfFirst { !it.isLetterOrDigit() && it != '_' }
-    val root = if (rootEnd < 0) target else target.substring(0, rootEnd)
+    val trees = lexRustTokenTrees(target)
+    if (trees.isEmpty()) return false
+    val cursor = RustTokenCursor(trees)
+    val root = cursor.cleanIdentAt(0) ?: return false
     if (root !in RUSTDOC_REF_TARGET_ROOTS) return false
-    return rootEnd < 0 || target.startsWith("$root::") || target.startsWith("$root!")
+    return cursor.size == 1 || cursor.isDoubleColonAt(1) || cursor.punctCharAt(1) == '!'
 }
 
 private fun sanitizeVerbatimFenceLine(line: String): String {
@@ -752,20 +777,25 @@ private fun translateInlineCodeSpan(spanContent: String): String {
         val mappedSingle = if (trimmed[0].isDigit()) trimmed else mapRustIdentInCommentCode(trimmed)
         return CommentLexicalScanner(mappedSingle).sanitizeProseVocabulary(convertCamelIdentifiersOnly = false)
     }
-    if (isBareLowercaseModulePath(trimmed)) {
-        val parts = trimmed.split("::")
-        val trimmedParts = if (parts.size > 1 && parts[0] in setOf("crate", "self", "super")) parts.drop(1) else parts
+    val trees = lexRustTokenTrees(trimmed)
+    val bareModuleParts =
+        if (trees.isNotEmpty()) {
+            RustTokenCursor(trees)
+                .extractPureColonPathSegments()
+                ?.first
+                ?.takeIf { parts ->
+                    parts.size >= 2 &&
+                        parts.all { seg -> seg.isNotEmpty() && !seg.contains('_') && seg.all { it.isLowerCase() || it.isDigit() } }
+                }
+        } else {
+            null
+        }
+    if (bareModuleParts != null) {
+        val trimmedParts = if (bareModuleParts[0] in setOf("crate", "self", "super")) bareModuleParts.drop(1) else bareModuleParts
         return CommentLexicalScanner(trimmedParts.joinToString(".")).sanitizeProseVocabulary(convertCamelIdentifiersOnly = false)
     }
-    val stream = lexRustTokenStreamOrNull(trimmed)
-    val rendered = if (stream != null) renderCommentTokenStream(stream) else trimmed
+    val rendered = if (trees.isNotEmpty()) CommentRustTokenEmitter(trees).render() else trimmed
     return CommentLexicalScanner(rendered).sanitizeProseVocabulary(convertCamelIdentifiersOnly = false)
-}
-
-private fun isBareLowercaseModulePath(text: String): Boolean {
-    if (!text.contains("::")) return false
-    val parts = text.split("::")
-    return parts.size >= 2 && parts.all { seg -> seg.isNotEmpty() && !seg.contains('_') && seg.all { it.isLowerCase() || it.isDigit() } }
 }
 
 /**
@@ -858,9 +888,11 @@ private class CommentLexicalScanner(
         if (closeBracket <= idx + 1) return false
         val inner = source.substring(idx + 1, closeBracket)
         if (inner.any { it.isWhitespace() || it == '[' || it == '`' }) return false
-        val isRustPath = inner.contains("::") && inner.all { isIdentContinue(it) || it == ':' || it == '!' || it == '(' || it == ')' }
-        val isRustMacroRef = inner.endsWith('!') && inner.length > 1 && inner.dropLast(1).all { isIdentContinue(it) || it == ':' }
-        return isRustPath || isRustMacroRef
+        val parsed =
+            RustTokenCursor(lexRustTokenTrees(inner))
+                .extractPureColonPathSegments(allowTrailingBang = true, allowTrailingEmptyParens = true)
+                ?: return false
+        return parsed.first.size >= 2 || parsed.second
     }
 
     private fun findNextBacktickOrIntraDocLink(start: Int): Int {
@@ -874,44 +906,6 @@ private class CommentLexicalScanner(
         return len
     }
 
-    fun rewriteParseQuoteStringArguments(): String {
-        val pqIdx =
-            source.indexOf("parseQuote(\"").takeIf { it >= 0 }
-                ?: source.indexOf("quote(\"").takeIf { it >= 0 }
-                ?: return source
-        val openQuoteIdx = source.indexOf('"', startIndex = pqIdx)
-        if (openQuoteIdx < 0) return source
-        val closeEnd = scanCookedStringEnd(openQuoteIdx)
-        if (closeEnd > len || closeEnd <= openQuoteIdx + 1 || source[closeEnd - 1] != '"') return source
-        val closeQuoteIdx = closeEnd - 1
-        val rawContent = unescapeSimpleQuotedSlice(openQuoteIdx + 1, closeQuoteIdx).replace("`#`", "#")
-        val innerStream = lexTokenStreamOrNull(normalizeSupplementaryCharLiterals(rawContent)) ?: return source
-        val reescaped = renderCommentTokenStream(innerStream).replace("\\", "\\\\").replace("\"", "\\\"")
-        return source.substring(0, openQuoteIdx + 1) + reescaped + source.substring(closeQuoteIdx)
-    }
-
-    private fun unescapeSimpleQuotedSlice(startIdx: Int, endExclusive: Int): String {
-        val sb = StringBuilder(endExclusive - startIdx)
-        var i = startIdx
-        while (i < endExclusive) {
-            val ch = source[i]
-            if (ch == '\\' && i + 1 < endExclusive) {
-                when (val esc = source[i + 1]) {
-                    '"' -> sb.append('"')
-                    '\\' -> sb.append('\\')
-                    'n' -> sb.append('\n')
-                    't' -> sb.append('\t')
-                    else -> sb.append('\\').append(esc)
-                }
-                i += 2
-            } else {
-                sb.append(ch)
-                i++
-            }
-        }
-        return sb.toString()
-    }
-
     fun rewriteInlineRustAttributes(): String {
         if (!source.contains('#')) return source
         val sb = StringBuilder(len)
@@ -919,18 +913,13 @@ private class CommentLexicalScanner(
         while (i < len) {
             if (source[i] == '#') {
                 var j = i + 1
-                var isInner = false
-                if (j < len && source[j] == '!') {
-                    isInner = true
-                    j++
-                }
+                if (j < len && source[j] == '!') j++
                 while (j < len && source[j].isWhitespace()) j++
                 if (j < len && source[j] == '[') {
-                    val closeIdx = findMatchingBracket(j)
+                    val closeIdx = findBalancedDelimiterEnd(j, '[', ']')
                     if (closeIdx > j) {
-                        val attrBody = source.substring(j + 1, closeIdx)
-                        val attrStream = lexTokenStreamOrNull(normalizeSupplementaryCharLiterals(attrBody))
-                        val renderedAttr = attrStream?.let { renderAttributeInteriorTokens(it, isInner = isInner) }.orEmpty()
+                        val attrStream = lexRustTokenStreamOrNull(source.substring(i, closeIdx + 1))
+                        val renderedAttr = attrStream?.let(::renderCommentTokenStream).orEmpty()
                         if (renderedAttr.isNotEmpty()) sb.append(renderedAttr)
                         i = closeIdx + 1
                         continue
@@ -943,29 +932,9 @@ private class CommentLexicalScanner(
         return sb.toString()
     }
 
-    private fun findMatchingBracket(openBracketIdx: Int): Int {
-        var depth = 1
-        var k = openBracketIdx + 1
-        while (k < len && depth > 0) {
-            when (source[k]) {
-                '"' -> k = scanCookedStringEnd(k)
-                '[' -> {
-                    depth++
-                    k++
-                }
-                ']' -> {
-                    depth--
-                    k++
-                }
-                else -> k++
-            }
-        }
-        return if (depth == 0) k - 1 else -1
-    }
-
     fun sanitizeProseVocabulary(convertCamelIdentifiersOnly: Boolean): String {
         if (source.isEmpty()) return ""
-        val normalized = rewriteSendPlusSyncPhrase(rewriteLeadingKotlinColonPrefix(stripFromImplProvenanceNotes(source)))
+        val normalized = rewriteLeadingKotlinColonPrefix(source)
         return CommentLexicalScanner(normalized).rewriteNormalizedProse(convertCamelIdentifiersOnly)
     }
 
@@ -974,6 +943,15 @@ private class CommentLexicalScanner(
         var i = 0
         while (i < len) {
             val ch = source[i]
+            if (ch == '(' && source.regionMatches(i, "(from impl", 0, 10, ignoreCase = true)) {
+                val afterWord = i + 10
+                val isBoundary = afterWord >= len || !source[afterWord].isLetterOrDigit()
+                val closeParen = if (isBoundary) source.indexOf(')', startIndex = afterWord) else -1
+                if (closeParen > i) {
+                    i = closeParen + 1
+                    continue
+                }
+            }
             if (ch == '&') {
                 var afterAmp = i + 1
                 while (afterAmp < len && source[afterAmp] == ' ') afterAmp++
@@ -1018,6 +996,14 @@ private class CommentLexicalScanner(
                 var end = i + 1
                 while (end < len && isIdentContinue(source[end])) end++
                 val word = source.substring(i, end)
+                if (word == "Send") {
+                    val sendSyncEnd = tryConsumeSendPlusSyncAt(end)
+                    if (sendSyncEnd > end) {
+                        sb.append("ThreadSafe")
+                        i = sendSyncEnd
+                        continue
+                    }
+                }
                 if (source.startsWith("::", end) && end + 2 < len && (source[end + 2].isLetter() || source[end + 2] == '_')) {
                     i = appendDoubleColonPath(word, end, sb)
                     continue
@@ -1062,6 +1048,17 @@ private class CommentLexicalScanner(
         return sb.toString()
     }
 
+    private fun tryConsumeSendPlusSyncAt(afterSend: Int): Int {
+        var j = afterSend
+        while (j < len && source[j].isWhitespace()) j++
+        if (j >= len || source[j] != '+') return -1
+        j++
+        while (j < len && source[j].isWhitespace()) j++
+        if (!source.regionMatches(j, "Sync", 0, 4)) return -1
+        val end = j + 4
+        return if (end >= len || !isIdentContinue(source[end])) end else -1
+    }
+
     private fun scanTickPrefixedIdentEnd(tickIdx: Int): Triple<Int, Boolean, Boolean>? {
         if (tickIdx + 1 >= len) return null
         val firstIdent = source[tickIdx + 1]
@@ -1103,8 +1100,72 @@ private class CommentLexicalScanner(
     }
 }
 
-private fun renderAttributeInteriorTokens(attrStream: TokenStream, isInner: Boolean): String =
-    CommentRustTokenEmitter(attrStream.toList()).renderAttributeInterior(isInner)
+private class ParseQuoteStringArgRewriter(
+    source: String,
+) : KotlinTokenRewriter(source) {
+    fun rewriteIfCandidate(): String =
+        if ("quote(" !in source && "parseQuote(" !in source) source else rewrite()
+
+    override fun emitAt(index: Int, out: StringBuilder): Int {
+        val fnIdent = identTextAt(index)
+        if (fnIdent == "parseQuote" || fnIdent == "quote") {
+            val openParenIdx = nextNonTriviaIndex(index + 1)
+            val strOpenIdx = if (punctAt(openParenIdx) == '(') nextNonTriviaIndex(openParenIdx + 1) else -1
+            val strOpen = tokens.getOrNull(strOpenIdx) as? KotlinLexToken.StringOpen
+            if (strOpen != null && !strOpen.isRaw) {
+                var k = strOpenIdx + 1
+                val rawBody = StringBuilder()
+                var validPlainString = true
+                while (k < tokens.size && tokens[k] !is KotlinLexToken.StringClose) {
+                    val part = tokens[k]
+                    if (part is KotlinLexToken.StringText) {
+                        rawBody.append(unescapeKotlinDoubleQuotedText(part.rawText))
+                    } else {
+                        validPlainString = false
+                        break
+                    }
+                    k++
+                }
+                if (validPlainString && k < tokens.size && tokens[k] is KotlinLexToken.StringClose) {
+                    val innerStream = lexRustTokenStreamOrNull(rawBody.toString().replace("`#`", "#"))
+                    if (innerStream != null) {
+                        val reescaped = renderCommentTokenStream(innerStream).replace("\\", "\\\\").replace("\"", "\\\"")
+                        for (t in index..strOpenIdx) out.append(tokens[t].rawText)
+                        out.append(reescaped).append('"')
+                        return k + 1
+                    }
+                }
+            }
+        }
+        out.append(tokens[index].rawText)
+        return index + 1
+    }
+
+    private fun unescapeKotlinDoubleQuotedText(raw: String): String {
+        if ('\\' !in raw) return raw
+        val sb = StringBuilder(raw.length)
+        var i = 0
+        while (i < raw.length) {
+            val ch = raw[i]
+            if (ch == '\\' && i + 1 < raw.length) {
+                when (val esc = raw[i + 1]) {
+                    '"' -> sb.append('"')
+                    '\\' -> sb.append('\\')
+                    'n' -> sb.append('\n')
+                    't' -> sb.append('\t')
+                    'r' -> sb.append('\r')
+                    '$' -> sb.append('$')
+                    else -> sb.append('\\').append(esc)
+                }
+                i += 2
+            } else {
+                sb.append(ch)
+                i++
+            }
+        }
+        return sb.toString()
+    }
+}
 
 private fun renderCommentTokenStream(stream: TokenStream): String =
     CommentRustTokenEmitter(stream.toList()).render()
@@ -1211,31 +1272,6 @@ private fun mapCommentVocabularyWord(word: String, convertCamelIdentifiersOnly: 
     return mapSnakeOrForbiddenCommentWord(word)
 }
 
-private fun stripFromImplProvenanceNotes(text: String): String {
-    val lower = text.lowercase()
-    var searchFrom = 0
-    var matchIdx = lower.indexOf("(from impl", startIndex = searchFrom)
-    if (matchIdx < 0) return text
-    val sb = StringBuilder(text.length)
-    var cursor = 0
-    while (matchIdx >= 0) {
-        val afterWord = matchIdx + 10
-        val isBoundary = afterWord >= text.length || !text[afterWord].isLetterOrDigit()
-        val closeParen = if (isBoundary) text.indexOf(')', startIndex = afterWord) else -1
-        if (closeParen > matchIdx) {
-            sb.append(text, cursor, matchIdx)
-            cursor = closeParen + 1
-        } else {
-            sb.append(text, cursor, matchIdx + 1)
-            cursor = matchIdx + 1
-        }
-        searchFrom = cursor
-        matchIdx = lower.indexOf("(from impl", startIndex = searchFrom)
-    }
-    sb.append(text, cursor, text.length)
-    return sb.toString()
-}
-
 private fun rewriteLeadingKotlinColonPrefix(text: String): String {
     var ws = 0
     while (ws < text.length && text[ws].isWhitespace()) ws++
@@ -1244,35 +1280,6 @@ private fun rewriteLeadingKotlinColonPrefix(text: String): String {
     while (colonIdx < text.length && text[colonIdx].isWhitespace()) colonIdx++
     if (colonIdx >= text.length || text[colonIdx] != ':') return text
     return text.substring(0, ws) + "Note:" + text.substring(colonIdx + 1)
-}
-
-private fun rewriteSendPlusSyncPhrase(text: String): String {
-    if (!text.contains("Send")) return text
-    val sb = StringBuilder(text.length)
-    var i = 0
-    while (i < text.length) {
-        if (text.regionMatches(i, "Send", 0, 4)) {
-            var j = i + 4
-            while (j < text.length && text[j].isWhitespace()) j++
-            if (j < text.length && text[j] == '+') {
-                j++
-                while (j < text.length && text[j].isWhitespace()) j++
-                if (text.regionMatches(j, "Sync", 0, 4)) {
-                    val end = j + 4
-                    val wordBoundAfter = end >= text.length || (!text[end].isLetterOrDigit() && text[end] != '_')
-                    val wordBoundBefore = i == 0 || (!text[i - 1].isLetterOrDigit() && text[i - 1] != '_')
-                    if (wordBoundBefore && wordBoundAfter) {
-                        sb.append("ThreadSafe")
-                        i = end
-                        continue
-                    }
-                }
-            }
-        }
-        sb.append(text[i])
-        i++
-    }
-    return sb.toString()
 }
 
 private fun isLowerSnakeIdentifier(token: String): Boolean {
