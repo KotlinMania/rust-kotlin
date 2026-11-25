@@ -900,3 +900,36 @@ public fun ensureRustLangInLibsVersionsToml(
     }
     return editor.render()
 }
+
+public fun isManualProtectedContent(content: String): Boolean =
+    content
+        .lineSequence()
+        .take(10)
+        .any { line ->
+            val trimmed = line.trimStart()
+            trimmed.startsWith("// rust-kotlin: manual") || trimmed.startsWith("# rust-kotlin: manual")
+        }
+
+public fun synchronizeRustLangProjectCatalog(
+    projectNamespace: String?,
+    existingToml: String,
+    existingProps: String?,
+    canUpdateProps: Boolean = true,
+    writeProps: (String) -> Unit,
+    writeToml: (String) -> Unit,
+): Boolean {
+    if (isRustLangSelfProject(projectNamespace, existingProps)) return false
+    var targetBundle: String? = null
+    if (canUpdateProps && existingProps != null && !isManualProtectedContent(existingProps)) {
+        val (updatedProps, bundleName) = ensureRustLangInGradleProperties(existingProps)
+        targetBundle = bundleName
+        if (updatedProps != existingProps) {
+            writeProps(updatedProps)
+        }
+    }
+    if (isManualProtectedContent(existingToml)) return false
+    val updatedToml = ensureRustLangInLibsVersionsToml(existingToml, commonMainBundleName = targetBundle)
+    if (updatedToml == existingToml) return false
+    writeToml(updatedToml)
+    return true
+}
