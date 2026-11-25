@@ -563,66 +563,33 @@ internal sealed class ForeignFnEmissionStrategy {
     abstract fun tryRender(ctx: ForeignFnRenderContext): String?
 
     object RustAllocShim : ForeignFnEmissionStrategy() {
-        private val SHIM_NAMES =
-            setOf(
-                "__rust_alloc",
-                "__rust_alloc_zeroed",
-                "__rust_dealloc",
-                "__rust_realloc",
-                "__rust_no_alloc_shim_is_unstable",
-                "__rust_no_alloc_shim_is_unstable_v2",
-            )
+        private val NO_ALLOC_SHIM_NAMES =
+            wordSet("__rust_no_alloc_shim_is_unstable __rust_no_alloc_shim_is_unstable_v2")
 
         override fun tryRender(ctx: ForeignFnRenderContext): String? {
-            if (ctx.rawFnName !in SHIM_NAMES) return null
-            val emitter = ctx.emitter
-            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
             val pNames = ctx.interopParams.map { it.kotlinName }
-
-            fun ptrArgToLong(idx: Int): String =
-                if (TranslationSession.rawAbiMode) pNames[idx] else "${pNames[idx]}.rawAddress"
-
-            fun alignArgToLong(idx: Int): String =
-                if (ctx.interopParams
-                        .getOrNull(idx)
-                        ?.kotlinType
-                        ?.substringAfterLast('.') == "Alignment"
-                ) {
-                    "${pNames[idx]}.asUsize().toLong()"
-                } else {
-                    "${pNames[idx]}.toLong()"
-                }
-
-            fun wrapLongToRet(expr: String): String =
-                if (TranslationSession.rawAbiMode) {
-                    expr
-                } else {
-                    CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.ptr.MutPtr")
-                    "MutPtr($expr)"
-                }
-
-            val shimBody =
-                when (ctx.rawFnName) {
-                    "__rust_alloc" -> {
-                        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.intrinsics.kmAlloc")
-                        "= ${wrapLongToRet("kmAlloc(${pNames[0]}.toLong(), ${alignArgToLong(1)})")}"
-                    }
-                    "__rust_alloc_zeroed" -> {
-                        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.intrinsics.kmAllocZeroed")
-                        "= ${wrapLongToRet("kmAllocZeroed(${pNames[0]}.toLong(), ${alignArgToLong(1)})")}"
-                    }
-                    "__rust_dealloc" -> {
-                        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.intrinsics.kmDealloc")
-                        "= kmDealloc(${ptrArgToLong(0)}, ${pNames[1]}.toLong(), ${alignArgToLong(2)})"
-                    }
-                    "__rust_realloc" -> {
-                        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.intrinsics.kmRealloc")
-                        "= ${wrapLongToRet("kmRealloc(${ptrArgToLong(0)}, ${pNames[1]}.toLong(), ${alignArgToLong(2)}, ${pNames[3]}.toLong())")}"
-                    }
-                    else -> "= Unit"
+            val shimExpr =
+                when {
+                    ctx.rawFnName in NO_ALLOC_SHIM_NAMES -> "Unit"
+                    else ->
+                        CoreIntrinsicLowering.renderRustGlobalAllocExpr(
+                            rawFnName = ctx.rawFnName,
+                            emitter = ctx.emitter,
+                            rawAbiMode = TranslationSession.rawAbiMode,
+                            ptrRawAddressAt = { idx -> if (TranslationSession.rawAbiMode) pNames[idx] else "${pNames[idx]}.rawAddress" },
+                            sizeToLongAt = { idx -> "${pNames[idx]}.toLong()" },
+                            alignToLongAt = { idx ->
+                                val fullTy = ctx.interopParams.getOrNull(idx)?.kotlinType
+                                if (fullTy?.substringAfterLast('.') == "Alignment") {
+                                    "${pNames[idx]}.asUsize().toLong()"
+                                } else {
+                                    "${pNames[idx]}.toLong()"
+                                }
+                            },
+                        ) ?: return null
                 }
             val directSig = ctx.sig.replaceFirst("expect fun ", "fun ")
-            return "${ctx.fnTrivia}${ctx.doc}${ctx.indent}$directSig $shimBody"
+            return "${ctx.fnTrivia}${ctx.doc}${ctx.indent}$directSig = $shimExpr"
         }
     }
 

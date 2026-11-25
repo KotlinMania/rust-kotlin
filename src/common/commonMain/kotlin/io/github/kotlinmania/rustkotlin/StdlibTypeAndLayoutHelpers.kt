@@ -6,125 +6,123 @@ import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.SynType
 
 internal val SIZED_TYPE_PROPERTY_NAMES: Set<String> =
-    setOf("SIZE", "ALIGN", "ALIGNMENT", "IS_ZST", "LAYOUT", "MAX_SLICE_LEN")
+    wordSet("SIZE ALIGN ALIGNMENT IS_ZST LAYOUT MAX_SLICE_LEN")
 
 private val ALLOC_SINGLE_DEFAULT_GLOBAL_TYPES: Set<String> =
-    setOf(
-        "Box",
-        "Vec",
-        "Arc",
-        "Rc",
-        "RawVec",
-        "VecDeque",
-        "LinkedList",
-        "BinaryHeap",
-        "BTreeSet",
-        "BoxedArrayIntoIter",
-    )
+    wordSet("Box Vec Arc Rc RawVec VecDeque LinkedList BinaryHeap BTreeSet BoxedArrayIntoIter")
 
 private val ALLOC_INTO_ITER_MODULE_HINTS: Set<String> =
-    setOf("vec", "binary_heap", "linked_list", "vec_deque", "btree", "boxed", "alloc")
-
-private val NONZERO_INNER_BY_RAW_PRIM: Map<String, String> =
-    mapOf(
-        "u8" to "NonZeroU8Inner",
-        "u16" to "NonZeroU16Inner",
-        "u32" to "NonZeroU32Inner",
-        "u64" to "NonZeroU64Inner",
-        "u128" to "NonZeroU128Inner",
-        "usize" to "NonZeroUsizeInner",
-        "i8" to "NonZeroI8Inner",
-        "i16" to "NonZeroI16Inner",
-        "i32" to "NonZeroI32Inner",
-        "i64" to "NonZeroI64Inner",
-        "i128" to "NonZeroI128Inner",
-        "isize" to "NonZeroIsizeInner",
-        "char" to "NonZeroCharInner",
-    )
-
-private val NONZERO_INNER_BY_KT_TYPE: Map<String, String> =
-    mapOf(
-        "UByte" to "NonZeroU8Inner",
-        "UShort" to "NonZeroU16Inner",
-        "UInt" to "NonZeroU32Inner",
-        "ULong" to "NonZeroU64Inner",
-        "U128" to "NonZeroU128Inner",
-        "Byte" to "NonZeroI8Inner",
-        "Short" to "NonZeroI16Inner",
-        "Int" to "NonZeroI32Inner",
-        "Long" to "NonZeroI64Inner",
-        "I128" to "NonZeroI128Inner",
-        "RustChar" to "NonZeroCharInner",
-        "Char" to "NonZeroCharInner",
-    )
-
-private val ATOMIC_STORAGE_BY_RAW_PRIM: Map<String, Pair<String, String>> =
-    mapOf(
-        "bool" to ("Align1" to "UByte"),
-        "u8" to ("Align1" to "UByte"),
-        "i8" to ("Align1" to "Byte"),
-        "u16" to ("Align2" to "UShort"),
-        "i16" to ("Align2" to "Short"),
-        "u32" to ("Align4" to "UInt"),
-        "i32" to ("Align4" to "Int"),
-        "u64" to ("Align8" to "ULong"),
-        "i64" to ("Align8" to "Long"),
-        "usize" to ("Align8" to "Int"),
-        "isize" to ("Align8" to "Int"),
-    )
-
-private val ATOMIC_STORAGE_BY_KT_TYPE: Map<String, Pair<String, String>> =
-    mapOf(
-        "Boolean" to ("Align1" to "UByte"),
-        "UByte" to ("Align1" to "UByte"),
-        "Byte" to ("Align1" to "Byte"),
-        "UShort" to ("Align2" to "UShort"),
-        "Short" to ("Align2" to "Short"),
-        "UInt" to ("Align4" to "UInt"),
-        "Int" to ("Align4" to "Int"),
-        "ULong" to ("Align8" to "ULong"),
-        "Long" to ("Align8" to "Long"),
-        "MutPtr" to ("Align8" to "MutPtr"),
-        "ConstPtr" to ("Align8" to "ConstPtr"),
-    )
+    wordSet("vec binary_heap linked_list vec_deque btree boxed alloc")
 
 private val NONZERO_INNER_REGEX = Regex("""\bNonZero\s*<\s*([^,<>\s]+(?:\s*<[^<>]*>)?)\s*,\s*(NonZero[A-Za-z0-9_]+Inner)\s*>""")
 
-private val STDLIB_CONST_PTR_CALL_PARAM_INDICES: Map<String, Set<Int>> =
-    mapOf(
-        "copy_nonoverlapping" to setOf(0),
-        "copy" to setOf(0),
-        "read" to setOf(0),
-        "read_unaligned" to setOf(0),
-        "read_volatile" to setOf(0),
-        "slice_from_raw_parts" to setOf(0),
-        "align_offset" to setOf(0),
-        "for_value_raw" to setOf(0),
-        "is_dangling" to setOf(0),
-        "Arc::from_raw" to setOf(0),
-        "Arc::from_raw_in" to setOf(0),
-        "Rc::from_raw" to setOf(0),
-        "Rc::from_raw_in" to setOf(0),
-        "Weak::from_raw" to setOf(0),
-        "Weak::from_raw_in" to setOf(0),
-        "UniqueArc::from_raw_with_allocator" to setOf(0),
-        "ptr::eq" to setOf(0, 1),
-        "ptr::addr_eq" to setOf(0, 1),
-        "ptr::hash" to setOf(0),
+private val STDLIB_CONST_PTR_FIRST_ARG_CALLS: Set<String> =
+    wordSet(
+        "copy_nonoverlapping copy read read_unaligned read_volatile slice_from_raw_parts",
+        "align_offset for_value_raw is_dangling Arc::from_raw Arc::from_raw_in",
+        "Rc::from_raw Rc::from_raw_in Weak::from_raw Weak::from_raw_in",
+        "UniqueArc::from_raw_with_allocator ptr::hash",
     )
 
-private val STDLIB_CONST_PTR_METHOD_PARAM_INDICES: Map<String, Set<Int>> =
-    mapOf(
-        "with_metadata_of" to setOf(0),
-        "offset_from" to setOf(0),
-        "byte_offset_from" to setOf(0),
-        "offset_from_unsigned" to setOf(0),
-        "byte_offset_from_unsigned" to setOf(0),
-        "sub_ptr" to setOf(0),
-        "copy_from" to setOf(0),
-        "copy_from_nonoverlapping" to setOf(0),
-        "addr_eq" to setOf(0),
+private val STDLIB_CONST_PTR_TWO_ARG_CALLS: Set<String> =
+    wordSet("ptr::eq ptr::addr_eq")
+
+private val STDLIB_CONST_PTR_FIRST_ARG_METHODS: Set<String> =
+    wordSet(
+        "with_metadata_of offset_from byte_offset_from offset_from_unsigned",
+        "byte_offset_from_unsigned sub_ptr copy_from copy_from_nonoverlapping addr_eq",
     )
+
+private object StdlibSpecialTypeCatalog {
+    data class AtomicSpec(
+        val ownerSimple: String,
+        val rawPrim: String?,
+        val ktValueType: String,
+        val numericKind: NumericKind? = null,
+        val storage: Pair<String, String>? = null,
+    )
+
+    val nonZeroByRawPrim: Map<String, String> =
+        mapOf(
+            "u8" to "NonZeroU8Inner",
+            "u16" to "NonZeroU16Inner",
+            "u32" to "NonZeroU32Inner",
+            "u64" to "NonZeroU64Inner",
+            "u128" to "NonZeroU128Inner",
+            "usize" to "NonZeroUsizeInner",
+            "i8" to "NonZeroI8Inner",
+            "i16" to "NonZeroI16Inner",
+            "i32" to "NonZeroI32Inner",
+            "i64" to "NonZeroI64Inner",
+            "i128" to "NonZeroI128Inner",
+            "isize" to "NonZeroIsizeInner",
+            "char" to "NonZeroCharInner",
+        )
+
+    val nonZeroByKtType: Map<String, String> =
+        mapOf(
+            "UByte" to "NonZeroU8Inner",
+            "UShort" to "NonZeroU16Inner",
+            "UInt" to "NonZeroU32Inner",
+            "ULong" to "NonZeroU64Inner",
+            "U128" to "NonZeroU128Inner",
+            "Byte" to "NonZeroI8Inner",
+            "Short" to "NonZeroI16Inner",
+            "Int" to "NonZeroI32Inner",
+            "Long" to "NonZeroI64Inner",
+            "I128" to "NonZeroI128Inner",
+            "RustChar" to "NonZeroCharInner",
+            "Char" to "NonZeroCharInner",
+        )
+
+    private val atomicSpecs: List<AtomicSpec> =
+        listOf(
+            AtomicSpec("AtomicBool", "bool", "Boolean", storage = "Align1" to "UByte"),
+            AtomicSpec("AtomicU8", "u8", "UByte", NumericKind.U8, "Align1" to "UByte"),
+            AtomicSpec("AtomicI8", "i8", "Byte", NumericKind.I8, "Align1" to "Byte"),
+            AtomicSpec("AtomicU16", "u16", "UShort", NumericKind.U16, "Align2" to "UShort"),
+            AtomicSpec("AtomicI16", "i16", "Short", NumericKind.I16, "Align2" to "Short"),
+            AtomicSpec("AtomicU32", "u32", "UInt", NumericKind.U32, "Align4" to "UInt"),
+            AtomicSpec("AtomicI32", "i32", "Int", NumericKind.I32, "Align4" to "Int"),
+            AtomicSpec("AtomicU64", "u64", "ULong", NumericKind.U64, "Align8" to "ULong"),
+            AtomicSpec("AtomicI64", "i64", "Long", NumericKind.I64, "Align8" to "Long"),
+            AtomicSpec("AtomicU128", "u128", "U128", NumericKind.U128),
+            AtomicSpec("AtomicI128", "i128", "I128", NumericKind.I128),
+            AtomicSpec("AtomicUsize", "usize", "Int", NumericKind.I32, "Align8" to "Int"),
+            AtomicSpec("AtomicIsize", "isize", "Int", NumericKind.I32, "Align8" to "Int"),
+            AtomicSpec("AtomicPtr", null, "MutPtr", storage = "Align8" to "MutPtr"),
+        )
+
+    val atomicByOwner: Map<String, AtomicSpec> = atomicSpecs.associateBy { it.ownerSimple }
+    val atomicByRawPrim: Map<String, AtomicSpec> =
+        buildMap {
+            for (spec in atomicSpecs) {
+                spec.rawPrim?.let { put(it, spec) }
+            }
+        }
+    val atomicStorageByKtType: Map<String, Pair<String, String>> =
+        buildMap {
+            for (spec in atomicSpecs) {
+                if (spec.storage != null && spec.ktValueType !in this) {
+                    put(spec.ktValueType, spec.storage)
+                }
+            }
+            put("ConstPtr", "Align8" to "ConstPtr")
+        }
+    val atomicOwnerByNonIntKtType: Map<String, String> =
+        buildMap {
+            for (spec in atomicSpecs) {
+                if (spec.ktValueType != "Int") put(spec.ktValueType, spec.ownerSimple)
+            }
+            put("ConstPtr", "AtomicPtr")
+        }
+
+    fun lookupNonZeroInner(rawPrim: String?, ktType: String?): String? =
+        rawPrim?.let(nonZeroByRawPrim::get) ?: ktType?.let(nonZeroByKtType::get)
+}
+
+private fun SynType.singleCleanPathIdent(): String? =
+    unwrapSynType(this).unqualifiedPath()?.singleSegment()?.cleanIdent()
 
 /** True when a Result scrutinee has an erased or unknown Kotlin type that still needs `<*, *>` casts. */
 internal fun isUntypedResultScrutinee(renderedType: String?): Boolean {
@@ -200,17 +198,8 @@ internal fun KotlinJ2KEmitter.appendStdlibDefaultTypeArgsIfNeeded(
         }
         for (idx in existingArgs.size until astDefaultSpecs.size) {
             val defSyn = astDefaultSpecs[idx].second ?: break
-            val renderedDef =
-                (
-                    (unwrapSynType(defSyn) as? SynType.Path)?.takeIf { it.qself == null && it.path.segments.size == 1 }?.let { p ->
-                        val segIdent =
-                            p.path.segments
-                                .first()
-                                ?.ident
-                                ?.toString()
-                        segIdent?.let { subs[rustTypeIdentToKotlin(it)] }
-                    }
-                ) ?: renderType(defSyn, selfTypeName)
+            val segIdent = unwrapSynType(defSyn).unqualifiedPath()?.singleSegment()?.identText()
+            val renderedDef = segIdent?.let { subs[rustTypeIdentToKotlin(it)] } ?: renderType(defSyn, selfTypeName)
             appended += renderedDef
             subs[astDefaultSpecs[idx].first] = renderedDef
         }
@@ -228,7 +217,9 @@ internal fun KotlinJ2KEmitter.appendStdlibDefaultTypeArgsIfNeeded(
         when {
             existingArgs.size == 1 && simpleBase in ALLOC_SINGLE_DEFAULT_GLOBAL_TYPES -> true
             existingArgs.size == 2 && simpleBase == "BTreeMap" -> true
-            existingArgs.size == 1 && simpleBase == "Weak" && (rawName !in inspector.declaredTypeNames || rawSegNames.any { it in setOf("sync", "rc", "rcs", "alloc") }) -> true
+            existingArgs.size == 1 &&
+                simpleBase == "Weak" &&
+                (rawName !in inspector.declaredTypeNames || rawSegNames.any { it in setOf("sync", "rc", "rcs", "alloc") }) -> true
             existingArgs.size == 1 && simpleBase == "IntoIter" && rawSegNames.any { it in ALLOC_INTO_ITER_MODULE_HINTS } -> true
             else -> false
         }
@@ -246,29 +237,18 @@ internal fun KotlinJ2KEmitter.resolveStdlibAssociatedArgs(
     val simpleBase = baseName.substringAfterLast('.')
     if (simpleBase != "NonZero" && simpleBase != "Atomic") return emptyList()
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    val rawPrimIdent =
-        rawFirstArgSyn
-            ?.let(::unwrapSynType)
-            ?.let { it as? SynType.Path }
-            ?.takeIf { it.qself == null && it.path.segments.size == 1 }
-            ?.path
-            ?.segments
-            ?.first()
-            ?.ident
-            ?.toString()
-            ?.removePrefix("r#")
+    val rawPrimIdent = rawFirstArgSyn?.singleCleanPathIdent()
     val cleanRendered = renderedFirstArg?.removeSuffix("?")?.trim()
     if (simpleBase == "NonZero") {
-        val innerSimple =
-            (rawPrimIdent?.let { NONZERO_INNER_BY_RAW_PRIM[it] })
-                ?: (cleanRendered?.let { NONZERO_INNER_BY_KT_TYPE[it] })
-                ?: return emptyList()
+        val innerSimple = StdlibSpecialTypeCatalog.lookupNonZeroInner(rawPrimIdent, cleanRendered) ?: return emptyList()
         return listOf(bindOrQualifyResolvedCrossSymbol("$coreNs.num.nichetypes.$innerSimple"))
     }
     val storageSpec =
-        (rawPrimIdent?.let { ATOMIC_STORAGE_BY_RAW_PRIM[it] })
-            ?: (rawFirstArgSyn?.let(::unwrapSynType) as? SynType.Ptr)?.let { "Align8" to if (cleanRendered == "ConstPtr") "ConstPtr" else "MutPtr" }
-            ?: (cleanRendered?.let { ATOMIC_STORAGE_BY_KT_TYPE[it] })
+        rawPrimIdent?.let { StdlibSpecialTypeCatalog.atomicByRawPrim[it]?.storage }
+            ?: (rawFirstArgSyn?.let(::unwrapSynType) as? SynType.Ptr)?.let {
+                "Align8" to if (cleanRendered == "ConstPtr") "ConstPtr" else "MutPtr"
+            }
+            ?: cleanRendered?.let(StdlibSpecialTypeCatalog.atomicStorageByKtType::get)
             ?: return emptyList()
     val alignRef = bindOrQualifyResolvedCrossSymbol("$coreNs.sync.atomic.${storageSpec.first}")
     return listOf("$alignRef<${storageSpec.second}>")
@@ -281,7 +261,8 @@ internal fun KotlinJ2KEmitter.resolveNonZeroNewExplicitTypeArgs(
     selfTypeName: String?,
 ): Pair<String, String>? {
     if (calleeTail !in setOf("NonZero.new", "NonZero.newUnchecked") || args.size != 1) return null
-    val hintSource = listOfNotNull(currentExpectedParseTargetType, currentEnclosingReturnRenderedType).firstNotNullOfOrNull { NONZERO_INNER_REGEX.find(it) }
+    val hintCandidates = listOfNotNull(currentExpectedParseTargetType, currentEnclosingReturnRenderedType)
+    val hintSource = hintCandidates.firstNotNullOfOrNull { NONZERO_INNER_REGEX.find(it) }
     if (hintSource != null) {
         return hintSource.groupValues[2] to hintSource.groupValues[1].trim()
     }
@@ -306,22 +287,16 @@ internal fun KotlinJ2KEmitter.resolveNonZeroNewExplicitTypeArgs(
                 }
             candidateNames.firstNotNullOfOrNull { fieldsByName?.get(it) }
         }
-    val rawFieldIdent =
-        (fieldPrim?.let(::unwrapSynType) as? SynType.Path)
-            ?.takeIf { it.qself == null && it.path.segments.size == 1 }
-            ?.path
-            ?.segments
-            ?.first()
-            ?.ident
-            ?.toString()
-            ?.removePrefix("r#")
+    val rawFieldIdent = fieldPrim?.singleCleanPathIdent()
     val inferredArg = inferExprRenderedType(args[0], selfTypeName)?.removeSuffix("?")?.trim()
-    val innerSimple =
-        rawFieldIdent?.let { NONZERO_INNER_BY_RAW_PRIM[it] }
-            ?: inferredArg?.let { NONZERO_INNER_BY_KT_TYPE[it] }
-            ?: return null
+    val innerSimple = StdlibSpecialTypeCatalog.lookupNonZeroInner(rawFieldIdent, inferredArg) ?: return null
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    val innerRef = if (innerSimple in inspector.declaredTypeNames) innerSimple else bindOrQualifyResolvedCrossSymbol("$coreNs.num.nichetypes.$innerSimple")
+    val innerRef =
+        if (innerSimple in inspector.declaredTypeNames) {
+            innerSimple
+        } else {
+            bindOrQualifyResolvedCrossSymbol("$coreNs.num.nichetypes.$innerSimple")
+        }
     return innerRef to (inferredArg ?: "Int")
 }
 
@@ -336,7 +311,12 @@ internal fun KotlinJ2KEmitter.resolveStdlibUnitStructValueExpr(rawSegNames: List
             "ParseBoolError" -> "$coreNs.str.error.ParseBoolError"
             "Global" -> headerContext.crateNamespaces["alloc"]?.let { "$it.alloc.Global" }
             "System" -> headerContext.crateNamespaces["std"]?.let { "$it.alloc.System" }
-            "Error" -> if (rawSegNames.size >= 2 && rawSegNames[rawSegNames.lastIndex - 1].removePrefix("r#") == "fmt") "$coreNs.fmt.Error" else null
+            "Error" ->
+                if (rawSegNames.size >= 2 && rawSegNames[rawSegNames.lastIndex - 1].removePrefix("r#") == "fmt") {
+                    "$coreNs.fmt.Error"
+                } else {
+                    null
+                }
             else -> null
         } ?: return null
     return "${bindOrQualifyResolvedCrossSymbol(fq)}()"
@@ -348,17 +328,15 @@ internal fun isStdlibConstPtrCallParam(rawSegs: List<String>, paramSyn: SynType?
     if (unwrapped is SynType.Ptr && unwrapped.mutability is PointerMutability.Const) return true
     val leaf = rawSegs.lastOrNull() ?: return false
     val qualKey = if (rawSegs.size >= 2) "${rawSegs[rawSegs.lastIndex - 1]}::$leaf" else leaf
-    val indices =
-        STDLIB_CONST_PTR_CALL_PARAM_INDICES[qualKey]
-            ?: if ('<' !in leaf) STDLIB_CONST_PTR_CALL_PARAM_INDICES[leaf] else null
-    return argIdx in indices.orEmpty()
+    if (qualKey in STDLIB_CONST_PTR_TWO_ARG_CALLS) return argIdx == 0 || argIdx == 1
+    return argIdx == 0 && (qualKey in STDLIB_CONST_PTR_FIRST_ARG_CALLS || ('<' !in leaf && leaf in STDLIB_CONST_PTR_FIRST_ARG_CALLS))
 }
 
 /** True when a raw pointer method parameter expects `ConstPtr`. */
 internal fun isStdlibConstPtrMethodParam(rawMethod: String, paramSyn: SynType?, argIdx: Int): Boolean {
     val unwrapped = paramSyn?.let(::unwrapSynType)
     if (unwrapped is SynType.Ptr && unwrapped.mutability is PointerMutability.Const) return true
-    return argIdx in STDLIB_CONST_PTR_METHOD_PARAM_INDICES[rawMethod].orEmpty()
+    return argIdx == 0 && rawMethod in STDLIB_CONST_PTR_FIRST_ARG_METHODS
 }
 
 /** Coerces a rendered `MutPtr` expression to `ConstPtr` using `asConstPtr()`. */
@@ -376,75 +354,15 @@ internal fun resolveConcreteStdlibAtomicSimpleName(
 ): String? {
     val unwrapped = rawFirstArgSyn?.let(::unwrapSynType)
     if (unwrapped is SynType.Ptr) return "AtomicPtr"
-    val rawPrimIdent =
-        (unwrapped as? SynType.Path)
-            ?.takeIf { it.qself == null && it.path.segments.size == 1 }
-            ?.path
-            ?.segments
-            ?.first()
-            ?.ident
-            ?.toString()
-            ?.removePrefix("r#")
-    when (rawPrimIdent) {
-        "bool" -> return "AtomicBool"
-        "u8" -> return "AtomicU8"
-        "i8" -> return "AtomicI8"
-        "u16" -> return "AtomicU16"
-        "i16" -> return "AtomicI16"
-        "u32" -> return "AtomicU32"
-        "i32" -> return "AtomicI32"
-        "u64" -> return "AtomicU64"
-        "i64" -> return "AtomicI64"
-        "u128" -> return "AtomicU128"
-        "i128" -> return "AtomicI128"
-        "usize" -> return "AtomicUsize"
-        "isize" -> return "AtomicIsize"
-    }
-    return when (renderedFirstArg?.removeSuffix("?")?.trim()) {
-        "Boolean" -> "AtomicBool"
-        "UByte" -> "AtomicU8"
-        "Byte" -> "AtomicI8"
-        "UShort" -> "AtomicU16"
-        "Short" -> "AtomicI16"
-        "UInt" -> "AtomicU32"
-        "ULong" -> "AtomicU64"
-        "Long" -> "AtomicI64"
-        "U128" -> "AtomicU128"
-        "I128" -> "AtomicI128"
-        "MutPtr", "ConstPtr" -> "AtomicPtr"
-        "Int" -> if (rawPrimIdent == null) "AtomicUsize" else null
-        else -> null
-    }
+    val rawPrimIdent = rawFirstArgSyn?.singleCleanPathIdent()
+    StdlibSpecialTypeCatalog.atomicByRawPrim[rawPrimIdent]?.let { return it.ownerSimple }
+    val cleanRendered = renderedFirstArg?.removeSuffix("?")?.trim() ?: return null
+    if (cleanRendered == "Int") return if (rawPrimIdent == null) "AtomicUsize" else null
+    return StdlibSpecialTypeCatalog.atomicOwnerByNonIntKtType[cleanRendered]
 }
 
 internal fun atomicOwnerValueRenderedType(ownerSimple: String): String? =
-    when (ownerSimple) {
-        "AtomicBool" -> "Boolean"
-        "AtomicPtr" -> "MutPtr"
-        "AtomicU8" -> "UByte"
-        "AtomicI8" -> "Byte"
-        "AtomicU16" -> "UShort"
-        "AtomicI16" -> "Short"
-        "AtomicU32" -> "UInt"
-        "AtomicI32", "AtomicUsize", "AtomicIsize" -> "Int"
-        "AtomicU64" -> "ULong"
-        "AtomicI64" -> "Long"
-        "AtomicU128" -> "U128"
-        "AtomicI128" -> "I128"
-        else -> null
-    }
+    StdlibSpecialTypeCatalog.atomicByOwner[ownerSimple]?.ktValueType
 
 internal fun atomicOwnerValueNumericKind(ownerSimple: String): NumericKind? =
-    when (ownerSimple) {
-        "AtomicU8" -> NumericKind.U8
-        "AtomicI8" -> NumericKind.I8
-        "AtomicU16" -> NumericKind.U16
-        "AtomicI16" -> NumericKind.I16
-        "AtomicU32" -> NumericKind.U32
-        "AtomicI32", "AtomicUsize", "AtomicIsize" -> NumericKind.I32
-        "AtomicU64" -> NumericKind.U64
-        "AtomicI64" -> NumericKind.I64
-        "AtomicU128" -> NumericKind.U128
-        "AtomicI128" -> NumericKind.I128
-        else -> null
-    }
+    StdlibSpecialTypeCatalog.atomicByOwner[ownerSimple]?.numericKind

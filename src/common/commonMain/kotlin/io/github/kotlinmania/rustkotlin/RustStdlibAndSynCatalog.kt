@@ -11,107 +11,40 @@ import io.github.kotlinmania.syn.TypeParamBound
 import io.github.kotlinmania.syn.WherePredicate
 
 internal val PRIMITIVE_ARRAY_TYPES =
-    setOf(
-        "ByteArray",
-        "UByteArray",
-        "ShortArray",
-        "UShortArray",
-        "IntArray",
-        "UIntArray",
-        "LongArray",
-        "ULongArray",
-        "FloatArray",
-        "DoubleArray",
-        "BooleanArray",
-    )
-internal val IGNORED_USE_ROOTS = setOf("super", "self")
-internal val STDLIB_CRATE_ROOTS = setOf("std", "core", "alloc")
-internal val STDLIB_MACRO_OR_PRIMITIVE_MODULES = setOf("primitive", "concat", "stringify")
-internal val FLAT_KOTLINMANIA_CRATES = setOf("procmacro2", "quote")
+    wordSet("ByteArray UByteArray ShortArray UShortArray IntArray UIntArray LongArray ULongArray FloatArray DoubleArray BooleanArray")
+internal val IGNORED_USE_ROOTS = wordSet("super self")
+internal val STDLIB_CRATE_ROOTS = wordSet("std core alloc")
+internal val STDLIB_MACRO_OR_PRIMITIVE_MODULES = wordSet("primitive concat stringify")
+internal val FLAT_KOTLINMANIA_CRATES = wordSet("procmacro2 quote")
 internal val STDLIB_TYPE_PATH_PREFIXES =
-    setOf("std", "core", "alloc", "vec", "boxed", "collections", "rc", "sync", "slice", "option", "marker", "mem")
-internal val IGNORED_PATH_PREFIXES = setOf("crate", "super", "self", "std", "core", "alloc")
+    wordSet("std core alloc vec boxed collections rc sync slice option marker mem")
+internal val IGNORED_PATH_PREFIXES = wordSet("crate super self std core alloc")
 internal val STDLIB_PRELUDE_REEXPORT_MODULES =
-    setOf("__private", "export", "prelude", "v1", "rust_2015", "rust_2018", "rust_2021", "rust_2024")
+    wordSet("__private export prelude v1 rust_2015 rust_2018 rust_2021 rust_2024")
 internal val IGNORED_TRAIT_BOUNDS =
-    setOf(
-        "Sized",
-        "MetaSized",
-        "PointeeSized",
-        "Unsize",
-        "CoerceUnsized",
-        "DispatchFromDyn",
-        "Send",
-        "Sync",
-        "Unpin",
-        "UnwindSafe",
-        "RefUnwindSafe",
-        "TrivialDrop",
-        "Destruct",
-        "Hasher",
-        "Tuple",
+    wordSet(
+        "Sized MetaSized PointeeSized Unsize CoerceUnsized DispatchFromDyn",
+        "Send Sync Unpin UnwindSafe RefUnwindSafe TrivialDrop Destruct Hasher Tuple",
     )
+internal val FMT_TRAIT_NAMES: Set<String> =
+    wordSet("Debug Display Octal LowerHex UpperHex Binary LowerExp UpperExp Pointer")
 internal val RUST_STD_IMPLICIT_SUPERTRAITS =
-    setOf(
-        "Clone",
-        "Copy",
-        "Debug",
-        "Default",
-        "PartialEq",
-        "Eq",
-        "PartialOrd",
-        "Ord",
-        "Hash",
-        "Drop",
-        "Send",
-        "Sync",
-        "Unpin",
-        "UnwindSafe",
-        "RefUnwindSafe",
-        "Iterator",
-        "ExactSizeIterator",
-        "DoubleEndedIterator",
-        "FusedIterator",
-        "FromIterator",
-        "IntoIterator",
-        "Extend",
-        "Index",
-        "IndexMut",
-        "Deref",
-        "DerefMut",
-        "Display",
-        "Octal",
-        "LowerHex",
-        "UpperHex",
-        "Binary",
-        "LowerExp",
-        "UpperExp",
-        "Pointer",
-        "From",
-        "TryFrom",
-        "Into",
-        "TryInto",
-    )
-
+    FMT_TRAIT_NAMES +
+        wordSet(
+            "Clone Copy Default PartialEq Eq PartialOrd Ord Hash Drop",
+            "Send Sync Unpin UnwindSafe RefUnwindSafe",
+            "Iterator ExactSizeIterator DoubleEndedIterator FusedIterator FromIterator IntoIterator Extend",
+            "Index IndexMut Deref DerefMut From TryFrom Into TryInto",
+        )
 internal val STDLIB_TRAIT_SUBMODULES =
-    setOf(
-        "error",
-        "fmt",
-        "cmp",
-        "hash",
-        "ops",
-        "convert",
-        "iter",
-        "borrow",
-        "marker",
-        "panic",
-        "any",
-        "clone",
-        "default",
-    )
-
+    wordSet("error fmt cmp hash ops convert iter borrow marker panic any clone default")
 internal val STDLIB_EXPLICIT_SUPERTRAITS =
-    RUST_STD_IMPLICIT_SUPERTRAITS + setOf("Error", "Borrow")
+    RUST_STD_IMPLICIT_SUPERTRAITS + wordSet("Error Borrow")
+
+private fun SynType.singleUnqualifiedIdent(): String? {
+    val seg = unqualifiedPath()?.singleSegment() ?: return null
+    return seg.ident.toString()
+}
 
 internal fun matchesUnspecializedOwnerGenerics(
     selfArgs: PathArguments,
@@ -126,43 +59,23 @@ internal fun matchesUnspecializedOwnerGenerics(
             rawArgsList
                 .filterIsInstance<GenericArgument.TypeArg>()
                 .take(ownerParameters.size)
-                .map { argument ->
-                    (argument.type as? SynType.Path)
-                        ?.takeIf { it.qself == null && it.path.segments.size == 1 }
-                        ?.path
-                        ?.segments
-                        ?.last()
-                        ?.ident
-                        ?.toString()
-                }
-        // A specialized impl belongs on its exact receiver, not on
-        // every instantiation of the generic source declaration.
+                .map { it.type.singleUnqualifiedIdent() }
         if (suppliedTypeArgs != ownerParameters) return false
     }
     if (ownerConstParameters.isNotEmpty() && rawArgsList.isNotEmpty()) {
         val suppliedConstIdents =
             rawArgsList.filterIsInstance<GenericArgument.ConstArg>().map { ca ->
-                (ca.expr as? io.github.kotlinmania.syn.Expr.Path)
-                    ?.takeIf { it.qself == null && it.path.segments.size == 1 }
-                    ?.path
-                    ?.segments
-                    ?.last()
-                    ?.ident
-                    ?.toString()
+                val constPath = ca.expr.unqualifiedPath()
+                constPath?.singleSegment()?.identText()
             }
         if (suppliedConstIdents.isNotEmpty() && suppliedConstIdents != ownerConstParameters) {
             return false
         }
         val extraTypeIdents =
-            rawArgsList.filterIsInstance<GenericArgument.TypeArg>().drop(ownerParameters.size).map { argument ->
-                (argument.type as? SynType.Path)
-                    ?.takeIf { it.qself == null && it.path.segments.size == 1 }
-                    ?.path
-                    ?.segments
-                    ?.last()
-                    ?.ident
-                    ?.toString()
-            }
+            rawArgsList
+                .filterIsInstance<GenericArgument.TypeArg>()
+                .drop(ownerParameters.size)
+                .map { it.type.singleUnqualifiedIdent() }
         if (extraTypeIdents.isNotEmpty() && extraTypeIdents != ownerConstParameters) {
             return false
         }
@@ -178,80 +91,36 @@ internal fun declaresExtraNonImplicitImplTraitBounds(
     fun hasNonImplicitBound(bounds: List<TypeParamBound>): Boolean =
         bounds.any { b ->
             if (b !is TypeParamBound.Trait || b.maybe != null) return@any false
-            val rawName =
-                b.path.segments
-                    .last()
-                    ?.ident
-                    ?.toString()
-                    ?.removePrefix("r#") ?: return@any false
-            if (rawName in IGNORED_TRAIT_BOUNDS) return@any false
-            !isImplicitTraitPath(b.path)
+            val rawName = b.path.lastCleanIdent() ?: return@any false
+            rawName !in IGNORED_TRAIT_BOUNDS && !isImplicitTraitPath(b.path)
         }
 
-    val ownerDeclTypeParams = ownerDeclGenerics.params.toList().filterIsInstance<GenericParam.TypeParam>()
-    if (ownerDeclTypeParams.isEmpty()) return false
-    val boundedOwnerParams = hashSetOf<String>()
-    for (gp in ownerDeclTypeParams) {
-        if (hasNonImplicitBound(gp.bounds.toList())) {
-            boundedOwnerParams += rustTypeIdentToKotlin(gp.ident.toString())
-        }
-    }
-    for (pred in ownerDeclGenerics.whereClause
-        ?.predicates
-        ?.toList()
-        .orEmpty()) {
-        if (pred is WherePredicate.TypePredicate) {
-            val boundedPath = (unwrapSynType(pred.boundedTy) as? SynType.Path)?.takeIf { it.qself == null && it.path.segments.size == 1 }
-            val tpKt =
-                boundedPath
-                    ?.path
-                    ?.segments
-                    ?.first()
-                    ?.ident
-                    ?.toString()
-                    ?.let(::rustTypeIdentToKotlin)
-            if (tpKt != null && hasNonImplicitBound(pred.bounds.toList())) {
-                boundedOwnerParams += tpKt
+    fun collectBoundedTypeParams(generics: Generics): Set<String> {
+        val bounded = hashSetOf<String>()
+        for (gp in generics.params.toList()) {
+            if (gp is GenericParam.TypeParam && hasNonImplicitBound(gp.bounds.toList())) {
+                bounded += rustTypeIdentToKotlin(gp.ident.toString())
             }
         }
-    }
-    val unboundedOwnerParams =
-        ownerDeclTypeParams
-            .map { rustTypeIdentToKotlin(it.ident.toString()) }
-            .toSet() - boundedOwnerParams
-    if (unboundedOwnerParams.isEmpty()) return false
-    for (gp in impl.generics.params.toList()) {
-        if (gp is GenericParam.TypeParam) {
-            val tpKt = rustTypeIdentToKotlin(gp.ident.toString())
-            if (tpKt in unboundedOwnerParams && hasNonImplicitBound(gp.bounds.toList())) {
-                return true
+        val whereClause = generics.whereClause
+        val predicates = whereClause?.predicates?.toList().orEmpty()
+        for (pred in predicates) {
+            if (pred is WherePredicate.TypePredicate && hasNonImplicitBound(pred.bounds.toList())) {
+                val tpRaw = unwrapSynType(pred.boundedTy).singleUnqualifiedIdent()
+                if (tpRaw != null) bounded += rustTypeIdentToKotlin(tpRaw)
             }
         }
+        return bounded
     }
-    for (pred in impl.generics.whereClause
-        ?.predicates
-        ?.toList()
-        .orEmpty()) {
-        if (pred is WherePredicate.TypePredicate) {
-            val boundedPath = (unwrapSynType(pred.boundedTy) as? SynType.Path)?.takeIf { it.qself == null && it.path.segments.size == 1 }
-            val tpKt =
-                boundedPath
-                    ?.path
-                    ?.segments
-                    ?.first()
-                    ?.ident
-                    ?.toString()
-                    ?.let(::rustTypeIdentToKotlin)
-            if (tpKt in unboundedOwnerParams && hasNonImplicitBound(pred.bounds.toList())) {
-                return true
-            }
-        }
-    }
-    return false
+
+    val ownerTypeParams = ownerDeclGenerics.typeParamIdentNames().mapTo(linkedSetOf(), ::rustTypeIdentToKotlin)
+    if (ownerTypeParams.isEmpty()) return false
+    val unboundedOwnerParams = ownerTypeParams - collectBoundedTypeParams(ownerDeclGenerics)
+    return unboundedOwnerParams.isNotEmpty() && collectBoundedTypeParams(impl.generics).any { it in unboundedOwnerParams }
 }
 
-internal fun KotlinJ2KEmitter.isImplicitStdlibSupertraitPath(path: io.github.kotlinmania.syn.Path): Boolean {
-    val segs = path.segments.toList().map { it.ident.toString().removePrefix("r#") }
+internal fun KotlinJ2KEmitter.isImplicitStdlibSupertraitPath(path: Path): Boolean {
+    val segs = path.cleanIdentStrings()
     val rawTrait = segs.lastOrNull() ?: return false
     val ktTrait = rustTypeIdentToKotlin(rawTrait)
     if (segs.size >= 2) {
@@ -264,11 +133,9 @@ internal fun KotlinJ2KEmitter.isImplicitStdlibSupertraitPath(path: io.github.kot
     if (ktTrait in RUST_STD_IMPLICIT_SUPERTRAITS && ktTrait !in inspector.declaredTypeNames) {
         return true
     }
-    if (ktTrait == "Error" && ktTrait !in inspector.declaredTraitsByName) {
-        return true
-    }
-    return false
+    return ktTrait == "Error" && ktTrait !in inspector.declaredTraitsByName
 }
+
 internal fun ensureBlankLineBeforeKDocAfterLineComment(text: String): String {
     if ("/**" !in text) return text
     return KDocSpacingRewriter(text).rewrite()
@@ -318,298 +185,54 @@ private class KDocSpacingRewriter(
 
 internal val STDLIB_ERASED_OR_BUILTIN_IMPORTS =
     RUST_STD_IMPLICIT_SUPERTRAITS +
-        setOf(
-            "Hasher",
-            "Formatter",
-            "DebugStruct",
-            "DebugTuple",
-            "DebugList",
-            "DebugSet",
-            "DebugMap",
-            "ManuallyDrop",
-            "needs_drop",
-            "PhantomData",
-            "ThreadId",
-            "Rc",
-            "Arc",
-            "VecDeque",
-            "None",
-            "Some",
-            "Ok",
-            "Err",
-            "TypeId",
-            "Into",
-            "From",
-            "Octal",
-            "LowerHex",
-            "UpperHex",
-            "Binary",
-            "LowerExp",
-            "UpperExp",
-            "Pointer",
+        wordSet(
+            "Hasher Formatter DebugStruct DebugTuple DebugList DebugSet DebugMap",
+            "ManuallyDrop needs_drop PhantomData ThreadId Rc Arc VecDeque None Some Ok Err TypeId",
         )
-internal val FMT_TRAIT_NAMES: Set<String> =
-    setOf("Debug", "Display", "Octal", "LowerHex", "UpperHex", "Binary", "LowerExp", "UpperExp", "Pointer")
-internal val KNOWN_SELF_PARAMETERIZED_TRAITS = setOf("Parse", "ParseQuote", "Read", "Write")
-internal val KOTLIN_COLLECTION_INTERFACES = setOf("List", "MutableList", "Map", "MutableMap", "Set", "MutableSet", "ArrayDeque")
+internal val KNOWN_SELF_PARAMETERIZED_TRAITS = wordSet("Parse ParseQuote Read Write")
+internal val KOTLIN_COLLECTION_INTERFACES =
+    wordSet("List MutableList Map MutableMap Set MutableSet ArrayDeque")
 internal val MUTATING_VEC_METHODS =
-    setOf("push", "pop", "clear", "insert", "remove", "truncate", "retain", "extend", "extend_from_slice", "append", "drain", "swap_remove")
+    wordSet("push pop clear insert remove truncate retain extend extend_from_slice append drain swap_remove")
 internal val KNOWN_OPTION_RETURNING_METHODS =
-    setOf(
-        "take",
-        "pop",
-        "pop_front",
-        "removeFirstOrNull",
-        "removeLastOrNull",
-        "next",
-        "next_back",
-        "first",
-        "first_mut",
-        "last",
-        "last_mut",
-        "get",
-        "get_mut",
-        "getOrNull",
-        "punct",
-        "punct_mut",
-        "find",
-        "position",
-        "rposition",
-        "checked_add",
-        "checked_sub",
-        "checked_mul",
-        "checked_div",
-        "checked_rem",
-        "checked_shl",
-        "checked_shr",
-        "checked_neg",
-        "strip_prefix",
-        "strip_suffix",
-        "split_once",
-        "rsplit_once",
-        "get_key_value",
+    wordSet(
+        "take pop pop_front removeFirstOrNull removeLastOrNull next next_back",
+        "first first_mut last last_mut get get_mut getOrNull punct punct_mut",
+        "find position rposition checked_add checked_sub checked_mul checked_div",
+        "checked_rem checked_shl checked_shr checked_neg strip_prefix strip_suffix",
+        "split_once rsplit_once get_key_value",
     )
 internal val KOTLIN_JVM_VALUE_TYPES =
-    setOf(
-        "Boolean",
-        "Byte",
-        "Short",
-        "Int",
-        "Long",
-        "Float",
-        "Double",
-        "Char",
-        "UByte",
-        "UShort",
-        "UInt",
-        "ULong",
-    )
+    wordSet("Boolean Byte Short Int Long Float Double Char UByte UShort UInt ULong")
 internal val NUMERIC_CAST_TARGETS = KOTLIN_JVM_VALUE_TYPES - "Boolean"
 internal val KOTLIN_STDLIB_SHADOWED_IMPORTS =
-    setOf(
-        "String",
-        "Boolean",
-        "Char",
-        "Byte",
-        "Short",
-        "Int",
-        "Long",
-        "UByte",
-        "UShort",
-        "UInt",
-        "ULong",
-        "Float",
-        "Double",
-        "Unit",
-        "Nothing",
-        "Any",
-        "Result",
-        "Iterator",
-        "Iterable",
-        "Comparable",
-        "List",
-        "MutableList",
-        "Map",
-        "MutableMap",
-        "Set",
-        "MutableSet",
-        "Pair",
-        "Triple",
-        "Vec",
-        "Box",
-        "HashMap",
-        "BTreeMap",
-        "HashSet",
-        "BTreeSet",
-    )
+    KOTLIN_JVM_VALUE_TYPES +
+        wordSet(
+            "String Unit Nothing Any Result Iterator Iterable Comparable",
+            "List MutableList Map MutableMap Set MutableSet Pair Triple",
+            "Vec Box HashMap BTreeMap HashSet BTreeSet",
+        )
 internal val FORWARD_DESERIALIZE_KEYS =
-    setOf(
-        "bool",
-        "i8",
-        "i16",
-        "i32",
-        "i64",
-        "i128",
-        "u8",
-        "u16",
-        "u32",
-        "u64",
-        "u128",
-        "f32",
-        "f64",
-        "char",
-        "str",
-        "string",
-        "bytes",
-        "byte_buf",
-        "option",
-        "unit",
-        "unit_struct",
-        "newtype_struct",
-        "seq",
-        "tuple",
-        "tuple_struct",
-        "map",
-        "struct",
-        "enum",
-        "identifier",
-        "ignored_any",
+    wordSet(
+        "bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string",
+        "bytes byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct",
+        "map struct enum identifier ignored_any",
     )
 internal val PRIMITIVE_TYPE_NAMES =
-    setOf(
-        "u8",
-        "u16",
-        "u32",
-        "u64",
-        "u128",
-        "usize",
-        "i8",
-        "i16",
-        "i32",
-        "i64",
-        "i128",
-        "isize",
-        "f16",
-        "f32",
-        "f64",
-        "f128",
-        "bool",
-        "str",
-        "char",
-    )
+    wordSet("u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize f16 f32 f64 f128 bool str char")
 internal val IGNORED_QUOTE_KEYWORDS =
-    setOf(
-        "use",
-        "as",
-        "crate",
-        "const",
-        "let",
-        "mut",
-        "match",
-        "fn",
-        "impl",
-        "for",
-        "in",
-        "where",
-        "pub",
-        "return",
-        "if",
-        "else",
-        "struct",
-        "enum",
-        "trait",
-        "type",
-        "static",
-        "unsafe",
-        "ref",
-        "dyn",
-        "loop",
-        "while",
-        "break",
-        "continue",
-        "move",
-        "async",
-        "await",
-        "super",
-        "default",
-        "union",
-        "try",
-        "yield",
-        "mod",
-        "u8",
-        "u16",
-        "u32",
-        "u64",
-        "u128",
-        "usize",
-        "i8",
-        "i16",
-        "i32",
-        "i64",
-        "i128",
-        "isize",
-        "f16",
-        "f32",
-        "f64",
-        "f128",
-        "bool",
-        "str",
-        "char",
-    )
+    wordSet(
+        "use as crate const let mut match fn impl for in where pub return if else",
+        "struct enum trait type static unsafe ref dyn loop while break continue",
+        "move async await super default union try yield mod",
+    ) + PRIMITIVE_TYPE_NAMES
 
 internal val SYN_KEYWORD_TOKENS =
-    setOf(
-        "abstract",
-        "as",
-        "async",
-        "auto",
-        "await",
-        "become",
-        "box",
-        "break",
-        "const",
-        "continue",
-        "crate",
-        "default",
-        "do",
-        "dyn",
-        "else",
-        "enum",
-        "extern",
-        "final",
-        "fn",
-        "for",
-        "if",
-        "impl",
-        "in",
-        "let",
-        "loop",
-        "macro",
-        "match",
-        "mod",
-        "move",
-        "mut",
-        "override",
-        "priv",
-        "pub",
-        "raw",
-        "ref",
-        "return",
-        "safe",
-        "static",
-        "struct",
-        "super",
-        "trait",
-        "try",
-        "typeof",
-        "union",
-        "unsafe",
-        "unsized",
-        "use",
-        "virtual",
-        "where",
-        "while",
-        "yield",
+    wordSet(
+        "abstract as async auto await become box break const continue crate default",
+        "do dyn else enum extern final fn for if impl in let loop macro match mod",
+        "move mut override priv pub raw ref return safe static struct super trait",
+        "try typeof union unsafe unsized use virtual where while yield",
     )
 
 internal val SYN_PUNCT_TOKEN_NAMES =

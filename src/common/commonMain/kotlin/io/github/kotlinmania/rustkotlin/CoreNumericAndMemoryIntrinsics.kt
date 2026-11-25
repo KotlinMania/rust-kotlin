@@ -102,13 +102,9 @@ internal class SynthesizedIntrinsicDeclContext(
     val typeParams: List<String>,
     val ord0: String,
     val ord1: String,
-    val coreNs: String,
-    val emitter: KotlinJ2KEmitter,
-) {
-    val intrPkg: String = "$coreNs.intrinsics"
-    val memPkg: String = "$coreNs.mem"
-    val ptrPkg: String = "$coreNs.ptr"
-    val rawAbi: Boolean get() = emitter.headerContext.rawAbiMode
+    coreNs: String,
+    emitter: KotlinJ2KEmitter,
+) : CoreIntrinsicPackageScope(coreNs, emitter) {
     val t0: String = typeParams.getOrElse(0) { "Any" }
     val t1: String = typeParams.getOrElse(1) { t0 }
     val layout0: String = StructLayoutComputer.typeLayoutParamName(t0)
@@ -116,54 +112,23 @@ internal class SynthesizedIntrinsicDeclContext(
     val p0: String = paramIdents.getOrElse(0) { "arg0" }
     val p1: String = paramIdents.getOrElse(1) { "arg1" }
     val p2: String = paramIdents.getOrElse(2) { "arg2" }
-
-    fun usizeLiteral(lit: Int): String = if (rawAbi) "${lit}uL" else "$lit"
-
-    fun asUsizeExpr(expr: String): String = if (rawAbi) "$expr.toULong()" else "$expr.toInt()"
-
-    fun importIntr(sym: String): String {
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$intrPkg.$sym")
-        return sym
-    }
-
-    fun importMem(sym: String): String {
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.$sym")
-        return sym
-    }
-
-    fun importPtr(sym: String): String {
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$ptrPkg.$sym")
-        return sym
-    }
-
-    fun callIntr(fnName: String, vararg args: String): String =
-        "${importIntr(fnName)}(${args.joinToString(", ")})"
-
-    fun callMem(fnName: String, vararg args: String): String =
-        "${importMem(fnName)}(${args.joinToString(", ")})"
-
-    fun callMemArgs(fnName: String, args: List<String>): String =
-        "${importMem(fnName)}(${args.joinToString(", ")})"
 }
 
-internal data class IntIntrinsicCallContext(
-    val canonicalName: String,
-    val renderedArgs: List<String>,
-    val callArgsList: List<Expr>,
-    val explicitTypes: List<SynType>,
+internal class IntIntrinsicCallContext(
+    call: IntrinsicCallContext,
     val kind: NumericKind?,
     val firstTargetTy: SynType?,
-    val selfTypeName: String?,
-    val coreNs: String,
-    val intrPkg: String,
-    val memPkg: String,
-    val emitter: KotlinJ2KEmitter,
-) {
+) : CoreIntrinsicPackageScope(call.coreNs, call.emitter) {
+    val canonicalName: String = call.canonicalName
+    val renderedArgs: List<String> = call.renderedArgs
+    val callArgsList: List<Expr> = call.callArgsList
+    val explicitTypes: List<SynType> = call.explicitTypes
+    val selfTypeName: String? = call.selfTypeName
+
     fun fallbackWithLayout(fnName: String, argsPart: String): String? {
         val ty = firstTargetTy ?: return null
         val layout = CoreIntrinsicLowering.resolveTypeLayoutExpression(ty, selfTypeName, emitter)
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.$fnName")
-        return "$fnName($argsPart, $layout)"
+        return callMem(fnName, argsPart, layout)
     }
 
     fun binary128Call(
@@ -172,7 +137,7 @@ internal data class IntIntrinsicCallContext(
         rhsExpr: String,
         wrapResult: (String) -> String = { it },
     ): String {
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$intrPkg.$kmFn")
+        importIntr(kmFn)
         val hiL = if (kind == NumericKind.I128) "lhs.high.toULong()" else "lhs.high"
         val hiR = if (kind == NumericKind.I128) "rhs.high.toULong()" else "rhs.high"
         val built = reconstruct128Expr(kind ?: NumericKind.U128, "it.lo", "it.hi", coreNs, emitter)
@@ -406,43 +371,19 @@ internal val INT_INTRINSIC_RULES_BY_NAME: Map<String, IntIntrinsicLoweringRule> 
         }
     }
 
-internal fun renderIntOrBitIntrinsicCall(
-    canonicalName: String,
-    renderedArgs: List<String>,
-    callArgsList: List<Expr>,
-    explicitTypes: List<SynType>,
-    selfTypeName: String?,
-    coreNs: String,
-    intrPkg: String,
-    memPkg: String,
-    emitter: KotlinJ2KEmitter,
-): String? {
-    val rule = INT_INTRINSIC_RULES_BY_NAME[canonicalName] ?: return null
+internal fun renderIntOrBitIntrinsicCall(call: IntrinsicCallContext): String? {
+    val rule = INT_INTRINSIC_RULES_BY_NAME[call.canonicalName] ?: return null
     val kind =
         CoreIntrinsicLowering.resolveIntrinsicNumericKind(
-            explicitTypes.firstOrNull(),
-            callArgsList.take(rule.symmetricArgCount),
-            selfTypeName,
-            emitter,
+            call.explicitTypes.firstOrNull(),
+            call.callArgsList.take(rule.symmetricArgCount),
+            call.selfTypeName,
+            call.emitter,
         )
     val firstTargetTy =
-        explicitTypes.nonInferAt(0)
-            ?: callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) }
-    return rule.renderCall(
-        IntIntrinsicCallContext(
-            canonicalName = canonicalName,
-            renderedArgs = renderedArgs,
-            callArgsList = callArgsList,
-            explicitTypes = explicitTypes,
-            kind = kind,
-            firstTargetTy = firstTargetTy,
-            selfTypeName = selfTypeName,
-            coreNs = coreNs,
-            intrPkg = intrPkg,
-            memPkg = memPkg,
-            emitter = emitter,
-        ),
-    )
+        call.explicitTypes.nonInferAt(0)
+            ?: call.callArgsList.firstOrNull()?.let { call.emitter.sourceInitializerType(it) }
+    return rule.renderCall(IntIntrinsicCallContext(call, kind, firstTargetTy))
 }
 
 internal class FloatEmitSpec(
@@ -450,36 +391,26 @@ internal class FloatEmitSpec(
     val args: List<String>,
     val layout0: String,
     val layout1: String,
-    val intrPkg: String,
-    val memPkg: String,
-    val emitter: KotlinJ2KEmitter,
-) {
+    coreNs: String,
+    emitter: KotlinJ2KEmitter,
+) : CoreIntrinsicPackageScope(coreNs, emitter) {
     val p0: String get() = args.getOrElse(0) { "" }
     val p1: String get() = args.getOrElse(1) { "" }
     val p2: String get() = args.getOrElse(2) { "" }
 
-    fun callIntr(fnName: String, count: Int): String {
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$intrPkg.$fnName")
-        return "$fnName(${args.take(count).joinToString(", ")})"
-    }
-
-    fun callMem(fnName: String, vararg callArgs: String): String {
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.$fnName")
-        return "$fnName(${callArgs.joinToString(", ")})"
-    }
+    fun callIntr(fnName: String, count: Int): String =
+        "${importIntr(fnName)}(${args.take(count).joinToString(", ")})"
 }
 
-internal data class FloatIntrinsicCallContext(
-    val canonicalName: String,
-    val renderedArgs: List<String>,
-    val callArgsList: List<Expr>,
-    val explicitTypes: List<SynType>,
-    val selfTypeName: String?,
-    val coreNs: String,
-    val intrPkg: String,
-    val memPkg: String,
-    val emitter: KotlinJ2KEmitter,
-) {
+internal class FloatIntrinsicCallContext(
+    call: IntrinsicCallContext,
+) : CoreIntrinsicPackageScope(call.coreNs, call.emitter) {
+    val canonicalName: String = call.canonicalName
+    val renderedArgs: List<String> = call.renderedArgs
+    val callArgsList: List<Expr> = call.callArgsList
+    val explicitTypes: List<SynType> = call.explicitTypes
+    val selfTypeName: String? = call.selfTypeName
+
     fun kindForArity(arity: Int): NumericKind? =
         CoreIntrinsicLowering.resolveIntrinsicNumericKind(
             explicitTypes.firstOrNull(),
@@ -501,7 +432,7 @@ internal data class FloatIntrinsicCallContext(
     }
 
     fun emitWithLayouts(rule: FloatIntrinsicLoweringRule, layout0: String, layout1: String = layout0): String? =
-        rule.renderWithLayouts(FloatEmitSpec(canonicalName, renderedArgs, layout0, layout1, intrPkg, memPkg, emitter))
+        rule.renderWithLayouts(FloatEmitSpec(canonicalName, renderedArgs, layout0, layout1, coreNs, emitter))
 
     fun dispatchF32F64OrFallback(
         rule: FloatIntrinsicLoweringRule,
@@ -513,14 +444,8 @@ internal data class FloatIntrinsicCallContext(
         if (renderedArgs.size < requiredArity) return null
         val callArgsJoined = renderedArgs.take(requiredArity).joinToString(", ")
         return when (kind) {
-            NumericKind.F32 -> {
-                CoreIntrinsicLowering.registerCoreImport(emitter, "$intrPkg.$f32Km")
-                "$f32Km($callArgsJoined)"
-            }
-            NumericKind.F64 -> {
-                CoreIntrinsicLowering.registerCoreImport(emitter, "$intrPkg.$f64Km")
-                "$f64Km($callArgsJoined)"
-            }
+            NumericKind.F32 -> "${importIntr(f32Km)}($callArgsJoined)"
+            NumericKind.F64 -> "${importIntr(f64Km)}($callArgsJoined)"
             else -> {
                 val layout = floatLayoutExpr(kind) ?: return null
                 emitWithLayouts(rule, layout)
@@ -542,8 +467,7 @@ internal abstract class FloatIntrinsicLoweringRule(
                 args = listOf(decl.p0, decl.p1, decl.p2),
                 layout0 = decl.layout0,
                 layout1 = decl.layout1,
-                intrPkg = decl.intrPkg,
-                memPkg = decl.memPkg,
+                coreNs = decl.coreNs,
                 emitter = decl.emitter,
             ),
         )
@@ -719,31 +643,9 @@ internal val FLOAT_INTRINSIC_RULES_BY_NAME: Map<String, FloatIntrinsicLoweringRu
         }
     }
 
-internal fun renderFloatIntrinsicCall(
-    canonicalName: String,
-    renderedArgs: List<String>,
-    callArgsList: List<Expr>,
-    explicitTypes: List<SynType>,
-    selfTypeName: String?,
-    coreNs: String,
-    intrPkg: String,
-    memPkg: String,
-    emitter: KotlinJ2KEmitter,
-): String? {
-    val rule = FLOAT_INTRINSIC_RULES_BY_NAME[canonicalName] ?: return null
-    return rule.renderCall(
-        FloatIntrinsicCallContext(
-            canonicalName = canonicalName,
-            renderedArgs = renderedArgs,
-            callArgsList = callArgsList,
-            explicitTypes = explicitTypes,
-            selfTypeName = selfTypeName,
-            coreNs = coreNs,
-            intrPkg = intrPkg,
-            memPkg = memPkg,
-            emitter = emitter,
-        ),
-    )
+internal fun renderFloatIntrinsicCall(call: IntrinsicCallContext): String? {
+    val rule = FLOAT_INTRINSIC_RULES_BY_NAME[call.canonicalName] ?: return null
+    return rule.renderCall(FloatIntrinsicCallContext(call))
 }
 
 /**
