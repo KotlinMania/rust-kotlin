@@ -1,7 +1,6 @@
 package io.github.kotlinmania.rustkotlin
 
 import io.github.kotlinmania.procmacro2.Delimiter
-import io.github.kotlinmania.procmacro2.Spacing
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.Attribute
@@ -267,8 +266,9 @@ private object RawPointerLiteralMacroRule : MacroApproximationRule() {
         }
         val rawParam = branches[0].paramNames.firstOrNull()?.removePrefix("r#") ?: "lit"
         val ktParam = sanitizeMacroParamName(rustValueIdentToKotlin(rawParam).ifEmpty { "lit" })
-        val bodyText = branches.joinToString(" ") { it.bodyTokens.toString() }
-        val isWide = spec.rawMacroName == "w" || "u16" in bodyText || "utf16" in bodyText
+        val isWide =
+            spec.rawMacroName == "w" ||
+                branches.any { b -> RustTokenCursor.anyIdentRecursive(b.bodyTokens) { "u16" in it || "utf16" in it } }
         val internFn = if (isWide) "kmInternWideStr" else "kmInternCStr"
         ctx.extraImports += "import ${ctx.coreNamespace}.intrinsics.$internFn"
         ctx.occupiedNames += spec.fnName
@@ -760,109 +760,46 @@ private class MacroCfgAttributeParser(
 private class MacroBodyTokenFormatter(
     trees: List<TokenTree>,
     private val allMetavars: Map<String, String>,
-) : RustTokenCursor(trees) {
-    fun format(): String {
-        val sb = StringBuilder()
-        appendInto(sb)
-        return sb.toString().trim()
+) : RustTokenStreamKotlinEmitter(trees) {
+    override val bracketMacroAsListOf: Boolean = false
+    override val omitTurbofishDot: Boolean = false
+    override val stripPostfixQuestion: Boolean = false
+
+    override fun spawnChild(childTrees: List<TokenTree>): RustTokenStreamKotlinEmitter =
+        MacroBodyTokenFormatter(childTrees, allMetavars)
+
+    override fun mapIdent(rawIdent: String): String = translateMacroTemplateIdent(rawIdent)
+
+    override fun tryConsumeSpecialAt(idx: Int, outTokens: MutableList<String>): Int? {
+        if (punctCharAt(idx) == '&') {
+            if (punctCharAt(idx + 1) == '$') return idx + 1
+            if (identAt(idx + 1) == "mut" && punctCharAt(idx + 2) == '$') return idx + 2
+        }
+        if (punctCharAt(idx) == '$' && idx + 1 < size) {
+            val nextIdent = identAt(idx + 1)
+            if (nextIdent == "crate") {
+                var k = idx + 2
+                while (isDoubleColonAt(k)) {
+                    k += 2
+                    if (identAt(k) == "__private") {
+                        k++
+                    } else {
+                        break
+                    }
+                }
+                return k
+            }
+            if (nextIdent != null) {
+                val raw = nextIdent.removePrefix("r#")
+                val ktParam = allMetavars[raw] ?: sanitizeMacroParamName(rustValueIdentToKotlin(raw))
+                outTokens += "\$$ktParam"
+                return idx + 2
+            }
+        }
+        return null
     }
 
-    private fun appendInto(sb: StringBuilder) {
-        var i = 0
-        while (i < size) {
-            consumeAttribute(i, allowInnerAttr = true)?.let {
-                i = it
-                continue
-            }
-            if (isLifetimeAt(i)) {
-                i += 2
-                continue
-            }
-            if (punctCharAt(i) == '&') {
-                if (punctCharAt(i + 1) == '$') {
-                    i += 1
-                    continue
-                }
-                if (identAt(i + 1) == "mut" && punctCharAt(i + 2) == '$') {
-                    i += 2
-                    continue
-                }
-            }
-            if (punctCharAt(i) == '$' && i + 1 < size) {
-                val nextIdent = identAt(i + 1)
-                if (nextIdent == "crate") {
-                    i += 2
-                    while (punctCharAt(i) == ':' && punctCharAt(i + 1) == ':') {
-                        i += 2
-                        if (identAt(i) == "__private") {
-                            i++
-                        } else {
-                            break
-                        }
-                    }
-                    continue
-                }
-                if (nextIdent != null) {
-                    if (sb.isNotEmpty() && sb.last() != ' ' && sb.last() != '(' && sb.last() != '[' && sb.last() != '{') {
-                        sb.append(' ')
-                    }
-                    val raw = nextIdent.removePrefix("r#")
-                    val ktParam = allMetavars[raw] ?: sanitizeMacroParamName(rustValueIdentToKotlin(raw))
-                    sb.append('$').append(ktParam)
-                    i += 2
-                    continue
-                }
-            }
-            if (isDoubleColonAt(i)) {
-                sb.append('.')
-                i += 2
-                continue
-            }
-            when (val tt = trees[i]) {
-                is TokenTree.Ident -> {
-                    val word = translateMacroTemplateIdent(tt.value.toString())
-                    if (sb.isNotEmpty() && !sb.endsWith('.') && !sb.endsWith('(') && !sb.endsWith('[') && !sb.endsWith('{') && !sb.endsWith(' ')) {
-                        sb.append(' ')
-                    }
-                    sb.append(word)
-                    if (punctCharAt(i + 1) == '!') {
-                        i += 2
-                        continue
-                    }
-                }
-                is TokenTree.Literal -> {
-                    if (sb.isNotEmpty() && !sb.endsWith('(') && !sb.endsWith('[') && !sb.endsWith(' ')) {
-                        sb.append(' ')
-                    }
-                    sb.append(tt.value.toString())
-                }
-                is TokenTree.Punct -> {
-                    val ch = tt.value.asChar()
-                    sb.append(ch)
-                    if ((ch == ';' || ch == ',') && tt.value.spacing() == Spacing.Alone) {
-                        sb.append(' ')
-                    }
-                }
-                is TokenTree.Group -> {
-                    val (open, close) =
-                        when (tt.value.delimiter()) {
-                            Delimiter.Parenthesis -> "(" to ")"
-                            Delimiter.Brace -> "{" to "}"
-                            Delimiter.Bracket -> "[" to "]"
-                            Delimiter.None -> "" to ""
-                        }
-                    if (open == "{" && sb.isNotEmpty() && !sb.endsWith(' ')) {
-                        sb.append(' ')
-                    }
-                    sb.append(open)
-                    val groupStream = tt.value.stream()
-                    MacroBodyTokenFormatter(groupStream.clone().toList(), allMetavars).appendInto(sb)
-                    sb.append(close)
-                }
-            }
-            i++
-        }
-    }
+    fun format(): String = render().trim()
 }
 
 private fun hasMacroExportAttr(attrs: List<Attribute>): Boolean =

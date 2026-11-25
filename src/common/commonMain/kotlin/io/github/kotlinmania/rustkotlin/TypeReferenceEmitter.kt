@@ -618,8 +618,17 @@ internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): St
                 rustTypeIdentToKotlin(macroName ?: "Token")
             }
         }
-        is SynType.Verbatim -> "Any"
+        is SynType.Verbatim -> renderVerbatimTypeTokens(ty.tokens)
     }
+
+private fun renderVerbatimTypeTokens(stream: TokenStream): String {
+    if (stream.isEmpty()) return "Any"
+    val trees = stream.clone().toList()
+    val cursor = RustTokenCursor(trees)
+    if (cursor.identAt(0) == "typeof" || cursor.identAt(0) == "struct" || cursor.identAt(0) == "union") return "Any"
+    val rendered = RustTokenStreamKotlinEmitter(trees).render()
+    return rendered.takeIf { it.isNotEmpty() && '{' !in it && ';' !in it && '=' !in it } ?: "Any"
+}
 
 private fun KotlinJ2KEmitter.renderReferenceType(ty: SynType.Reference, selfTypeName: String?): String {
     val mutElem = if (ty.mutability != null) unwrapSynType(ty.elem) else null

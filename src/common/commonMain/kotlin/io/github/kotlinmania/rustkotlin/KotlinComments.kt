@@ -291,7 +291,7 @@ private fun translateRustDocCodeBlock(
 
     if (allowAstTranslation) {
         val visibleSource = visibleLines.joinToString("\n")
-        val visibleStream = lexTokenStreamOrNull(normalizeSupplementaryCharLiterals(visibleSource))
+        val visibleStream = lexRustTokenStreamOrNull(visibleSource)
         if (visibleStream != null && RustdocSnippetTokenInspector(visibleStream.toList()).isCompleteSnippetEnding()) {
             translateSingleDoctestCandidate(visibleSource, wrapperFnKtName = null, stripTrailingSuccessUnit = false)?.let {
                 return cleanEmittedKotlinDoctestLines(it)
@@ -310,7 +310,7 @@ private fun translateRustDocCodeBlock(
         }
     }
 
-    val wholeStream = lexTokenStreamOrNull(normalizeSupplementaryCharLiterals(visibleLines.joinToString("\n")))
+    val wholeStream = lexRustTokenStreamOrNull(visibleLines.joinToString("\n"))
     if (wholeStream != null) {
         val rendered = renderCommentTokenStream(wholeStream)
         if (rendered.isNotBlank()) {
@@ -325,7 +325,7 @@ private fun translateSingleDoctestCandidate(
     wrapperFnKtName: String?,
     stripTrailingSuccessUnit: Boolean,
 ): List<String>? {
-    val supNormalized = normalizeSupplementaryCharLiterals(rawCandidate)
+    val supNormalized = normalizeRustSourceForLexing(rawCandidate)
     val initialStream = lexTokenStreamOrNull(supNormalized) ?: return null
     val initialTrees = initialStream.toList()
     if (initialTrees.isEmpty()) return null
@@ -380,7 +380,7 @@ private fun buildUnhiddenRustdocSource(lines: List<String>): UnhiddenRustdocSour
                 inStringifyHide = false
                 continue
             }
-            val lineTokens = lexTokenStreamOrNull(normalizeSupplementaryCharLiterals(unhidden))
+            val lineTokens = lexRustTokenStreamOrNull(unhidden)
             if (lineTokens != null) {
                 val inspector = RustdocSnippetTokenInspector(lineTokens.toList())
                 if (inspector.isExternCrateLine()) continue
@@ -396,7 +396,7 @@ private fun buildUnhiddenRustdocSource(lines: List<String>): UnhiddenRustdocSour
                     hadHiddenTrailingOkUnit = true
                 }
             } else {
-                val fallbackStream = lexTokenStreamOrNull(normalizeSupplementaryCharLiterals("$unhiddenTrimmed }"))
+                val fallbackStream = lexRustTokenStreamOrNull("$unhiddenTrimmed }")
                 val fallbackFn = fallbackStream?.let { RustdocSnippetTokenInspector(it.toList()).extractFnHeaderIdent() }
                 if (fallbackFn != null && wrapperFnKtName == null) {
                     wrapperFnKtName = rustFunctionIdentToKotlin(fallbackFn)
@@ -564,7 +564,7 @@ private class RustdocSnippetTokenInspector(
 }
 
 private fun rewriteHiddenUnimplementedMacrosViaTokens(source: String): String {
-    val normalized = normalizeSupplementaryCharLiterals(source)
+    val normalized = normalizeRustSourceForLexing(source)
     val stream = lexTokenStreamOrNull(normalized) ?: return source
     val edits = mutableListOf<SpanReplacement>()
     RustdocSnippetTokenInspector(stream.toList()).collectUnimplementedMacroReplacements(edits)
@@ -724,7 +724,7 @@ private fun sanitizeVerbatimFenceLine(line: String): String {
 internal fun sanitizeCommentTextForKotlin(line: String, inRustCodeFence: Boolean = false): String {
     if (line.isEmpty()) return ""
     if (inRustCodeFence) {
-        val stream = lexTokenStreamOrNull(normalizeSupplementaryCharLiterals(line))
+        val stream = lexRustTokenStreamOrNull(line)
         if (stream != null) {
             val rendered = renderCommentTokenStream(stream).replace("*/", "* /").replace("/*", "/ *")
             return CommentLexicalScanner(rendered).sanitizeProseVocabulary(convertCamelIdentifiersOnly = true).trimEnd()
@@ -736,7 +736,7 @@ internal fun sanitizeCommentTextForKotlin(line: String, inRustCodeFence: Boolean
 private fun renderIntraDocLinkTarget(rawCode: String): String {
     val trimmed = rawCode.trim()
     if (trimmed.isEmpty()) return ""
-    val stream = lexTokenStreamOrNull(normalizeSupplementaryCharLiterals(trimmed))
+    val stream = lexRustTokenStreamOrNull(trimmed)
     val parts = stream?.let { CommentRustTokenEmitter(it.toList()).renderIntraDocLinkParts() }.orEmpty()
     return if (parts.isEmpty()) {
         CommentLexicalScanner(trimmed).sanitizeProseVocabulary(convertCamelIdentifiersOnly = false)
@@ -757,7 +757,7 @@ private fun translateInlineCodeSpan(spanContent: String): String {
         val trimmedParts = if (parts.size > 1 && parts[0] in setOf("crate", "self", "super")) parts.drop(1) else parts
         return CommentLexicalScanner(trimmedParts.joinToString(".")).sanitizeProseVocabulary(convertCamelIdentifiersOnly = false)
     }
-    val stream = lexTokenStreamOrNull(normalizeSupplementaryCharLiterals(trimmed))
+    val stream = lexRustTokenStreamOrNull(trimmed)
     val rendered = if (stream != null) renderCommentTokenStream(stream) else trimmed
     return CommentLexicalScanner(rendered).sanitizeProseVocabulary(convertCamelIdentifiersOnly = false)
 }
@@ -1111,7 +1111,23 @@ private fun renderCommentTokenStream(stream: TokenStream): String =
 
 private class CommentRustTokenEmitter(
     trees: List<TokenTree>,
-) : RustTokenCursor(trees) {
+) : RustTokenStreamKotlinEmitter(trees) {
+    override fun spawnChild(childTrees: List<TokenTree>): RustTokenStreamKotlinEmitter =
+        CommentRustTokenEmitter(childTrees)
+
+    override fun renderAttributeInteriorStream(stream: TokenStream, isInner: Boolean): String =
+        CommentRustTokenEmitter(stream.toList()).renderAttributeInterior(isInner)
+
+    override fun consumeLifetimeAt(idx: Int, outTokens: MutableList<String>): Int {
+        if (size == 2) {
+            outTokens += mapCommentVocabularyWord(cleanIdentAt(idx + 1).orEmpty(), convertCamelIdentifiersOnly = false)
+            return idx + 2
+        }
+        return super.consumeLifetimeAt(idx, outTokens)
+    }
+
+    override fun mapIdent(rawIdent: String): String = mapRustIdentInCommentCode(rawIdent)
+
     fun renderIntraDocLinkParts(): List<String> {
         val parts = mutableListOf<String>()
         var i = 0
@@ -1170,157 +1186,7 @@ private class CommentRustTokenEmitter(
         }
         return "$prefix$ktName${CommentRustTokenEmitter(rest).render()}"
     }
-
-    fun render(): String {
-        if (trees.isEmpty()) return ""
-        val outTokens = mutableListOf<String>()
-        var i = 0
-        while (i < size) {
-            val current = trees[i]
-            if (punctCharAt(i) == '#') {
-                var nextIdx = i + 1
-                var isInner = false
-                if (punctCharAt(nextIdx) == '!') {
-                    isInner = true
-                    nextIdx++
-                }
-                val grp = groupAt(nextIdx, Delimiter.Bracket)
-                if (grp != null) {
-                    val renderedAttr = renderAttributeInteriorTokens(grp.stream(), isInner = isInner)
-                    if (renderedAttr.isNotEmpty()) outTokens += renderedAttr
-                    i = nextIdx + 1
-                    continue
-                }
-            }
-
-            if (isLifetimeAt(i)) {
-                if (size == 2) {
-                    outTokens += mapCommentVocabularyWord(cleanIdentAt(i + 1).orEmpty(), convertCamelIdentifiersOnly = false)
-                    i += 2
-                    continue
-                }
-                i += 2
-                if (punctCharAt(i) == '+' || (punctCharAt(i) == ',' && outTokens.lastOrNull() == "<")) {
-                    i++
-                }
-                continue
-            }
-
-            if (punctCharAt(i) == '&') {
-                val prev = outTokens.lastOrNull()
-                if (punctSpacingAt(i) == Spacing.Joint && punctCharAt(i + 1) == '&') {
-                    outTokens += "&&"
-                    i += 2
-                    continue
-                }
-                if (prev == null || prev in setOf("(", ",", ":", "=", "<", "->")) {
-                    i++
-                    if (isLifetimeAt(i)) i += 2
-                    if (identAt(i) == "mut") i++
-                    continue
-                }
-            }
-
-            val bangMacroGrp = if (current is TokenTree.Ident && punctCharAt(i + 1) == '!') groupAt(i + 2) else null
-            if (bangMacroGrp != null) {
-                val rawMacro = cleanIdentAt(i).orEmpty()
-                if (identAt(i) == "Token" && bangMacroGrp.delimiter() == Delimiter.Bracket) {
-                    outTokens += mapSynTokenMacroSymbol(bangMacroGrp.stream().toString().replace(" ", ""))
-                    i += 3
-                    continue
-                }
-                val ktMacro = if (rawMacro == "macro_rules") "macroRules" else rustFunctionIdentToKotlin(rawMacro)
-                val inner = renderCommentTokenStream(bangMacroGrp.stream())
-                outTokens +=
-                    when (bangMacroGrp.delimiter()) {
-                        Delimiter.Brace -> "$ktMacro { $inner }"
-                        Delimiter.Bracket -> "listOf($inner)"
-                        else -> "$ktMacro($inner)"
-                    }
-                i += 3
-                continue
-            }
-
-            if (current is TokenTree.Ident && punctCharAt(i + 1) == '!' && punctCharAt(i + 2) != '=') {
-                val rawMacro = cleanIdentAt(i).orEmpty()
-                outTokens += if (rawMacro == "macro_rules") "macroRules" else rustFunctionIdentToKotlin(rawMacro)
-                i += 2
-                continue
-            }
-
-            if (isDoubleColonAt(i)) {
-                if (outTokens.lastOrNull() in setOf("crate", "self", "super")) {
-                    outTokens.removeAt(outTokens.lastIndex)
-                } else if (punctCharAt(i + 2) != '<') {
-                    outTokens += "."
-                }
-                i += 2
-                continue
-            }
-
-            when (current) {
-                is TokenTree.Ident -> {
-                    val mapped = mapRustIdentInCommentCode(cleanIdentAt(i).orEmpty())
-                    if (mapped.isNotEmpty()) outTokens += mapped
-                    i++
-                }
-                is TokenTree.Literal -> {
-                    outTokens += current.value.toString()
-                    i++
-                }
-                is TokenTree.Group -> {
-                    val grp = current.value
-                    val inner = renderCommentTokenStream(grp.stream())
-                    outTokens +=
-                        when (grp.delimiter()) {
-                            Delimiter.Parenthesis -> if (inner.isEmpty() && outTokens.lastOrNull() == "<") "Unit" else "($inner)"
-                            Delimiter.Bracket -> "[$inner]"
-                            Delimiter.Brace -> if (inner.isEmpty()) "{}" else "{ $inner }"
-                            Delimiter.None -> inner
-                        }
-                    i++
-                }
-                is TokenTree.Punct -> {
-                    val (punctOut, step) = consumeMultiCharPunct(i, outTokens.lastOrNull())
-                    if (punctOut.isNotEmpty()) outTokens += punctOut
-                    i += step
-                }
-            }
-        }
-        return joinCommentTokensCleanly(outTokens)
-    }
-
-    private fun consumeMultiCharPunct(idx: Int, prevRendered: String?): Pair<String, Int> {
-        val c0 = punctCharAt(idx) ?: return "" to 1
-        if (punctSpacingAt(idx) == Spacing.Joint) {
-            val c1 = punctCharAt(idx + 1)
-            if (c1 != null) {
-                when (val pair = "$c0$c1") {
-                    "->", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=" -> return pair to 2
-                    "=>" -> return "->" to 2
-                    ".." -> {
-                        if (punctSpacingAt(idx + 1) == Spacing.Joint) {
-                            val c2 = punctCharAt(idx + 2)
-                            if (c2 == '=' || c2 == '.') return "..$c2" to 3
-                        }
-                        return ".." to 2
-                    }
-                }
-            }
-        }
-        if (c0 == '?' &&
-            prevRendered != null &&
-            (prevRendered.endsWith(")") || prevRendered.last().isLetterOrDigit() || prevRendered.endsWith("]"))
-        ) {
-            return "" to 1
-        }
-        return c0.toString() to 1
-    }
 }
-
-private fun mapSynTokenMacroSymbol(symbol: String): String =
-    RustTokenCursor.resolveSynTokenIdentOrPunctTypeName(symbol)
-        ?: rustTypeIdentToKotlin(symbol.filter { it.isLetterOrDigit() || it == '_' }.ifEmpty { "Token" })
 
 private fun mapSnakeOrForbiddenCommentWord(word: String): String {
     if (word.lowercase() in COMMENT_FORBIDDEN_STUB_WORDS) return "Note"
@@ -1343,37 +1209,6 @@ private fun mapCommentVocabularyWord(word: String, convertCamelIdentifiersOnly: 
     COMMENT_COMMON_VOCAB_MAP[word]?.let { return it }
     if (!convertCamelIdentifiersOnly && word == "macro_rules") return "macroRules"
     return mapSnakeOrForbiddenCommentWord(word)
-}
-
-private fun joinCommentTokensCleanly(tokens: List<String>): String {
-    if (tokens.isEmpty()) return ""
-    val sb = StringBuilder()
-    val binarySpacedOps =
-        setOf("=", "->", "==", "!=", "<=", ">=", "&&", "||", "+", "-", "*", "/", "+=", "-=", "*=", "/=")
-    for (idx in tokens.indices) {
-        val tok = tokens[idx]
-        if (tok.isEmpty()) continue
-        val prev = if (idx > 0) tokens[idx - 1] else null
-        val needSpace =
-            when {
-                prev == null -> false
-                tok == "." || prev == "." -> false
-                tok == "," || tok == ";" || tok == ":" -> false
-                prev == "," || prev == ":" || prev == ";" -> true
-                tok in binarySpacedOps || prev in binarySpacedOps -> true
-                tok.startsWith("(") || tok.startsWith("[") ->
-                    prev in setOf("if", "while", "for", "when", "return", "val", "var", "in")
-                prev == "<" || tok == ">" -> false
-                tok == "<" -> prev in setOf("val", "var", "return", "in")
-                prev.endsWith("(") || prev.endsWith("[") -> false
-                tok.startsWith(")") || tok.startsWith("]") -> false
-                prev == "!" || prev == "@" -> false
-                else -> true
-            }
-        if (needSpace && sb.isNotEmpty() && sb.last() != ' ') sb.append(' ')
-        sb.append(tok)
-    }
-    return sb.toString()
 }
 
 private fun stripFromImplProvenanceNotes(text: String): String {

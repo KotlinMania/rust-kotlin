@@ -1,5 +1,7 @@
 package io.github.kotlinmania.rustkotlin
 
+import io.github.kotlinmania.procmacro2.Delimiter
+import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.rustkotlin.reused.starlark.AssignCount
 import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
@@ -494,8 +496,41 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
             if (valExpr != null) "yield($valExpr)" else "yield()"
         }
         is Expr.Infer -> "_"
-        is Expr.Verbatim -> ""
+        is Expr.Verbatim -> renderVerbatimExprTokens(expr.tokens, indent, selfTypeName)
     }
+
+private fun KotlinJ2KEmitter.renderVerbatimExprTokens(
+    stream: TokenStream,
+    indent: String,
+    selfTypeName: String?,
+): String {
+    if (stream.isEmpty()) return ""
+    val cursor = RustTokenCursor(stream.clone().toList())
+    if (cursor.identAt(0) == "builtin" && cursor.punctCharAt(1) == '#') {
+        val builtinName = cursor.cleanIdentAt(2)
+        val parenGrp = cursor.groupAt(3, Delimiter.Parenthesis)
+        if (builtinName != null && parenGrp != null) {
+            return when (builtinName) {
+                "offset_of" ->
+                    if (headerContext.rawAbiMode && currentExpectedNumericKind == null) {
+                        "0uL"
+                    } else {
+                        renderIntLiteral("0", "")
+                    }
+                "type_ascribe" -> {
+                    val firstArg = RustTokenCursor(parenGrp.stream().toList()).splitByTopLevelPunct(',').firstOrNull()
+                    if (firstArg != null) {
+                        parseAndRenderTokenStreamAsExpr(TokenStream.fromTokenTrees(firstArg), indent, selfTypeName)
+                    } else {
+                        "Unit"
+                    }
+                }
+                else -> "${rustFunctionIdentToKotlin(builtinName)}(${parseAndRenderTokenStreamAsExpr(parenGrp.stream(), indent, selfTypeName)})"
+            }
+        }
+    }
+    return RustTokenStreamKotlinEmitter(cursor.trees).render()
+}
 
 internal fun KotlinJ2KEmitter.renderBlockAsExpression(block: Block, indent: String, selfTypeName: String?): String {
     val stmts = block.stmts
