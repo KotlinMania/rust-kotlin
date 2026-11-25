@@ -1240,33 +1240,16 @@ internal fun conservativeNeedsDropCall(
             is SynType.Tuple -> unwrapped.elems.toList().all { cannotNeedDrop(it) }
             is SynType.Array -> cannotNeedDrop(unwrapped.elem)
             is SynType.Path -> {
-                val path = unwrapped.path.segments.toList()
-                val name = path.singleOrNull()?.ident?.toString()
-                val primitiveTypes =
-                    setOf(
-                        "bool",
-                        "char",
-                        "u8",
-                        "u16",
-                        "u32",
-                        "u64",
-                        "u128",
-                        "usize",
-                        "i8",
-                        "i16",
-                        "i32",
-                        "i64",
-                        "i128",
-                        "isize",
-                        "f32",
-                        "f64",
-                    )
-                unwrapped.qself == null && name !in localTypes && name in primitiveTypes
+                val name = unwrapped.unqualifiedPath()?.singleSegment()?.identText()
+                name != null && name !in localTypes && name in COPY_SCALAR_PRIMITIVE_NAMES
             }
             else -> false
         }
     return !cannotNeedDrop(type)
 }
+
+private val COPY_SCALAR_PRIMITIVE_NAMES =
+    wordSet("bool char u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize f32 f64")
 
 internal fun validateSupportedRustSemantics(
     file: File,

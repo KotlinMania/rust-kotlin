@@ -25,6 +25,15 @@ internal data class StandaloneMacroEmission(
 private sealed class CfgConditionAst {
     abstract fun render(parenthesizeBinary: Boolean = false): String
 
+    protected fun renderJoined(
+        items: List<CfgConditionAst>,
+        separator: String,
+        parenthesizeBinary: Boolean,
+    ): String {
+        val joined = items.joinToString(separator) { it.render(parenthesizeBinary = true) }
+        return if (parenthesizeBinary && items.size > 1) "($joined)" else joined
+    }
+
     data class Flag(
         val constName: String,
         val defaultValue: Boolean,
@@ -41,19 +50,13 @@ private sealed class CfgConditionAst {
     data class All(
         val items: List<CfgConditionAst>,
     ) : CfgConditionAst() {
-        override fun render(parenthesizeBinary: Boolean): String {
-            val joined = items.joinToString(" && ") { it.render(parenthesizeBinary = true) }
-            return if (parenthesizeBinary && items.size > 1) "($joined)" else joined
-        }
+        override fun render(parenthesizeBinary: Boolean): String = renderJoined(items, " && ", parenthesizeBinary)
     }
 
     data class AnyOf(
         val items: List<CfgConditionAst>,
     ) : CfgConditionAst() {
-        override fun render(parenthesizeBinary: Boolean): String {
-            val joined = items.joinToString(" || ") { it.render(parenthesizeBinary = true) }
-            return if (parenthesizeBinary && items.size > 1) "($joined)" else joined
-        }
+        override fun render(parenthesizeBinary: Boolean): String = renderJoined(items, " || ", parenthesizeBinary)
     }
 }
 
@@ -226,6 +229,12 @@ private data class MacroGroupSpec(
 ) {
     val unconditionalBranches: List<MacroRuleBranch>?
         get() = variants.singleOrNull()?.takeIf { it.cfgCondition == null }?.branches
+
+    fun renderConstDecl(type: String, expr: String): String =
+        "$kdocPrefix$vis const val $constName: $type = $expr"
+
+    fun renderFnDecl(fnIdent: String = fnName, paramsSig: String, returnType: String, bodyExpr: String): String =
+        "$kdocPrefix$vis fun $fnIdent($paramsSig): $returnType =\n    $bodyExpr"
 }
 
 /**
@@ -239,6 +248,12 @@ private abstract class MacroApproximationRule {
         spec: MacroGroupSpec,
         ctx: MacroApproximationContext,
     ): String?
+
+    protected fun formatDefaultedStringParams(names: Iterable<String>): String =
+        names.joinToString(", ") { "$it: String = \"\"" }
+
+    protected fun formatUnusedEmptyGuard(unusedParams: List<String>): String =
+        unusedParams.joinToString(" && ") { "$it.isEmpty()" }
 }
 
 private object RawPointerLiteralMacroRule : MacroApproximationRule() {
@@ -277,11 +292,11 @@ private object ScalarConstMacroRule : MacroApproximationRule() {
         }
         if (branch.bodyTokens.isEmpty()) {
             ctx.occupiedNames += spec.constName
-            return "${spec.kdocPrefix}${spec.vis} const val ${spec.constName}: String = \"\""
+            return spec.renderConstDecl("String", "\"\"")
         }
         val scalar = extractScalarLiteralFromMacroBody(branch.bodyTokens) ?: return null
         ctx.occupiedNames += spec.constName
-        return "${spec.kdocPrefix}${spec.vis} const val ${spec.constName}: ${scalar.kotlinType} = ${scalar.renderedExpr}"
+        return spec.renderConstDecl(scalar.kotlinType, scalar.renderedExpr)
     }
 }
 
@@ -327,31 +342,22 @@ private object ScalarConditionalMacroRule : MacroApproximationRule() {
 
         val defaultScalar = fallbackExpr ?: defaultInitializerForType(returnType)
         val armWalkers = whenArms.map(::KotlinTokenWalker)
-        val usedParams = paramNames.filter { p -> armWalkers.any { it.containsIdentifier(p) } }
-        val unusedGuard = paramNames.filter { it !in usedParams }.joinToString(" && ") { "$it.isEmpty()" }
+        val unusedParams = paramNames.filter { p -> armWalkers.none { it.containsIdentifier(p) } }
+        val unusedGuard = formatUnusedEmptyGuard(unusedParams)
 
         ctx.occupiedNames += spec.fnName
-        val sigParams = paramNames.joinToString(", ") { "$it: String = \"\"" }
+        val sigParams = formatDefaultedStringParams(paramNames)
         if (unusedGuard.isNotEmpty() && whenArms.isEmpty()) {
-            return buildString {
-                append(spec.kdocPrefix)
-                append("${spec.vis} fun ${spec.fnName}($sigParams): $returnType =\n")
-                append("    if ($unusedGuard) $defaultScalar else $defaultScalar")
-            }
+            return spec.renderFnDecl(paramsSig = sigParams, returnType = returnType, bodyExpr = "if ($unusedGuard) $defaultScalar else $defaultScalar")
         }
-        return buildString {
-            append(spec.kdocPrefix)
-            append("${spec.vis} fun ${spec.fnName}($sigParams): $returnType =\n")
-            append("    when {\n")
-            for (arm in whenArms) {
-                append(arm).append('\n')
+        val whenBody =
+            buildString {
+                append("when {\n")
+                for (arm in whenArms) append(arm).append('\n')
+                if (unusedGuard.isNotEmpty()) append("        $unusedGuard -> $defaultScalar\n")
+                append("        else -> $defaultScalar\n    }")
             }
-            if (unusedGuard.isNotEmpty()) {
-                append("        $unusedGuard -> $defaultScalar\n")
-            }
-            append("        else -> $defaultScalar\n")
-            append("    }")
-        }
+        return spec.renderFnDecl(paramsSig = sigParams, returnType = returnType, bodyExpr = whenBody)
     }
 
     private fun splitPatternTopLevelCommaClauses(pattern: List<MacroPat>): List<List<MacroPat>> {
@@ -443,14 +449,10 @@ private object TemplateConditionalMacroRule : MacroApproximationRule() {
             spec.variants.any { v ->
                 v.branches.size > 1 && v.branches.any { extractPatternDistinguishingLiterals(it.pattern).isNotEmpty() }
             }
-        val paramDecls =
+        val allParamNames =
             buildList {
-                for (ktParam in allMetavars.values) {
-                    add("$ktParam: String = \"\"")
-                }
-                if (needsClauseSelector) {
-                    add("clause: String = \"\"")
-                }
+                addAll(allMetavars.values)
+                if (needsClauseSelector) add("clause")
             }
 
         var templateCounter = 0
@@ -534,32 +536,22 @@ private object TemplateConditionalMacroRule : MacroApproximationRule() {
             }
 
         val bodyWalker = KotlinTokenWalker(bodyExpr)
-        val unusedParams =
-            buildList {
-                for (ktParam in allMetavars.values) {
-                    if (!bodyWalker.containsIdentifier(ktParam)) {
-                        add(ktParam)
-                    }
-                }
-                if (needsClauseSelector && !bodyWalker.containsIdentifier("clause")) {
-                    add("clause")
-                }
-            }
-
+        val unusedParams = allParamNames.filterNot(bodyWalker::containsIdentifier)
         val finalBodyExpr =
             if (unusedParams.isEmpty()) {
                 bodyExpr
             } else {
-                val touchCond = unusedParams.joinToString(" && ") { "$it.isEmpty()" }
+                val touchCond = formatUnusedEmptyGuard(unusedParams)
                 val indentedBody = bodyExpr.replace("\n    ", "\n        ")
                 "if ($touchCond) {\n        $indentedBody\n    } else {\n        $indentedBody\n    }"
             }
 
-        return buildString {
-            append(spec.kdocPrefix)
-            append("${spec.vis} fun $effectiveFnName(${paramDecls.joinToString(", ")}): String =\n")
-            append("    $finalBodyExpr")
-        }
+        return spec.renderFnDecl(
+            fnIdent = effectiveFnName,
+            paramsSig = formatDefaultedStringParams(allParamNames),
+            returnType = "String",
+            bodyExpr = finalBodyExpr,
+        )
     }
 
     private fun collectNormalizedMetavars(variants: List<MacroVariantAst>): LinkedHashMap<String, String> {

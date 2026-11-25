@@ -24,22 +24,11 @@ import io.github.kotlinmania.syn.WhereClause
 import io.github.kotlinmania.syn.WherePredicate
 
 private val CORE_OPS_BINARY_TRAITS =
-    setOf("Add", "Sub", "Mul", "Div", "Rem", "BitAnd", "BitOr", "BitXor", "Shl", "Shr")
+    wordSet("Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr")
 private val CORE_OPS_UNARY_OUTPUT_TRAITS =
-    setOf("Neg", "Not")
+    wordSet("Neg Not")
 private val CORE_OPS_ASSIGN_TRAITS =
-    setOf(
-        "AddAssign",
-        "SubAssign",
-        "MulAssign",
-        "DivAssign",
-        "RemAssign",
-        "BitAndAssign",
-        "BitOrAssign",
-        "BitXorAssign",
-        "ShlAssign",
-        "ShrAssign",
-    )
+    CORE_OPS_BINARY_TRAITS.mapTo(linkedSetOf()) { "${it}Assign" }
 
 private val NUMERIC_SUFFIX_BY_KIND: Map<NumericKind, String> =
     mapOf(
@@ -71,32 +60,16 @@ private val BOXED_INT_FROM_SUFFIX_BY_KIND: Map<NumericKind, String> =
         NumericKind.U64 to "fromULong",
     )
 
-private val ZERO_OR_NULL_POINTER_LITERALS = setOf("0", "0L", "0u", "0uL", "null")
+private val ZERO_OR_NULL_POINTER_LITERALS = wordSet("0 0L 0u 0uL null")
 
 private val KOTLIN_BUILTIN_VALUE_TYPE_NAMES: Set<String> =
-    setOf(
-        "Byte",
-        "Short",
-        "Int",
-        "Long",
-        "UByte",
-        "UShort",
-        "UInt",
-        "ULong",
-        "Float",
-        "Double",
-        "Boolean",
-        "Char",
-        "String",
-        "Unit",
-        "Any",
-    )
+    wordSet("Byte Short Int Long UByte UShort UInt ULong Float Double Boolean Char String Unit Any")
 
 private val C_POINTER_WIDTH_UNSIGNED_TYPE_NAMES =
-    setOf("size_t", "SizeT", "uintptr_t", "UintptrT", "rsize_t", "RsizeT", "__size_t")
+    wordSet("size_t SizeT uintptr_t UintptrT rsize_t RsizeT __size_t")
 
 private val C_POINTER_WIDTH_SIGNED_TYPE_NAMES =
-    setOf("ssize_t", "SsizeT", "ptrdiff_t", "PtrdiffT", "intptr_t", "IntptrT", "__ssize_t")
+    wordSet("ssize_t SsizeT ptrdiff_t PtrdiffT intptr_t IntptrT __ssize_t")
 
 internal fun isDecimalOrHexLiteralDigits(text: String): Boolean {
     if (text.isEmpty()) return false

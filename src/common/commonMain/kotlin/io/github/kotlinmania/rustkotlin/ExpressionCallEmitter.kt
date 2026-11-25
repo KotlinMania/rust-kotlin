@@ -11,101 +11,42 @@ import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.TraitItem
 
 private val HOMOGENEOUS_BINARY_SIMD_INTRINSICS =
-    setOf(
-        "simd_add",
-        "simd_sub",
-        "simd_mul",
-        "simd_div",
-        "simd_rem",
-        "simd_and",
-        "simd_or",
-        "simd_xor",
-        "simd_shl",
-        "simd_shr",
-        "simd_eq",
-        "simd_ne",
-        "simd_lt",
-        "simd_le",
-        "simd_gt",
-        "simd_ge",
-        "simd_fmin",
-        "simd_fmax",
+    wordSet(
+        "simd_add simd_sub simd_mul simd_div simd_rem simd_and simd_or simd_xor simd_shl simd_shr",
+        "simd_eq simd_ne simd_lt simd_le simd_gt simd_ge simd_fmin simd_fmax",
     )
 
 private val BYTE_SWAP_CALLEE_KIND: Map<String, NumericKind?> =
-    mapOf(
-        "Byte.toLe" to null,
-        "Byte.fromLe" to null,
-        "Byte.toBe" to null,
-        "Byte.fromBe" to null,
-        "Byte.swapBytes" to null,
-        "UByte.toLe" to null,
-        "UByte.fromLe" to null,
-        "UByte.toBe" to null,
-        "UByte.fromBe" to null,
-        "UByte.swapBytes" to null,
-        "Short.toLe" to null,
-        "Short.fromLe" to null,
-        "UShort.toLe" to null,
-        "UShort.fromLe" to null,
-        "Int.toLe" to null,
-        "Int.fromLe" to null,
-        "UInt.toLe" to null,
-        "UInt.fromLe" to null,
-        "Long.toLe" to null,
-        "Long.fromLe" to null,
-        "ULong.toLe" to null,
-        "ULong.fromLe" to null,
-        "UInt.toBe" to NumericKind.U32,
-        "UInt.fromBe" to NumericKind.U32,
-        "UInt.swapBytes" to NumericKind.U32,
-        "Int.toBe" to NumericKind.I32,
-        "Int.fromBe" to NumericKind.I32,
-        "Int.swapBytes" to NumericKind.I32,
-        "UShort.toBe" to NumericKind.U16,
-        "UShort.fromBe" to NumericKind.U16,
-        "UShort.swapBytes" to NumericKind.U16,
-        "Short.toBe" to NumericKind.I16,
-        "Short.fromBe" to NumericKind.I16,
-        "Short.swapBytes" to NumericKind.I16,
-        "ULong.toBe" to NumericKind.U64,
-        "ULong.fromBe" to NumericKind.U64,
-        "ULong.swapBytes" to NumericKind.U64,
-        "Long.toBe" to NumericKind.I64,
-        "Long.fromBe" to NumericKind.I64,
-        "Long.swapBytes" to NumericKind.I64,
-    )
+    buildMap {
+        for (singleByte in listOf("Byte", "UByte")) {
+            for (op in listOf("toLe", "fromLe", "toBe", "fromBe", "swapBytes")) put("$singleByte.$op", null)
+        }
+        val multiByte =
+            listOf(
+                "Short" to NumericKind.I16,
+                "UShort" to NumericKind.U16,
+                "Int" to NumericKind.I32,
+                "UInt" to NumericKind.U32,
+                "Long" to NumericKind.I64,
+                "ULong" to NumericKind.U64,
+            )
+        for ((type, kind) in multiByte) {
+            put("$type.toLe", null)
+            put("$type.fromLe", null)
+            for (op in listOf("toBe", "fromBe", "swapBytes")) put("$type.$op", kind)
+        }
+    }
 
 private val INTEGER_COMPANION_MIN_MAX_OWNERS =
-    setOf("Byte", "UByte", "Short", "UShort", "Int", "UInt", "Long", "ULong")
+    wordSet("Byte UByte Short UShort Int UInt Long ULong")
 
 private val COMPANION_CONVERT_PRIMITIVES =
-    INTEGER_COMPANION_MIN_MAX_OWNERS + setOf("I128", "U128", "Boolean", "Float", "Double", "F16", "F128")
+    INTEGER_COMPANION_MIN_MAX_OWNERS + wordSet("I128 U128 Boolean Float Double F16 F128")
 
 private val KNOWN_STD_UFCS_RECEIVER_METHODS =
-    setOf(
-        "clone",
-        "cmp",
-        "partialCmp",
-        "eq",
-        "ne",
-        "hash",
-        "fmt",
-        "deref",
-        "derefMut",
-        "asRef",
-        "borrow",
-        "borrowMut",
-        "toString",
-        "toOwned",
-        "writeFmt",
-        "write",
-        "writeAll",
-        "flush",
-        "read",
-        "readExact",
-        "readToEnd",
-        "readToString",
+    wordSet(
+        "clone cmp partialCmp eq ne hash fmt deref derefMut asRef borrow borrowMut",
+        "toString toOwned writeFmt write writeAll flush read readExact readToEnd readToString",
     )
 
 private fun isFmtTraitMethodCallee(calleeBase: String): Boolean {

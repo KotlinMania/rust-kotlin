@@ -38,32 +38,16 @@ private enum class DocFenceKind {
 private val VERBATIM_FENCE_LANGS =
     setOf("text", "console", "plain", "plaintext", "sh", "bash", "zsh", "toml", "json", "yaml", "c", "cpp", "diff")
 
-private val NON_COMPILING_RUSTDOC_FENCE_TAGS =
-    setOf("ignore", "compile_fail", "custom")
+private val NON_COMPILING_RUSTDOC_FENCE_TAGS = wordSet("ignore compile_fail custom")
 
 private val COMPILER_ONLY_DOC_EXAMPLE_ATTRS =
-    setOf(
-        "doc",
-        "cfg",
-        "cfg_attr",
-        "allow",
-        "warn",
-        "deny",
-        "forbid",
-        "non_exhaustive",
-        "must_use",
-        "inline",
-        "cold",
-        "track_caller",
-        "derive",
-        "test",
-    )
+    wordSet("doc cfg cfg_attr allow warn deny forbid non_exhaustive must_use inline cold track_caller derive test")
 
 private val RUSTDOC_REF_TARGET_ROOTS =
-    setOf("crate", "super", "self", "core", "std", "alloc", "proc_macro", "proc_macro2", "quote", "syn")
+    wordSet("crate super self core std alloc proc_macro proc_macro2 quote syn")
 
 private val COMMENT_FORBIDDEN_STUB_WORDS =
-    setOf("todo", "fixme", "xxx", "hack", "stub", "placeholder", "unimplemented")
+    wordSet("todo fixme xxx hack stub placeholder unimplemented")
 
 private val COMMENT_COMMON_VOCAB_MAP =
     mapOf(
@@ -107,40 +91,14 @@ private val COMMENT_CODE_IDENT_MAP =
         )
 
 private val KNOWN_RUST_PROSE_MACROS: Set<String> =
-    setOf(
-        "quote",
-        "format",
-        "write",
-        "writeln",
-        "print",
-        "println",
-        "eprint",
-        "eprintln",
-        "vec",
-        "panic",
-        "todo",
-        "unimplemented",
-        "unreachable",
-        "matches",
-        "cfg",
-        "include",
-        "concat",
-        "stringify",
-        "assert",
-        "dbg",
-        "pin",
-        "select",
-        "join",
-        "try",
-        "column",
-        "line",
-        "file",
-        "env",
-        "compile",
+    wordSet(
+        "quote format write writeln print println eprint eprintln vec panic todo unimplemented",
+        "unreachable matches cfg include concat stringify assert dbg pin select join try",
+        "column line file env compile",
     )
 
 private val TOP_LEVEL_ITEM_KEYWORDS =
-    setOf("fn", "struct", "enum", "trait", "impl", "mod", "type", "const", "static")
+    wordSet("fn struct enum trait impl mod type const static")
 
 internal fun sanitizeDocLines(
     rawLines: List<String>,

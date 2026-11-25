@@ -351,43 +351,45 @@ internal fun buildNodeNapiLoaderJsBody(
 ): String {
     val relsJs = napiRelativeCandidatesJsArray(ffiModName)
     val globalProp = "globalThis.__km_napi_$ffiModName"
-    val sb = StringBuilder()
-    if (returnBooleanStatus) {
-        sb.append("if (typeof $globalProp !== 'undefined') return $globalProp !== null; ")
-        sb.append("if (typeof process === 'undefined' || !process.versions || !process.versions.node) { $globalProp = null; return false; } ")
-    } else {
-        sb.append("if (typeof globalThis !== 'undefined' && typeof $globalProp !== 'undefined') return $globalProp; ")
-        sb.append("if (typeof process === 'undefined' || !process.versions || !process.versions.node) return null; ")
-    }
-    sb.append(
-        "var mod = process.getBuiltinModule ? process.getBuiltinModule('module') : (process.mainModule && process.mainModule.constructor); " +
-            "var req = (mod && mod.createRequire) ? mod.createRequire((process.cwd ? process.cwd() : '.') + '/package.json') : (process.mainModule ? process.mainModule.require : null); ",
-    )
-    if (returnBooleanStatus) {
-        sb.append("if (!req) { $globalProp = null; return false; } ")
-        sb.append("try { $globalProp = req('@kotlinmania/$ffiModName-native-bindings'); return true; } catch (_) {} ")
-    } else {
-        sb.append("if (!req) return null; ")
-        sb.append("try { var pkg = req('@kotlinmania/$ffiModName-native-bindings'); if (typeof globalThis !== 'undefined') $globalProp = pkg; return pkg; } catch (_) {} ")
-    }
-    sb.append(
-        "var fs = req('fs'); var path = req('path'); var dir = process.cwd ? process.cwd() : '.'; var rels = $relsJs; " +
-            "for (var d = 0; d < 8; d++) { for (var i = 0; i < rels.length; i++) { var c = path.resolve(dir, rels[i]); ",
-    )
-    if (returnBooleanStatus) {
-        sb.append("if (fs.existsSync(c)) { $globalProp = req(c); return true; } ")
-    } else {
-        sb.append("if (fs.existsSync(c)) { var loaded = req(c); if (typeof globalThis !== 'undefined') $globalProp = loaded; return loaded; } ")
-    }
-    sb.append("} var parent = path.dirname(dir); if (parent === dir) break; dir = parent; } ")
-    sb.append(
+    val pkgSpec = "@kotlinmania/$ffiModName-native-bindings"
+    val cachedGuard =
+        if (returnBooleanStatus) {
+            "if (typeof $globalProp !== 'undefined') return $globalProp !== null; "
+        } else {
+            "if (typeof globalThis !== 'undefined' && typeof $globalProp !== 'undefined') return $globalProp; "
+        }
+    val failAndCache = if (returnBooleanStatus) "{ $globalProp = null; return false; }" else "return null;"
+    val finalFail =
         if (returnBooleanStatus) {
             "$globalProp = null; return false; "
         } else {
             "if (typeof globalThis !== 'undefined') $globalProp = null; return null; "
-        },
-    )
-    return sb.toString()
+        }
+
+    fun storeLoaded(localName: String, loadExpr: String): String =
+        if (returnBooleanStatus) {
+            "$globalProp = $loadExpr; return true;"
+        } else {
+            "var $localName = $loadExpr; if (typeof globalThis !== 'undefined') $globalProp = $localName; return $localName;"
+        }
+
+    return buildString {
+        append(cachedGuard)
+        append("if (typeof process === 'undefined' || !process.versions || !process.versions.node) $failAndCache ")
+        append(
+            "var mod = process.getBuiltinModule ? process.getBuiltinModule('module') : (process.mainModule && process.mainModule.constructor); " +
+                "var req = (mod && mod.createRequire) ? mod.createRequire((process.cwd ? process.cwd() : '.') + '/package.json') : (process.mainModule ? process.mainModule.require : null); ",
+        )
+        append("if (!req) $failAndCache ")
+        append("try { ${storeLoaded("pkg", "req('$pkgSpec')")} } catch (_) {} ")
+        append(
+            "var fs = req('fs'); var path = req('path'); var dir = process.cwd ? process.cwd() : '.'; var rels = $relsJs; " +
+                "for (var d = 0; d < 8; d++) { for (var i = 0; i < rels.length; i++) { var c = path.resolve(dir, rels[i]); ",
+        )
+        append("if (fs.existsSync(c)) { ${storeLoaded("loaded", "req(c)")} } ")
+        append("} var parent = path.dirname(dir); if (parent === dir) break; dir = parent; } ")
+        append(finalFail)
+    }
 }
 
 internal class FfiInteropCollector(
@@ -892,15 +894,7 @@ internal class FfiInteropCollector(
             CAbiBridgeKind.CALLBACK_PTR ->
                 if (isRawPointerReturn) {
                     profile.pointerImport?.let { importsOut += it }
-                    if (!profile.callbackConvertsNonLongNumeric ||
-                        retNonNullNumeric == NumericKind.I64 ||
-                        kotlinReturnType == "Long" ||
-                        retNonNullNumeric == null
-                    ) {
-                        profile.ptrLongExpr
-                    } else {
-                        "${profile.ptrLongReceiverExpr}.${conversionMethodForNumericKind(retNonNullNumeric)}()"
-                    }
+                    renderRawPointerNumericReturn(profile, kotlinReturnType, retNonNullNumeric, profile.callbackConvertsNonLongNumeric)
                 } else {
                     returnDefaultExpr
                 }
@@ -912,11 +906,7 @@ internal class FfiInteropCollector(
             -> {
                 profile.pointerImport?.let { importsOut += it }
                 if (isRawPointerReturn) {
-                    if (retNonNullNumeric == NumericKind.I64 || kotlinReturnType == "Long" || retNonNullNumeric == null) {
-                        profile.ptrLongExpr
-                    } else {
-                        "${profile.ptrLongReceiverExpr}.${conversionMethodForNumericKind(retNonNullNumeric)}()"
-                    }
+                    renderRawPointerNumericReturn(profile, kotlinReturnType, retNonNullNumeric, allowNonLongConversion = true)
                 } else {
                     wrapLongAddressForPointerReturn(
                         addrExpr = profile.ptrLongExpr,
@@ -931,6 +921,22 @@ internal class FfiInteropCollector(
             else -> profile.fallbackNonScalar
         }
     }
+
+    private fun renderRawPointerNumericReturn(
+        profile: BridgeReturnConversionProfile,
+        kotlinReturnType: String,
+        retNonNullNumeric: NumericKind?,
+        allowNonLongConversion: Boolean,
+    ): String =
+        if (!allowNonLongConversion ||
+            retNonNullNumeric == NumericKind.I64 ||
+            kotlinReturnType == "Long" ||
+            retNonNullNumeric == null
+        ) {
+            profile.ptrLongExpr
+        } else {
+            "${profile.ptrLongReceiverExpr}.${conversionMethodForNumericKind(retNonNullNumeric)}()"
+        }
 
     internal fun addRecordedImportsForBody(
         bodyText: String,
@@ -1537,19 +1543,19 @@ internal fun sanitizeCParamIdentifier(raw: String, index: Int): String {
 }
 
 private val C_RESERVED_PARAM_NAMES: Set<String> =
-    (
-        "auto break case char const continue default do double else enum extern float for goto if " +
-            "inline int long register restrict return short signed sizeof static struct switch typedef union " +
-            "unsigned void volatile while class namespace template typename public private protected virtual operator " +
-            "new delete this friend using try catch throw bool true false alignas alignof constexpr decltype " +
-            "noexcept nullptr static_assert thread_local typeid dynamic_cast static_cast reinterpret_cast const_cast " +
-            "explicit mutable export wchar_t char8_t char16_t char32_t concept requires co_await co_return co_yield " +
-            "and or not xor bitand bitor compl and_eq or_eq xor_eq not_eq near far huge pascal cdecl stdcall fastcall " +
-            "interface small hyper environ errno stdin stdout stderr stat time read write open close accept bind " +
-            "connect listen recv send socket select poll fork pipe dup dup2 link unlink chmod chown " +
-            "lseek mkdir rmdir rename remove system abort exit free malloc calloc realloc div abs labs llabs " +
-            "sin cos tan exp log pow sqrt ceil floor index rindex bcopy bzero bcmp"
-    ).split(' ').toSet()
+    wordSet(
+        "auto break case char const continue default do double else enum extern float for goto if",
+        "inline int long register restrict return short signed sizeof static struct switch typedef union",
+        "unsigned void volatile while class namespace template typename public private protected virtual operator",
+        "new delete this friend using try catch throw bool true false alignas alignof constexpr decltype",
+        "noexcept nullptr static_assert thread_local typeid dynamic_cast static_cast reinterpret_cast const_cast",
+        "explicit mutable export wchar_t char8_t char16_t char32_t concept requires co_await co_return co_yield",
+        "and or not xor bitand bitor compl and_eq or_eq xor_eq not_eq near far huge pascal cdecl stdcall fastcall",
+        "interface small hyper environ errno stdin stdout stderr stat time read write open close accept bind",
+        "connect listen recv send socket select poll fork pipe dup dup2 link unlink chmod chown",
+        "lseek mkdir rmdir rename remove system abort exit free malloc calloc realloc div abs labs llabs",
+        "sin cos tan exp log pow sqrt ceil floor index rindex bcopy bzero bcmp",
+    )
 
 internal fun jniMangleSegment(segment: String): String =
     buildString(segment.length + 4) {
@@ -1715,12 +1721,12 @@ internal fun extractIdentifierTokens(
 }
 
 internal val BUILTIN_KOTLIN_IDENTS: Set<String> =
-    (
-        "null true false Unit Nothing Boolean Byte UByte Short UShort Int UInt Long ULong Float Double " +
-            "String ZERO toByte toUByte toShort toUShort toInt toUInt toLong " +
-            "toULong toFloat toDouble error emptyArray intArrayOf longArrayOf byteArrayOf shortArrayOf " +
-            "floatArrayOf doubleArrayOf ubyteArrayOf ushortArrayOf uintArrayOf ulongArrayOf booleanArrayOf"
-    ).split(' ').toSet()
+    wordSet(
+        "null true false Unit Nothing Boolean Byte UByte Short UShort Int UInt Long ULong Float Double",
+        "String ZERO toByte toUByte toShort toUShort toInt toUInt toLong toULong toFloat toDouble",
+        "error emptyArray intArrayOf longArrayOf byteArrayOf shortArrayOf floatArrayOf doubleArrayOf",
+        "ubyteArrayOf ushortArrayOf uintArrayOf ulongArrayOf booleanArrayOf",
+    )
 
 /**
  * Token-cursor parser for `c!` / `cpp!` inline FFI blocks (`[mut x: T as "CType", ...] -> Ret as "CRet" { ... }`).

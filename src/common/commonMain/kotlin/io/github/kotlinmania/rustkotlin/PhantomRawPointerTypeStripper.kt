@@ -12,35 +12,13 @@ package io.github.kotlinmania.rustkotlin
  */
 internal object PhantomRawPointerTypeStripper {
     private val PHANTOM_RAW_POINTER_IDENTIFIERS: Set<String> =
-        setOf(
-            "ConstPtr",
-            "MutPtr",
-            "NonNull",
-            "Unique",
-            "AtomicPtr",
-            "constPtrLayout",
-            "mutPtrLayout",
-            "constPtrFromRustCast",
-            "mutPtrFromRustCast",
-            "nullPtr",
-            "nullMut",
+        wordSet(
+            "ConstPtr MutPtr NonNull Unique AtomicPtr constPtrLayout mutPtrLayout",
+            "constPtrFromRustCast mutPtrFromRustCast nullPtr nullMut",
         )
 
     private val TOP_LEVEL_ITEM_STARTERS: Set<String> =
-        setOf(
-            "public",
-            "internal",
-            "private",
-            "protected",
-            "override",
-            "fun",
-            "val",
-            "var",
-            "class",
-            "interface",
-            "object",
-            "typealias",
-        )
+        wordSet("public internal private protected override fun val var class interface object typealias")
 
     fun strip(code: String): String {
         if ('<' !in code) return code
