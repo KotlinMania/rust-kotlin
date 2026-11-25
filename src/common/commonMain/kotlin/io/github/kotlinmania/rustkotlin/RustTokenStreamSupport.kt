@@ -2,7 +2,11 @@ package io.github.kotlinmania.rustkotlin
 
 import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.procmacro2.Group
+import io.github.kotlinmania.procmacro2.Ident
+import io.github.kotlinmania.procmacro2.Literal
+import io.github.kotlinmania.procmacro2.Punct
 import io.github.kotlinmania.procmacro2.Spacing
+import io.github.kotlinmania.procmacro2.Span
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.Lit
@@ -46,6 +50,40 @@ internal open class RustTokenCursor(
     fun stringLiteralAt(idx: Int): String? {
         val litTree = trees.getOrNull(idx) as? TokenTree.Literal ?: return null
         return (Lit.new(litTree.value) as? Lit.Str)?.value?.value()
+    }
+
+    fun longLiteralAt(idx: Int): Long? =
+        trees.getOrNull(idx)?.let(::parseIntegerLiteral)
+
+    fun intLiteralAt(idx: Int): Int? =
+        longLiteralAt(idx)?.takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }?.toInt()
+
+    fun hasOuterAttributeIdent(attrIdent: String): Boolean {
+        var idx = 0
+        val attrGroups = mutableListOf<List<TokenTree>>()
+        while (true) {
+            val next = consumeAttribute(idx, attrGroups, allowInnerAttr = false) ?: break
+            idx = next
+        }
+        return attrGroups.any { RustTokenCursor(it).cleanIdentAt(0) == attrIdent }
+    }
+
+    fun consumeJointOperator(idx: Int): Pair<String, Int>? {
+        val c0 = punctCharAt(idx) ?: return null
+        if (punctSpacingAt(idx) != Spacing.Joint) return null
+        val c1 = punctCharAt(idx + 1) ?: return null
+        return when (val pair = "$c0$c1") {
+            "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<", ">>" ->
+                pair to 2
+            ".." -> {
+                if (punctSpacingAt(idx + 1) == Spacing.Joint) {
+                    val c2 = punctCharAt(idx + 2)
+                    if (c2 == '=' || c2 == '.') return "..$c2" to 3
+                }
+                ".." to 2
+            }
+            else -> null
+        }
     }
 
     fun extractGroupInnerSource(source: String, idx: Int, delimiter: Delimiter? = null): String? {
@@ -208,15 +246,28 @@ internal open class RustTokenCursor(
 
     fun collectTopLevelIdentsOutsideAngles(): List<String> {
         val out = mutableListOf<String>()
+        anyTopLevelOutsideAngles { idx ->
+            cleanIdentAt(idx)?.let { out += it }
+            false
+        }
+        return out
+    }
+
+    inline fun anyTopLevelOutsideAngles(
+        startIdx: Int = 0,
+        endIdx: Int = trees.size,
+        predicate: (idx: Int) -> Boolean,
+    ): Boolean {
         var angleDepth = 0
-        for (idx in 0 until trees.size) {
+        val limit = minOf(endIdx, trees.size)
+        for (idx in startIdx until limit) {
             when (punctCharAt(idx)) {
                 '<' -> angleDepth++
                 '>' -> if (angleDepth > 0 && !isRArrowEndAt(idx)) angleDepth--
-                null -> if (angleDepth == 0) cleanIdentAt(idx)?.let { out += it }
+                else -> if (angleDepth == 0 && predicate(idx)) return true
             }
         }
-        return out
+        return false
     }
 
     fun skipBalancedAngles(openIdx: Int): Int? {
@@ -335,6 +386,84 @@ internal open class RustTokenCursor(
     }
 
     companion object {
+        fun identTree(name: String, span: Span = Span.callSite()): TokenTree =
+            TokenTree.Ident(Ident.new(name, span))
+
+        fun punctTree(
+            ch: Char,
+            spacing: Spacing = Spacing.Alone,
+            span: Span = Span.callSite(),
+        ): TokenTree = TokenTree.Punct(Punct(ch, spacing).also { it.setSpan(span) })
+
+        fun stringLiteralTree(value: String): TokenTree =
+            TokenTree.Literal(Literal.string(value))
+
+        fun groupStreamTree(
+            delimiter: Delimiter,
+            stream: TokenStream,
+            span: Span? = null,
+        ): TokenTree =
+            TokenTree.Group(
+                Group(delimiter, stream).also { grp ->
+                    if (span != null) grp.setSpan(span)
+                },
+            )
+
+        fun groupTree(
+            delimiter: Delimiter,
+            trees: List<TokenTree> = emptyList(),
+            span: Span? = null,
+        ): TokenTree = groupStreamTree(delimiter, TokenStream.fromTokenTrees(trees), span)
+
+        fun parseIntegerLiteral(litTree: TokenTree): Long? {
+            val rawLit = (litTree as? TokenTree.Literal)?.value?.toString() ?: return null
+            val withoutUnderscore = rawLit.replace("_", "")
+            if (withoutUnderscore.isEmpty()) return null
+            return when {
+                withoutUnderscore.startsWith("0x") || withoutUnderscore.startsWith("0X") ->
+                    stripHexOrRadixSuffix(withoutUnderscore.drop(2), allowHexDigits = true).toLongOrNull(16)
+                withoutUnderscore.startsWith("0b") || withoutUnderscore.startsWith("0B") ->
+                    stripHexOrRadixSuffix(withoutUnderscore.drop(2), allowHexDigits = false).toLongOrNull(2)
+                withoutUnderscore.startsWith("0o") || withoutUnderscore.startsWith("0O") ->
+                    stripHexOrRadixSuffix(withoutUnderscore.drop(2), allowHexDigits = false).toLongOrNull(8)
+                else -> withoutUnderscore.trimEnd { it.isLetter() }.toLongOrNull()
+            }
+        }
+
+        private fun stripHexOrRadixSuffix(body: String, allowHexDigits: Boolean): String {
+            for (suffix in INT_LITERAL_SUFFIXES) {
+                if (body.endsWith(suffix) && body.length > suffix.length) {
+                    return body.dropLast(suffix.length)
+                }
+            }
+            return if (allowHexDigits) body else body.trimEnd { it.isLetter() }
+        }
+
+        private val INT_LITERAL_SUFFIXES =
+            listOf("u128", "i128", "usize", "isize", "u64", "i64", "u32", "i32", "u16", "i16", "u8", "i8")
+
+        fun canonicalTokenKey(trees: List<TokenTree>): String =
+            trees.joinToString(" ") { tt ->
+                when (tt) {
+                    is TokenTree.Ident -> "I:${tt.value}"
+                    is TokenTree.Punct -> "P:${tt.value.asChar()}:${tt.value.spacing()}"
+                    is TokenTree.Literal -> "L:${tt.value}"
+                    is TokenTree.Group -> "G:${tt.value.delimiter()}(${canonicalTokenKey(tt.value.stream().toList())})"
+                }
+            }
+
+        fun extractCfgComplementSignature(predTrees: List<TokenTree>): Pair<String, Boolean>? {
+            if (predTrees.isEmpty()) return null
+            val cursor = RustTokenCursor(predTrees)
+            val innerGroup = cursor.groupAt(1, Delimiter.Parenthesis)
+            if (cursor.size == 2 && cursor.identAt(0) == "not" && innerGroup != null) {
+                val inner = canonicalTokenKey(innerGroup.stream().toList())
+                if (inner.isNotEmpty()) return inner to true
+            }
+            val raw = canonicalTokenKey(predTrees)
+            return if (raw.isNotEmpty()) raw to false else null
+        }
+
         fun tokenTreeStartOffset(tt: TokenTree): Int =
             when (tt) {
                 is TokenTree.Group -> tt.value.spanOpen().startOffset()

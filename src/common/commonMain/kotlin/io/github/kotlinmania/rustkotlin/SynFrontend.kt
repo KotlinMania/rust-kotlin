@@ -5,11 +5,18 @@ import io.github.kotlinmania.procmacro2.Group
 import io.github.kotlinmania.procmacro2.Spacing
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
+import io.github.kotlinmania.syn.Expr
+import io.github.kotlinmania.syn.ExprParse
 import io.github.kotlinmania.syn.File
 import io.github.kotlinmania.syn.FileParse
+import io.github.kotlinmania.syn.ForeignItem
+import io.github.kotlinmania.syn.ImplItem
 import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.ItemParse
+import io.github.kotlinmania.syn.Pat
+import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
+import io.github.kotlinmania.syn.TraitItem
 import io.github.kotlinmania.syn.TypeParamBound
 import io.github.kotlinmania.syn.gen.Fold
 import io.github.kotlinmania.syn.parse2
@@ -22,7 +29,7 @@ internal data class RecognizedRust(
 )
 
 internal fun recognizeRust(source: String): RecognizedRust {
-    val normalizedSource = normalizeSupplementaryCharLiterals(source)
+    val normalizedSource = normalizeRustSourceForLexing(source)
     val tokens = TranslationSession.measure("lex:${normalizedSource.length}") { TokenStream.fromString(normalizedSource).getOrThrow() }
     val parseStream = normalizeLetOrPatternsForSyn(tokens.clone())
     // Syn consumes its token stream. Preserve the original library token trees for provenance.
@@ -46,6 +53,12 @@ internal fun lexTokenStreamOrNull(source: String): TokenStream? {
     return if (lexed.isSuccess()) lexed.getOrThrow() else null
 }
 
+internal fun lexRustTokenStreamOrNull(source: String): TokenStream? =
+    lexTokenStreamOrNull(normalizeRustSourceForLexing(source))
+
+internal fun lexRustTokenTrees(source: String): List<TokenTree> =
+    lexRustTokenStreamOrNull(source)?.toList().orEmpty()
+
 internal fun recognizePreLexedRustOrNull(
     normalizedSource: String,
     tokens: TokenStream,
@@ -57,17 +70,27 @@ internal fun recognizePreLexedRustOrNull(
 }
 
 internal fun recognizeRustOrNull(source: String): RecognizedRust? {
-    val normalizedSource = normalizeSupplementaryCharLiterals(source)
+    val normalizedSource = normalizeRustSourceForLexing(source)
     val tokens = lexTokenStreamOrNull(normalizedSource) ?: return null
     return recognizePreLexedRustOrNull(normalizedSource, tokens)
 }
 
 /**
- * `proc-macro2` character literal lexing steps one UTF-16 `Char` for unescaped character bodies,
- * rejecting UTF-16 surrogate pairs (`'🦀'`) while accepting `'\\u{1f980}'` and decoding both to the
- * exact same 21-bit scalar in `syn`'s `LitChar`. Rewrite unescaped supplementary character literals
- * outside comments and string literals in a single lexical pass so token spans and trivia align.
+ * Normalizes a leading `#!...` interpreter shebang (without `#![...]` inner attribute brackets)
+ * to equal-length spaces so UTF-16 span offsets remain unchanged, then rewrites unescaped
+ * supplementary character literals (`'🦀'` -> `'\\u{1f980}'`) outside strings and comments.
  */
+internal fun normalizeRustSourceForLexing(source: String): String {
+    val withoutShebang =
+        if (source.startsWith("#!") && !source.startsWith("#![")) {
+            val nl = source.indexOf('\n')
+            if (nl >= 0) " ".repeat(nl) + source.substring(nl) else " ".repeat(source.length)
+        } else {
+            source
+        }
+    return SupplementaryCharLiteralRewriter(withoutShebang).rewrite()
+}
+
 internal fun normalizeSupplementaryCharLiterals(source: String): String =
     SupplementaryCharLiteralRewriter(source).rewrite()
 
@@ -382,8 +405,84 @@ internal fun isSingleConstBracketGroup(group: Group): Boolean {
 }
 
 /**
- * Normalizes RFC 3762 `const trait` / `const impl` items and `[const]` / `const` trait bounds
- * that `syn` preserves as `Item.Verbatim` and `TypeParamBound.Verbatim` into structured AST nodes
+ * Token-constructed AST fragment parsers built directly on `proc_macro2` [TokenTree] nodes
+ * (zero `TokenStream.fromString` string round-trips).
+ */
+internal object SynAstFragmentParser {
+    fun parseRawFile(stream: TokenStream): File? =
+        parse2(FileParse::parse, normalizeLetOrPatternsForSyn(stream)).getOrNull()
+
+    fun parseNormalizedFile(stream: TokenStream): File? =
+        parseRawFile(stream)?.let(RustNextAstNormalizer::foldFile)
+
+    fun parseRawImplItems(inner: TokenStream): List<ImplItem>? {
+        val wrapped =
+            TokenStream.fromTokenTrees(
+                listOf(
+                    RustTokenCursor.identTree("impl"),
+                    RustTokenCursor.identTree("Dummy"),
+                    RustTokenCursor.groupStreamTree(Delimiter.Brace, inner),
+                ),
+            )
+        return (parseRawFile(wrapped)?.items?.singleOrNull() as? Item.Impl)?.items
+    }
+
+    fun parseNormalizedImplItems(inner: TokenStream): List<ImplItem>? =
+        parseRawImplItems(inner)?.map(RustNextAstNormalizer::foldImplItem)
+
+    fun parseRawTraitItems(inner: TokenStream): List<TraitItem>? {
+        val wrapped =
+            TokenStream.fromTokenTrees(
+                listOf(
+                    RustTokenCursor.identTree("trait"),
+                    RustTokenCursor.identTree("Dummy"),
+                    RustTokenCursor.groupStreamTree(Delimiter.Brace, inner),
+                ),
+            )
+        return (parseRawFile(wrapped)?.items?.singleOrNull() as? Item.Trait)?.items
+    }
+
+    fun parseNormalizedBlockStmts(inner: TokenStream): List<Stmt>? {
+        val wrapped =
+            TokenStream.fromTokenTrees(
+                listOf(
+                    RustTokenCursor.identTree("fn"),
+                    RustTokenCursor.identTree("dummy"),
+                    RustTokenCursor.groupTree(Delimiter.Parenthesis),
+                    RustTokenCursor.groupStreamTree(Delimiter.Brace, inner),
+                ),
+            )
+        return (parseNormalizedFile(wrapped)?.items?.singleOrNull() as? Item.Fn)?.block?.stmts
+    }
+
+    fun parseForeignFnFromTokens(fnTokens: List<TokenTree>): ForeignItem.Fn? {
+        if (fnTokens.isEmpty()) return null
+        val body = ArrayList<TokenTree>(fnTokens.size + 2)
+        body += RustTokenCursor.identTree("pub")
+        body.addAll(fnTokens)
+        if ((fnTokens.last() as? TokenTree.Punct)?.value?.asChar() != ';') {
+            body += RustTokenCursor.punctTree(';')
+        }
+        val wrapped =
+            TokenStream.fromTokenTrees(
+                listOf(
+                    RustTokenCursor.identTree("extern"),
+                    RustTokenCursor.stringLiteralTree("C"),
+                    RustTokenCursor.groupTree(Delimiter.Brace, body),
+                ),
+            )
+        val foreignMod = parseNormalizedFile(wrapped)?.items?.singleOrNull() as? Item.ForeignMod ?: return null
+        return foreignMod.items.singleOrNull() as? ForeignItem.Fn
+    }
+
+    fun u8SynType(): SynType =
+        parse2(SynType.Companion::parse, TokenStream.fromTokenTrees(listOf(RustTokenCursor.identTree("u8")))).getOrThrow()
+}
+
+/**
+ * Normalizes RFC 3762 `const trait` / `const impl`, `[const]` / `~const` bounds, `dyn*`,
+ * `&pin mut` / `&pin const`, `for<T> fn(...)`, `box pat`, `become expr`, and trait/impl
+ * member `Verbatim` nodes that `syn` preserves as `*.Verbatim` into structured AST nodes
  * while preserving outer attributes and source spans.
  */
 internal object RustNextAstNormalizer : Fold() {
@@ -402,7 +501,45 @@ internal object RustNextAstNormalizer : Fold() {
             val underlying = parse2(SynType.Companion::parse, TokenStream.fromTokenTrees(tokens.take(separator))).getOrThrow()
             return foldType(underlying)
         }
+        if (t is SynType.Verbatim) {
+            val stripped = ConstVerbatimTokenStripper(t.tokens.clone().toList()).stripType()
+            if (stripped != null) {
+                val reparsed = parse2(SynType.Companion::parse, TokenStream.fromTokenTrees(stripped)).getOrNull()
+                if (reparsed != null && reparsed !is SynType.Verbatim) {
+                    return super.foldType(reparsed)
+                }
+            }
+        }
         return super.foldType(t)
+    }
+
+    override fun foldPat(p: Pat): Pat {
+        if (p is Pat.Verbatim) {
+            val trees = p.tokens.clone().toList()
+            if (trees.size >= 2 && RustTokenCursor(trees).identAt(0) == "box") {
+                val reparsed = parse2(Pat.Companion::parseSingle, TokenStream.fromTokenTrees(trees.subList(1, trees.size))).getOrNull()
+                if (reparsed != null && reparsed !is Pat.Verbatim) {
+                    return super.foldPat(reparsed)
+                }
+            }
+        }
+        return super.foldPat(p)
+    }
+
+    override fun foldExpr(e: Expr): Expr {
+        if (e is Expr.Verbatim) {
+            val trees = e.tokens.clone().toList()
+            if (trees.size >= 2 && RustTokenCursor(trees).identAt(0) == "become") {
+                val retTokens = ArrayList<TokenTree>(trees.size)
+                retTokens += RustTokenCursor.identTree("return", trees[0].span())
+                retTokens.addAll(trees.subList(1, trees.size))
+                val reparsed = parse2(ExprParse::parse, TokenStream.fromTokenTrees(retTokens)).getOrNull()
+                if (reparsed != null && reparsed !is Expr.Verbatim) {
+                    return super.foldExpr(reparsed)
+                }
+            }
+        }
+        return super.foldExpr(e)
     }
 
     override fun foldItem(i: Item): Item {
@@ -416,6 +553,32 @@ internal object RustNextAstNormalizer : Fold() {
             }
         }
         return super.foldItem(i)
+    }
+
+    override fun foldImplItem(item: ImplItem): ImplItem {
+        if (item is ImplItem.Verbatim) {
+            val stripped = ConstVerbatimTokenStripper(item.tokens.clone().toList()).stripImplMember()
+            if (stripped != null) {
+                val reparsed = SynAstFragmentParser.parseRawImplItems(TokenStream.fromTokenTrees(stripped))?.singleOrNull()
+                if (reparsed != null && reparsed !is ImplItem.Verbatim) {
+                    return super.foldImplItem(reparsed)
+                }
+            }
+        }
+        return super.foldImplItem(item)
+    }
+
+    override fun foldTraitItem(item: TraitItem): TraitItem {
+        if (item is TraitItem.Verbatim) {
+            val stripped = ConstVerbatimTokenStripper(item.tokens.clone().toList()).stripTraitMember()
+            if (stripped != null) {
+                val reparsed = SynAstFragmentParser.parseRawTraitItems(TokenStream.fromTokenTrees(stripped))?.singleOrNull()
+                if (reparsed != null && reparsed !is TraitItem.Verbatim) {
+                    return super.foldTraitItem(reparsed)
+                }
+            }
+        }
+        return super.foldTraitItem(item)
     }
 
     override fun foldTypeParamBound(bound: TypeParamBound): TypeParamBound {
@@ -487,6 +650,92 @@ private class ConstVerbatimTokenStripper(
         return out
     }
 
+    fun stripImplMember(): List<TokenTree>? {
+        if (size == 0) return null
+        val out = ArrayList<TokenTree>(size)
+        var idx = copyLeadingOuterAttributes(0, out)
+        idx = copyOptionalPubVisibility(idx, out)
+        var changed = false
+        if (identAt(idx) == "default") {
+            out += trees[idx]
+            idx++
+        }
+        if (identAt(idx) == "type" && cleanIdentAt(idx + 1) != null) {
+            out += trees[idx]
+            out += trees[idx + 1]
+            idx = copyBalancedAngles(idx + 2, out)
+            if (isSingleColonAt(idx)) {
+                var eqIdx = idx + 1
+                var angleDepth = 0
+                while (eqIdx < size) {
+                    val ch = punctCharAt(eqIdx)
+                    if (ch == '<') {
+                        angleDepth++
+                    } else if (ch == '>' && !isRArrowEndAt(eqIdx) && angleDepth > 0) {
+                        angleDepth--
+                    } else if (angleDepth == 0 && (ch == '=' || ch == ';')) {
+                        break
+                    }
+                    eqIdx++
+                }
+                if (punctCharAt(eqIdx) == '=') {
+                    out.addAll(trees.subList(eqIdx, size))
+                    return out
+                }
+            }
+        }
+        val rem = stripConstAndPinModifiersRecursive(trees.subList(idx, size))
+        if (rem != null) {
+            out.addAll(rem)
+            changed = true
+        }
+        return if (changed) out else null
+    }
+
+    fun stripTraitMember(): List<TokenTree>? {
+        if (size == 0) return null
+        val out = ArrayList<TokenTree>(size)
+        var idx = copyLeadingOuterAttributes(0, out)
+        var changed = false
+        val afterPub = copyOptionalPubVisibility(idx)
+        if (afterPub > idx) {
+            idx = afterPub
+            changed = true
+        }
+        while (identAt(idx) == "default" || identAt(idx) == "final") {
+            idx++
+            changed = true
+        }
+        val remSlice = trees.subList(idx, size)
+        val remStripped = stripConstAndPinModifiersRecursive(remSlice)
+        if (remStripped != null) {
+            out.addAll(remStripped)
+            return out
+        }
+        if (!changed) return null
+        out.addAll(remSlice)
+        return out
+    }
+
+    fun stripType(): List<TokenTree>? {
+        if (size == 0) return null
+        if (identAt(0) == "dyn" && punctCharAt(1) == '*') {
+            val out = ArrayList<TokenTree>(size - 1)
+            out += trees[0]
+            val tail = trees.subList(2, size)
+            out.addAll(stripConstAndPinModifiersRecursive(tail) ?: tail)
+            return out
+        }
+        if (identAt(0) == "for" && punctCharAt(1) == '<') {
+            val afterAngles = skipBalancedAngles(1)
+            if (afterAngles != null && afterAngles < size) {
+                val tail = trees.subList(afterAngles, size)
+                return stripConstAndPinModifiersRecursive(tail) ?: tail
+            }
+        }
+        return stripConstAndPinModifiersRecursive(trees)
+    }
+
     fun stripBound(): List<TokenTree>? {
         if (size == 0) return null
         if (size == 1) {
@@ -508,6 +757,62 @@ private class ConstVerbatimTokenStripper(
         if (constModLen == 0) return null
         out.addAll(trees.subList(idx + constModLen, size))
         return out
+    }
+
+    private fun stripConstAndPinModifiersRecursive(slice: List<TokenTree>): List<TokenTree>? {
+        if (slice.isEmpty()) return null
+        val c = RustTokenCursor(slice)
+        val out = ArrayList<TokenTree>(slice.size)
+        var changed = false
+        var i = 0
+        while (i < c.size) {
+            val bracketGrp = c.groupAt(i, Delimiter.Bracket)
+            if (bracketGrp != null && c.punctCharAt(i - 1) != '#' && isSingleConstBracketGroup(bracketGrp)) {
+                changed = true
+                i++
+                continue
+            }
+            val ch = c.punctCharAt(i)
+            if ((ch == '~' || ch == '?') && c.identAt(i + 1) == "const") {
+                changed = true
+                i += 2
+                continue
+            }
+            if (ch == '&') {
+                out += slice[i]
+                var next = i + 1
+                if (c.isLifetimeAt(next)) {
+                    out += slice[next]
+                    out += slice[next + 1]
+                    next += 2
+                }
+                if (c.identAt(next) == "pin") {
+                    changed = true
+                    next++
+                    if (c.identAt(next) == "const") {
+                        next++
+                    } else if (c.identAt(next) == "mut") {
+                        out += slice[next]
+                        next++
+                    }
+                    i = next
+                    continue
+                }
+            }
+            val tt = slice[i]
+            if (tt is TokenTree.Group) {
+                val innerStripped = stripConstAndPinModifiersRecursive(tt.value.stream().toList())
+                if (innerStripped != null) {
+                    out += RustTokenCursor.groupTree(tt.value.delimiter(), innerStripped, tt.value.span())
+                    changed = true
+                    i++
+                    continue
+                }
+            }
+            out += tt
+            i++
+        }
+        return if (changed) out else null
     }
 
     private fun leadingConstBoundModifierLength(startIdx: Int): Int {

@@ -2,7 +2,6 @@ package io.github.kotlinmania.rustkotlin
 
 import io.github.kotlinmania.io.files.SystemFileSystem
 import io.github.kotlinmania.procmacro2.Delimiter
-import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.ModContent
@@ -1159,31 +1158,14 @@ private class CrateAbiSessionScanner(
     }
 }
 
-internal fun lexScannerTokens(sourceText: String): List<TokenTree> {
-    val sanitized =
-        if (sourceText.startsWith("#!") && !sourceText.startsWith("#![")) {
-            val nl = sourceText.indexOf('\n')
-            if (nl >= 0) sourceText.substring(nl + 1) else ""
-        } else {
-            sourceText
-        }
-    val lexed = TokenStream.fromString(sanitized)
-    return if (lexed.isSuccess()) lexed.getOrThrow().toList() else emptyList()
-}
+internal fun lexScannerTokens(sourceText: String): List<TokenTree> =
+    lexRustTokenTrees(sourceText)
 
 private fun scalarKindSizeAndAlign(kind: String): Pair<Int, Int>? =
     SCANNER_SCALAR_DESCRIPTORS_BY_KIND[kind]?.sizeAlign
 
-private fun parseArrayLenIntFromTokens(lenTokens: List<TokenTree>): Int? {
-    if (lenTokens.size != 1) return null
-    val rawLit = (lenTokens[0] as? TokenTree.Literal)?.value?.toString() ?: return null
-    val clean = rawLit.replace("_", "").trimEnd { it.isLetter() }
-    return if (clean.startsWith("0x") || clean.startsWith("0X")) {
-        clean.drop(2).toIntOrNull(16)
-    } else {
-        clean.toIntOrNull()
-    }
-}
+private fun parseArrayLenIntFromTokens(lenTokens: List<TokenTree>): Int? =
+    lenTokens.singleOrNull()?.let { RustTokenCursor(listOf(it)).intLiteralAt(0) }
 
 private fun alignUpBytes(value: Int, align: Int): Int {
     if (align <= 1) return value

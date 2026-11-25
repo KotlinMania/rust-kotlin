@@ -1,6 +1,5 @@
 package io.github.kotlinmania.rustkotlin
 
-import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.rustkotlin.reused.starlark.AssignCount
 import io.github.kotlinmania.syn.Arm
 import io.github.kotlinmania.syn.Attribute
@@ -1823,14 +1822,7 @@ internal fun KotlinJ2KEmitter.extractArmCfgSignature(attrs: List<Attribute>): Pa
     for (attr in attrs) {
         val meta = attr.meta
         if (meta is Meta.List && meta.path.isIdent("cfg")) {
-            val cursor = RustTokenCursor(meta.tokens.clone().toList())
-            val innerGroup = cursor.groupAt(1, Delimiter.Parenthesis)
-            if (cursor.size == 2 && cursor.identAt(0) == "not" && innerGroup != null) {
-                val inner = innerGroup.stream().toString().trim()
-                if (inner.isNotEmpty()) return inner to true
-            }
-            val raw = meta.tokens.toString().trim()
-            if (raw.isNotEmpty()) return raw to false
+            RustTokenCursor.extractCfgComplementSignature(meta.tokens.clone().toList())?.let { return it }
         }
     }
     return null

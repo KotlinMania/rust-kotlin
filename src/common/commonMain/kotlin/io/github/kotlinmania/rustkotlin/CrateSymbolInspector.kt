@@ -1,9 +1,6 @@
 package io.github.kotlinmania.rustkotlin
 
-import io.github.kotlinmania.procmacro2.Delimiter
-import io.github.kotlinmania.procmacro2.Group
 import io.github.kotlinmania.procmacro2.Ident
-import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.Attribute
 import io.github.kotlinmania.syn.Block
@@ -11,7 +8,6 @@ import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.Field
 import io.github.kotlinmania.syn.Fields
 import io.github.kotlinmania.syn.File
-import io.github.kotlinmania.syn.FileParse
 import io.github.kotlinmania.syn.FnArg
 import io.github.kotlinmania.syn.ForeignItem
 import io.github.kotlinmania.syn.GenericArgument
@@ -36,7 +32,6 @@ import io.github.kotlinmania.syn.UseTree
 import io.github.kotlinmania.syn.Variant
 import io.github.kotlinmania.syn.WherePredicate
 import io.github.kotlinmania.syn.gen.Visit
-import io.github.kotlinmania.syn.parse2
 
 internal data class AssocTypeDecl(
     val ty: SynType,
@@ -324,32 +319,10 @@ internal object WindowsLinkMacroParser {
     }
 
     fun parse(mac: Macro): ParsedWindowsLinkMacro? {
-        val trees = mac.clonedTokenList()
-        val fnIdx = trees.indexOfFirst { tt -> tt is TokenTree.Ident && tt.value.toString() == "fn" }
-        if (fnIdx < 0) return null
-        val leadingStrings = mutableListOf<String>()
-        for (i in 0 until fnIdx) {
-            val tt = trees[i]
-            if (tt is TokenTree.Literal) {
-                val lit = Lit.new(tt.value)
-                if (lit is Lit.Str) {
-                    leadingStrings += lit.value.value()
-                }
-            }
-        }
-        val fnTokens = trees.subList(fnIdx, trees.size)
-        val pubTokens = TokenStream.fromString("pub").getOrThrow().toList()
-        val hasTrailingSemi = (fnTokens.lastOrNull() as? TokenTree.Punct)?.value?.asChar() == ';'
-        val semiTokens = if (hasTrailingSemi) emptyList() else TokenStream.fromString(";").getOrThrow().toList()
-        val braceBody =
-            TokenTree.Group(
-                Group(Delimiter.Brace, TokenStream.fromTokenTrees(pubTokens + fnTokens + semiTokens)),
-            )
-        val externPrefix = TokenStream.fromString("extern \"C\"").getOrThrow().toList()
-        val wrappedStream = TokenStream.fromTokenTrees(externPrefix + braceBody)
-        val parsedFile = parse2(FileParse::parse, wrappedStream).getOrNull() ?: return null
-        val foreignMod = parsedFile.items.firstOrNull() as? Item.ForeignMod ?: return null
-        val foreignFn = foreignMod.items.firstOrNull() as? ForeignItem.Fn ?: return null
+        val cursor = RustTokenCursor(mac.clonedTokenList())
+        val fnIdx = (0 until cursor.size).firstOrNull { cursor.identAt(it) == "fn" } ?: return null
+        val leadingStrings = (0 until fnIdx).mapNotNull(cursor::stringLiteralAt)
+        val foreignFn = SynAstFragmentParser.parseForeignFnFromTokens(cursor.trees.subList(fnIdx, cursor.size)) ?: return null
         return ParsedWindowsLinkMacro(
             dllName = leadingStrings.getOrNull(0).orEmpty(),
             customSymbol = leadingStrings.getOrNull(2),

@@ -1,6 +1,6 @@
 package io.github.kotlinmania.rustkotlin
 
-import io.github.kotlinmania.procmacro2.TokenTree
+import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.syn.Attribute
 import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
@@ -86,10 +86,11 @@ public object StructLayoutComputer {
         return if (rem == 0L) offset else offset + (align - rem)
     }
 
-    private fun parsePowerOfTwoGroupArg(tokens: List<TokenTree>, nextIndex: Int): Long? {
-        val nextGroup = tokens.getOrNull(nextIndex) as? TokenTree.Group ?: return null
-        val streamText = nextGroup.value.stream().toString()
-        val parsed = streamText.trim().toLongOrNull() ?: return null
+    private fun parsePowerOfTwoGroupArg(cursor: RustTokenCursor, nextIndex: Int): Long? {
+        val nextGroup = cursor.groupAt(nextIndex, Delimiter.Parenthesis) ?: return null
+        val inner = RustTokenCursor(nextGroup.stream().toList())
+        if (inner.size != 1) return null
+        val parsed = inner.longLiteralAt(0) ?: return null
         return parsed.takeIf { it > 0L && (it and (it - 1L)) == 0L }
     }
 
@@ -102,14 +103,14 @@ public object StructLayoutComputer {
         for (attr in attrs) {
             val repr = attr.meta as? Meta.List ?: continue
             if (!repr.path.isIdent("repr")) continue
-            val tokens = repr.tokens.clone().toList()
+            val cursor = RustTokenCursor(repr.tokens.clone().toList())
             var index = 0
-            while (index < tokens.size) {
-                when ((tokens[index] as? TokenTree.Ident)?.value?.toString()) {
+            while (index < cursor.size) {
+                when (cursor.identAt(index)) {
                     "C" -> isReprC = true
                     "transparent" -> isTransparent = true
                     "packed" -> {
-                        val parsedN = parsePowerOfTwoGroupArg(tokens, index + 1)
+                        val parsedN = parsePowerOfTwoGroupArg(cursor, index + 1)
                         val packVal =
                             if (parsedN != null) {
                                 index++
@@ -120,7 +121,7 @@ public object StructLayoutComputer {
                         packedAlign = packedAlign?.let { minOf(it, packVal) } ?: packVal
                     }
                     "align" -> {
-                        parsePowerOfTwoGroupArg(tokens, index + 1)?.let { parsedN ->
+                        parsePowerOfTwoGroupArg(cursor, index + 1)?.let { parsedN ->
                             explicitAlign = explicitAlign?.let { maxOf(it, parsedN) } ?: parsedN
                             index++
                         }

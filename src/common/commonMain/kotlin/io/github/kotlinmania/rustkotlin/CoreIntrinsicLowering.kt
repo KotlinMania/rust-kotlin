@@ -1,6 +1,7 @@
 package io.github.kotlinmania.rustkotlin
 
 import io.github.kotlinmania.procmacro2.Delimiter
+import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
@@ -1194,8 +1195,8 @@ public object CoreIntrinsicLowering {
             if (cursor.identAt(idx) == "else") {
                 val elseGroup = ((idx + 1) until cursor.size).firstNotNullOfOrNull { cursor.groupAt(it, Delimiter.Brace) }
                 if (elseGroup != null) {
-                    val blockSrc = "{ ${elseGroup.stream()} }"
-                    val parsedExpr = lexTokenStreamOrNull(blockSrc)?.let { parse2(ExprParse::parse, it).getOrNull() }
+                    val blockStream = TokenStream.fromTokenTrees(listOf(TokenTree.Group(elseGroup)))
+                    val parsedExpr = parse2(ExprParse::parse, blockStream).getOrNull()
                     if (parsedExpr != null) return emitter.renderExpr(parsedExpr, indent, selfTypeName)
                 }
             }
@@ -1204,10 +1205,13 @@ public object CoreIntrinsicLowering {
         val topArgs = cursor.splitByTopLevelPunct(',')
         if (topArgs.size >= 3) {
             val tupleTree = topArgs[0].singleOrNull() as? TokenTree.Group
-            val runtimeFnSrc = topArgs[2].joinToString("") { it.toString() }.trim()
-            val tupleStream = tupleTree?.value?.stream()?.toString()
-            val argTupleSrc = tupleStream?.trim().orEmpty()
-            val parsedCall = lexTokenStreamOrNull("$runtimeFnSrc($argTupleSrc)")?.let { parse2(ExprParse::parse, it).getOrNull() }
+            val callArgsGroup =
+                RustTokenCursor.groupStreamTree(
+                    Delimiter.Parenthesis,
+                    tupleTree?.value?.stream() ?: TokenStream.new(),
+                )
+            val callStream = TokenStream.fromTokenTrees(topArgs[2] + callArgsGroup)
+            val parsedCall = parse2(ExprParse::parse, callStream).getOrNull()
             if (parsedCall != null) return emitter.renderExpr(parsedCall, indent, selfTypeName)
         }
         return null
@@ -1218,9 +1222,14 @@ public object CoreIntrinsicLowering {
         emitter: KotlinJ2KEmitter,
         indent: String,
     ): String? {
-        val rawSrc = item.tokens.toString().trim()
-        if (!rawSrc.contains("rustc_intrinsic") || !rawSrc.endsWith(";")) return null
-        val parsedFn = (lexTokenStreamOrNull(rawSrc.dropLast(1) + " {}")?.let { parse2(ItemParse::parse, it).getOrNull() } as? Item.Fn) ?: return null
+        val cursor = RustTokenCursor(item.tokens.clone().toList())
+        if (cursor.size < 4 || cursor.punctCharAt(cursor.size - 1) != ';' || !cursor.hasOuterAttributeIdent("rustc_intrinsic")) {
+            return null
+        }
+        val fnTokens = ArrayList<TokenTree>(cursor.size)
+        fnTokens.addAll(cursor.trees.subList(0, cursor.size - 1))
+        fnTokens += RustTokenCursor.groupTree(Delimiter.Brace)
+        val parsedFn = (parse2(ItemParse::parse, TokenStream.fromTokenTrees(fnTokens)).getOrNull() as? Item.Fn) ?: return null
         val rawFnName = parsedFn.sig.cleanFnName()
         val synthesizedBody = renderSynthesizedIntrinsicFnBody(parsedFn, rawFnName, emitter) ?: return null
         val prevIntrinsicDecl = activeRustcIntrinsicDeclarationName

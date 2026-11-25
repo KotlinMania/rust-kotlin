@@ -1385,23 +1385,13 @@ internal class RustItemHeaderTokenScanner(
             when (bodyScanner.identAt(j)) {
                 "type" -> {
                     val assocRaw = bodyScanner.identAt(j + 1)
-                    var k = j + 2
-                    var angleDepth = 0
-                    var hasDefault = false
-                    while (k < bodyScanner.size) {
-                        when (bodyScanner.punctCharAt(k)) {
-                            '<' -> angleDepth++
-                            '>' -> angleDepth = maxOf(0, angleDepth - 1)
-                            '=' -> if (angleDepth == 0) hasDefault = true
-                            ';' -> break
-                        }
-                        k++
-                    }
+                    val endSemi = ((j + 2) until bodyScanner.size).firstOrNull { bodyScanner.punctCharAt(it) == ';' } ?: bodyScanner.size
+                    val hasDefault = bodyScanner.anyTopLevelOutsideAngles(j + 2, endSemi) { bodyScanner.punctCharAt(it) == '=' }
                     if (!skipped && assocRaw != null && !hasDefault) {
                         val assocKt = KotlinNamingPolicy.Default.toTypeIdentifier(assocRaw, allowRawAbi = false)
                         if (assocKt !in assocNames) assocNames += assocKt
                     }
-                    j = k + 1
+                    j = endSemi + 1
                     itemAttrs.clear()
                     continue
                 }
@@ -1618,18 +1608,10 @@ internal class RustItemHeaderTokenScanner(
             } else {
                 emptyList()
             }
-        if (scanIdx < beforeCursor.size) {
-            var angleDepth = 0
-            for (idx in scanIdx until beforeCursor.size) {
-                val ch = beforeCursor.punctCharAt(idx)
-                if (ch == '<') {
-                    angleDepth++
-                } else if (ch == '>' && angleDepth > 0) {
-                    angleDepth--
-                } else if (angleDepth == 0 && beforeCursor.identAt(idx) == "for") {
-                    return
-                }
-            }
+        if (scanIdx < beforeCursor.size &&
+            beforeCursor.anyTopLevelOutsideAngles(scanIdx) { beforeCursor.identAt(it) == "for" }
+        ) {
+            return
         }
         val typeHeadTokens =
             beforeBrace

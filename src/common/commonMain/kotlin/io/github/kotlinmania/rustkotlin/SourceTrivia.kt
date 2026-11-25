@@ -146,64 +146,58 @@ internal class SourceTrivia private constructor(
             }
         }
 
-        private fun scanGapForComments(source: String, start: Int, end: Int): List<TriviaPiece> {
-            val result = mutableListOf<TriviaPiece>()
-            var i = start.coerceAtLeast(0)
-            val limit = end.coerceAtMost(source.length)
+        private fun scanGapForComments(source: String, start: Int, end: Int): List<TriviaPiece> =
+            TriviaGapScanner(source).scanRange(start, end)
+    }
+}
 
-            while (i < limit) {
-                val ch = source[i]
-                if (ch.isWhitespace()) {
-                    i++
+private class TriviaGapScanner(
+    source: String,
+) : RustLexicalSourceScanner(source) {
+    fun scanRange(start: Int, end: Int): List<TriviaPiece> {
+        val result = mutableListOf<TriviaPiece>()
+        var i = start.coerceAtLeast(0)
+        val limit = end.coerceAtMost(len)
+        while (i < limit) {
+            val ch = source[i]
+            if (ch.isWhitespace()) {
+                i++
+                continue
+            }
+            if (ch == '/' && i + 1 < limit) {
+                val next = source[i + 1]
+                if (next == '/') {
+                    val commentStart = i
+                    i += 2
+                    while (i < limit && source[i] != '\n') i++
+                    val raw = source.substring(commentStart, i).trimEnd('\r')
+                    val style =
+                        when {
+                            raw.startsWith("//!") -> TriviaStyle.InnerDocLine
+                            raw.startsWith("///") && !raw.startsWith("////") -> TriviaStyle.OuterDocLine
+                            else -> TriviaStyle.LineComment
+                        }
+                    result.add(TriviaPiece(commentStart, i, style, raw))
+                    if (i < limit && source[i] == '\n') i++
                     continue
                 }
-                if (ch == '/' && i + 1 < limit) {
-                    val next = source[i + 1]
-                    if (next == '/') {
-                        val commentStart = i
-                        i += 2
-                        while (i < limit && source[i] != '\n') {
-                            i++
+                if (next == '*') {
+                    val commentStart = i
+                    val commentEnd = scanNestedBlockCommentEnd(commentStart).coerceAtMost(limit)
+                    val raw = source.substring(commentStart, commentEnd)
+                    val style =
+                        when {
+                            raw.startsWith("/*!") -> TriviaStyle.InnerDocBlock
+                            raw.startsWith("/**") && !raw.startsWith("/***") && raw != "/**/" -> TriviaStyle.OuterDocBlock
+                            else -> TriviaStyle.BlockComment
                         }
-                        val raw = source.substring(commentStart, i).trimEnd('\r')
-                        val style =
-                            when {
-                                raw.startsWith("//!") -> TriviaStyle.InnerDocLine
-                                raw.startsWith("///") && !raw.startsWith("////") -> TriviaStyle.OuterDocLine
-                                else -> TriviaStyle.LineComment
-                            }
-                        result.add(TriviaPiece(commentStart, i, style, raw))
-                        if (i < limit && source[i] == '\n') i++
-                        continue
-                    } else if (next == '*') {
-                        val commentStart = i
-                        i += 2
-                        var depth = 1
-                        while (i < limit && depth > 0) {
-                            if (source[i] == '/' && i + 1 < limit && source[i + 1] == '*') {
-                                depth++
-                                i += 2
-                            } else if (source[i] == '*' && i + 1 < limit && source[i + 1] == '/') {
-                                depth--
-                                i += 2
-                            } else {
-                                i++
-                            }
-                        }
-                        val raw = source.substring(commentStart, i)
-                        val style =
-                            when {
-                                raw.startsWith("/*!") -> TriviaStyle.InnerDocBlock
-                                raw.startsWith("/**") && !raw.startsWith("/***") && raw != "/**/" -> TriviaStyle.OuterDocBlock
-                                else -> TriviaStyle.BlockComment
-                            }
-                        result.add(TriviaPiece(commentStart, i, style, raw))
-                        continue
-                    }
+                    result.add(TriviaPiece(commentStart, commentEnd, style, raw))
+                    i = commentEnd
+                    continue
                 }
-                i++
             }
-            return result
+            i++
         }
+        return result
     }
 }

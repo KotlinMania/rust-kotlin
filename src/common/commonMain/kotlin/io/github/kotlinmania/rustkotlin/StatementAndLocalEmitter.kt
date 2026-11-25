@@ -132,28 +132,12 @@ internal fun isLeadingCfgStmtDisabled(stmt: Stmt): Boolean {
     return false
 }
 
-private fun canonicalTokenSequenceKey(trees: List<TokenTree>): String =
-    trees.joinToString(" ") { tt ->
-        when (tt) {
-            is TokenTree.Ident -> "I:${tt.value}"
-            is TokenTree.Punct -> "P:${tt.value.asChar()}:${tt.value.spacing()}"
-            is TokenTree.Literal -> "L:${tt.value}"
-            is TokenTree.Group -> "G:${tt.value.delimiter()}(${canonicalTokenSequenceKey(tt.value.stream().toList())})"
-        }
-    }
-
 private fun extractLeadingCfgSignature(stmt: Stmt): Pair<Boolean, String>? {
     var found: Pair<Boolean, String>? = null
     StmtLeadingCfgScanner(stmt).forEachLeadingCfgPredicate { predTrees ->
         if (found != null) return null
-        val predCursor = RustTokenCursor(predTrees)
-        val negGroup = predCursor.groupAt(1, Delimiter.Parenthesis)
-        found =
-            if (predCursor.size == 2 && predCursor.identAt(0) == "not" && negGroup != null) {
-                false to canonicalTokenSequenceKey(negGroup.stream().toList())
-            } else {
-                true to canonicalTokenSequenceKey(predTrees)
-            }
+        val sig = RustTokenCursor.extractCfgComplementSignature(predTrees) ?: return@forEachLeadingCfgPredicate
+        found = !sig.second to sig.first
     }
     return found
 }
@@ -1751,7 +1735,7 @@ private object ScopedBorrowedPlaceLocalLowering : LocalBindingLowering() {
                 override fun visitMacro(m: Macro) {
                     // Token-only macro arguments have not been resolved to expressions.
                     // Do not classify a hidden pointer use as a dereference.
-                    if (containsWholeIdentifier(m.tokens.toString(), raw)) escapes = true
+                    if (RustTokenCursor.containsAnyIdentRecursive(m.tokens, setOf(raw))) escapes = true
                     super.visitMacro(m)
                 }
             }
@@ -1805,13 +1789,7 @@ private class AddressableLocalUsageScanner(
     private fun isSelfIdentPath(expr: Expr?): Boolean = emitter.singlePlainPathCleanIdent(expr) == raw
 
     private fun tokenStreamContainsSelfIdent(stream: TokenStream): Boolean =
-        stream.clone().toList().any { tt ->
-            when (tt) {
-                is TokenTree.Ident -> tt.value.toString().removePrefix("r#") == raw
-                is TokenTree.Group -> tokenStreamContainsSelfIdent(tt.value.stream())
-                else -> false
-            }
-        }
+        RustTokenCursor.containsAnyIdentRecursive(stream, setOf(raw))
 
     override fun visitExprPath(e: Expr.Path) {
         if (e.qself == null && e.path.isIdent(raw)) totalPathMentions++

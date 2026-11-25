@@ -13,7 +13,6 @@ import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.ExprParse
 import io.github.kotlinmania.syn.File
-import io.github.kotlinmania.syn.FileParse
 import io.github.kotlinmania.syn.FnArg
 import io.github.kotlinmania.syn.ImplItem
 import io.github.kotlinmania.syn.Item
@@ -241,28 +240,11 @@ private fun implItemDeclarationKey(item: ImplItem): String? =
         else -> null
     }
 
-private object MacroAstSyntaxParser {
-    fun wrapBraceStream(prefixCode: String, inner: TokenStream): TokenStream {
-        val prefix = TokenStream.fromString(prefixCode).getOrThrow().toList()
-        val group = TokenTree.Group(Group(Delimiter.Brace, inner))
-        return TokenStream.fromTokenTrees(prefix + group)
-    }
-
-    fun parseNormalizedFile(stream: TokenStream): File? =
-        parse2(FileParse::parse, stream).getOrNull()?.let(RustNextAstNormalizer::foldFile)
-
-    fun parseNormalizedImplItems(inner: TokenStream): List<ImplItem>? =
-        (parseNormalizedFile(wrapBraceStream("impl Dummy", inner))?.items?.singleOrNull() as? Item.Impl)?.items
-
-    fun parseNormalizedBlockStmts(inner: TokenStream): List<Stmt>? =
-        (parseNormalizedFile(wrapBraceStream("fn dummy()", inner))?.items?.singleOrNull() as? Item.Fn)?.block?.stmts
-}
-
 private object TokenBodyCfgSelector : CfgArmSelector<List<TokenTree>>() {
     override fun parseArmBody(bodyTokens: List<TokenTree>): List<List<TokenTree>> = listOf(bodyTokens)
 
     override fun extractArmKeys(parsed: List<List<TokenTree>>): List<String>? =
-        MacroAstSyntaxParser.parseNormalizedFile(TokenStream.fromTokenTrees(parsed.single()))?.items?.mapNotNull(::itemDeclarationKey)
+        SynAstFragmentParser.parseNormalizedFile(TokenStream.fromTokenTrees(parsed.single()))?.items?.mapNotNull(::itemDeclarationKey)
 
     override fun shouldSkipWildcardArm(armKeys: List<String>, seenKeys: Set<String>): Boolean =
         ("mod:unsupported" in armKeys && seenKeys.any { it.startsWith("mod:") }) ||
@@ -271,7 +253,7 @@ private object TokenBodyCfgSelector : CfgArmSelector<List<TokenTree>>() {
 
 private object ImplItemCfgSelector : CfgArmSelector<ImplItem>() {
     override fun parseArmBody(bodyTokens: List<TokenTree>): List<ImplItem>? =
-        MacroAstSyntaxParser.parseNormalizedImplItems(TokenStream.fromTokenTrees(bodyTokens))
+        SynAstFragmentParser.parseNormalizedImplItems(TokenStream.fromTokenTrees(bodyTokens))
 
     override fun extractArmKeys(parsed: List<ImplItem>): List<String> =
         parsed.mapNotNull(::implItemDeclarationKey)
@@ -915,13 +897,13 @@ internal class MacroRulesFileExpander(
                 if (selected != null) {
                     val parsedExpr =
                         if (selected.isEmpty()) {
-                            parse2(ExprParse::parse, TokenStream.fromString("{}").getOrThrow()).getOrNull()
+                            parse2(ExprParse::parse, TokenStream.fromTokenTrees(listOf(RustTokenCursor.groupTree(Delimiter.Brace)))).getOrNull()
                         } else {
                             val selectedStream = TokenStream.fromTokenTrees(selected)
                             parse2(ExprParse::parse, selectedStream).getOrNull()
                                 ?: parse2(
                                     ExprParse::parse,
-                                    TokenStream.fromTokenTrees(listOf(TokenTree.Group(Group(Delimiter.Brace, selectedStream)))),
+                                    TokenStream.fromTokenTrees(listOf(RustTokenCursor.groupStreamTree(Delimiter.Brace, selectedStream))),
                                 ).getOrNull()
                         }
                     if (parsedExpr != null) {
@@ -979,7 +961,7 @@ internal class MacroRulesFileExpander(
                 if (builtinCfgName != null) {
                     val rawTokens = item.mac.clonedTokenList()
                     val bodies = if (builtinCfgName == "cfg_select") selectActiveCfgSelectBodies(rawTokens) else selectActiveCfgIfBodies(rawTokens)
-                    val normalized = bodies?.let { MacroAstSyntaxParser.parseNormalizedFile(TokenStream.fromTokenTrees(it.flatten())) }
+                    val normalized = bodies?.let { SynAstFragmentParser.parseNormalizedFile(TokenStream.fromTokenTrees(it.flatten())) }
                     if (normalized != null) {
                         val expanded = withExpansionDepth(depth + 1) { expandAndFoldItemList(normalized.items, depth + 1) }
                         val propagated = propagateOuterAttrsToItems(item.attrs, expanded)
@@ -1020,7 +1002,7 @@ internal class MacroRulesFileExpander(
                             selectActiveCfgSelectImplItems(rawTokens)
                         } else {
                             selectActiveCfgIfBodies(rawTokens)?.let { bodies ->
-                                MacroAstSyntaxParser.parseNormalizedImplItems(TokenStream.fromTokenTrees(bodies.flatten()))
+                                SynAstFragmentParser.parseNormalizedImplItems(TokenStream.fromTokenTrees(bodies.flatten()))
                             }
                         }
                     if (selectedItems != null) {
@@ -1118,7 +1100,7 @@ internal class MacroRulesFileExpander(
                         }
                     if (selectedBody != null) {
                         if (selectedBody.isEmpty()) continue
-                        val parsedStmts = MacroAstSyntaxParser.parseNormalizedBlockStmts(TokenStream.fromTokenTrees(selectedBody))
+                        val parsedStmts = SynAstFragmentParser.parseNormalizedBlockStmts(TokenStream.fromTokenTrees(selectedBody))
                         if (parsedStmts != null) {
                             result.addAll(withExpansionDepth(depth + 1) { expandAndFoldBlockStmts(parsedStmts, depth + 1) })
                             continue
@@ -1141,21 +1123,21 @@ internal class MacroRulesFileExpander(
     private fun tryExpandMacroItem(def: MacroRulesDef, invocation: Macro, depth: Int): List<Item>? {
         val substitutedStream = expandMacroToTokenStream(def, invocation) ?: return null
         if (substitutedStream.isEmpty()) return emptyList()
-        val parsedFile = MacroAstSyntaxParser.parseNormalizedFile(substitutedStream) ?: return null
+        val parsedFile = SynAstFragmentParser.parseNormalizedFile(substitutedStream) ?: return null
         return withExpansionDepth(depth + 1) { expandAndFoldItemList(parsedFile.items, depth + 1) }
     }
 
     private fun tryExpandMacroImplItem(def: MacroRulesDef, invocation: Macro, depth: Int): List<ImplItem>? {
         val substitutedStream = expandMacroToTokenStream(def, invocation) ?: return null
         if (substitutedStream.isEmpty()) return emptyList()
-        val implItems = MacroAstSyntaxParser.parseNormalizedImplItems(substitutedStream) ?: return null
+        val implItems = SynAstFragmentParser.parseNormalizedImplItems(substitutedStream) ?: return null
         return withExpansionDepth(depth + 1) { expandAndFoldImplItemList(implItems, depth + 1) }
     }
 
     private fun tryExpandMacroStmts(def: MacroRulesDef, invocation: Macro, depth: Int): List<Stmt>? {
         val substitutedStream = expandMacroToTokenStream(def, invocation) ?: return null
         if (substitutedStream.isEmpty()) return emptyList()
-        val fnStmts = MacroAstSyntaxParser.parseNormalizedBlockStmts(substitutedStream) ?: return null
+        val fnStmts = SynAstFragmentParser.parseNormalizedBlockStmts(substitutedStream) ?: return null
         return withExpansionDepth(depth + 1) { expandAndFoldBlockStmts(fnStmts, depth + 1) }
     }
 
@@ -1819,8 +1801,7 @@ private class MacroTemplateTokenCursor(
                 val maxDepth =
                     when {
                         pos == args.size -> null
-                        pos + 2 == args.size && args.punctCharAt(pos) == ',' && args.trees[pos + 1] is TokenTree.Literal ->
-                            (args.trees[pos + 1] as TokenTree.Literal).value.toString().toIntOrNull() ?: return null
+                        pos + 2 == args.size && args.punctCharAt(pos) == ',' -> args.intLiteralAt(pos + 1) ?: return null
                         else -> return null
                     }
                 val cnt = countMetavarOccurrences(env, targetVar, maxDepth)
@@ -1833,9 +1814,7 @@ private class MacroTemplateTokenCursor(
     companion object {
         private fun parseOptionalDepthArg(args: RustTokenCursor): Int? {
             if (args.size == 0) return 0
-            if (args.size == 1 && args.trees[0] is TokenTree.Literal) {
-                return (args.trees[0] as TokenTree.Literal).value.toString().toIntOrNull()
-            }
+            if (args.size == 1) return args.intLiteralAt(0)
             return null
         }
 
@@ -1893,9 +1872,9 @@ private fun collectExternalMacroDefs(sourceText: String): Map<String, MacroRules
     }
     crateMacroDefsCache[sourceText]?.let { return it }
     val defs = linkedMapOf<String, MacroRulesDef>()
-    val lexed = TokenStream.fromString(sourceText)
-    if (lexed.isSuccess()) {
-        collectMacroRulesFromTokenTrees(lexed.getOrThrow().toList(), defs)
+    val trees = lexRustTokenTrees(sourceText)
+    if (trees.isNotEmpty()) {
+        collectMacroRulesFromTokenTrees(trees, defs)
     }
     val result = defs.toMap()
     if (crateMacroDefsCache.size >= 64) {
@@ -1920,9 +1899,9 @@ internal fun collectMacroRulesFromTokenTrees(
 
 public fun extractMacroUseModuleNames(rustSource: String): List<String> {
     if (!rustSource.contains("macro_use")) return emptyList()
-    val lexed = TokenStream.fromString(rustSource)
-    if (lexed.isFailure()) return emptyList()
-    return MacroDeclarativeTokenScanner(lexed.getOrThrow().toList()).extractMacroUseModules()
+    val trees = lexRustTokenTrees(rustSource)
+    if (trees.isEmpty()) return emptyList()
+    return MacroDeclarativeTokenScanner(trees).extractMacroUseModules()
 }
 
 private class MacroDeclarativeTokenScanner(
