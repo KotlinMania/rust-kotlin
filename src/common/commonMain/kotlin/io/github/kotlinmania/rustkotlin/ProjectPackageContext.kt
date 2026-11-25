@@ -262,7 +262,7 @@ public abstract class CrateFileTreeNavigator<Node : Any> {
             val resolvedKey = pathKey(resolvedCandidate)
             if (!visitedPaths.add(resolvedKey)) return
             val text = readText(resolvedCandidate)
-            if (text.contains("macro_rules")) {
+            if (text.contains("macro_rules") || text.contains("macro ")) {
                 entries.add(resolvedKey to text)
             }
             if (followMacroUse && text.contains("macro_use")) {

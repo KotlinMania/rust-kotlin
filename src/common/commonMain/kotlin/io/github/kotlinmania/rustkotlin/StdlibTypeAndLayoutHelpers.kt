@@ -14,8 +14,6 @@ private val ALLOC_SINGLE_DEFAULT_GLOBAL_TYPES: Set<String> =
 private val ALLOC_INTO_ITER_MODULE_HINTS: Set<String> =
     wordSet("vec binary_heap linked_list vec_deque btree boxed alloc")
 
-private val NONZERO_INNER_REGEX = Regex("""\bNonZero\s*<\s*([^,<>\s]+(?:\s*<[^<>]*>)?)\s*,\s*(NonZero[A-Za-z0-9_]+Inner)\s*>""")
-
 private val STDLIB_CONST_PTR_FIRST_ARG_CALLS: Set<String> =
     wordSet(
         "copy_nonoverlapping copy read read_unaligned read_volatile slice_from_raw_parts",
@@ -268,9 +266,24 @@ internal fun KotlinJ2KEmitter.resolveNonZeroNewExplicitTypeArgs(
 ): Pair<String, String>? {
     if (calleeTail !in setOf("NonZero.new", "NonZero.newUnchecked") || args.size != 1) return null
     val hintCandidates = listOfNotNull(currentExpectedParseTargetType, currentEnclosingReturnRenderedType)
-    val hintSource = hintCandidates.firstNotNullOfOrNull { NONZERO_INNER_REGEX.find(it) }
-    if (hintSource != null) {
-        return hintSource.groupValues[2] to hintSource.groupValues[1].trim()
+    val hintParsed =
+        hintCandidates.firstNotNullOfOrNull { candidate ->
+            KotlinTokenWalker(candidate).firstGenericApplication { owner, topArgs ->
+                val secondArg = topArgs.getOrNull(1)?.substringAfterLast('.')
+                if (owner == "NonZero" &&
+                    topArgs.size == 2 &&
+                    secondArg != null &&
+                    secondArg.startsWith("NonZero") &&
+                    secondArg.endsWith("Inner")
+                ) {
+                    topArgs[1] to topArgs[0]
+                } else {
+                    null
+                }
+            }
+        }
+    if (hintParsed != null) {
+        return hintParsed
     }
     if ("NonZeroInner" in currentTraitAssocParamNames) {
         val tArg = inferExprRenderedType(args[0], selfTypeName)?.removeSuffix("?")?.trim() ?: "T"

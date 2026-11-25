@@ -468,6 +468,25 @@ internal open class KotlinTokenWalker(
         return if (tok.interpolationDepth == 0) tok.ch else null
     }
 
+    fun anyIdentAt(idx: Int): String? =
+        when (val tok = tokens.getOrNull(idx)) {
+            is KotlinLexToken.Ident -> tok.rawText
+            is KotlinLexToken.BacktickIdent -> tok.ident
+            else -> null
+        }
+
+    fun anyPunctAt(idx: Int): Char? =
+        (tokens.getOrNull(idx) as? KotlinLexToken.Punct)?.ch
+
+    fun previousNonTriviaIndex(beforeIdx: Int): Int {
+        var k = beforeIdx - 1
+        while (k >= 0) {
+            if (!isTriviaToken(tokens[k])) return k
+            k--
+        }
+        return -1
+    }
+
     fun readDottedIdentifier(startIdx: Int, limit: Int = tokens.size): Pair<String, Int>? {
         val first = identTextAt(startIdx) ?: return null
         val sb = StringBuilder(first)
@@ -548,15 +567,130 @@ internal open class KotlinTokenWalker(
         return false
     }
 
-    fun previousNonTriviaToken(beforeIdx: Int): KotlinLexToken? {
-        var k = beforeIdx - 1
-        while (k >= 0) {
-            val t = tokens[k]
-            if (!isTriviaToken(t)) return t
-            k--
+    fun containsNonMemberIdentifier(ident: String): Boolean {
+        if (ident.isEmpty()) return false
+        for (idx in tokens.indices) {
+            when (val tok = tokens[idx]) {
+                is KotlinLexToken.StringIdentTemplate -> if (tok.ident == ident) return true
+                is KotlinLexToken.Ident, is KotlinLexToken.BacktickIdent -> {
+                    if (anyIdentAt(idx) == ident) {
+                        val prevIdx = previousNonTriviaIndex(idx)
+                        if (anyPunctAt(prevIdx) != '.') return true
+                    }
+                }
+                else -> {}
+            }
         }
-        return null
+        return false
     }
+
+    fun isSingleSimpleIdentifierOrThis(): Boolean {
+        val first = nextNonTriviaIndex(0)
+        if (first >= tokens.size) return false
+        if (identTextAt(first) == null) return false
+        return nextNonTriviaIndex(first + 1) >= tokens.size
+    }
+
+    fun declaresFunctionNamed(fnName: String): Boolean {
+        var idx = 0
+        while (idx < tokens.size) {
+            if (identTextAt(idx) == "fun") {
+                var cur = nextNonTriviaIndex(idx + 1)
+                if (punctAt(cur) == '<') {
+                    val closeAngle = findMatchingTypeAngleToken(cur)
+                    if (closeAngle > cur) cur = nextNonTriviaIndex(closeAngle + 1)
+                }
+                var lastIdent: String? = null
+                while (cur < tokens.size && punctAt(cur) != '(' && punctAt(cur) != '{' && punctAt(cur) != '=') {
+                    identTextAt(cur)?.let { lastIdent = it }
+                    cur =
+                        if (punctAt(cur) == '<') {
+                            val ca = findMatchingTypeAngleToken(cur)
+                            if (ca > cur) nextNonTriviaIndex(ca + 1) else cur + 1
+                        } else {
+                            nextNonTriviaIndex(cur + 1)
+                        }
+                }
+                if (lastIdent == fnName && punctAt(cur) == '(') return true
+            }
+            idx++
+        }
+        return false
+    }
+
+    fun parseSingleLineLocalDeclaration(): SingleLineLocalDecl? {
+        if (source.isEmpty() || '\n' in source) return null
+        val indent = (tokens.firstOrNull() as? KotlinLexToken.Whitespace)?.rawText.orEmpty()
+        val kwIdx = if (indent.isNotEmpty()) 1 else 0
+        val kw = identTextAt(kwIdx)
+        if (kw != "val" && kw != "var") return null
+        val nameIdx = skipHorizontalWhitespace(kwIdx + 1)
+        val ident = (tokens.getOrNull(nameIdx) as? KotlinLexToken.Ident)?.rawText ?: return null
+        val afterNameIdx = skipHorizontalWhitespace(nameIdx + 1)
+        val eqIdx =
+            when (punctAt(afterNameIdx)) {
+                '=' -> {
+                    if (punctAt(afterNameIdx + 1) == '=') return null
+                    afterNameIdx
+                }
+                ':' -> {
+                    var foundEq = -1
+                    walkTopLevelTokens(afterNameIdx + 1, tokens.size, trackBraces = true) { k, _, isTop ->
+                        if (isTop &&
+                            punctAt(k) == '=' &&
+                            punctAt(k + 1) != '=' &&
+                            punctAt(k - 1)?.let { it in "=!<>+-*/%" } != true
+                        ) {
+                            foundEq = k
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    if (foundEq < 0) return null
+                    foundEq
+                }
+                else -> return null
+            }
+        val typeClause =
+            if (punctAt(afterNameIdx) == ':') {
+                source.substring(tokens[nameIdx].end, tokens[eqIdx].start).trimEnd()
+            } else {
+                ""
+            }
+        val rhs = source.substring(tokens[eqIdx].end).trim()
+        if (rhs.isEmpty()) return null
+        return SingleLineLocalDecl(indent, kw, ident, typeClause, rhs)
+    }
+
+    fun isIdentifierMutated(targetIdent: String): Boolean {
+        if (targetIdent.isEmpty()) return false
+        for (idx in tokens.indices) {
+            if (anyIdentAt(idx) != targetIdent) continue
+            val prevIdx = previousNonTriviaIndex(idx)
+            if (anyPunctAt(prevIdx) == '.') continue
+            if (prevIdx >= 1) {
+                val p1 = anyPunctAt(prevIdx)
+                if ((p1 == '+' || p1 == '-') &&
+                    anyPunctAt(prevIdx - 1) == p1 &&
+                    tokens[prevIdx - 1].end == tokens[prevIdx].start
+                ) {
+                    return true
+                }
+            }
+            val nextIdx = nextNonTriviaIndex(idx + 1)
+            val n1 = anyPunctAt(nextIdx) ?: continue
+            val n2 = anyPunctAt(nextIdx + 1)
+            val isAdjacent = nextIdx + 1 < tokens.size && tokens[nextIdx].end == tokens[nextIdx + 1].start
+            if (n1 == '=' && !(isAdjacent && (n2 == '=' || n2 == '>'))) return true
+            if (n1 in "+-*/%" && isAdjacent && n2 == '=') return true
+            if ((n1 == '+' || n1 == '-') && isAdjacent && n2 == n1) return true
+        }
+        return false
+    }
+
+    fun previousNonTriviaToken(beforeIdx: Int): KotlinLexToken? =
+        previousNonTriviaIndex(beforeIdx).takeIf { it >= 0 }?.let(tokens::get)
 
     fun findMatchingBraceEndToken(openTokenIdx: Int): Int {
         val closeIdx = findMatchingPunctPairToken(openTokenIdx, '{', '}')
@@ -651,9 +785,9 @@ internal open class KotlinTokenWalker(
         }
     }
 
-    inline fun anyGenericApplication(
-        predicate: (ownerSimpleIdent: String, typeArgs: List<String>) -> Boolean,
-    ): Boolean {
+    inline fun <R : Any> firstGenericApplication(
+        selector: (ownerSimpleIdent: String, typeArgs: List<String>) -> R?,
+    ): R? {
         var idx = 0
         while (idx < tokens.size) {
             val tok = tokens[idx]
@@ -669,15 +803,17 @@ internal open class KotlinTokenWalker(
                         }
                     val innerSlice = source.substring(tok.end, tokens[closeIdx].start)
                     val topArgs = splitTopLevelCommaList(innerSlice).map { it.trim() }
-                    if (predicate(ownerIdent, topArgs)) return true
-                    idx = closeIdx + 1
-                    continue
+                    selector(ownerIdent, topArgs)?.let { return it }
                 }
             }
             idx++
         }
-        return false
+        return null
     }
+
+    inline fun anyGenericApplication(
+        predicate: (ownerSimpleIdent: String, typeArgs: List<String>) -> Boolean,
+    ): Boolean = firstGenericApplication { owner, args -> true.takeIf { predicate(owner, args) } } != null
 
     companion object {
         fun splitTopLevelCommaList(segment: String): List<String> {
@@ -777,5 +913,167 @@ internal abstract class KotlinTokenRewriter(
             idx = emitAt(idx, out)
         }
         return out.toString()
+    }
+}
+
+internal data class SingleLineLocalDecl(
+    val indent: String,
+    val keyword: String,
+    val ident: String,
+    val typeClause: String,
+    val rhs: String,
+)
+
+/**
+ * Single-pass token index over emitted Kotlin file bodies so import synthesis and `pub use`
+ * filtering answer whole-identifier, `.member(...)` call, `.inv()`, `Atomic*`, and tuple
+ * destructuring queries in O(1) without Regexes or repeated full-file re-tokenization.
+ */
+internal class KotlinCodeTokenIndex(
+    source: String,
+) : KotlinTokenWalker(source) {
+    val identifiers: Set<String>
+    val dotCallMemberNames: Set<String>
+    val maxTupleDestructuringArity: Int
+    val hasZeroArgDotInvCall: Boolean
+    val hasAtomicTypeIdent: Boolean
+
+    init {
+        val idents = HashSet<String>(maxOf(16, tokens.size / 4))
+        val dotCalls = HashSet<String>()
+        var maxTuple = 0
+        var sawDotInv = false
+        for (idx in tokens.indices) {
+            when (val tok = tokens[idx]) {
+                is KotlinLexToken.Ident -> idents += tok.rawText
+                is KotlinLexToken.BacktickIdent -> idents += tok.ident
+                is KotlinLexToken.StringIdentTemplate -> idents += tok.ident
+                else -> {}
+            }
+            if (anyPunctAt(idx) == '.') {
+                val memberIdx = nextNonTriviaIndex(idx + 1)
+                val member = anyIdentAt(memberIdx)
+                if (member != null) {
+                    val afterMember = nextNonTriviaIndex(memberIdx + 1)
+                    val openCh = anyPunctAt(afterMember)
+                    if (openCh == '(' || openCh == '{' || openCh == '<') {
+                        dotCalls += member
+                        if (member == "inv" && openCh == '(' && anyPunctAt(nextNonTriviaIndex(afterMember + 1)) == ')') {
+                            sawDotInv = true
+                        }
+                    }
+                }
+            }
+            val kw = anyIdentAt(idx)
+            if (kw == "val" || kw == "var") {
+                val openParen = nextNonTriviaIndex(idx + 1)
+                if (anyPunctAt(openParen) == '(') {
+                    val closeParen = findMatchingParenAnyDepth(openParen)
+                    if (closeParen > openParen) {
+                        val afterClose = nextNonTriviaIndex(closeParen + 1)
+                        if (anyPunctAt(afterClose) == '=' && anyPunctAt(afterClose + 1) != '=') {
+                            val arity = countTopLevelCommasInRange(openParen + 1, closeParen) + 1
+                            if (arity > maxTuple) maxTuple = arity
+                        }
+                    }
+                }
+            }
+        }
+        identifiers = idents
+        dotCallMemberNames = dotCalls
+        maxTupleDestructuringArity = maxTuple
+        hasZeroArgDotInvCall = sawDotInv
+        hasAtomicTypeIdent = idents.any { it in ATOMIC_TYPE_IDENT_NAMES }
+    }
+
+    fun hasIdent(ident: String): Boolean = ident in identifiers
+
+    fun hasMemberCall(memberName: String): Boolean = memberName in dotCallMemberNames
+
+    private fun findMatchingParenAnyDepth(openIdx: Int): Int {
+        val baseInterp = tokens[openIdx].interpolationDepth
+        var depth = 0
+        for (k in openIdx until tokens.size) {
+            val tok = tokens[k]
+            if (tok.interpolationDepth == baseInterp && tok is KotlinLexToken.Punct) {
+                when (tok.ch) {
+                    '(' -> depth++
+                    ')' -> {
+                        depth--
+                        if (depth == 0) return k
+                    }
+                }
+            }
+        }
+        return -1
+    }
+
+    private fun countTopLevelCommasInRange(startIdx: Int, endExclusive: Int): Int {
+        val baseInterp = tokens.getOrNull(startIdx)?.interpolationDepth ?: return 0
+        var commas = 0
+        var angleDepth = 0
+        var parenDepth = 0
+        for (k in startIdx until endExclusive) {
+            val tok = tokens[k]
+            if (tok.interpolationDepth != baseInterp || tok !is KotlinLexToken.Punct) continue
+            when (tok.ch) {
+                '<' -> angleDepth++
+                '>' -> if (angleDepth > 0) angleDepth--
+                '(' -> parenDepth++
+                ')' -> if (parenDepth > 0) parenDepth--
+                ',' -> if (angleDepth == 0 && parenDepth == 0) commas++
+            }
+        }
+        return commas
+    }
+
+    private companion object {
+        val ATOMIC_TYPE_IDENT_NAMES: Set<String> =
+            setOf(
+                "Atomic",
+                "AtomicBool",
+                "AtomicPtr",
+                "AtomicI8",
+                "AtomicU8",
+                "AtomicI16",
+                "AtomicU16",
+                "AtomicI32",
+                "AtomicU32",
+                "AtomicI64",
+                "AtomicU64",
+                "AtomicI128",
+                "AtomicU128",
+                "AtomicIsize",
+                "AtomicUsize",
+            )
+    }
+}
+
+internal class KotlinIdentifierTokenRewriter(
+    source: String,
+    private val replacements: Map<String, String>,
+    private val skipMemberAccess: Boolean = true,
+) : KotlinTokenRewriter(source) {
+    override fun emitAt(index: Int, out: StringBuilder): Int {
+        when (val tok = tokens[index]) {
+            is KotlinLexToken.Ident -> {
+                val mapped = replacements[tok.rawText]
+                val afterDot = skipMemberAccess && anyPunctAt(previousNonTriviaIndex(index)) == '.'
+                if (mapped != null && !afterDot) {
+                    out.append(mapped)
+                    return index + 1
+                }
+            }
+            is KotlinLexToken.StringIdentTemplate -> {
+                val mapped = replacements[tok.ident]
+                if (mapped != null) {
+                    out.append('$').append(mapped)
+                    return index + 1
+                }
+            }
+            else -> {}
+        }
+        out.append(tokens[index].rawText)
+        return index + 1
     }
 }

@@ -1766,8 +1766,8 @@ private class KotlinImportPathResolver(
 internal fun KotlinJ2KEmitter.renderItemUse(
     item: Item.Use,
     indent: String,
-    bodyTextForPubUseFilter: String? = null,
-): String = UseItemImportEmitter(this).render(item, indent, bodyTextForPubUseFilter)
+    bodyTokensForPubUseFilter: KotlinCodeTokenIndex? = null,
+): String = UseItemImportEmitter(this).render(item, indent, bodyTokensForPubUseFilter)
 
 internal fun collectUseLeaves(
     tree: UseTree,
@@ -2006,7 +2006,7 @@ private class UseItemImportEmitter(
     fun render(
         item: Item.Use,
         indent: String,
-        bodyTextForPubUseFilter: String?,
+        bodyTokensForPubUseFilter: KotlinCodeTokenIndex?,
     ): String {
         val rawLeaves = mutableListOf<UseLeaf>()
         collectUseLeaves(item.tree, emptyList(), rawLeaves)
@@ -2069,13 +2069,13 @@ private class UseItemImportEmitter(
             if (localBoundIdent in STDLIB_ERASED_OR_BUILTIN_IMPORTS && root in STDLIB_CRATE_ROOTS) continue
             if (leaf.alias == null && isLocallyDeclaredSymbol(localBoundIdent)) continue
             val isPubGlob = item.vis is Visibility.Public && localBoundIdent == "*"
-            if (isPubGlob && !shouldKeepPubWildcard(root, importPkg, bodyTextForPubUseFilter)) {
+            if (isPubGlob && !shouldKeepPubWildcard(root, importPkg, bodyTokensForPubUseFilter)) {
                 continue
             }
             if (shouldFilterUnusedLeaf(item, localBoundIdent) &&
-                bodyTextForPubUseFilter != null &&
+                bodyTokensForPubUseFilter != null &&
                 localBoundIdent != "*" &&
-                !containsWholeIdentifier(bodyTextForPubUseFilter, localBoundIdent)
+                !bodyTokensForPubUseFilter.hasIdent(localBoundIdent)
             ) {
                 continue
             }
@@ -2097,14 +2097,16 @@ private class UseItemImportEmitter(
     private fun shouldKeepPubWildcard(
         root: String?,
         importPkg: String,
-        bodyTextForPubUseFilter: String?,
+        bodyTokensForPubUseFilter: KotlinCodeTokenIndex?,
     ): Boolean {
-        if (root !in STDLIB_CRATE_ROOTS || bodyTextForPubUseFilter.isNullOrBlank()) return false
+        if (root !in STDLIB_CRATE_ROOTS || bodyTokensForPubUseFilter == null || bodyTokensForPubUseFilter.identifiers.isEmpty()) {
+            return false
+        }
         val symbolsInPkg =
             headerContext.externalCrateSymbolPackages.values.flatMap { symMap ->
                 symMap.entries.mapNotNull { (sym, pkgs) -> if (importPkg in pkgs) sym else null }
             }
-        return symbolsInPkg.isEmpty() || symbolsInPkg.any { containsWholeIdentifier(bodyTextForPubUseFilter, it) }
+        return symbolsInPkg.isEmpty() || symbolsInPkg.any(bodyTokensForPubUseFilter::hasIdent)
     }
 
     private fun shouldFilterUnusedLeaf(item: Item.Use, localBoundIdent: String): Boolean =

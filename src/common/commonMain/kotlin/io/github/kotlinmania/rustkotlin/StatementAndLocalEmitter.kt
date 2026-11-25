@@ -720,28 +720,21 @@ private fun KotlinJ2KEmitter.exprAlwaysDiverges(expr: Expr): Boolean =
     }
 
 internal fun KotlinJ2KEmitter.sanitizeBatchBlockLocals(lines: MutableList<String>) {
-    val singleLineDeclRegex = Regex("^(\\s*)(val|var)\\s+([a-zA-Z_][a-zA-Z0-9_]*)(\\s*:\\s*[^=\\n]+)?\\s*=\\s*([^\\n]+)$")
     for (i in lines.indices.reversed()) {
         val entryLines = lines[i].split('\n')
         val firstCodeIdx = entryLines.indexOfFirst { !it.trimStart().startsWith("//") }
         if (firstCodeIdx < 0 || entryLines.size - firstCodeIdx != 1) continue
         val triviaPart = if (firstCodeIdx > 0) entryLines.subList(0, firstCodeIdx).joinToString("\n") else ""
-        val match = singleLineDeclRegex.matchEntire(entryLines[firstCodeIdx]) ?: continue
-        val groups = match.groupValues
-        val ident = groups[3]
+        val decl = KotlinTokenWalker(entryLines[firstCodeIdx]).parseSingleLineLocalDeclaration() ?: continue
         val afterText = if (i + 1 < lines.size) lines.subList(i + 1, lines.size).joinToString("\n") else ""
-        if (!containsWholeIdentifier(afterText, ident)) {
+        val afterWalker = KotlinTokenWalker(afterText)
+        if (!afterWalker.containsIdentifier(decl.ident)) {
             if (triviaPart.isNotEmpty()) lines[i] = triviaPart else lines.removeAt(i)
             continue
         }
-        if (groups[2] == "var") {
-            val isReassigned =
-                Regex("(?<![.\\w])${Regex.escape(ident)}\\s*(?:[+\\-*/%]?=(?![=>])|\\+\\+|--)").containsMatchIn(afterText) ||
-                    Regex("(?:\\+\\+|--)\\s*${Regex.escape(ident)}\\b").containsMatchIn(afterText)
-            if (!isReassigned) {
-                val updatedCode = "${groups[1]}val $ident${groups[4]} = ${groups[5]}"
-                lines[i] = if (triviaPart.isNotEmpty()) "$triviaPart\n$updatedCode" else updatedCode
-            }
+        if (decl.keyword == "var" && !afterWalker.isIdentifierMutated(decl.ident)) {
+            val updatedCode = "${decl.indent}val ${decl.ident}${decl.typeClause} = ${decl.rhs}"
+            lines[i] = if (triviaPart.isNotEmpty()) "$triviaPart\n$updatedCode" else updatedCode
         }
     }
 }
@@ -2130,7 +2123,7 @@ internal fun KotlinJ2KEmitter.renderTupleStructDestructuringLocal(
     val isMutBorrow =
         (unwrappedInit is Expr.Reference && unwrappedInit.mutability != null) ||
             (unwrappedInit is Expr.Path && unwrappedInit.qself == null && unwrappedInit.path.isIdent("self") && currentReceiverIsMutBorrow)
-    val isSimpleRhs = rhsTrimmed == "this" || rhsTrimmed.matches(Regex("[A-Za-z_][A-Za-z0-9_]*"))
+    val isSimpleRhs = KotlinTokenWalker(rhsTrimmed).isSingleSimpleIdentifierOrThis()
     val lines = mutableListOf<String>()
     val receiverVar = bindDestructuringReceiverIfNeeded(rhsTrimmed, isSimpleRhs, "_tupleStruct", "tupleStructVal", span, indent, lines)
     val arity = elems.size

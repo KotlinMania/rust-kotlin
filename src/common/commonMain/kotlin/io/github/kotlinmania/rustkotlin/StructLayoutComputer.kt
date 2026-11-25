@@ -416,39 +416,46 @@ public object StructLayoutComputer {
             val constLayoutParams = mutableListOf<TypeLayoutParamSpec>()
             val existingParamNames = usedTypeParams.mapTo(hashSetOf()) { typeLayoutParamName(it) }
             if (constGenericSpecs.isNotEmpty()) {
-                val allLayoutExprs =
+                val layoutWalkers =
                     buildList {
-                        add(adjustedSizeExpr)
-                        add(adjustedAlignExpr)
-                        adjustedHelperOffsetDecls.forEach { add(it.helperInitExpr) }
+                        add(KotlinTokenWalker(adjustedSizeExpr))
+                        add(KotlinTokenWalker(adjustedAlignExpr))
+                        adjustedHelperOffsetDecls.forEach { add(KotlinTokenWalker(it.helperInitExpr)) }
                         adjustedComputedFields.forEach {
-                            add(it.offsetExpr)
-                            add(it.layoutExpr)
+                            add(KotlinTokenWalker(it.offsetExpr))
+                            add(KotlinTokenWalker(it.layoutExpr))
                         }
                     }
+                val replacements = linkedMapOf<String, String>()
                 for ((raw, ktParam) in constGenericSpecs) {
-                    val detectRegex = Regex("(?<!\\.)\\b(?:${Regex.escape(raw)}|${Regex.escape(ktParam)})\\b")
-                    if (allLayoutExprs.any { detectRegex.containsMatchIn(it) }) {
+                    val referenced =
+                        layoutWalkers.any { w ->
+                            w.containsNonMemberIdentifier(raw) || w.containsNonMemberIdentifier(ktParam)
+                        }
+                    if (referenced) {
                         if (raw != ktParam) {
-                            val rewriteRegex = Regex("(?<!\\.)\\b${Regex.escape(raw)}\\b")
-                            adjustedSizeExpr = rewriteRegex.replace(adjustedSizeExpr, ktParam)
-                            adjustedAlignExpr = rewriteRegex.replace(adjustedAlignExpr, ktParam)
-                            adjustedHelperOffsetDecls =
-                                adjustedHelperOffsetDecls.map { decl ->
-                                    decl.copy(helperInitExpr = rewriteRegex.replace(decl.helperInitExpr, ktParam))
-                                }
-                            adjustedComputedFields =
-                                adjustedComputedFields.map { field ->
-                                    field.copy(
-                                        offsetExpr = rewriteRegex.replace(field.offsetExpr, ktParam),
-                                        layoutExpr = rewriteRegex.replace(field.layoutExpr, ktParam),
-                                    )
-                                }
+                            replacements[raw] = ktParam
                         }
                         if (existingParamNames.add(ktParam)) {
                             constLayoutParams += TypeLayoutParamSpec(ktParam, "Int = 0")
                         }
                     }
+                }
+                if (replacements.isNotEmpty()) {
+                    fun rewriteExpr(expr: String): String = KotlinIdentifierTokenRewriter(expr, replacements).rewrite()
+                    adjustedSizeExpr = rewriteExpr(adjustedSizeExpr)
+                    adjustedAlignExpr = rewriteExpr(adjustedAlignExpr)
+                    adjustedHelperOffsetDecls =
+                        adjustedHelperOffsetDecls.map { decl ->
+                            decl.copy(helperInitExpr = rewriteExpr(decl.helperInitExpr))
+                        }
+                    adjustedComputedFields =
+                        adjustedComputedFields.map { field ->
+                            field.copy(
+                                offsetExpr = rewriteExpr(field.offsetExpr),
+                                layoutExpr = rewriteExpr(field.layoutExpr),
+                            )
+                        }
                 }
             }
 

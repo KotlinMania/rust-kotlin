@@ -220,9 +220,14 @@ internal object PhantomRawPointerTypeStripper {
     }
 
     private fun extractTypeParamName(rawParam: String): String? {
-        val head = rawParam.substringBefore(':').trim()
-        val words = head.split(Regex("\\s+")).filter { it.isNotEmpty() }
-        val candidate = words.lastOrNull { it != "in" && it != "out" && it != "reified" } ?: return null
-        return candidate.takeIf { it.isNotEmpty() && isKotlinIdentStart(it[0]) && it.all(::isKotlinIdentPart) }
+        val walker = KotlinTokenWalker(rawParam.substringBefore(':'))
+        var candidate: String? = null
+        for (idx in walker.tokens.indices) {
+            val id = walker.identTextAt(idx) ?: continue
+            if (id != "in" && id != "out" && id != "reified") {
+                candidate = id
+            }
+        }
+        return candidate
     }
 }

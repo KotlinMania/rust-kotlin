@@ -1187,7 +1187,7 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
             fnOnlyTypeParamNames
                 .filter { tpKt ->
                     (renderedReturnType == tpKt || renderedReturnType == "$tpKt?") &&
-                        params.none { Regex("\\b${Regex.escape(tpKt)}\\b").containsMatchIn(it.substringAfter(": ")) }
+                        params.none { containsWholeIdentifier(it.substringAfter(": "), tpKt) }
                 }.toSet()
         } else {
             emptySet()

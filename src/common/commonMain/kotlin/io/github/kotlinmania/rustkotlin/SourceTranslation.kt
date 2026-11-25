@@ -418,8 +418,8 @@ internal class KotlinJ2KEmitter(
             }
         }
 
-        val bodyTextForImports = stripKotlinCommentsAndStrings(allBodyItems.joinToString("\n\n"))
-        val needsUnsignedArrayOptIn = UNSIGNED_ARRAY_IDENTS.any { containsWholeIdentifier(bodyTextForImports, it) }
+        val bodyTokens = KotlinCodeTokenIndex(allBodyItems.joinToString("\n\n"))
+        val needsUnsignedArrayOptIn = UNSIGNED_ARRAY_IDENTS.any(bodyTokens::hasIdent)
 
         if (headerContext.portLintDirective != "none") {
             headerContext.portLintSourcePath?.let { relPath ->
@@ -441,7 +441,7 @@ internal class KotlinJ2KEmitter(
         val importLines =
             KotlinFileImportSynthesizer(this).synthesizeImports(
                 activeCoreNs = activeCoreNs,
-                bodyTextForImports = bodyTextForImports,
+                bodyTokens = bodyTokens,
                 standaloneMacrosExtraImports = standaloneMacros.extraImports,
             )
         if (importLines.isNotEmpty()) {
@@ -629,35 +629,6 @@ internal class KotlinJ2KEmitter(
         }
         return sb.toString()
     }
-
-    internal fun stripKotlinCommentsAndStrings(text: String): String =
-        object : KotlinTokenRewriter(text) {
-            override fun emitAt(index: Int, out: StringBuilder): Int {
-                when (val tok = tokens[index]) {
-                    is KotlinLexToken.LineComment -> {}
-                    is KotlinLexToken.BlockComment -> {
-                        for (ch in tok.rawText) {
-                            if (ch == '\n') out.append('\n')
-                        }
-                        out.append(' ')
-                    }
-                    is KotlinLexToken.CharLiteral,
-                    is KotlinLexToken.StringOpen,
-                    is KotlinLexToken.StringClose,
-                    is KotlinLexToken.TemplateExprOpen,
-                    is KotlinLexToken.TemplateExprClose,
-                    -> out.append(' ')
-                    is KotlinLexToken.StringText ->
-                        for (ch in tok.rawText) {
-                            if (ch == '\n') out.append('\n')
-                        }
-                    is KotlinLexToken.StringIdentTemplate ->
-                        out.append(' ').append(tok.ident).append(' ')
-                    else -> out.append(tok.rawText)
-                }
-                return index + 1
-            }
-        }.rewrite()
 
     internal fun renderItem(
         item: Item,
@@ -853,12 +824,12 @@ private class KotlinFileImportSynthesizer(
 
     fun synthesizeImports(
         activeCoreNs: String,
-        bodyTextForImports: String,
+        bodyTokens: KotlinCodeTokenIndex,
         standaloneMacrosExtraImports: Set<String>,
     ): List<String> {
         val useImportLines =
             inspector.allUseItems
-                .flatMap { emitter.renderItemUse(it, indent = "", bodyTextForPubUseFilter = bodyTextForImports).lines() }
+                .flatMap { emitter.renderItemUse(it, indent = "", bodyTokensForPubUseFilter = bodyTokens).lines() }
                 .map(String::trim)
                 .filter(String::isNotEmpty)
 
@@ -885,7 +856,7 @@ private class KotlinFileImportSynthesizer(
         for ((symSimple, symPkg) in buildAutoCoreSymbols(activeCoreNs, usesExternalCore)) {
             val isMemGet = symPkg == "$activeCoreNs.mem" && symSimple == "get"
             if (canSynthesizeSymbolImport(symSimple, symPkg, allowDeclaredTopFn = isMemGet) &&
-                containsWholeIdentifier(bodyTextForImports, symSimple)
+                bodyTokens.hasIdent(symSimple)
             ) {
                 val imp = "import $symPkg.$symSimple"
                 if (isMemGet) stdlibOverloadExtImports += imp
@@ -893,14 +864,9 @@ private class KotlinFileImportSynthesizer(
             }
         }
         if (usesExternalCore && !headerContext.rawAbiMode) {
-            synthesizeCoreEnumVariantImports(activeCoreNs, bodyTextForImports, combinedExtraTypeImports)
+            synthesizeCoreEnumVariantImports(activeCoreNs, bodyTokens, combinedExtraTypeImports)
             if (headerContext.packageName != "$activeCoreNs.mem") {
-                val maxTupleArity =
-                    TUPLE_DESTRUCTURING_REGEX
-                        .findAll(bodyTextForImports)
-                        .maxOfOrNull { match -> match.groupValues[1].count { it == ',' } + 1 }
-                        ?: 0
-                for (compIdx in 6..minOf(maxTupleArity, 12)) {
+                for (compIdx in 6..minOf(bodyTokens.maxTupleDestructuringArity, 12)) {
                     val compImp = "import $activeCoreNs.mem.component$compIdx"
                     if (compImp !in extraImports) extraImports += compImp
                 }
@@ -913,9 +879,9 @@ private class KotlinFileImportSynthesizer(
             combinedExtraTypeImports += "import $activeCoreNs.char.RustChar"
         }
         if (usesExternalCore && !headerContext.rawAbiMode) {
-            for ((extName, extPkg) in buildCoreExtensionSymbols(activeCoreNs, bodyTextForImports)) {
+            for ((extName, extPkg) in buildCoreExtensionSymbols(activeCoreNs, bodyTokens)) {
                 if (canSynthesizeSymbolImport(extName, extPkg, allowDeclaredTopFn = extName == "clone") &&
-                    hasMemberCallInBody(bodyTextForImports, extName)
+                    bodyTokens.hasMemberCall(extName)
                 ) {
                     val imp = "import $extPkg.$extName"
                     stdlibOverloadExtImports += imp
@@ -923,15 +889,15 @@ private class KotlinFileImportSynthesizer(
                 }
             }
         }
-        synthesizeExperimentalBitwiseImports(bodyTextForImports, combinedExtraTypeImports)
-        synthesizeImportedTypeExtensionImports(bodyTextForImports, combinedExtraTypeImports)
+        synthesizeExperimentalBitwiseImports(bodyTokens, combinedExtraTypeImports)
+        synthesizeImportedTypeExtensionImports(bodyTokens, combinedExtraTypeImports)
 
         extraImports.addAll(
             combinedExtraTypeImports.filter { imp ->
-                shouldRetainSynthesizedImport(imp, bodyTextForImports)
+                shouldRetainSynthesizedImport(imp, bodyTokens)
             },
         )
-        synthesizeSpecialFallbackImports(extraImports, bodyTextForImports)
+        synthesizeSpecialFallbackImports(extraImports, bodyTokens)
 
         val seenImportedSimpleNames = hashSetOf<String>()
         val importLines =
@@ -982,9 +948,6 @@ private class KotlinFileImportSynthesizer(
             symSimple !in inspector.declaredConstNames.values &&
             symSimple !in emitter.importedSimpleNameToPkg &&
             (allowDeclaredTopFn || !emitter.isDeclaredTopLevelFnKotlinName(symSimple))
-
-    private fun hasMemberCallInBody(bodyText: String, memberName: String): Boolean =
-        bodyText.contains(memberName) && Regex("\\.\\s*$memberName\\s*[({<]").containsMatchIn(bodyText)
 
     private fun buildAutoCoreSymbols(
         activeCoreNs: String,
@@ -1041,7 +1004,7 @@ private class KotlinFileImportSynthesizer(
 
     private fun synthesizeCoreEnumVariantImports(
         activeCoreNs: String,
-        bodyTextForImports: String,
+        bodyTokens: KotlinCodeTokenIndex,
         combinedExtraTypeImports: MutableSet<String>,
     ) {
         val variants =
@@ -1057,7 +1020,7 @@ private class KotlinFileImportSynthesizer(
             if (canSynthesizeSymbolImport(variantName, ownerPkg) &&
                 variantName !in inspector.enumVariantSimpleNames &&
                 variantName !in inspector.importedEnumVariantSimpleNames &&
-                containsWholeIdentifier(bodyTextForImports, variantName)
+                bodyTokens.hasIdent(variantName)
             ) {
                 combinedExtraTypeImports += "import $variantOwner.$variantName"
             }
@@ -1066,45 +1029,38 @@ private class KotlinFileImportSynthesizer(
 
     private fun buildCoreExtensionSymbols(
         activeCoreNs: String,
-        bodyTextForImports: String,
+        bodyTokens: KotlinCodeTokenIndex,
     ): List<Pair<String, String>> =
         buildList {
             add("clone" to "$activeCoreNs.clone")
             for (sliceExt in CORE_SLICE_EXT_IMPORTS) add(sliceExt to "$activeCoreNs.slice")
             for (strExt in CORE_STR_EXT_IMPORTS) add(strExt to "$activeCoreNs.str")
-            if (ATOMIC_TYPE_IDENT_REGEX.containsMatchIn(bodyTextForImports)) {
+            if (bodyTokens.hasAtomicTypeIdent) {
                 for (atomicExt in CORE_ATOMIC_EXT_IMPORTS) add(atomicExt to "$activeCoreNs.sync.atomic")
             }
             for (ext in CORE_NUM_EXT_IMPORTS) add(ext to "$activeCoreNs.num")
-            if (containsWholeIdentifier(bodyTextForImports, "MutPtr") ||
-                containsWholeIdentifier(bodyTextForImports, "asMutPtr") ||
-                containsWholeIdentifier(bodyTextForImports, "nullMut")
-            ) {
+            if (bodyTokens.hasIdent("MutPtr") || bodyTokens.hasIdent("asMutPtr") || bodyTokens.hasIdent("nullMut")) {
                 for (ext in SHARED_RAW_PTR_EXT_IMPORTS) add(ext to "$activeCoreNs.ptr.mutptr")
                 for (ext in MUT_ONLY_RAW_PTR_EXT_IMPORTS) add(ext to "$activeCoreNs.ptr.mutptr")
             }
-            if (containsWholeIdentifier(bodyTextForImports, "ConstPtr") ||
-                containsWholeIdentifier(bodyTextForImports, "asPtr")
-            ) {
+            if (bodyTokens.hasIdent("ConstPtr") || bodyTokens.hasIdent("asPtr")) {
                 for (ext in SHARED_RAW_PTR_EXT_IMPORTS) add(ext to "$activeCoreNs.ptr.constptr")
                 add("castMut" to "$activeCoreNs.ptr.constptr")
             }
         }
 
     private fun synthesizeExperimentalBitwiseImports(
-        bodyTextForImports: String,
+        bodyTokens: KotlinCodeTokenIndex,
         combinedExtraTypeImports: MutableSet<String>,
     ) {
-        if (!containsWholeIdentifier(bodyTextForImports, "Byte") &&
-            !containsWholeIdentifier(bodyTextForImports, "Short")
-        ) {
+        if (!bodyTokens.hasIdent("Byte") && !bodyTokens.hasIdent("Short")) {
             return
         }
         val expOps =
             buildList {
-                if (DOT_INV_CALL_REGEX.containsMatchIn(bodyTextForImports)) add("inv")
+                if (bodyTokens.hasZeroArgDotInvCall) add("inv")
                 for (op in EXPERIMENTAL_INFIX_BITWISE_OPS) {
-                    if (containsWholeIdentifier(bodyTextForImports, op)) add(op)
+                    if (bodyTokens.hasIdent(op)) add(op)
                 }
             }
         for (op in expOps) {
@@ -1115,14 +1071,14 @@ private class KotlinFileImportSynthesizer(
     }
 
     private fun synthesizeImportedTypeExtensionImports(
-        bodyTextForImports: String,
+        bodyTokens: KotlinCodeTokenIndex,
         combinedExtraTypeImports: MutableSet<String>,
     ) {
         val nsPrefixForExt = emitter.currentNamespacePrefix()
         for ((symSimple, symPkg) in emitter.importedSimpleNameToPkg.toList()) {
             if (symSimple.firstOrNull()?.isUpperCase() != true || symPkg == headerContext.packageName) continue
             val camelFn = symSimple.replaceFirstChar { it.lowercaseChar() }
-            if (!canSynthesizeSymbolImport(camelFn, symPkg) || !hasMemberCallInBody(bodyTextForImports, camelFn)) {
+            if (!canSynthesizeSymbolImport(camelFn, symPkg) || !bodyTokens.hasMemberCall(camelFn)) {
                 continue
             }
             val relSub =
@@ -1143,7 +1099,7 @@ private class KotlinFileImportSynthesizer(
         }
     }
 
-    private fun shouldRetainSynthesizedImport(imp: String, bodyTextForImports: String): Boolean {
+    private fun shouldRetainSynthesizedImport(imp: String, bodyTokens: KotlinCodeTokenIndex): Boolean {
         val afterImport = imp.removePrefix("import ").trim()
         val impPath = afterImport.substringBefore(" as ").trim()
         val rawSimple = impPath.substringAfterLast('.')
@@ -1160,12 +1116,12 @@ private class KotlinFileImportSynthesizer(
             boundSimple !in inspector.declaredTypeNames &&
             !isSingleUpperTypeParam &&
             !isEnumVariantShadowed &&
-            containsWholeIdentifier(bodyTextForImports, boundSimple)
+            bodyTokens.hasIdent(boundSimple)
     }
 
     private fun synthesizeSpecialFallbackImports(
         extraImports: MutableList<String>,
-        bodyTextForImports: String,
+        bodyTokens: KotlinCodeTokenIndex,
     ) {
         val projNs = headerContext.projectNamespace.nonBlankNormalizedNs()
         val libcNs = FfiInteropCollector.resolveLibcNamespace(headerContext)
@@ -1175,7 +1131,7 @@ private class KotlinFileImportSynthesizer(
             headerContext.crateSymbolSubpackages.isNotEmpty() &&
             "CEnumRepr" !in inspector.declaredTypeNames &&
             "CEnumRepr" !in emitter.importedSimpleNameToPkg &&
-            containsWholeIdentifier(bodyTextForImports, "CEnumRepr")
+            bodyTokens.hasIdent("CEnumRepr")
         ) {
             emitter.resolveBestSubpackageForSymbol("CEnumRepr")?.let { cenumSub ->
                 val cenumPkg = if (cenumSub.isEmpty()) libcNs else "$libcNs.$cenumSub"
@@ -1206,10 +1162,6 @@ private class KotlinFileImportSynthesizer(
         this?.trim()?.removeSuffix(".")?.takeIf(String::isNotEmpty)
 
     private companion object {
-        val TUPLE_DESTRUCTURING_REGEX = Regex("""\b(?:val|var)\s*\(([^()]+)\)\s*=""")
-        val ATOMIC_TYPE_IDENT_REGEX =
-            Regex("""\bAtomic(?:Bool|Ptr|I8|U8|I16|U16|I32|U32|I64|U64|I128|U128|Isize|Usize)?\b""")
-        val DOT_INV_CALL_REGEX = Regex("""\.\s*inv\s*\(\s*\)""")
         val EXPERIMENTAL_INFIX_BITWISE_OPS = listOf("and", "or", "xor")
 
         val CORE_MEM_LAYOUT_IMPORTS =
