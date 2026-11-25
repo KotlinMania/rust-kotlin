@@ -138,6 +138,68 @@ internal fun traitItemHasDocOnlyCfg(item: TraitItem): Boolean = isDocOnlyCfgAttr
 
 internal fun foreignItemHasDocOnlyCfg(item: ForeignItem): Boolean = isDocOnlyCfgAttribute(item.attributes)
 
+internal fun Expr.leadingOuterAttributes(): List<Attribute> =
+    when (this) {
+        is Expr.Array -> attrs
+        is Expr.Assign -> attrs.ifEmpty { left.leadingOuterAttributes() }
+        is Expr.Async -> attrs
+        is Expr.Await -> attrs.ifEmpty { base.leadingOuterAttributes() }
+        is Expr.Binary -> attrs.ifEmpty { left.leadingOuterAttributes() }
+        is Expr.BlockExpr -> attrs
+        is Expr.Break -> attrs
+        is Expr.Call -> attrs.ifEmpty { func.leadingOuterAttributes() }
+        is Expr.Cast -> attrs.ifEmpty { expr.leadingOuterAttributes() }
+        is Expr.Closure -> attrs
+        is Expr.Const -> attrs
+        is Expr.Continue -> attrs
+        is Expr.Field -> attrs.ifEmpty { base.leadingOuterAttributes() }
+        is Expr.ForLoop -> attrs
+        is Expr.Group -> attrs
+        is Expr.If -> attrs
+        is Expr.Index -> attrs.ifEmpty { expr.leadingOuterAttributes() }
+        is Expr.Infer -> attrs
+        is Expr.Let -> attrs
+        is Expr.Lit -> attrs
+        is Expr.Loop -> attrs
+        is Expr.Macro -> attrs
+        is Expr.Match -> attrs
+        is Expr.MethodCall -> attrs.ifEmpty { receiver.leadingOuterAttributes() }
+        is Expr.Paren -> attrs
+        is Expr.Path -> attrs
+        is Expr.Range -> attrs.ifEmpty { start?.leadingOuterAttributes().orEmpty() }
+        is Expr.RawAddr -> attrs
+        is Expr.Reference -> attrs
+        is Expr.Repeat -> attrs
+        is Expr.Return -> attrs
+        is Expr.Struct -> attrs
+        is Expr.Try -> attrs.ifEmpty { expr.leadingOuterAttributes() }
+        is Expr.TryBlock -> attrs
+        is Expr.Tuple -> attrs
+        is Expr.Unary -> attrs
+        is Expr.Unsafe -> attrs
+        is Expr.While -> attrs
+        is Expr.Yield -> attrs
+        is Expr.Verbatim -> emptyList()
+    }
+
+internal fun Stmt.leadingOuterAttributes(): List<Attribute> =
+    when (this) {
+        is Stmt.Local -> attrs
+        is Stmt.ItemStmt -> item.attributes
+        is Stmt.ExprStmt -> expr.leadingOuterAttributes()
+        is Stmt.MacroStmt -> attrs
+    }
+
+internal fun extractCfgComplementSignature(attrs: List<Attribute>): Pair<String, Boolean>? {
+    for (attr in attrs) {
+        val meta = attr.meta
+        if (meta is Meta.List && meta.path.isIdent("cfg")) {
+            RustTokenCursor.extractCfgComplementSignature(meta.tokens.clone().toList())?.let { return it }
+        }
+    }
+    return null
+}
+
 internal fun extractStringMetaAttribute(attrs: List<Attribute>, attrIdent: String): String? {
     for (attr in attrs) {
         val meta = attr.meta

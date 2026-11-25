@@ -26,7 +26,6 @@ import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.gen.Fold
 import io.github.kotlinmania.syn.gen.Visit
 import io.github.kotlinmania.syn.parse2
-import io.github.kotlinmania.syn.span
 import io.github.kotlinmania.procmacro2.Ident as PmIdent
 
 internal sealed class MacroPat {
@@ -2141,8 +2140,19 @@ internal data class ExpandedFileMacroRules(
  * declaration bodies, parameter groups, or initializer separators), avoiding AST-variant dispatch
  * and skipping synthesized zero-width `Span.callSite()` tokens injected by `macro_rules!` templates.
  */
-internal fun collectHeaderSourceSpans(node: ToTokens): List<Span> =
-    MacroDeclarativeTokenScanner(node.toTokenStream().toList()).collectHeaderSpans(node.span())
+internal fun collectHeaderSourceSpans(node: ToTokens): List<Span> {
+    val safeNode =
+        when (node) {
+            is Item.Verbatim -> Item.Verbatim(node.tokens.clone())
+            is ImplItem.Verbatim -> ImplItem.Verbatim(node.tokens.clone())
+            is Stmt -> node.deepCopy()
+            is Expr -> node.deepCopy()
+            else -> node
+        }
+    val trees = safeNode.toTokenStream().toList()
+    val fallbackSpan = trees.firstOrNull()?.span() ?: Span.callSite()
+    return MacroDeclarativeTokenScanner(trees).collectHeaderSpans(fallbackSpan)
+}
 
 internal fun expandFileMacroRules(
     file: File,

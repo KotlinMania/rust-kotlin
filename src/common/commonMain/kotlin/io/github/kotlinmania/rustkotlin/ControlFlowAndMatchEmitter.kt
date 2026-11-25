@@ -8,7 +8,6 @@ import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.GenericArgument
 import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.Lit
-import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.Pat
 import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
@@ -1818,15 +1817,8 @@ internal fun KotlinJ2KEmitter.deduplicateComplementaryCfgArms(arms: List<Arm>): 
     return result
 }
 
-internal fun KotlinJ2KEmitter.extractArmCfgSignature(attrs: List<Attribute>): Pair<String, Boolean>? {
-    for (attr in attrs) {
-        val meta = attr.meta
-        if (meta is Meta.List && meta.path.isIdent("cfg")) {
-            RustTokenCursor.extractCfgComplementSignature(meta.tokens.clone().toList())?.let { return it }
-        }
-    }
-    return null
-}
+internal fun KotlinJ2KEmitter.extractArmCfgSignature(attrs: List<Attribute>): Pair<String, Boolean>? =
+    extractCfgComplementSignature(attrs)
 
 internal fun KotlinJ2KEmitter.joinPathIdents(path: Path): String =
     path.segments.toList().joinToString("::") { it.ident.toString() }

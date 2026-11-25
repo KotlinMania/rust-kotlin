@@ -358,6 +358,15 @@ internal open class SynTokenStreamNormalizer(
                 i++
                 continue
             }
+            if (punctCharAt(i) == '&' && punctSpacingAt(i) != Spacing.Joint) {
+                val ltEnd = if (isLifetimeAt(i + 1)) i + 3 else i + 1
+                if (identAt(ltEnd) == "pin" && (identAt(ltEnd + 1) == "mut" || identAt(ltEnd + 1) == "const")) {
+                    for (k in i until ltEnd) out.add(trees[k])
+                    if (identAt(ltEnd + 1) == "mut") out.add(trees[ltEnd + 1])
+                    i = ltEnd + 2
+                    continue
+                }
+            }
             if (ident == "let") {
                 out.add(tt)
                 val patInfo = findLetPatternEndAndTopLevelOr(i + 1)
@@ -562,13 +571,36 @@ internal object RustNextAstNormalizer : Fold() {
     override fun foldExpr(e: Expr): Expr {
         if (e is Expr.Verbatim) {
             val trees = e.tokens.clone().toList()
-            if (trees.size >= 2 && RustTokenCursor(trees).identAt(0) == "become") {
+            val cursor = RustTokenCursor(trees)
+            if (trees.size >= 2 && cursor.identAt(0) == "become") {
                 val retTokens = ArrayList<TokenTree>(trees.size)
                 retTokens += RustTokenCursor.identTree("return", trees[0].span())
                 retTokens.addAll(trees.subList(1, trees.size))
                 val reparsed = parse2(ExprParse::parse, TokenStream.fromTokenTrees(retTokens)).getOrNull()
                 if (reparsed != null && reparsed !is Expr.Verbatim) {
                     return super.foldExpr(reparsed)
+                }
+            }
+            if (cursor.identAt(0) == "builtin" && cursor.punctCharAt(1) == '#') {
+                val builtinName = cursor.cleanIdentAt(2)
+                val delimGrp = cursor.groupAt(3)
+                if (builtinName != null && delimGrp != null) {
+                    val reparsed =
+                        if (builtinName == "type_ascribe" && delimGrp.delimiter() == Delimiter.Parenthesis) {
+                            val firstArg = RustTokenCursor(delimGrp.stream().toList()).splitByTopLevelPunct(',').firstOrNull()
+                            firstArg?.let { parse2(ExprParse::parse, normalizeLetOrPatternsForSyn(TokenStream.fromTokenTrees(it))).getOrNull() }
+                        } else {
+                            val macroTokens =
+                                listOf(
+                                    RustTokenCursor.identTree(builtinName, trees[0].span()),
+                                    RustTokenCursor.punctTree('!'),
+                                    trees[3],
+                                )
+                            parse2(ExprParse::parse, TokenStream.fromTokenTrees(macroTokens)).getOrNull()
+                        }
+                    if (reparsed != null && reparsed !is Expr.Verbatim) {
+                        return super.foldExpr(reparsed)
+                    }
                 }
             }
         }
@@ -810,27 +842,6 @@ private class ConstVerbatimTokenStripper(
                 changed = true
                 i += 2
                 continue
-            }
-            if (ch == '&') {
-                out += slice[i]
-                var next = i + 1
-                if (c.isLifetimeAt(next)) {
-                    out += slice[next]
-                    out += slice[next + 1]
-                    next += 2
-                }
-                if (c.identAt(next) == "pin") {
-                    changed = true
-                    next++
-                    if (c.identAt(next) == "const") {
-                        next++
-                    } else if (c.identAt(next) == "mut") {
-                        out += slice[next]
-                        next++
-                    }
-                    i = next
-                    continue
-                }
             }
             val tt = slice[i]
             if (tt is TokenTree.Group) {
