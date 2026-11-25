@@ -1,6 +1,7 @@
 package io.github.kotlinmania.rustkotlin
 
 import io.github.kotlinmania.syn.Expr
+import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.SynType
 
@@ -93,6 +94,58 @@ private fun layoutExprForNumericKind(
     }
 }
 
+internal class SynthesizedIntrinsicDeclContext(
+    val fnItem: Item.Fn,
+    val rawName: String,
+    val canonicalName: String,
+    val paramIdents: List<String>,
+    val typeParams: List<String>,
+    val ord0: String,
+    val ord1: String,
+    val coreNs: String,
+    val emitter: KotlinJ2KEmitter,
+) {
+    val intrPkg: String = "$coreNs.intrinsics"
+    val memPkg: String = "$coreNs.mem"
+    val ptrPkg: String = "$coreNs.ptr"
+    val rawAbi: Boolean get() = emitter.headerContext.rawAbiMode
+    val t0: String = typeParams.getOrElse(0) { "Any" }
+    val t1: String = typeParams.getOrElse(1) { t0 }
+    val layout0: String = StructLayoutComputer.typeLayoutParamName(t0)
+    val layout1: String = StructLayoutComputer.typeLayoutParamName(t1)
+    val p0: String = paramIdents.getOrElse(0) { "arg0" }
+    val p1: String = paramIdents.getOrElse(1) { "arg1" }
+    val p2: String = paramIdents.getOrElse(2) { "arg2" }
+
+    fun usizeLiteral(lit: Int): String = if (rawAbi) "${lit}uL" else "$lit"
+
+    fun asUsizeExpr(expr: String): String = if (rawAbi) "$expr.toULong()" else "$expr.toInt()"
+
+    fun importIntr(sym: String): String {
+        CoreIntrinsicLowering.registerCoreImport(emitter, "$intrPkg.$sym")
+        return sym
+    }
+
+    fun importMem(sym: String): String {
+        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.$sym")
+        return sym
+    }
+
+    fun importPtr(sym: String): String {
+        CoreIntrinsicLowering.registerCoreImport(emitter, "$ptrPkg.$sym")
+        return sym
+    }
+
+    fun callIntr(fnName: String, vararg args: String): String =
+        "${importIntr(fnName)}(${args.joinToString(", ")})"
+
+    fun callMem(fnName: String, vararg args: String): String =
+        "${importMem(fnName)}(${args.joinToString(", ")})"
+
+    fun callMemArgs(fnName: String, args: List<String>): String =
+        "${importMem(fnName)}(${args.joinToString(", ")})"
+}
+
 internal data class IntIntrinsicCallContext(
     val canonicalName: String,
     val renderedArgs: List<String>,
@@ -138,82 +191,31 @@ internal abstract class IntIntrinsicLoweringRule(
         symmetricArgCount: Int = 2,
     ) : this(setOf(name), withLayoutFn, symmetricArgCount)
 
-    open fun renderSynthesizedBody(
-        p0: String,
-        p1: String,
-        typeParamCount: Int,
-        layout0: String,
-        layout1: String,
-        memPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String {
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.$withLayoutFn")
-        return "$withLayoutFn($p0, $p1, $layout0)"
-    }
+    protected open fun synthesizedArgs(decl: SynthesizedIntrinsicDeclContext): List<String> =
+        listOf(decl.p0, decl.p1, decl.layout0)
+
+    open fun renderSynthesizedBody(decl: SynthesizedIntrinsicDeclContext): String =
+        decl.callMemArgs(withLayoutFn, synthesizedArgs(decl))
 
     abstract fun renderCall(ctx: IntIntrinsicCallContext): String?
 }
 
-private class UnaryBitCountIntrinsicRule(
+private class BitwiseUnsignedIntrinsicRule(
     names: Set<String>,
     private val kmStem: String,
     withLayoutFn: String,
+    private val returnsUIntCount: Boolean = false,
+    private val takesUIntShift: Boolean = false,
+    private val identityOnByte: Boolean = false,
 ) : IntIntrinsicLoweringRule(names, withLayoutFn, symmetricArgCount = 1) {
-    override fun renderSynthesizedBody(
-        p0: String,
-        p1: String,
-        typeParamCount: Int,
-        layout0: String,
-        layout1: String,
-        memPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String {
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.$withLayoutFn")
-        return "$withLayoutFn($p0, $layout0)"
-    }
+    override fun synthesizedArgs(decl: SynthesizedIntrinsicDeclContext): List<String> =
+        if (takesUIntShift) listOf(decl.p0, "(${decl.p1}).toUInt()", decl.layout0) else listOf(decl.p0, decl.layout0)
 
     override fun renderCall(ctx: IntIntrinsicCallContext): String? {
+        if (takesUIntShift && ctx.renderedArgs.size < 2) return null
         val arg0 = ctx.renderedArgs.firstOrNull() ?: return null
-        val kind = ctx.kind
-        val uTag = kind?.let(::numericKindUnsignedBitTag)
-        return when {
-            uTag == "U128" -> {
-                val kmFn = "${kmStem}U128"
-                CoreIntrinsicLowering.registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
-                val hiExpr = if (kind == NumericKind.I128) "v.high.toULong()" else "v.high"
-                "($arg0).let { v -> $kmFn(v.low, $hiExpr) }"
-            }
-            uTag != null -> {
-                val kmFn = "$kmStem$uTag"
-                CoreIntrinsicLowering.registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
-                "$kmFn(${toExactWidthUnsignedExpr(arg0, kind)})"
-            }
-            else -> ctx.fallbackWithLayout(withLayoutFn, arg0)
-        }
-    }
-}
-
-private class UnaryBitTransformIntrinsicRule(
-    name: String,
-    private val kmStem: String,
-    withLayoutFn: String,
-    private val identityOnByte: Boolean,
-) : IntIntrinsicLoweringRule(name, withLayoutFn, symmetricArgCount = 1) {
-    override fun renderSynthesizedBody(
-        p0: String,
-        p1: String,
-        typeParamCount: Int,
-        layout0: String,
-        layout1: String,
-        memPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String {
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.$withLayoutFn")
-        return "$withLayoutFn($p0, $layout0)"
-    }
-
-    override fun renderCall(ctx: IntIntrinsicCallContext): String? {
-        val arg0 = ctx.renderedArgs.firstOrNull() ?: return null
+        val shift = if (takesUIntShift) "(${ctx.renderedArgs[1]}).toUInt()" else null
+        val shiftSuffix = if (shift != null) ", $shift" else ""
         val kind = ctx.kind
         if (identityOnByte && (kind == NumericKind.I8 || kind == NumericKind.U8)) return arg0
         val uTag = kind?.let(::numericKindUnsignedBitTag)
@@ -222,66 +224,29 @@ private class UnaryBitTransformIntrinsicRule(
                 val kmFn = "${kmStem}U128"
                 CoreIntrinsicLowering.registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
                 val hiExpr = if (kind == NumericKind.I128) "v.high.toULong()" else "v.high"
-                val built = reconstruct128Expr(kind, "r.lo", "r.hi", ctx.coreNs, ctx.emitter)
-                "($arg0).let { v -> $kmFn(v.low, $hiExpr).let { r -> $built } }"
+                if (returnsUIntCount) {
+                    "($arg0).let { v -> $kmFn(v.low, $hiExpr$shiftSuffix) }"
+                } else {
+                    val built = reconstruct128Expr(kind, "r.lo", "r.hi", ctx.coreNs, ctx.emitter)
+                    "($arg0).let { v -> $kmFn(v.low, $hiExpr$shiftSuffix).let { r -> $built } }"
+                }
             }
             uTag != null -> {
                 val kmFn = "$kmStem$uTag"
                 CoreIntrinsicLowering.registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
-                fromExactWidthUnsignedExpr("$kmFn(${toExactWidthUnsignedExpr(arg0, kind)})", kind)
+                val rawCall = "$kmFn(${toExactWidthUnsignedExpr(arg0, kind)}$shiftSuffix)"
+                if (returnsUIntCount) rawCall else fromExactWidthUnsignedExpr(rawCall, kind)
             }
-            else -> ctx.fallbackWithLayout(withLayoutFn, arg0)
+            else -> ctx.fallbackWithLayout(withLayoutFn, if (shift != null) "$arg0, $shift" else arg0)
         }
     }
 }
 
-private class RotateIntrinsicRule(
-    name: String,
-    private val kmStem: String,
-    withLayoutFn: String,
-) : IntIntrinsicLoweringRule(name, withLayoutFn, symmetricArgCount = 1) {
-    override fun renderSynthesizedBody(
-        p0: String,
-        p1: String,
-        typeParamCount: Int,
-        layout0: String,
-        layout1: String,
-        memPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String {
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.$withLayoutFn")
-        return "$withLayoutFn($p0, ($p1).toUInt(), $layout0)"
-    }
-
-    override fun renderCall(ctx: IntIntrinsicCallContext): String? {
-        if (ctx.renderedArgs.size < 2) return null
-        val arg0 = ctx.renderedArgs[0]
-        val shift = "(${ctx.renderedArgs[1]}).toUInt()"
-        val kind = ctx.kind
-        val uTag = kind?.let(::numericKindUnsignedBitTag)
-        return when {
-            uTag == "U128" -> {
-                val kmFn = "${kmStem}U128"
-                CoreIntrinsicLowering.registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
-                val hiExpr = if (kind == NumericKind.I128) "v.high.toULong()" else "v.high"
-                val built = reconstruct128Expr(kind, "r.lo", "r.hi", ctx.coreNs, ctx.emitter)
-                "($arg0).let { v -> $kmFn(v.low, $hiExpr, $shift).let { r -> $built } }"
-            }
-            uTag != null -> {
-                val kmFn = "$kmStem$uTag"
-                CoreIntrinsicLowering.registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
-                fromExactWidthUnsignedExpr("$kmFn(${toExactWidthUnsignedExpr(arg0, kind)}, $shift)", kind)
-            }
-            else -> ctx.fallbackWithLayout(withLayoutFn, "$arg0, $shift")
-        }
-    }
-}
-
-private class WrappingArithmeticIntrinsicRule(
+private class BinaryInfixIntIntrinsicRule(
     names: Set<String>,
     private val opSymbol: String,
-    private val u128Fn: String,
     withLayoutFn: String,
+    private val u128Fn: String? = null,
 ) : IntIntrinsicLoweringRule(names, withLayoutFn) {
     override fun renderCall(ctx: IntIntrinsicCallContext): String? {
         if (ctx.renderedArgs.size < 2) return null
@@ -293,7 +258,8 @@ private class WrappingArithmeticIntrinsicRule(
             NumericKind.I16 -> "((($a) $opSymbol ($b))).toShort()"
             NumericKind.U16 -> "((($a) $opSymbol ($b))).toUShort()"
             NumericKind.I32, NumericKind.U32, NumericKind.I64, NumericKind.U64 -> "(($a) $opSymbol ($b))"
-            NumericKind.I128, NumericKind.U128 -> ctx.binary128Call(u128Fn, a, b)
+            NumericKind.I128, NumericKind.U128 ->
+                if (u128Fn != null) ctx.binary128Call(u128Fn, a, b) else "(($a) $opSymbol ($b))"
             else -> ctx.fallbackWithLayout(withLayoutFn, "$a, $b")
         }
     }
@@ -326,48 +292,17 @@ private class WidthTaggedBinaryIntrinsicRule(
     }
 }
 
-private class DivisionIntrinsicRule(
-    name: String,
-    private val opSymbol: String,
-    withLayoutFn: String,
-) : IntIntrinsicLoweringRule(name, withLayoutFn) {
-    override fun renderCall(ctx: IntIntrinsicCallContext): String? {
-        if (ctx.renderedArgs.size < 2) return null
-        val a = ctx.renderedArgs[0]
-        val b = ctx.renderedArgs[1]
-        return when (ctx.kind) {
-            NumericKind.I8 -> "((($a) $opSymbol ($b))).toByte()"
-            NumericKind.U8 -> "((($a) $opSymbol ($b))).toUByte()"
-            NumericKind.I16 -> "((($a) $opSymbol ($b))).toShort()"
-            NumericKind.U16 -> "((($a) $opSymbol ($b))).toUShort()"
-            NumericKind.I32, NumericKind.U32, NumericKind.I64, NumericKind.U64, NumericKind.I128, NumericKind.U128 ->
-                "(($a) $opSymbol ($b))"
-            else -> ctx.fallbackWithLayout(withLayoutFn, "$a, $b")
-        }
-    }
-}
-
 private class UncheckedShiftIntrinsicRule(
     name: String,
     private val isLeft: Boolean,
     withLayoutFn: String,
 ) : IntIntrinsicLoweringRule(name, withLayoutFn, symmetricArgCount = 1) {
-    override fun renderSynthesizedBody(
-        p0: String,
-        p1: String,
-        typeParamCount: Int,
-        layout0: String,
-        layout1: String,
-        memPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String {
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.$withLayoutFn")
-        return if (typeParamCount >= 2) {
-            "$withLayoutFn($p0, $p1, $layout0, $layout1)"
+    override fun synthesizedArgs(decl: SynthesizedIntrinsicDeclContext): List<String> =
+        if (decl.typeParams.size >= 2) {
+            listOf(decl.p0, decl.p1, decl.layout0, decl.layout1)
         } else {
-            "$withLayoutFn($p0, ($p1).toUInt(), $layout0)"
+            listOf(decl.p0, "(${decl.p1}).toUInt()", decl.layout0)
         }
-    }
 
     override fun renderCall(ctx: IntIntrinsicCallContext): String? {
         if (ctx.renderedArgs.size < 2) return null
@@ -380,24 +315,25 @@ private class UncheckedShiftIntrinsicRule(
             NumericKind.I16 -> "((($x).toInt() $op ($shift).toInt()).toShort())"
             NumericKind.U16 -> "(((($x).toUInt() and 0xFFFFu) $op ($shift).toInt()).toUShort())"
             NumericKind.I32, NumericKind.U32, NumericKind.I64, NumericKind.U64 -> "(($x) $op ($shift).toInt())"
-            NumericKind.U128 -> {
-                val kmFn = if (isLeft) "kmU128Shl" else "kmU128Shr"
+            NumericKind.U128, NumericKind.I128 -> {
+                val isSigned = ctx.kind == NumericKind.I128
+                val kmFn =
+                    when {
+                        isLeft -> "kmU128Shl"
+                        isSigned -> "kmI128Shr"
+                        else -> "kmU128Shr"
+                    }
                 CoreIntrinsicLowering.registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
-                CoreIntrinsicLowering.registerCoreImport(ctx.emitter, "${ctx.coreNs}.U128")
-                "($x).let { v -> $kmFn(v.low, v.high, ($shift).toUInt()).let { r -> U128(r.hi, r.lo) } }"
-            }
-            NumericKind.I128 -> {
-                val kmFn = if (isLeft) "kmU128Shl" else "kmI128Shr"
-                CoreIntrinsicLowering.registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$kmFn")
-                CoreIntrinsicLowering.registerCoreImport(ctx.emitter, "${ctx.coreNs}.I128")
-                "($x).let { v -> $kmFn(v.low, v.high.toULong(), ($shift).toUInt()).let { r -> I128(r.hi.toLong(), r.lo) } }"
+                val hiExpr = if (isSigned) "v.high.toULong()" else "v.high"
+                val built = reconstruct128Expr(ctx.kind, "r.lo", "r.hi", ctx.coreNs, ctx.emitter)
+                "($x).let { v -> $kmFn(v.low, $hiExpr, ($shift).toUInt()).let { r -> $built } }"
             }
             else -> {
                 val ty0 = ctx.firstTargetTy ?: return null
                 val layout0 = CoreIntrinsicLowering.resolveTypeLayoutExpression(ty0, ctx.selfTypeName, ctx.emitter)
                 CoreIntrinsicLowering.registerCoreImport(ctx.emitter, "${ctx.memPkg}.$withLayoutFn")
                 val shiftTy =
-                    ctx.explicitTypes.getOrNull(1)?.takeUnless { it is SynType.Infer }
+                    ctx.explicitTypes.nonInferAt(1)
                         ?: ctx.callArgsList.getOrNull(1)?.let { ctx.emitter.sourceInitializerType(it) }
                 if (shiftTy != null && ctx.explicitTypes.size >= 2) {
                     val layout1 = CoreIntrinsicLowering.resolveTypeLayoutExpression(shiftTy, ctx.selfTypeName, ctx.emitter)
@@ -439,24 +375,24 @@ private object ThreeWayCompareIntrinsicRule : IntIntrinsicLoweringRule("three_wa
 
 private val INT_INTRINSIC_RULES: List<IntIntrinsicLoweringRule> =
     listOf(
-        UnaryBitCountIntrinsicRule(setOf("ctpop"), "kmCtpop", "ctpopWithLayout"),
-        UnaryBitCountIntrinsicRule(setOf("ctlz", "ctlz_nonzero"), "kmCtlz", "ctlzWithLayout"),
-        UnaryBitCountIntrinsicRule(setOf("cttz", "cttz_nonzero"), "kmCttz", "cttzWithLayout"),
-        UnaryBitTransformIntrinsicRule("bswap", "kmBswap", "bswapWithLayout", identityOnByte = true),
-        UnaryBitTransformIntrinsicRule("bitreverse", "kmBitreverse", "bitreverseWithLayout", identityOnByte = false),
-        RotateIntrinsicRule("rotate_left", "kmRotateLeft", "rotateLeftWithLayout"),
-        RotateIntrinsicRule("rotate_right", "kmRotateRight", "rotateRightWithLayout"),
-        WrappingArithmeticIntrinsicRule(setOf("wrapping_add", "unchecked_add"), "+", "kmU128Add", "wrappingAddWithLayout"),
-        WrappingArithmeticIntrinsicRule(setOf("wrapping_sub", "unchecked_sub"), "-", "kmU128Sub", "wrappingSubWithLayout"),
-        WrappingArithmeticIntrinsicRule(setOf("wrapping_mul", "unchecked_mul"), "*", "kmU128Mul", "wrappingMulWithLayout"),
+        BitwiseUnsignedIntrinsicRule(setOf("ctpop"), "kmCtpop", "ctpopWithLayout", returnsUIntCount = true),
+        BitwiseUnsignedIntrinsicRule(setOf("ctlz", "ctlz_nonzero"), "kmCtlz", "ctlzWithLayout", returnsUIntCount = true),
+        BitwiseUnsignedIntrinsicRule(setOf("cttz", "cttz_nonzero"), "kmCttz", "cttzWithLayout", returnsUIntCount = true),
+        BitwiseUnsignedIntrinsicRule(setOf("bswap"), "kmBswap", "bswapWithLayout", identityOnByte = true),
+        BitwiseUnsignedIntrinsicRule(setOf("bitreverse"), "kmBitreverse", "bitreverseWithLayout"),
+        BitwiseUnsignedIntrinsicRule(setOf("rotate_left"), "kmRotateLeft", "rotateLeftWithLayout", takesUIntShift = true),
+        BitwiseUnsignedIntrinsicRule(setOf("rotate_right"), "kmRotateRight", "rotateRightWithLayout", takesUIntShift = true),
+        BinaryInfixIntIntrinsicRule(setOf("wrapping_add", "unchecked_add"), "+", "wrappingAddWithLayout", u128Fn = "kmU128Add"),
+        BinaryInfixIntIntrinsicRule(setOf("wrapping_sub", "unchecked_sub"), "-", "wrappingSubWithLayout", u128Fn = "kmU128Sub"),
+        BinaryInfixIntIntrinsicRule(setOf("wrapping_mul", "unchecked_mul"), "*", "wrappingMulWithLayout", u128Fn = "kmU128Mul"),
         WidthTaggedBinaryIntrinsicRule("saturating_add", "kmSaturatingAdd", "saturatingAddWithLayout", wrapPairOverflow = false),
         WidthTaggedBinaryIntrinsicRule("saturating_sub", "kmSaturatingSub", "saturatingSubWithLayout", wrapPairOverflow = false),
         WidthTaggedBinaryIntrinsicRule("add_with_overflow", "kmAddWithOverflow", "addWithOverflowWithLayout", wrapPairOverflow = true),
         WidthTaggedBinaryIntrinsicRule("sub_with_overflow", "kmSubWithOverflow", "subWithOverflowWithLayout", wrapPairOverflow = true),
         WidthTaggedBinaryIntrinsicRule("mul_with_overflow", "kmMulWithOverflow", "mulWithOverflowWithLayout", wrapPairOverflow = true),
-        DivisionIntrinsicRule("unchecked_div", "/", "uncheckedDivWithLayout"),
-        DivisionIntrinsicRule("exact_div", "/", "exactDivWithLayout"),
-        DivisionIntrinsicRule("unchecked_rem", "%", "uncheckedRemWithLayout"),
+        BinaryInfixIntIntrinsicRule(setOf("unchecked_div"), "/", "uncheckedDivWithLayout"),
+        BinaryInfixIntIntrinsicRule(setOf("exact_div"), "/", "exactDivWithLayout"),
+        BinaryInfixIntIntrinsicRule(setOf("unchecked_rem"), "%", "uncheckedRemWithLayout"),
         UncheckedShiftIntrinsicRule("unchecked_shl", isLeft = true, "uncheckedShlWithLayout"),
         UncheckedShiftIntrinsicRule("unchecked_shr", isLeft = false, "uncheckedShrWithLayout"),
         DisjointBitorIntrinsicRule,
@@ -466,9 +402,7 @@ private val INT_INTRINSIC_RULES: List<IntIntrinsicLoweringRule> =
 internal val INT_INTRINSIC_RULES_BY_NAME: Map<String, IntIntrinsicLoweringRule> =
     buildMap {
         for (rule in INT_INTRINSIC_RULES) {
-            for (name in rule.names) {
-                put(name, rule)
-            }
+            for (name in rule.names) put(name, rule)
         }
     }
 
@@ -484,9 +418,15 @@ internal fun renderIntOrBitIntrinsicCall(
     emitter: KotlinJ2KEmitter,
 ): String? {
     val rule = INT_INTRINSIC_RULES_BY_NAME[canonicalName] ?: return null
-    val kind = CoreIntrinsicLowering.resolveIntrinsicNumericKind(explicitTypes.firstOrNull(), callArgsList.take(rule.symmetricArgCount), selfTypeName, emitter)
+    val kind =
+        CoreIntrinsicLowering.resolveIntrinsicNumericKind(
+            explicitTypes.firstOrNull(),
+            callArgsList.take(rule.symmetricArgCount),
+            selfTypeName,
+            emitter,
+        )
     val firstTargetTy =
-        explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
+        explicitTypes.nonInferAt(0)
             ?: callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) }
     return rule.renderCall(
         IntIntrinsicCallContext(
@@ -503,6 +443,30 @@ internal fun renderIntOrBitIntrinsicCall(
             emitter = emitter,
         ),
     )
+}
+
+internal class FloatEmitSpec(
+    val canonicalName: String,
+    val args: List<String>,
+    val layout0: String,
+    val layout1: String,
+    val intrPkg: String,
+    val memPkg: String,
+    val emitter: KotlinJ2KEmitter,
+) {
+    val p0: String get() = args.getOrElse(0) { "" }
+    val p1: String get() = args.getOrElse(1) { "" }
+    val p2: String get() = args.getOrElse(2) { "" }
+
+    fun callIntr(fnName: String, count: Int): String {
+        CoreIntrinsicLowering.registerCoreImport(emitter, "$intrPkg.$fnName")
+        return "$fnName(${args.take(count).joinToString(", ")})"
+    }
+
+    fun callMem(fnName: String, vararg callArgs: String): String {
+        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.$fnName")
+        return "$fnName(${callArgs.joinToString(", ")})"
+    }
 }
 
 internal data class FloatIntrinsicCallContext(
@@ -526,7 +490,7 @@ internal data class FloatIntrinsicCallContext(
 
     fun floatLayoutExpr(kind: NumericKind?): String? {
         val targetTy =
-            explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
+            explicitTypes.nonInferAt(0)
                 ?: callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) }
         return when {
             kind != null && kind in setOf(NumericKind.F16, NumericKind.F32, NumericKind.F64, NumericKind.F128) ->
@@ -535,6 +499,9 @@ internal data class FloatIntrinsicCallContext(
             else -> null
         }
     }
+
+    fun emitWithLayouts(rule: FloatIntrinsicLoweringRule, layout0: String, layout1: String = layout0): String? =
+        rule.renderWithLayouts(FloatEmitSpec(canonicalName, renderedArgs, layout0, layout1, intrPkg, memPkg, emitter))
 
     fun dispatchF32F64OrFallback(
         rule: FloatIntrinsicLoweringRule,
@@ -556,17 +523,7 @@ internal data class FloatIntrinsicCallContext(
             }
             else -> {
                 val layout = floatLayoutExpr(kind) ?: return null
-                rule.renderSynthesizedBody(
-                    canonicalName = canonicalName,
-                    p0 = renderedArgs.getOrElse(0) { "" },
-                    p1 = renderedArgs.getOrElse(1) { "" },
-                    p2 = renderedArgs.getOrElse(2) { "" },
-                    layout0 = layout,
-                    layout1 = layout,
-                    intrPkg = intrPkg,
-                    memPkg = memPkg,
-                    emitter = emitter,
-                )
+                emitWithLayouts(rule, layout)
             }
         }
     }
@@ -574,163 +531,53 @@ internal data class FloatIntrinsicCallContext(
 
 internal abstract class FloatIntrinsicLoweringRule(
     val names: Set<String>,
+    private val directCallArity: Int? = null,
 ) {
-    abstract fun renderSynthesizedBody(
-        canonicalName: String,
-        p0: String,
-        p1: String,
-        p2: String,
-        layout0: String,
-        layout1: String,
-        intrPkg: String,
-        memPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String?
+    abstract fun renderWithLayouts(spec: FloatEmitSpec): String?
 
-    abstract fun renderCall(ctx: FloatIntrinsicCallContext): String?
-}
-
-private class FixedUnaryFloatIntrinsicRule : FloatIntrinsicLoweringRule(CoreIntrinsicLowering.SUFFIXED_FLOAT_UNARY_KM.keys) {
-    override fun renderSynthesizedBody(
-        canonicalName: String,
-        p0: String,
-        p1: String,
-        p2: String,
-        layout0: String,
-        layout1: String,
-        intrPkg: String,
-        memPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String? {
-        val kmFn = CoreIntrinsicLowering.SUFFIXED_FLOAT_UNARY_KM[canonicalName] ?: return null
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$intrPkg.$kmFn")
-        return "$kmFn($p0)"
-    }
-
-    override fun renderCall(ctx: FloatIntrinsicCallContext): String? {
-        val arg0 = ctx.renderedArgs.firstOrNull() ?: return null
-        return renderSynthesizedBody(ctx.canonicalName, arg0, "", "", "", "", ctx.intrPkg, ctx.memPkg, ctx.emitter)
-    }
-}
-
-private class FixedBinaryFloatIntrinsicRule : FloatIntrinsicLoweringRule(CoreIntrinsicLowering.SUFFIXED_FLOAT_BINARY_KM.keys) {
-    override fun renderSynthesizedBody(
-        canonicalName: String,
-        p0: String,
-        p1: String,
-        p2: String,
-        layout0: String,
-        layout1: String,
-        intrPkg: String,
-        memPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String? {
-        val kmFn = CoreIntrinsicLowering.SUFFIXED_FLOAT_BINARY_KM[canonicalName] ?: return null
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$intrPkg.$kmFn")
-        return "$kmFn($p0, $p1)"
-    }
-
-    override fun renderCall(ctx: FloatIntrinsicCallContext): String? {
-        if (ctx.renderedArgs.size < 2) return null
-        return renderSynthesizedBody(
-            ctx.canonicalName,
-            ctx.renderedArgs[0],
-            ctx.renderedArgs[1],
-            "",
-            "",
-            "",
-            ctx.intrPkg,
-            ctx.memPkg,
-            ctx.emitter,
+    fun renderSynthesizedBody(decl: SynthesizedIntrinsicDeclContext): String? =
+        renderWithLayouts(
+            FloatEmitSpec(
+                canonicalName = decl.canonicalName,
+                args = listOf(decl.p0, decl.p1, decl.p2),
+                layout0 = decl.layout0,
+                layout1 = decl.layout1,
+                intrPkg = decl.intrPkg,
+                memPkg = decl.memPkg,
+                emitter = decl.emitter,
+            ),
         )
+
+    open fun renderCall(ctx: FloatIntrinsicCallContext): String? {
+        val arity = directCallArity ?: return null
+        if (ctx.renderedArgs.size < arity) return null
+        return ctx.emitWithLayouts(this, "")
     }
 }
 
-private object FixedFmaFloatIntrinsicRule :
-    FloatIntrinsicLoweringRule(setOf("fmaf32", "fmuladdf32", "fmaf64", "fmuladdf64")) {
-    override fun renderSynthesizedBody(
-        canonicalName: String,
-        p0: String,
-        p1: String,
-        p2: String,
-        layout0: String,
-        layout1: String,
-        intrPkg: String,
-        memPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String {
-        val kmFn = if (canonicalName.endsWith("f32")) "kmFmaf32" else "kmFmaf64"
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$intrPkg.$kmFn")
-        return "$kmFn($p0, $p1, $p2)"
-    }
-
-    override fun renderCall(ctx: FloatIntrinsicCallContext): String? {
-        if (ctx.renderedArgs.size < 3) return null
-        return renderSynthesizedBody(
-            ctx.canonicalName,
-            ctx.renderedArgs[0],
-            ctx.renderedArgs[1],
-            ctx.renderedArgs[2],
-            "",
-            "",
-            ctx.intrPkg,
-            ctx.memPkg,
-            ctx.emitter,
-        )
+private class FixedKmFloatIntrinsicRule(
+    private val kmByName: Map<String, String>,
+    private val arity: Int,
+) : FloatIntrinsicLoweringRule(kmByName.keys, directCallArity = arity) {
+    override fun renderWithLayouts(spec: FloatEmitSpec): String? {
+        val kmFn = kmByName[spec.canonicalName] ?: return null
+        return spec.callIntr(kmFn, arity)
     }
 }
 
 private object FixedMinMaxFloatIntrinsicRule :
-    FloatIntrinsicLoweringRule(setOf("minimumf32", "maximumf32", "minimumf64", "maximumf64")) {
-    override fun renderSynthesizedBody(
-        canonicalName: String,
-        p0: String,
-        p1: String,
-        p2: String,
-        layout0: String,
-        layout1: String,
-        intrPkg: String,
-        memPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String {
-        val op = if (canonicalName.startsWith("min")) "minimum" else "maximum"
-        val layoutName = if (canonicalName.endsWith("f32")) "PrimitiveLayouts.F32" else "PrimitiveLayouts.F64"
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.floatBinaryWithLayout")
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.PrimitiveLayouts")
-        return "floatBinaryWithLayout(\"$op\", $p0, $p1, $layoutName)"
-    }
-
-    override fun renderCall(ctx: FloatIntrinsicCallContext): String? {
-        if (ctx.renderedArgs.size < 2) return null
-        return renderSynthesizedBody(
-            ctx.canonicalName,
-            ctx.renderedArgs[0],
-            ctx.renderedArgs[1],
-            "",
-            "",
-            "",
-            ctx.intrPkg,
-            ctx.memPkg,
-            ctx.emitter,
-        )
+    FloatIntrinsicLoweringRule(setOf("minimumf32", "maximumf32", "minimumf64", "maximumf64"), directCallArity = 2) {
+    override fun renderWithLayouts(spec: FloatEmitSpec): String {
+        val op = if (spec.canonicalName.startsWith("min")) "minimum" else "maximum"
+        val layoutName = if (spec.canonicalName.endsWith("f32")) "PrimitiveLayouts.F32" else "PrimitiveLayouts.F64"
+        CoreIntrinsicLowering.registerCoreImport(spec.emitter, "${spec.memPkg}.PrimitiveLayouts")
+        return spec.callMem("floatBinaryWithLayout", "\"$op\"", spec.p0, spec.p1, layoutName)
     }
 }
 
 private class GenericUnaryFloatIntrinsicRule : FloatIntrinsicLoweringRule(CoreIntrinsicLowering.GENERIC_FLOAT_UNARY_KM.keys) {
-    override fun renderSynthesizedBody(
-        canonicalName: String,
-        p0: String,
-        p1: String,
-        p2: String,
-        layout0: String,
-        layout1: String,
-        intrPkg: String,
-        memPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String {
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.floatUnaryWithLayout")
-        return "floatUnaryWithLayout(\"$canonicalName\", $p0, $layout0)"
-    }
+    override fun renderWithLayouts(spec: FloatEmitSpec): String =
+        spec.callMem("floatUnaryWithLayout", "\"${spec.canonicalName}\"", spec.p0, spec.layout0)
 
     override fun renderCall(ctx: FloatIntrinsicCallContext): String? {
         val (f32Km, f64Km) = CoreIntrinsicLowering.GENERIC_FLOAT_UNARY_KM[ctx.canonicalName] ?: return null
@@ -739,20 +586,9 @@ private class GenericUnaryFloatIntrinsicRule : FloatIntrinsicLoweringRule(CoreIn
 }
 
 private class GenericBinaryFloatOpIntrinsicRule : FloatIntrinsicLoweringRule(CoreIntrinsicLowering.GENERIC_FLOAT_BINARY_OP_NAMES.keys) {
-    override fun renderSynthesizedBody(
-        canonicalName: String,
-        p0: String,
-        p1: String,
-        p2: String,
-        layout0: String,
-        layout1: String,
-        intrPkg: String,
-        memPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String {
-        val op = CoreIntrinsicLowering.GENERIC_FLOAT_BINARY_OP_NAMES.getValue(canonicalName)
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.floatBinaryWithLayout")
-        return "floatBinaryWithLayout(\"$op\", $p0, $p1, $layout0)"
+    override fun renderWithLayouts(spec: FloatEmitSpec): String {
+        val op = CoreIntrinsicLowering.GENERIC_FLOAT_BINARY_OP_NAMES.getValue(spec.canonicalName)
+        return spec.callMem("floatBinaryWithLayout", "\"$op\"", spec.p0, spec.p1, spec.layout0)
     }
 
     override fun renderCall(ctx: FloatIntrinsicCallContext): String? {
@@ -775,77 +611,40 @@ private class GenericBinaryFloatOpIntrinsicRule : FloatIntrinsicLoweringRule(Cor
             }
         }
         val layout = ctx.floatLayoutExpr(kind) ?: return null
-        return renderSynthesizedBody(ctx.canonicalName, a, b, "", layout, layout, ctx.intrPkg, ctx.memPkg, ctx.emitter)
+        return ctx.emitWithLayouts(this, layout)
     }
 }
 
 private object GenericPowiFloatIntrinsicRule : FloatIntrinsicLoweringRule(setOf("powi")) {
-    override fun renderSynthesizedBody(
-        canonicalName: String,
-        p0: String,
-        p1: String,
-        p2: String,
-        layout0: String,
-        layout1: String,
-        intrPkg: String,
-        memPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String {
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.floatPowiWithLayout")
-        return "floatPowiWithLayout($p0, $p1, $layout0)"
-    }
+    override fun renderWithLayouts(spec: FloatEmitSpec): String =
+        spec.callMem("floatPowiWithLayout", spec.p0, spec.p1, spec.layout0)
 
     override fun renderCall(ctx: FloatIntrinsicCallContext): String? =
         ctx.dispatchF32F64OrFallback(this, "kmPowif32", "kmPowif64", requiredArity = 2, kind = ctx.kindForArity(1))
 }
 
 private object GenericFmaFloatIntrinsicRule : FloatIntrinsicLoweringRule(setOf("fma", "fmuladd")) {
-    override fun renderSynthesizedBody(
-        canonicalName: String,
-        p0: String,
-        p1: String,
-        p2: String,
-        layout0: String,
-        layout1: String,
-        intrPkg: String,
-        memPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String {
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.floatFmaWithLayout")
-        return "floatFmaWithLayout($p0, $p1, $p2, $layout0)"
-    }
+    override fun renderWithLayouts(spec: FloatEmitSpec): String =
+        spec.callMem("floatFmaWithLayout", spec.p0, spec.p1, spec.p2, spec.layout0)
 
     override fun renderCall(ctx: FloatIntrinsicCallContext): String? =
         ctx.dispatchF32F64OrFallback(this, "kmFmaf32", "kmFmaf64", requiredArity = 3, kind = ctx.kindForArity(3))
 }
 
 private object FloatToIntUncheckedIntrinsicRule : FloatIntrinsicLoweringRule(setOf("float_to_int_unchecked")) {
-    override fun renderSynthesizedBody(
-        canonicalName: String,
-        p0: String,
-        p1: String,
-        p2: String,
-        layout0: String,
-        layout1: String,
-        intrPkg: String,
-        memPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String {
-        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.floatToIntUncheckedWithLayout")
-        return "floatToIntUncheckedWithLayout($p0, $layout0, $layout1)"
-    }
+    override fun renderWithLayouts(spec: FloatEmitSpec): String =
+        spec.callMem("floatToIntUncheckedWithLayout", spec.p0, spec.layout0, spec.layout1)
 
     override fun renderCall(ctx: FloatIntrinsicCallContext): String? {
         val arg0 = ctx.renderedArgs.firstOrNull() ?: return null
         val srcTy =
-            ctx.explicitTypes.getOrNull(0)?.takeUnless { it is SynType.Infer }
+            ctx.explicitTypes.nonInferAt(0)
                 ?: ctx.callArgsList.firstOrNull()?.let { ctx.emitter.sourceInitializerType(it) }
-        val dstTy =
-            ctx.explicitTypes.getOrNull(1)?.takeUnless { it is SynType.Infer }
-                ?: ctx.emitter.currentEnclosingReturnSynType
+        val dstTy = ctx.explicitTypes.nonInferAt(1) ?: ctx.emitter.currentEnclosingReturnSynType
         val srcKind = CoreIntrinsicLowering.resolveIntrinsicNumericKind(srcTy, ctx.callArgsList.take(1), ctx.selfTypeName, ctx.emitter)
+        val dstScalar = dstTy?.let { CoreIntrinsicLowering.explicitScalarRustName(it, ctx.emitter) }
         val dstKind =
-            dstTy?.let { CoreIntrinsicLowering.explicitScalarRustName(it, ctx.emitter)?.let { s -> CoreIntrinsicLowering.rustScalarToNumericKind(s, ctx.emitter) } }
+            dstScalar?.let { CoreIntrinsicLowering.rustScalarToNumericKind(it, ctx.emitter) }
                 ?: ctx.emitter.currentExpectedNumericKind
         if (srcKind == NumericKind.F32 || srcKind == NumericKind.F64) {
             val isF32 = srcKind == NumericKind.F32
@@ -875,7 +674,7 @@ private object FloatToIntUncheckedIntrinsicRule : FloatIntrinsicLoweringRule(set
                 NumericKind.I128 -> {
                     val srcLayout = layoutExprForNumericKind(srcKind, ctx.coreNs, ctx.memPkg, ctx.emitter)
                     val dstLayout = layoutExprForNumericKind(NumericKind.I128, ctx.coreNs, ctx.memPkg, ctx.emitter)
-                    return renderSynthesizedBody(ctx.canonicalName, arg0, "", "", srcLayout, dstLayout, ctx.intrPkg, ctx.memPkg, ctx.emitter)
+                    return ctx.emitWithLayouts(this, srcLayout, dstLayout)
                 }
                 else -> Unit
             }
@@ -888,15 +687,23 @@ private object FloatToIntUncheckedIntrinsicRule : FloatIntrinsicLoweringRule(set
             dstKind?.let { layoutExprForNumericKind(it, ctx.coreNs, ctx.memPkg, ctx.emitter) }
                 ?: dstTy?.let { CoreIntrinsicLowering.resolveTypeLayoutExpression(it, ctx.selfTypeName, ctx.emitter) }
                 ?: return null
-        return renderSynthesizedBody(ctx.canonicalName, arg0, "", "", srcLayout, dstLayout, ctx.intrPkg, ctx.memPkg, ctx.emitter)
+        return ctx.emitWithLayouts(this, srcLayout, dstLayout)
     }
 }
 
 private val FLOAT_INTRINSIC_RULES: List<FloatIntrinsicLoweringRule> =
     listOf(
-        FixedUnaryFloatIntrinsicRule(),
-        FixedBinaryFloatIntrinsicRule(),
-        FixedFmaFloatIntrinsicRule,
+        FixedKmFloatIntrinsicRule(CoreIntrinsicLowering.SUFFIXED_FLOAT_UNARY_KM, arity = 1),
+        FixedKmFloatIntrinsicRule(CoreIntrinsicLowering.SUFFIXED_FLOAT_BINARY_KM, arity = 2),
+        FixedKmFloatIntrinsicRule(
+            mapOf(
+                "fmaf32" to "kmFmaf32",
+                "fmuladdf32" to "kmFmaf32",
+                "fmaf64" to "kmFmaf64",
+                "fmuladdf64" to "kmFmaf64",
+            ),
+            arity = 3,
+        ),
         FixedMinMaxFloatIntrinsicRule,
         GenericUnaryFloatIntrinsicRule(),
         GenericBinaryFloatOpIntrinsicRule(),
@@ -908,9 +715,7 @@ private val FLOAT_INTRINSIC_RULES: List<FloatIntrinsicLoweringRule> =
 internal val FLOAT_INTRINSIC_RULES_BY_NAME: Map<String, FloatIntrinsicLoweringRule> =
     buildMap {
         for (rule in FLOAT_INTRINSIC_RULES) {
-            for (name in rule.names) {
-                put(name, rule)
-            }
+            for (name in rule.names) put(name, rule)
         }
     }
 

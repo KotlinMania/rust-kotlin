@@ -2,7 +2,6 @@ package io.github.kotlinmania.rustkotlin
 
 import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.procmacro2.TokenStream
-import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.Attribute
 import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.Lit
@@ -11,6 +10,7 @@ import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.PathArguments
 import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.SynType
+import io.github.kotlinmania.syn.parse2
 
 public sealed class CompanionInteropKind {
     public data object CInteropDef : CompanionInteropKind()
@@ -80,7 +80,12 @@ internal data class InteropParamSpec(
     val kotlinType: String,
     val cType: String = "",
     val bridgeKind: CAbiBridgeKind,
-)
+) {
+    fun isDirectStringBridge(noStringConvEnabled: Boolean): Boolean =
+        bridgeKind == CAbiBridgeKind.CONST_CSTR &&
+            !noStringConvEnabled &&
+            (kotlinType == "String?" || kotlinType == "String")
+}
 
 internal data class ForeignFnInteropSpec(
     val visibilityPrefix: String,
@@ -110,6 +115,9 @@ internal data class ForeignStaticInteropSpec(
 ) {
     val getterWrapperSymbolName: String get() = getterSymbolName
     val setterWrapperSymbolName: String get() = setterSymbolName
+
+    fun asSetterParamSpec(): InteropParamSpec =
+        InteropParamSpec(kotlinName = "value", cName = "value", kotlinType = kotlinType, bridgeKind = bridgeKind)
 }
 
 internal data class InlineCFunctionSpec(
@@ -156,24 +164,72 @@ internal data class CAbiBridgeDescriptor(
     val wasmJsType: String? = null,
     val jniKotlinType: String,
     val jniCType: String,
+    val kotlinScalarType: String? = null,
     val isPointerAddress: Boolean = false,
 )
 
+internal data class BridgeReturnConversionProfile(
+    val subIntBase: String,
+    val i64Base: String,
+    val u64Base: String,
+    val ptrLongExpr: String,
+    val ptrLongReceiverExpr: String = ptrLongExpr,
+    val boolExpr: String,
+    val f32Expr: String,
+    val f64Expr: String,
+    val signedSubIntKeepsRaw: Boolean = false,
+    val nativeTypedIntegrals: Boolean = false,
+    val callbackConvertsNonLongNumeric: Boolean = false,
+    val pointerImport: String? = null,
+    val fallbackNonScalar: String,
+)
+
+private data class TargetCWidthProfile(
+    val ptrSigned: CAbiBridgeKind,
+    val ptrUnsigned: CAbiBridgeKind,
+    val cLongSigned: CAbiBridgeKind,
+    val cLongUnsigned: CAbiBridgeKind,
+) {
+    companion object {
+        fun from(cfgProfile: CfgTargetProfile): TargetCWidthProfile {
+            val ptrWidth = cfgProfile.pointerWidth
+            val isWindows =
+                cfgProfile.targetOs == "windows" ||
+                    cfgProfile.targetFamilies?.contains("windows") == true
+            val ptrSigned =
+                when (ptrWidth) {
+                    64 -> CAbiBridgeKind.I64
+                    16 -> CAbiBridgeKind.I16
+                    else -> CAbiBridgeKind.I32
+                }
+            val ptrUnsigned =
+                when (ptrWidth) {
+                    64 -> CAbiBridgeKind.U64
+                    16 -> CAbiBridgeKind.U16
+                    else -> CAbiBridgeKind.U32
+                }
+            val cLongSigned = if (ptrWidth == 64 && !isWindows) CAbiBridgeKind.I64 else CAbiBridgeKind.I32
+            val cLongUnsigned = if (ptrWidth == 64 && !isWindows) CAbiBridgeKind.U64 else CAbiBridgeKind.U32
+            return TargetCWidthProfile(ptrSigned, ptrUnsigned, cLongSigned, cLongUnsigned)
+        }
+    }
+}
+
 internal val C_ABI_BRIDGE_DESCRIPTORS: Map<CAbiBridgeKind, CAbiBridgeDescriptor> =
     mapOf(
-        CAbiBridgeKind.VOID to CAbiBridgeDescriptor("void", "", wasmWasiScalarType = "Unit", wasmJsType = "Unit", jniKotlinType = "Unit", jniCType = "void"),
-        CAbiBridgeKind.NEVER to CAbiBridgeDescriptor("void", "", wasmWasiScalarType = "Unit", wasmJsType = "Unit", jniKotlinType = "Unit", jniCType = "void"),
-        CAbiBridgeKind.BOOL to CAbiBridgeDescriptor("bool", "false", wasmWasiScalarType = "Int", wasmJsType = "Boolean", jniKotlinType = "Boolean", jniCType = "jboolean"),
-        CAbiBridgeKind.I8 to CAbiBridgeDescriptor("int8_t", "-1", NumericKind.I8, "toByte", "Int", "Int", "Byte", "jbyte"),
-        CAbiBridgeKind.U8 to CAbiBridgeDescriptor("uint8_t", "0", NumericKind.U8, "toUByte", "Int", "Int", "Byte", "jbyte"),
-        CAbiBridgeKind.I16 to CAbiBridgeDescriptor("int16_t", "-1", NumericKind.I16, "toShort", "Int", "Int", "Short", "jshort"),
-        CAbiBridgeKind.U16 to CAbiBridgeDescriptor("uint16_t", "0", NumericKind.U16, "toUShort", "Int", "Int", "Short", "jshort"),
-        CAbiBridgeKind.I32 to CAbiBridgeDescriptor("int32_t", "-1", NumericKind.I32, null, "Int", "Int", "Int", "jint"),
-        CAbiBridgeKind.U32 to CAbiBridgeDescriptor("uint32_t", "0", NumericKind.U32, "toUInt", "Int", "Int", "Int", "jint"),
-        CAbiBridgeKind.I64 to CAbiBridgeDescriptor("int64_t", "-1", NumericKind.I64, null, "Long", null, "Long", "jlong"),
-        CAbiBridgeKind.U64 to CAbiBridgeDescriptor("uint64_t", "0", NumericKind.U64, "toULong", "Long", null, "Long", "jlong"),
-        CAbiBridgeKind.F32 to CAbiBridgeDescriptor("float", "0.0f", NumericKind.F32, null, "Float", "Double", "Float", "jfloat"),
-        CAbiBridgeKind.F64 to CAbiBridgeDescriptor("double", "0.0", NumericKind.F64, null, "Double", "Double", "Double", "jdouble"),
+        CAbiBridgeKind.VOID to CAbiBridgeDescriptor("void", "", wasmWasiScalarType = "Unit", wasmJsType = "Unit", jniKotlinType = "Unit", jniCType = "void", kotlinScalarType = "Unit"),
+        CAbiBridgeKind.NEVER to CAbiBridgeDescriptor("void", "", wasmWasiScalarType = "Unit", wasmJsType = "Unit", jniKotlinType = "Unit", jniCType = "void", kotlinScalarType = "Unit"),
+        CAbiBridgeKind.BOOL to CAbiBridgeDescriptor("bool", "false", wasmWasiScalarType = "Int", wasmJsType = "Boolean", jniKotlinType = "Boolean", jniCType = "jboolean", kotlinScalarType = "Boolean"),
+        CAbiBridgeKind.I8 to CAbiBridgeDescriptor("int8_t", "-1", NumericKind.I8, "toByte", "Int", "Int", "Byte", "jbyte", "Byte"),
+        CAbiBridgeKind.U8 to CAbiBridgeDescriptor("uint8_t", "0", NumericKind.U8, "toUByte", "Int", "Int", "Byte", "jbyte", "UByte"),
+        CAbiBridgeKind.I16 to CAbiBridgeDescriptor("int16_t", "-1", NumericKind.I16, "toShort", "Int", "Int", "Short", "jshort", "Short"),
+        CAbiBridgeKind.U16 to CAbiBridgeDescriptor("uint16_t", "0", NumericKind.U16, "toUShort", "Int", "Int", "Short", "jshort", "UShort"),
+        CAbiBridgeKind.I32 to CAbiBridgeDescriptor("int32_t", "-1", NumericKind.I32, null, "Int", "Int", "Int", "jint", "Int"),
+        CAbiBridgeKind.U32 to CAbiBridgeDescriptor("uint32_t", "0", NumericKind.U32, "toUInt", "Int", "Int", "Int", "jint", "UInt"),
+        CAbiBridgeKind.I64 to CAbiBridgeDescriptor("int64_t", "-1", NumericKind.I64, null, "Long", null, "Long", "jlong", "Long"),
+        CAbiBridgeKind.U64 to CAbiBridgeDescriptor("uint64_t", "0", NumericKind.U64, "toULong", "Long", null, "Long", "jlong", "ULong"),
+        CAbiBridgeKind.F32 to CAbiBridgeDescriptor("float", "0.0f", NumericKind.F32, null, "Float", "Double", "Float", "jfloat", "Float"),
+        CAbiBridgeKind.F64 to CAbiBridgeDescriptor("double", "0.0", NumericKind.F64, null, "Double", "Double", "Double", "jdouble", "Double"),
         CAbiBridgeKind.CONST_CSTR to CAbiBridgeDescriptor("const char*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
         CAbiBridgeKind.MUT_CSTR to CAbiBridgeDescriptor("char*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
         CAbiBridgeKind.OPAQUE_PTR to CAbiBridgeDescriptor("void*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
@@ -182,6 +238,11 @@ internal val C_ABI_BRIDGE_DESCRIPTORS: Map<CAbiBridgeKind, CAbiBridgeDescriptor>
         CAbiBridgeKind.CALLBACK_PTR to CAbiBridgeDescriptor("void*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
         CAbiBridgeKind.BY_VALUE_OBJECT to CAbiBridgeDescriptor("void*", "NULL", wasmJsType = "Unit", jniKotlinType = "Long", jniCType = "jlong"),
     )
+
+private val NUMERIC_KIND_TO_BRIDGE_KIND: Map<NumericKind, CAbiBridgeKind> =
+    C_ABI_BRIDGE_DESCRIPTORS.entries
+        .mapNotNull { (kind, desc) -> desc.numericKind?.let { it to kind } }
+        .toMap()
 
 internal fun bridgeDescriptorFor(kind: CAbiBridgeKind): CAbiBridgeDescriptor =
     C_ABI_BRIDGE_DESCRIPTORS.getValue(kind)
@@ -198,26 +259,13 @@ internal fun cHeaderTypeForReturn(fn: ForeignFnInteropSpec): String =
 internal fun cHeaderTypeForInlineReturn(fn: InlineCFunctionSpec): String =
     cHeaderTypeForBridge(fn.returnBridgeKind)
 
-internal fun cTypeForBridge(kind: CAbiBridgeKind): String =
-    bridgeDescriptorFor(kind).cType
-
 internal fun cDefaultFailureLiteral(kind: CAbiBridgeKind): String =
     bridgeDescriptorFor(kind).cFailureLiteral
 
 internal fun requiresNoStringConversion(params: List<InteropParamSpec>): Boolean =
     params.any { it.bridgeKind == CAbiBridgeKind.MUT_CSTR } ||
-        params.count {
-            it.bridgeKind == CAbiBridgeKind.CONST_CSTR &&
-                (it.kotlinType == "String?" || it.kotlinType == "String")
-        } > 1 ||
-        params.any {
-            it.bridgeKind == CAbiBridgeKind.CONST_CSTR &&
-                it.kotlinType != "String?" && it.kotlinType != "String"
-        }
-
-internal fun requiresNoStringConversionForInline(params: List<InteropParamSpec>): Boolean =
-    requiresNoStringConversion(params) ||
-        params.any { it.bridgeKind == CAbiBridgeKind.MUT_CSTR }
+        params.count { it.bridgeKind == CAbiBridgeKind.CONST_CSTR && (it.kotlinType == "String?" || it.kotlinType == "String") } > 1 ||
+        params.any { it.bridgeKind == CAbiBridgeKind.CONST_CSTR && it.kotlinType != "String?" && it.kotlinType != "String" }
 
 internal fun appendVariadicKotlinArgs(
     baseArgs: List<String>,
@@ -230,6 +278,11 @@ internal fun appendVariadicKotlinArgs(
             if (stringifyArgs) "($raw).toString()" else raw
         }
 
+internal fun formatKotlinActualParamsSig(params: List<InteropParamSpec>, isVariadic: Boolean): String {
+    val baseParams = params.map { "${it.kotlinName}: ${it.kotlinType}" }
+    return (if (isVariadic) baseParams + "vararg variadicArgs: Long" else baseParams).joinToString(", ")
+}
+
 internal fun renderActualFunctionDecl(
     visibilityPrefix: String,
     kotlinName: String,
@@ -241,30 +294,20 @@ internal fun renderActualFunctionDecl(
     bodyExpr: String,
     addonAvailabilityGuard: String? = null,
 ): String {
-    val baseParams = params.map { "${it.kotlinName}: ${it.kotlinType}" }
-    val paramsSig =
-        (if (isVariadic) baseParams + "vararg variadicArgs: Long" else baseParams)
-            .joinToString(", ")
+    val paramsSig = formatKotlinActualParamsSig(params, isVariadic)
     val retSuffix = if (returnBridgeKind == CAbiBridgeKind.VOID) "" else ": $kotlinReturnType"
     if (addonAvailabilityGuard != null) {
+        val addonCallBlock =
+            "    if ($addonAvailabilityGuard) {\n" +
+                "        $rawCall\n" +
+                "    } else {\n" +
+                "        throw UnsupportedOperationException(\"Native FFI addon is not available\")\n" +
+                "    }"
         return when {
             returnBridgeKind == CAbiBridgeKind.VOID ->
-                "${visibilityPrefix}actual fun $kotlinName($paramsSig) {\n" +
-                    "    if ($addonAvailabilityGuard) {\n" +
-                    "        $rawCall\n" +
-                    "    } else {\n" +
-                    "        throw UnsupportedOperationException(\"Native FFI addon is not available\")\n" +
-                    "    }\n" +
-                    "}"
+                "${visibilityPrefix}actual fun $kotlinName($paramsSig) {\n$addonCallBlock\n}"
             returnBridgeKind == CAbiBridgeKind.NEVER || kotlinReturnType == "Nothing" ->
-                "${visibilityPrefix}actual fun $kotlinName($paramsSig): Nothing {\n" +
-                    "    if ($addonAvailabilityGuard) {\n" +
-                    "        $rawCall\n" +
-                    "    } else {\n" +
-                    "        throw UnsupportedOperationException(\"Native FFI addon is not available\")\n" +
-                    "    }\n" +
-                    "    error(\"Unreachable noreturn C function $kotlinName\")\n" +
-                    "}"
+                "${visibilityPrefix}actual fun $kotlinName($paramsSig): Nothing {\n$addonCallBlock\n    error(\"Unreachable noreturn C function $kotlinName\")\n}"
             else ->
                 "${visibilityPrefix}actual fun $kotlinName($paramsSig)$retSuffix =\n" +
                     "    if ($addonAvailabilityGuard) $bodyExpr else throw UnsupportedOperationException(\"Native FFI addon is not available\")"
@@ -288,20 +331,20 @@ internal fun napiRelativeCandidatesJsArray(ffiModName: String): String {
                 add("${ffiModName.substring(3)}_native.node")
             }
         }
-    val rels =
-        buildList {
-            for (b in binNames) {
-                add(b)
-                add("build/node-ffi/$b")
-                add("build/node-ffi/release/$b")
-                add("build/node-ffi/debug/$b")
-                add("src/js/node-$ffiModName/build/Release/$b")
-                add("src/js/node-$ffiModName/build/Debug/$b")
-                add("src/js/node-$ffiModName/dist/build/Release/$b")
-                add("src/js/node-$ffiModName/dist/build/Debug/$b")
-            }
-        }
-    return rels.joinToString(", ", prefix = "[", postfix = "]") { "'$it'" }
+    val prefixes =
+        listOf(
+            "",
+            "build/node-ffi/",
+            "build/node-ffi/release/",
+            "build/node-ffi/debug/",
+            "src/js/node-$ffiModName/build/Release/",
+            "src/js/node-$ffiModName/build/Debug/",
+            "src/js/node-$ffiModName/dist/build/Release/",
+            "src/js/node-$ffiModName/dist/build/Debug/",
+        )
+    return binNames
+        .flatMap { b -> prefixes.map { "$it$b" } }
+        .joinToString(", ", prefix = "[", postfix = "]") { "'$it'" }
 }
 
 internal fun buildNodeNapiLoaderJsBody(
@@ -330,13 +373,8 @@ internal fun buildNodeNapiLoaderJsBody(
         sb.append("try { var pkg = req('@kotlinmania/$ffiModName-native-bindings'); if (typeof globalThis !== 'undefined') $globalProp = pkg; return pkg; } catch (_) {} ")
     }
     sb.append(
-        "var fs = req('fs'); " +
-            "var path = req('path'); " +
-            "var dir = process.cwd ? process.cwd() : '.'; " +
-            "var rels = $relsJs; " +
-            "for (var d = 0; d < 8; d++) { " +
-            "for (var i = 0; i < rels.length; i++) { " +
-            "var c = path.resolve(dir, rels[i]); ",
+        "var fs = req('fs'); var path = req('path'); var dir = process.cwd ? process.cwd() : '.'; var rels = $relsJs; " +
+            "for (var d = 0; d < 8; d++) { for (var i = 0; i < rels.length; i++) { var c = path.resolve(dir, rels[i]); ",
     )
     if (returnBooleanStatus) {
         sb.append("if (fs.existsSync(c)) { $globalProp = req(c); return true; } ")
@@ -344,11 +382,13 @@ internal fun buildNodeNapiLoaderJsBody(
         sb.append("if (fs.existsSync(c)) { var loaded = req(c); if (typeof globalThis !== 'undefined') $globalProp = loaded; return loaded; } ")
     }
     sb.append("} var parent = path.dirname(dir); if (parent === dir) break; dir = parent; } ")
-    if (returnBooleanStatus) {
-        sb.append("$globalProp = null; return false; ")
-    } else {
-        sb.append("if (typeof globalThis !== 'undefined') $globalProp = null; return null; ")
-    }
+    sb.append(
+        if (returnBooleanStatus) {
+            "$globalProp = null; return false; "
+        } else {
+            "if (typeof globalThis !== 'undefined') $globalProp = null; return null; "
+        },
+    )
     return sb.toString()
 }
 
@@ -381,17 +421,25 @@ internal class FfiInteropCollector(
     private val activeCfgProfile: CfgTargetProfile
         get() = headerContext.cfgTargetProfile ?: TranslationSession.cfgTargetProfile
 
+    internal fun declaredModuleSymbolNames(): Set<String> =
+        buildSet {
+            addAll(localDeclaredTypeNames)
+            addAll(headerContext.moduleDeclaredTypeNames)
+            for (fn in foreignFunctions) add(fn.kotlinName)
+            for (fn in inlineFunctions) add(fn.kotlinName)
+            for (st in foreignStatics) add(st.kotlinName)
+        }
+
     private fun decodePointerAliasSpec(encoded: String?): Pair<Boolean, String>? {
         if (encoded == null) return null
         val sep = encoded.indexOf(':')
         if (sep <= 0) return null
-        val isMut = encoded.substring(0, sep) == "mut"
-        val pointee = encoded.substring(sep + 1)
-        return isMut to pointee
+        return (encoded.substring(0, sep) == "mut") to encoded.substring(sep + 1)
     }
 
     private fun currentSubpackageKey(): String? =
-        headerContext.currentRelativeSourceDir
+        headerContext
+            .currentRelativeSourceDir
             ?.split('/')
             ?.filter { it.isNotEmpty() }
             ?.joinToString(".") { rustModuleIdentToKotlin(it) }
@@ -408,7 +456,8 @@ internal class FfiInteropCollector(
                 pkgName.startsWith("$projNs.") -> pkgName.removePrefix("$projNs.")
                 else -> currentSubpackageKey()
             }
-        return subpkg != null && headerContext.crateSymbolSubpackages["String"]?.contains(subpkg) == true
+        val stringSubpkgs = headerContext.crateSymbolSubpackages["String"]
+        return subpkg != null && stringSubpkgs?.contains(subpkg) == true
     }
 
     internal fun lookupCrossFilePointerAlias(ident: String): Pair<Boolean, String>? {
@@ -426,9 +475,8 @@ internal class FfiInteropCollector(
                 return null
             }
         }
-        decodePointerAliasSpec(headerContext.cratePointerTypeAliases[simple])?.let { return it }
-        decodePointerAliasSpec(headerContext.cratePointerTypeAliases[mappedKt])?.let { return it }
-        return null
+        return decodePointerAliasSpec(headerContext.cratePointerTypeAliases[simple])
+            ?: decodePointerAliasSpec(headerContext.cratePointerTypeAliases[mappedKt])
     }
 
     private fun isScopedStructType(renderedKotlinType: String): Boolean {
@@ -437,21 +485,16 @@ internal class FfiInteropCollector(
         val projNs = headerContext.projectNamespace?.trim()?.removeSuffix(".")
         if ('.' in clean && !clean.startsWith("kotlin.")) {
             val relKey = if (!projNs.isNullOrEmpty() && clean.startsWith("$projNs.")) clean.removePrefix("$projNs.") else clean
-            if (headerContext.crateTypeAliasDefaults[relKey] == "$simple()") {
-                return true
-            }
+            if (headerContext.crateTypeAliasDefaults[relKey] == "$simple()") return true
         }
         val curRel = headerContext.currentRelativeSourceDir?.replace('/', '.')?.takeIf { it.isNotEmpty() }
         val curSub = currentSubpackageKey()
-        for (scopePrefix in listOfNotNull(curSub, curRel).distinct()) {
-            if (headerContext.crateTypeAliasDefaults["$scopePrefix.$simple"] == "$simple()") {
-                return true
-            }
+        return listOfNotNull(curSub, curRel).distinct().any { scopePrefix ->
+            headerContext.crateTypeAliasDefaults["$scopePrefix.$simple"] == "$simple()"
         }
-        return false
     }
 
-    fun classifyParamAbiBridge(synType: SynType?, renderedKotlinType: String): CAbiBridgeKind {
+    private fun classifyScopedAbiBridge(synType: SynType?, renderedKotlinType: String): CAbiBridgeKind {
         if (!renderedKotlinType.endsWith("?") && isScopedStructType(renderedKotlinType)) {
             return CAbiBridgeKind.BY_VALUE_OBJECT
         }
@@ -465,19 +508,11 @@ internal class FfiInteropCollector(
         )
     }
 
-    fun classifyReturnAbiBridge(synType: SynType?, renderedKotlinType: String): CAbiBridgeKind {
-        if (!renderedKotlinType.endsWith("?") && isScopedStructType(renderedKotlinType)) {
-            return CAbiBridgeKind.BY_VALUE_OBJECT
-        }
-        return classifyAbiBridge(
-            synType = synType,
-            renderedKotlinType = renderedKotlinType,
-            cfgProfile = activeCfgProfile,
-            resolveNumericKind = resolveNumericKind,
-            resolveTypeAliasTarget = resolveTypeAliasTarget,
-            resolvePointerAlias = ::lookupCrossFilePointerAlias,
-        )
-    }
+    fun classifyParamAbiBridge(synType: SynType?, renderedKotlinType: String): CAbiBridgeKind =
+        classifyScopedAbiBridge(synType, renderedKotlinType)
+
+    fun classifyReturnAbiBridge(synType: SynType?, renderedKotlinType: String): CAbiBridgeKind =
+        classifyScopedAbiBridge(synType, renderedKotlinType)
 
     fun hasInteropContent(): Boolean =
         preambles.isNotEmpty() || foreignFunctions.isNotEmpty() || foreignStatics.isNotEmpty() || inlineFunctions.isNotEmpty()
@@ -485,9 +520,7 @@ internal class FfiInteropCollector(
     fun recordImportLines(lines: List<String>) {
         for (line in lines) {
             val trimmed = line.trim().removePrefix("import ").trim()
-            if (trimmed.isNotEmpty()) {
-                recordedImportLines += trimmed
-            }
+            if (trimmed.isNotEmpty()) recordedImportLines += trimmed
         }
     }
 
@@ -502,22 +535,17 @@ internal class FfiInteropCollector(
             if (meta is Meta.List && meta.path.isIdent("link")) {
                 extractLinkLibraryNamesFromLinkArgs(meta.tokens, modLibs)
             } else if (meta is Meta.List && meta.path.isIdent("cfg_attr")) {
-                val cfgParts = RustTokenCursor.splitMacroArguments(meta.tokens.clone())
-                for (part in cfgParts.drop(1)) {
-                    if (part.size == 2 &&
-                        (part[0] as? TokenTree.Ident)?.value?.toString() == "link" &&
-                        part[1] is TokenTree.Group &&
-                        (part[1] as TokenTree.Group).value.delimiter() == Delimiter.Parenthesis
-                    ) {
-                        extractLinkLibraryNamesFromLinkArgs((part[1] as TokenTree.Group).value.stream(), modLibs)
+                for (part in RustTokenCursor.splitMacroArguments(meta.tokens.clone()).drop(1)) {
+                    val partCursor = RustTokenCursor(part)
+                    val linkGroup = partCursor.groupAt(1, Delimiter.Parenthesis)
+                    if (partCursor.size == 2 && partCursor.identAt(0) == "link" && linkGroup != null) {
+                        extractLinkLibraryNamesFromLinkArgs(linkGroup.stream(), modLibs)
                     }
                 }
             }
         }
         for (libName in modLibs) {
-            if (libName != "c") {
-                linkLibraries += libName
-            }
+            if (libName != "c") linkLibraries += libName
         }
         return modLibs.firstOrNull { it !in UMBRELLA_LINK_LIBRARIES }
     }
@@ -526,23 +554,28 @@ internal class FfiInteropCollector(
         val lastSeg = mac.path.segments.last() ?: return false
         val macroName = lastSeg.ident.toString()
         if (macroName != "cpp" && macroName != "c" && macroName != "inline_c") return false
-        if (macroName == "cpp") {
-            usesCppLanguage = true
-        }
-        val trees = mac.tokens.clone().toList()
+        if (macroName == "cpp") usesCppLanguage = true
+        val cursor = RustTokenCursor(mac.tokens.clone().toList())
         val rawChunk =
-            if (trees.size == 1 && trees[0] is TokenTree.Group && (trees[0] as TokenTree.Group).value.delimiter() == Delimiter.Brace) {
-                extractGroupInnerSource(source, trees[0] as TokenTree.Group)
-            } else {
-                extractStreamSource(source, trees)
-            }.trim()
+            (if (cursor.size == 1) cursor.extractGroupInnerSource(source, 0, Delimiter.Brace) else null)
+                ?.trim()
+                ?: cursor.extractSliceSource(source).trim()
         if (rawChunk.isNotEmpty()) {
             preambles += rawChunk
-            if (looksLikeCppCode(rawChunk)) {
-                usesCppLanguage = true
-            }
+            if (looksLikeCppCode(rawChunk)) usesCppLanguage = true
         }
         return true
+    }
+
+    private fun allocateUniqueWrapperSymbol(suffix: String): String {
+        val baseWrapperName = "${cSymbolPrefixCamel}${toPascalCaseIdentifierPart(suffix)}"
+        var wrapperName = baseWrapperName
+        var dupIdx = 2
+        while (!usedWrapperSymbolNames.add(wrapperName)) {
+            wrapperName = "${baseWrapperName}$dupIdx"
+            dupIdx++
+        }
+        return wrapperName
     }
 
     fun recordForeignFunction(
@@ -560,44 +593,21 @@ internal class FfiInteropCollector(
     ) {
         val linkName = extractLinkNameAttribute(attrs) ?: rawRustName.removePrefix("r#")
         val retBridge = classifyReturnAbiBridge(returnSynType, kotlinReturnType)
-        val cRet = cTypeForBridge(retBridge)
-        val sanitizedParams =
-            params.mapIndexed { idx, p ->
-                p.copy(cName = sanitizeCParamIdentifier(p.cName, idx))
-            }
-        val baseWrapperName = "${cSymbolPrefixCamel}${toPascalCaseIdentifierPart(kotlinName)}"
-        var wrapperName = baseWrapperName
-        var dupIdx = 2
-        while (!usedWrapperSymbolNames.add(wrapperName)) {
-            wrapperName = "${baseWrapperName}$dupIdx"
-            dupIdx++
-        }
         foreignFunctions +=
             ForeignFnInteropSpec(
                 visibilityPrefix = visibilityPrefix,
                 kotlinName = kotlinName,
                 cSymbolName = linkName,
-                wrapperSymbolName = wrapperName,
-                params = sanitizedParams,
+                wrapperSymbolName = allocateUniqueWrapperSymbol(kotlinName),
+                params = params.mapIndexed { idx, p -> p.copy(cName = sanitizeCParamIdentifier(p.cName, idx)) },
                 kotlinReturnType = kotlinReturnType,
-                cReturnType = cRet,
+                cReturnType = cHeaderTypeForBridge(retBridge),
                 returnBridgeKind = retBridge,
                 isVariadic = isVariadic,
                 returnDefaultExpr = returnDefaultExpr,
                 dllName = dllName,
                 linkLibrary = linkLibrary,
             )
-    }
-
-    private fun allocateUniqueWrapperSymbol(suffix: String): String {
-        val baseWrapperName = "${cSymbolPrefixCamel}${toPascalCaseIdentifierPart(suffix)}"
-        var wrapperName = baseWrapperName
-        var dupIdx = 2
-        while (!usedWrapperSymbolNames.add(wrapperName)) {
-            wrapperName = "${baseWrapperName}$dupIdx"
-            dupIdx++
-        }
-        return wrapperName
     }
 
     fun recordForeignStatic(
@@ -620,15 +630,13 @@ internal class FfiInteropCollector(
             } else {
                 rawBridge
             }
-        val getterName = allocateUniqueWrapperSymbol("get_$kotlinName")
-        val setterName = allocateUniqueWrapperSymbol("set_$kotlinName")
         foreignStatics +=
             ForeignStaticInteropSpec(
                 visibilityPrefix = visibilityPrefix,
                 kotlinName = kotlinName,
                 cSymbolName = linkName,
-                getterSymbolName = getterName,
-                setterSymbolName = setterName,
+                getterSymbolName = allocateUniqueWrapperSymbol("get_$kotlinName"),
+                setterSymbolName = allocateUniqueWrapperSymbol("set_$kotlinName"),
                 kotlinType = kotlinType,
                 bridgeKind = bridgeKind,
                 isMutable = isMutable,
@@ -645,7 +653,7 @@ internal class FfiInteropCollector(
         val lastSeg = mac.path.segments.last() ?: return null
         val macroName = lastSeg.ident.toString()
         if (macroName != "cpp" && macroName != "c") return null
-        val parsed = parseInlineCMacro(source, mac.tokens.clone(), isCpp = macroName == "cpp") ?: return null
+        val parsed = InlineCMacroTokenParser(source, mac.tokens).parse(isCpp = macroName == "cpp") ?: return null
         if (parsed.isCpp || looksLikeCppCode(parsed.rawBody)) {
             usesCppLanguage = true
         }
@@ -656,56 +664,41 @@ internal class FfiInteropCollector(
         val wrapperSymbol = "${cSymbolPrefixCamel}Inline${idx}${toPascalCaseIdentifierPart(basePrefix)}"
         usedWrapperSymbolNames += wrapperSymbol
 
+        fun resolveInlineBridgeTriple(
+            rustTy: SynType?,
+            explicitC: String?,
+            isParam: Boolean,
+            defaultKt: String,
+            defaultBridge: CAbiBridgeKind,
+        ): Triple<String, CAbiBridgeKind, String> {
+            val cleanC = explicitC?.trim()
+            val ktTy =
+                when {
+                    rustTy != null -> renderRustType(rustTy, isParam)
+                    cleanC != null -> inferKotlinTypeFromCType(cleanC, headerContext.rawAbiMode, activeCfgProfile)
+                    else -> defaultKt
+                }
+            val bridge =
+                when {
+                    rustTy != null -> if (isParam) classifyParamAbiBridge(rustTy, ktTy) else classifyReturnAbiBridge(rustTy, ktTy)
+                    cleanC != null -> classifyExplicitCTypeBridge(cleanC, activeCfgProfile)
+                    else -> defaultBridge
+                }
+            val finalC = cleanC?.takeIf { it.isNotEmpty() } ?: cHeaderTypeForBridge(bridge)
+            return Triple(ktTy, bridge, finalC)
+        }
+
         val paramSpecs =
             parsed.captureArgs.mapIndexed { pIdx, cap ->
                 val ktParamName = rustValueIdentToKotlin(cap.rawRustIdent).ifEmpty { "arg$pIdx" }
                 val cParamName = sanitizeCParamIdentifier(cap.rawRustIdent.removePrefix("r#").ifEmpty { "arg$pIdx" }, pIdx)
-                val explicitC = cap.explicitCType?.trim()
-                val ktType =
-                    when {
-                        cap.rustType != null -> renderRustType(cap.rustType, true)
-                        explicitC != null ->
-                            inferKotlinTypeFromCType(
-                                cType = explicitC,
-                                rawAbiMode = headerContext.rawAbiMode,
-                                cfgProfile = activeCfgProfile,
-                            )
-                        else -> "Long"
-                    }
-                val bridge =
-                    when {
-                        cap.rustType != null -> classifyParamAbiBridge(cap.rustType, ktType)
-                        explicitC != null -> classifyExplicitCTypeBridge(explicitC, activeCfgProfile)
-                        else -> CAbiBridgeKind.I64
-                    }
-                val finalCType = explicitC?.takeIf { it.isNotEmpty() } ?: cTypeForBridge(bridge)
-                InteropParamSpec(
-                    kotlinName = ktParamName,
-                    cName = cParamName,
-                    kotlinType = ktType,
-                    cType = finalCType,
-                    bridgeKind = bridge,
-                )
+                val (ktType, bridge, finalCType) =
+                    resolveInlineBridgeTriple(cap.rustType, cap.explicitCType, true, "Long", CAbiBridgeKind.I64)
+                InteropParamSpec(ktParamName, cParamName, ktType, finalCType, bridge)
             }
 
-        val ktReturnType =
-            when {
-                parsed.returnRustType != null -> renderRustType(parsed.returnRustType, false)
-                parsed.explicitCReturnType != null ->
-                    inferKotlinTypeFromCType(
-                        cType = parsed.explicitCReturnType,
-                        rawAbiMode = headerContext.rawAbiMode,
-                        cfgProfile = activeCfgProfile,
-                    )
-                else -> "Unit"
-            }
-        val retBridge =
-            when {
-                parsed.returnRustType != null -> classifyReturnAbiBridge(parsed.returnRustType, ktReturnType)
-                parsed.explicitCReturnType != null -> classifyExplicitCTypeBridge(parsed.explicitCReturnType, activeCfgProfile)
-                else -> CAbiBridgeKind.VOID
-            }
-        val finalCRetType = parsed.explicitCReturnType?.takeIf { it.isNotEmpty() } ?: cTypeForBridge(retBridge)
+        val (ktReturnType, retBridge, finalCRetType) =
+            resolveInlineBridgeTriple(parsed.returnRustType, parsed.explicitCReturnType, false, "Unit", CAbiBridgeKind.VOID)
 
         inlineFunctions +=
             InlineCFunctionSpec(
@@ -721,15 +714,15 @@ internal class FfiInteropCollector(
                 returnDefaultExpr = defaultKotlinFallbackForBridge(retBridge, ktReturnType),
             )
 
-        val callArgs = parsed.captureArgs.map { cap -> resolveLocalExprName(cap.rawRustIdent.removePrefix("r#")) }
-        return "$helperKtName(${callArgs.joinToString(", ")})"
+        val callArgs = parsed.captureArgs.joinToString(", ") { resolveLocalExprName(it.rawRustIdent.removePrefix("r#")) }
+        return "$helperKtName($callArgs)"
     }
 
     fun renderInlineExpectDeclarations(): List<String> {
         val pending = inlineFunctions.subList(renderedInlineExpectCount, inlineFunctions.size)
         renderedInlineExpectCount = inlineFunctions.size
         return pending.map { fn ->
-            val paramsStr = fn.params.joinToString(", ") { "${it.kotlinName}: ${it.kotlinType}" }
+            val paramsStr = formatKotlinActualParamsSig(fn.params, isVariadic = false)
             val retSuffix = if (fn.returnBridgeKind == CAbiBridgeKind.VOID) "" else ": ${fn.kotlinReturnType}"
             "${fn.visibilityPrefix}expect fun ${fn.kotlinName}($paramsStr)$retSuffix"
         }
@@ -746,100 +739,57 @@ internal class FfiInteropCollector(
 
         val headerFileName = "${cinteropStemSnake}_wrapper.h"
         val sourceExt = if (usesCppLanguage) "cpp" else "c"
-        val sourceFileName = "${cinteropStemSnake}_wrapper.$sourceExt"
-        val defFileName = "$cinteropStemPascal.def"
-        val nativeActualsFileName = "${localStemPascal}NativeActuals.kt"
-        val jvmActualsFileName = "${localStemPascal}JvmActuals.kt"
-        val androidActualsFileName = "${localStemPascal}AndroidActuals.kt"
-        val jniFileName = "${cSymbolPrefix}_jni.c"
-        val jsActualsFileName = "${localStemPascal}JsActuals.kt"
-        val napiFileName = "${cSymbolPrefix}_bindings.cpp"
-        val wasmJsActualsFileName = "${localStemPascal}WasmJsActuals.kt"
-        val wasmWasiActualsFileName = "${localStemPascal}WasmWasiActuals.kt"
-
         val pkgName = headerContext.packageName
         val cinteropPkg = if (!pkgName.isNullOrBlank()) "$pkgName.cinterop" else "ffi.cinterop"
         val jniObjectName = "${cinteropStemPascal}JniBridge"
         val jniLibName = "${ffiModName}_jni"
 
-        val defContent = buildDefFileContent(cinteropPkg, headerFileName, cinteropStemSnake)
-        val headerContent = buildCHeaderContent(cinteropStemSnake)
-        val cSourceContent = buildCOrCppSourceContent(headerFileName)
-        val nativeActualsContent = buildNativeActualsKotlinContent(pkgName, cinteropPkg)
-        val jvmActualsContent = buildJvmOrAndroidActualsKotlinContent(pkgName, jniObjectName, jniLibName, includeJarResourceLoader = true)
-        val androidActualsContent = buildJvmOrAndroidActualsKotlinContent(pkgName, jniObjectName, jniLibName, includeJarResourceLoader = false)
-        val jniCContent = buildJniCSourceContent(pkgName, jniObjectName)
-        val jsActualsContent = buildJsActualsKotlinContent(pkgName, cinteropStemPascal, ffiModName)
-        val napiCppContent = buildNapiCppSourceContent(cinteropStemSnake)
-        val wasmJsActualsContent = buildWasmJsActualsKotlinContent(pkgName, cinteropStemPascal, ffiModName)
-        val wasmWasiActualsContent = buildWasmWasiActualsKotlinContent(pkgName)
+        fun file(path: String, kind: CompanionInteropKind, content: String): CompanionInteropFile =
+            CompanionInteropFile(relativePath = path, kind = kind, content = content, ffiModuleName = ffiModName)
 
         return listOf(
-            CompanionInteropFile(
-                relativePath = defFileName,
-                kind = CompanionInteropKind.CInteropDef,
-                content = defContent,
-                ffiModuleName = ffiModName,
+            file(
+                "$cinteropStemPascal.def",
+                CompanionInteropKind.CInteropDef,
+                buildDefFileContent(cinteropPkg, headerFileName, cinteropStemSnake),
             ),
-            CompanionInteropFile(
-                relativePath = headerFileName,
-                kind = CompanionInteropKind.CHeader,
-                content = headerContent,
-                ffiModuleName = ffiModName,
+            file(headerFileName, CompanionInteropKind.CHeader, buildCHeaderContent(cinteropStemSnake)),
+            file(
+                "${cinteropStemSnake}_wrapper.$sourceExt",
+                if (usesCppLanguage) CompanionInteropKind.CppSource else CompanionInteropKind.CSource,
+                buildCOrCppSourceContent(headerFileName),
             ),
-            CompanionInteropFile(
-                relativePath = sourceFileName,
-                kind = if (usesCppLanguage) CompanionInteropKind.CppSource else CompanionInteropKind.CSource,
-                content = cSourceContent,
-                ffiModuleName = ffiModName,
+            file(
+                "${localStemPascal}NativeActuals.kt",
+                CompanionInteropKind.NativeKotlinActuals,
+                buildNativeActualsKotlinContent(pkgName, cinteropPkg),
             ),
-            CompanionInteropFile(
-                relativePath = nativeActualsFileName,
-                kind = CompanionInteropKind.NativeKotlinActuals,
-                content = nativeActualsContent,
-                ffiModuleName = ffiModName,
+            file(
+                "${localStemPascal}JvmActuals.kt",
+                CompanionInteropKind.JvmKotlinActuals,
+                buildJvmOrAndroidActualsKotlinContent(pkgName, jniObjectName, jniLibName, includeJarResourceLoader = true),
             ),
-            CompanionInteropFile(
-                relativePath = jvmActualsFileName,
-                kind = CompanionInteropKind.JvmKotlinActuals,
-                content = jvmActualsContent,
-                ffiModuleName = ffiModName,
+            file(
+                "${localStemPascal}AndroidActuals.kt",
+                CompanionInteropKind.AndroidKotlinActuals,
+                buildJvmOrAndroidActualsKotlinContent(pkgName, jniObjectName, jniLibName, includeJarResourceLoader = false),
             ),
-            CompanionInteropFile(
-                relativePath = androidActualsFileName,
-                kind = CompanionInteropKind.AndroidKotlinActuals,
-                content = androidActualsContent,
-                ffiModuleName = ffiModName,
+            file("${cSymbolPrefix}_jni.c", CompanionInteropKind.JniCSource, buildJniCSourceContent(pkgName, jniObjectName)),
+            file(
+                "${localStemPascal}JsActuals.kt",
+                CompanionInteropKind.JsKotlinActuals,
+                buildJsActualsKotlinContent(pkgName, cinteropStemPascal, ffiModName),
             ),
-            CompanionInteropFile(
-                relativePath = jniFileName,
-                kind = CompanionInteropKind.JniCSource,
-                content = jniCContent,
-                ffiModuleName = ffiModName,
+            file("${cSymbolPrefix}_bindings.cpp", CompanionInteropKind.NapiCppSource, buildNapiCppSourceContent(cinteropStemSnake)),
+            file(
+                "${localStemPascal}WasmJsActuals.kt",
+                CompanionInteropKind.WasmJsKotlinActuals,
+                buildWasmJsActualsKotlinContent(pkgName, cinteropStemPascal, ffiModName),
             ),
-            CompanionInteropFile(
-                relativePath = jsActualsFileName,
-                kind = CompanionInteropKind.JsKotlinActuals,
-                content = jsActualsContent,
-                ffiModuleName = ffiModName,
-            ),
-            CompanionInteropFile(
-                relativePath = napiFileName,
-                kind = CompanionInteropKind.NapiCppSource,
-                content = napiCppContent,
-                ffiModuleName = ffiModName,
-            ),
-            CompanionInteropFile(
-                relativePath = wasmJsActualsFileName,
-                kind = CompanionInteropKind.WasmJsKotlinActuals,
-                content = wasmJsActualsContent,
-                ffiModuleName = ffiModName,
-            ),
-            CompanionInteropFile(
-                relativePath = wasmWasiActualsFileName,
-                kind = CompanionInteropKind.WasmWasiKotlinActuals,
-                content = wasmWasiActualsContent,
-                ffiModuleName = ffiModName,
+            file(
+                "${localStemPascal}WasmWasiActuals.kt",
+                CompanionInteropKind.WasmWasiKotlinActuals,
+                buildWasmWasiActualsKotlinContent(pkgName),
             ),
         )
     }
@@ -864,8 +814,7 @@ internal class FfiInteropCollector(
         if (fn.returnBridgeKind == CAbiBridgeKind.CALLBACK_PTR || fn.params.any { it.bridgeKind == CAbiBridgeKind.CALLBACK_PTR }) {
             return false
         }
-        if (preambles.any { containsCIdentifier(it, fn.cSymbolName) }) return true
-        return isDirectCallSafeSymbol(fn)
+        return preambles.any { containsCIdentifier(it, fn.cSymbolName) } || isDirectCallSafeSymbol(fn)
     }
 
     internal fun finalizeActualsKotlinFile(
@@ -893,81 +842,86 @@ internal class FfiInteropCollector(
         return sb.toString()
     }
 
-    internal fun renderLongOrScalarBridgeReturnConversion(
+    internal fun renderBridgeReturnConversion(
         rawCall: String,
         kotlinReturnType: String,
         returnBridgeKind: CAbiBridgeKind,
         returnDefaultExpr: String,
         pkgName: String?,
         importsOut: MutableSet<String>,
-        subIntBase: String,
-        i64Base: String,
-        u64Base: String,
-        ptrLongExpr: String,
-        boolExpr: String,
-        f32Expr: String,
-        f64Expr: String,
-        signedSubIntKeepsRaw: Boolean,
-        fallbackNonScalar: String,
+        profile: BridgeReturnConversionProfile,
     ): String {
         val retNonNullNumeric = if (!kotlinReturnType.endsWith("?")) resolveNumericKind(kotlinReturnType) else null
         val isRawPointerReturn = headerContext.rawAbiMode || kotlinReturnType == "Long" || retNonNullNumeric != null
         val desc = bridgeDescriptorFor(returnBridgeKind)
         return when (returnBridgeKind) {
             CAbiBridgeKind.VOID -> rawCall
-            CAbiBridgeKind.BOOL -> boolExpr
-            CAbiBridgeKind.F32 -> f32Expr
-            CAbiBridgeKind.F64 -> f64Expr
+            CAbiBridgeKind.BOOL -> profile.boolExpr
+            CAbiBridgeKind.F32 -> profile.f32Expr
+            CAbiBridgeKind.F64 -> profile.f64Expr
             CAbiBridgeKind.I8, CAbiBridgeKind.U8,
             CAbiBridgeKind.I16, CAbiBridgeKind.U16,
             CAbiBridgeKind.I32, CAbiBridgeKind.U32,
             -> {
                 val targetKind = desc.numericKind!!
                 if (retNonNullNumeric != null && retNonNullNumeric != targetKind) {
-                    "$subIntBase.${conversionMethodForNumericKind(retNonNullNumeric)}()"
+                    "${profile.subIntBase}.${conversionMethodForNumericKind(retNonNullNumeric)}()"
+                } else if (profile.nativeTypedIntegrals) {
+                    profile.subIntBase
                 } else {
                     val isUnsigned =
                         returnBridgeKind == CAbiBridgeKind.U8 ||
                             returnBridgeKind == CAbiBridgeKind.U16 ||
                             returnBridgeKind == CAbiBridgeKind.U32
-                    val conv =
-                        if (signedSubIntKeepsRaw && !isUnsigned) {
-                            null
-                        } else {
-                            desc.defaultReturnConv
-                        }
-                    if (conv == null) subIntBase else "$subIntBase.$conv()"
+                    val conv = if (profile.signedSubIntKeepsRaw && !isUnsigned) null else desc.defaultReturnConv
+                    if (conv == null) profile.subIntBase else "${profile.subIntBase}.$conv()"
                 }
             }
             CAbiBridgeKind.I64 ->
                 if (retNonNullNumeric != null && retNonNullNumeric != NumericKind.I64) {
-                    "$i64Base.${conversionMethodForNumericKind(retNonNullNumeric)}()"
+                    "${profile.i64Base}.${conversionMethodForNumericKind(retNonNullNumeric)}()"
                 } else {
-                    i64Base
+                    profile.i64Base
                 }
             CAbiBridgeKind.U64 ->
                 if (retNonNullNumeric != null && retNonNullNumeric != NumericKind.U64) {
-                    "$u64Base.${conversionMethodForNumericKind(retNonNullNumeric)}()"
+                    "${profile.u64Base}.${conversionMethodForNumericKind(retNonNullNumeric)}()"
+                } else if (!profile.nativeTypedIntegrals && profile.u64Base == rawCall) {
+                    "$rawCall.toULong()"
                 } else {
-                    if (u64Base == rawCall) "$rawCall.toULong()" else u64Base
+                    profile.u64Base
                 }
             CAbiBridgeKind.CALLBACK_PTR ->
-                if (isRawPointerReturn) ptrLongExpr else returnDefaultExpr
+                if (isRawPointerReturn) {
+                    profile.pointerImport?.let { importsOut += it }
+                    if (!profile.callbackConvertsNonLongNumeric ||
+                        retNonNullNumeric == NumericKind.I64 ||
+                        kotlinReturnType == "Long" ||
+                        retNonNullNumeric == null
+                    ) {
+                        profile.ptrLongExpr
+                    } else {
+                        "${profile.ptrLongReceiverExpr}.${conversionMethodForNumericKind(retNonNullNumeric)}()"
+                    }
+                } else {
+                    returnDefaultExpr
+                }
             CAbiBridgeKind.CONST_CSTR,
             CAbiBridgeKind.MUT_CSTR,
             CAbiBridgeKind.OPAQUE_PTR,
             CAbiBridgeKind.FILE_PTR,
             CAbiBridgeKind.DIR_PTR,
             -> {
+                profile.pointerImport?.let { importsOut += it }
                 if (isRawPointerReturn) {
                     if (retNonNullNumeric == NumericKind.I64 || kotlinReturnType == "Long" || retNonNullNumeric == null) {
-                        ptrLongExpr
+                        profile.ptrLongExpr
                     } else {
-                        "$ptrLongExpr.${conversionMethodForNumericKind(retNonNullNumeric)}()"
+                        "${profile.ptrLongReceiverExpr}.${conversionMethodForNumericKind(retNonNullNumeric)}()"
                     }
                 } else {
                     wrapLongAddressForPointerReturn(
-                        addrExpr = ptrLongExpr,
+                        addrExpr = profile.ptrLongExpr,
                         kotlinReturnType = kotlinReturnType,
                         returnBridgeKind = returnBridgeKind,
                         returnDefaultExpr = returnDefaultExpr,
@@ -976,7 +930,7 @@ internal class FfiInteropCollector(
                     )
                 }
             }
-            else -> fallbackNonScalar
+            else -> profile.fallbackNonScalar
         }
     }
 
@@ -986,73 +940,39 @@ internal class FfiInteropCollector(
         importsOut: MutableSet<String>,
     ) {
         val usedIdents = extractIdentifierTokens(bodyText)
-        val localDeclaredNames =
-            buildSet {
-                addAll(localDeclaredTypeNames)
-                addAll(headerContext.moduleDeclaredTypeNames)
-                for (fn in foreignFunctions) add(fn.kotlinName)
-                for (fn in inlineFunctions) add(fn.kotlinName)
-                for (st in foreignStatics) add(st.kotlinName)
-            }
+        val localDeclaredNames = declaredModuleSymbolNames()
         val explicitlyImportedNames =
-            linkedSetOf<String>().apply {
-                for (existing in importsOut) {
-                    if (!existing.endsWith(".*")) {
-                        val aliasSep = existing.indexOf(" as ")
-                        add(
-                            if (aliasSep > 0) {
-                                existing.substring(aliasSep + 4).trim()
-                            } else {
-                                existing.substringAfterLast('.')
-                            },
-                        )
-                    }
-                }
-            }
+            importsOut
+                .filterNot { it.endsWith(".*") }
+                .mapTo(linkedSetOf(), ::extractImportLocalName)
         for (imp in recordedImportLines) {
             if (imp.endsWith(".*")) continue
-            val aliasSep = imp.indexOf(" as ")
-            val simpleName =
-                if (aliasSep > 0) {
-                    imp.substring(aliasSep + 4).trim()
-                } else {
-                    imp.substringAfterLast('.')
-                }
+            val simpleName = extractImportLocalName(imp)
             if (simpleName in usedIdents && simpleName !in localDeclaredNames) {
+                val aliasSep = imp.indexOf(" as ")
                 val impPkg = if (aliasSep > 0) imp.substring(0, aliasSep).trim().substringBeforeLast('.') else imp.substringBeforeLast('.')
                 if (impPkg != pkgName) {
                     importsOut += imp
-                    explicitlyImportedNames += simpleName
-                } else {
-                    explicitlyImportedNames += simpleName
                 }
+                explicitlyImportedNames += simpleName
             }
         }
         val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
         val allocNs = CoreIntrinsicLowering.resolveAllocNamespace(headerContext)
+        val extCoreSymbols = headerContext.externalCrateSymbolPackages["core"]
+        val cVoidSub = headerContext.crateSymbolSubpackages["CVoid"]?.firstOrNull()
+        val rawProjNs = headerContext.projectNamespace
+        val projNs = rawProjNs?.trim()?.removeSuffix(".").orEmpty()
         val cVoidPkg =
-            headerContext.crateSymbolSubpackages["CVoid"]
-                ?.firstOrNull()
-                ?.let { sub ->
-                    val projNs =
-                        headerContext.projectNamespace
-                            ?.trim()
-                            ?.removeSuffix(".")
-                            .orEmpty()
-                    when {
-                        projNs.isEmpty() -> null
-                        sub.isEmpty() -> projNs
-                        else -> "$projNs.$sub"
-                    }
+            when {
+                cVoidSub != null && projNs.isNotEmpty() -> if (cVoidSub.isEmpty()) projNs else "$projNs.$cVoidSub"
+                else -> {
+                    val extCVoid = extCoreSymbols?.get("CVoid")
+                    extCVoid?.filter { ".ffi." in it || it.endsWith(".ffi") }?.minByOrNull { it.length }
+                        ?: extCVoid?.minByOrNull { it.length }
+                        ?: "$coreNs.ffi"
                 }
-                ?: headerContext.externalCrateSymbolPackages["core"]
-                    ?.get("CVoid")
-                    ?.filter { ".ffi." in it || it.endsWith(".ffi") }
-                    ?.minByOrNull { it.length }
-                ?: headerContext.externalCrateSymbolPackages["core"]
-                    ?.get("CVoid")
-                    ?.minByOrNull { it.length }
-                ?: "$coreNs.ffi"
+            }
         val ffiPairs =
             buildList {
                 add("ConstPtr" to "$coreNs.ptr")
@@ -1082,28 +1002,16 @@ internal class FfiInteropCollector(
             }
         if (hasUnresolvedTypeIdent) {
             for (imp in recordedImportLines) {
-                if (imp.endsWith(".*")) {
-                    val starPkg = imp.removeSuffix(".*")
-                    if (starPkg != pkgName) {
-                        importsOut += imp
-                    }
+                if (imp.endsWith(".*") && imp.removeSuffix(".*") != pkgName) {
+                    importsOut += imp
                 }
             }
         }
         val rawIdents = extractIdentifierTokens(bodyText, includeBuiltins = true)
         importsOut.retainAll { existing ->
-            if (existing.endsWith(".*") || existing == "kotlinx.cinterop.ExperimentalForeignApi") {
-                true
-            } else {
-                val aliasSep = existing.indexOf(" as ")
-                val localName =
-                    if (aliasSep > 0) {
-                        existing.substring(aliasSep + 4).trim()
-                    } else {
-                        existing.substringAfterLast('.')
-                    }
-                localName in rawIdents
-            }
+            existing.endsWith(".*") ||
+                existing == "kotlinx.cinterop.ExperimentalForeignApi" ||
+                extractImportLocalName(existing) in rawIdents
         }
     }
 
@@ -1130,10 +1038,7 @@ internal class FfiInteropCollector(
         returnDefaultExpr: String,
         isVariadic: Boolean = false,
     ): String {
-        val baseParams = params.map { "${it.kotlinName}: ${it.kotlinType}" }
-        val paramsSig =
-            (if (isVariadic) baseParams + "vararg variadicArgs: Long" else baseParams)
-                .joinToString(", ")
+        val paramsSig = formatKotlinActualParamsSig(params, isVariadic)
         val retSuffix = if (returnBridgeKind == CAbiBridgeKind.VOID) "" else ": $kotlinReturnType"
         return when {
             returnBridgeKind == CAbiBridgeKind.VOID ->
@@ -1156,10 +1061,7 @@ internal class FfiInteropCollector(
         isVariadic: Boolean = false,
         message: String = "Native FFI is not available on WasmWasi",
     ): String {
-        val baseParams = params.map { "${it.kotlinName}: ${it.kotlinType}" }
-        val paramsSig =
-            (if (isVariadic) baseParams + "vararg variadicArgs: Long" else baseParams)
-                .joinToString(", ")
+        val paramsSig = formatKotlinActualParamsSig(params, isVariadic)
         if (returnBridgeKind == CAbiBridgeKind.VOID) {
             return "${visibilityPrefix}actual fun $kotlinName($paramsSig) {\n" +
                 "    throw UnsupportedOperationException(\"$message\")\n" +
@@ -1168,11 +1070,6 @@ internal class FfiInteropCollector(
         return "${visibilityPrefix}actual fun $kotlinName($paramsSig): $kotlinReturnType =\n" +
             "    throw UnsupportedOperationException(\"$message\")"
     }
-
-    // WasmImport has no Kotlin adapters. Narrow C integers and bool are i32,
-    // while i64/f32/f64 retain their Wasm value types. Reference-valued C ABI
-    // bridges require a host memory/handle adapter and must not be passed as
-    // Kotlin references or fabricated numeric addresses.
 
     internal fun wrapLongAddressForPointerReturn(
         addrExpr: String,
@@ -1208,26 +1105,16 @@ internal class FfiInteropCollector(
         convMethod: String,
     ): String {
         val paramKind = if (!param.kotlinType.endsWith("?")) resolveNumericKind(param.kotlinType) else null
-        return if (paramKind == targetKind) {
-            param.kotlinName
-        } else {
-            "${param.kotlinName}.$convMethod()"
-        }
+        return if (paramKind == targetKind) param.kotlinName else "${param.kotlinName}.$convMethod()"
     }
 
     internal fun renderPointerParamToLong(param: InteropParamSpec): String {
         val ktType = param.kotlinType
         val nonNullNumeric = if (!ktType.endsWith("?")) resolveNumericKind(ktType) else null
         if (headerContext.rawAbiMode || ktType == "Long" || nonNullNumeric != null) {
-            return if (ktType == "Long" || nonNullNumeric == NumericKind.I64) {
-                param.kotlinName
-            } else {
-                "${param.kotlinName}.toLong()"
-            }
+            return if (ktType == "Long" || nonNullNumeric == NumericKind.I64) param.kotlinName else "${param.kotlinName}.toLong()"
         }
-        if (param.bridgeKind == CAbiBridgeKind.CALLBACK_PTR) {
-            return "0L"
-        }
+        if (param.bridgeKind == CAbiBridgeKind.CALLBACK_PTR) return "0L"
         return "${param.kotlinName}.rawAddress"
     }
 
@@ -1239,29 +1126,27 @@ internal class FfiInteropCollector(
             resolveTypeAliasTarget: (String) -> SynType?,
             stopIdents: Set<String> = emptySet(),
         ): SynType {
-            var cur = unwrapType(ty)
+            var cur = unwrapSynType(ty)
             var depth = 0
             while (depth < 8 && cur is SynType.Path && cur.qself == null) {
                 val lastSeg = cur.path.segments.last() ?: break
                 if (lastSeg.arguments !is PathArguments.None) break
-                val rawIdent = lastSeg.ident.toString().removePrefix("r#")
+                val rawIdent = lastSeg.cleanIdent()
                 if (rawIdent in stopIdents) break
                 val target = resolveTypeAliasTarget(rawIdent) ?: break
-                cur = unwrapType(target)
+                cur = unwrapSynType(target)
                 depth++
             }
             return cur
         }
 
-        private fun unwrapOuterAliases(
-            ty: SynType,
-            resolveTypeAliasTarget: (String) -> SynType?,
-        ): SynType = unwrapTypeAliases(ty, resolveTypeAliasTarget)
-
-        private fun unwrapPointeeAliases(
-            ty: SynType,
-            resolveTypeAliasTarget: (String) -> SynType?,
-        ): SynType = unwrapTypeAliases(ty, resolveTypeAliasTarget, POINTEE_STOP_IDENTS)
+        private fun pointeeBridgeKind(isMut: Boolean, pointeeIdent: String?): CAbiBridgeKind =
+            when (pointeeIdent) {
+                "c_char" -> if (isMut) CAbiBridgeKind.MUT_CSTR else CAbiBridgeKind.CONST_CSTR
+                "FILE" -> CAbiBridgeKind.FILE_PTR
+                "DIR" -> CAbiBridgeKind.DIR_PTR
+                else -> CAbiBridgeKind.OPAQUE_PTR
+            }
 
         internal fun classifyAbiBridge(
             synType: SynType?,
@@ -1272,7 +1157,7 @@ internal class FfiInteropCollector(
             resolvePointerAlias: (String) -> Pair<Boolean, String>? = { null },
         ): CAbiBridgeKind {
             if (synType == null) return CAbiBridgeKind.VOID
-            val unwrapped = unwrapOuterAliases(synType, resolveTypeAliasTarget)
+            val unwrapped = unwrapTypeAliases(synType, resolveTypeAliasTarget)
             if (unwrapped is SynType.Tuple && unwrapped.elems.isEmpty()) return CAbiBridgeKind.VOID
             if (renderedKotlinType == "Unit" && resolveNumericKind(renderedKotlinType) == null && unwrapped == synType) {
                 return CAbiBridgeKind.VOID
@@ -1280,100 +1165,33 @@ internal class FfiInteropCollector(
             if (unwrapped is SynType.Never || renderedKotlinType == "Nothing") return CAbiBridgeKind.NEVER
             if (unwrapped is SynType.FnPtr) return CAbiBridgeKind.CALLBACK_PTR
             if (unwrapped is SynType.Ptr) {
-                val elem = unwrapPointeeAliases(unwrapped.elem, resolveTypeAliasTarget)
-                val elemPath = (elem as? SynType.Path)?.takeIf { it.qself == null }?.path
-                val elemSeg = elemPath?.segments?.last()
-                val elemIdent = elemSeg?.ident?.toString()?.removePrefix("r#")
-                return when (elemIdent) {
-                    "c_char" -> {
-                        if (unwrapped.mutability is PointerMutability.Mut) {
-                            CAbiBridgeKind.MUT_CSTR
-                        } else {
-                            CAbiBridgeKind.CONST_CSTR
-                        }
-                    }
-                    "FILE" -> CAbiBridgeKind.FILE_PTR
-                    "DIR" -> CAbiBridgeKind.DIR_PTR
-                    else -> CAbiBridgeKind.OPAQUE_PTR
-                }
+                val elem = unwrapTypeAliases(unwrapped.elem, resolveTypeAliasTarget, POINTEE_STOP_IDENTS)
+                val elemIdent = elem.unqualifiedPath()?.lastCleanIdent()
+                return pointeeBridgeKind(unwrapped.mutability is PointerMutability.Mut, elemIdent)
             }
+            var unwrappedPathIdent: String? = null
             if (unwrapped is SynType.Path && unwrapped.qself == null) {
                 val lastSeg = unwrapped.path.segments.last()
-                val pathIdent = lastSeg?.ident?.toString()?.removePrefix("r#")
+                val pathIdent = lastSeg?.cleanIdent()
+                unwrappedPathIdent = pathIdent
                 if (pathIdent == "Option") {
-                    val args = (lastSeg.arguments as? PathArguments.AngleBracketed)?.args?.toList()
-                    val firstTypeArg =
-                        args
-                            ?.mapNotNull { (it as? io.github.kotlinmania.syn.GenericArgument.TypeArg)?.type }
-                            ?.firstOrNull()
-                    if (firstTypeArg != null) {
-                        val innerUnwrapped = unwrapOuterAliases(firstTypeArg, resolveTypeAliasTarget)
-                        if (innerUnwrapped is SynType.FnPtr) {
-                            return CAbiBridgeKind.CALLBACK_PTR
-                        }
+                    val firstTypeArg = lastSeg.arguments.firstAngleTypeArg()
+                    if (firstTypeArg != null && unwrapTypeAliases(firstTypeArg, resolveTypeAliasTarget) is SynType.FnPtr) {
+                        return CAbiBridgeKind.CALLBACK_PTR
                     }
                 }
-                val ptrAlias =
-                    (pathIdent?.let(resolvePointerAlias))
-                        ?: resolvePointerAlias(renderedKotlinType)
-                if (ptrAlias != null) {
-                    val (isMut, pointeeIdent) = ptrAlias
-                    return when (pointeeIdent) {
-                        "c_char" -> if (isMut) CAbiBridgeKind.MUT_CSTR else CAbiBridgeKind.CONST_CSTR
-                        "FILE" -> CAbiBridgeKind.FILE_PTR
-                        "DIR" -> CAbiBridgeKind.DIR_PTR
-                        else -> CAbiBridgeKind.OPAQUE_PTR
-                    }
-                }
+                val ptrAlias = (pathIdent?.let(resolvePointerAlias)) ?: resolvePointerAlias(renderedKotlinType)
+                if (ptrAlias != null) return pointeeBridgeKind(ptrAlias.first, ptrAlias.second)
             }
-            val unwrappedPathIdent =
-                (unwrapped as? SynType.Path)
-                    ?.takeIf { it.qself == null }
-                    ?.path
-                    ?.segments
-                    ?.last()
-                    ?.ident
-                    ?.toString()
-                    ?.removePrefix("r#")
             if (!renderedKotlinType.endsWith("?")) {
-                val numericKind =
-                    resolveNumericKind(renderedKotlinType)
-                        ?: unwrappedPathIdent?.let(resolveNumericKind)
-                when (numericKind) {
-                    NumericKind.I8 -> return CAbiBridgeKind.I8
-                    NumericKind.U8 -> return CAbiBridgeKind.U8
-                    NumericKind.I16 -> return CAbiBridgeKind.I16
-                    NumericKind.U16 -> return CAbiBridgeKind.U16
-                    NumericKind.I32 -> return CAbiBridgeKind.I32
-                    NumericKind.U32 -> return CAbiBridgeKind.U32
-                    NumericKind.I64 -> return CAbiBridgeKind.I64
-                    NumericKind.U64 -> return CAbiBridgeKind.U64
-                    NumericKind.F32 -> return CAbiBridgeKind.F32
-                    NumericKind.F64 -> return CAbiBridgeKind.F64
-                    NumericKind.I128, NumericKind.U128, NumericKind.F16, NumericKind.F128, null -> {}
-                }
+                val numericKind = resolveNumericKind(renderedKotlinType) ?: unwrappedPathIdent?.let(resolveNumericKind)
+                val mappedBridge = numericKind?.let(NUMERIC_KIND_TO_BRIDGE_KIND::get)
+                if (mappedBridge != null) return mappedBridge
             }
-            val ptrWidth = cfgProfile.pointerWidth
-            val isWindows =
-                cfgProfile.targetOs == "windows" ||
-                    cfgProfile.targetFamilies?.contains("windows") == true
-            val ptrSigned =
-                when (ptrWidth) {
-                    64 -> CAbiBridgeKind.I64
-                    16 -> CAbiBridgeKind.I16
-                    else -> CAbiBridgeKind.I32
-                }
-            val ptrUnsigned =
-                when (ptrWidth) {
-                    64 -> CAbiBridgeKind.U64
-                    16 -> CAbiBridgeKind.U16
-                    else -> CAbiBridgeKind.U32
-                }
-            val cLongSigned = if (ptrWidth == 64 && !isWindows) CAbiBridgeKind.I64 else CAbiBridgeKind.I32
-            val cLongUnsigned = if (ptrWidth == 64 && !isWindows) CAbiBridgeKind.U64 else CAbiBridgeKind.U32
+            val widths = TargetCWidthProfile.from(cfgProfile)
             val simpleType = renderedKotlinType.substringAfterLast('.')
-            if (isCPointerWidthSignedTypeName(simpleType)) return ptrSigned
-            if (isCPointerWidthUnsignedTypeName(simpleType)) return ptrUnsigned
+            if (isCPointerWidthSignedTypeName(simpleType)) return widths.ptrSigned
+            if (isCPointerWidthUnsignedTypeName(simpleType)) return widths.ptrUnsigned
             return when (simpleType) {
                 "Boolean" -> CAbiBridgeKind.BOOL
                 "Byte", "CChar", "c_char", "CSchar", "c_schar", "Int8T", "int8_t" -> CAbiBridgeKind.I8
@@ -1386,8 +1204,8 @@ internal class FfiInteropCollector(
                 "UInt", "CUint", "c_uint", "Uint32T", "uint32_t", "UidT", "uid_t", "GidT", "gid_t",
                 "ModeT", "mode_t", "SocklenT", "socklen_t", "InAddrT", "in_addr_t",
                 -> CAbiBridgeKind.U32
-                "CLong", "c_long" -> cLongSigned
-                "CUlong", "c_ulong" -> cLongUnsigned
+                "CLong", "c_long" -> widths.cLongSigned
+                "CUlong", "c_ulong" -> widths.cLongUnsigned
                 "Long", "CLonglong", "c_longlong", "OffT", "off_t", "TimeT", "time_t", "Int64T", "int64_t" -> CAbiBridgeKind.I64
                 "ULong", "CUlonglong", "c_ulonglong", "Uint64T", "uint64_t" -> CAbiBridgeKind.U64
                 "Float", "CFloat", "c_float" -> CAbiBridgeKind.F32
@@ -1395,8 +1213,8 @@ internal class FfiInteropCollector(
                 else ->
                     when {
                         simpleType == "ConstPtr" || simpleType.startsWith("ConstPtr<") ||
-                            simpleType == "MutPtr" || simpleType.startsWith("MutPtr<") -> CAbiBridgeKind.OPAQUE_PTR
-                        renderedKotlinType.endsWith("?") -> CAbiBridgeKind.OPAQUE_PTR
+                            simpleType == "MutPtr" || simpleType.startsWith("MutPtr<") ||
+                            renderedKotlinType.endsWith("?") -> CAbiBridgeKind.OPAQUE_PTR
                         simpleType.startsWith("Cfn") ||
                             simpleType.endsWith("Callback") ||
                             simpleType.endsWith("Handler") ||
@@ -1412,14 +1230,9 @@ internal class FfiInteropCollector(
             cfgProfile: CfgTargetProfile = TranslationSession.cfgTargetProfile,
         ): CAbiBridgeKind {
             val norm = cType.replace(" ", "")
-            val ptrWidth = cfgProfile.pointerWidth
-            val isWindows =
-                cfgProfile.targetOs == "windows" ||
-                    cfgProfile.targetFamilies?.contains("windows") == true
-            val ptrSigned = if (ptrWidth == 64) CAbiBridgeKind.I64 else CAbiBridgeKind.I32
-            val ptrUnsigned = if (ptrWidth == 64) CAbiBridgeKind.U64 else CAbiBridgeKind.U32
-            val cLongSigned = if (ptrWidth == 64 && !isWindows) CAbiBridgeKind.I64 else CAbiBridgeKind.I32
-            val cLongUnsigned = if (ptrWidth == 64 && !isWindows) CAbiBridgeKind.U64 else CAbiBridgeKind.U32
+            val widths = TargetCWidthProfile.from(cfgProfile)
+            val ptrSigned32Or64 = if (cfgProfile.pointerWidth == 64) CAbiBridgeKind.I64 else CAbiBridgeKind.I32
+            val ptrUnsigned32Or64 = if (cfgProfile.pointerWidth == 64) CAbiBridgeKind.U64 else CAbiBridgeKind.U32
             return when {
                 norm == "void" -> CAbiBridgeKind.VOID
                 norm == "bool" || norm == "_Bool" -> CAbiBridgeKind.BOOL
@@ -1433,10 +1246,10 @@ internal class FfiInteropCollector(
                 norm == "int16_t" || norm == "short" -> CAbiBridgeKind.I16
                 norm == "uint16_t" || norm == "unsignedshort" -> CAbiBridgeKind.U16
                 norm == "uint32_t" || norm == "unsignedint" || norm == "unsigned" -> CAbiBridgeKind.U32
-                norm == "long" -> cLongSigned
-                norm == "unsignedlong" -> cLongUnsigned
-                norm == "ssize_t" || norm == "intptr_t" || norm == "ptrdiff_t" -> ptrSigned
-                norm == "size_t" || norm == "uintptr_t" -> ptrUnsigned
+                norm == "long" -> widths.cLongSigned
+                norm == "unsignedlong" -> widths.cLongUnsigned
+                norm == "ssize_t" || norm == "intptr_t" || norm == "ptrdiff_t" -> ptrSigned32Or64
+                norm == "size_t" || norm == "uintptr_t" -> ptrUnsigned32Or64
                 norm == "int64_t" || norm == "longlong" -> CAbiBridgeKind.I64
                 norm == "uint64_t" || norm == "unsignedlonglong" -> CAbiBridgeKind.U64
                 norm == "float" -> CAbiBridgeKind.F32
@@ -1449,43 +1262,17 @@ internal class FfiInteropCollector(
             cType: String,
             rawAbiMode: Boolean = false,
             cfgProfile: CfgTargetProfile = TranslationSession.cfgTargetProfile,
-        ): String =
-            when (classifyExplicitCTypeBridge(cType, cfgProfile)) {
-                CAbiBridgeKind.VOID, CAbiBridgeKind.NEVER -> "Unit"
-                CAbiBridgeKind.BOOL -> "Boolean"
-                CAbiBridgeKind.I8 -> "Byte"
-                CAbiBridgeKind.U8 -> "UByte"
-                CAbiBridgeKind.I16 -> "Short"
-                CAbiBridgeKind.U16 -> "UShort"
-                CAbiBridgeKind.I32 -> "Int"
-                CAbiBridgeKind.U32 -> "UInt"
-                CAbiBridgeKind.I64 -> "Long"
-                CAbiBridgeKind.U64 -> "ULong"
-                CAbiBridgeKind.F32 -> "Float"
-                CAbiBridgeKind.F64 -> "Double"
-                CAbiBridgeKind.CONST_CSTR -> if (rawAbiMode) "Long" else "ConstPtr"
-                CAbiBridgeKind.MUT_CSTR -> if (rawAbiMode) "Long" else "MutPtr"
-                CAbiBridgeKind.FILE_PTR,
-                CAbiBridgeKind.DIR_PTR,
-                CAbiBridgeKind.OPAQUE_PTR,
-                CAbiBridgeKind.CALLBACK_PTR,
-                CAbiBridgeKind.BY_VALUE_OBJECT,
-                ->
-                    if (rawAbiMode) {
-                        "Long"
-                    } else if (cType.replace(" ", "").startsWith("const")) {
-                        "ConstPtr"
-                    } else {
-                        "MutPtr"
-                    }
+        ): String {
+            val kind = classifyExplicitCTypeBridge(cType, cfgProfile)
+            bridgeDescriptorFor(kind).kotlinScalarType?.let { return it }
+            if (rawAbiMode) return "Long"
+            return when {
+                kind == CAbiBridgeKind.CONST_CSTR -> "ConstPtr"
+                kind == CAbiBridgeKind.MUT_CSTR -> "MutPtr"
+                cType.replace(" ", "").startsWith("const") -> "ConstPtr"
+                else -> "MutPtr"
             }
-
-        private fun unwrapType(ty: SynType): SynType =
-            when (ty) {
-                is SynType.Group -> unwrapType(ty.elem)
-                is SynType.Paren -> unwrapType(ty.elem)
-                else -> ty
-            }
+        }
 
         internal fun resolveLibcNamespace(headerContext: FileHeaderContext): String? {
             val fromCrate = headerContext.crateNamespaces["libc"]?.trim()?.removeSuffix(".")
@@ -1511,41 +1298,26 @@ internal class FfiInteropCollector(
         }
     }
 }
+
+private fun extractImportLocalName(imp: String): String {
+    val aliasSep = imp.indexOf(" as ")
+    return if (aliasSep > 0) imp.substring(aliasSep + 4).trim() else imp.substringAfterLast('.')
+}
+
 internal val UMBRELLA_LINK_LIBRARIES =
-    setOf(
-        "c",
-        "m",
-        "dl",
-        "pthread",
-        "rt",
-        "System",
-        "gcc",
-        "gcc_s",
-        "stdc++",
-        "c++",
-        "msvcrt",
-        "ucrtbase",
-        "libcmt",
-        "legacy_stdio_definitions",
-    )
+    "c m dl pthread rt System gcc gcc_s stdc++ c++ msvcrt ucrtbase libcmt legacy_stdio_definitions"
+        .split(' ')
+        .toSet()
 
 internal fun extractLinkLibraryNamesFromLinkArgs(
     tokens: TokenStream,
     out: MutableSet<String>,
 ) {
     for (part in RustTokenCursor.splitMacroArguments(tokens.clone())) {
-        if (part.size >= 3 &&
-            (part[0] as? TokenTree.Ident)?.value?.toString() == "name" &&
-            (part[1] as? TokenTree.Punct)?.value?.asChar() == '=' &&
-            part[2] is TokenTree.Literal
-        ) {
-            val lit = Lit.new((part[2] as TokenTree.Literal).value)
-            if (lit is Lit.Str) {
-                val libName = lit.value.value().trim()
-                if (libName.isNotEmpty()) {
-                    out += libName
-                }
-            }
+        val cursor = RustTokenCursor(part)
+        if (cursor.size >= 3 && cursor.identAt(0) == "name" && cursor.punctCharAt(1) == '=') {
+            val libName = cursor.stringLiteralAt(2)?.trim().orEmpty()
+            if (libName.isNotEmpty()) out += libName
         }
     }
 }
@@ -1560,19 +1332,15 @@ internal fun isAtexitForeignFn(fn: ForeignFnInteropSpec): Boolean =
 
 internal fun androidLp64BaseSymbolFallback(fn: ForeignFnInteropSpec): String? {
     val sym = fn.cSymbolName
-    if (sym.endsWith("64") && !sym.endsWith("base64") && sym.length > 2 && sym[sym.length - 3].isLetter()) {
-        return sym.removeSuffix("64")
+    return if (sym.endsWith("64") && !sym.endsWith("base64") && sym.length > 2 && sym[sym.length - 3].isLetter()) {
+        sym.removeSuffix("64")
+    } else {
+        null
     }
-    return null
 }
 
 internal fun sanitizeLinkLibraryHandleIdent(libName: String): String {
-    val raw =
-        buildString {
-            for (ch in libName) {
-                append(if (ch.isLetterOrDigit()) ch else '_')
-            }
-        }
+    val raw = buildString { for (ch in libName) append(if (ch.isLetterOrDigit()) ch else '_') }
     return if (raw.isEmpty() || raw[0].isDigit()) "lib_$raw" else raw
 }
 
@@ -1586,8 +1354,7 @@ internal fun appendPosixDynamicLookupFallbacks(
         if (isCpp) "reinterpret_cast<km_fn_t>($expr)" else "(km_fn_t)$expr"
 
     val symEsc = escapeCString(fn.cSymbolName)
-    val androidBaseSym = androidLp64BaseSymbolFallback(fn)
-    if (androidBaseSym != null) {
+    androidLp64BaseSymbolFallback(fn)?.let { androidBaseSym ->
         val baseEsc = escapeCString(androidBaseSym)
         sb.append("#if defined(__ANDROID__) && defined(__LP64__)\n")
         sb.append("        if (km_fn_ptr == $nullLit) {\n")
@@ -1595,26 +1362,24 @@ internal fun appendPosixDynamicLookupFallbacks(
         sb.append("        }\n")
         sb.append("#endif\n")
     }
-    val linkLib = fn.linkLibrary
-    if (linkLib != null) {
-        val libIdent = sanitizeLinkLibraryHandleIdent(linkLib)
-        val libEsc = escapeCString(linkLib)
-        fun appendLibDlopen(guard: String, dlTarget: String) {
-            sb.append("$guard\n")
-            sb.append("        if (km_fn_ptr == $nullLit) {\n")
-            sb.append("            static void* km_h_$libIdent = $nullLit;\n")
-            sb.append("            static bool km_h_${libIdent}_init = false;\n")
-            sb.append("            if (!km_h_${libIdent}_init) {\n")
-            sb.append("                km_h_${libIdent}_init = true;\n")
-            sb.append("                km_h_$libIdent = dlopen(\"$dlTarget\", RTLD_LAZY | RTLD_LOCAL);\n")
-            sb.append("            }\n")
-            sb.append("            if (km_h_$libIdent != $nullLit) km_fn_ptr = ${castFnPtr("dlsym(km_h_$libIdent, \"$symEsc\")")};\n")
-            sb.append("        }\n")
-        }
-        appendLibDlopen("#ifdef __APPLE__", "/usr/lib/lib$libEsc.dylib")
-        appendLibDlopen("#elif defined(__linux__) && !defined(__ANDROID__)", "lib$libEsc.so")
-        sb.append("#endif\n")
+    val linkLib = fn.linkLibrary ?: return
+    val libIdent = sanitizeLinkLibraryHandleIdent(linkLib)
+    val libEsc = escapeCString(linkLib)
+    fun appendLibDlopen(guard: String, dlTarget: String) {
+        sb.append("$guard\n")
+        sb.append("        if (km_fn_ptr == $nullLit) {\n")
+        sb.append("            static void* km_h_$libIdent = $nullLit;\n")
+        sb.append("            static bool km_h_${libIdent}_init = false;\n")
+        sb.append("            if (!km_h_${libIdent}_init) {\n")
+        sb.append("                km_h_${libIdent}_init = true;\n")
+        sb.append("                km_h_$libIdent = dlopen(\"$dlTarget\", RTLD_LAZY | RTLD_LOCAL);\n")
+        sb.append("            }\n")
+        sb.append("            if (km_h_$libIdent != $nullLit) km_fn_ptr = ${castFnPtr("dlsym(km_h_$libIdent, \"$symEsc\")")};\n")
+        sb.append("        }\n")
     }
+    appendLibDlopen("#ifdef __APPLE__", "/usr/lib/lib$libEsc.dylib")
+    appendLibDlopen("#elif defined(__linux__) && !defined(__ANDROID__)", "lib$libEsc.so")
+    sb.append("#endif\n")
 }
 
 internal fun cFailureReturnExpr(
@@ -1643,17 +1408,11 @@ internal fun extractHeaderCommentsFromSource(source: String, out: MutableSet<Str
         }
         if (!trimmed.regionMatches(idx, "Header:", 0, 7)) continue
         idx += 7
-        while (idx < trimmed.length && (trimmed[idx].isWhitespace() || trimmed[idx] == '`')) {
-            idx++
-        }
+        while (idx < trimmed.length && (trimmed[idx].isWhitespace() || trimmed[idx] == '`')) idx++
         val start = idx
-        while (idx < trimmed.length && !trimmed[idx].isWhitespace() && trimmed[idx] != '`' && trimmed[idx] != '*') {
-            idx++
-        }
+        while (idx < trimmed.length && !trimmed[idx].isWhitespace() && trimmed[idx] != '`' && trimmed[idx] != '*') idx++
         val hdr = trimmed.substring(start, idx).trim()
-        if (hdr.endsWith(".h") || hdr.endsWith(".hpp")) {
-            out += hdr
-        }
+        if (hdr.endsWith(".h") || hdr.endsWith(".hpp")) out += hdr
     }
 }
 
@@ -1667,17 +1426,14 @@ internal fun extractIncludedHeadersFromPreambles(preambles: List<String>): Set<S
             if (!afterHash.startsWith("include")) continue
             val afterInclude = afterHash.substring(7).trimStart()
             if (afterInclude.isEmpty()) continue
-            val open = afterInclude[0]
             val close =
-                when (open) {
+                when (afterInclude[0]) {
                     '<' -> '>'
                     '"' -> '"'
                     else -> continue
                 }
             val closeIdx = afterInclude.indexOf(close, startIndex = 1)
-            if (closeIdx > 1) {
-                found += afterInclude.substring(1, closeIdx)
-            }
+            if (closeIdx > 1) found += afterInclude.substring(1, closeIdx)
         }
     }
     return found
@@ -1717,18 +1473,14 @@ internal fun computeCInteropStemSnake(headerContext: FileHeaderContext): String 
     val projNs = headerContext.projectNamespace?.trim()?.removeSuffix(".")
     val pkg = headerContext.packageName?.trim()?.removeSuffix(".")
     if (!projNs.isNullOrEmpty() && !pkg.isNullOrEmpty() && pkg.startsWith("$projNs.")) {
-        val rel = pkg.removePrefix("$projNs.")
         val relSnake =
-            rel
+            pkg
+                .removePrefix("$projNs.")
                 .split('.')
                 .filter { it.isNotEmpty() }
                 .joinToString("_") { sanitizeCSymbolPart(it) }
         if (relSnake.isNotEmpty()) {
-            return if (stem.isNotEmpty() && relSnake != stem && !relSnake.endsWith("_$stem")) {
-                "${relSnake}_$stem"
-            } else {
-                relSnake
-            }
+            return if (stem.isNotEmpty() && relSnake != stem && !relSnake.endsWith("_$stem")) "${relSnake}_$stem" else relSnake
         }
     }
     return stem
@@ -1736,36 +1488,26 @@ internal fun computeCInteropStemSnake(headerContext: FileHeaderContext): String 
 
 internal fun computeFfiModuleNameLower(headerContext: FileHeaderContext): String {
     val ffiOverride =
-        headerContext.projectFfiName
+        headerContext
+            .projectFfiName
             ?.trim()
             ?.lowercase()
             ?.filter { it.isLetterOrDigit() || it == '_' }
             ?.takeIf { it.isNotEmpty() }
     if (ffiOverride != null) return ffiOverride
-    val nsSegment =
-        headerContext.projectNamespace
-            ?.substringAfterLast('.')
-            ?.takeIf { it.isNotEmpty() }
-            ?: headerContext.packageName
-                ?.substringAfterLast('.')
-                ?.takeIf { it.isNotEmpty() }
-            ?: "ffi"
-    return sanitizeCSymbolPart(nsSegment).replace("_", "")
+    return sanitizeCSymbolPart(resolveNamespaceTailSegment(headerContext)).replace("_", "")
 }
 
 internal fun computeCSymbolPrefix(headerContext: FileHeaderContext): String {
-    val nsSegment =
-        headerContext.projectNamespace
-            ?.substringAfterLast('.')
-            ?.takeIf { it.isNotEmpty() }
-            ?: headerContext.packageName
-                ?.substringAfterLast('.')
-                ?.takeIf { it.isNotEmpty() }
-            ?: "ffi"
     val stem = computeCInteropStemSnake(headerContext)
-    val cleanNs = sanitizeCSymbolPart(nsSegment)
+    val cleanNs = sanitizeCSymbolPart(resolveNamespaceTailSegment(headerContext))
     return if (cleanNs == stem) cleanNs else "${cleanNs}_$stem"
 }
+
+private fun resolveNamespaceTailSegment(headerContext: FileHeaderContext): String =
+    headerContext.projectNamespace?.substringAfterLast('.')?.takeIf { it.isNotEmpty() }
+        ?: headerContext.packageName?.substringAfterLast('.')?.takeIf { it.isNotEmpty() }
+        ?: "ffi"
 
 private fun sanitizeCSymbolPart(raw: String): String {
     val sb = StringBuilder(raw.length + 4)
@@ -1788,16 +1530,11 @@ internal fun toPascalCaseIdentifierPart(raw: String): String {
     val sb = StringBuilder(raw.length)
     var capitalizeNext = true
     for (ch in raw) {
-        when {
-            ch.isLetterOrDigit() -> {
-                if (capitalizeNext) {
-                    sb.append(ch.uppercaseChar())
-                    capitalizeNext = false
-                } else {
-                    sb.append(ch)
-                }
-            }
-            else -> capitalizeNext = true
+        if (ch.isLetterOrDigit()) {
+            sb.append(if (capitalizeNext) ch.uppercaseChar() else ch)
+            capitalizeNext = false
+        } else {
+            capitalizeNext = true
         }
     }
     val res = sb.toString()
@@ -1805,18 +1542,12 @@ internal fun toPascalCaseIdentifierPart(raw: String): String {
     return if (res.first().isDigit()) "N$res" else res
 }
 
-internal fun toCamelCaseIdentifierPart(raw: String): String {
-    val pascal = toPascalCaseIdentifierPart(raw)
-    return pascal.replaceFirstChar { it.lowercaseChar() }
-}
+internal fun toCamelCaseIdentifierPart(raw: String): String =
+    toPascalCaseIdentifierPart(raw).replaceFirstChar { it.lowercaseChar() }
 
 internal fun sanitizeCParamIdentifier(raw: String, index: Int): String {
     val clean = toCamelCaseIdentifierPart(raw)
-    return if (clean in C_RESERVED_PARAM_NAMES) {
-        "arg${index}${toPascalCaseIdentifierPart(clean)}"
-    } else {
-        clean
-    }
+    return if (clean in C_RESERVED_PARAM_NAMES) "arg${index}${toPascalCaseIdentifierPart(clean)}" else clean
 }
 
 private val C_RESERVED_PARAM_NAMES: Set<String> =
@@ -1852,55 +1583,55 @@ internal fun buildJniResourceLoaderBody(
     jniLibName: String,
     resourcePrefix: String,
 ): String =
-    buildString {
-        append("    private fun loadNativeLibrary() {\n")
-        append("        val osRaw = System.getProperty(\"os.name\", \"\").lowercase()\n")
-        append("        val archRaw = System.getProperty(\"os.arch\", \"\").lowercase()\n")
-        append("        val hostPlatform =\n")
-        append("            when {\n")
-        append("                osRaw.contains(\"win\") -> \"windows\"\n")
-        append("                osRaw.contains(\"mac\") || osRaw.contains(\"darwin\") -> \"macos\"\n")
-        append("                else -> \"linux\"\n")
-        append("            }\n")
-        append("        val hostArch =\n")
-        append("            when {\n")
-        append("                archRaw == \"aarch64\" || archRaw == \"arm64\" -> \"aarch64\"\n")
-        append("                archRaw == \"amd64\" || archRaw == \"x86_64\" -> \"x86_64\"\n")
-        append("                else -> archRaw\n")
-        append("            }\n")
-        append("        val libFileName =\n")
-        append("            when (hostPlatform) {\n")
-        append("                \"windows\" -> \"").append(jniLibName).append(".dll\"\n")
-        append("                \"macos\" -> \"lib").append(jniLibName).append(".dylib\"\n")
-        append("                else -> \"lib").append(jniLibName).append(".so\"\n")
-        append("            }\n")
-        append("        val pathSep = System.getProperty(\"path.separator\", \":\")\n")
-        append("        val libPathProp = System.getProperty(\"java.library.path\", \"\")\n")
-        append("        for (dirEntry in libPathProp.split(pathSep)) {\n")
-        append("            if (dirEntry.isEmpty()) continue\n")
-        append("            val candidate = java.io.File(dirEntry, libFileName)\n")
-        append("            if (candidate.isFile) {\n")
-        append("                System.load(candidate.absolutePath)\n")
-        append("                return\n")
-        append("            }\n")
-        append("        }\n")
-        append("        val resourcePath = \"").append(resourcePrefix).append("/native/${'$'}hostPlatform-${'$'}hostArch/${'$'}libFileName\"\n")
-        append("        val stream = ").append(jniObjectName).append("::class.java.classLoader?.getResourceAsStream(resourcePath)\n")
-        append("        if (stream != null) {\n")
-        append("            val suffix = \".\" + libFileName.substringAfterLast('.')\n")
-        append("            val extracted = java.nio.file.Files.createTempFile(\"").append(jniLibName).append("-\", suffix).toFile()\n")
-        append("            extracted.deleteOnExit()\n")
-        append("            stream.use { input ->\n")
-        append("                extracted.outputStream().use { output ->\n")
-        append("                    input.copyTo(output)\n")
-        append("                }\n")
-        append("            }\n")
-        append("            System.load(extracted.absolutePath)\n")
-        append("            return\n")
-        append("        }\n")
-        append("        System.loadLibrary(\"").append(jniLibName).append("\")\n")
-        append("    }\n\n")
+    """
+    private fun loadNativeLibrary() {
+        val osRaw = System.getProperty("os.name", "").lowercase()
+        val archRaw = System.getProperty("os.arch", "").lowercase()
+        val hostPlatform =
+            when {
+                osRaw.contains("win") -> "windows"
+                osRaw.contains("mac") || osRaw.contains("darwin") -> "macos"
+                else -> "linux"
+            }
+        val hostArch =
+            when {
+                archRaw == "aarch64" || archRaw == "arm64" -> "aarch64"
+                archRaw == "amd64" || archRaw == "x86_64" -> "x86_64"
+                else -> archRaw
+            }
+        val libFileName =
+            when (hostPlatform) {
+                "windows" -> "$jniLibName.dll"
+                "macos" -> "lib$jniLibName.dylib"
+                else -> "lib$jniLibName.so"
+            }
+        val pathSep = System.getProperty("path.separator", ":")
+        val libPathProp = System.getProperty("java.library.path", "")
+        for (dirEntry in libPathProp.split(pathSep)) {
+            if (dirEntry.isEmpty()) continue
+            val candidate = java.io.File(dirEntry, libFileName)
+            if (candidate.isFile) {
+                System.load(candidate.absolutePath)
+                return
+            }
+        }
+        val resourcePath = "$resourcePrefix/native/${'$'}hostPlatform-${'$'}hostArch/${'$'}libFileName"
+        val stream = $jniObjectName::class.java.classLoader?.getResourceAsStream(resourcePath)
+        if (stream != null) {
+            val suffix = "." + libFileName.substringAfterLast('.')
+            val extracted = java.nio.file.Files.createTempFile("$jniLibName-", suffix).toFile()
+            extracted.deleteOnExit()
+            stream.use { input ->
+                extracted.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            System.load(extracted.absolutePath)
+            return
+        }
+        System.loadLibrary("$jniLibName")
     }
+    """.trimIndent().prependIndent("    ") + "\n\n"
 
 internal fun escapeCString(raw: String): String =
     buildString(raw.length + 4) {
@@ -1926,11 +1657,27 @@ internal fun conversionMethodForNumericKind(kind: NumericKind): String =
         NumericKind.U32 -> "toUInt"
         NumericKind.I64 -> "toLong"
         NumericKind.U64 -> "toULong"
-        NumericKind.F16 -> "toFloat"
-        NumericKind.F32 -> "toFloat"
-        NumericKind.F64 -> "toDouble"
-        NumericKind.F128 -> "toDouble"
+        NumericKind.F16, NumericKind.F32 -> "toFloat"
+        NumericKind.F64, NumericKind.F128 -> "toDouble"
         NumericKind.I128, NumericKind.U128 -> "toLong"
+    }
+
+private fun defaultKotlinFallbackForNumericKind(numKind: NumericKind): String =
+    when (numKind) {
+        NumericKind.I8 -> "(-1).toByte()"
+        NumericKind.U8 -> "0u.toUByte()"
+        NumericKind.I16 -> "(-1).toShort()"
+        NumericKind.U16 -> "0u.toUShort()"
+        NumericKind.I32 -> "-1"
+        NumericKind.U32 -> "0u"
+        NumericKind.I64 -> "-1L"
+        NumericKind.U64 -> "0uL"
+        NumericKind.F16 -> "F16.ZERO"
+        NumericKind.F32 -> "0.0f"
+        NumericKind.F64 -> "0.0"
+        NumericKind.F128 -> "F128.ZERO"
+        NumericKind.I128 -> "I128.ZERO"
+        NumericKind.U128 -> "U128.ZERO"
     }
 
 internal fun defaultKotlinFallbackForBridge(
@@ -1938,39 +1685,12 @@ internal fun defaultKotlinFallbackForBridge(
     kotlinType: String,
     resolveNumericKind: (String) -> NumericKind? = { null },
 ): String {
-    val numKind = resolveNumericKind(kotlinType)
-    if (numKind != null) {
-        return when (numKind) {
-            NumericKind.I8 -> "(-1).toByte()"
-            NumericKind.U8 -> "0u.toUByte()"
-            NumericKind.I16 -> "(-1).toShort()"
-            NumericKind.U16 -> "0u.toUShort()"
-            NumericKind.I32 -> "-1"
-            NumericKind.U32 -> "0u"
-            NumericKind.I64 -> "-1L"
-            NumericKind.U64 -> "0uL"
-            NumericKind.F16 -> "F16.ZERO"
-            NumericKind.F32 -> "0.0f"
-            NumericKind.F64 -> "0.0"
-            NumericKind.F128 -> "F128.ZERO"
-            NumericKind.I128 -> "I128.ZERO"
-            NumericKind.U128 -> "U128.ZERO"
-        }
-    }
+    resolveNumericKind(kotlinType)?.let { return defaultKotlinFallbackForNumericKind(it) }
+    bridgeDescriptorFor(kind).numericKind?.let { return defaultKotlinFallbackForNumericKind(it) }
     return when (kind) {
         CAbiBridgeKind.VOID -> "Unit"
         CAbiBridgeKind.NEVER -> "error(\"unreachable\")"
         CAbiBridgeKind.BOOL -> "false"
-        CAbiBridgeKind.I8 -> "(-1).toByte()"
-        CAbiBridgeKind.U8 -> "0u.toUByte()"
-        CAbiBridgeKind.I16 -> "(-1).toShort()"
-        CAbiBridgeKind.U16 -> "0u.toUShort()"
-        CAbiBridgeKind.I32 -> "-1"
-        CAbiBridgeKind.U32 -> "0u"
-        CAbiBridgeKind.I64 -> "-1L"
-        CAbiBridgeKind.U64 -> "0uL"
-        CAbiBridgeKind.F32 -> "0.0f"
-        CAbiBridgeKind.F64 -> "0.0"
         CAbiBridgeKind.CONST_CSTR -> if (kotlinType == "Long") "0L" else "ConstPtr(0L)"
         CAbiBridgeKind.MUT_CSTR -> if (kotlinType == "Long") "0L" else "MutPtr(0L)"
         CAbiBridgeKind.OPAQUE_PTR,
@@ -1982,10 +1702,9 @@ internal fun defaultKotlinFallbackForBridge(
                 kotlinType.substringAfterLast('.').startsWith("ConstPtr") -> "ConstPtr(0L)"
                 else -> "MutPtr(0L)"
             }
-        CAbiBridgeKind.CALLBACK_PTR ->
-            if (kotlinType.endsWith("?")) "null" else "$kotlinType { }"
-        CAbiBridgeKind.BY_VALUE_OBJECT ->
-            if (kotlinType.endsWith("?")) "null" else "$kotlinType()"
+        CAbiBridgeKind.CALLBACK_PTR -> if (kotlinType.endsWith("?")) "null" else "$kotlinType { }"
+        CAbiBridgeKind.BY_VALUE_OBJECT -> if (kotlinType.endsWith("?")) "null" else "$kotlinType()"
+        else -> "0"
     }
 }
 
@@ -2031,161 +1750,70 @@ internal fun containsCIdentifier(code: String, ident: String): Boolean {
     }
 }
 
-private fun extractGroupInnerSource(source: String, group: TokenTree.Group): String {
-    val openEnd = group.value.spanOpen().endExclusiveOffset()
-    val closeStart = group.value.spanClose().startOffset()
-    if (openEnd >= 0 && closeStart >= openEnd && closeStart <= source.length) {
-        return source.substring(openEnd, closeStart)
-    }
-    return group.value.stream().toString()
-}
-
-private fun extractStreamSource(source: String, trees: List<TokenTree>): String {
-    if (trees.isEmpty()) return ""
-    val start = tokenStartOffset(trees.first())
-    val end = tokenEndOffset(trees.last())
-    if (start >= 0 && end >= start && end <= source.length) {
-        return source.substring(start, end)
-    }
-    return TokenStream.fromTokenTrees(trees).toString()
-}
-
-private fun tokenStartOffset(tt: TokenTree): Int =
-    when (tt) {
-        is TokenTree.Group -> tt.value.spanOpen().startOffset()
-        is TokenTree.Ident -> tt.value.span().startOffset()
-        is TokenTree.Punct -> tt.value.span().startOffset()
-        is TokenTree.Literal -> tt.value.span().startOffset()
-    }
-
-private fun tokenEndOffset(tt: TokenTree): Int =
-    when (tt) {
-        is TokenTree.Group -> tt.value.spanClose().endExclusiveOffset()
-        is TokenTree.Ident -> tt.value.span().endExclusiveOffset()
-        is TokenTree.Punct -> tt.value.span().endExclusiveOffset()
-        is TokenTree.Literal -> tt.value.span().endExclusiveOffset()
-    }
-
-internal fun parseInlineCMacro(
-    source: String,
-    tokens: TokenStream,
-    isCpp: Boolean,
-): ParsedInlineCMacro? {
-    val list = tokens.clone().toList()
-    if (list.isEmpty()) return null
-    var cursor = 0
-    if (list[cursor] is TokenTree.Ident && (list[cursor] as TokenTree.Ident).value.toString() == "unsafe") {
-        cursor++
-    }
-    val captureArgs = mutableListOf<InlineCaptureArg>()
-    if (cursor < list.size &&
-        list[cursor] is TokenTree.Group &&
-        (list[cursor] as TokenTree.Group).value.delimiter() == Delimiter.Bracket
-    ) {
-        val bracketGroup = list[cursor] as TokenTree.Group
-        val parts = RustTokenCursor.splitMacroArguments(bracketGroup.value.stream())
-        for (part in parts) {
-            parseSingleCaptureArg(part)?.let { captureArgs += it }
-        }
-        cursor++
-    }
-
-    var returnRustType: SynType? = null
-    var explicitCReturnType: String? = null
-    if (cursor + 1 < list.size &&
-        (list[cursor] as? TokenTree.Punct)?.value?.asChar() == '-' &&
-        (list[cursor + 1] as? TokenTree.Punct)?.value?.asChar() == '>'
-    ) {
-        cursor += 2
-        val bodyGroupIdx =
-            (cursor until list.size).lastOrNull { idx ->
-                list[idx] is TokenTree.Group && (list[idx] as TokenTree.Group).value.delimiter() == Delimiter.Brace
-            } ?: return null
-        val headerSlice = list.subList(cursor, bodyGroupIdx)
-        val asIdx =
-            headerSlice.indexOfFirst { tt ->
-                tt is TokenTree.Ident && tt.value.toString() == "as"
+/**
+ * Token-cursor parser for `c!` / `cpp!` inline FFI blocks (`[mut x: T as "CType", ...] -> Ret as "CRet" { ... }`).
+ */
+private class InlineCMacroTokenParser(
+    private val source: String,
+    stream: TokenStream,
+) : RustTokenCursor(stream.clone().toList()) {
+    fun parse(isCpp: Boolean): ParsedInlineCMacro? {
+        if (size == 0) return null
+        var cursor = if (identAt(0) == "unsafe") 1 else 0
+        val captureArgs = mutableListOf<InlineCaptureArg>()
+        groupAt(cursor, Delimiter.Bracket)?.let { bracketGroup ->
+            for (part in splitMacroArguments(bracketGroup.stream())) {
+                parseCaptureArg(RustTokenCursor(part))?.let { captureArgs += it }
             }
-        val rustTyTokens = if (asIdx >= 0) headerSlice.subList(0, asIdx) else headerSlice
-        if (rustTyTokens.isNotEmpty()) {
-            returnRustType =
-                io.github.kotlinmania.syn
-                    .parse2(SynType.Companion::parse, TokenStream.fromTokenTrees(rustTyTokens))
-                    .getOrNull()
+            cursor++
         }
-        if (asIdx >= 0 && asIdx + 1 < headerSlice.size) {
-            val cLit = headerSlice[asIdx + 1] as? TokenTree.Literal
-            if (cLit != null) {
-                val parsedLit = Lit.new(cLit.value)
-                if (parsedLit is Lit.Str) {
-                    explicitCReturnType = parsedLit.value.value()
-                }
+
+        var returnRustType: SynType? = null
+        var explicitCReturnType: String? = null
+        if (punctCharAt(cursor) == '-' && punctCharAt(cursor + 1) == '>') {
+            cursor += 2
+            val bodyGroupIdx = (cursor until size).lastOrNull { groupAt(it, Delimiter.Brace) != null } ?: return null
+            val asIdx = (cursor until bodyGroupIdx).firstOrNull { identAt(it) == "as" }
+            val rustTyEnd = asIdx ?: bodyGroupIdx
+            if (cursor < rustTyEnd) {
+                returnRustType = parse2(SynType.Companion::parse, TokenStream.fromTokenTrees(trees.subList(cursor, rustTyEnd))).getOrNull()
             }
+            if (asIdx != null && asIdx + 1 < bodyGroupIdx) {
+                explicitCReturnType = stringLiteralAt(asIdx + 1)
+            }
+            cursor = bodyGroupIdx
         }
-        cursor = bodyGroupIdx
+
+        if (cursor >= size) return null
+        val rawBody = extractGroupInnerSource(source, cursor, Delimiter.Brace) ?: extractSliceSource(source, cursor, size)
+        return ParsedInlineCMacro(
+            captureArgs = captureArgs,
+            returnRustType = returnRustType,
+            explicitCReturnType = explicitCReturnType,
+            rawBody = rawBody,
+            isCpp = isCpp,
+        )
     }
 
-    if (cursor >= list.size) return null
-    val lastTree = list[cursor]
-    val rawBody =
-        if (lastTree is TokenTree.Group && lastTree.value.delimiter() == Delimiter.Brace) {
-            extractGroupInnerSource(source, lastTree)
-        } else {
-            extractStreamSource(source, list.subList(cursor, list.size))
-        }
-    return ParsedInlineCMacro(
-        captureArgs = captureArgs,
-        returnRustType = returnRustType,
-        explicitCReturnType = explicitCReturnType,
-        rawBody = rawBody,
-        isCpp = isCpp,
-    )
-}
-
-private fun parseSingleCaptureArg(tokens: List<TokenTree>): InlineCaptureArg? {
-    if (tokens.isEmpty()) return null
-    var idx = 0
-    var isMut = false
-    if (tokens[idx] is TokenTree.Ident && (tokens[idx] as TokenTree.Ident).value.toString() == "mut") {
-        isMut = true
+    private fun parseCaptureArg(argCursor: RustTokenCursor): InlineCaptureArg? {
+        if (argCursor.size == 0) return null
+        var idx = 0
+        val isMut = argCursor.identAt(idx) == "mut"
+        if (isMut) idx++
+        val rawIdent = argCursor.identAt(idx) ?: return null
         idx++
-    }
-    if (idx >= tokens.size) return null
-    val identTree = tokens[idx] as? TokenTree.Ident ?: return null
-    val rawIdent = identTree.value.toString()
-    idx++
 
-    var rustType: SynType? = null
-    var explicitCType: String? = null
-    val asIdx =
-        (idx until tokens.size).firstOrNull { i ->
-            tokens[i] is TokenTree.Ident && (tokens[i] as TokenTree.Ident).value.toString() == "as"
-        }
-    val typeEnd = asIdx ?: tokens.size
-    if (idx < typeEnd && (tokens[idx] as? TokenTree.Punct)?.value?.asChar() == ':') {
-        val tySlice = tokens.subList(idx + 1, typeEnd)
-        if (tySlice.isNotEmpty()) {
-            rustType =
-                io.github.kotlinmania.syn
-                    .parse2(SynType.Companion::parse, TokenStream.fromTokenTrees(tySlice))
-                    .getOrNull()
-        }
-    }
-    if (asIdx != null && asIdx + 1 < tokens.size) {
-        val litTree = tokens[asIdx + 1] as? TokenTree.Literal
-        if (litTree != null) {
-            val lit = Lit.new(litTree.value)
-            if (lit is Lit.Str) {
-                explicitCType = lit.value.value()
+        val asIdx = (idx until argCursor.size).firstOrNull { argCursor.identAt(it) == "as" }
+        val typeEnd = asIdx ?: argCursor.size
+        val rustType =
+            if (idx < typeEnd && argCursor.punctCharAt(idx) == ':' && idx + 1 < typeEnd) {
+                parse2(SynType.Companion::parse, TokenStream.fromTokenTrees(argCursor.trees.subList(idx + 1, typeEnd))).getOrNull()
+            } else {
+                null
             }
-        }
+        val explicitCType = if (asIdx != null) argCursor.stringLiteralAt(asIdx + 1) else null
+        return InlineCaptureArg(rawRustIdent = rawIdent, isMut = isMut, rustType = rustType, explicitCType = explicitCType)
     }
-    return InlineCaptureArg(
-        rawRustIdent = rawIdent,
-        isMut = isMut,
-        rustType = rustType,
-        explicitCType = explicitCType,
-    )
 }
 
 internal fun ktlintImportSortBucket(rawImportSpec: String): Int {

@@ -7,13 +7,17 @@ import io.github.kotlinmania.syn.Fields
 import io.github.kotlinmania.syn.FnArg
 import io.github.kotlinmania.syn.ForeignItem
 import io.github.kotlinmania.syn.GenericArgument
+import io.github.kotlinmania.syn.GenericParam
+import io.github.kotlinmania.syn.Generics
 import io.github.kotlinmania.syn.ImplItem
 import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.Lit
 import io.github.kotlinmania.syn.Member
 import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.Pat
+import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
+import io.github.kotlinmania.syn.PathSegment
 import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.ReturnType
 import io.github.kotlinmania.syn.Signature
@@ -22,33 +26,145 @@ import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.TraitItem
 import io.github.kotlinmania.syn.UnOp
 import io.github.kotlinmania.syn.gen.Visit
+
+internal val RAW_POINTER_ARITH_METHODS: Set<String> =
+    wordSet(
+        "offset add sub wrapping_offset wrapping_add wrapping_sub",
+        "byte_offset byte_add byte_sub wrapping_byte_offset wrapping_byte_add wrapping_byte_sub",
+    )
+
+internal fun Expr.MethodCall.firstTurbofishTypeArg(): SynType? {
+    val argList = turbofish?.args?.toList() ?: return null
+    return argList.firstNotNullOfOrNull { (it as? GenericArgument.TypeArg)?.type }
+}
+
+internal fun PathArguments.firstAngleTypeArg(): SynType? {
+    val ab = this as? PathArguments.AngleBracketed ?: return null
+    return ab.args.toList().firstNotNullOfOrNull { (it as? GenericArgument.TypeArg)?.type }
+}
+
+internal fun PathArguments.angleTypeArgs(): List<SynType> {
+    val ab = this as? PathArguments.AngleBracketed ?: return emptyList()
+    val argList = ab.args.toList()
+    return argList.mapNotNull { (it as? GenericArgument.TypeArg)?.type }
+}
+
+internal fun Path.lastAngleTypeArgs(): List<SynType> {
+    val lastSeg = segments.last() ?: return emptyList()
+    return lastSeg.arguments.angleTypeArgs()
+}
+
+internal fun SynType.unqualifiedPath(): Path? {
+    val tp = this as? SynType.Path ?: return null
+    return if (tp.qself == null) tp.path else null
+}
+
+internal fun Expr.unqualifiedPath(): Path? {
+    val ep = this as? Expr.Path ?: return null
+    return if (ep.qself == null) ep.path else null
+}
+
+internal fun Generics.typeParamIdentNames(): List<String> {
+    val typeParams = params.toList().filterIsInstance<GenericParam.TypeParam>()
+    return typeParams.map { it.ident.toString() }
+}
+
+internal object PrimitiveArrayTypeCatalog {
+    private data class Spec(
+        val arrayType: String,
+        val elemType: String,
+        val numericKind: NumericKind?,
+        val layoutFactory: String,
+    )
+
+    private val SPECS: List<Spec> =
+        listOf(
+            Spec("BooleanArray", "Boolean", null, "booleanArray"),
+            Spec("ByteArray", "Byte", NumericKind.I8, "byteArray"),
+            Spec("UByteArray", "UByte", NumericKind.U8, "uByteArray"),
+            Spec("ShortArray", "Short", NumericKind.I16, "shortArray"),
+            Spec("UShortArray", "UShort", NumericKind.U16, "uShortArray"),
+            Spec("IntArray", "Int", NumericKind.I32, "intArray"),
+            Spec("UIntArray", "UInt", NumericKind.U32, "uIntArray"),
+            Spec("LongArray", "Long", NumericKind.I64, "longArray"),
+            Spec("ULongArray", "ULong", NumericKind.U64, "uLongArray"),
+            Spec("FloatArray", "Float", NumericKind.F32, "floatArray"),
+            Spec("DoubleArray", "Double", NumericKind.F64, "doubleArray"),
+        )
+
+    private val BY_ARRAY_TYPE: Map<String, Spec> = SPECS.associateBy { it.arrayType }
+    private val FACTORY_BY_KIND: Map<NumericKind, String> =
+        SPECS
+            .mapNotNull { spec -> spec.numericKind?.let { it to spec.layoutFactory } }
+            .toMap()
+    private val ARRAY_BY_ELEM: Map<String, String> =
+        SPECS.associate { it.elemType to it.arrayType } + ("kotlin.Float" to "FloatArray")
+
+    private val NUMERIC_KIND_BY_ELEM: Map<String, NumericKind> =
+        mapOf(
+            "Byte" to NumericKind.I8,
+            "UByte" to NumericKind.U8,
+            "Short" to NumericKind.I16,
+            "UShort" to NumericKind.U16,
+            "Int" to NumericKind.I32,
+            "UInt" to NumericKind.U32,
+            "Long" to NumericKind.I64,
+            "ULong" to NumericKind.U64,
+            "I128" to NumericKind.I128,
+            "U128" to NumericKind.U128,
+            "F16" to NumericKind.F16,
+            "Float" to NumericKind.F32,
+            "kotlin.Float" to NumericKind.F32,
+            "Double" to NumericKind.F64,
+            "F128" to NumericKind.F128,
+        )
+
+    fun elemKind(containerType: String, coreNs: String): NumericKind? {
+        BY_ARRAY_TYPE[containerType]?.numericKind?.let { return it }
+        val listElem =
+            when {
+                containerType.startsWith("List<") && containerType.endsWith(">") ->
+                    containerType.removePrefix("List<").dropLast(1).trim()
+                containerType.startsWith("MutableList<") && containerType.endsWith(">") ->
+                    containerType.removePrefix("MutableList<").dropLast(1).trim()
+                else -> return null
+            }
+        val normalizedElem = if (listElem.startsWith("$coreNs.")) listElem.removePrefix("$coreNs.") else listElem
+        return NUMERIC_KIND_BY_ELEM[normalizedElem]
+    }
+
+    fun elemType(arrayType: String, f32Name: String): String? {
+        val spec = BY_ARRAY_TYPE[arrayType] ?: return null
+        return if (spec.arrayType == "FloatArray") f32Name else spec.elemType
+    }
+
+    fun arrayTypeForElem(elemTy: String?): String? =
+        elemTy?.trim()?.let(ARRAY_BY_ELEM::get)
+
+    fun toArrayMethodName(arrayType: String): String? =
+        if (arrayType in BY_ARRAY_TYPE) "to$arrayType" else null
+
+    fun isPrimitiveArrayType(type: String): Boolean =
+        type in BY_ARRAY_TYPE
+
+    fun layoutFactoryForKind(kind: NumericKind?): String? =
+        kind?.let(FACTORY_BY_KIND::get)
+}
+
 internal fun KotlinJ2KEmitter.resolveUnnamedTupleFieldSynType(
     baseExpr: Expr,
     index: Int,
 ): SynType? {
-    val unwrappedBase = unwrapParenOrGroupExpr(baseExpr)
+    val unwrappedBase = unwrapParenOrGroupExpr(baseExpr) as? Expr.Path ?: return null
+    if (unwrappedBase.qself != null || unwrappedBase.path.segments.len() != 1) return null
+    val raw = unwrappedBase.path.firstCleanIdent() ?: return null
     val baseSynTy =
-        when (unwrappedBase) {
-            is Expr.Path ->
-                if (unwrappedBase.qself == null && unwrappedBase.path.segments.len() == 1) {
-                    val raw =
-                        unwrappedBase.path.segments
-                            .first()
-                            ?.ident
-                            ?.toString()
-                            ?.removePrefix("r#")
-                    when (raw) {
-                        "self" -> currentStandaloneImplSelfSynType
-                        null -> null
-                        else -> {
-                            val ktLocal = scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
-                            currentSourceParameterTypes[ktLocal] ?: currentSourceParameterTypes[raw]
-                        }
-                    }
-                } else {
-                    null
-                }
-            else -> null
+        when (raw) {
+            "self" -> currentStandaloneImplSelfSynType
+            else -> {
+                val ktLocal = scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
+                currentSourceParameterTypes[ktLocal] ?: currentSourceParameterTypes[raw]
+            }
         } ?: return null
     val unwrappedRef = unwrapSynType(baseSynTy).let { (it as? SynType.Reference)?.elem ?: it }
     val tupleTy = unwrapSynType(unwrappedRef) as? SynType.Tuple ?: return null
@@ -58,46 +174,31 @@ internal fun KotlinJ2KEmitter.resolveUnnamedTupleFieldSynType(
 internal fun KotlinJ2KEmitter.resolveContainerElementTraitCallee(callee: String): String? {
     val standaloneTraitPath = currentStandaloneImplTraitPath ?: return null
     val standaloneSelfSynType = currentStandaloneImplSelfSynType ?: return null
-    val lastTraitSeg = standaloneTraitPath.segments.last() ?: return null
-    val traitName = rustTypeIdentToKotlin(lastTraitSeg.ident.toString())
+    val traitName = standaloneTraitPath.lastKotlinTypeName() ?: return null
     if (!callee.startsWith("$traitName.")) return null
     val methodPart = callee.removePrefix("$traitName.")
     if (methodPart.isEmpty() || '.' in methodPart) return null
     val selfPath = (unwrapSynType(standaloneSelfSynType) as? SynType.Path)?.takeIf { it.qself == null } ?: return null
     val lastSelfSeg = selfPath.path.segments.last() ?: return null
-    if (lastSelfSeg.ident.toString() != "Vec") return null
-    val elemSynType =
-        (lastSelfSeg.arguments as? PathArguments.AngleBracketed)
-            ?.args
-            ?.toList()
-            ?.firstNotNullOfOrNull { (it as? GenericArgument.TypeArg)?.type }
-            ?: return null
+    if (lastSelfSeg.identText() != "Vec") return null
+    val elemSynType = lastSelfSeg.arguments.firstAngleTypeArg() ?: return null
     return disambiguateReceiverlessTraitImplFnName(standaloneTraitPath, methodPart, elemSynType)
 }
 
 internal fun KotlinJ2KEmitter.extractOwnerAndFieldName(expr: Expr, selfTypeName: String?): Pair<String?, String>? {
-    val core = unwrapTransparentCastExpr(expr)
-    if (core !is Expr.Field) return null
+    val core = unwrapTransparentCastExpr(expr) as? Expr.Field ?: return null
     val member = core.member as? Member.Named ?: return null
     val fieldName = rustFieldIdentToKotlin(member.ident.toString())
     val baseCore = unwrapTransparentCastExpr(core.base)
+
     fun normalizeDeclaredOwnerType(rawRendered: String?): String? {
-        val base =
-            rawRendered
-                ?.trim()
-                ?.removeSuffix("?")
-                ?.substringBefore('<')
-                ?.substringAfterLast('.')
-                ?.trim()
-                ?.takeIf { it.isNotEmpty() }
-                ?: return null
-        return base.takeIf { it in inspector.declaredTypeNames }
+        val base = rawRendered?.trim()?.removeSuffix("?")?.simpleKotlinTypeName() ?: return null
+        return base.takeIf { it.isNotEmpty() && it in inspector.declaredTypeNames }
     }
+
     val ownerType =
         if (baseCore is Expr.Path && baseCore.qself == null && baseCore.path.segments.len() == 1) {
-            val firstSeg = baseCore.path.segments.first()
-            val firstIdent = firstSeg?.ident?.toString()
-            val baseRaw = firstIdent?.removePrefix("r#")
+            val baseRaw = baseCore.path.firstCleanIdent()
             if (baseRaw == "self") {
                 selfTypeName?.substringBefore('<')?.trim()
             } else {
@@ -121,187 +222,43 @@ internal fun KotlinJ2KEmitter.isMutableVecExpr(expr: Expr, renderedReceiver: Str
     if (renderedReceiver in currentMutableListLocals) return true
     val (ownerType, fieldName) = extractOwnerAndFieldName(expr, selfTypeName) ?: return false
     if (ownerType != null && fieldName in inspector.vecFieldsByType[ownerType].orEmpty()) return true
-    if (ownerType == null && inspector.vecFieldsByType.values.any { fieldName in it } && fieldName == "inner") {
+    if (ownerType == null && fieldName == "inner" && inspector.vecFieldsByType.values.any { "inner" in it }) {
         val baseCore = unwrapTransparentCastExpr((unwrapTransparentCastExpr(expr) as Expr.Field).base)
         if (baseCore is Expr.Path && baseCore.qself == null && baseCore.path.segments.len() == 1) {
-            val firstSeg = baseCore.path.segments.first()
-            val firstIdent = firstSeg?.ident?.toString()
-            val rawVar = firstIdent?.removePrefix("r#").orEmpty()
+            val rawVar = baseCore.path.firstCleanIdent().orEmpty()
             if (rustTypeIdentToKotlin(rawVar) in inspector.vecFieldsByType) return true
         }
     }
     return false
 }
 
-internal fun KotlinJ2KEmitter.isKnownNullableOptionExpr(expr: Expr, renderedReceiver: String, selfTypeName: String?): Boolean {
-    if (hasDeclaredOptionEnum()) return false
-    val core = unwrapTransparentCastExpr(expr)
-    if (unwrapUnqualifiedOptionSomeArg(core) != null) return true
-    if (core is Expr.Path && core.qself == null) {
-        val parts =
-            core.path.segments
-                .toList()
-                .map { it.ident.toString().removePrefix("r#") }
-        if (parts == listOf("None") ||
-            parts == listOf("Option", "None") ||
-            parts == listOf("core", "option", "Option", "None") ||
-            parts == listOf("std", "option", "Option", "None")
-        ) {
-            return true
-        }
-    }
-    if (core is Expr.MethodCall) {
-        val m = core.method.toString()
-        if (m in setOf("ok_or", "ok_or_else", "is_ok", "is_err", "is_some", "is_none", "map_err", "to_lowercase", "to_uppercase")) {
-            return false
-        }
-        if (m == "ok" &&
-            core.args.isEmpty() &&
-            "ok" !in inspector.declaredTopLevelFnRawNames &&
-            inspector.implMethodReturnSynTypes.keys.none { it.second == "ok" }
-        ) {
-            return true
-        }
-        if (m in KNOWN_OPTION_RETURNING_METHODS) return true
-        if ((m == "fold" || m == "rfold") && core.args.toList().firstOrNull()?.let { firstArg ->
-                val unwrapped = unwrapParenOrGroupExpr(firstArg)
-                unwrapped is Expr.Path && unwrapped.qself == null && unwrapped.path.segments
-                    .last()
-                    ?.ident
-                    ?.toString() == "None"
-            } == true
-        ) {
-            return true
-        }
-        if ((m == "map" || m == "and_then" || m == "flatten" || m == "or" || m == "or_else" || m == "as_ref" || m == "as_mut" || m == "cloned" || m == "copied" || m == "filter") &&
-            isKnownNullableOptionExpr(core.receiver, "", selfTypeName)
-        ) {
-            return true
-        }
-    }
-    if (core is Expr.Call) {
-        val fnPath = (unwrapParenOrGroupExpr(core.func) as? Expr.Path)?.takeIf { it.qself == null }
-        val segs =
-            fnPath
-                ?.path
-                ?.segments
-                ?.toList()
-                .orEmpty()
-        if (segs.size >= 2 && ("core" in headerContext.crateNamespaces || headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true)) {
-            val rawCallNames = segs.map { it.ident.toString().removePrefix("r#") }
-            val owner = rawCallNames[rawCallNames.lastIndex - 1]
-            val leaf = rawCallNames.last()
-            val selfBase = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
-            val resolvedOwner = if (owner == "Self") selfBase else owner
-            if (leaf == "new" && resolvedOwner in setOf("NonNull", "NonZero", "Alignment")) {
-                return true
-            }
-        }
-        val lastRaw =
-            segs
-                .lastOrNull()
-                ?.ident
-                ?.toString()
-                ?.removePrefix("r#")
-        if (lastRaw != null) {
-            if (lastRaw in setOf("memchr", "memrchr")) {
-                return true
-            }
-            val ktFn = rustFunctionIdentToKotlin(lastRaw)
-            val localRet =
-                inspector.topLevelFnReturnSynTypes[lastRaw]
-                    ?: inspector.topLevelFnReturnSynTypes[ktFn]
-            if (localRet != null) {
-                val uRet = unwrapSynType(localRet) as? SynType.Path
-                if (uRet
-                        ?.path
-                        ?.segments
-                        ?.last()
-                        ?.ident
-                        ?.toString() == "Option"
-                ) {
-                    return true
-                }
-            } else if (headerContext.externalCrateNullableReturnFns.isNotEmpty()) {
-                val importedPkg = importedSimpleNameToPkg[ktFn]
-                if (importedPkg != null && "$importedPkg.$ktFn" in headerContext.externalCrateNullableReturnFns) {
-                    return true
-                }
-                if (segs.size == 1 &&
-                    headerContext.externalCrateSymbolPackages.values.any { symMap ->
-                        symMap[ktFn].orEmpty().any { pkg -> "$pkg.$ktFn" in headerContext.externalCrateNullableReturnFns }
-                    }
-                ) {
-                    return true
-                }
-            }
-        }
-    }
-    val inferred = inferExprRenderedType(expr, selfTypeName)?.trim()
-    if (inferred != null) {
-        if (rustResultTypeArguments(inferred) != null || inferred.startsWith("Result<") || inferred.startsWith("RustResult<")) {
-            return false
-        }
-        if (inferred.endsWith("?") && rawPointerPointeeType(inferred) == null) {
-            return true
-        }
-    }
-    if (renderedReceiver in currentNullableLocals || renderedReceiver.contains("?.let(")) return true
-    val (ownerType, fieldName) = extractOwnerAndFieldName(expr, selfTypeName) ?: (null to "")
-    if (ownerType != null && fieldName in inspector.nullableFieldsByType[ownerType].orEmpty()) return true
-    return false
-}
+internal fun KotlinJ2KEmitter.isKnownNullableOptionExpr(expr: Expr, renderedReceiver: String, selfTypeName: String?): Boolean =
+    ExprTypeInferenceEngine(this, selfTypeName).isKnownNullableOption(expr, renderedReceiver)
 
 internal fun KotlinJ2KEmitter.unwrapZeroArgClosureText(renderedClosure: String): String {
     val trimmed = renderedClosure.trim()
     if (trimmed.startsWith("{") && trimmed.endsWith("}") && !trimmed.contains("->")) {
         val inner = trimmed.substring(1, trimmed.length - 1).trim()
-        if ('\n' !in inner && ';' !in inner) {
-            return inner
-        }
-        return "run $trimmed"
+        return if ('\n' !in inner && ';' !in inner) inner else "run $trimmed"
     }
-    if (trimmed.startsWith("::")) {
-        return "${trimmed.removePrefix("::")}()"
-    }
-    if ("::" in trimmed) {
-        return "${trimmed.replaceFirst("::", ".")}()"
-    }
+    if (trimmed.startsWith("::")) return "${trimmed.removePrefix("::")}()"
+    if ("::" in trimmed) return "${trimmed.replaceFirst("::", ".")}()"
     return "$trimmed()"
 }
 
-internal fun KotlinJ2KEmitter.primitiveArrayElementNumericKind(arrayType: String): NumericKind? {
-    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    return when (arrayType) {
-        "ByteArray", "List<Byte>", "MutableList<Byte>" -> NumericKind.I8
-        "UByteArray", "List<UByte>", "MutableList<UByte>" -> NumericKind.U8
-        "ShortArray", "List<Short>", "MutableList<Short>" -> NumericKind.I16
-        "UShortArray", "List<UShort>", "MutableList<UShort>" -> NumericKind.U16
-        "IntArray", "List<Int>", "MutableList<Int>" -> NumericKind.I32
-        "UIntArray", "List<UInt>", "MutableList<UInt>" -> NumericKind.U32
-        "LongArray", "List<Long>", "MutableList<Long>" -> NumericKind.I64
-        "ULongArray", "List<ULong>", "MutableList<ULong>" -> NumericKind.U64
-        "List<I128>", "MutableList<I128>", "List<$coreNs.I128>", "MutableList<$coreNs.I128>" -> NumericKind.I128
-        "List<U128>", "MutableList<U128>", "List<$coreNs.U128>", "MutableList<$coreNs.U128>" -> NumericKind.U128
-        "List<F16>", "MutableList<F16>", "List<$coreNs.F16>", "MutableList<$coreNs.F16>" -> NumericKind.F16
-        "FloatArray", "List<Float>", "MutableList<Float>", "List<kotlin.Float>", "MutableList<kotlin.Float>" -> NumericKind.F32
-        "DoubleArray", "List<Double>", "MutableList<Double>" -> NumericKind.F64
-        "List<F128>", "MutableList<F128>", "List<$coreNs.F128>", "MutableList<$coreNs.F128>" -> NumericKind.F128
-        else -> null
-    }
-}
+internal fun KotlinJ2KEmitter.primitiveArrayElementNumericKind(arrayType: String): NumericKind? =
+    PrimitiveArrayTypeCatalog.elemKind(arrayType, CoreIntrinsicLowering.resolveCoreNamespace(headerContext))
 
 internal fun KotlinJ2KEmitter.inferArrayElementNumericKind(expr: Expr, selfTypeName: String?): NumericKind? {
     var containerTy = inferExprRenderedType(expr, selfTypeName)?.removeSuffix("?")?.trim() ?: return null
-    primitiveArrayElementNumericKind(containerTy)?.let { return it }
-    extractIndexedElementRenderedType(containerTy, selfTypeName)?.let(this::resolveNumericKind)?.let { return it }
     var depth = 0
-    while (depth < 6) {
+    while (depth <= 6) {
+        primitiveArrayElementNumericKind(containerTy)?.let { return it }
+        extractIndexedElementRenderedType(containerTy, selfTypeName)?.let(this::resolveNumericKind)?.let { return it }
+        if (depth == 6) break
         val aliasSyn = inspector.typeAliasTargets[containerTy] ?: break
         val rendered = renderType(aliasSyn, selfTypeName = null).removeSuffix("?").trim()
         if (rendered == containerTy) break
-        primitiveArrayElementNumericKind(rendered)?.let { return it }
-        extractIndexedElementRenderedType(rendered, selfTypeName)?.let(this::resolveNumericKind)?.let { return it }
         containerTy = rendered
         depth++
     }
@@ -312,19 +269,7 @@ internal fun KotlinJ2KEmitter.extractIndexedElementRenderedType(containerTy: Str
     var cur = containerTy.removeSuffix("?").trim()
     var depth = 0
     while (depth <= 6) {
-        when (cur) {
-            "ByteArray" -> return "Byte"
-            "UByteArray" -> return "UByte"
-            "ShortArray" -> return "Short"
-            "UShortArray" -> return "UShort"
-            "IntArray" -> return "Int"
-            "UIntArray" -> return "UInt"
-            "LongArray" -> return "Long"
-            "ULongArray" -> return "ULong"
-            "FloatArray" -> return kotlinF32TypeName()
-            "DoubleArray" -> return "Double"
-            "BooleanArray" -> return "Boolean"
-        }
+        PrimitiveArrayTypeCatalog.elemType(cur, kotlinF32TypeName())?.let { return it }
         when {
             cur.startsWith("List<") && cur.endsWith(">") -> return cur.removePrefix("List<").removeSuffix(">").trim()
             cur.startsWith("MutableList<") && cur.endsWith(">") -> return cur.removePrefix("MutableList<").removeSuffix(">").trim()
@@ -345,45 +290,23 @@ internal fun KotlinJ2KEmitter.isKnownNonNullableNonOptionReceiver(
     selfTypeName: String?,
 ): Boolean {
     if (renderedReceiver in currentNullableLocals) return false
-    val rawTy =
-        (currentTypedLocals[renderedReceiver] ?: inferExprRenderedType(recvExpr, selfTypeName))
-            ?.trim()
-            ?: return false
-    if (rawTy.isEmpty() ||
-        rawTy.endsWith("?") ||
-        rawTy == "Any" ||
-        rawTy == "Option" ||
-        rawTy.startsWith("Option<")
-    ) {
-        return false
-    }
+    fun isNullableOrOptionShape(ty: String): Boolean =
+        ty.isEmpty() || ty.endsWith("?") || ty == "Any" || ty == "Option" || ty.startsWith("Option<")
+    val rawTy = (currentTypedLocals[renderedReceiver] ?: inferExprRenderedType(recvExpr, selfTypeName))?.trim() ?: return false
+    if (isNullableOrOptionShape(rawTy)) return false
     var cur = rawTy
     var depth = 0
     while (depth < 8) {
-        val base = cur.substringBefore('<').substringAfterLast('.').trim()
+        val base = cur.simpleKotlinTypeName()
         if (base.isEmpty() || base in activeTypeParamNames) return false
-        val aliasSyn = inspector.typeAliasTargets[base]
-        if (aliasSyn != null) {
-            val next = renderType(aliasSyn, selfTypeName).trim()
-            if (next.endsWith("?") || next == "Any" || next == "Option" || next.startsWith("Option<")) {
-                return false
-            }
-            if (next == cur) break
-            cur = next
-            depth++
-            continue
-        }
-        val crateAlias = headerContext.crateTypeAliasDefaults[base]?.trim()
-        if (crateAlias != null) {
-            if (crateAlias.endsWith("?") || crateAlias == "Any" || crateAlias == "Option" || crateAlias.startsWith("Option<")) {
-                return false
-            }
-            if (crateAlias == cur) break
-            cur = crateAlias
-            depth++
-            continue
-        }
-        break
+        val next =
+            inspector.typeAliasTargets[base]?.let { renderType(it, selfTypeName).trim() }
+                ?: headerContext.crateTypeAliasDefaults[base]?.trim()
+                ?: break
+        if (isNullableOrOptionShape(next)) return false
+        if (next == cur) break
+        cur = next
+        depth++
     }
     return true
 }
@@ -406,9 +329,7 @@ internal fun KotlinJ2KEmitter.inferExprRenderedType(expr: Expr, selfTypeName: St
             expr is Expr.BlockExpr ||
             expr is Expr.If ||
             expr is Expr.Unsafe
-    if (!shouldMemoize) {
-        return inferExprRenderedTypeImpl(expr, selfTypeName)
-    }
+    if (!shouldMemoize) return ExprTypeInferenceEngine(this, selfTypeName).inferRenderedType(expr)
     val cacheKey =
         InferExprCacheKey(
             expr = expr,
@@ -422,815 +343,837 @@ internal fun KotlinJ2KEmitter.inferExprRenderedType(expr: Expr, selfTypeName: St
     if (inferExprRenderedTypeCache.containsKey(cacheKey)) {
         return inferExprRenderedTypeCache[cacheKey]
     }
-    val computed = inferExprRenderedTypeImpl(expr, selfTypeName)
+    val computed = ExprTypeInferenceEngine(this, selfTypeName).inferRenderedType(expr)
     inferExprRenderedTypeCache[cacheKey] = computed
     return computed
 }
 
-private fun KotlinJ2KEmitter.inferExprRenderedTypeImpl(expr: Expr, selfTypeName: String?): String? =
-    when (expr) {
-        is Expr.Paren -> inferExprRenderedType(expr.expr, selfTypeName)
-        is Expr.Group -> inferExprRenderedType(expr.expr, selfTypeName)
-        is Expr.Reference -> {
-            val innerSynType = sourceInitializerType(expr.expr)
-            val innerRendered = inferExprRenderedType(expr.expr, selfTypeName) ?: innerSynType?.let { renderType(it, selfTypeName) }
-            innerRendered?.let { rendered ->
-                val local = extractSingleSegmentLocalKotlinName(expr.expr)
-                val isAddrMut =
-                    expr.mutability != null &&
-                        !headerContext.rawAbiMode &&
-                        (
-                            (local != null && local in currentAddressableLocals) ||
-                                (local == null && innerSynType != null && shouldUseAddressBackedMutableReference(innerSynType, selfTypeName))
-                        )
-                if (isAddrMut) {
-                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.RustMutableReference")
-                    "RustMutableReference<$rendered>"
-                } else {
-                    rendered
-                }
-            }
+internal fun KotlinJ2KEmitter.inferExprNumericKind(expr: Expr, selfTypeName: String?): NumericKind? =
+    ExprTypeInferenceEngine(this, selfTypeName).inferNumericKind(expr)
+
+/**
+ * Stateful AST expression type, numeric-kind, and erased-`Option` inference engine for a single
+ * `(emitter, selfTypeName)` scope.
+ */
+private class ExprTypeInferenceEngine(
+    private val emitter: KotlinJ2KEmitter,
+    private val selfTypeName: String?,
+) {
+    private val inspector get() = emitter.inspector
+    private val headerContext get() = emitter.headerContext
+    private val scopeBuilder get() = emitter.scopeBuilder
+    private val coreNs: String get() = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+
+    private fun isInCoreOrRustLangScope(): Boolean =
+        "core" in headerContext.crateNamespaces ||
+            headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true
+
+    private fun registerCorePtrType(isMut: Boolean, pointee: String? = null): String {
+        val ptrType = if (isMut) "MutPtr" else "ConstPtr"
+        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.ptr.$ptrType")
+        return if (pointee != null) "$ptrType<$pointee>" else ptrType
+    }
+
+    private fun hasOnlyIgnoredPathPrefixes(exprPath: Expr.Path): Boolean {
+        val segs = exprPath.path.segments.toList()
+        return exprPath.qself == null &&
+            segs.isNotEmpty() &&
+            segs.dropLast(1).all { it.arguments is PathArguments.None && it.cleanIdent() in IGNORED_PATH_PREFIXES }
+    }
+
+    private fun inferBlockTailType(stmts: List<Stmt>): String? {
+        val tail = stmts.lastOrNull() as? Stmt.ExprStmt
+        return if (tail != null && tail.semiToken == null) emitter.inferExprRenderedType(tail.expr, selfTypeName) else null
+    }
+
+    fun isKnownNullableOption(expr: Expr, renderedReceiver: String): Boolean {
+        if (emitter.hasDeclaredOptionEnum()) return false
+        val core = emitter.unwrapTransparentCastExpr(expr)
+        if (emitter.unwrapUnqualifiedOptionSomeArg(core) != null) return true
+        if (core is Expr.Path && core.qself == null && core.path.cleanIdentStrings() in NONE_PATH_SHAPES) {
+            return true
         }
-        is Expr.RawAddr ->
-            if (headerContext.rawAbiMode) {
-                "Long"
-            } else {
-                inferExprRenderedType(expr.expr, selfTypeName)?.let { pointee ->
-                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                    val ptrType = if (expr.mutability is PointerMutability.Mut) "MutPtr" else "ConstPtr"
-                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.$ptrType")
-                    "$ptrType<$pointee>"
-                }
-            }
-        is Expr.Await -> inferExprRenderedType(expr.base, selfTypeName)
-        is Expr.Try -> {
-            val inner = unwrapParenOrGroupExpr(expr.expr)
-            val innerTurbofish = (inner as? Expr.MethodCall)?.turbofish
-            if (inner is Expr.MethodCall &&
-                inner.method.toString().removePrefix("r#") == "parse" &&
-                inner.args.isEmpty() &&
-                innerTurbofish != null &&
-                innerTurbofish.args.size == 1
+        if (core is Expr.MethodCall) {
+            val m = core.method.toString()
+            if (m in NON_OPTION_METHOD_NAMES) return false
+            if (m == "ok" &&
+                core.args.isEmpty() &&
+                "ok" !in inspector.declaredTopLevelFnRawNames &&
+                inspector.implMethodReturnSynTypes.keys.none { it.second == "ok" }
             ) {
-                val tfGa = innerTurbofish.args.first() as? GenericArgument.TypeArg
-                if (tfGa != null) {
-                    renderType(tfGa.type, selfTypeName)
-                } else {
-                    null
-                }
-            } else {
-                val innerTy = inferExprRenderedType(expr.expr, selfTypeName)?.trim()
-                when {
-                    innerTy == null -> null
-                    rustResultOkPayloadType(innerTy) != null -> rustResultOkPayloadType(innerTy)
-                    innerTy.endsWith("?") -> innerTy.removeSuffix("?").trim()
-                    else -> null
-                }
+                return true
             }
-        }
-        is Expr.Cast -> renderType(expr.ty, selfTypeName)
-        is Expr.Struct -> {
-            val lastSeg =
-                expr.path.segments
-                    .toList()
-                    .lastOrNull()
-                    ?.ident
-                    ?.toString()
-            when (lastSeg) {
-                null -> null
-                "Self" -> selfTypeName?.substringBefore('<')?.trim()
-                else -> rustTypeIdentToKotlin(lastSeg)
-            }
-        }
-        is Expr.Path -> {
-            val constPrimKind = resolvePrimitiveAssociatedConstKind(expr.path, expr.qself)
-            val segs = expr.path.segments.toList()
-            val hasOnlyIgnoredPrefixes =
-                expr.qself == null &&
-                    segs.isNotEmpty() &&
-                    segs.dropLast(1).all {
-                        it.arguments is PathArguments.None &&
-                            it.ident.toString().removePrefix("r#") in IGNORED_PATH_PREFIXES
+            if (m in KNOWN_OPTION_RETURNING_METHODS) return true
+            if (m == "fold" || m == "rfold") {
+                val firstArg = core.args.first()
+                if (firstArg != null) {
+                    val unwrapped = emitter.unwrapParenOrGroupExpr(firstArg)
+                    if (unwrapped is Expr.Path && unwrapped.qself == null && unwrapped.path.lastIdentText() == "None") {
+                        return true
                     }
-            when {
-                constPrimKind != null -> numericKindToPureTypeName(constPrimKind)
-                hasOnlyIgnoredPrefixes -> {
-                    val raw =
-                        segs
-                            .last()
-                            .ident
-                            .toString()
-                            .removePrefix("r#")
-                    when {
-                        raw == "self" && segs.size == 1 -> selfTypeName
-                        else -> {
-                            val ktConst = inspector.declaredConstNames[raw]
-                            val constTy = ktConst?.let { inspector.declaredConstTypes[it] }
-                            when {
-                                constTy != null -> renderType(constTy, selfTypeName)
-                                segs.size == 1 -> {
-                                    val ktLocal = scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
-                                    currentTypedLocals[ktLocal]
-                                        ?: if (raw in inspector.unitStructNames) {
-                                            raw
-                                        } else if ("core" in headerContext.crateNamespaces || headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true) {
-                                            resolveStdlibUnitStructValueExpr(listOf(raw))?.removeSuffix("()")
-                                        } else {
-                                            null
-                                        }
-                                }
-                                else -> null
-                            }
+                }
+            }
+            if (m in OPTION_CHAIN_PRESERVING_METHODS && isKnownNullableOption(core.receiver, "")) {
+                return true
+            }
+        }
+        if (core is Expr.Call) {
+            val fnPathExpr = emitter.unwrapParenOrGroupExpr(core.func) as? Expr.Path
+            val fnPath = if (fnPathExpr != null && fnPathExpr.qself == null) fnPathExpr.path else null
+            val segs = fnPath?.segments?.toList().orEmpty()
+            if (segs.size >= 2 && isInCoreOrRustLangScope()) {
+                val rawCallNames = segs.map { it.cleanIdent() }
+                val owner = rawCallNames[rawCallNames.lastIndex - 1]
+                val resolvedOwner = if (owner == "Self") selfTypeName?.simpleKotlinTypeName() else owner
+                if (rawCallNames.last() == "new" && resolvedOwner in NULLABLE_NEW_WRAPPER_OWNERS) {
+                    return true
+                }
+            }
+            val lastRaw = segs.lastOrNull()?.cleanIdent()
+            if (lastRaw != null) {
+                if (lastRaw == "memchr" || lastRaw == "memrchr") return true
+                val ktFn = rustFunctionIdentToKotlin(lastRaw)
+                val localRet = inspector.topLevelFnReturnSynTypes[lastRaw] ?: inspector.topLevelFnReturnSynTypes[ktFn]
+                if (localRet != null) {
+                    val uRet = unwrapSynType(localRet) as? SynType.Path
+                    if (uRet?.path?.lastIdentText() == "Option") return true
+                } else if (headerContext.externalCrateNullableReturnFns.isNotEmpty()) {
+                    val importedPkg = emitter.importedSimpleNameToPkg[ktFn]
+                    if (importedPkg != null && "$importedPkg.$ktFn" in headerContext.externalCrateNullableReturnFns) {
+                        return true
+                    }
+                    if (segs.size == 1 &&
+                        headerContext.externalCrateSymbolPackages.values.any { symMap ->
+                            symMap[ktFn].orEmpty().any { pkg -> "$pkg.$ktFn" in headerContext.externalCrateNullableReturnFns }
                         }
+                    ) {
+                        return true
                     }
                 }
-                else ->
-                    if (expr.qself == null && ("core" in headerContext.crateNamespaces || headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true)) {
-                        resolveStdlibUnitStructValueExpr(segs.map { it.ident.toString().removePrefix("r#") })?.removeSuffix("()")
+            }
+        }
+        val inferred = emitter.inferExprRenderedType(expr, selfTypeName)?.trim()
+        if (inferred != null) {
+            if (rustResultTypeArguments(inferred) != null || inferred.startsWith("Result<") || inferred.startsWith("RustResult<")) {
+                return false
+            }
+            if (inferred.endsWith("?") && rawPointerPointeeType(inferred) == null) return true
+        }
+        if (renderedReceiver in emitter.currentNullableLocals || renderedReceiver.contains("?.let(")) return true
+        val (ownerType, fieldName) = emitter.extractOwnerAndFieldName(expr, selfTypeName) ?: return false
+        return ownerType != null && fieldName in inspector.nullableFieldsByType[ownerType].orEmpty()
+    }
+
+    fun inferRenderedType(expr: Expr): String? =
+        when (expr) {
+            is Expr.Paren -> emitter.inferExprRenderedType(expr.expr, selfTypeName)
+            is Expr.Group -> emitter.inferExprRenderedType(expr.expr, selfTypeName)
+            is Expr.Reference -> inferReferenceType(expr)
+            is Expr.RawAddr ->
+                if (headerContext.rawAbiMode) {
+                    "Long"
+                } else {
+                    emitter.inferExprRenderedType(expr.expr, selfTypeName)?.let { pointee ->
+                        registerCorePtrType(isMut = expr.mutability is PointerMutability.Mut, pointee = pointee)
+                    }
+                }
+            is Expr.Await -> emitter.inferExprRenderedType(expr.base, selfTypeName)
+            is Expr.Try -> inferTryType(expr)
+            is Expr.Cast -> emitter.renderType(expr.ty, selfTypeName)
+            is Expr.Struct ->
+                when (val lastSeg = expr.path.lastIdentText()) {
+                    null -> null
+                    "Self" -> selfTypeName?.substringBefore('<')?.trim()
+                    else -> rustTypeIdentToKotlin(lastSeg)
+                }
+            is Expr.Path -> inferPathType(expr)
+            is Expr.Unary -> inferUnaryType(expr)
+            is Expr.Field -> inferFieldType(expr)
+            is Expr.Index ->
+                if (expr.index is Expr.Range) {
+                    emitter.inferExprRenderedType(expr.expr, selfTypeName)
+                } else {
+                    emitter.inferExprRenderedType(expr.expr, selfTypeName)?.let { emitter.extractIndexedElementRenderedType(it, selfTypeName) }
+                }
+            is Expr.Call -> inferCallType(expr)
+            is Expr.MethodCall -> inferMethodCallType(expr)
+            is Expr.BlockExpr -> inferBlockTailType(expr.block.stmts)
+            is Expr.Unsafe -> inferBlockTailType(expr.block.stmts)
+            is Expr.If -> inferBlockTailType(expr.thenBranch.stmts)
+            is Expr.Repeat -> {
+                val elemTy = emitter.inferExplicitArrayElementRenderedType(expr.expr, selfTypeName)
+                emitter.primitiveArrayTypeForElementRenderedType(elemTy) ?: elemTy?.let { "List<$it>" }
+            }
+            is Expr.Tuple -> inferTupleType(expr)
+            is Expr.Array -> {
+                val elemTy = expr.elems.toList().firstNotNullOfOrNull { emitter.inferExplicitArrayElementRenderedType(it, selfTypeName) }
+                emitter.primitiveArrayTypeForElementRenderedType(elemTy) ?: elemTy?.let { "List<$it>" }
+            }
+            else -> null
+        }
+
+    private fun inferReferenceType(expr: Expr.Reference): String? {
+        val innerSynType = emitter.sourceInitializerType(expr.expr)
+        val innerRendered =
+            emitter.inferExprRenderedType(expr.expr, selfTypeName) ?: innerSynType?.let { emitter.renderType(it, selfTypeName) }
+        return innerRendered?.let { rendered ->
+            val local = emitter.extractSingleSegmentLocalKotlinName(expr.expr)
+            val isAddrMut =
+                expr.mutability != null &&
+                    !headerContext.rawAbiMode &&
+                    (
+                        (local != null && local in emitter.currentAddressableLocals) ||
+                            (local == null && innerSynType != null && emitter.shouldUseAddressBackedMutableReference(innerSynType, selfTypeName))
+                    )
+            if (isAddrMut) {
+                CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.mem.RustMutableReference")
+                "RustMutableReference<$rendered>"
+            } else {
+                rendered
+            }
+        }
+    }
+
+    private fun inferTryType(expr: Expr.Try): String? {
+        val inner = emitter.unwrapParenOrGroupExpr(expr.expr)
+        if (inner is Expr.MethodCall &&
+            inner.method.toString().removePrefix("r#") == "parse" &&
+            inner.args.isEmpty() &&
+            inner.turbofish?.args?.size == 1
+        ) {
+            return inner.firstTurbofishTypeArg()?.let { emitter.renderType(it, selfTypeName) }
+        }
+        val innerTy = emitter.inferExprRenderedType(expr.expr, selfTypeName)?.trim() ?: return null
+        return rustResultOkPayloadType(innerTy)
+            ?: if (innerTy.endsWith("?")) innerTy.removeSuffix("?").trim() else null
+    }
+
+    private fun inferPathType(expr: Expr.Path): String? {
+        emitter.resolvePrimitiveAssociatedConstKind(expr.path, expr.qself)?.let { return emitter.numericKindToPureTypeName(it) }
+        val segs = expr.path.segments.toList()
+        if (hasOnlyIgnoredPathPrefixes(expr)) {
+            val raw = segs.last().cleanIdent()
+            if (raw == "self" && segs.size == 1) return selfTypeName
+            val ktConst = inspector.declaredConstNames[raw]
+            val constTy = ktConst?.let { inspector.declaredConstTypes[it] }
+            if (constTy != null) return emitter.renderType(constTy, selfTypeName)
+            if (segs.size == 1) {
+                val ktLocal = scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
+                return emitter.currentTypedLocals[ktLocal]
+                    ?: when {
+                        raw in inspector.unitStructNames -> raw
+                        isInCoreOrRustLangScope() -> emitter.resolveStdlibUnitStructValueExpr(listOf(raw))?.removeSuffix("()")
+                        else -> null
+                    }
+            }
+            return null
+        }
+        return if (expr.qself == null && isInCoreOrRustLangScope()) {
+            emitter.resolveStdlibUnitStructValueExpr(segs.map { it.cleanIdent() })?.removeSuffix("()")
+        } else {
+            null
+        }
+    }
+
+    private fun inferUnaryType(expr: Expr.Unary): String? =
+        when (expr.op) {
+            is UnOp.Deref -> {
+                val innerTy = emitter.inferExprRenderedType(expr.expr, selfTypeName)
+                rawPointerPointeeType(innerTy)
+                    ?: mutableReferencePointeeType(innerTy)
+                    ?: mutablePlaceValueType(innerTy)
+                    ?: refCellGuardPointeeType(innerTy)
+                    ?: emitter.borrowedPlaceLocalName(expr.expr)?.let { emitter.currentTypedLocals[it] }
+                    ?: innerTy?.removeSuffix("?")
+            }
+            is UnOp.Neg -> emitter.inferExprRenderedType(expr.expr, selfTypeName)
+            is UnOp.NotOp ->
+                if (emitter.isKnownIntegerBitmaskExpr(expr.expr) || inferNumericKind(expr.expr)?.isIntegerNumericKind() == true) {
+                    emitter.inferExprRenderedType(expr.expr, selfTypeName)
+                } else {
+                    "Boolean"
+                }
+        }
+
+    private fun inferFieldType(expr: Expr.Field): String? {
+        if (expr.member is Member.Unnamed) {
+            val tupleFieldTy = emitter.resolveUnnamedTupleFieldSynType(expr.base, (expr.member as Member.Unnamed).index.index.toInt())
+            if (tupleFieldTy != null) return emitter.renderType(tupleFieldTy, selfTypeName)
+        }
+        val baseReferenceTy = emitter.inferExprRenderedType(expr.base, selfTypeName) ?: return null
+        val baseTy =
+            (mutableReferencePointeeType(baseReferenceTy) ?: refCellGuardPointeeType(baseReferenceTy) ?: baseReferenceTy)
+                .removeSuffix("?")
+                .trim()
+        val rawOwnerKt = baseTy.simpleKotlinTypeName()
+        if (rawOwnerKt.isEmpty()) return null
+        val aliasedOwnerKt = inspector.typeAliasTargets[rawOwnerKt]?.let { emitter.renderType(it, null).simpleKotlinTypeName() }
+        val ownerKt = aliasedOwnerKt?.takeIf { it.isNotEmpty() && it in inspector.structFieldSynTypesByType } ?: rawOwnerKt
+        return when (val member = expr.member) {
+            is Member.Named -> {
+                val fieldKt = rustFieldIdentToKotlin(member.ident.toString())
+                inspector.structFieldSynTypesByType[ownerKt]?.get(fieldKt)?.let { return emitter.renderType(it, ownerKt) }
+                lookupScopedCrateFieldType(baseTy, ownerKt, fieldKt)
+                    ?: if (aliasedOwnerKt != null && aliasedOwnerKt != rawOwnerKt) {
+                        lookupScopedCrateFieldType(aliasedOwnerKt, aliasedOwnerKt, fieldKt)
                     } else {
                         null
                     }
             }
+            is Member.Unnamed -> {
+                val idx = member.index.index.toInt()
+                if (ownerKt == "Pair" || ownerKt == "Triple") {
+                    val ltIdx = baseTy.indexOf('<')
+                    val gtIdx = baseTy.lastIndexOf('>')
+                    if (ltIdx >= 0 && gtIdx > ltIdx) {
+                        val typeArgs = PhantomRawPointerTypeStripper.splitTopLevelCommaList(baseTy.substring(ltIdx + 1, gtIdx)).map { it.trim() }
+                        typeArgs.getOrNull(idx)?.let { return it }
+                    }
+                }
+                val arity = inspector.tupleStructArityByType[ownerKt]
+                val primaryField = if (arity != null) tupleFieldPropertyName(idx, arity) else emitter.tupleAccessMemberName(expr.base, idx, selfTypeName)
+                inspector.structFieldSynTypesByType[ownerKt]?.get(primaryField)?.let { return emitter.renderType(it, ownerKt) }
+                if (idx == 0 && primaryField != "value") {
+                    inspector.structFieldSynTypesByType[ownerKt]?.get("value")?.let { return emitter.renderType(it, ownerKt) }
+                    inspector.structFieldSynTypesByType[ownerKt]?.get("field0")?.let { return emitter.renderType(it, ownerKt) }
+                }
+                val candidateFields = if (idx == 0 && primaryField != "value") listOf(primaryField, "value") else listOf(primaryField)
+                candidateFields.firstNotNullOfOrNull { fName -> lookupScopedCrateFieldType(baseTy, ownerKt, fName) }
+            }
         }
-        is Expr.Unary ->
-            when (expr.op) {
-                is UnOp.Deref ->
-                    rawPointerPointeeType(inferExprRenderedType(expr.expr, selfTypeName))
-                        ?: mutableReferencePointeeType(inferExprRenderedType(expr.expr, selfTypeName))
-                        ?: mutablePlaceValueType(inferExprRenderedType(expr.expr, selfTypeName))
-                        ?: refCellGuardPointeeType(inferExprRenderedType(expr.expr, selfTypeName))
-                        ?: borrowedPlaceLocalName(expr.expr)?.let { currentTypedLocals[it] }
-                        ?: inferExprRenderedType(expr.expr, selfTypeName)?.removeSuffix("?")
-                is UnOp.Neg -> inferExprRenderedType(expr.expr, selfTypeName)
-                is UnOp.NotOp ->
-                    if (isKnownIntegerBitmaskExpr(expr.expr) || inferExprNumericKind(expr.expr, selfTypeName)?.isIntegerNumericKind() == true) {
-                        inferExprRenderedType(expr.expr, selfTypeName)
-                    } else {
-                        "Boolean"
+    }
+
+    private fun lookupScopedCrateFieldType(
+        scopedType: String,
+        fallbackOwner: String,
+        fieldName: String,
+    ): String? =
+        emitter.scopedAbiKeysForRenderedType(scopedType).firstNotNullOfOrNull { key ->
+            headerContext.crateStructFieldTypes["$key.$fieldName"]
+        } ?: headerContext.crateStructFieldTypes["$fallbackOwner.$fieldName"]
+
+    private fun inferCallType(expr: Expr.Call): String? {
+        emitter.resolvePrimitiveFromBytesSpec(expr)?.let { return it.second }
+        if (isInCoreOrRustLangScope()) {
+            val fnPath = (emitter.unwrapParenOrGroupExpr(expr.func) as? Expr.Path)?.takeIf { it.qself == null }
+            val rawSegs = fnPath?.path?.cleanIdentStrings().orEmpty()
+            if (rawSegs.size >= 2) {
+                val owner = rawSegs[rawSegs.lastIndex - 1]
+                val method = rawSegs.last()
+                val resolvedOwner = if (owner == "Self") selfTypeName?.simpleKotlinTypeName() else owner
+                when {
+                    resolvedOwner == "NonNull" && (method == "new" || method == "new_unchecked" || method == "dangling") -> {
+                        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.ptr.nonnull.NonNull")
+                        return if (method == "new") "NonNull?" else "NonNull"
                     }
-            }
-        is Expr.Field -> {
-            if (expr.member is Member.Unnamed) {
-                resolveUnnamedTupleFieldSynType(expr.base, (expr.member as Member.Unnamed).index.index.toInt())
-                    ?.let { return renderType(it, selfTypeName) }
-            }
-            val baseReferenceTy = inferExprRenderedType(expr.base, selfTypeName) ?: return null
-            val baseTy =
-                (
-                    mutableReferencePointeeType(baseReferenceTy)
-                        ?: refCellGuardPointeeType(baseReferenceTy)
-                        ?: baseReferenceTy
-                ).removeSuffix("?").trim()
-            val rawOwnerKt = baseTy.substringAfterLast('.').substringBefore('<').trim()
-            if (rawOwnerKt.isEmpty()) return null
-            val aliasedOwnerKt =
-                inspector.typeAliasTargets[rawOwnerKt]?.let {
-                    renderType(it, null).substringAfterLast('.').substringBefore('<').trim()
-                }
-            val ownerKt = aliasedOwnerKt?.takeIf { it.isNotEmpty() && it in inspector.structFieldSynTypesByType } ?: rawOwnerKt
-            when (val member = expr.member) {
-                is Member.Named -> {
-                    val fieldKt = rustFieldIdentToKotlin(member.ident.toString())
-                    inspector.structFieldSynTypesByType[ownerKt]?.get(fieldKt)?.let { return renderType(it, ownerKt) }
-                    for (key in scopedAbiKeysForRenderedType(baseTy)) {
-                        headerContext.crateStructFieldTypes["$key.$fieldKt"]?.let { return it }
+                    resolvedOwner == "Alignment" && (method == "new" || method == "new_unchecked") -> {
+                        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.mem.alignment.Alignment")
+                        return if (method == "new") "Alignment?" else "Alignment"
                     }
-                    if (aliasedOwnerKt != null && aliasedOwnerKt != rawOwnerKt) {
-                        for (key in scopedAbiKeysForRenderedType(aliasedOwnerKt)) {
-                            headerContext.crateStructFieldTypes["$key.$fieldKt"]?.let { return it }
+                    resolvedOwner == "NonZero" && (method == "new" || method == "new_unchecked") -> {
+                        val kotlinMethod = if (method == "new") "new" else "newUnchecked"
+                        val resolvedArgs = emitter.resolveNonZeroNewExplicitTypeArgs("NonZero.$kotlinMethod", expr.args.toList(), selfTypeName)
+                        if (resolvedArgs != null) {
+                            CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.num.nonzero.NonZero")
+                            return "NonZero<${resolvedArgs.second}, ${resolvedArgs.first}>${if (method == "new") "?" else ""}"
                         }
                     }
-                    headerContext.crateStructFieldTypes["$ownerKt.$fieldKt"]
-                }
-                is Member.Unnamed -> {
-                    val idx = member.index.index.toInt()
-                    if (ownerKt == "Pair" || ownerKt == "Triple") {
-                        val ltIdx = baseTy.indexOf('<')
-                        val gtIdx = baseTy.lastIndexOf('>')
-                        if (ltIdx >= 0 && gtIdx > ltIdx) {
-                            val typeArgs =
-                                PhantomRawPointerTypeStripper
-                                    .splitTopLevelCommaList(baseTy.substring(ltIdx + 1, gtIdx))
-                                    .map { it.trim() }
-                            typeArgs.getOrNull(idx)?.let { return it }
-                        }
-                    }
-                    val arity = inspector.tupleStructArityByType[ownerKt]
-                    val primaryField =
-                        if (arity != null) {
-                            tupleFieldPropertyName(idx, arity)
-                        } else {
-                            tupleAccessMemberName(expr.base, idx, selfTypeName)
-                        }
-                    inspector.structFieldSynTypesByType[ownerKt]?.get(primaryField)?.let { return renderType(it, ownerKt) }
-                    if (idx == 0 && primaryField != "value") {
-                        inspector.structFieldSynTypesByType[ownerKt]?.get("value")?.let { return renderType(it, ownerKt) }
-                        inspector.structFieldSynTypesByType[ownerKt]?.get("field0")?.let { return renderType(it, ownerKt) }
-                    }
-                    val candidateFields =
-                        if (idx == 0 && primaryField != "value") {
-                            listOf(primaryField, "value")
-                        } else {
-                            listOf(primaryField)
-                        }
-                    candidateFields.firstNotNullOfOrNull { fName ->
-                        scopedAbiKeysForRenderedType(baseTy).firstNotNullOfOrNull { key ->
-                            headerContext.crateStructFieldTypes["$key.$fName"]
-                        } ?: headerContext.crateStructFieldTypes["$ownerKt.$fName"]
+                    resolvedOwner != null && atomicOwnerValueRenderedType(resolvedOwner) != null && method == "new" -> {
+                        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.sync.atomic.$resolvedOwner")
+                        return resolvedOwner
                     }
                 }
             }
         }
-        is Expr.Index -> {
-            if (expr.index is Expr.Range) {
-                inferExprRenderedType(expr.expr, selfTypeName)
-            } else {
-                val baseTy = inferExprRenderedType(expr.expr, selfTypeName) ?: return null
-                extractIndexedElementRenderedType(baseTy, selfTypeName)
+        if ("core" in headerContext.crateNamespaces) {
+            val calleePath = expr.func as? Expr.Path
+            val rawCalleeSegs = if (calleePath != null && calleePath.qself == null) calleePath.path.cleanIdentStrings() else emptyList()
+            val isFromRawPartsCall =
+                expr.args.len() == 2 &&
+                    (
+                        rawCalleeSegs == listOf("from_raw_parts") ||
+                            rawCalleeSegs == listOf("from_raw_parts_mut") ||
+                            rawCalleeSegs.takeLast(2) == listOf("slice", "from_raw_parts") ||
+                            rawCalleeSegs.takeLast(2) == listOf("slice", "from_raw_parts_mut")
+                    )
+            if (isFromRawPartsCall) {
+                val ptrTy = emitter.inferExprRenderedType(expr.args.toList()[0], selfTypeName)
+                val elem = rawPointerPointeeType(ptrTy)
+                if (elem != null) {
+                    return if (rawCalleeSegs.last().endsWith("_mut")) "MutableList<$elem>" else "List<$elem>"
+                }
             }
         }
-        is Expr.Call -> {
-            resolvePrimitiveFromBytesSpec(expr)?.let { return it.second }
-            if ("core" in headerContext.crateNamespaces || headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true) {
-                val fnPath = (unwrapParenOrGroupExpr(expr.func) as? Expr.Path)?.takeIf { it.qself == null }
-                val rawSegs =
-                    fnPath
-                        ?.path
-                        ?.segments
-                        ?.toList()
-                        ?.map { it.ident.toString().removePrefix("r#") }
-                        .orEmpty()
-                if (rawSegs.size >= 2) {
-                    val owner = rawSegs[rawSegs.lastIndex - 1]
-                    val method = rawSegs.last()
-                    val selfBase = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
-                    val resolvedOwner = if (owner == "Self") selfBase else owner
-                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                    when {
-                        resolvedOwner == "NonNull" && method == "new" -> {
-                            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.nonnull.NonNull")
-                            return "NonNull?"
-                        }
-                        resolvedOwner == "NonNull" && method in setOf("new_unchecked", "dangling") -> {
-                            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.nonnull.NonNull")
-                            return "NonNull"
-                        }
-                        resolvedOwner == "Alignment" && method == "new" -> {
-                            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.alignment.Alignment")
-                            return "Alignment?"
-                        }
-                        resolvedOwner == "Alignment" && method == "new_unchecked" -> {
-                            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.alignment.Alignment")
-                            return "Alignment"
-                        }
-                        resolvedOwner == "NonZero" && (method == "new" || method == "new_unchecked") -> {
-                            val kotlinMethod = if (method == "new") "new" else "newUnchecked"
-                            val resolvedArgs = resolveNonZeroNewExplicitTypeArgs("NonZero.$kotlinMethod", expr.args.toList(), selfTypeName)
-                            if (resolvedArgs != null) {
-                                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.num.nonzero.NonZero")
-                                val suffix = if (method == "new") "?" else ""
-                                return "NonZero<${resolvedArgs.second}, ${resolvedArgs.first}>$suffix"
-                            }
-                        }
-                        resolvedOwner != null && atomicOwnerValueRenderedType(resolvedOwner) != null && method == "new" -> {
-                            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.sync.atomic.$resolvedOwner")
-                            return resolvedOwner
-                        }
+        emitter.parseStaticPrimitiveCallSpec(expr)?.let { spec ->
+            when (spec.methodName) {
+                "from_bits" -> return emitter.numericKindToPureTypeName(spec.primKind)
+                "from_str_radix" ->
+                    if ("core" in headerContext.crateNamespaces) {
+                        val elem = emitter.numericKindToPureTypeName(spec.primKind)
+                        return if (emitter.usesTaggedCoreResult()) "${emitter.sourceResultName()}<$elem, ParseIntError>" else "Result<$elem>"
                     }
-                }
+                else ->
+                    emitter
+                        .inferPrimitiveOpReturnRenderedType(spec.primKind, spec.methodName, spec.turbofishType, selfTypeName)
+                        ?.let { return it }
             }
-            if ("core" in headerContext.crateNamespaces) {
-                val fnPathCall = (expr.func as? Expr.Path)?.takeIf { it.qself == null }
-                val rawCalleeSegs =
-                    fnPathCall
-                        ?.path
-                        ?.segments
-                        ?.toList()
-                        ?.map { it.ident.toString().removePrefix("r#") }
-                        .orEmpty()
-                val isFromRawPartsCall =
-                    expr.args.len() == 2 &&
-                        (
-                            rawCalleeSegs == listOf("from_raw_parts") ||
-                                rawCalleeSegs == listOf("from_raw_parts_mut") ||
-                                rawCalleeSegs.takeLast(2) == listOf("slice", "from_raw_parts") ||
-                                rawCalleeSegs.takeLast(2) == listOf("slice", "from_raw_parts_mut")
-                        )
-                if (isFromRawPartsCall) {
-                    val ptrTy = inferExprRenderedType(expr.args.toList()[0], selfTypeName)
-                    val elem = rawPointerPointeeType(ptrTy)
-                    if (elem != null) {
-                        val isMut = rawCalleeSegs.last().endsWith("_mut")
-                        return if (isMut) "MutableList<$elem>" else "List<$elem>"
-                    }
-                }
+        }
+        CoreIntrinsicLowering.inferCoreIntrinsicReturnRenderedType(expr, selfTypeName, emitter)?.let { return it }
+        val fnPath = (expr.func as? Expr.Path)?.takeIf { it.qself == null } ?: return null
+        val lastCallIdent = fnPath.path.lastCleanIdent()
+        if (lastCallIdent in LAYOUT_QUERY_FN_IDENTS) {
+            return when {
+                emitter.currentExpectedNumericKind != null -> null
+                headerContext.rawAbiMode -> "ULong"
+                else -> "Int"
             }
-            parseStaticPrimitiveCallSpec(expr)?.let { spec ->
-                when (spec.methodName) {
-                    "from_bits" -> return numericKindToPureTypeName(spec.primKind)
-                    "from_str_radix" ->
-                        if ("core" in headerContext.crateNamespaces) {
-                            val elem = numericKindToPureTypeName(spec.primKind)
-                            return if (usesTaggedCoreResult()) {
-                                "${sourceResultName()}<$elem, ParseIntError>"
-                            } else {
-                                "Result<$elem>"
-                            }
-                        }
-                    else ->
-                        inferPrimitiveOpReturnRenderedType(
-                            recvKind = spec.primKind,
-                            rawMethod = spec.methodName,
-                            turbofishType = spec.turbofishType,
-                            selfTypeName = selfTypeName,
-                        )?.let { return it }
-                }
-            }
-            CoreIntrinsicLowering.inferCoreIntrinsicReturnRenderedType(expr, selfTypeName, this)?.let { return it }
-            val fnPath = (expr.func as? Expr.Path)?.takeIf { it.qself == null } ?: return null
-            val lastCallIdent =
-                fnPath.path.segments
-                    .last()
-                    ?.ident
-                    ?.toString()
-                    ?.removePrefix("r#")
-            if (lastCallIdent in setOf("size_of", "size_of_val", "align_of", "align_of_val")) {
-                return when {
-                    currentExpectedNumericKind != null -> null
-                    headerContext.rawAbiMode -> "ULong"
-                    else -> "Int"
-                }
-            }
-            if (lastCallIdent == "strlen" && (currentExpectedNumericKind == NumericKind.I32 || currentEnclosingReturnRenderedType == "Int")) {
-                return "Int"
-            }
-            if (lastCallIdent == "type_name") {
-                return "String"
-            }
-            if (lastCallIdent in setOf("memchr", "memrchr") &&
-                lastCallIdent !in inspector.declaredTopLevelFnRawNames &&
-                "memchr" !in inspector.declaredTypeNames
-            ) {
-                return "Int?"
-            }
-            fun renderTopLevelFnRet(ktFn: String, rawFn: String? = null): String? {
-                val synRet =
-                    (rawFn?.let { inspector.topLevelFnReturnSynTypes[it] })
-                        ?: inspector.topLevelFnReturnSynTypes[ktFn]
-                        ?: return null
-                val prevExtern = inExternAbiSignature
-                if (ktFn in inspector.externFnKotlinNames) {
-                    inExternAbiSignature = true
-                }
+        }
+        if (lastCallIdent == "strlen" &&
+            (emitter.currentExpectedNumericKind == NumericKind.I32 || emitter.currentEnclosingReturnRenderedType == "Int")
+        ) {
+            return "Int"
+        }
+        if (lastCallIdent == "type_name") return "String"
+        if ((lastCallIdent == "memchr" || lastCallIdent == "memrchr") &&
+            lastCallIdent !in inspector.declaredTopLevelFnRawNames &&
+            "memchr" !in inspector.declaredTypeNames
+        ) {
+            return "Int?"
+        }
+
+        fun resolveDeclaredOrCrateFnRet(ktFn: String, rawFn: String): String? {
+            val synRet = inspector.topLevelFnReturnSynTypes[rawFn] ?: inspector.topLevelFnReturnSynTypes[ktFn]
+            if (synRet != null) {
+                val prevExtern = emitter.inExternAbiSignature
+                if (ktFn in inspector.externFnKotlinNames) emitter.inExternAbiSignature = true
                 return try {
-                    renderType(synRet, selfTypeName)
+                    emitter.renderType(synRet, selfTypeName)
                 } finally {
-                    inExternAbiSignature = prevExtern
+                    emitter.inExternAbiSignature = prevExtern
                 }
             }
-            val segs =
-                fnPath.path.segments
-                    .toList()
-                    .filter { it.ident.toString() !in IGNORED_PATH_PREFIXES }
-            when {
-                segs.size == 1 -> {
-                    val raw = segs[0].ident.toString().removePrefix("r#")
-                    if (raw == "Self") {
-                        selfTypeName?.substringBefore('<')?.trim()
-                    } else if (raw.isNotEmpty() && raw.first().isUpperCase() && raw !in inspector.declaredTopLevelFnRawNames) {
+            return emitter.scopedAbiKeysForRenderedType(ktFn).firstNotNullOfOrNull { headerContext.crateFnReturnTypes[it] }
+                ?: headerContext.crateFnReturnTypes[ktFn]
+        }
+
+        val rawSegList = fnPath.path.segments.toList()
+        val segs = rawSegList.filter { it.identText() !in IGNORED_PATH_PREFIXES }
+        return when {
+            segs.size == 1 -> {
+                val raw = segs[0].cleanIdent()
+                when {
+                    raw == "Self" -> selfTypeName?.substringBefore('<')?.trim()
+                    raw.isNotEmpty() && raw.first().isUpperCase() && raw !in inspector.declaredTopLevelFnRawNames -> {
                         val ktType = rustTypeIdentToKotlin(raw)
-                        if (ktType in inspector.declaredTypeNames ||
-                            scopedAbiKeysForRenderedType(ktType).any { it in headerContext.crateSymbolSubpackages || "$it.value" in headerContext.crateStructFieldTypes }
-                        ) {
+                        val knownCrateType =
+                            emitter.scopedAbiKeysForRenderedType(ktType).any {
+                                it in headerContext.crateSymbolSubpackages || "$it.value" in headerContext.crateStructFieldTypes
+                            }
+                        if (ktType in inspector.declaredTypeNames || knownCrateType) {
                             ktType
                         } else {
-                            val ktFn = rustFunctionIdentToKotlin(raw)
-                            renderTopLevelFnRet(ktFn, raw)
-                                ?: scopedAbiKeysForRenderedType(ktFn).firstNotNullOfOrNull { headerContext.crateFnReturnTypes[it] }
-                                ?: headerContext.crateFnReturnTypes[ktFn]
+                            resolveDeclaredOrCrateFnRet(rustFunctionIdentToKotlin(raw), raw)
                         }
-                    } else {
+                    }
+                    else -> {
                         val localKt = scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
-                        extractCallableReturnRenderedType(currentTypedLocals[localKt])
-                            ?: run {
-                                val ktFn = activeLocalForeignFnRenames[raw] ?: rustFunctionIdentToKotlin(raw)
-                                renderTopLevelFnRet(ktFn, raw)
-                                    ?: scopedAbiKeysForRenderedType(ktFn).firstNotNullOfOrNull { headerContext.crateFnReturnTypes[it] }
-                                    ?: headerContext.crateFnReturnTypes[ktFn]
-                            }
+                        extractCallableReturnRenderedType(emitter.currentTypedLocals[localKt])
+                            ?: resolveDeclaredOrCrateFnRet(emitter.activeLocalForeignFnRenames[raw] ?: rustFunctionIdentToKotlin(raw), raw)
                     }
                 }
-                segs.size >= 2 -> {
-                    val penultSeg = segs[segs.size - 2]
-                    val lastSeg = segs[segs.size - 1]
-                    val penultRaw = penultSeg.ident.toString().removePrefix("r#")
-                    val lastRaw = lastSeg.ident.toString().removePrefix("r#")
-                    val penultTypeArgs =
-                        (penultSeg.arguments as? PathArguments.AngleBracketed)
-                            ?.args
-                            ?.toList()
-                            .orEmpty()
-                            .filterIsInstance<GenericArgument.TypeArg>()
-                            .map { renderType(it.type, selfTypeName) }
-                    when {
-                        penultRaw == "String" &&
-                            lastRaw in setOf("new", "with_capacity", "from") &&
-                            "String" !in inspector.declaredTypeNames -> return "String"
-                        penultRaw == "Vec" &&
-                            lastRaw in setOf("new", "with_capacity", "from") &&
-                            "Vec" !in inspector.declaredTypeNames ->
-                            return if (penultTypeArgs.size == 1) "MutableList<${penultTypeArgs[0]}>" else "MutableList<*>"
-                        (penultRaw == "HashMap" || penultRaw == "BTreeMap") &&
-                            lastRaw in setOf("new", "with_capacity", "from") &&
-                            penultRaw !in inspector.declaredTypeNames ->
-                            return if (penultTypeArgs.size >= 2) {
-                                "MutableMap<${penultTypeArgs[0]}, ${penultTypeArgs[1]}>"
-                            } else {
-                                "MutableMap<*, *>"
-                            }
-                        (penultRaw == "HashSet" || penultRaw == "BTreeSet") &&
-                            lastRaw in setOf("new", "with_capacity", "from") &&
-                            penultRaw !in inspector.declaredTypeNames ->
-                            return if (penultTypeArgs.isNotEmpty()) "MutableSet<${penultTypeArgs[0]}>" else "MutableSet<*>"
-                        atomicOwnerValueRenderedType(penultRaw) != null &&
-                            lastRaw == "new" &&
-                            penultRaw !in inspector.declaredTypeNames ->
-                            return penultRaw
-                        headerContext.scalarChar &&
-                            (penultRaw == "char" || penultRaw == "RustChar") &&
-                            "Char" !in inspector.declaredTypeNames ->
-                            when (lastRaw) {
-                                "from_u32" -> return "RustChar?"
-                                "from_u32_unchecked", "from" -> return "RustChar"
-                                "try_from" ->
-                                    return if (usesTaggedCoreResult()) {
-                                        "${sourceResultName()}<RustChar, CharTryFromError>"
-                                    } else {
-                                        "Result<RustChar>"
-                                    }
-                            }
+            }
+            segs.size >= 2 -> inferMultiSegmentCallType(segs)
+            else -> null
+        }
+    }
+
+    private fun inferMultiSegmentCallType(segs: List<PathSegment>): String? {
+        val penultSeg = segs[segs.size - 2]
+        val lastSeg = segs[segs.size - 1]
+        val penultRaw = penultSeg.cleanIdent()
+        val lastRaw = lastSeg.cleanIdent()
+        val penultTypeArgs =
+            (penultSeg.arguments as? PathArguments.AngleBracketed)
+                ?.args
+                ?.toList()
+                .orEmpty()
+                .filterIsInstance<GenericArgument.TypeArg>()
+                .map { emitter.renderType(it.type, selfTypeName) }
+        val isFactoryCtor = lastRaw == "new" || lastRaw == "with_capacity" || lastRaw == "from"
+        when {
+            penultRaw == "String" && isFactoryCtor && "String" !in inspector.declaredTypeNames -> return "String"
+            penultRaw == "Vec" && isFactoryCtor && "Vec" !in inspector.declaredTypeNames ->
+                return if (penultTypeArgs.size == 1) "MutableList<${penultTypeArgs[0]}>" else "MutableList<*>"
+            (penultRaw == "HashMap" || penultRaw == "BTreeMap") && isFactoryCtor && penultRaw !in inspector.declaredTypeNames ->
+                return if (penultTypeArgs.size >= 2) "MutableMap<${penultTypeArgs[0]}, ${penultTypeArgs[1]}>" else "MutableMap<*, *>"
+            (penultRaw == "HashSet" || penultRaw == "BTreeSet") && isFactoryCtor && penultRaw !in inspector.declaredTypeNames ->
+                return if (penultTypeArgs.isNotEmpty()) "MutableSet<${penultTypeArgs[0]}>" else "MutableSet<*>"
+            atomicOwnerValueRenderedType(penultRaw) != null && lastRaw == "new" && penultRaw !in inspector.declaredTypeNames ->
+                return penultRaw
+            headerContext.scalarChar && (penultRaw == "char" || penultRaw == "RustChar") && "Char" !in inspector.declaredTypeNames ->
+                when (lastRaw) {
+                    "from_u32" -> return "RustChar?"
+                    "from_u32_unchecked", "from" -> return "RustChar"
+                    "try_from" ->
+                        return if (emitter.usesTaggedCoreResult()) {
+                            "${emitter.sourceResultName()}<RustChar, CharTryFromError>"
+                        } else {
+                            "Result<RustChar>"
+                        }
+                }
+        }
+        val methodKt = rustFunctionIdentToKotlin(lastRaw)
+        val ownerKt =
+            when {
+                penultRaw == "Self" -> selfTypeName?.substringBefore('<')?.trim()
+                penultRaw.isNotEmpty() && penultRaw.first().isUpperCase() -> rustTypeIdentToKotlin(penultRaw)
+                else -> null
+            }
+        if (ownerKt != null) {
+            val canonicalOwner = emitter.resolveTypeAliasOwnerName(ownerKt)
+            inspector.implMethodReturnSynTypes[canonicalOwner to methodKt]?.let { return emitter.renderType(it, canonicalOwner) }
+            inspector.implMethodReturnSynTypes[ownerKt to methodKt]?.let { return emitter.renderType(it, ownerKt) }
+            emitter.resolveMethodSignatureForOwner(ownerKt, methodKt)?.let { (resolvedOwner, sig) ->
+                return when (val out = sig.output) {
+                    is ReturnType.TypeReturn -> emitter.renderType(out.ty, resolvedOwner)
+                    is ReturnType.Default -> "Unit"
+                }
+            }
+            val modPrefix = segs.dropLast(2).joinToString(".") { rustModuleIdentToKotlin(it.identText().replace('-', '_')) }
+            if (modPrefix.isNotEmpty()) {
+                headerContext.crateFnReturnTypes["$modPrefix.$canonicalOwner.$methodKt"]?.let { return it }
+                headerContext.crateFnReturnTypes["$modPrefix.$ownerKt.$methodKt"]?.let { return it }
+            }
+            val ownerKeys = (emitter.scopedAbiKeysForRenderedType(canonicalOwner) + emitter.scopedAbiKeysForRenderedType(ownerKt)).distinct()
+            for (ownerKey in ownerKeys) {
+                headerContext.crateFnReturnTypes["$ownerKey.$methodKt"]?.let { return it }
+            }
+            return headerContext.crateFnReturnTypes["$canonicalOwner.$methodKt"]
+                ?: headerContext.crateFnReturnTypes["$ownerKt.$methodKt"]
+        }
+        val modSubpkg = segs.dropLast(1).joinToString(".") { rustModuleIdentToKotlin(it.identText().replace('-', '_')) }
+        return headerContext.crateFnReturnTypes["$modSubpkg.$methodKt"] ?: headerContext.crateFnReturnTypes[methodKt]
+    }
+
+    private fun inferMethodCallType(expr: Expr.MethodCall): String? {
+        val rawMethod = expr.method.toString().removePrefix("r#")
+        emitter.sourceReceiverMethodReturn(expr.receiver, rawMethod)?.let { return emitter.renderType(it, selfTypeName) }
+        val lazyRecvType by lazy(LazyThreadSafetyMode.NONE) { emitter.inferExprRenderedType(expr.receiver, selfTypeName) }
+        if ((rawMethod == "as_ptr" || rawMethod == "as_mut_ptr") && expr.args.isEmpty()) {
+            val arrayLocal = emitter.sourceArrayLocal(expr.receiver)
+            if (arrayLocal != null) {
+                return registerCorePtrType(isMut = rawMethod == "as_mut_ptr", pointee = emitter.renderType(arrayLocal.second, selfTypeName))
+            }
+            val recvRendered = lazyRecvType
+            val recvBase = recvRendered?.removeSuffix("?")?.substringBefore('<')?.trim()
+            if (recvBase != null && (recvBase in MUT_PTR_CONTAINER_BASES || MUT_PTR_CONTAINER_BASES.any { recvBase.endsWith(".$it") })) {
+                return registerCorePtrType(isMut = true)
+            }
+            val elemRendered = recvRendered?.let { emitter.extractIndexedElementRenderedType(it, selfTypeName) }
+            if (elemRendered != null) {
+                return registerCorePtrType(isMut = rawMethod == "as_mut_ptr", pointee = elemRendered)
+            }
+        }
+        if (rawMethod in ENDIAN_INT_METHODS && expr.args.isEmpty()) {
+            return lazyRecvType ?: inferNumericKind(expr.receiver)?.let(emitter::numericKindToPureTypeName)
+        }
+        if (!emitter.hasDeclaredOptionEnum() && expr.turbofish == null) {
+            val optRecvTy = lazyRecvType
+            val recvIsNullable = optRecvTy != null && optRecvTy.endsWith("?")
+            if (recvIsNullable) {
+                if ((rawMethod == "unwrap" && expr.args.isEmpty()) ||
+                    (rawMethod in OPTION_UNWRAP_SINGLE_ARG_METHODS && expr.args.size == 1)
+                ) {
+                    return optRecvTy.removeSuffix("?")
+                }
+            }
+            if (recvIsNullable || isKnownNullableOption(expr.receiver, "")) {
+                when {
+                    (rawMethod == "or" || rawMethod == "or_else" || rawMethod == "filter") && expr.args.size == 1 ->
+                        return optRecvTy ?: "Any?"
+                    rawMethod in OPTION_ZERO_ARG_IDENTITY_METHODS && expr.args.isEmpty() ->
+                        return optRecvTy ?: "Any?"
+                    rawMethod == "flatten" && expr.args.isEmpty() ->
+                        return optRecvTy?.removeSuffix("?")?.let { inner -> if (inner.endsWith("?")) inner else "$inner?" } ?: "Any?"
+                    (rawMethod == "map" || rawMethod == "and_then") && expr.args.size == 1 -> {
+                        val firstArg = expr.args.first()
+                        val closureExpr = if (firstArg != null) emitter.unwrapParenOrGroupExpr(firstArg) as? Expr.Closure else null
+                        val cbTy = closureExpr?.let { emitter.inferExprRenderedType(it.body, selfTypeName)?.removeSuffix("?") } ?: "Any"
+                        return "$cbTy?"
                     }
-                    val methodKt = rustFunctionIdentToKotlin(lastRaw)
-                    val ownerKt =
-                        when {
-                            penultRaw == "Self" -> selfTypeName?.substringBefore('<')?.trim()
-                            penultRaw.isNotEmpty() && penultRaw.first().isUpperCase() -> rustTypeIdentToKotlin(penultRaw)
-                            else -> null
-                        }
-                    if (ownerKt != null) {
-                        val canonicalOwner = resolveTypeAliasOwnerName(ownerKt)
-                        inspector.implMethodReturnSynTypes[canonicalOwner to methodKt]?.let { return renderType(it, canonicalOwner) }
-                        inspector.implMethodReturnSynTypes[ownerKt to methodKt]?.let { return renderType(it, ownerKt) }
-                        resolveMethodSignatureForOwner(ownerKt, methodKt)?.let { (resolvedOwner, sig) ->
-                            when (val out = sig.output) {
-                                is ReturnType.TypeReturn -> return renderType(out.ty, resolvedOwner)
-                                is ReturnType.Default -> return "Unit"
-                            }
-                        }
-                        val modPrefix =
-                            segs
-                                .dropLast(2)
-                                .joinToString(".") { rustModuleIdentToKotlin(it.ident.toString().replace('-', '_')) }
-                        if (modPrefix.isNotEmpty()) {
-                            headerContext.crateFnReturnTypes["$modPrefix.$canonicalOwner.$methodKt"]?.let { return it }
-                            headerContext.crateFnReturnTypes["$modPrefix.$ownerKt.$methodKt"]?.let { return it }
-                        }
-                        for (ownerKey in (scopedAbiKeysForRenderedType(canonicalOwner) + scopedAbiKeysForRenderedType(ownerKt)).distinct()) {
-                            headerContext.crateFnReturnTypes["$ownerKey.$methodKt"]?.let { return it }
-                        }
-                        headerContext.crateFnReturnTypes["$canonicalOwner.$methodKt"]
-                            ?: headerContext.crateFnReturnTypes["$ownerKt.$methodKt"]
-                    } else {
-                        val modSubpkg =
-                            segs
-                                .dropLast(1)
-                                .joinToString(".") { rustModuleIdentToKotlin(it.ident.toString().replace('-', '_')) }
-                        headerContext.crateFnReturnTypes["$modSubpkg.$methodKt"]
-                            ?: headerContext.crateFnReturnTypes[methodKt]
+                }
+            }
+        }
+        if ("core" in headerContext.crateNamespaces && expr.turbofish == null) {
+            val recvRendered = lazyRecvType?.removeSuffix("?")?.trim()
+            when {
+                rawMethod == "chars" && expr.args.isEmpty() && (recvRendered == "String" || recvRendered == "CharSequence") ->
+                    return "$coreNs.str.iter.Chars"
+                (recvRendered == "Chars" || recvRendered?.endsWith(".Chars") == true) && expr.args.isEmpty() ->
+                    when (rawMethod) {
+                        "next" -> return "Char?"
+                        "as_str" -> return "String"
+                        "clone" -> return "$coreNs.str.iter.Chars"
+                        "enumerate" -> return "Iterator<Pair<Int, Char>>"
                     }
+                rawMethod == "to_digit" &&
+                    expr.args.size == 1 &&
+                    (recvRendered == "Char" || (emitter.unwrapParenOrGroupExpr(expr.receiver) as? Expr.Lit)?.lit is Lit.Char) ->
+                    return "UInt?"
+            }
+            val recvSimple = recvRendered?.simpleKotlinTypeName()
+            if (recvSimple != null && rawMethod in ATOMIC_VALUE_RETURNING_METHODS) {
+                atomicOwnerValueRenderedType(recvSimple)?.let { return it }
+            }
+            if (emitter.isFmtStringBuilderReceiver(expr.receiver, "", selfTypeName)) {
+                FMT_DEBUG_BUILDER_RETURNS[rawMethod]?.let { return it }
+            }
+        }
+        val recvNumericKind =
+            when (expr.receiver) {
+                is Expr.Call, is Expr.MethodCall, is Expr.BlockExpr, is Expr.Unsafe, is Expr.If ->
+                    lazyRecvType?.let(emitter::resolveNumericKind)
+                else -> inferNumericKind(expr.receiver)
+            }
+        recvNumericKind?.let { concreteRecvKind ->
+            emitter
+                .inferPrimitiveOpReturnRenderedType(concreteRecvKind, rawMethod, expr.firstTurbofishTypeArg(), selfTypeName)
+                ?.let { return it }
+        }
+        return when {
+            rawMethod in RAW_POINTER_ARITH_METHODS && expr.args.size == 1 -> lazyRecvType
+            (rawMethod == "cast_mut" || rawMethod == "cast_const") && expr.args.isEmpty() -> {
+                val recvTy = lazyRecvType
+                val pointee = rawPointerPointeeType(recvTy)
+                if (pointee != null) registerCorePtrType(isMut = rawMethod == "cast_mut", pointee = pointee) else recvTy
+            }
+            rawMethod == "wrapping_mul" && expr.args.size == 1 -> lazyRecvType
+            (rawMethod == "to_be_bytes" || rawMethod == "to_le_bytes" || rawMethod == "to_ne_bytes") && expr.args.isEmpty() -> "UByteArray"
+            rawMethod == "as_bytes" && expr.args.isEmpty() ->
+                if (headerContext.rawAbiMode || headerContext.finalClasses) "UByteArray" else "List<UByte>"
+            rawMethod == "len" && expr.args.isEmpty() -> "Int"
+            rawMethod == "to_bits" && expr.args.isEmpty() ->
+                when (recvNumericKind) {
+                    NumericKind.F16 -> "UShort"
+                    NumericKind.F32 -> "UInt"
+                    NumericKind.F128 -> "U128"
+                    else -> "ULong"
+                }
+            (rawMethod == "to_lowercase" || rawMethod == "to_uppercase") &&
+                expr.args.isEmpty() &&
+                inspector.instanceMethodsByType.values.none { rustFunctionIdentToKotlin(rawMethod) in it } -> "String"
+            (rawMethod == "split_once" || rawMethod == "rsplit_once") && expr.args.size == 1 -> "Pair<String, String>?"
+            rawMethod == "as_str" && expr.args.isEmpty() && inspector.instanceMethodsByType.values.none { "asStr" in it } -> "String"
+            (rawMethod == "ok_or" || rawMethod == "ok_or_else") && expr.args.size == 1 ->
+                if (emitter.usesTaggedCoreResult()) {
+                    val okInner = lazyRecvType?.removeSuffix("?")?.trim() ?: "*"
+                    val errExpr =
+                        if (rawMethod == "ok_or_else") {
+                            (emitter.unwrapParenOrGroupExpr(expr.args[0]) as? Expr.Closure)?.body
+                        } else {
+                            expr.args[0]
+                        }
+                    val errInner = errExpr?.let { emitter.inferExprRenderedType(it, selfTypeName)?.trim() } ?: "*"
+                    "${emitter.sourceResultName()}<$okInner, $errInner>"
+                } else {
+                    "Result<*>"
+                }
+            (rawMethod == "cloned" || rawMethod == "copied" || rawMethod == "clone") && expr.args.isEmpty() -> lazyRecvType
+            rawMethod == "cast" && expr.args.isEmpty() -> {
+                val recvTy = lazyRecvType
+                if (rawPointerPointeeType(recvTy) != null) {
+                    val isMut = isMutRawPointerRenderedType(recvTy)
+                    val destination = expr.firstTurbofishTypeArg()
+                    destination?.let { registerCorePtrType(isMut = isMut, pointee = emitter.renderType(it, selfTypeName)) }
+                        ?: run {
+                            registerCorePtrType(isMut = isMut)
+                            emitter.currentExpectedParseTargetType ?: emitter.currentEnclosingReturnRenderedType ?: recvTy
+                        }
+                } else {
+                    recvTy
+                }
+            }
+            else -> inferDeclaredOrCrateMethodReturn(expr, rawMethod, lazyRecvType ?: return null)
+        }
+    }
+
+    private fun inferDeclaredOrCrateMethodReturn(
+        expr: Expr.MethodCall,
+        rawMethod: String,
+        receiverType: String,
+    ): String? {
+        val recvTy =
+            (mutableReferencePointeeType(receiverType) ?: refCellGuardPointeeType(receiverType) ?: receiverType)
+                .removeSuffix("?")
+                .trim()
+        if (isMapRenderedType(recvTy) &&
+            (rawMethod == "get" || rawMethod == "get_mut" || rawMethod == "remove") &&
+            expr.args.size == 1 &&
+            '<' in recvTy &&
+            recvTy.endsWith('>')
+        ) {
+            val innerArgs = recvTy.substringAfter('<').dropLast(1)
+            val comma = findTopLevelGenericCommaIndex(innerArgs)
+            if (comma >= 0) {
+                val valTy = innerArgs.substring(comma + 1).trim()
+                if (valTy.isNotEmpty() && valTy != "*") return "$valTy?"
+            }
+        }
+        val ownerKt = recvTy.simpleKotlinTypeName()
+        if (ownerKt.isEmpty()) return null
+        val methodKt = rustFunctionIdentToKotlin(rawMethod)
+        emitter.mutablePlaceReturnType(ownerKt, rawMethod)?.let { return it }
+        inspector.implMethodReturnSynTypes[ownerKt to methodKt]?.let { return emitter.renderType(it, ownerKt) }
+        return emitter.scopedAbiKeysForRenderedType(recvTy).firstNotNullOfOrNull { headerContext.crateFnReturnTypes["$it.$methodKt"] }
+            ?: headerContext.crateFnReturnTypes["$ownerKt.$methodKt"]
+    }
+
+    private fun inferTupleType(expr: Expr.Tuple): String? {
+        val elems = expr.elems.toList()
+        return when (elems.size) {
+            0 -> "Unit"
+            1 -> emitter.inferExprRenderedType(elems[0], selfTypeName)
+            2 -> {
+                val t0 = emitter.inferExprRenderedType(elems[0], selfTypeName)
+                val t1 = emitter.inferExprRenderedType(elems[1], selfTypeName)
+                val pairType = if ("Pair" in inspector.declaredTypeNames) "kotlin.Pair" else "Pair"
+                if (t0 != null || t1 != null) "$pairType<${t0 ?: "Any?"}, ${t1 ?: "Any?"}>" else null
+            }
+            3 -> {
+                val t0 = emitter.inferExprRenderedType(elems[0], selfTypeName)
+                val t1 = emitter.inferExprRenderedType(elems[1], selfTypeName)
+                val t2 = emitter.inferExprRenderedType(elems[2], selfTypeName)
+                val tripleType = if ("Triple" in inspector.declaredTypeNames) "kotlin.Triple" else "Triple"
+                if (t0 != null || t1 != null || t2 != null) "$tripleType<${t0 ?: "Any?"}, ${t1 ?: "Any?"}, ${t2 ?: "Any?"}>" else null
+            }
+            else -> "List<Any?>"
+        }
+    }
+
+    fun inferNumericKind(expr: Expr): NumericKind? =
+        when (expr) {
+            is Expr.Paren -> inferNumericKind(expr.expr)
+            is Expr.Group -> inferNumericKind(expr.expr)
+            is Expr.Cast -> emitter.resolveNumericKind(emitter.renderType(expr.ty, selfTypeName))
+            is Expr.Index -> emitter.inferArrayElementNumericKind(expr.expr, selfTypeName)
+            is Expr.Field -> emitter.resolveFieldRenderedType(expr, selfTypeName)?.let(emitter::resolveNumericKind)
+            is Expr.Call, is Expr.MethodCall, is Expr.BlockExpr, is Expr.Unsafe, is Expr.If ->
+                emitter.inferExprRenderedType(expr, selfTypeName)?.let(emitter::resolveNumericKind)
+            is Expr.Lit -> inferLitNumericKind(expr.lit)
+            is Expr.Path -> inferPathNumericKind(expr)
+            is Expr.Unary ->
+                when (expr.op) {
+                    is UnOp.NotOp -> inferNumericKind(expr.expr)?.takeIf { it.isIntegerNumericKind() }
+                    is UnOp.Neg -> inferNumericKind(expr.expr)
+                    is UnOp.Deref ->
+                        emitter.inferExprRenderedType(expr, selfTypeName)?.let(emitter::resolveNumericKind)
+                            ?: inferNumericKind(expr.expr)
+                }
+            is Expr.Binary ->
+                when (expr.op) {
+                    is BinOp.Eq, is BinOp.Ne, is BinOp.Lt, is BinOp.Le, is BinOp.Gt, is BinOp.Ge, is BinOp.And, is BinOp.Or -> null
+                    is BinOp.Shl, is BinOp.Shr -> inferNumericKind(expr.left)
+                    else -> inferNumericKind(expr.left) ?: inferNumericKind(expr.right)
+                }
+            else -> null
+        }
+
+    private fun inferLitNumericKind(lit: Lit): NumericKind? =
+        when (lit) {
+            is Lit.Byte -> NumericKind.U8
+            is Lit.Float -> FLOAT_SUFFIX_NUMERIC_KINDS[lit.value.suffix()]
+            is Lit.Int ->
+                when (val sfx = lit.value.suffix()) {
+                    "isize" -> emitter.resolvePointerSizedNumericKind(signed = true)
+                    "usize" -> emitter.resolvePointerSizedNumericKind(signed = false)
+                    "" ->
+                        if (parseUnsigned128LiteralDigits(lit.value.token().toString())?.exceeds64BitUnsigned == true) {
+                            NumericKind.U128
+                        } else {
+                            null
+                        }
+                    else -> INT_SUFFIX_NUMERIC_KINDS[sfx]
+                }
+            else -> null
+        }
+
+    private fun inferPathNumericKind(expr: Expr.Path): NumericKind? {
+        emitter.resolvePrimitiveAssociatedConstKind(expr.path, expr.qself)?.let { return it }
+        if (!hasOnlyIgnoredPathPrefixes(expr)) return null
+        val segs = expr.path.segments.toList()
+        val raw = segs.last().cleanIdent()
+        val ktConst = inspector.declaredConstNames[raw]
+        val constTy = ktConst?.let { inspector.declaredConstTypes[it] }
+        if (constTy != null) return emitter.resolveNumericKind(emitter.renderType(constTy, selfTypeName))
+        val localKind =
+            when {
+                segs.size == 1 && raw == "self" -> (emitter.currentTypedLocals["this"] ?: selfTypeName)?.let(emitter::resolveNumericKind)
+                segs.size == 1 -> {
+                    val ktLocal = scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
+                    emitter.currentTypedLocals[ktLocal]?.let(emitter::resolveNumericKind)
                 }
                 else -> null
             }
-        }
-        is Expr.MethodCall -> {
-            val rawMethod = expr.method.toString().removePrefix("r#")
-            sourceReceiverMethodReturn(expr.receiver, rawMethod)?.let { return renderType(it, selfTypeName) }
-            val lazyRecvType by lazy(LazyThreadSafetyMode.NONE) { inferExprRenderedType(expr.receiver, selfTypeName) }
-            if (rawMethod in setOf("as_ptr", "as_mut_ptr") && expr.args.isEmpty()) {
-                sourceArrayLocal(expr.receiver)?.second?.let {
-                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                    val ptrType = if (rawMethod == "as_mut_ptr") "MutPtr" else "ConstPtr"
-                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.$ptrType")
-                    return "$ptrType<${renderType(it, selfTypeName)}>"
-                }
-                val recvRendered = lazyRecvType
-                val recvBase = recvRendered?.removeSuffix("?")?.substringBefore('<')?.trim()
-                val mutPtrBaseSet = setOf("NonNull", "Unique", "BoxRaw")
-                if (recvBase != null &&
-                    (recvBase in mutPtrBaseSet || mutPtrBaseSet.any { recvBase.endsWith(".$it") })
-                ) {
-                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.MutPtr")
-                    return "MutPtr"
-                }
-                if (rawMethod in
-                    setOf(
-                        "add",
-                        "sub",
-                        "offset",
-                        "byte_add",
-                        "byte_sub",
-                        "byte_offset",
-                        "wrapping_add",
-                        "wrapping_sub",
-                        "wrapping_offset",
-                        "wrapping_byte_add",
-                        "wrapping_byte_sub",
-                        "wrapping_byte_offset",
-                        "cast",
-                        "with_addr",
-                        "map_addr",
-                    )
-                ) {
-                    if (recvBase == "MutPtr" || recvBase?.endsWith(".MutPtr") == true) {
-                        return "MutPtr"
-                    }
-                    if (recvBase == "ConstPtr" || recvBase?.endsWith(".ConstPtr") == true) {
-                        return "ConstPtr"
-                    }
-                }
-                val elemRendered = recvRendered?.let { extractIndexedElementRenderedType(it, selfTypeName) }
-                if (elemRendered != null) {
-                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                    val ptrType = if (rawMethod == "as_mut_ptr") "MutPtr" else "ConstPtr"
-                    CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.$ptrType")
-                    return "$ptrType<$elemRendered>"
-                }
-            }
-            if ((rawMethod == "to_be" || rawMethod == "from_be" || rawMethod == "swap_bytes" || rawMethod == "to_le" || rawMethod == "from_le") &&
-                expr.args.isEmpty()
-            ) {
-                return lazyRecvType
-                    ?: inferExprNumericKind(expr.receiver, selfTypeName)?.let(this::numericKindToPureTypeName)
-            }
-            if (!hasDeclaredOptionEnum() && expr.turbofish == null) {
-                val optRecvTy = lazyRecvType
-                val recvIsNullable = optRecvTy != null && optRecvTy.endsWith("?")
-                if (recvIsNullable) {
-                    when {
-                        rawMethod == "unwrap" && expr.args.isEmpty() -> return optRecvTy.removeSuffix("?")
-                        (rawMethod == "expect" || rawMethod == "unwrap_or" || rawMethod == "unwrap_or_else") && expr.args.size == 1 ->
-                            return optRecvTy.removeSuffix("?")
-                    }
-                }
-                if (recvIsNullable || isKnownNullableOptionExpr(expr.receiver, "", selfTypeName)) {
-                    when {
-                        (rawMethod == "or" || rawMethod == "or_else" || rawMethod == "filter") && expr.args.size == 1 ->
-                            return optRecvTy ?: "Any?"
-                        (rawMethod == "cloned" || rawMethod == "copied" || rawMethod == "as_ref" || rawMethod == "as_mut") && expr.args.isEmpty() ->
-                            return optRecvTy ?: "Any?"
-                        rawMethod == "flatten" && expr.args.isEmpty() ->
-                            return optRecvTy?.removeSuffix("?")?.let { inner ->
-                                if (inner.endsWith("?")) inner else "$inner?"
-                            } ?: "Any?"
-                        (rawMethod == "map" || rawMethod == "and_then") && expr.args.size == 1 -> {
-                            val cbTy =
-                                expr.args
-                                    .first()
-                                    ?.let { unwrapParenOrGroupExpr(it) as? Expr.Closure }
-                                    ?.body
-                                    ?.let { inferExprRenderedType(it, selfTypeName)?.removeSuffix("?") }
-                                    ?: "Any"
-                            return "$cbTy?"
-                        }
-                    }
-                }
-            }
-            if ("core" in headerContext.crateNamespaces && expr.turbofish == null) {
-                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                val recvRendered = lazyRecvType?.removeSuffix("?")?.trim()
-                when {
-                    rawMethod == "chars" && expr.args.isEmpty() && (recvRendered == "String" || recvRendered == "CharSequence") ->
-                        return "$coreNs.str.iter.Chars"
-                    (recvRendered == "Chars" || recvRendered?.endsWith(".Chars") == true) && expr.args.isEmpty() ->
-                        when (rawMethod) {
-                            "next" -> return "Char?"
-                            "as_str" -> return "String"
-                            "clone" -> return "$coreNs.str.iter.Chars"
-                            "enumerate" -> return "Iterator<Pair<Int, Char>>"
-                        }
-                    rawMethod == "to_digit" &&
-                        expr.args.size == 1 &&
-                        (recvRendered == "Char" || (unwrapParenOrGroupExpr(expr.receiver) as? Expr.Lit)?.lit is Lit.Char) ->
-                        return "UInt?"
-                }
-                val recvSimple = recvRendered?.substringBefore('<')?.substringAfterLast('.')?.trim()
-                if (recvSimple != null) {
-                    atomicOwnerValueRenderedType(recvSimple)?.let { valTy ->
-                        if (rawMethod in setOf("load", "swap", "into_inner", "fetch_add", "fetch_sub", "fetch_and", "fetch_or", "fetch_xor", "fetch_max", "fetch_min")) {
-                            return valTy
-                        }
-                    }
-                }
-                if (isFmtStringBuilderReceiver(expr.receiver, "", selfTypeName)) {
-                    when (rawMethod) {
-                        "debug_struct" -> return "DebugStruct"
-                        "debug_tuple" -> return "DebugTuple"
-                        "debug_list" -> return "DebugList"
-                        "debug_set" -> return "DebugSet"
-                        "debug_map" -> return "DebugMap"
-                    }
-                }
-            }
-            val recvNumericKind =
-                when (expr.receiver) {
-                    is Expr.Call, is Expr.MethodCall, is Expr.BlockExpr, is Expr.Unsafe, is Expr.If ->
-                        lazyRecvType?.let(this::resolveNumericKind)
-                    else -> inferExprNumericKind(expr.receiver, selfTypeName)
-                }
-            recvNumericKind?.let { concreteRecvKind ->
-                val tfType =
-                    expr.turbofish
-                        ?.args
-                        ?.toList()
-                        ?.firstNotNullOfOrNull { (it as? GenericArgument.TypeArg)?.type }
-                inferPrimitiveOpReturnRenderedType(concreteRecvKind, rawMethod, tfType, selfTypeName)?.let {
-                    return it
-                }
-            }
-            when {
-                (
-                    rawMethod == "offset" ||
-                        rawMethod == "add" ||
-                        rawMethod == "sub" ||
-                        rawMethod == "byte_offset" ||
-                        rawMethod == "byte_add" ||
-                        rawMethod == "byte_sub" ||
-                        rawMethod == "wrapping_offset" ||
-                        rawMethod == "wrapping_add" ||
-                        rawMethod == "wrapping_sub" ||
-                        rawMethod == "wrapping_byte_offset" ||
-                        rawMethod == "wrapping_byte_add" ||
-                        rawMethod == "wrapping_byte_sub"
-                ) && expr.args.size == 1 -> lazyRecvType
-                rawMethod == "cast_mut" && expr.args.isEmpty() -> {
-                    val recvTy = lazyRecvType
-                    val pointee = rawPointerPointeeType(recvTy)
-                    if (pointee != null) {
-                        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.MutPtr")
-                        "MutPtr<$pointee>"
-                    } else {
-                        recvTy
-                    }
-                }
-                rawMethod == "cast_const" && expr.args.isEmpty() -> {
-                    val recvTy = lazyRecvType
-                    val pointee = rawPointerPointeeType(recvTy)
-                    if (pointee != null) {
-                        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.ConstPtr")
-                        "ConstPtr<$pointee>"
-                    } else {
-                        recvTy
-                    }
-                }
-                rawMethod == "wrapping_mul" && expr.args.size == 1 -> lazyRecvType
-                (rawMethod == "to_be_bytes" || rawMethod == "to_le_bytes" || rawMethod == "to_ne_bytes") && expr.args.isEmpty() ->
-                    "UByteArray"
-                rawMethod == "as_bytes" && expr.args.isEmpty() ->
-                    if (headerContext.rawAbiMode || headerContext.finalClasses) "UByteArray" else "List<UByte>"
-                rawMethod == "len" && expr.args.isEmpty() -> "Int"
-                rawMethod == "to_bits" && expr.args.isEmpty() ->
-                    when (recvNumericKind) {
-                        NumericKind.F16 -> "UShort"
-                        NumericKind.F32 -> "UInt"
-                        NumericKind.F128 -> "U128"
-                        else -> "ULong"
-                    }
-                (rawMethod == "to_lowercase" || rawMethod == "to_uppercase") &&
-                    expr.args.isEmpty() &&
-                    inspector.instanceMethodsByType.values.none { rustFunctionIdentToKotlin(rawMethod) in it } -> "String"
-                (rawMethod == "split_once" || rawMethod == "rsplit_once") && expr.args.size == 1 -> "Pair<String, String>?"
-                rawMethod == "as_str" &&
-                    expr.args.isEmpty() &&
-                    inspector.instanceMethodsByType.values.none { "asStr" in it } -> "String"
-                (rawMethod == "ok_or" || rawMethod == "ok_or_else") && expr.args.size == 1 ->
-                    if (usesTaggedCoreResult()) {
-                        val okInner = lazyRecvType?.removeSuffix("?")?.trim() ?: "*"
-                        val errExpr =
-                            if (rawMethod == "ok_or_else") {
-                                (unwrapParenOrGroupExpr(expr.args[0]) as? Expr.Closure)?.body
-                            } else {
-                                expr.args[0]
-                            }
-                        val errInner = errExpr?.let { inferExprRenderedType(it, selfTypeName)?.trim() } ?: "*"
-                        "${sourceResultName()}<$okInner, $errInner>"
-                    } else {
-                        "Result<*>"
-                    }
-                (rawMethod == "cloned" || rawMethod == "copied") && expr.args.isEmpty() ->
-                    lazyRecvType
-                rawMethod == "cast" && expr.args.isEmpty() -> {
-                    val recvTy = lazyRecvType
-                    if (rawPointerPointeeType(recvTy) != null) {
-                        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                        val ptrCtor = if (isMutRawPointerRenderedType(recvTy)) "MutPtr" else "ConstPtr"
-                        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.$ptrCtor")
-                        val destination =
-                            expr.turbofish
-                                ?.args
-                                ?.toList()
-                                ?.firstNotNullOfOrNull { (it as? GenericArgument.TypeArg)?.type }
-                        return destination?.let { "$ptrCtor<${renderType(it, selfTypeName)}>" }
-                            ?: currentExpectedParseTargetType
-                            ?: currentEnclosingReturnRenderedType
-                            ?: recvTy
-                    }
-                    lazyRecvType
-                }
-                rawMethod == "clone" && expr.args.isEmpty() -> lazyRecvType
-                else -> {
-                    val receiverType = lazyRecvType ?: return null
-                    val recvTy =
-                        (
-                            mutableReferencePointeeType(receiverType)
-                                ?: refCellGuardPointeeType(receiverType)
-                                ?: receiverType
-                        ).removeSuffix("?").trim()
-                    if (isMapRenderedType(recvTy) &&
-                        (rawMethod == "get" || rawMethod == "get_mut" || rawMethod == "remove") &&
-                        expr.args.size == 1 &&
-                        '<' in recvTy &&
-                        recvTy.endsWith('>')
-                    ) {
-                        val innerArgs = recvTy.substringAfter('<').dropLast(1)
-                        val comma = findTopLevelGenericCommaIndex(innerArgs)
-                        if (comma >= 0) {
-                            val valTy = innerArgs.substring(comma + 1).trim()
-                            if (valTy.isNotEmpty() && valTy != "*") return "$valTy?"
-                        }
-                    }
-                    val ownerKt = recvTy.substringAfterLast('.').substringBefore('<').trim()
-                    if (ownerKt.isEmpty()) return null
-                    val methodKt = rustFunctionIdentToKotlin(rawMethod)
-                    mutablePlaceReturnType(ownerKt, rawMethod)?.let { return it }
-                    inspector.implMethodReturnSynTypes[ownerKt to methodKt]?.let { return renderType(it, ownerKt) }
-                    for (ownerKey in scopedAbiKeysForRenderedType(recvTy)) {
-                        headerContext.crateFnReturnTypes["$ownerKey.$methodKt"]?.let { return it }
-                    }
-                    headerContext.crateFnReturnTypes["$ownerKt.$methodKt"]
-                }
-            }
-        }
-        is Expr.BlockExpr -> {
-            val tail = expr.block.stmts.lastOrNull() as? Stmt.ExprStmt
-            if (tail != null && tail.semiToken == null) inferExprRenderedType(tail.expr, selfTypeName) else null
-        }
-        is Expr.Unsafe -> {
-            val tail = expr.block.stmts.lastOrNull() as? Stmt.ExprStmt
-            if (tail != null && tail.semiToken == null) inferExprRenderedType(tail.expr, selfTypeName) else null
-        }
-        is Expr.If -> {
-            val tail = expr.thenBranch.stmts.lastOrNull() as? Stmt.ExprStmt
-            if (tail != null && tail.semiToken == null) inferExprRenderedType(tail.expr, selfTypeName) else null
-        }
-        is Expr.Repeat -> {
-            val elemTy = inferExplicitArrayElementRenderedType(expr.expr, selfTypeName)
-            primitiveArrayTypeForElementRenderedType(elemTy) ?: elemTy?.let { "List<$it>" }
-        }
-        is Expr.Tuple -> {
-            val elems = expr.elems.toList()
-            val pairType = if ("Pair" in inspector.declaredTypeNames) "kotlin.Pair" else "Pair"
-            val tripleType = if ("Triple" in inspector.declaredTypeNames) "kotlin.Triple" else "Triple"
-            when (elems.size) {
-                0 -> "Unit"
-                1 -> inferExprRenderedType(elems[0], selfTypeName)
-                2 -> {
-                    val t0 = inferExprRenderedType(elems[0], selfTypeName)
-                    val t1 = inferExprRenderedType(elems[1], selfTypeName)
-                    if (t0 != null || t1 != null) "$pairType<${t0 ?: "Any?"}, ${t1 ?: "Any?"}>" else null
-                }
-                3 -> {
-                    val t0 = inferExprRenderedType(elems[0], selfTypeName)
-                    val t1 = inferExprRenderedType(elems[1], selfTypeName)
-                    val t2 = inferExprRenderedType(elems[2], selfTypeName)
-                    if (t0 != null || t1 != null || t2 != null) {
-                        "$tripleType<${t0 ?: "Any?"}, ${t1 ?: "Any?"}, ${t2 ?: "Any?"}>"
-                    } else {
-                        null
-                    }
-                }
-                else -> "List<Any?>"
-            }
-        }
-        is Expr.Array -> {
-            val elemTy = expr.elems.toList().firstNotNullOfOrNull { inferExplicitArrayElementRenderedType(it, selfTypeName) }
-            primitiveArrayTypeForElementRenderedType(elemTy) ?: elemTy?.let { "List<$it>" }
-        }
-        else -> null
+        if (localKind != null) return localKind
+        val ktConstIdent = ktConst ?: KotlinNamingPolicy.Default.toConstIdentifier(raw)
+        return emitter.scopedAbiKeysForRenderedType(ktConstIdent).firstNotNullOfOrNull {
+            emitter.numericKindFromScannerCode(headerContext.crateNumericTypeKinds[it])
+        } ?: emitter.resolveBestSubpackageForSymbol(ktConstIdent)?.let { sub ->
+            val key = if (sub.isEmpty()) ktConstIdent else "$sub.$ktConstIdent"
+            emitter.numericKindFromScannerCode(headerContext.crateNumericTypeKinds[key])
+        } ?: emitter.numericKindFromScannerCode(headerContext.crateNumericTypeKinds[ktConstIdent])
     }
+
+    companion object {
+        private val NONE_PATH_SHAPES: Set<List<String>> =
+            setOf(
+                listOf("None"),
+                listOf("Option", "None"),
+                listOf("core", "option", "Option", "None"),
+                listOf("std", "option", "Option", "None"),
+            )
+        private val NON_OPTION_METHOD_NAMES: Set<String> =
+            wordSet("ok_or ok_or_else is_ok is_err is_some is_none map_err to_lowercase to_uppercase")
+        private val OPTION_CHAIN_PRESERVING_METHODS: Set<String> =
+            wordSet("map and_then flatten or or_else as_ref as_mut cloned copied filter")
+        private val NULLABLE_NEW_WRAPPER_OWNERS: Set<String> = wordSet("NonNull NonZero Alignment")
+        private val LAYOUT_QUERY_FN_IDENTS: Set<String> = wordSet("size_of size_of_val align_of align_of_val")
+        private val MUT_PTR_CONTAINER_BASES: Set<String> = wordSet("NonNull Unique BoxRaw")
+        private val ENDIAN_INT_METHODS: Set<String> = wordSet("to_be from_be swap_bytes to_le from_le")
+        private val OPTION_UNWRAP_SINGLE_ARG_METHODS: Set<String> = wordSet("expect unwrap_or unwrap_or_else")
+        private val OPTION_ZERO_ARG_IDENTITY_METHODS: Set<String> = wordSet("cloned copied as_ref as_mut")
+        private val ATOMIC_VALUE_RETURNING_METHODS: Set<String> =
+            wordSet("load swap into_inner fetch_add fetch_sub fetch_and fetch_or fetch_xor fetch_max fetch_min")
+        private val FMT_DEBUG_BUILDER_RETURNS: Map<String, String> =
+            mapOf(
+                "debug_struct" to "DebugStruct",
+                "debug_tuple" to "DebugTuple",
+                "debug_list" to "DebugList",
+                "debug_set" to "DebugSet",
+                "debug_map" to "DebugMap",
+            )
+        private val FLOAT_SUFFIX_NUMERIC_KINDS: Map<String, NumericKind> =
+            mapOf(
+                "f16" to NumericKind.F16,
+                "f32" to NumericKind.F32,
+                "f64" to NumericKind.F64,
+                "f128" to NumericKind.F128,
+            )
+        private val INT_SUFFIX_NUMERIC_KINDS: Map<String, NumericKind> =
+            mapOf(
+                "i8" to NumericKind.I8,
+                "u8" to NumericKind.U8,
+                "i16" to NumericKind.I16,
+                "u16" to NumericKind.U16,
+                "i32" to NumericKind.I32,
+                "u32" to NumericKind.U32,
+                "i64" to NumericKind.I64,
+                "u64" to NumericKind.U64,
+                "i128" to NumericKind.I128,
+                "u128" to NumericKind.U128,
+            )
+    }
+}
 
 internal val NUMERIC_COERCE_SUFFIX_BY_KIND: Map<NumericKind, String> =
     mapOf(
@@ -1246,6 +1189,8 @@ internal val NUMERIC_COERCE_SUFFIX_BY_KIND: Map<NumericKind, String> =
         NumericKind.F64 to "toDouble()",
     )
 
+private val NUMERIC_KIND_BY_NAME: Map<String, NumericKind> = NumericKind.entries.associateBy { it.name }
+
 internal fun NumericKind.isIntegerNumericKind(): Boolean =
     this != NumericKind.F16 && this != NumericKind.F32 && this != NumericKind.F64 && this != NumericKind.F128
 
@@ -1260,12 +1205,15 @@ internal fun KotlinJ2KEmitter.resolvePointerSizedNumericKind(signed: Boolean): N
         NumericKind.I32
     }
 
-internal fun KotlinJ2KEmitter.unwrapParenOrGroupExpr(expr: Expr): Expr =
+internal fun unwrapExprParens(expr: Expr): Expr =
     when (expr) {
-        is Expr.Paren -> unwrapParenOrGroupExpr(expr.expr)
-        is Expr.Group -> unwrapParenOrGroupExpr(expr.expr)
+        is Expr.Paren -> unwrapExprParens(expr.expr)
+        is Expr.Group -> unwrapExprParens(expr.expr)
         else -> expr
     }
+
+internal fun KotlinJ2KEmitter.unwrapParenOrGroupExpr(expr: Expr): Expr =
+    unwrapExprParens(expr)
 
 internal fun KotlinJ2KEmitter.isNarrowComparisonLiteralOperand(operand: Expr, targetKind: NumericKind): Boolean {
     val isNarrowUnsigned = targetKind == NumericKind.U8 || targetKind == NumericKind.U16
@@ -1273,20 +1221,16 @@ internal fun KotlinJ2KEmitter.isNarrowComparisonLiteralOperand(operand: Expr, ta
     if (!isNarrowUnsigned && !isNarrowSigned) return false
     val core = unwrapParenOrGroupExpr(operand)
     if (core is Expr.Lit) {
-        val lit = core.lit
-        if (lit is Lit.Int) {
-            val suffix = lit.value.suffix()
-            return if (isNarrowUnsigned) {
-                suffix.isEmpty() || suffix == "u8" || suffix == "u16"
-            } else {
-                suffix.isEmpty() || suffix == "i8" || suffix == "i16"
-            }
+        val lit = core.lit as? Lit.Int ?: return false
+        val suffix = lit.value.suffix()
+        return if (isNarrowUnsigned) {
+            suffix.isEmpty() || suffix == "u8" || suffix == "u16"
+        } else {
+            suffix.isEmpty() || suffix == "i8" || suffix == "i16"
         }
-        return false
     }
     if (isNarrowSigned && core is Expr.Unary && core.op is UnOp.Neg) {
-        val inner = unwrapParenOrGroupExpr(core.expr)
-        val innerLit = (inner as? Expr.Lit)?.lit as? Lit.Int ?: return false
+        val innerLit = (unwrapParenOrGroupExpr(core.expr) as? Expr.Lit)?.lit as? Lit.Int ?: return false
         val suffix = innerLit.value.suffix()
         return suffix.isEmpty() || suffix == "i8" || suffix == "i16"
     }
@@ -1296,17 +1240,13 @@ internal fun KotlinJ2KEmitter.isNarrowComparisonLiteralOperand(operand: Expr, ta
 internal fun KotlinJ2KEmitter.coerceRenderedNarrowLiteral(sourceExpr: Expr, rendered: String, kind: NumericKind): String {
     if (isAlreadyRenderedAsNumericKind(rendered, kind)) return rendered
     val recv = if (isAtomicPostfixReceiver(sourceExpr, rendered)) rendered else "($rendered)"
-    if (kind !in setOf(NumericKind.U8, NumericKind.U16, NumericKind.I8, NumericKind.I16)) return rendered
+    if (kind != NumericKind.U8 && kind != NumericKind.U16 && kind != NumericKind.I8 && kind != NumericKind.I16) return rendered
     val suffix = NUMERIC_COERCE_SUFFIX_BY_KIND[kind] ?: return rendered
     return if (rendered.endsWith(".$suffix")) rendered else "$recv.$suffix"
 }
 
 internal fun KotlinJ2KEmitter.isUnsignedKind(kind: NumericKind): Boolean =
-    kind == NumericKind.U8 ||
-        kind == NumericKind.U16 ||
-        kind == NumericKind.U32 ||
-        kind == NumericKind.U64 ||
-        kind == NumericKind.U128
+    kind == NumericKind.U8 || kind == NumericKind.U16 || kind == NumericKind.U32 || kind == NumericKind.U64 || kind == NumericKind.U128
 
 internal fun KotlinJ2KEmitter.coerceRenderedNumericExpr(sourceExpr: Expr, rendered: String, kind: NumericKind): String {
     if (isAlreadyRenderedAsNumericKind(rendered, kind)) return rendered
@@ -1317,116 +1257,6 @@ internal fun KotlinJ2KEmitter.coerceRenderedNumericExpr(sourceExpr: Expr, render
     val suffix = NUMERIC_COERCE_SUFFIX_BY_KIND[kind] ?: return rendered
     return if (rendered.endsWith(".$suffix")) rendered else "$recv.$suffix"
 }
-
-internal fun KotlinJ2KEmitter.inferExprNumericKind(expr: Expr, selfTypeName: String?): NumericKind? =
-    when (expr) {
-        is Expr.Paren -> inferExprNumericKind(expr.expr, selfTypeName)
-        is Expr.Group -> inferExprNumericKind(expr.expr, selfTypeName)
-        is Expr.Cast -> resolveNumericKind(renderType(expr.ty, selfTypeName))
-        is Expr.Index -> inferArrayElementNumericKind(expr.expr, selfTypeName)
-        is Expr.Field -> resolveFieldRenderedType(expr, selfTypeName)?.let(this::resolveNumericKind)
-        is Expr.Call, is Expr.MethodCall, is Expr.BlockExpr, is Expr.Unsafe, is Expr.If ->
-            inferExprRenderedType(expr, selfTypeName)?.let(this::resolveNumericKind)
-        is Expr.Lit -> {
-            val lit = expr.lit
-            when (lit) {
-                is Lit.Byte -> NumericKind.U8
-                is Lit.Float ->
-                    when (lit.value.suffix()) {
-                        "f16" -> NumericKind.F16
-                        "f32" -> NumericKind.F32
-                        "f64" -> NumericKind.F64
-                        "f128" -> NumericKind.F128
-                        else -> null
-                    }
-                is Lit.Int -> {
-                    when (lit.value.suffix()) {
-                        "i8" -> NumericKind.I8
-                        "u8" -> NumericKind.U8
-                        "i16" -> NumericKind.I16
-                        "u16" -> NumericKind.U16
-                        "i32" -> NumericKind.I32
-                        "u32" -> NumericKind.U32
-                        "i64" -> NumericKind.I64
-                        "u64" -> NumericKind.U64
-                        "i128" -> NumericKind.I128
-                        "u128" -> NumericKind.U128
-                        "isize" -> resolvePointerSizedNumericKind(signed = true)
-                        "usize" -> resolvePointerSizedNumericKind(signed = false)
-                        "" -> {
-                            val parsed = parseUnsigned128LiteralDigits(lit.value.token().toString())
-                            if (parsed?.exceeds64BitUnsigned == true) NumericKind.U128 else null
-                        }
-                        else -> null
-                    }
-                }
-                else -> null
-            }
-        }
-        is Expr.Path -> {
-            val constPrimKind = resolvePrimitiveAssociatedConstKind(expr.path, expr.qself)
-            val segs = expr.path.segments.toList()
-            val hasOnlyIgnoredPrefixes =
-                expr.qself == null &&
-                    segs.isNotEmpty() &&
-                    segs.dropLast(1).all {
-                        it.arguments is PathArguments.None &&
-                            it.ident.toString().removePrefix("r#") in IGNORED_PATH_PREFIXES
-                    }
-            when {
-                constPrimKind != null -> constPrimKind
-                hasOnlyIgnoredPrefixes -> {
-                    val raw =
-                        segs
-                            .last()
-                            .ident
-                            .toString()
-                            .removePrefix("r#")
-                    val ktConst = inspector.declaredConstNames[raw]
-                    val constTy = ktConst?.let { inspector.declaredConstTypes[it] }
-                    if (constTy != null) {
-                        resolveNumericKind(renderType(constTy, selfTypeName))
-                    } else {
-                        val localKind =
-                            if (segs.size == 1 && raw == "self") {
-                                (currentTypedLocals["this"] ?: selfTypeName)?.let(this::resolveNumericKind)
-                            } else if (segs.size == 1) {
-                                val ktLocal = scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
-                                currentTypedLocals[ktLocal]?.let(this::resolveNumericKind)
-                            } else {
-                                null
-                            }
-                        if (localKind != null) {
-                            localKind
-                        } else {
-                            val ktConstIdent = ktConst ?: KotlinNamingPolicy.Default.toConstIdentifier(raw)
-                            scopedAbiKeysForRenderedType(ktConstIdent).firstNotNullOfOrNull {
-                                numericKindFromScannerCode(headerContext.crateNumericTypeKinds[it])
-                            } ?: resolveBestSubpackageForSymbol(ktConstIdent)?.let { sub ->
-                                val key = if (sub.isEmpty()) ktConstIdent else "$sub.$ktConstIdent"
-                                numericKindFromScannerCode(headerContext.crateNumericTypeKinds[key])
-                            } ?: numericKindFromScannerCode(headerContext.crateNumericTypeKinds[ktConstIdent])
-                        }
-                    }
-                }
-                else -> null
-            }
-        }
-        is Expr.Unary ->
-            when (expr.op) {
-                is UnOp.NotOp -> inferExprNumericKind(expr.expr, selfTypeName)?.takeIf { it.isIntegerNumericKind() }
-                is UnOp.Neg -> inferExprNumericKind(expr.expr, selfTypeName)
-                is UnOp.Deref -> inferExprRenderedType(expr, selfTypeName)?.let(this::resolveNumericKind) ?: inferExprNumericKind(expr.expr, selfTypeName)
-            }
-        is Expr.Binary -> {
-            when (expr.op) {
-                is BinOp.Eq, is BinOp.Ne, is BinOp.Lt, is BinOp.Le, is BinOp.Gt, is BinOp.Ge, is BinOp.And, is BinOp.Or -> null
-                is BinOp.Shl, is BinOp.Shr -> inferExprNumericKind(expr.left, selfTypeName)
-                else -> inferExprNumericKind(expr.left, selfTypeName) ?: inferExprNumericKind(expr.right, selfTypeName)
-            }
-        }
-        else -> null
-    }
 
 internal fun KotlinJ2KEmitter.numericKindToPureTypeName(kind: NumericKind): String =
     when (kind) {
@@ -1447,33 +1277,12 @@ internal fun KotlinJ2KEmitter.numericKindToPureTypeName(kind: NumericKind): Stri
     }
 
 internal fun KotlinJ2KEmitter.numericKindFromScannerCode(code: String?): NumericKind? =
-    when (code) {
-        "I8" -> NumericKind.I8
-        "U8" -> NumericKind.U8
-        "I16" -> NumericKind.I16
-        "U16" -> NumericKind.U16
-        "I32" -> NumericKind.I32
-        "U32" -> NumericKind.U32
-        "I64" -> NumericKind.I64
-        "U64" -> NumericKind.U64
-        "I128" -> NumericKind.I128
-        "U128" -> NumericKind.U128
-        "F16" -> NumericKind.F16
-        "F32" -> NumericKind.F32
-        "F64" -> NumericKind.F64
-        "F128" -> NumericKind.F128
-        else -> null
-    }
+    code?.let(NUMERIC_KIND_BY_NAME::get)
 
 internal fun KotlinJ2KEmitter.borrowedPlaceLocalName(expr: Expr): String? {
     val path = unwrapParenOrGroupExpr(expr) as? Expr.Path ?: return null
     if (path.qself != null || path.path.segments.size != 1) return null
-    val raw =
-        path.path.segments
-            .first()
-            ?.ident
-            ?.toString()
-            ?.removePrefix("r#") ?: return null
+    val raw = path.path.firstCleanIdent() ?: return null
     val name = scopeBuilder.resolveLocalKotlinName(raw) ?: rustValueIdentToKotlin(raw)
     return name.takeIf { it in currentBorrowedPlaceLocals }
 }
@@ -1500,10 +1309,19 @@ internal fun KotlinJ2KEmitter.borrowedPlaceProjection(
     val call = core as? Expr.MethodCall ?: return null
     if (!call.args.isEmpty() || call.turbofish != null) return null
     val receiverType = inferExprRenderedType(call.receiver, selfTypeName) ?: return null
-    val owner = receiverType.removeSuffix("?").substringBefore('<').substringAfterLast('.')
+    val owner = receiverType.removeSuffix("?").simpleKotlinTypeName()
     val fields = mutableReferenceProjection(owner, call.method.toString(), linkedSetOf()) ?: return null
     return call.receiver to fields
 }
+
+private fun KotlinJ2KEmitter.findSingleReceiverInherentImplMethod(owner: String, method: String): ImplItem.Fn? =
+    file.items
+        .filterIsInstance<Item.Impl>()
+        .filter { it.traitPath == null && renderType(it.selfType, owner).simpleKotlinTypeName() == owner }
+        .flatMap { it.items.filterIsInstance<ImplItem.Fn>() }
+        .singleOrNull {
+            it.sig.ident.toString() == method && it.sig.inputs.size == 1 && it.sig.hasSelfReceiver()
+        }
 
 internal fun KotlinJ2KEmitter.mutablePlaceAccessorType(owner: String, method: String): String? {
     // A raw Rust address can escape into FFI/atomic operations. It must retain
@@ -1514,7 +1332,7 @@ internal fun KotlinJ2KEmitter.mutablePlaceAccessorType(owner: String, method: St
     var type: SynType? = null
     for (field in fields) {
         type = inspector.structFieldSynTypesByType[fieldOwner]?.get(field) ?: return null
-        fieldOwner = renderType(type, fieldOwner).substringBefore('<').substringAfterLast('.')
+        fieldOwner = renderType(type, fieldOwner).simpleKotlinTypeName()
     }
     return "kotlin.reflect.KMutableProperty0<${renderType(type ?: return null, owner)}>"
 }
@@ -1530,7 +1348,9 @@ internal fun KotlinJ2KEmitter.mutablePlaceReturnType(
     val transparent = transparentDeclaration(owner)
     val liveField = transparent?.let { sourceTransparentField(it, owner + renderTypeArgumentsFromGenerics(it.generics)) }
     val declaredOutput = inspector.implMethodReturnSynTypes[owner to rustFunctionIdentToKotlin(method)]
-    if (liveField != null && declaredOutput is SynType.Reference && declaredOutput.mutability != null &&
+    if (liveField != null &&
+        declaredOutput is SynType.Reference &&
+        declaredOutput.mutability != null &&
         mutableReferenceProjection(owner, method, linkedSetOf()) == listOf(liveField.first)
     ) {
         val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
@@ -1541,15 +1361,7 @@ internal fun KotlinJ2KEmitter.mutablePlaceReturnType(
     val key = owner to method
     if (!visiting.add(key)) return null
     try {
-        val fn =
-            file.items
-                .filterIsInstance<Item.Impl>()
-                .filter {
-                    it.traitPath == null && renderType(it.selfType, owner).substringBefore('<').substringAfterLast('.') == owner
-                }.flatMap { it.items.filterIsInstance<ImplItem.Fn>() }
-                .singleOrNull {
-                    it.sig.ident.toString() == method && it.sig.inputs.size == 1 && it.sig.inputs.firstOrNull() is FnArg.Receiver
-                } ?: return null
+        val fn = findSingleReceiverInherentImplMethod(owner, method) ?: return null
         val output = (fn.sig.output as? ReturnType.TypeReturn)?.ty ?: return null
         if (output !is SynType.Reference || output.mutability == null) return null
         val tail = fn.block.stmts.lastOrNull() as? Stmt.ExprStmt ?: return null
@@ -1595,39 +1407,29 @@ internal val STR_PRIMITIVE_PARSE_METHODS: Map<String, String> =
 internal fun refCellGuardPointeeType(type: String?): String? {
     val base = type?.trim()?.removeSuffix("?") ?: return null
     if (!base.endsWith('>')) return null
-    val simple = base.substringBefore('<').substringAfterLast('.').trim()
+    val simple = base.simpleKotlinTypeName()
     if (simple != "Ref" && simple != "RefMut") return null
-    return base
-        .substringAfter('<')
-        .dropLast(1)
-        .trim()
-        .takeIf { it.isNotEmpty() }
+    val inner = base.substringAfter('<').dropLast(1).trim()
+    return inner.ifEmpty { null }
 }
+
+private val MAP_TYPE_PREFIXES = listOf("MutableMap<", "Map<", "LinkedHashMap<", "HashMap<")
+private val SET_TYPE_PREFIXES = listOf("MutableSet<", "Set<", "LinkedHashSet<", "HashSet<")
+private val INDEXED_SLICE_BASES = wordSet("List MutableList Array ArrayDeque")
 
 internal fun isMapRenderedType(type: String?): Boolean {
     val clean = type?.removeSuffix("?")?.trim() ?: return false
-    return clean.startsWith("MutableMap<") ||
-        clean.startsWith("Map<") ||
-        clean.startsWith("LinkedHashMap<") ||
-        clean.startsWith("HashMap<")
+    return MAP_TYPE_PREFIXES.any(clean::startsWith)
 }
 
 internal fun isSetRenderedType(type: String?): Boolean {
     val clean = type?.removeSuffix("?")?.trim() ?: return false
-    return clean.startsWith("MutableSet<") ||
-        clean.startsWith("Set<") ||
-        clean.startsWith("LinkedHashSet<") ||
-        clean.startsWith("HashSet<")
+    return SET_TYPE_PREFIXES.any(clean::startsWith)
 }
 
 internal fun isIndexedSliceOrArrayRenderedType(type: String?): Boolean {
-    val clean = type?.trim()?.removeSuffix("?")?.trim() ?: return false
-    val base = clean.substringBefore('<').substringAfterLast('.').trim()
-    return base in PRIMITIVE_ARRAY_TYPES ||
-        base == "List" ||
-        base == "MutableList" ||
-        base == "Array" ||
-        base == "ArrayDeque"
+    val base = type?.trim()?.removeSuffix("?")?.simpleKotlinTypeName() ?: return false
+    return base in PRIMITIVE_ARRAY_TYPES || base in INDEXED_SLICE_BASES
 }
 
 internal fun mutablePlaceValueType(type: String?): String? =
@@ -1644,17 +1446,7 @@ internal fun KotlinJ2KEmitter.mutableReferenceProjection(
     val key = owner to method
     if (!visiting.add(key)) return null
     try {
-        val candidates =
-            file.items
-                .filterIsInstance<Item.Impl>()
-                .filter {
-                    it.traitPath == null && renderType(it.selfType, owner).substringBefore('<').substringAfterLast('.') == owner
-                }.flatMap { it.items.filterIsInstance<ImplItem.Fn>() }
-                .filter {
-                    it.sig.ident.toString() == method && it.sig.inputs.size == 1 &&
-                        it.sig.inputs.firstOrNull() is FnArg.Receiver
-                }
-        val fn = candidates.singleOrNull() ?: return null
+        val fn = findSingleReceiverInherentImplMethod(owner, method) ?: return null
         val output = (fn.sig.output as? ReturnType.TypeReturn)?.ty ?: return null
         if (output !is SynType.Ptr && (output !is SynType.Reference || output.mutability == null)) return null
         var body = (fn.block.stmts.singleOrNull() as? Stmt.ExprStmt)?.expr ?: return null
@@ -1664,17 +1456,13 @@ internal fun KotlinJ2KEmitter.mutableReferenceProjection(
         // accessor (Cell::as_ptr -> UnsafeCell::get). The transparent-layout
         // proof is required for reinterpret casts, not for that forwarding.
         if (output is SynType.Ptr && body is Expr.Cast) {
-            val struct =
-                file.items.filterIsInstance<Item.Struct>().singleOrNull {
-                    rustTypeIdentToKotlin(it.ident.toString()) == owner
-                } ?: return null
+            val struct = file.findStructByKotlinName(owner) ?: return null
             val transparent =
                 struct.attrs.any { attr ->
                     val meta = attr.meta as? Meta.List
+                    val reprToks = meta?.tokens?.clone()?.toList()
                     meta != null && meta.path.isIdent("repr") &&
-                        meta.tokens.clone().toList().any {
-                            it is TokenTree.Ident && it.value.toString() == "transparent"
-                        }
+                        reprToks?.any { it is TokenTree.Ident && it.value.toString() == "transparent" } == true
                 }
             if (!transparent) return null
             val field = inspector.structFieldSynTypesByType[owner]?.entries?.singleOrNull() ?: return null
@@ -1691,6 +1479,7 @@ internal fun KotlinJ2KEmitter.mutableReferenceProjection(
         }
         val borrowsField = body is Expr.Reference && body.mutability != null
         if (borrowsField) body = unwrapParenOrGroupExpr(body.expr)
+
         fun fieldPath(place: Expr): List<String>? {
             val core = unwrapParenOrGroupExpr(place)
             if (core is Expr.Path && core.qself == null && core.path.isIdent("self")) return emptyList()
@@ -1698,6 +1487,7 @@ internal fun KotlinJ2KEmitter.mutableReferenceProjection(
             val member = field.member as? Member.Named ?: return null
             return fieldPath(field.base)?.plus(rustFieldIdentToKotlin(member.ident.toString()))
         }
+
         if (borrowsField) fieldPath(body)?.takeIf { it.isNotEmpty() }?.let { return it }
         val forwarded = body as? Expr.MethodCall ?: return null
         if (!forwarded.args.isEmpty() || forwarded.turbofish != null) return null
@@ -1705,7 +1495,7 @@ internal fun KotlinJ2KEmitter.mutableReferenceProjection(
         var fieldOwner = owner
         for (field in prefix) {
             val type = inspector.structFieldSynTypesByType[fieldOwner]?.get(field) ?: return null
-            fieldOwner = renderType(type, fieldOwner).substringBefore('<').substringAfterLast('.')
+            fieldOwner = renderType(type, fieldOwner).simpleKotlinTypeName()
         }
         return prefix + (mutableReferenceProjection(fieldOwner, forwarded.method.toString(), visiting) ?: return null)
     } finally {
@@ -1716,11 +1506,8 @@ internal fun KotlinJ2KEmitter.mutableReferenceProjection(
 internal fun unwrapMaybeUninitRenderedInner(rendered: String?): String? {
     val clean = rendered?.trim()?.takeIf { it.isNotEmpty() } ?: return null
     if ((clean.startsWith("MaybeUninit<") || ".MaybeUninit<" in clean) && clean.endsWith(">")) {
-        return clean
-            .substringAfter("MaybeUninit<")
-            .removeSuffix(">")
-            .trim()
-            .takeIf { it.isNotEmpty() }
+        val inner = clean.substringAfter("MaybeUninit<").removeSuffix(">").trim()
+        return inner.ifEmpty { null }
     }
     return null
 }
@@ -1734,10 +1521,7 @@ internal fun KotlinJ2KEmitter.resolveMaybeUninitElementRenderedType(
     if (funcPath != null) {
         for (seg in funcPath.segments.toList()) {
             val ab = seg.arguments as? PathArguments.AngleBracketed ?: continue
-            val firstTy =
-                ab.args
-                    .toList()
-                    .firstNotNullOfOrNull { renderGenericArgument(it, selfTypeName) }
+            val firstTy = ab.args.toList().firstNotNullOfOrNull { renderGenericArgument(it, selfTypeName) }
             if (!firstTy.isNullOrBlank()) {
                 return unwrapMaybeUninitRenderedInner(firstTy) ?: firstTy.trim()
             }
@@ -1756,15 +1540,12 @@ internal fun KotlinJ2KEmitter.resolveMaybeUninitElementRenderedType(
     if (!ownerBase.isNullOrEmpty()) {
         val singleFieldSyn = inspector.structFieldSynTypesByType[ownerBase]?.values?.singleOrNull()
         if (singleFieldSyn != null) {
-            val renderedField = renderType(singleFieldSyn, selfTypeName)
-            unwrapMaybeUninitRenderedInner(renderedField)?.let { return it }
+            unwrapMaybeUninitRenderedInner(renderType(singleFieldSyn, selfTypeName))?.let { return it }
         }
     }
     currentEnclosingReturnRenderedType?.trim()?.takeIf { it.isNotEmpty() && it != "Unit" }?.let { ret ->
         unwrapMaybeUninitRenderedInner(ret)?.let { return it }
-        if (ownerBase.isNullOrEmpty() || ret.substringBefore('<').trim() != ownerBase) {
-            return ret
-        }
+        if (ownerBase.isNullOrEmpty() || ret.substringBefore('<').trim() != ownerBase) return ret
     }
     return "UByte"
 }
@@ -1781,14 +1562,7 @@ internal fun KotlinJ2KEmitter.resolveTypeAliasOwnerName(ownerKt: String): String
         val targetTy = inspector.typeAliasTargets[cur] ?: break
         val unwrapped = unwrapSynType(targetTy) as? SynType.Path ?: break
         if (unwrapped.qself != null) break
-        val lastIdent =
-            unwrapped.path.segments
-                .toList()
-                .lastOrNull()
-                ?.ident
-                ?.toString()
-                ?.removePrefix("r#")
-                ?: break
+        val lastIdent = unwrapped.path.lastCleanIdent() ?: break
         val next = rustTypeIdentToKotlin(lastIdent)
         if (next == cur) break
         cur = next
@@ -1803,19 +1577,15 @@ internal fun KotlinJ2KEmitter.resolveMethodSignatureForOwner(
     val canonicalOwner = resolveTypeAliasOwnerName(ownerKt)
     val allFilesItems =
         buildList {
-            TranslationSession.sharedModuleFile?.items?.let { addAll(it) }
-            if (TranslationSession.sharedModuleFile !== file) {
-                addAll(file.items)
-            }
+            TranslationSession.sharedModuleFile?.items?.let(::addAll)
+            if (TranslationSession.sharedModuleFile !== file) addAll(file.items)
         }
     val traitByName = linkedMapOf<String, Item.Trait>()
     traitByName.putAll(inspector.declaredTraitsByName)
     for (item in allFilesItems) {
         if (item is Item.Trait && !itemHasDocOnlyCfg(item)) {
             val tName = rustTypeIdentToKotlin(item.ident.toString())
-            if (tName !in traitByName) {
-                traitByName[tName] = item
-            }
+            if (tName !in traitByName) traitByName[tName] = item
         }
     }
     val candidateImplTraits = linkedSetOf<String>()
@@ -1831,23 +1601,14 @@ internal fun KotlinJ2KEmitter.resolveMethodSignatureForOwner(
                     return canonicalOwner to implItem.sig
                 }
             }
-            item.traitPath
-                ?.path
-                ?.segments
-                ?.toList()
-                ?.lastOrNull()
-                ?.ident
-                ?.toString()
-                ?.let(::rustTypeIdentToKotlin)
-                ?.let { candidateImplTraits += it }
+            val traitPath = item.traitPath?.path
+            traitPath?.lastKotlinTypeName()?.let { candidateImplTraits += it }
         }
     }
     val candidateTraits = linkedSetOf<String>()
     candidateTraits.addAll(candidateImplTraits)
     candidateTraits.addAll(currentTypeParamTraitBounds[ownerKt].orEmpty())
-    if (canonicalOwner in traitByName) {
-        candidateTraits += canonicalOwner
-    }
+    if (canonicalOwner in traitByName) candidateTraits += canonicalOwner
     for (traitKt in candidateTraits) {
         val traitItem = traitByName[traitKt] ?: continue
         for (tItem in traitItem.items) {
@@ -1865,67 +1626,57 @@ internal fun KotlinJ2KEmitter.resolveMethodSignatureForOwner(
 internal fun KotlinJ2KEmitter.getFnLookupIndex(): EmitterFnLookupIndex {
     val sharedMod = TranslationSession.sharedModuleFile
     val existing = cachedFnLookupIndex
-    if (existing != null && existing.sharedModFile === sharedMod) {
-        return existing
-    }
+    if (existing != null && existing.sharedModFile === sharedMod) return existing
     val entriesByKey = hashMapOf<String, MutableList<IndexedFnEntry>>()
     val nonForeignByKtName = hashMapOf<String, MutableList<IndexedFnEntry>>()
     var nextOrder = 0
+
     fun addKey(key: String, entry: IndexedFnEntry) {
         val list = entriesByKey.getOrPut(key) { mutableListOf() }
-        if (list.lastOrNull() !== entry) {
-            list.add(entry)
+        if (list.lastOrNull() !== entry) list.add(entry)
+    }
+
+    fun registerSig(sig: Signature, isForeign: Boolean) {
+        val cleanDecl = sig.cleanFnName()
+        val ktDecl = rustFunctionIdentToKotlin(cleanDecl)
+        val typedParams = sig.inputs.toList().filterIsInstance<FnArg.Typed>()
+        val entry = IndexedFnEntry(nextOrder++, cleanDecl, ktDecl, isForeign = isForeign, typedParams = typedParams)
+        addKey(cleanDecl, entry)
+        addKey(ktDecl, entry)
+        if (!isForeign) {
+            nonForeignByKtName.getOrPut(ktDecl) { mutableListOf() } += entry
+        } else {
+            inspector.collidingTopLevelForeignFnRenames[cleanDecl]?.let { addKey(it, entry) }
+            for ((inlineKey, renamed) in inspector.collidingInlineForeignFnRenames) {
+                if (inlineKey.second == cleanDecl) addKey(renamed, entry)
+            }
         }
     }
+
     fun scanItems(items: List<Item>) {
         for (item in items) {
             if (item is Item.Fn && !itemHasDocOnlyCfg(item)) {
-                val cleanDecl =
-                    item.sig.ident
-                        .toString()
-                        .removePrefix("r#")
-                val ktDecl = rustFunctionIdentToKotlin(cleanDecl)
-                val typedParams =
-                    item.sig.inputs
-                        .toList()
-                        .filterIsInstance<FnArg.Typed>()
-                val entry = IndexedFnEntry(nextOrder++, cleanDecl, ktDecl, isForeign = false, typedParams = typedParams)
-                addKey(cleanDecl, entry)
-                addKey(ktDecl, entry)
-                nonForeignByKtName.getOrPut(ktDecl) { mutableListOf() }.add(entry)
+                registerSig(item.sig, isForeign = false)
             } else if (item is Item.ForeignMod && !itemHasDocOnlyCfg(item)) {
                 for (foreign in item.items) {
                     if (foreign is ForeignItem.Fn && !foreignItemHasDocOnlyCfg(foreign)) {
-                        val cleanDecl =
-                            foreign.sig.ident
-                                .toString()
-                                .removePrefix("r#")
-                        val ktDecl = rustFunctionIdentToKotlin(cleanDecl)
-                        val typedParams =
-                            foreign.sig.inputs
-                                .toList()
-                                .filterIsInstance<FnArg.Typed>()
-                        val entry = IndexedFnEntry(nextOrder++, cleanDecl, ktDecl, isForeign = true, typedParams = typedParams)
-                        addKey(cleanDecl, entry)
-                        addKey(ktDecl, entry)
-                        inspector.collidingTopLevelForeignFnRenames[cleanDecl]?.let { addKey(it, entry) }
-                        for ((inlineKey, renamed) in inspector.collidingInlineForeignFnRenames) {
-                            if (inlineKey.second == cleanDecl) {
-                                addKey(renamed, entry)
-                            }
-                        }
+                        registerSig(foreign.sig, isForeign = true)
                     }
                 }
             }
         }
     }
-    sharedMod?.items?.let { scanItems(it) }
-    if (sharedMod !== file) {
-        scanItems(file.items)
-    }
+
+    sharedMod?.items?.let(::scanItems)
+    if (sharedMod !== file) scanItems(file.items)
     return EmitterFnLookupIndex(sharedMod, entriesByKey, nonForeignByKtName).also {
         cachedFnLookupIndex = it
     }
+}
+
+private fun Signature.typedParamSynTypeAt(idx: Int): SynType? {
+    val typedParams = inputs.toList().filterIsInstance<FnArg.Typed>()
+    return typedParams.getOrNull(idx)?.patType?.ty
 }
 
 internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
@@ -1937,91 +1688,60 @@ internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
     if (pathExpr.qself != null) return null
     val segs = pathExpr.path.segments.toList()
     if (segs.isEmpty()) return null
-    val methodKt =
-        rustFunctionIdentToKotlin(
-            segs
-                .last()
-                .ident
-                .toString()
-                .removePrefix("r#"),
-        )
+    val methodKt = rustFunctionIdentToKotlin(segs.last().cleanIdent())
     if (segs.size == 1) {
-        val rawCalleeIdent =
-            segs[0]
-                .ident
-                .toString()
-                .removePrefix("r#")
+        val rawCalleeIdent = segs[0].cleanIdent()
         val preferLocalForeign = rawCalleeIdent in activeLocalForeignFnRenames
+
         fun matchesFnIdent(rawDeclIdent: String, ktCallee: String, isForeign: Boolean): Boolean {
             val cleanDecl = rawDeclIdent.removePrefix("r#")
-            if (cleanDecl == rawCalleeIdent) return true
-            if (rustFunctionIdentToKotlin(cleanDecl) == ktCallee) return true
-            if (isForeign) {
-                val renamed =
-                    activeLocalForeignFnRenames[cleanDecl]
-                        ?: inspector.collidingTopLevelForeignFnRenames[cleanDecl]
-                        ?: currentModPathPrefix.lastOrNull()?.let { modRaw ->
-                            inspector.collidingInlineForeignFnRenames[modRaw to cleanDecl]
-                        }
-                if (renamed == ktCallee) return true
-            }
-            return false
+            if (cleanDecl == rawCalleeIdent || rustFunctionIdentToKotlin(cleanDecl) == ktCallee) return true
+            if (!isForeign) return false
+            val renamed =
+                activeLocalForeignFnRenames[cleanDecl]
+                    ?: inspector.collidingTopLevelForeignFnRenames[cleanDecl]
+                    ?: currentModPathPrefix.lastOrNull()?.let { inspector.collidingInlineForeignFnRenames[it to cleanDecl] }
+            return renamed == ktCallee
         }
-        for (item in activeLocalBlockItems) {
-            if (!preferLocalForeign && item is Item.Fn && !itemHasDocOnlyCfg(item) && matchesFnIdent(item.sig.ident.toString(), methodKt, isForeign = false)) {
-                val typedParams =
-                    item.sig.inputs
-                        .toList()
-                        .filterIsInstance<FnArg.Typed>()
-                typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
-            }
-            if (item is Item.ForeignMod && !itemHasDocOnlyCfg(item)) {
-                for (foreign in item.items) {
-                    if (foreign is ForeignItem.Fn &&
-                        !foreignItemHasDocOnlyCfg(foreign) &&
-                        matchesFnIdent(foreign.sig.ident.toString(), methodKt, isForeign = true)
-                    ) {
-                        val typedParams =
-                            foreign.sig.inputs
-                                .toList()
-                                .filterIsInstance<FnArg.Typed>()
-                        typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
+
+        fun findInBlockItems(includeRegularFns: Boolean, includeForeignFns: Boolean): SynType? {
+            for (item in activeLocalBlockItems) {
+                if (includeRegularFns && item is Item.Fn && !itemHasDocOnlyCfg(item) && matchesFnIdent(item.sig.ident.toString(), methodKt, isForeign = false)) {
+                    item.sig.typedParamSynTypeAt(argIdx)?.let { return it }
+                }
+                if (includeForeignFns && item is Item.ForeignMod && !itemHasDocOnlyCfg(item)) {
+                    for (foreign in item.items) {
+                        if (foreign is ForeignItem.Fn &&
+                            !foreignItemHasDocOnlyCfg(foreign) &&
+                            matchesFnIdent(foreign.sig.ident.toString(), methodKt, isForeign = true)
+                        ) {
+                            foreign.sig.typedParamSynTypeAt(argIdx)?.let { return it }
+                        }
                     }
                 }
             }
+            return null
         }
+
+        findInBlockItems(includeRegularFns = !preferLocalForeign, includeForeignFns = true)?.let { return it }
         val fnIndex = getFnLookupIndex()
         val candidateSet = linkedSetOf<IndexedFnEntry>()
-        fnIndex.entriesByKey[rawCalleeIdent]?.let { candidateSet.addAll(it) }
-        fnIndex.entriesByKey[methodKt]?.let { candidateSet.addAll(it) }
-        activeLocalForeignFnRenames.entries
-            .firstOrNull { it.value == methodKt }
-            ?.key
-            ?.let { fnIndex.entriesByKey[it] }
-            ?.let { candidateSet.addAll(it) }
-        val orderedCandidates =
-            if (candidateSet.size <= 1) {
-                candidateSet.toList()
-            } else {
-                candidateSet.sortedBy { it.order }
+        fnIndex.entriesByKey[rawCalleeIdent]?.let(candidateSet::addAll)
+        fnIndex.entriesByKey[methodKt]?.let(candidateSet::addAll)
+        for ((origRaw, renamedKt) in activeLocalForeignFnRenames) {
+            if (renamedKt == methodKt) {
+                fnIndex.entriesByKey[origRaw]?.let(candidateSet::addAll)
+                break
             }
+        }
+        val orderedCandidates = if (candidateSet.size <= 1) candidateSet.toList() else candidateSet.sortedBy { it.order }
         for (entry in orderedCandidates) {
-            if ((!preferLocalForeign || entry.isForeign) &&
-                matchesFnIdent(entry.cleanDecl, methodKt, isForeign = entry.isForeign)
-            ) {
+            if ((!preferLocalForeign || entry.isForeign) && matchesFnIdent(entry.cleanDecl, methodKt, isForeign = entry.isForeign)) {
                 entry.typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
             }
         }
         if (preferLocalForeign) {
-            for (item in activeLocalBlockItems) {
-                if (item is Item.Fn && !itemHasDocOnlyCfg(item) && matchesFnIdent(item.sig.ident.toString(), methodKt, isForeign = false)) {
-                    val typedParams =
-                        item.sig.inputs
-                            .toList()
-                            .filterIsInstance<FnArg.Typed>()
-                    typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
-                }
-            }
+            findInBlockItems(includeRegularFns = true, includeForeignFns = false)?.let { return it }
             for (entry in orderedCandidates) {
                 if (!entry.isForeign && matchesFnIdent(entry.cleanDecl, methodKt, isForeign = false)) {
                     entry.typedParams.getOrNull(argIdx)?.let { return it.patType.ty }
@@ -2030,7 +1750,7 @@ internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
         }
         return null
     }
-    val penultRaw = segs[segs.size - 2].ident.toString().removePrefix("r#")
+    val penultRaw = segs[segs.size - 2].cleanIdent()
     val ownerKt =
         when {
             penultRaw == "Self" -> selfTypeName?.substringBefore('<')?.trim()
@@ -2038,11 +1758,8 @@ internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
             else -> null
         } ?: return null
     val (_, sig) = resolveMethodSignatureForOwner(ownerKt, methodKt) ?: return null
-    val hasReceiver = sig.inputs.firstOrNull() is FnArg.Receiver
-    val typedIdx = if (hasReceiver) argIdx - 1 else argIdx
-    if (typedIdx < 0) return null
-    val typedParams = sig.inputs.toList().filterIsInstance<FnArg.Typed>()
-    return typedParams.getOrNull(typedIdx)?.patType?.ty
+    val typedIdx = if (sig.hasSelfReceiver()) argIdx - 1 else argIdx
+    return if (typedIdx >= 0) sig.typedParamSynTypeAt(typedIdx) else null
 }
 
 internal fun KotlinJ2KEmitter.resolveCallArgExpectedCollectionOrArrayType(
@@ -2057,25 +1774,14 @@ internal fun KotlinJ2KEmitter.resolveCallArgExpectedCollectionOrArrayType(
         paramSynTy?.let { renderType(it, selfTypeName).removeSuffix("?").trim() }
             ?: run {
                 val fnPath = (unwrapParenOrGroupExpr(func) as? Expr.Path)?.takeIf { it.qself == null }?.path
-                val rawCtor =
-                    fnPath
-                        ?.segments
-                        ?.toList()
-                        ?.lastOrNull()
-                        ?.ident
-                        ?.toString()
-                        ?.removePrefix("r#")
+                val rawCtor = fnPath?.lastCleanIdent()
                 val ctorKt = rawCtor?.let(::rustTypeIdentToKotlin)
                 if (ctorKt != null && rawCtor.firstOrNull()?.isUpperCase() == true) {
-                    val localTy = localStructFields[ctorKt]?.getOrNull(argIdx)?.let { renderType(it, selfTypeName).removeSuffix("?").trim() }
-                    localTy
+                    localStructFields[ctorKt]?.getOrNull(argIdx)?.let { renderType(it, selfTypeName).removeSuffix("?").trim() }
                         ?: run {
                             val fieldKey = if (totalArgs == 1) "value" else "field$argIdx"
-                            val synMap = inspector.structFieldSynTypesByType[ctorKt]
-                            synMap?.get(fieldKey)?.let { renderType(it, selfTypeName).removeSuffix("?").trim() }
-                                ?: scopedAbiKeysForRenderedType(ctorKt).firstNotNullOfOrNull { scoped ->
-                                    headerContext.crateStructFieldTypes["$scoped.$fieldKey"]
-                                }
+                            inspector.structFieldSynTypesByType[ctorKt]?.get(fieldKey)?.let { renderType(it, selfTypeName).removeSuffix("?").trim() }
+                                ?: scopedAbiKeysForRenderedType(ctorKt).firstNotNullOfOrNull { headerContext.crateStructFieldTypes["$it.$fieldKey"] }
                                 ?: headerContext.crateStructFieldTypes["$ctorKt.$fieldKey"]
                                 ?: headerContext.crateStructFieldTypes.entries
                                     .mapNotNull { (k, v) -> if (k.endsWith(".$ctorKt.$fieldKey")) v else null }
@@ -2087,9 +1793,7 @@ internal fun KotlinJ2KEmitter.resolveCallArgExpectedCollectionOrArrayType(
                 }
             }
     return paramRendered?.takeIf {
-        it.startsWith("List<") ||
-            it.startsWith("MutableList<") ||
-            it in PRIMITIVE_ARRAY_TYPES
+        it.startsWith("List<") || it.startsWith("MutableList<") || it in PRIMITIVE_ARRAY_TYPES
     }
 }
 
@@ -2109,11 +1813,7 @@ internal fun KotlinJ2KEmitter.inferUntypedArrayLocalTargetTypeFromRemainingStmts
                     is Expr.Reference -> unwrapParenOrGroupExpr(cur.expr)
                     is Expr.Index -> {
                         val range = unwrapParenOrGroupExpr(cur.index) as? Expr.Range
-                        if (range != null && range.start == null && range.end == null) {
-                            unwrapParenOrGroupExpr(cur.expr)
-                        } else {
-                            return cur
-                        }
+                        if (range != null && range.start == null && range.end == null) unwrapParenOrGroupExpr(cur.expr) else return cur
                     }
                     else -> return cur
                 }
@@ -2125,13 +1825,10 @@ internal fun KotlinJ2KEmitter.inferUntypedArrayLocalTargetTypeFromRemainingStmts
     val visitor =
         object : Visit() {
             override fun visitItemStruct(i: Item.Struct) {
-                val structKt = rustTypeIdentToKotlin(i.ident.toString())
                 val fields = i.fields
                 if (fields is Fields.Unnamed) {
-                    localTupleStructFields[structKt] =
-                        fields.fields.unnamed
-                            .toList()
-                            .map { it.ty }
+                    val unnamedList = fields.fields.unnamed.toList()
+                    localTupleStructFields[rustTypeIdentToKotlin(i.ident.toString())] = unnamedList.map { it.ty }
                 }
                 super.visitItemStruct(i)
             }
@@ -2167,22 +1864,15 @@ internal fun KotlinJ2KEmitter.calleeExpectsMutableListSliceParam(calleeBase: Str
     val simpleFn = calleeBase.substringAfterLast('.').trim()
     val ownerPrefix = calleeBase.substringBeforeLast('.', missingDelimiterValue = "").substringAfterLast('.').trim()
     if (ownerPrefix.isEmpty()) {
-        for (entry in getFnLookupIndex().nonForeignByKtName[simpleFn].orEmpty()) {
-            val param = entry.typedParams.getOrNull(argIdx) ?: continue
-            if (isMutSliceSynType(param.patType.ty)) return true
+        return getFnLookupIndex().nonForeignByKtName[simpleFn].orEmpty().any { entry ->
+            entry.typedParams.getOrNull(argIdx)?.let { isMutSliceSynType(it.patType.ty) } == true
         }
-        return false
     }
     resolveMethodSignatureForOwner(ownerPrefix, simpleFn)?.let { (_, sig) ->
-        val hasReceiver = sig.inputs.firstOrNull() is FnArg.Receiver
-        val typedIdx = if (hasReceiver) argIdx - 1 else argIdx
+        val typedIdx = if (sig.hasSelfReceiver()) argIdx - 1 else argIdx
         if (typedIdx >= 0) {
-            val param =
-                sig.inputs
-                    .toList()
-                    .filterIsInstance<FnArg.Typed>()
-                    .getOrNull(typedIdx)
-            if (param != null && isMutSliceSynType(param.patType.ty)) return true
+            val paramTy = sig.typedParamSynTypeAt(typedIdx)
+            if (paramTy != null && isMutSliceSynType(paramTy)) return true
         }
     }
     return methodExpectsMutableListSliceParam(ownerPrefix, simpleFn, argIdx, includeStaticOnly = true)
@@ -2194,61 +1884,33 @@ internal fun KotlinJ2KEmitter.methodExpectsMutableListSliceParam(
     argIdx: Int,
     includeStaticOnly: Boolean = false,
 ): Boolean {
+    fun matchesSig(sig: Signature): Boolean {
+        if (rustFunctionIdentToKotlin(sig.ident.toString()) != methodKt) return false
+        if (includeStaticOnly && sig.hasSelfReceiver()) return false
+        val paramTy = sig.typedParamSynTypeAt(argIdx) ?: return false
+        return isMutSliceSynType(paramTy)
+    }
+
     for (item in file.items) {
         when (item) {
             is Item.Impl -> {
-                val implOwner = renderType(item.selfType, null).substringBefore('<').substringAfterLast('.').trim()
+                val implOwner = renderType(item.selfType, null).simpleKotlinTypeName()
                 if (ownerSimple != null && implOwner != ownerSimple) continue
-                for (implItem in item.items) {
-                    if (implItem is ImplItem.Fn && rustFunctionIdentToKotlin(implItem.sig.ident.toString()) == methodKt) {
-                        val hasReceiver = implItem.sig.inputs.firstOrNull() is FnArg.Receiver
-                        if (includeStaticOnly && hasReceiver) continue
-                        val typedParams =
-                            implItem.sig.inputs
-                                .toList()
-                                .filterIsInstance<FnArg.Typed>()
-                        val param = typedParams.getOrNull(argIdx) ?: continue
-                        if (isMutSliceSynType(param.patType.ty)) return true
-                    }
-                }
+                if (item.items.any { it is ImplItem.Fn && matchesSig(it.sig) }) return true
             }
             is Item.Trait -> {
                 val traitName = rustTypeIdentToKotlin(item.ident.toString())
                 if (ownerSimple != null && traitName != ownerSimple) continue
-                for (tItem in item.items) {
-                    if (tItem is TraitItem.Fn && rustFunctionIdentToKotlin(tItem.sig.ident.toString()) == methodKt) {
-                        val hasReceiver = tItem.sig.inputs.firstOrNull() is FnArg.Receiver
-                        if (includeStaticOnly && hasReceiver) continue
-                        val typedParams =
-                            tItem.sig.inputs
-                                .toList()
-                                .filterIsInstance<FnArg.Typed>()
-                        val param = typedParams.getOrNull(argIdx) ?: continue
-                        if (isMutSliceSynType(param.patType.ty)) return true
-                    }
-                }
+                if (item.items.any { it is TraitItem.Fn && matchesSig(it.sig) }) return true
             }
-            else -> {}
+            else -> Unit
         }
     }
     return false
 }
 
 internal fun KotlinJ2KEmitter.primitiveArrayTypeForElementRenderedType(elemTy: String?): String? =
-    when (elemTy?.trim()) {
-        "Boolean" -> "BooleanArray"
-        "Byte" -> "ByteArray"
-        "UByte" -> "UByteArray"
-        "Short" -> "ShortArray"
-        "UShort" -> "UShortArray"
-        "Int" -> "IntArray"
-        "UInt" -> "UIntArray"
-        "Long" -> "LongArray"
-        "ULong" -> "ULongArray"
-        "Float", "kotlin.Float" -> "FloatArray"
-        "Double" -> "DoubleArray"
-        else -> null
-    }
+    PrimitiveArrayTypeCatalog.arrayTypeForElem(elemTy)
 
 private fun extractCallableReturnRenderedType(renderedCallableType: String?): String? {
     val raw = renderedCallableType?.trim()?.takeIf { it.isNotEmpty() } ?: return null
@@ -2264,33 +1926,27 @@ private class CallableReturnTypeWalker(
             if (closeParenIdx > 0) {
                 val nextIdx = nextNonTriviaIndex(closeParenIdx + 1)
                 if (tokens.getOrNull(nextIdx) is KotlinLexToken.Arrow) {
-                    return source
-                        .substring(tokens[nextIdx].end)
-                        .trim()
-                        .takeIf { it.isNotEmpty() }
+                    val retText = source.substring(tokens[nextIdx].end).trim()
+                    return retText.ifEmpty { null }
                 }
                 if (closeParenIdx == tokens.lastIndex - 1 && punctAt(tokens.lastIndex) == '?') {
                     val inner = source.substring(tokens[0].end, tokens[closeParenIdx].start).trim()
-                    if ("->" in inner) {
-                        return CallableReturnTypeWalker(inner).extractReturnType()
-                    }
+                    if ("->" in inner) return CallableReturnTypeWalker(inner).extractReturnType()
                 }
                 return null
             }
         }
-        val base = source.substringBefore('<').substringAfterLast('.').trim()
+        val base = source.simpleKotlinTypeName()
         if (base in FN_TRAIT_NAMES && '<' in source && source.endsWith('>')) {
             val argsInner = source.substringAfter('<').dropLast(1)
             val comma = findTopLevelCommaIndex(argsInner)
-            if (comma >= 0) {
-                return argsInner.substring(comma + 1).trim().takeIf { it.isNotEmpty() }
-            }
+            if (comma >= 0) return argsInner.substring(comma + 1).trim().takeIf { it.isNotEmpty() }
         }
         return null
     }
 
     companion object {
-        private val FN_TRAIT_NAMES = setOf("Fn", "FnMut", "FnOnce")
+        private val FN_TRAIT_NAMES = wordSet("Fn FnMut FnOnce")
     }
 }
 
@@ -2298,8 +1954,7 @@ internal fun KotlinJ2KEmitter.inferExplicitArrayElementRenderedType(
     elem: Expr,
     selfTypeName: String?,
 ): String? {
-    val unwrapped = unwrapParenOrGroupExpr(elem)
-    val lit = (unwrapped as? Expr.Lit)?.lit
+    val lit = (unwrapParenOrGroupExpr(elem) as? Expr.Lit)?.lit
     if (lit is Lit.Bool) return "Boolean"
     if (lit is Lit.Byte) return "UByte"
     if (lit is Lit.Float) {
@@ -2323,9 +1978,7 @@ internal fun KotlinJ2KEmitter.inferPrimitiveArrayTypeForArrayLiteral(
             is Expr.Array -> expr.elems.toList()
             else -> return null
         }
-    for (elem in sampleElems) {
-        val elemTy = inferExplicitArrayElementRenderedType(elem, selfTypeName)
-        primitiveArrayTypeForElementRenderedType(elemTy)?.let { return it }
+    return sampleElems.firstNotNullOfOrNull { elem ->
+        primitiveArrayTypeForElementRenderedType(inferExplicitArrayElementRenderedType(elem, selfTypeName))
     }
-    return null
 }

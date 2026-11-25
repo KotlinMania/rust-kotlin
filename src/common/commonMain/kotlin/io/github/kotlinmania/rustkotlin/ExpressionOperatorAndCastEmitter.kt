@@ -577,7 +577,7 @@ internal fun KotlinJ2KEmitter.renderExprCast(expr: Expr.Cast, indent: String, se
         } else {
             renderType(expr.ty, selfTypeName)
         }
-    return renderCastExpression(inner, target, expr.expr, selfTypeName, (expr.ty as? SynType.Ptr)?.elem)
+    return renderCastExpression(inner, target, expr.expr, selfTypeName)
 }
 
 internal fun KotlinJ2KEmitter.renderExprAssign(expr: Expr.Assign, indent: String, selfTypeName: String?): String {

@@ -42,23 +42,23 @@ private fun parsePropertiesMap(content: String): Pair<Map<String, String>, Strin
     return map to bareLine
 }
 
+private fun Map<String, String>.firstNonEmpty(vararg keys: String): String? =
+    keys.firstNotNullOfOrNull { get(it)?.takeIf(String::isNotEmpty) }
+
 private fun extractCrateNamespaceOverrides(map: Map<String, String>): Map<String, String> {
     val overrides = linkedMapOf<String, String>()
     for ((key, value) in map) {
         if (value.isEmpty()) continue
-        when {
-            key.startsWith("crate.") -> {
-                val crateName = key.removePrefix("crate.").trim()
-                if (crateName.isNotEmpty()) overrides[rustModuleIdentToKotlin(crateName)] = value
+        val rawCrate =
+            when {
+                key.startsWith("crate.") -> key.removePrefix("crate.")
+                key.startsWith("namespace.") -> key.removePrefix("namespace.")
+                key.endsWith(".namespace") && key != "project.namespace" -> key.removeSuffix(".namespace")
+                else -> null
             }
-            key.startsWith("namespace.") -> {
-                val crateName = key.removePrefix("namespace.").trim()
-                if (crateName.isNotEmpty()) overrides[rustModuleIdentToKotlin(crateName)] = value
-            }
-            key.endsWith(".namespace") && key != "project.namespace" -> {
-                val crateName = key.removeSuffix(".namespace").trim()
-                if (crateName.isNotEmpty()) overrides[rustModuleIdentToKotlin(crateName)] = value
-            }
+        val trimmedCrate = rawCrate?.trim()
+        if (!trimmedCrate.isNullOrEmpty()) {
+            overrides[rustModuleIdentToKotlin(trimmedCrate)] = value
         }
     }
     return overrides
@@ -66,15 +66,9 @@ private fun extractCrateNamespaceOverrides(map: Map<String, String>): Map<String
 
 public fun parseRustKotlinProperties(content: String): RustKotlinProperties {
     val (map, _) = parsePropertiesMap(content)
-    val group =
-        map["project.group"]?.takeIf { it.isNotEmpty() }
-            ?: map["group"]?.takeIf { it.isNotEmpty() }
-    val name =
-        map["project.name"]?.takeIf { it.isNotEmpty() }
-            ?: map["name"]?.takeIf { it.isNotEmpty() }
-    val explicitNamespace =
-        map["project.namespace"]?.takeIf { it.isNotEmpty() }
-            ?: map["namespace"]?.takeIf { it.isNotEmpty() }
+    val group = map.firstNonEmpty("project.group", "group")
+    val name = map.firstNonEmpty("project.name", "name")
+    val explicitNamespace = map.firstNonEmpty("project.namespace", "namespace")
     val derivedNamespace =
         if (explicitNamespace == null && group != null && name != null) {
             val crateSegment = rustModuleIdentToKotlin(name.removeSuffix("-kotlin"))
@@ -87,28 +81,16 @@ public fun parseRustKotlinProperties(content: String): RustKotlinProperties {
         projectNamespace = derivedNamespace,
         projectName = name,
         crateNamespaces = extractCrateNamespaceOverrides(map),
-        projectFfiName = map["project.ffi.name"]?.takeIf { it.isNotEmpty() },
+        projectFfiName = map.firstNonEmpty("project.ffi.name"),
     )
 }
 
 public fun parsePackageProperties(content: String): FolderPackageProperties {
     val (map, bareLine) = parsePropertiesMap(content)
-    val pkg =
-        map["package"]?.takeIf { it.isNotEmpty() }
-            ?: map["package.name"]?.takeIf { it.isNotEmpty() }
-            ?: map["namespace"]?.takeIf { it.isNotEmpty() }
-            ?: map["project.namespace"]?.takeIf { it.isNotEmpty() }
-            ?: bareLine
-    val group =
-        map["project.group"]?.takeIf { it.isNotEmpty() }
-            ?: map["group"]?.takeIf { it.isNotEmpty() }
-    val namespace =
-        map["project.namespace"]?.takeIf { it.isNotEmpty() }
-            ?: map["namespace"]?.takeIf { it.isNotEmpty() }
     return FolderPackageProperties(
-        packageName = pkg,
-        projectGroup = group,
-        projectNamespace = namespace,
+        packageName = map.firstNonEmpty("package", "package.name", "namespace", "project.namespace") ?: bareLine,
+        projectGroup = map.firstNonEmpty("project.group", "group"),
+        projectNamespace = map.firstNonEmpty("project.namespace", "namespace"),
         crateNamespaces = extractCrateNamespaceOverrides(map),
     )
 }
@@ -311,7 +293,7 @@ public abstract class CrateFileTreeNavigator<Node : Any> {
         val resolvedFile = canonicalize(rustFile)
         val inputDir = parentOf(resolvedFile) ?: return emptyList()
         val selfKey = pathKey(resolvedFile)
-        return collectMacroSourceEntries(inputDir).filter { it.first != selfKey }.map { it.second }
+        return collectMacroSourceEntries(inputDir).mapNotNull { (k, v) -> if (k != selfKey) v else null }
     }
 }
 
@@ -423,17 +405,7 @@ public data class FileHeaderContext(
         projectGroup: String?,
         projectNamespace: String?,
         crateNamespaces: Map<String, String>,
-    ) : this(
-        portLintSourcePath = portLintSourcePath,
-        packageName = packageName,
-        projectGroup = projectGroup,
-        projectNamespace = projectNamespace,
-        crateNamespaces = crateNamespaces,
-        portLintDirective = "source",
-        crateMacroSources = emptyList(),
-        crateFlatFileModules = emptyList(),
-        isDocExample = false,
-    )
+    ) : this(portLintSourcePath, packageName, projectGroup, projectNamespace, crateNamespaces, "source")
 
     public constructor(
         portLintSourcePath: String?,
@@ -442,17 +414,7 @@ public data class FileHeaderContext(
         projectNamespace: String?,
         crateNamespaces: Map<String, String>,
         portLintDirective: String,
-    ) : this(
-        portLintSourcePath = portLintSourcePath,
-        packageName = packageName,
-        projectGroup = projectGroup,
-        projectNamespace = projectNamespace,
-        crateNamespaces = crateNamespaces,
-        portLintDirective = portLintDirective,
-        crateMacroSources = emptyList(),
-        crateFlatFileModules = emptyList(),
-        isDocExample = false,
-    )
+    ) : this(portLintSourcePath, packageName, projectGroup, projectNamespace, crateNamespaces, portLintDirective, emptyList())
 
     public constructor(
         portLintSourcePath: String?,
@@ -463,15 +425,14 @@ public data class FileHeaderContext(
         portLintDirective: String,
         crateMacroSources: List<String>,
     ) : this(
-        portLintSourcePath = portLintSourcePath,
-        packageName = packageName,
-        projectGroup = projectGroup,
-        projectNamespace = projectNamespace,
-        crateNamespaces = crateNamespaces,
-        portLintDirective = portLintDirective,
-        crateMacroSources = crateMacroSources,
-        crateFlatFileModules = emptyList(),
-        isDocExample = false,
+        portLintSourcePath,
+        packageName,
+        projectGroup,
+        projectNamespace,
+        crateNamespaces,
+        portLintDirective,
+        crateMacroSources,
+        emptyList(),
     )
 
     public constructor(
@@ -496,24 +457,30 @@ public data class FileHeaderContext(
     )
 }
 
-private var diskMacroSourcesByDirCache: Map<String, List<Pair<String, String>>> = emptyMap()
-private var diskFlatFileModulesByRootCache: Map<String, Set<String>> = emptyMap()
+private class BoundedDiskCache<V : Any>(
+    private val maxEntries: Int = 128,
+) {
+    private var entries: Map<String, V> = emptyMap()
+
+    fun getOrPut(key: String, compute: () -> V): V {
+        entries[key]?.let { return it }
+        val computed = compute()
+        entries = if (entries.size >= maxEntries) mapOf(key to computed) else entries + (key to computed)
+        return computed
+    }
+}
+
+private val diskMacroSourcesByDirCache = BoundedDiskCache<List<Pair<String, String>>>()
+private val diskFlatFileModulesByRootCache = BoundedDiskCache<Set<String>>()
 
 internal fun discoverCrateFlatFileModulesFromDisk(
     inputPath: String?,
     sourceRoot: String? = null,
 ): Set<String> {
     val resolvedRoot = KmPathFileTreeNavigator.resolveCrateSrcRootFromDisk(inputPath, sourceRoot) ?: return emptySet()
-    val cacheKey = resolvedRoot.toString()
-    diskFlatFileModulesByRootCache[cacheKey]?.let { return it }
-
-    val result = KmPathFileTreeNavigator.discoverFlatFileModulesInRoot(resolvedRoot)
-    if (diskFlatFileModulesByRootCache.size >= 128) {
-        diskFlatFileModulesByRootCache = mapOf(cacheKey to result)
-    } else {
-        diskFlatFileModulesByRootCache = diskFlatFileModulesByRootCache + (cacheKey to result)
+    return diskFlatFileModulesByRootCache.getOrPut(resolvedRoot.toString()) {
+        KmPathFileTreeNavigator.discoverFlatFileModulesInRoot(resolvedRoot)
     }
-    return result
 }
 
 internal fun discoverCrateMacroSourcesFromDisk(inputPath: String?): List<String> {
@@ -523,18 +490,11 @@ internal fun discoverCrateMacroSourcesFromDisk(inputPath: String?): List<String>
     val resolvedFile = SystemFileSystem.resolve(rawFile)
     val resolvedFileStr = resolvedFile.toString()
     val inputDir = resolvedFile.parent ?: return emptyList()
-    val cacheKey = inputDir.toString()
-    diskMacroSourcesByDirCache[cacheKey]?.let { cached ->
-        return cached.filter { it.first != resolvedFileStr }.map { it.second }
-    }
-
-    val cachedEntries = KmPathFileTreeNavigator.collectMacroSourceEntries(inputDir)
-    if (diskMacroSourcesByDirCache.size >= 128) {
-        diskMacroSourcesByDirCache = mapOf(cacheKey to cachedEntries)
-    } else {
-        diskMacroSourcesByDirCache = diskMacroSourcesByDirCache + (cacheKey to cachedEntries)
-    }
-    return cachedEntries.filter { it.first != resolvedFileStr }.map { it.second }
+    val entries =
+        diskMacroSourcesByDirCache.getOrPut(inputDir.toString()) {
+            KmPathFileTreeNavigator.collectMacroSourceEntries(inputDir)
+        }
+    return entries.mapNotNull { (k, v) -> if (k != resolvedFileStr) v else null }
 }
 
 public fun inferFileHeaderContext(
@@ -629,29 +589,37 @@ internal fun inferFileHeaderContextWithResolvers(
     )
 }
 
-internal fun extractTmpSubcrateName(inputPath: String): String? {
-    var cleaned = inputPath.replace('\\', '/')
+private fun extractAfterTmpRepoAndInside(rawPath: String): Pair<String, String>? {
+    var cleaned = rawPath.replace('\\', '/')
     while (cleaned.startsWith("./")) {
         cleaned = cleaned.substring(2)
     }
     val afterTmp =
-        when {
-            cleaned.startsWith("tmp/") -> cleaned.substring("tmp/".length)
-            else -> {
-                val tmpIdx = cleaned.indexOf("/tmp/")
-                if (tmpIdx < 0) return null
-                cleaned.substring(tmpIdx + "/tmp/".length)
-            }
+        if (cleaned.startsWith("tmp/")) {
+            cleaned.substring("tmp/".length)
+        } else {
+            val tmpIdx = cleaned.indexOf("/tmp/")
+            if (tmpIdx >= 0) cleaned.substring(tmpIdx + "/tmp/".length) else return null
         }
     val slashAfterRepo = afterTmp.indexOf('/')
-    if (slashAfterRepo <= 0) return null
-    val repoName = afterTmp.substring(0, slashAfterRepo)
-    val insideRepo = afterTmp.substring(slashAfterRepo + 1)
+    if (slashAfterRepo < 0) return null
+    return afterTmp.substring(0, slashAfterRepo) to afterTmp.substring(slashAfterRepo + 1)
+}
+
+private fun stripSourceRootPrefix(normalizedPath: String, root: String?): String? {
+    if (root.isNullOrBlank()) return null
+    val rootPrefix = root.replace('\\', '/').trimEnd('/') + "/"
+    if (!normalizedPath.startsWith(rootPrefix)) return null
+    return normalizedPath.removePrefix(rootPrefix).takeIf { it.isNotEmpty() }
+}
+
+internal fun extractTmpSubcrateName(inputPath: String): String? {
+    val (repoName, insideRepo) = extractAfterTmpRepoAndInside(inputPath) ?: return null
+    if (repoName.isEmpty()) return null
     val srcIdx = insideRepo.indexOf("/src/")
     if (srcIdx <= 0) return null
     val subcrate = insideRepo.substring(0, srcIdx).substringAfterLast('/')
-    if (subcrate.isEmpty() || subcrate == repoName) return null
-    return subcrate
+    return subcrate.takeIf { it.isNotEmpty() && it != repoName }
 }
 
 internal fun inferPackageFromNamespaceAndSource(
@@ -685,54 +653,14 @@ internal fun inferPortLintRelativePath(
 ): String? {
     val normalized = inputPath.replace('\\', '/')
     val fileName = normalized.substringAfterLast('/')
-    if (fileName == "lib.rs" || fileName == "mod.rs" || fileName == "main.rs") {
-        return null
-    }
-    if (!sourceRoot.isNullOrBlank()) {
-        val rootPrefix = sourceRoot.replace('\\', '/').trimEnd('/') + "/"
-        if (normalized.startsWith(rootPrefix)) {
-            val rel = normalized.removePrefix(rootPrefix)
-            if (rel.isNotEmpty()) {
-                return rel
-            }
-        }
-    }
+    if (fileName == "lib.rs" || fileName == "mod.rs" || fileName == "main.rs") return null
+    stripSourceRootPrefix(normalized, sourceRoot)?.let { return it }
     val srcIdx = normalized.lastIndexOf("/src/")
-    if (srcIdx >= 0) {
-        return normalized.substring(srcIdx + "/src/".length)
+    if (srcIdx >= 0) return normalized.substring(srcIdx + "/src/".length)
+    extractAfterTmpRepoAndInside(normalized)?.let { (_, insideRepo) ->
+        return insideRepo.removePrefix("src/")
     }
-    var cleanedForTmp = normalized
-    while (cleanedForTmp.startsWith("./")) {
-        cleanedForTmp = cleanedForTmp.substring(2)
-    }
-    val afterTmp =
-        when {
-            cleanedForTmp.startsWith("tmp/") -> cleanedForTmp.substring("tmp/".length)
-            else -> {
-                val tmpIdx = cleanedForTmp.indexOf("/tmp/")
-                if (tmpIdx >= 0) cleanedForTmp.substring(tmpIdx + "/tmp/".length) else null
-            }
-        }
-    if (afterTmp != null) {
-        val slashAfterRepo = afterTmp.indexOf('/')
-        if (slashAfterRepo >= 0) {
-            val insideRepo = afterTmp.substring(slashAfterRepo + 1)
-            if (insideRepo.startsWith("src/")) {
-                return insideRepo.removePrefix("src/")
-            }
-            return insideRepo
-        }
-    }
-    if (!fallbackSourceRoot.isNullOrBlank()) {
-        val rootPrefix = fallbackSourceRoot.replace('\\', '/').trimEnd('/') + "/"
-        if (normalized.startsWith(rootPrefix)) {
-            val rel = normalized.removePrefix(rootPrefix)
-            if (rel.isNotEmpty()) {
-                return rel
-            }
-        }
-    }
-    return null
+    return stripSourceRootPrefix(normalized, fallbackSourceRoot)
 }
 
 internal fun inferKotlinPackageName(outputPath: String): String? {
@@ -821,23 +749,18 @@ public fun ensureRustLangInGradleProperties(propsText: String): Pair<String, Str
     return propsText to null
 }
 
-public fun ensureRustLangInLibsVersionsToml(
-    tomlText: String,
-    commonMainBundleName: String? = null,
-    version: String = DEFAULT_RUST_LANG_KOTLIN_VERSION,
-): String {
-    val hadTrailingNewline = tomlText.endsWith('\n')
-    val lines = tomlText.trimEnd('\n').split('\n').toMutableList()
-    val headerRegex = Regex("""^\[([A-Za-z0-9_.-]+)]\s*$""")
+private class TomlManifestEditor(
+    private val rawText: String,
+) {
+    private val hadTrailingNewline = rawText.endsWith('\n')
+    val lines: MutableList<String> = rawText.trimEnd('\n').split('\n').toMutableList()
 
     fun findSectionBounds(sectionName: String): IntRange? {
         var start = -1
         for (i in lines.indices) {
-            val match = headerRegex.matchEntire(lines[i].trim()) ?: continue
+            val match = HEADER_REGEX.matchEntire(lines[i].trim()) ?: continue
             if (start < 0) {
-                if (match.groupValues[1] == sectionName) {
-                    start = i
-                }
+                if (match.groupValues[1] == sectionName) start = i
             } else {
                 return start until i
             }
@@ -853,88 +776,35 @@ public fun ensureRustLangInLibsVersionsToml(
         return idx
     }
 
-    var existingLibKey: String? = null
-    var existingVerRef: String? = null
-    findSectionBounds("libraries")?.let { libBounds ->
-        for (i in (libBounds.first + 1)..libBounds.last) {
-            val line = lines[i].trim()
-            if (!line.startsWith("#") && "io.github.kotlinmania:rust-lang-kotlin" in line && '=' in line) {
-                existingLibKey = line.substringBefore('=').trim()
-                existingVerRef =
-                    Regex("""version\.ref\s*=\s*"([^"]+)"""")
-                        .find(line)
-                        ?.groupValues
-                        ?.get(1)
-                break
-            }
-        }
-    }
-
-    var versionKey = existingVerRef
-    val verBounds = findSectionBounds("versions")
-    if (versionKey == null && verBounds != null) {
-        for (i in (verBounds.first + 1)..verBounds.last) {
-            val line = lines[i].trim()
-            if (line.startsWith("#") || '=' !in line) continue
-            val k = line.substringBefore('=').trim()
-            if (k == "rustLang" || k == "rustLangKotlin") {
-                versionKey = k
-                break
-            }
-        }
-    }
-    if (versionKey == null) {
-        versionKey = "rustLang"
-        val currentVerBounds = findSectionBounds("versions")
-        if (currentVerBounds != null) {
-            lines.add(sectionInsertIndex(currentVerBounds), """$versionKey = "$version"""")
-        } else {
-            if (lines.isNotEmpty() && lines.last().isNotBlank()) lines.add("")
-            lines.add("[versions]")
-            lines.add("""$versionKey = "$version"""")
-        }
-    }
-
-    val libKey = existingLibKey ?: "rust-lang-kotlin"
-    if (existingLibKey == null) {
-        val libEntry = """$libKey = { module = "io.github.kotlinmania:rust-lang-kotlin", version.ref = "$versionKey" }"""
-        val currentLibBounds = findSectionBounds("libraries")
-        if (currentLibBounds != null) {
-            lines.add(sectionInsertIndex(currentLibBounds), libEntry)
-        } else {
-            if (lines.isNotEmpty() && lines.last().isNotBlank()) lines.add("")
-            lines.add("[libraries]")
-            lines.add(libEntry)
-        }
-    }
-
-    var bundleBounds = findSectionBounds("bundles")
-    if (bundleBounds == null) {
+    fun ensureSection(sectionName: String): IntRange {
+        findSectionBounds(sectionName)?.let { return it }
         if (lines.isNotEmpty() && lines.last().isNotBlank()) lines.add("")
-        lines.add("[bundles]")
-        bundleBounds = findSectionBounds("bundles")!!
+        lines.add("[$sectionName]")
+        return findSectionBounds(sectionName)!!
     }
 
-    fun addLibToExistingBundle(bundleName: String): Boolean {
+    fun appendLineToSection(sectionName: String, entryLine: String) {
+        val bounds = findSectionBounds(sectionName)
+        if (bounds != null) {
+            lines.add(sectionInsertIndex(bounds), entryLine)
+        } else {
+            ensureSection(sectionName)
+            lines.add(entryLine)
+        }
+    }
+
+    fun addLibToExistingBundle(bundleName: String, libKey: String): Boolean {
         val curBounds = findSectionBounds("bundles") ?: return false
-        var startLine = -1
-        for (i in (curBounds.first + 1)..curBounds.last) {
-            val trimmed = lines[i].trim()
-            if (!trimmed.startsWith("#") && '=' in trimmed && trimmed.substringBefore('=').trim() == bundleName) {
-                startLine = i
-                break
-            }
-        }
-        if (startLine < 0) return false
+        val startLine =
+            ((curBounds.first + 1)..curBounds.last).firstOrNull { i ->
+                val trimmed = lines[i].trim()
+                !trimmed.startsWith("#") && '=' in trimmed && trimmed.substringBefore('=').trim() == bundleName
+            } ?: return false
         var endLine = startLine
-        while (endLine <= curBounds.last && ']' !in lines[endLine]) {
-            endLine++
-        }
+        while (endLine <= curBounds.last && ']' !in lines[endLine]) endLine++
         if (endLine > curBounds.last) return false
         val sliceText = (startLine..endLine).joinToString("\n") { lines[it] }
-        if (Regex(""""${Regex.escape(libKey)}"""").containsMatchIn(sliceText)) {
-            return true
-        }
+        if (Regex(""""${Regex.escape(libKey)}"""").containsMatchIn(sliceText)) return true
         if (startLine == endLine) {
             val beforeClose = lines[startLine].substringBeforeLast(']').trimEnd()
             val sep = if (beforeClose.endsWith('[') || beforeClose.endsWith(',')) " " else ", "
@@ -945,39 +815,84 @@ public fun ensureRustLangInLibsVersionsToml(
         return true
     }
 
-    val preferredBundle =
-        commonMainBundleName?.trim()?.takeIf { it.isNotEmpty() }
-            ?: run {
-                val curBounds = findSectionBounds("bundles")!!
-                var candidate: String? = null
-                for (i in (curBounds.first + 1)..curBounds.last) {
-                    val trimmed = lines[i].trim()
-                    if (trimmed.startsWith("#") || '=' !in trimmed || '[' !in trimmed) continue
-                    val name = trimmed.substringBefore('=').trim()
-                    if (name.endsWith("-commonMain") && name != "rust-lang-commonMain") {
-                        candidate = name
-                        break
-                    }
-                }
-                candidate
-            }
-
-    if (preferredBundle != null && preferredBundle != "rust-lang-commonMain") {
-        addLibToExistingBundle(preferredBundle)
+    fun render(): String {
+        val joined = lines.joinToString("\n")
+        return if (hadTrailingNewline || rawText.isEmpty()) "$joined\n" else joined
     }
-    if (!addLibToExistingBundle("rust-lang-commonMain")) {
-        val curBounds = findSectionBounds("bundles")!!
-        val insertAt = sectionInsertIndex(curBounds)
-        lines.addAll(
-            insertAt,
-            listOf(
-                "rust-lang-commonMain = [",
-                """  "$libKey",""",
-                "]",
-            ),
+
+    companion object {
+        val HEADER_REGEX = Regex("""^\[([A-Za-z0-9_.-]+)]\s*$""")
+        val VERSION_REF_REGEX = Regex("""version\.ref\s*=\s*"([^"]+)"""")
+    }
+}
+
+public fun ensureRustLangInLibsVersionsToml(
+    tomlText: String,
+    commonMainBundleName: String? = null,
+    version: String = DEFAULT_RUST_LANG_KOTLIN_VERSION,
+): String {
+    val editor = TomlManifestEditor(tomlText)
+    var existingLibKey: String? = null
+    var existingVerRef: String? = null
+    editor.findSectionBounds("libraries")?.let { libBounds ->
+        for (i in (libBounds.first + 1)..libBounds.last) {
+            val line = editor.lines[i].trim()
+            if (!line.startsWith("#") && "io.github.kotlinmania:rust-lang-kotlin" in line && '=' in line) {
+                existingLibKey = line.substringBefore('=').trim()
+                val verMatch = TomlManifestEditor.VERSION_REF_REGEX.find(line)
+                existingVerRef = verMatch?.groupValues?.get(1)
+                break
+            }
+        }
+    }
+
+    var versionKey = existingVerRef
+    val verBounds = if (versionKey == null) editor.findSectionBounds("versions") else null
+    if (verBounds != null) {
+        for (i in (verBounds.first + 1)..verBounds.last) {
+            val line = editor.lines[i].trim()
+            if (line.startsWith("#") || '=' !in line) continue
+            val k = line.substringBefore('=').trim()
+            if (k == "rustLang" || k == "rustLangKotlin") {
+                versionKey = k
+                break
+            }
+        }
+    }
+    if (versionKey == null) {
+        versionKey = "rustLang"
+        editor.appendLineToSection("versions", """$versionKey = "$version"""")
+    }
+
+    val libKey = existingLibKey ?: "rust-lang-kotlin"
+    if (existingLibKey == null) {
+        editor.appendLineToSection(
+            "libraries",
+            """$libKey = { module = "io.github.kotlinmania:rust-lang-kotlin", version.ref = "$versionKey" }""",
         )
     }
 
-    val joined = lines.joinToString("\n")
-    return if (hadTrailingNewline || tomlText.isEmpty()) "$joined\n" else joined
+    val bundleBounds = editor.ensureSection("bundles")
+    val preferredBundle =
+        commonMainBundleName?.trim()?.takeIf { it.isNotEmpty() }
+            ?: ((bundleBounds.first + 1)..bundleBounds.last).firstNotNullOfOrNull { i ->
+                val trimmed = editor.lines[i].trim()
+                if (trimmed.startsWith("#") || '=' !in trimmed || '[' !in trimmed) {
+                    null
+                } else {
+                    trimmed.substringBefore('=').trim().takeIf { it.endsWith("-commonMain") && it != "rust-lang-commonMain" }
+                }
+            }
+
+    if (preferredBundle != null && preferredBundle != "rust-lang-commonMain") {
+        editor.addLibToExistingBundle(preferredBundle, libKey)
+    }
+    if (!editor.addLibToExistingBundle("rust-lang-commonMain", libKey)) {
+        val curBounds = editor.findSectionBounds("bundles")!!
+        editor.lines.addAll(
+            editor.sectionInsertIndex(curBounds),
+            listOf("rust-lang-commonMain = [", """  "$libKey",""", "]"),
+        )
+    }
+    return editor.render()
 }

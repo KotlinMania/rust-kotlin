@@ -21,6 +21,743 @@ import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.parse2
 
+internal fun wordSet(vararg lines: String): Set<String> =
+    lines.flatMapTo(linkedSetOf()) { it.split(' ').filter(String::isNotEmpty) }
+
+internal fun List<SynType>.nonInferAt(idx: Int): SynType? =
+    getOrNull(idx)?.takeUnless { it is SynType.Infer }
+
+internal data class CoreIntrinsicCallSpec(
+    val rawName: String,
+    val canonicalName: String,
+    val ord0: String?,
+    val ord1: String?,
+    val isIntrinsicsModuleCall: Boolean,
+    val penultName: String?,
+    val rewrittenSegNames: List<String>,
+    val explicitTypes: List<SynType>,
+    val explicitConsts: List<Expr>,
+    val callArgsList: List<Expr>,
+) {
+    fun renderedExplicitTypeAt(idx: Int, selfTypeName: String?, emitter: KotlinJ2KEmitter): String? =
+        explicitTypes.nonInferAt(idx)?.let { emitter.renderType(it, selfTypeName) }
+
+    fun inferredPointeeTypeAt0(emitter: KotlinJ2KEmitter): SynType? {
+        explicitTypes.nonInferAt(0)?.let { return it }
+        val initTy = callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) } ?: return null
+        return (unwrapSynType(initTy) as? SynType.Ptr)?.elem
+    }
+}
+
+internal class IntrinsicCallContext(
+    val spec: CoreIntrinsicCallSpec,
+    val renderedArgs: List<String>,
+    val indent: String,
+    val selfTypeName: String?,
+    val coreNs: String,
+    val isCoreSimdCall: Boolean,
+    val emitter: KotlinJ2KEmitter,
+) {
+    val rawName: String get() = spec.rawName
+    val canonicalName: String get() = spec.canonicalName
+    val explicitTypes: List<SynType> get() = spec.explicitTypes
+    val explicitConsts: List<Expr> get() = spec.explicitConsts
+    val callArgsList: List<Expr> get() = spec.callArgsList
+    val intrPkg: String = "$coreNs.intrinsics"
+    val memPkg: String = "$coreNs.mem"
+    val ptrPkg: String = "$coreNs.ptr"
+    val rawAbi: Boolean get() = emitter.headerContext.rawAbiMode
+
+    fun usizeLiteral(lit: Int): String = if (rawAbi) "${lit}uL" else "$lit"
+
+    fun asUsizeExpr(expr: String): String = if (rawAbi) "$expr.toULong()" else "$expr.toInt()"
+
+    fun importIntr(sym: String): String {
+        CoreIntrinsicLowering.registerCoreImport(emitter, "$intrPkg.$sym")
+        return sym
+    }
+
+    fun importMem(sym: String): String {
+        CoreIntrinsicLowering.registerCoreImport(emitter, "$memPkg.$sym")
+        return sym
+    }
+
+    fun importPtr(sym: String): String {
+        CoreIntrinsicLowering.registerCoreImport(emitter, "$ptrPkg.$sym")
+        return sym
+    }
+
+    fun callIntr(fnName: String, vararg args: String): String =
+        "${importIntr(fnName)}(${args.joinToString(", ")})"
+
+    fun callMem(fnName: String, vararg args: String): String =
+        "${importMem(fnName)}(${args.joinToString(", ")})"
+
+    fun pointeeAt(argIdx: Int = 0): SynType? =
+        explicitTypes.firstOrNull()
+            ?: (callArgsList.getOrNull(argIdx)?.let { emitter.sourceInitializerType(it) } as? SynType.Ptr)?.elem
+
+    fun targetOrPointeeAt0(): SynType? =
+        CoreIntrinsicLowering.unwrapTargetOrPointeeType(explicitTypes, callArgsList, emitter)
+
+    fun layoutOf(ty: SynType): String =
+        CoreIntrinsicLowering.resolveTypeLayoutExpression(ty, selfTypeName, emitter)
+
+    fun rawAddrOf(argIdx: Int): String {
+        val argExpr = callArgsList.getOrNull(argIdx)
+        val rendered = renderedArgs[argIdx]
+        if (rawAbi) return rendered
+        val inferred = argExpr?.let { emitter.inferExprRenderedType(it, selfTypeName) }
+        val atom = if (argExpr != null && emitter.isAtomicPostfixReceiver(argExpr, rendered)) rendered else "($rendered)"
+        return if (inferred == "Long") rendered else "$atom.rawAddress"
+    }
+
+    fun orderingCode(constIdx: Int): String {
+        val legacyOrd = if (constIdx == 0) spec.ord0 else spec.ord1
+        if (legacyOrd != null && constIdx >= explicitConsts.size) return legacyOrd
+        var expr = explicitConsts.getOrNull(constIdx) ?: return legacyOrd ?: "4"
+        while (true) {
+            expr =
+                when (val unwrapped = emitter.unwrapParenOrGroupExpr(expr)) {
+                    is Expr.BlockExpr -> (unwrapped.block.stmts.singleOrNull() as? Stmt.ExprStmt)?.expr ?: break
+                    else -> unwrapped
+                }
+            if (expr !is Expr.BlockExpr) break
+        }
+        return when ((expr as? Expr.Path)?.path?.lastIdentText()) {
+            "Relaxed" -> "0"
+            "Release" -> "1"
+            "Acquire" -> "2"
+            "AcqRel" -> "3"
+            "SeqCst" -> "4"
+            else -> "(${emitter.renderExpr(expr, indent, selfTypeName)}).ordinal"
+        }
+    }
+}
+
+private abstract class CoreIntrinsicFamilyRule {
+    abstract fun matches(canonicalName: String, isCoreSimdCall: Boolean = false): Boolean
+
+    open fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? = null
+
+    abstract fun renderCall(ctx: IntrinsicCallContext): String?
+}
+
+private object ControlAndHintIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
+    private val DECL_NOOP_NAMES =
+        "assume breakpoint forget cold_path assert_inhabited assert_zero_valid assert_mem_uninitialized_valid"
+            .split(' ')
+            .toSet()
+    private val CALL_NOOP_NAMES =
+        DECL_NOOP_NAMES +
+            "prefetch_read_data prefetch_write_data prefetch_read_instruction prefetch_write_instruction".split(' ')
+    private val IDENTITY_NAMES = setOf("likely", "unlikely", "rustc_peek")
+    private val FALSE_CHECK_NAMES = setOf("ub_checks", "overflow_checks", "is_val_statically_known")
+    private val OTHER_NAMES = setOf("abort", "abort_immediate", "unreachable", "select_unpredictable", "black_box")
+
+    override fun matches(canonicalName: String, isCoreSimdCall: Boolean): Boolean =
+        canonicalName in CALL_NOOP_NAMES ||
+            canonicalName in IDENTITY_NAMES ||
+            canonicalName in FALSE_CHECK_NAMES ||
+            canonicalName in OTHER_NAMES
+
+    override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? =
+        when (decl.canonicalName) {
+            "abort", "abort_immediate" -> decl.callIntr("kmAbort")
+            "unreachable" -> "error(\"Entered Rust intrinsics::unreachable\")"
+            in DECL_NOOP_NAMES -> "Unit"
+            in IDENTITY_NAMES, "black_box" -> decl.p0
+            "select_unpredictable" -> "if (${decl.p0}) ${decl.p1} else ${decl.p2}"
+            else -> null
+        }
+
+    override fun renderCall(ctx: IntrinsicCallContext): String? =
+        when (ctx.canonicalName) {
+            "abort", "abort_immediate" -> ctx.callIntr("kmAbort")
+            "unreachable" -> "error(\"Entered Rust intrinsics::unreachable\")"
+            in CALL_NOOP_NAMES -> "Unit"
+            in IDENTITY_NAMES -> ctx.renderedArgs.firstOrNull() ?: "Unit"
+            "select_unpredictable" ->
+                if (ctx.renderedArgs.size >= 3) "if (${ctx.renderedArgs[0]}) ${ctx.renderedArgs[1]} else ${ctx.renderedArgs[2]}" else null
+            in FALSE_CHECK_NAMES -> "false"
+            "black_box" -> {
+                val arg0 = ctx.renderedArgs.firstOrNull() ?: return "Unit"
+                val kind = ctx.callArgsList.firstOrNull()?.let { ctx.emitter.inferExprNumericKind(it, ctx.selfTypeName) }
+                if (kind == NumericKind.U64) ctx.callIntr("kmBlackBoxU64", arg0) else arg0
+            }
+            else -> null
+        }
+}
+
+private object LayoutAndReflectionIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
+    private val ALIGN_NAMES = setOf("align_of", "align_of_val", "min_align_of", "min_align_of_val", "pref_align_of")
+    private val ALL_NAMES =
+        ALIGN_NAMES +
+            setOf("size_of", "size_of_val", "vtable_size", "vtable_align", "variant_count", "raw_eq", "needs_drop", "type_name")
+    private val TRIVIAL_SCALARS =
+        "bool char i8 u8 i16 u16 i32 u32 i64 u64 i128 u128 isize usize f16 f32 f64 f128".split(' ').toSet()
+
+    override fun matches(canonicalName: String, isCoreSimdCall: Boolean): Boolean = canonicalName in ALL_NAMES
+
+    override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? =
+        when (decl.canonicalName) {
+            "size_of" -> decl.asUsizeExpr("${decl.layout0}.sizeBytes")
+            "size_of_val" ->
+                if (decl.rawAbi) {
+                    "${decl.layout0}.sizeBytes.toULong()"
+                } else {
+                    "(if (${decl.p0}.rawMeta > 0L) (${decl.p0}.rawMeta * ${decl.layout0}.sizeBytes).toInt() else ${decl.layout0}.sizeBytes.toInt())"
+                }
+            in ALIGN_NAMES -> decl.asUsizeExpr("${decl.layout0}.alignBytes")
+            "vtable_size", "vtable_align" -> decl.usizeLiteral(8)
+            "variant_count" -> decl.usizeLiteral(1)
+            "raw_eq" -> decl.callMem("rawEqWithLayout", decl.p0, decl.p1, decl.layout0)
+            "needs_drop" -> "true"
+            "type_name" -> "\"${decl.t0}\""
+            else -> null
+        }
+
+    override fun renderCall(ctx: IntrinsicCallContext): String? =
+        when (ctx.canonicalName) {
+            "size_of" -> {
+                val ty = ctx.explicitTypes.firstOrNull() ?: return null
+                ctx.asUsizeExpr("(${ctx.layoutOf(ty)}).sizeBytes")
+            }
+            "size_of_val" -> {
+                val ptrExpr = ctx.renderedArgs.firstOrNull() ?: return null
+                val firstArg = ctx.callArgsList.firstOrNull()
+                val pointeeTy = ctx.targetOrPointeeAt0() ?: return null
+                val layout = ctx.layoutOf(pointeeTy)
+                if (ctx.rawAbi) {
+                    "($layout).sizeBytes.toULong()"
+                } else {
+                    val argRenderedTy = firstArg?.let { ctx.emitter.inferExprRenderedType(it, ctx.selfTypeName) }
+                    val isPtrArg =
+                        argRenderedTy != null &&
+                            (argRenderedTy.startsWith("ConstPtr") || argRenderedTy.startsWith("MutPtr") || ".ptr." in argRenderedTy)
+                    if (isPtrArg) {
+                        val atomPtr = if (ctx.emitter.isAtomicPostfixReceiver(firstArg, ptrExpr)) ptrExpr else "($ptrExpr)"
+                        "(if ($atomPtr.rawMeta > 0L) ($atomPtr.rawMeta * ($layout).sizeBytes).toInt() else ($layout).sizeBytes.toInt())"
+                    } else {
+                        "($layout).sizeBytes.toInt()"
+                    }
+                }
+            }
+            in ALIGN_NAMES -> {
+                val ty = ctx.targetOrPointeeAt0() ?: return null
+                ctx.asUsizeExpr("(${ctx.layoutOf(ty)}).alignBytes")
+            }
+            "vtable_size", "vtable_align" -> ctx.usizeLiteral(8)
+            "variant_count" -> ctx.usizeLiteral(1)
+            "raw_eq" -> {
+                if (ctx.renderedArgs.size < 2) return null
+                val targetTy = ctx.targetOrPointeeAt0() ?: return null
+                ctx.callMem("rawEqWithLayout", ctx.renderedArgs[0], ctx.renderedArgs[1], ctx.layoutOf(targetTy))
+            }
+            "needs_drop" -> {
+                val ty = ctx.explicitTypes.firstOrNull() ?: return "true"
+                val primName =
+                    (ty as? SynType.Path)
+                        ?.takeIf { it.qself == null && it.path.segments.size == 1 }
+                        ?.path
+                        ?.lastIdentText()
+                val isTrivial = ty is SynType.Ptr || ty is SynType.Reference || primName in TRIVIAL_SCALARS
+                if (isTrivial) "false" else "true"
+            }
+            "type_name" -> {
+                val label = ctx.explicitTypes.firstOrNull()?.let { ctx.emitter.renderType(it, ctx.selfTypeName) } ?: "Any"
+                "\"$label\""
+            }
+            else -> null
+        }
+}
+
+private object PointerAndMemoryIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
+    private val LOAD_NAMES = setOf("read_via_copy", "volatile_load", "unaligned_volatile_load")
+    private val STORE_NAMES = setOf("write_via_move", "volatile_store", "unaligned_volatile_store", "nontemporal_store")
+    private val COPY_NAMES = setOf("copy_nonoverlapping", "volatile_copy_nonoverlapping_memory", "copy", "volatile_copy_memory")
+    private val SET_NAMES = setOf("write_bytes", "volatile_set_memory")
+    private val PTR_OPS =
+        setOf("offset", "arith_offset", "ptr_offset_from", "ptr_offset_from_unsigned", "ptr_mask", "aggregate_raw_ptr", "ptr_metadata", "compare_bytes")
+
+    override fun matches(canonicalName: String, isCoreSimdCall: Boolean): Boolean =
+        canonicalName in PTR_OPS || canonicalName in LOAD_NAMES || canonicalName in STORE_NAMES || canonicalName in COPY_NAMES || canonicalName in SET_NAMES
+
+    override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? =
+        when (decl.canonicalName) {
+            "arith_offset" -> "${decl.importPtr("ConstPtr")}(${decl.p0}.rawAddress + (${decl.p1}).toLong() * ${decl.layout0}.strideBytes)"
+            "ptr_offset_from" -> {
+                val diff = "((${decl.p0}.rawAddress - ${decl.p1}.rawAddress) / maxOf(1L, ${decl.layout0}.sizeBytes))"
+                if (decl.rawAbi) diff else "$diff.toInt()"
+            }
+            "ptr_offset_from_unsigned" -> {
+                val diff = "((${decl.p0}.rawAddress - ${decl.p1}.rawAddress) / maxOf(1L, ${decl.layout0}.sizeBytes))"
+                if (decl.rawAbi) "($diff.toULong())" else "$diff.toInt()"
+            }
+            "ptr_mask" -> "${decl.importPtr("ConstPtr")}(${decl.p0}.rawAddress and (${decl.p1}).toLong())"
+            "read_via_copy" -> "${decl.layout0}.readNative(${decl.p0}.rawAddress)"
+            "write_via_move", "nontemporal_store" -> "${decl.layout0}.writeNative(${decl.p0}.rawAddress, ${decl.p1})"
+            "volatile_load", "unaligned_volatile_load" -> "${decl.layout0}.readVolatileNative(${decl.p0}.rawAddress)"
+            "volatile_store", "unaligned_volatile_store" -> "${decl.layout0}.writeVolatileNative(${decl.p0}.rawAddress, ${decl.p1})"
+            "copy_nonoverlapping", "volatile_copy_nonoverlapping_memory" ->
+                decl.callIntr("kmCopyNonoverlapping", "${decl.p1}.rawAddress", "${decl.p0}.rawAddress", "(${decl.p2}).toLong() * ${decl.layout0}.sizeBytes")
+            "copy", "volatile_copy_memory" ->
+                decl.callIntr("kmCopy", "${decl.p1}.rawAddress", "${decl.p0}.rawAddress", "(${decl.p2}).toLong() * ${decl.layout0}.sizeBytes")
+            "write_bytes", "volatile_set_memory" ->
+                decl.callIntr("kmWriteBytes", "${decl.p0}.rawAddress", decl.p1, "(${decl.p2}).toLong() * ${decl.layout0}.sizeBytes")
+            "compare_bytes" ->
+                decl.callIntr("kmCompareBytes", "${decl.p0}.rawAddress", "${decl.p1}.rawAddress", "(${decl.p2}).toLong()")
+            else -> null
+        }
+
+    override fun renderCall(ctx: IntrinsicCallContext): String? =
+        when (ctx.canonicalName) {
+            "offset", "arith_offset" -> {
+                val firstArg = ctx.callArgsList.firstOrNull() ?: return null
+                val ptrSynType =
+                    (ctx.explicitTypes.firstOrNull() as? SynType.Ptr)
+                        ?: (ctx.emitter.sourceInitializerType(firstArg) as? SynType.Ptr)
+                val pointeeSynType = ptrSynType?.elem ?: ctx.explicitTypes.firstOrNull()?.takeUnless { it is SynType.Ptr }
+                val inferredPtrRendered = ctx.emitter.inferExprRenderedType(firstArg, ctx.selfTypeName)
+                val isMut =
+                    (ptrSynType?.mutability is PointerMutability.Mut) ||
+                        inferredPtrRendered?.substringAfterLast('.')?.startsWith("MutPtr<") == true
+                val ctor = ctx.importPtr(if (isMut) "MutPtr" else "ConstPtr")
+                val strideExpr = if (pointeeSynType != null) "(${ctx.layoutOf(pointeeSynType)}).strideBytes" else "1L"
+                "$ctor(${ctx.rawAddrOf(0)} + (${ctx.renderedArgs[1]}).toLong() * $strideExpr)"
+            }
+            "ptr_offset_from", "ptr_offset_from_unsigned" -> {
+                val pointeeSynType = ctx.pointeeAt(0) ?: ctx.pointeeAt(1)
+                val sizeExpr = if (pointeeSynType != null) "maxOf(1L, (${ctx.layoutOf(pointeeSynType)}).sizeBytes)" else "1L"
+                val diffDiv = "((${ctx.rawAddrOf(0)} - ${ctx.rawAddrOf(1)}) / $sizeExpr)"
+                when {
+                    ctx.canonicalName == "ptr_offset_from_unsigned" && ctx.rawAbi -> "$diffDiv.toULong()"
+                    ctx.rawAbi -> diffDiv
+                    else -> "$diffDiv.toInt()"
+                }
+            }
+            "ptr_mask" -> "${ctx.importPtr("ConstPtr")}(${ctx.rawAddrOf(0)} and (${ctx.renderedArgs[1]}).toLong())"
+            "aggregate_raw_ptr" -> {
+                val enclosingRet = ctx.emitter.currentEnclosingReturnRenderedType
+                val isMut = enclosingRet?.substringAfterLast('.')?.startsWith("MutPtr<") == true
+                val ctor = ctx.importPtr(if (isMut) "MutPtr" else "ConstPtr")
+                "$ctor(${ctx.rawAddrOf(0)}, (${ctx.renderedArgs[1]}).toLong())"
+            }
+            "ptr_metadata" -> ctx.asUsizeExpr("${ctx.renderedArgs[0]}.rawMeta")
+            in LOAD_NAMES -> {
+                val isVolatile = ctx.rawName != "read_via_copy"
+                val pointee = ctx.pointeeAt(0) ?: return null
+                DirectLoadIntrinsicEmitter(
+                    fnPrefix = if (isVolatile) "kmVolatileLoad" else "kmLoad",
+                    allowChar = true,
+                    allowFloat = true,
+                    isVolatile = isVolatile,
+                    trailingArgs = emptyList(),
+                    intrPkg = ctx.intrPkg,
+                    ptrPkg = ctx.ptrPkg,
+                    emitter = ctx.emitter,
+                ).render(pointee, ctx.rawAddrOf(0)) ?: run {
+                    val method = if (isVolatile) "readVolatileNative" else "readNative"
+                    "(${ctx.layoutOf(pointee)}).$method(${ctx.rawAddrOf(0)})"
+                }
+            }
+            in STORE_NAMES -> {
+                val isVolatile = ctx.rawName == "volatile_store" || ctx.rawName == "unaligned_volatile_store"
+                val pointee = ctx.pointeeAt(0) ?: return null
+                DirectStoreIntrinsicEmitter(
+                    fnPrefix = if (isVolatile) "kmVolatileStore" else "kmStore",
+                    allowChar = true,
+                    allowFloat = true,
+                    isVolatile = isVolatile,
+                    trailingArgs = emptyList(),
+                    intrPkg = ctx.intrPkg,
+                    ptrPkg = ctx.ptrPkg,
+                    emitter = ctx.emitter,
+                ).render(pointee, ctx.rawAddrOf(0), ctx.renderedArgs[1]) ?: run {
+                    val method = if (isVolatile) "writeVolatileNative" else "writeNative"
+                    "(${ctx.layoutOf(pointee)}).$method(${ctx.rawAddrOf(0)}, ${ctx.renderedArgs[1]})"
+                }
+            }
+            in COPY_NAMES -> {
+                val fnName = if (ctx.rawName.contains("nonoverlapping")) "kmCopyNonoverlapping" else "kmCopy"
+                val srcIdx = if (ctx.rawName.startsWith("volatile_")) 1 else 0
+                val dstIdx = if (ctx.rawName.startsWith("volatile_")) 0 else 1
+                val bytesExpr = CoreIntrinsicLowering.renderScaledByteCountExpr(ctx.pointeeAt(srcIdx), ctx.renderedArgs[2], ctx.selfTypeName, ctx.emitter)
+                ctx.callIntr(fnName, ctx.rawAddrOf(dstIdx), ctx.rawAddrOf(srcIdx), bytesExpr)
+            }
+            in SET_NAMES -> {
+                val bytesExpr = CoreIntrinsicLowering.renderScaledByteCountExpr(ctx.pointeeAt(0), ctx.renderedArgs[2], ctx.selfTypeName, ctx.emitter)
+                ctx.callIntr("kmWriteBytes", ctx.rawAddrOf(0), "(${ctx.renderedArgs[1]}).toUByte()", bytesExpr)
+            }
+            "compare_bytes" ->
+                ctx.callIntr("kmCompareBytes", ctx.rawAddrOf(0), ctx.rawAddrOf(1), "(${ctx.renderedArgs[2]}).toLong()")
+            else -> null
+        }
+}
+
+private object AtomicMemoryIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
+    val RMW_OP_CODES: Map<String, Int> =
+        mapOf(
+            "atomic_xadd" to 1,
+            "atomic_xsub" to 2,
+            "atomic_and" to 3,
+            "atomic_nand" to 4,
+            "atomic_or" to 5,
+            "atomic_xor" to 6,
+            "atomic_max" to 7,
+            "atomic_min" to 8,
+            "atomic_umax" to 9,
+            "atomic_umin" to 10,
+        )
+    val NON_RMW_NAMES: Set<String> =
+        setOf("atomic_load", "atomic_store", "atomic_xchg", "atomic_fence", "atomic_singlethreadfence", "atomic_cxchg", "atomic_cxchgweak")
+
+    override fun matches(canonicalName: String, isCoreSimdCall: Boolean): Boolean =
+        canonicalName in NON_RMW_NAMES || canonicalName in RMW_OP_CODES
+
+    override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? =
+        when (decl.canonicalName) {
+            "atomic_fence" -> decl.callIntr("kmAtomicFence", decl.ord0)
+            "atomic_singlethreadfence" -> decl.callIntr("kmAtomicSignalFence", decl.ord0)
+            "atomic_load" -> decl.callMem("atomicLoadWithLayout", "${decl.p0}.rawAddress", decl.ord0, decl.layout0)
+            "atomic_store" -> decl.callMem("atomicStoreWithLayout", "${decl.p0}.rawAddress", decl.p1, decl.ord0, decl.layout0)
+            "atomic_xchg" -> decl.callMem("atomicXchgWithLayout", "${decl.p0}.rawAddress", decl.p1, decl.ord0, decl.layout0)
+            "atomic_cxchg", "atomic_cxchgweak" ->
+                decl.callMem("atomicCxchgWithLayout", "${decl.p0}.rawAddress", decl.p1, decl.p2, decl.ord0, decl.ord1, decl.layout0)
+            in RMW_OP_CODES -> {
+                val opCode = RMW_OP_CODES.getValue(decl.canonicalName).toString()
+                val opLayout = if (decl.typeParams.size >= 2) decl.layout1 else decl.layout0
+                decl.callMem("atomicRmwWithLayout", "${decl.p0}.rawAddress", decl.p1, opCode, decl.ord0, decl.layout0, opLayout)
+            }
+            else -> null
+        }
+
+    override fun renderCall(ctx: IntrinsicCallContext): String? =
+        when (ctx.canonicalName) {
+            "atomic_fence" -> ctx.callIntr("kmAtomicFence", ctx.orderingCode(0))
+            "atomic_singlethreadfence" -> ctx.callIntr("kmAtomicSignalFence", ctx.orderingCode(0))
+            "atomic_load" -> {
+                val pointee = ctx.pointeeAt(0) ?: return null
+                val ord0 = ctx.orderingCode(0)
+                DirectLoadIntrinsicEmitter("kmAtomicLoad", false, false, false, listOf(ord0), ctx.intrPkg, ctx.ptrPkg, ctx.emitter)
+                    .render(pointee, ctx.rawAddrOf(0))
+                    ?: ctx.callMem("atomicLoadWithLayout", ctx.rawAddrOf(0), ord0, ctx.layoutOf(pointee))
+            }
+            "atomic_store" -> {
+                val pointee = ctx.pointeeAt(0) ?: return null
+                val ord0 = ctx.orderingCode(0)
+                DirectStoreIntrinsicEmitter("kmAtomicStore", false, false, false, listOf(ord0), ctx.intrPkg, ctx.ptrPkg, ctx.emitter)
+                    .render(pointee, ctx.rawAddrOf(0), ctx.renderedArgs[1])
+                    ?: ctx.callMem("atomicStoreWithLayout", ctx.rawAddrOf(0), ctx.renderedArgs[1], ord0, ctx.layoutOf(pointee))
+            }
+            "atomic_xchg" -> {
+                val pointee = ctx.pointeeAt(0) ?: return null
+                val ord0 = ctx.orderingCode(0)
+                DirectReadModifyWriteIntrinsicEmitter("kmAtomicXchg", listOf(ord0), ctx.intrPkg, ctx.ptrPkg, ctx.emitter)
+                    .render(pointee, ctx.rawAddrOf(0), ctx.renderedArgs[1])
+                    ?: ctx.callMem("atomicXchgWithLayout", ctx.rawAddrOf(0), ctx.renderedArgs[1], ord0, ctx.layoutOf(pointee))
+            }
+            "atomic_cxchg", "atomic_cxchgweak" -> {
+                val pointee = ctx.pointeeAt(0) ?: return null
+                val ord0 = ctx.orderingCode(0)
+                val ord1 = ctx.orderingCode(1)
+                DirectCompareExchangeIntrinsicEmitter(ctx.intrPkg, ctx.ptrPkg, ctx.emitter)
+                    .render(pointee, ctx.rawAddrOf(0), ctx.renderedArgs[1], ctx.renderedArgs[2], ord0, ord1)
+                    ?: ctx.callMem("atomicCxchgWithLayout", ctx.rawAddrOf(0), ctx.renderedArgs[1], ctx.renderedArgs[2], ord0, ord1, ctx.layoutOf(pointee))
+            }
+            in RMW_OP_CODES -> {
+                val opCode = RMW_OP_CODES.getValue(ctx.canonicalName).toString()
+                val pointee = ctx.pointeeAt(0) ?: return null
+                val operandType = ctx.explicitTypes.getOrNull(1) ?: pointee
+                val ord0 = ctx.orderingCode(0)
+                val direct =
+                    if (ctx.explicitTypes.size <= 1) {
+                        DirectReadModifyWriteIntrinsicEmitter("kmAtomicRmw", listOf(opCode, ord0), ctx.intrPkg, ctx.ptrPkg, ctx.emitter)
+                            .render(pointee, ctx.rawAddrOf(0), ctx.renderedArgs[1])
+                    } else {
+                        null
+                    }
+                direct ?: ctx.callMem("atomicRmwWithLayout", ctx.rawAddrOf(0), ctx.renderedArgs[1], opCode, ord0, ctx.layoutOf(pointee), ctx.layoutOf(operandType))
+            }
+            else -> null
+        }
+}
+
+private object NumericAndFloatIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
+    override fun matches(canonicalName: String, isCoreSimdCall: Boolean): Boolean =
+        canonicalName in INT_INTRINSIC_RULES_BY_NAME || canonicalName in FLOAT_INTRINSIC_RULES_BY_NAME
+
+    override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? =
+        INT_INTRINSIC_RULES_BY_NAME[decl.canonicalName]?.renderSynthesizedBody(decl)
+            ?: FLOAT_INTRINSIC_RULES_BY_NAME[decl.canonicalName]?.renderSynthesizedBody(decl)
+
+    override fun renderCall(ctx: IntrinsicCallContext): String? =
+        when (ctx.canonicalName) {
+            in INT_INTRINSIC_RULES_BY_NAME ->
+                renderIntOrBitIntrinsicCall(
+                    canonicalName = ctx.canonicalName,
+                    renderedArgs = ctx.renderedArgs,
+                    callArgsList = ctx.callArgsList,
+                    explicitTypes = ctx.explicitTypes,
+                    selfTypeName = ctx.selfTypeName,
+                    coreNs = ctx.coreNs,
+                    intrPkg = ctx.intrPkg,
+                    memPkg = ctx.memPkg,
+                    emitter = ctx.emitter,
+                )
+            in FLOAT_INTRINSIC_RULES_BY_NAME ->
+                renderFloatIntrinsicCall(
+                    canonicalName = ctx.canonicalName,
+                    renderedArgs = ctx.renderedArgs,
+                    callArgsList = ctx.callArgsList,
+                    explicitTypes = ctx.explicitTypes,
+                    selfTypeName = ctx.selfTypeName,
+                    coreNs = ctx.coreNs,
+                    intrPkg = ctx.intrPkg,
+                    memPkg = ctx.memPkg,
+                    emitter = ctx.emitter,
+                )
+            else -> null
+        }
+}
+
+private object TransmuteIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
+    override fun matches(canonicalName: String, isCoreSimdCall: Boolean): Boolean =
+        canonicalName == "transmute" || canonicalName == "transmute_unchecked"
+
+    override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String =
+        decl.callMem("transmuteWithLayouts", decl.p0, decl.layout0, decl.layout1)
+
+    override fun renderCall(ctx: IntrinsicCallContext): String? =
+        ctx.callArgsList.singleOrNull()?.let { arg0 ->
+            CoreIntrinsicLowering.renderTransmuteCall(
+                rawTransmuteIdent = ctx.rawName,
+                explicitTypes = ctx.explicitTypes,
+                argExpr = arg0,
+                indent = ctx.indent,
+                selfTypeName = ctx.selfTypeName,
+                emitter = ctx.emitter,
+            )
+        }
+}
+
+private object SimdIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
+    val NAMES: Set<String> =
+        wordSet(
+            "simd_insert simd_extract simd_insert_dyn simd_extract_dyn simd_splat simd_add simd_sub simd_mul simd_div",
+            "simd_rem simd_shl simd_shr simd_funnel_shl simd_funnel_shr simd_carryless_mul simd_and simd_or simd_xor",
+            "simd_cast simd_as simd_neg simd_fabs simd_minimum_number_nsz simd_maximum_number_nsz simd_eq simd_ne",
+            "simd_lt simd_le simd_gt simd_ge simd_shuffle simd_gather simd_scatter simd_masked_load simd_masked_store",
+            "simd_saturating_add simd_saturating_sub simd_reduce_add_ordered simd_reduce_add_unordered",
+            "simd_reduce_mul_ordered simd_reduce_mul_unordered simd_reduce_all simd_reduce_any simd_reduce_max",
+            "simd_reduce_min simd_reduce_and simd_reduce_or simd_reduce_xor simd_bitmask simd_select simd_select_bitmask",
+            "simd_arith_offset simd_cast_ptr simd_expose_provenance simd_with_exposed_provenance simd_bswap",
+            "simd_bitreverse simd_ctlz simd_ctpop simd_cttz simd_ceil simd_floor simd_round simd_round_ties_even",
+            "simd_trunc simd_fsqrt simd_fma simd_relaxed_fma simd_fsin simd_fcos simd_fexp simd_fexp2 simd_flog10",
+            "simd_flog2 simd_flog",
+        )
+    val BOOL_RETURN_NAMES: Set<String> = setOf("simd_reduce_all", "simd_reduce_any")
+    val UNIT_RETURN_NAMES: Set<String> = setOf("simd_scatter", "simd_masked_store")
+    val SAME_ARG0_NAMES: Set<String> =
+        wordSet(
+            "simd_insert simd_insert_dyn simd_add simd_sub simd_mul simd_div simd_rem simd_shl simd_shr",
+            "simd_funnel_shl simd_funnel_shr simd_carryless_mul simd_and simd_or simd_xor simd_neg simd_fabs",
+            "simd_minimum_number_nsz simd_maximum_number_nsz simd_gather simd_saturating_add simd_saturating_sub",
+            "simd_arith_offset simd_bswap simd_bitreverse simd_ctlz simd_ctpop simd_cttz simd_ceil simd_floor",
+            "simd_round simd_round_ties_even simd_trunc simd_fsqrt simd_fma simd_relaxed_fma simd_fsin simd_fcos",
+            "simd_fexp simd_fexp2 simd_flog10 simd_flog2 simd_flog",
+        )
+    private val SAME_ARG1_NAMES: Set<String> =
+        setOf("simd_reduce_add_ordered", "simd_reduce_mul_ordered", "simd_select", "simd_select_bitmask")
+    private val SAME_ARG2_NAMES: Set<String> = setOf("simd_masked_load")
+    private val NO_PEER_INFER_EXPECTED =
+        setOf("simd_select_bitmask", "simd_gather", "simd_scatter", "simd_masked_load", "simd_masked_store")
+    private val NO_EXPECTED_TARGET_PROPAGATION =
+        setOf("simd_insert", "simd_insert_dyn", "simd_gather", "simd_arith_offset")
+    private val NO_PEER_INFER_RETURN = NO_PEER_INFER_EXPECTED + NO_EXPECTED_TARGET_PROPAGATION
+
+    fun isSimdIntrinsicName(name: String): Boolean = name in NAMES || name.startsWith("sve_tuple_")
+
+    override fun matches(canonicalName: String, isCoreSimdCall: Boolean): Boolean =
+        isCoreSimdCall || isSimdIntrinsicName(canonicalName)
+
+    private fun extractDirectNonTransmuteArgType(
+        argExpr: Expr,
+        selfTypeName: String?,
+        emitter: KotlinJ2KEmitter,
+        unwrapParensForCheck: Boolean,
+    ): String? {
+        val checkedCall = (if (unwrapParensForCheck) emitter.unwrapParenOrGroupExpr(argExpr) else argExpr) as? Expr.Call
+        val rawCallName = (checkedCall?.func as? Expr.Path)?.path?.lastCleanIdent()
+        if (rawCallName == "transmute" || rawCallName == "transmute_unchecked") return null
+        return emitter.inferExprRenderedType(argExpr, selfTypeName)?.takeIf(CoreIntrinsicLowering::isUsableRenderedTypeArg)
+    }
+
+    private fun extractSingleArgTransmuteInputType(
+        argExpr: Expr,
+        selfTypeName: String?,
+        emitter: KotlinJ2KEmitter,
+    ): String? {
+        val callArg = emitter.unwrapParenOrGroupExpr(argExpr) as? Expr.Call ?: return null
+        val callPath = (callArg.func as? Expr.Path)?.takeIf { it.qself == null }?.path ?: return null
+        val callName = callPath.lastCleanIdent()
+        if ((callName == "transmute" || callName == "transmute_unchecked") && callArg.args.len() == 1) {
+            return emitter.inferExprRenderedType(callArg.args.first()!!, selfTypeName)?.takeIf(CoreIntrinsicLowering::isUsableRenderedTypeArg)
+        }
+        return null
+    }
+
+    fun resolveExpectedArgTarget(
+        spec: CoreIntrinsicCallSpec,
+        selfTypeName: String?,
+        emitter: KotlinJ2KEmitter,
+    ): String? {
+        val canInferFromPeerArgs = spec.canonicalName !in NO_PEER_INFER_EXPECTED
+        return spec.renderedExplicitTypeAt(0, selfTypeName, emitter)?.takeIf(CoreIntrinsicLowering::isUsableRenderedTypeArg)
+            ?: if (canInferFromPeerArgs) {
+                spec.callArgsList.firstNotNullOfOrNull { extractDirectNonTransmuteArgType(it, selfTypeName, emitter, unwrapParensForCheck = false) }
+            } else {
+                null
+            }
+            ?: if (spec.canonicalName in SAME_ARG0_NAMES && spec.canonicalName !in NO_EXPECTED_TARGET_PROPAGATION) {
+                val candidate =
+                    emitter.currentExpectedParseTargetType
+                        ?: if (emitter.callArgumentNestingDepth == 0) emitter.currentEnclosingReturnRenderedType else null
+                candidate?.takeIf(CoreIntrinsicLowering::isUsableRenderedTypeArg)
+            } else {
+                null
+            }
+            ?: if (canInferFromPeerArgs) {
+                spec.callArgsList.firstNotNullOfOrNull { extractSingleArgTransmuteInputType(it, selfTypeName, emitter) }
+            } else {
+                null
+            }
+    }
+
+    fun inferReturnRenderedType(
+        spec: CoreIntrinsicCallSpec,
+        selfTypeName: String?,
+        emitter: KotlinJ2KEmitter,
+    ): String? {
+        val canonical = spec.canonicalName
+        if (canonical.startsWith("sve_tuple_")) return null
+        if (canonical !in NAMES) return null
+        return when (canonical) {
+            "simd_splat" -> spec.renderedExplicitTypeAt(0, selfTypeName, emitter)
+            "simd_shuffle" -> spec.renderedExplicitTypeAt(2, selfTypeName, emitter)
+            "simd_cast", "simd_as", "simd_bitmask" -> spec.renderedExplicitTypeAt(1, selfTypeName, emitter)
+            "simd_select" ->
+                spec.renderedExplicitTypeAt(1, selfTypeName, emitter)
+                    ?: spec.callArgsList.getOrNull(1)?.let { emitter.inferExprRenderedType(it, selfTypeName) }
+            in BOOL_RETURN_NAMES -> "Boolean"
+            in UNIT_RETURN_NAMES -> "Unit"
+            in SAME_ARG0_NAMES ->
+                spec.renderedExplicitTypeAt(0, selfTypeName, emitter)?.takeIf(CoreIntrinsicLowering::isUsableRenderedTypeArg)
+                    ?: (
+                        if (canonical !in NO_PEER_INFER_RETURN) {
+                            spec.callArgsList.firstNotNullOfOrNull {
+                                extractDirectNonTransmuteArgType(it, selfTypeName, emitter, unwrapParensForCheck = true)
+                            }
+                        } else {
+                            null
+                        }
+                    )
+                    ?: spec.callArgsList.firstOrNull()?.let { arg0 ->
+                        emitter.inferExprRenderedType(arg0, selfTypeName)?.takeIf(CoreIntrinsicLowering::isUsableRenderedTypeArg)
+                            ?: extractSingleArgTransmuteInputType(arg0, selfTypeName, emitter)
+                    }
+            in SAME_ARG1_NAMES -> spec.callArgsList.getOrNull(1)?.let { emitter.inferExprRenderedType(it, selfTypeName) }
+            in SAME_ARG2_NAMES -> spec.callArgsList.getOrNull(2)?.let { emitter.inferExprRenderedType(it, selfTypeName) }
+            else ->
+                spec.renderedExplicitTypeAt(0, selfTypeName, emitter)
+                    ?: spec.callArgsList.firstOrNull()?.let { emitter.inferExprRenderedType(it, selfTypeName) }
+        }
+    }
+
+    override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? {
+        if (!isSimdIntrinsicName(decl.canonicalName)) return null
+        if (decl.canonicalName in BOOL_RETURN_NAMES) return "false"
+        if (decl.canonicalName in UNIT_RETURN_NAMES) return "Unit"
+        val retSynTy = (decl.fnItem.sig.output as? ReturnType.TypeReturn)?.ty
+        val retKtIdent =
+            (retSynTy?.let(::unwrapSynType) as? SynType.Path)
+                ?.takeIf { it.qself == null && it.path.segments.size == 1 }
+                ?.path
+                ?.firstKotlinTypeName()
+        val layoutIdent =
+            when {
+                retKtIdent != null && retKtIdent in decl.typeParams -> StructLayoutComputer.typeLayoutParamName(retKtIdent)
+                decl.typeParams.isNotEmpty() -> StructLayoutComputer.typeLayoutParamName(decl.typeParams.last())
+                else -> null
+            }
+        if (layoutIdent != null) {
+            return CoreIntrinsicLowering.renderZeroedLayoutReadExpression(layoutIdent, decl.intrPkg, decl.emitter)
+        }
+        return if (retSynTy != null) {
+            decl.emitter.renderFallbackDefaultForRenderedType(decl.emitter.renderType(retSynTy, null))
+        } else {
+            "Unit"
+        }
+    }
+
+    override fun renderCall(ctx: IntrinsicCallContext): String? {
+        if (!ctx.isCoreSimdCall) return null
+        val renderedArgs = ctx.renderedArgs
+        val canonicalName = ctx.canonicalName
+
+        fun wrapWithSideEffects(resultExpr: String): String {
+            if (renderedArgs.isEmpty()) return resultExpr
+            val evalPrefix = renderedArgs.mapIndexed { idx, arg -> "val simdArg$idx = $arg" }.joinToString("; ")
+            return "run { $evalPrefix; $resultExpr }"
+        }
+        if (canonicalName in BOOL_RETURN_NAMES) return wrapWithSideEffects("false")
+        if (canonicalName in UNIT_RETURN_NAMES) return wrapWithSideEffects("Unit")
+        val sameArgIndex =
+            when (canonicalName) {
+                in SAME_ARG0_NAMES -> 0
+                in SAME_ARG1_NAMES -> 1
+                in SAME_ARG2_NAMES -> 2
+                else -> -1
+            }
+        if (sameArgIndex in renderedArgs.indices) {
+            val valBind = renderedArgs.mapIndexed { idx, arg -> "val simdArg$idx = $arg" }.joinToString("; ")
+            return "run { $valBind; simdArg$sameArgIndex }"
+        }
+        val explicitRetSlot =
+            when (canonicalName) {
+                "simd_splat" -> ctx.explicitTypes.nonInferAt(0)
+                "simd_shuffle" -> ctx.explicitTypes.nonInferAt(2)
+                else -> ctx.explicitTypes.nonInferAt(1)
+            }
+        if (explicitRetSlot != null) {
+            val renderedRet = ctx.emitter.renderType(explicitRetSlot, ctx.selfTypeName)
+            val fallback = ctx.emitter.renderFallbackDefaultForRenderedType(renderedRet)
+            if (!fallback.startsWith("null as ") && !fallback.startsWith("error(")) {
+                return wrapWithSideEffects(fallback)
+            }
+            val layoutExpr = ctx.layoutOf(explicitRetSlot)
+            return wrapWithSideEffects(CoreIntrinsicLowering.renderZeroedLayoutReadExpression(layoutExpr, ctx.intrPkg, ctx.emitter))
+        }
+        val expectedRendered =
+            (ctx.emitter.currentExpectedParseTargetType ?: ctx.emitter.currentEnclosingReturnRenderedType)
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() && it != "Unit" }
+        if (expectedRendered != null) {
+            val fallback = ctx.emitter.renderFallbackDefaultForRenderedType(expectedRendered)
+            if (!fallback.startsWith("null as ") && !fallback.startsWith("error(")) {
+                return wrapWithSideEffects(fallback)
+            }
+            val layoutExpr = CoreIntrinsicLowering.resolveRenderedTypeLayoutExpression(expectedRendered, ctx.emitter)
+            return wrapWithSideEffects(CoreIntrinsicLowering.renderZeroedLayoutReadExpression(layoutExpr, ctx.intrPkg, ctx.emitter))
+        }
+        if (renderedArgs.isNotEmpty()) {
+            val valBind = renderedArgs.mapIndexed { idx, arg -> "val simdArg$idx = $arg" }.joinToString("; ")
+            return "run { $valBind; simdArg0 }"
+        }
+        return "Unit"
+    }
+}
+
 /**
  * Lowers Rust compiler-supplied `core::intrinsics`, `core::arch`, and `alloc` global allocator
  * boundaries into:
@@ -68,264 +805,25 @@ public object CoreIntrinsicLowering {
             else -> "$coreNs.ffi.primitives"
         }
 
-    private val ATOMIC_RMW_OP_CODES: Map<String, Int> =
-        mapOf(
-            "atomic_xadd" to 1,
-            "atomic_xsub" to 2,
-            "atomic_and" to 3,
-            "atomic_nand" to 4,
-            "atomic_or" to 5,
-            "atomic_xor" to 6,
-            "atomic_max" to 7,
-            "atomic_min" to 8,
-            "atomic_umax" to 9,
-            "atomic_umin" to 10,
-        )
-
-    private val CORE_SIMD_INTRINSIC_NAMES: Set<String> =
-        setOf(
-            "simd_insert",
-            "simd_extract",
-            "simd_insert_dyn",
-            "simd_extract_dyn",
-            "simd_splat",
-            "simd_add",
-            "simd_sub",
-            "simd_mul",
-            "simd_div",
-            "simd_rem",
-            "simd_shl",
-            "simd_shr",
-            "simd_funnel_shl",
-            "simd_funnel_shr",
-            "simd_carryless_mul",
-            "simd_and",
-            "simd_or",
-            "simd_xor",
-            "simd_cast",
-            "simd_as",
-            "simd_neg",
-            "simd_fabs",
-            "simd_minimum_number_nsz",
-            "simd_maximum_number_nsz",
-            "simd_eq",
-            "simd_ne",
-            "simd_lt",
-            "simd_le",
-            "simd_gt",
-            "simd_ge",
-            "simd_shuffle",
-            "simd_gather",
-            "simd_scatter",
-            "simd_masked_load",
-            "simd_masked_store",
-            "simd_saturating_add",
-            "simd_saturating_sub",
-            "simd_reduce_add_ordered",
-            "simd_reduce_add_unordered",
-            "simd_reduce_mul_ordered",
-            "simd_reduce_mul_unordered",
-            "simd_reduce_all",
-            "simd_reduce_any",
-            "simd_reduce_max",
-            "simd_reduce_min",
-            "simd_reduce_and",
-            "simd_reduce_or",
-            "simd_reduce_xor",
-            "simd_bitmask",
-            "simd_select",
-            "simd_select_bitmask",
-            "simd_arith_offset",
-            "simd_cast_ptr",
-            "simd_expose_provenance",
-            "simd_with_exposed_provenance",
-            "simd_bswap",
-            "simd_bitreverse",
-            "simd_ctlz",
-            "simd_ctpop",
-            "simd_cttz",
-            "simd_ceil",
-            "simd_floor",
-            "simd_round",
-            "simd_round_ties_even",
-            "simd_trunc",
-            "simd_fsqrt",
-            "simd_fma",
-            "simd_relaxed_fma",
-            "simd_fsin",
-            "simd_fcos",
-            "simd_fexp",
-            "simd_fexp2",
-            "simd_flog10",
-            "simd_flog2",
-            "simd_flog",
-        )
-
-    private val SIMD_BOOL_RETURN_INTRINSICS: Set<String> = setOf("simd_reduce_all", "simd_reduce_any")
-    private val SIMD_UNIT_RETURN_INTRINSICS: Set<String> = setOf("simd_scatter", "simd_masked_store")
-    private val SIMD_SAME_ARG0_INTRINSICS: Set<String> =
-        setOf(
-            "simd_insert",
-            "simd_insert_dyn",
-            "simd_add",
-            "simd_sub",
-            "simd_mul",
-            "simd_div",
-            "simd_rem",
-            "simd_shl",
-            "simd_shr",
-            "simd_funnel_shl",
-            "simd_funnel_shr",
-            "simd_carryless_mul",
-            "simd_and",
-            "simd_or",
-            "simd_xor",
-            "simd_neg",
-            "simd_fabs",
-            "simd_minimum_number_nsz",
-            "simd_maximum_number_nsz",
-            "simd_gather",
-            "simd_saturating_add",
-            "simd_saturating_sub",
-            "simd_arith_offset",
-            "simd_bswap",
-            "simd_bitreverse",
-            "simd_ctlz",
-            "simd_ctpop",
-            "simd_cttz",
-            "simd_ceil",
-            "simd_floor",
-            "simd_round",
-            "simd_round_ties_even",
-            "simd_trunc",
-            "simd_fsqrt",
-            "simd_fma",
-            "simd_relaxed_fma",
-            "simd_fsin",
-            "simd_fcos",
-            "simd_fexp",
-            "simd_fexp2",
-            "simd_flog10",
-            "simd_flog2",
-            "simd_flog",
-        )
-    private val SIMD_SAME_ARG1_INTRINSICS: Set<String> =
-        setOf(
-            "simd_reduce_add_ordered",
-            "simd_reduce_mul_ordered",
-            "simd_select",
-            "simd_select_bitmask",
-        )
-    private val SIMD_SAME_ARG2_INTRINSICS: Set<String> = setOf("simd_masked_load")
-
     private val FIRST_TYPE_ARG_LAYOUT_INTRINSICS: Set<String> =
-        setOf(
-            "size_of",
-            "size_of_val",
-            "align_of",
-            "align_of_val",
-            "min_align_of",
-            "min_align_of_val",
-            "pref_align_of",
-            "offset",
-            "arith_offset",
-            "ptr_offset_from",
-            "ptr_offset_from_unsigned",
-            "read_via_copy",
-            "write_via_move",
-            "volatile_load",
-            "volatile_store",
-            "unaligned_volatile_load",
-            "unaligned_volatile_store",
-            "nontemporal_store",
-            "copy",
-            "copy_nonoverlapping",
-            "volatile_copy_memory",
-            "volatile_copy_nonoverlapping_memory",
-            "write_bytes",
-            "volatile_set_memory",
-            "typed_swap_nonoverlapping",
-            "raw_eq",
-            "atomic_load",
-            "atomic_store",
-            "atomic_xchg",
-            "atomic_cxchg",
-            "atomic_cxchgweak",
-            "atomic_max",
-            "atomic_min",
-            "atomic_umax",
-            "atomic_umin",
-            "ctpop",
-            "ctlz",
-            "ctlz_nonzero",
-            "cttz",
-            "cttz_nonzero",
-            "bswap",
-            "bitreverse",
-            "rotate_left",
-            "rotate_right",
-            "wrapping_add",
-            "wrapping_sub",
-            "wrapping_mul",
-            "unchecked_add",
-            "unchecked_sub",
-            "unchecked_mul",
-            "saturating_add",
-            "saturating_sub",
-            "add_with_overflow",
-            "sub_with_overflow",
-            "mul_with_overflow",
-            "unchecked_div",
-            "unchecked_rem",
-            "exact_div",
-            "disjoint_bitor",
-            "three_way_compare",
-            "sqrt",
-            "sin",
-            "cos",
-            "exp",
-            "exp2",
-            "log",
-            "log2",
-            "log10",
-            "trunc",
-            "round",
-            "round_ties_even",
-            "ceil",
-            "floor",
-            "fabs",
-            "powf",
-            "powi",
-            "fma",
-            "fmuladd",
-            "copysign",
-            "minnum",
-            "maxnum",
-            "fadd_fast",
-            "fsub_fast",
-            "fmul_fast",
-            "fdiv_fast",
-            "frem_fast",
-            "fadd_algebraic",
-            "fsub_algebraic",
-            "fmul_algebraic",
-            "fdiv_algebraic",
-            "frem_algebraic",
+        wordSet(
+            "size_of size_of_val align_of align_of_val min_align_of min_align_of_val pref_align_of offset arith_offset",
+            "ptr_offset_from ptr_offset_from_unsigned read_via_copy write_via_move volatile_load volatile_store",
+            "unaligned_volatile_load unaligned_volatile_store nontemporal_store copy copy_nonoverlapping",
+            "volatile_copy_memory volatile_copy_nonoverlapping_memory write_bytes volatile_set_memory",
+            "typed_swap_nonoverlapping raw_eq atomic_load atomic_store atomic_xchg atomic_cxchg atomic_cxchgweak",
+            "atomic_max atomic_min atomic_umax atomic_umin ctpop ctlz ctlz_nonzero cttz cttz_nonzero bswap bitreverse",
+            "rotate_left rotate_right wrapping_add wrapping_sub wrapping_mul unchecked_add unchecked_sub unchecked_mul",
+            "saturating_add saturating_sub add_with_overflow sub_with_overflow mul_with_overflow unchecked_div",
+            "unchecked_rem exact_div disjoint_bitor three_way_compare sqrt sin cos exp exp2 log log2 log10 trunc round",
+            "round_ties_even ceil floor fabs powf powi fma fmuladd copysign minnum maxnum fadd_fast fsub_fast fmul_fast",
+            "fdiv_fast frem_fast fadd_algebraic fsub_algebraic fmul_algebraic fdiv_algebraic frem_algebraic",
         )
 
     private val TWO_TYPE_ARG_LAYOUT_INTRINSICS: Set<String> =
-        setOf(
-            "transmute",
-            "transmute_unchecked",
-            "unchecked_shl",
-            "unchecked_shr",
-            "float_to_int_unchecked",
-            "atomic_xadd",
-            "atomic_xsub",
-            "atomic_and",
-            "atomic_nand",
-            "atomic_or",
-            "atomic_xor",
+        wordSet(
+            "transmute transmute_unchecked unchecked_shl unchecked_shr float_to_int_unchecked",
+            "atomic_xadd atomic_xsub atomic_and atomic_nand atomic_or atomic_xor",
         )
 
     internal val GENERIC_FLOAT_UNARY_KM: Map<String, Pair<String, String>> =
@@ -399,53 +897,56 @@ public object CoreIntrinsicLowering {
         )
 
     private val KNOWN_STDLIB_LAYOUT_FUNCTIONS: Set<String> =
-        setOf(
-            "size_of",
-            "size_of_val",
-            "align_of",
-            "align_of_val",
-            "min_align_of",
-            "pref_align_of",
-            "zeroed",
-            "read",
-            "read_unaligned",
-            "read_volatile",
-            "write",
-            "write_unaligned",
-            "write_volatile",
-            "write_bytes",
-            "copy",
-            "copy_nonoverlapping",
-            "dangling",
-            "dangling_mut",
+        wordSet(
+            "size_of size_of_val align_of align_of_val min_align_of pref_align_of zeroed",
+            "read read_unaligned read_volatile write write_unaligned write_volatile write_bytes",
+            "copy copy_nonoverlapping dangling dangling_mut",
         )
 
-    public fun resolveCoreNamespace(headerContext: FileHeaderContext): String {
+    private val POINTED_LOAD_RETURN_INTRINSICS: Set<String> =
+        wordSet(
+            "volatile_load unaligned_volatile_load read_via_copy atomic_load atomic_xchg",
+            "atomic_xadd atomic_xsub atomic_and atomic_nand atomic_or atomic_xor",
+            "atomic_max atomic_min atomic_umax atomic_umin",
+        )
+
+    private val FIRST_ARG_RETURN_INTRINSICS: Set<String> =
+        wordSet(
+            "bswap bitreverse rotate_left rotate_right wrapping_add wrapping_sub wrapping_mul",
+            "unchecked_add unchecked_sub unchecked_mul saturating_add saturating_sub unchecked_div",
+            "unchecked_rem exact_div unchecked_shl unchecked_shr disjoint_bitor select_unpredictable",
+            "powi fma fmuladd",
+        )
+
+    private val USIZE_RETURN_INTRINSICS: Set<String> =
+        wordSet(
+            "ptr_offset_from ptr_offset_from_unsigned size_of size_of_val align_of",
+            "align_of_val min_align_of_val vtable_size vtable_align variant_count",
+        )
+
+    private val FAMILY_RULES: List<CoreIntrinsicFamilyRule> =
+        listOf(
+            ControlAndHintIntrinsicFamilyRule,
+            LayoutAndReflectionIntrinsicFamilyRule,
+            PointerAndMemoryIntrinsicFamilyRule,
+            AtomicMemoryIntrinsicFamilyRule,
+            NumericAndFloatIntrinsicFamilyRule,
+            TransmuteIntrinsicFamilyRule,
+            SimdIntrinsicFamilyRule,
+        )
+
+    private fun resolveStdlibNamespace(headerContext: FileHeaderContext, crateKey: String, defaultNs: String): String {
         val pkg = headerContext.packageName?.trim().orEmpty()
-        if (pkg == DEFAULT_CORE_NAMESPACE || pkg.startsWith("$DEFAULT_CORE_NAMESPACE.")) {
-            return DEFAULT_CORE_NAMESPACE
-        }
-        val configured = headerContext.crateNamespaces["core"]?.trim()?.removeSuffix(".")
-        if (!configured.isNullOrEmpty()) {
-            return configured
-        }
-        return DEFAULT_CORE_NAMESPACE
+        if (pkg == defaultNs || pkg.startsWith("$defaultNs.")) return defaultNs
+        val configured = headerContext.crateNamespaces[crateKey]?.trim()?.removeSuffix(".")
+        return if (!configured.isNullOrEmpty()) configured else defaultNs
     }
 
-    public fun resolveAllocNamespace(headerContext: FileHeaderContext): String {
-        val pkg = headerContext.packageName?.trim().orEmpty()
-        if (pkg == DEFAULT_ALLOC_NAMESPACE || pkg.startsWith("$DEFAULT_ALLOC_NAMESPACE.")) {
-            return DEFAULT_ALLOC_NAMESPACE
-        }
-        val configured = headerContext.crateNamespaces["alloc"]?.trim()?.removeSuffix(".")
-        if (!configured.isNullOrEmpty()) {
-            return configured
-        }
-        return DEFAULT_ALLOC_NAMESPACE
-    }
+    public fun resolveCoreNamespace(headerContext: FileHeaderContext): String =
+        resolveStdlibNamespace(headerContext, "core", DEFAULT_CORE_NAMESPACE)
 
-    private fun isSimdIntrinsicName(name: String): Boolean =
-        name in CORE_SIMD_INTRINSIC_NAMES || name.startsWith("sve_tuple_")
+    public fun resolveAllocNamespace(headerContext: FileHeaderContext): String =
+        resolveStdlibNamespace(headerContext, "alloc", DEFAULT_ALLOC_NAMESPACE)
 
     public fun layoutConsumingTypeArgIndices(
         intrinsicName: String,
@@ -453,8 +954,8 @@ public object CoreIntrinsicLowering {
     ): List<Int> {
         val canonical = parseLegacyAtomicOrderingSuffix(intrinsicName).baseName
         return when {
-            canonical in SIMD_BOOL_RETURN_INTRINSICS || canonical in SIMD_UNIT_RETURN_INTRINSICS -> emptyList()
-            isSimdIntrinsicName(canonical) -> (0 until explicitTypeArgCount).toList()
+            canonical in SimdIntrinsicFamilyRule.BOOL_RETURN_NAMES || canonical in SimdIntrinsicFamilyRule.UNIT_RETURN_NAMES -> emptyList()
+            SimdIntrinsicFamilyRule.isSimdIntrinsicName(canonical) -> (0 until explicitTypeArgCount).toList()
             canonical in TWO_TYPE_ARG_LAYOUT_INTRINSICS ->
                 if (explicitTypeArgCount >= 2) listOf(0, 1) else listOf(0)
             canonical in FIRST_TYPE_ARG_LAYOUT_INTRINSICS -> listOf(0)
@@ -491,17 +992,8 @@ public object CoreIntrinsicLowering {
                         }
                     }
                 }
-                if (withoutLast in ATOMIC_RMW_OP_CODES ||
-                    withoutLast in
-                    setOf(
-                        "atomic_load",
-                        "atomic_store",
-                        "atomic_xchg",
-                        "atomic_fence",
-                        "atomic_singlethreadfence",
-                        "atomic_cxchg",
-                        "atomic_cxchgweak",
-                    )
+                if (withoutLast in AtomicMemoryIntrinsicFamilyRule.RMW_OP_CODES ||
+                    withoutLast in AtomicMemoryIntrinsicFamilyRule.NON_RMW_NAMES
                 ) {
                     return ParsedIntrinsicName(withoutLast, code2, code2)
                 }
@@ -520,6 +1012,20 @@ public object CoreIntrinsicLowering {
         }
     }
 
+    internal fun unwrapTargetOrPointeeType(
+        explicitTypes: List<SynType>,
+        callArgsList: List<Expr>,
+        emitter: KotlinJ2KEmitter,
+    ): SynType? =
+        explicitTypes.nonInferAt(0)
+            ?: callArgsList.firstOrNull()?.let { firstArg ->
+                when (val argTy = emitter.sourceInitializerType(firstArg)) {
+                    is SynType.Ptr -> argTy.elem
+                    is SynType.Reference -> argTy.elem
+                    else -> argTy
+                }
+            }
+
     internal fun coreIntrinsicSignatureParameters(
         sig: Signature,
         block: Block?,
@@ -527,11 +1033,11 @@ public object CoreIntrinsicLowering {
         selfTypeName: String?,
         emitter: KotlinJ2KEmitter,
     ): List<Pair<String, String>> {
-        val rawFnName = sig.ident.toString().removePrefix("r#")
+        val rawFnName = sig.cleanFnName()
         if (activeRustcIntrinsicDeclarationName == rawFnName && !emitter.headerContext.rawAbiMode) {
+            val genericParams = sig.generics.params.toList()
             val typeParams =
-                sig.generics.params
-                    .toList()
+                genericParams
                     .filterIsInstance<GenericParam.TypeParam>()
                     .map { rustTypeIdentToKotlin(it.ident.toString()) }
             val indices = layoutConsumingTypeArgIndices(rawFnName, typeParams.size)
@@ -558,25 +1064,15 @@ public object CoreIntrinsicLowering {
         emitter: KotlinJ2KEmitter,
     ): List<String> {
         if (emitter.headerContext.rawAbiMode) return emptyList()
-        val path = (call.func as? Expr.Path)?.takeIf { it.qself == null }?.path ?: return emptyList()
-        val segs = path.segments.toList()
-        val lastSeg = segs.lastOrNull() ?: return emptyList()
-        val rawName = lastSeg.ident.toString().removePrefix("r#")
-        val rewrittenSegNames =
-            emitter.rewriteCrateRootAliasAndReexportSegments(
-                segs.map { it.ident.toString().removePrefix("r#") },
-            )
-        val penultName =
-            rewrittenSegNames
-                .getOrNull(rewrittenSegNames.size - 2)
-                ?.removePrefix("r#")
-        val explicitTypes =
-            ((lastSeg.arguments as? PathArguments.AngleBracketed)?.args?.toList().orEmpty())
-                .filterIsInstance<GenericArgument.TypeArg>()
-                .map { it.type }
+        val spec = resolveCoreIntrinsicCallSpec(call, emitter) ?: return emptyList()
+        val rawName = spec.rawName
+        val penultName = spec.penultName
+        val explicitTypes = spec.explicitTypes
+        val callArgsList = spec.callArgsList
+        val segCount = ((call.func as? Expr.Path)?.path?.segments?.size) ?: 0
 
         // 1. Same-file free or local function requiring `typeLayout<P>`
-        if (segs.size == 1) {
+        if (segCount == 1) {
             val sameFileFn = emitter.sameFileUniqueTopFn(rawName)
             if (sameFileFn != null) {
                 val required =
@@ -587,20 +1083,19 @@ public object CoreIntrinsicLowering {
                         selfTypeName = null,
                     )
                 if (required.isNotEmpty()) {
+                    val sigGenerics = sameFileFn.sig.generics
+                    val fnGenericParams = sigGenerics.params.toList()
                     val fnTypeParams =
-                        sameFileFn.sig.generics.params
-                            .toList()
+                        fnGenericParams
                             .filterIsInstance<GenericParam.TypeParam>()
                             .map { it.ident.toString().removePrefix("r#") }
-                    val typedInputs =
-                        sameFileFn.sig.inputs
-                            .toList()
-                            .filterIsInstance<FnArg.Typed>()
+                    val fnInputs = sameFileFn.sig.inputs.toList()
+                    val typedInputs = fnInputs.filterIsInstance<FnArg.Typed>()
                     return required.mapNotNull { (reqLayoutParamName, _) ->
                         val calleeKtParam = reqLayoutParamName.removePrefix("typeLayout")
                         val paramIdx = fnTypeParams.indexOfFirst { rustTypeIdentToKotlin(it) == calleeKtParam }
                         val rawParamName = fnTypeParams.getOrNull(paramIdx) ?: return@mapNotNull null
-                        val specified = explicitTypes.getOrNull(paramIdx)?.takeUnless { it is SynType.Infer }
+                        val specified = explicitTypes.nonInferAt(paramIdx)
                         val inferredFromArg =
                             if (specified == null) {
                                 val argIdx =
@@ -609,8 +1104,7 @@ public object CoreIntrinsicLowering {
                                         (ty is SynType.Path && ty.path.isIdent(rawParamName)) ||
                                             (ty is SynType.Ptr && (ty.elem as? SynType.Path)?.path?.isIdent(rawParamName) == true)
                                     }
-                                val callArg = call.args.toList().getOrNull(argIdx)
-                                val initTy = callArg?.let { emitter.sourceInitializerType(it) }
+                                val initTy = callArgsList.getOrNull(argIdx)?.let { emitter.sourceInitializerType(it) }
                                 if (initTy is SynType.Ptr && typedInputs.getOrNull(argIdx)?.patType?.ty is SynType.Ptr) {
                                     initTy.elem
                                 } else {
@@ -620,8 +1114,7 @@ public object CoreIntrinsicLowering {
                                 null
                             }
                         val actualTy = specified ?: inferredFromArg ?: return@mapNotNull null
-                        val layoutExpr = resolveTypeLayoutExpression(actualTy, selfTypeName, emitter)
-                        "$reqLayoutParamName = $layoutExpr"
+                        "$reqLayoutParamName = ${resolveTypeLayoutExpression(actualTy, selfTypeName, emitter)}"
                     }
                 }
             }
@@ -631,7 +1124,7 @@ public object CoreIntrinsicLowering {
         val isLayoutNewOrArray = penultName == "Layout" && (rawName == "new" || rawName == "array")
         val isStdlibMemOrPtrFn =
             rawName in KNOWN_STDLIB_LAYOUT_FUNCTIONS &&
-                (segs.size == 1 || penultName in setOf("mem", "ptr")) &&
+                (segCount == 1 || penultName in setOf("mem", "ptr")) &&
                 rawName !in emitter.inspector.declaredTopLevelFnRawNames
         if (isLayoutNewOrArray || isStdlibMemOrPtrFn) {
             if (isStdlibMemOrPtrFn &&
@@ -639,56 +1132,28 @@ public object CoreIntrinsicLowering {
                 penultName != "ptr" &&
                 rawName in setOf("size_of", "align_of", "size_of_val", "align_of_val")
             ) {
-                registerCoreImport(
-                    emitter,
-                    "${resolveCoreNamespace(emitter.headerContext)}.mem.${rustFunctionIdentToKotlin(rawName)}",
-                )
+                registerCoreImport(emitter, "${resolveCoreNamespace(emitter.headerContext)}.mem.${rustFunctionIdentToKotlin(rawName)}")
             }
-            val callArgsList = call.args.toList()
-            val targetSynType =
-                explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
-                    ?: callArgsList.firstOrNull()?.let { firstArg ->
-                        when (val argTy = emitter.sourceInitializerType(firstArg)) {
-                            is SynType.Ptr -> argTy.elem
-                            is SynType.Reference -> argTy.elem
-                            else -> argTy
-                        }
-                    }
+            val targetSynType = unwrapTargetOrPointeeType(explicitTypes, callArgsList, emitter)
             if (targetSynType != null) {
-                val layoutExpr = resolveTypeLayoutExpression(targetSynType, selfTypeName, emitter)
-                return listOf("typeLayoutT = $layoutExpr")
+                return listOf("typeLayoutT = ${resolveTypeLayoutExpression(targetSynType, selfTypeName, emitter)}")
             }
         }
 
         // 3. Cross-crate / local calls to synthesized `core::intrinsics` layout-consuming functions
-        val isIntrinsicsModuleCall =
-            penultName == "intrinsics" ||
-                "intrinsics" in rewrittenSegNames.dropLast(1) ||
-                (segs.size == 1 && emitter.headerContext.packageName?.endsWith(".intrinsics") == true)
-        if (isIntrinsicsModuleCall && rawName !in emitter.inspector.declaredTopLevelFnRawNames) {
-            val canonical = parseLegacyAtomicOrderingSuffix(rawName).baseName
+        if (spec.isIntrinsicsModuleCall && rawName !in emitter.inspector.declaredTopLevelFnRawNames) {
+            val canonical = spec.canonicalName
             val minTypeArgs =
-                when {
-                    canonical in TWO_TYPE_ARG_LAYOUT_INTRINSICS -> maxOf(explicitTypes.size, 2)
-                    canonical in FIRST_TYPE_ARG_LAYOUT_INTRINSICS -> maxOf(explicitTypes.size, 1)
+                when (canonical) {
+                    in TWO_TYPE_ARG_LAYOUT_INTRINSICS -> maxOf(explicitTypes.size, 2)
+                    in FIRST_TYPE_ARG_LAYOUT_INTRINSICS -> maxOf(explicitTypes.size, 1)
                     else -> explicitTypes.size
                 }
             val indices = layoutConsumingTypeArgIndices(rawName, minTypeArgs)
             if (indices.isNotEmpty()) {
-                val callArgsList = call.args.toList()
-                val argSynType =
-                    callArgsList.firstOrNull()?.let { firstArg ->
-                        when (val argTy = emitter.sourceInitializerType(firstArg)) {
-                            is SynType.Ptr -> argTy.elem
-                            is SynType.Reference -> argTy.elem
-                            else -> argTy
-                        }
-                    }
+                val argSynType = unwrapTargetOrPointeeType(emptyList(), callArgsList, emitter)
                 return indices.mapNotNull { idx ->
-                    val synTy =
-                        explicitTypes.getOrNull(idx)?.takeUnless { it is SynType.Infer }
-                            ?: (if (idx == 0) argSynType else null)
-                            ?: return@mapNotNull null
+                    val synTy = explicitTypes.nonInferAt(idx) ?: (if (idx == 0) argSynType else null) ?: return@mapNotNull null
                     val layoutExpr = resolveTypeLayoutExpression(synTy, selfTypeName, emitter)
                     val paramName =
                         when {
@@ -713,25 +1178,23 @@ public object CoreIntrinsicLowering {
         emitter: KotlinJ2KEmitter,
     ): String {
         emitter.sourcePointerLayout(type, selfTypeName)?.let { return it }
+        val resolved = emitter.resolveLayoutType(type, emptyMap())
+        return resolveRenderedTypeLayoutExpression(emitter.renderType(resolved, selfTypeName), emitter)
+    }
+
+    internal fun resolveRenderedTypeLayoutExpression(
+        renderedType: String,
+        emitter: KotlinJ2KEmitter,
+    ): String {
         val coreNs = resolveCoreNamespace(emitter.headerContext)
         val memPkg = "$coreNs.mem"
-        val resolved = emitter.resolveLayoutType(type, emptyMap())
-        val rendered = emitter.renderType(resolved, selfTypeName)
-
-        // Check in-scope `typeLayout<T>` dictionary parameters
-        val expectedLayoutType = "$memPkg.TypeLayout<$rendered>"
-        emitter.currentTypedLocals
-            .filterValues { it == expectedLayoutType }
-            .keys
-            .singleOrNull()
-            ?.let { return it }
-        val candidateParam = StructLayoutComputer.typeLayoutParamName(rendered)
-        if (candidateParam in emitter.currentTypedLocals) {
-            return candidateParam
-        }
-
-        // Same-file struct with synthesized companion `typeLayout(...)`
-        val structSimple = rendered.substringBefore('<').substringAfterLast('.')
+        val clean = renderedType.trim()
+        val expectedLayoutType = "$memPkg.TypeLayout<$clean>"
+        val matchedLocal = emitter.currentTypedLocals.filterValues { it == expectedLayoutType }.keys
+        matchedLocal.singleOrNull()?.let { return it }
+        val candidateParam = StructLayoutComputer.typeLayoutParamName(clean)
+        if (candidateParam in emitter.currentTypedLocals) return candidateParam
+        val structSimple = clean.substringBefore('<').substringAfterLast('.')
         val structDecl = emitter.sameFileUniqueSimpleStruct(structSimple)
         if (structDecl != null) {
             val computed = StructLayoutComputer.computeStructLayout(structDecl, emitter)
@@ -739,10 +1202,8 @@ public object CoreIntrinsicLowering {
                 return "$structSimple.typeLayout()"
             }
         }
-
-        // Unresolved generic / unsized fallback: register explicit layout boundary for caller monomorphization
         registerCoreImport(emitter, "$memPkg.UnresolvedTypeLayout")
-        return "UnresolvedTypeLayout<$rendered>()"
+        return "UnresolvedTypeLayout<$clean>()"
     }
 
     internal fun renderConstEvalSelectMacro(
@@ -751,50 +1212,30 @@ public object CoreIntrinsicLowering {
         indent: String,
         selfTypeName: String?,
     ): String? {
-        val macroName =
-            mac.path.segments
-                .last()
-                ?.ident
-                ?.toString()
-                ?.removePrefix("r#") ?: return null
-        if (macroName == "assert_unsafe_precondition") {
-            return "Unit"
-        }
-        if (macroName != "const_eval_select") {
-            return null
-        }
-        val tokens = mac.tokens.clone().toList()
+        val macroName = mac.path.lastCleanIdent() ?: return null
+        if (macroName == "assert_unsafe_precondition") return "Unit"
+        if (macroName != "const_eval_select") return null
+        val cursor = RustTokenCursor(mac.tokens.clone().toList())
         // Form 1: `const_eval_select!(@capture { ... } -> Ret: if const { ... } else { runtime_body })`
-        for (idx in tokens.indices) {
-            val ident = (tokens[idx] as? TokenTree.Ident)?.value?.toString()
-            if (ident == "else") {
-                val elseGroup = tokens.subList(idx + 1, tokens.size).firstOrNull { it is TokenTree.Group && it.value.delimiter() == Delimiter.Brace } as? TokenTree.Group
+        for (idx in cursor.trees.indices) {
+            if (cursor.identAt(idx) == "else") {
+                val elseGroup = ((idx + 1) until cursor.size).firstNotNullOfOrNull { cursor.groupAt(it, Delimiter.Brace) }
                 if (elseGroup != null) {
-                    val blockSrc = "{ ${elseGroup.value.stream()} }"
+                    val blockSrc = "{ ${elseGroup.stream()} }"
                     val parsedExpr = lexTokenStreamOrNull(blockSrc)?.let { parse2(ExprParse::parse, it).getOrNull() }
-                    if (parsedExpr != null) {
-                        return emitter.renderExpr(parsedExpr, indent, selfTypeName)
-                    }
+                    if (parsedExpr != null) return emitter.renderExpr(parsedExpr, indent, selfTypeName)
                 }
             }
         }
         // Form 2: `const_eval_select!((arg0, arg1), const_fn, runtime_fn)`
-        val topArgs = RustTokenCursor(tokens).splitByTopLevelPunct(',')
+        val topArgs = cursor.splitByTopLevelPunct(',')
         if (topArgs.size >= 3) {
             val tupleTree = topArgs[0].singleOrNull() as? TokenTree.Group
             val runtimeFnSrc = topArgs[2].joinToString("") { it.toString() }.trim()
-            val argTupleSrc =
-                tupleTree
-                    ?.value
-                    ?.stream()
-                    ?.toString()
-                    ?.trim()
-                    .orEmpty()
-            val callSrc = "$runtimeFnSrc($argTupleSrc)"
-            val parsedCall = lexTokenStreamOrNull(callSrc)?.let { parse2(ExprParse::parse, it).getOrNull() }
-            if (parsedCall != null) {
-                return emitter.renderExpr(parsedCall, indent, selfTypeName)
-            }
+            val tupleStream = tupleTree?.value?.stream()?.toString()
+            val argTupleSrc = tupleStream?.trim().orEmpty()
+            val parsedCall = lexTokenStreamOrNull("$runtimeFnSrc($argTupleSrc)")?.let { parse2(ExprParse::parse, it).getOrNull() }
+            if (parsedCall != null) return emitter.renderExpr(parsedCall, indent, selfTypeName)
         }
         return null
     }
@@ -805,16 +1246,10 @@ public object CoreIntrinsicLowering {
         indent: String,
     ): String? {
         val rawSrc = item.tokens.toString().trim()
-        if (!rawSrc.contains("rustc_intrinsic") || !rawSrc.endsWith(";")) {
-            return null
-        }
-        val withEmptyBody = rawSrc.dropLast(1) + " {}"
-        val parsedFn = (lexTokenStreamOrNull(withEmptyBody)?.let { parse2(ItemParse::parse, it).getOrNull() } as? Item.Fn) ?: return null
-        val rawFnName =
-            parsedFn.sig.ident
-                .toString()
-                .removePrefix("r#")
-        val synthesizedBody = renderSynthesizedIntrinsicFnBody(parsedFn, rawFnName, emitter, indent) ?: return null
+        if (!rawSrc.contains("rustc_intrinsic") || !rawSrc.endsWith(";")) return null
+        val parsedFn = (lexTokenStreamOrNull(rawSrc.dropLast(1) + " {}")?.let { parse2(ItemParse::parse, it).getOrNull() } as? Item.Fn) ?: return null
+        val rawFnName = parsedFn.sig.cleanFnName()
+        val synthesizedBody = renderSynthesizedIntrinsicFnBody(parsedFn, rawFnName, emitter) ?: return null
         val prevIntrinsicDecl = activeRustcIntrinsicDeclarationName
         activeRustcIntrinsicDeclarationName = rawFnName
         val fnWithStubBody =
@@ -824,167 +1259,43 @@ public object CoreIntrinsicLowering {
                 activeRustcIntrinsicDeclarationName = prevIntrinsicDecl
             }
         val emptyBraceIdx = fnWithStubBody.lastIndexOf("{}")
-        if (emptyBraceIdx >= 0) {
-            return fnWithStubBody.substring(0, emptyBraceIdx) + "{\n$indent    return $synthesizedBody\n$indent}"
+        return if (emptyBraceIdx >= 0) {
+            fnWithStubBody.substring(0, emptyBraceIdx) + "{\n$indent    return $synthesizedBody\n$indent}"
+        } else {
+            fnWithStubBody
         }
-        return fnWithStubBody
     }
 
     private fun renderSynthesizedIntrinsicFnBody(
         fnItem: Item.Fn,
         rawName: String,
         emitter: KotlinJ2KEmitter,
-        indent: String,
     ): String? {
+        val fnInputs = fnItem.sig.inputs.toList()
         val paramIdents =
-            fnItem.sig.inputs.toList().filterIsInstance<FnArg.Typed>().mapIndexed { idx, input ->
+            fnInputs.filterIsInstance<FnArg.Typed>().mapIndexed { idx, input ->
                 val raw = (input.patType.pat as? Pat.Ident)?.ident?.toString()?.removePrefix("r#")
                 if (raw == null || raw == "_") "arg$idx" else rustValueIdentToKotlin(raw)
             }
-        val typeParams =
-            fnItem.sig.generics.params
-                .toList()
-                .filterIsInstance<GenericParam.TypeParam>()
-                .map { rustTypeIdentToKotlin(it.ident.toString()) }
-        val constParams =
-            fnItem.sig.generics.params
-                .toList()
-                .filterIsInstance<GenericParam.ConstParam>()
-                .map { rustValueIdentToKotlin(it.ident.toString()) }
-        val coreNs = resolveCoreNamespace(emitter.headerContext)
-        val intrPkg = "$coreNs.intrinsics"
-        val memPkg = "$coreNs.mem"
-        val ptrPkg = "$coreNs.ptr"
-        val t0 = typeParams.getOrNull(0) ?: "Any"
-        val t1 = typeParams.getOrNull(1) ?: t0
-        val layout0 = StructLayoutComputer.typeLayoutParamName(t0)
-        val layout1 = StructLayoutComputer.typeLayoutParamName(t1)
-        val p0 = paramIdents.getOrNull(0) ?: "arg0"
-        val p1 = paramIdents.getOrNull(1) ?: "arg1"
-        val p2 = paramIdents.getOrNull(2) ?: "arg2"
+        val sigGenerics = fnItem.sig.generics
+        val genericParams = sigGenerics.params.toList()
+        val typeParams = genericParams.filterIsInstance<GenericParam.TypeParam>().map { rustTypeIdentToKotlin(it.ident.toString()) }
+        val constParams = genericParams.filterIsInstance<GenericParam.ConstParam>().map { rustValueIdentToKotlin(it.ident.toString()) }
         val parsedAtomic = parseLegacyAtomicOrderingSuffix(rawName)
-        val canonicalIntrinsicName = parsedAtomic.baseName
-        val ord0 = constParams.getOrNull(0)?.let { "($it).ordinal" } ?: parsedAtomic.ord0 ?: "4"
-        val ord1 = constParams.getOrNull(1)?.let { "($it).ordinal" } ?: parsedAtomic.ord1 ?: "4"
-
-        return when (canonicalIntrinsicName) {
-            "abort", "abort_immediate" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAbort")
-                "kmAbort()"
-            }
-            "unreachable" -> "error(\"Entered Rust intrinsics::unreachable\")"
-            "assume", "breakpoint", "forget", "assert_inhabited", "assert_zero_valid", "assert_mem_uninitialized_valid" -> "Unit"
-            "likely", "unlikely" -> p0
-            "cold_path" -> "Unit"
-            "rustc_peek" -> p0
-            "black_box" -> p0
-            "select_unpredictable" -> "if ($p0) $p1 else $p2"
-            "size_of" -> if (emitter.headerContext.rawAbiMode) "$layout0.sizeBytes.toULong()" else "$layout0.sizeBytes.toInt()"
-            "size_of_val" ->
-                if (emitter.headerContext.rawAbiMode) {
-                    "$layout0.sizeBytes.toULong()"
-                } else {
-                    "(if ($p0.rawMeta > 0L) ($p0.rawMeta * $layout0.sizeBytes).toInt() else $layout0.sizeBytes.toInt())"
-                }
-            "align_of", "align_of_val", "min_align_of", "min_align_of_val", "pref_align_of" ->
-                if (emitter.headerContext.rawAbiMode) "$layout0.alignBytes.toULong()" else "$layout0.alignBytes.toInt()"
-            "vtable_size", "vtable_align" -> if (emitter.headerContext.rawAbiMode) "8uL" else "8"
-            "variant_count" -> if (emitter.headerContext.rawAbiMode) "1uL" else "1"
-            "raw_eq" -> {
-                registerCoreImport(emitter, "$memPkg.rawEqWithLayout")
-                "rawEqWithLayout($p0, $p1, $layout0)"
-            }
-            "needs_drop" -> "true"
-            "type_name" -> t0.let { "\"$it\"" }
-            "arith_offset" -> {
-                registerCoreImport(emitter, "$ptrPkg.ConstPtr")
-                "ConstPtr($p0.rawAddress + ($p1).toLong() * $layout0.strideBytes)"
-            }
-            "ptr_offset_from" ->
-                if (emitter.headerContext.rawAbiMode) {
-                    "(($p0.rawAddress - $p1.rawAddress) / maxOf(1L, $layout0.sizeBytes))"
-                } else {
-                    "(($p0.rawAddress - $p1.rawAddress) / maxOf(1L, $layout0.sizeBytes)).toInt()"
-                }
-            "ptr_offset_from_unsigned" ->
-                if (emitter.headerContext.rawAbiMode) {
-                    "((($p0.rawAddress - $p1.rawAddress) / maxOf(1L, $layout0.sizeBytes)).toULong())"
-                } else {
-                    "(($p0.rawAddress - $p1.rawAddress) / maxOf(1L, $layout0.sizeBytes)).toInt()"
-                }
-            "ptr_mask" -> {
-                registerCoreImport(emitter, "$ptrPkg.ConstPtr")
-                "ConstPtr($p0.rawAddress and ($p1).toLong())"
-            }
-            "read_via_copy" -> "$layout0.readNative($p0.rawAddress)"
-            "write_via_move", "nontemporal_store" -> "$layout0.writeNative($p0.rawAddress, $p1)"
-            "volatile_load", "unaligned_volatile_load" -> "$layout0.readVolatileNative($p0.rawAddress)"
-            "volatile_store", "unaligned_volatile_store" -> "$layout0.writeVolatileNative($p0.rawAddress, $p1)"
-            "copy_nonoverlapping", "volatile_copy_nonoverlapping_memory" -> {
-                registerCoreImport(emitter, "$intrPkg.kmCopyNonoverlapping")
-                "kmCopyNonoverlapping($p1.rawAddress, $p0.rawAddress, ($p2).toLong() * $layout0.sizeBytes)"
-            }
-            "copy", "volatile_copy_memory" -> {
-                registerCoreImport(emitter, "$intrPkg.kmCopy")
-                "kmCopy($p1.rawAddress, $p0.rawAddress, ($p2).toLong() * $layout0.sizeBytes)"
-            }
-            "write_bytes", "volatile_set_memory" -> {
-                registerCoreImport(emitter, "$intrPkg.kmWriteBytes")
-                "kmWriteBytes($p0.rawAddress, $p1, ($p2).toLong() * $layout0.sizeBytes)"
-            }
-            "compare_bytes" -> {
-                registerCoreImport(emitter, "$intrPkg.kmCompareBytes")
-                "kmCompareBytes($p0.rawAddress, $p1.rawAddress, ($p2).toLong())"
-            }
-            "transmute", "transmute_unchecked" -> {
-                registerCoreImport(emitter, "$memPkg.transmuteWithLayouts")
-                "transmuteWithLayouts($p0, $layout0, $layout1)"
-            }
-            "atomic_fence" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicFence")
-                "kmAtomicFence($ord0)"
-            }
-            "atomic_singlethreadfence" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicSignalFence")
-                "kmAtomicSignalFence($ord0)"
-            }
-            "atomic_load" -> {
-                registerCoreImport(emitter, "$memPkg.atomicLoadWithLayout")
-                "atomicLoadWithLayout($p0.rawAddress, $ord0, $layout0)"
-            }
-            "atomic_store" -> {
-                registerCoreImport(emitter, "$memPkg.atomicStoreWithLayout")
-                "atomicStoreWithLayout($p0.rawAddress, $p1, $ord0, $layout0)"
-            }
-            "atomic_xchg" -> {
-                registerCoreImport(emitter, "$memPkg.atomicXchgWithLayout")
-                "atomicXchgWithLayout($p0.rawAddress, $p1, $ord0, $layout0)"
-            }
-            "atomic_cxchg", "atomic_cxchgweak" -> {
-                registerCoreImport(emitter, "$memPkg.atomicCxchgWithLayout")
-                "atomicCxchgWithLayout($p0.rawAddress, $p1, $p2, $ord0, $ord1, $layout0)"
-            }
-            in ATOMIC_RMW_OP_CODES -> {
-                val opCode = ATOMIC_RMW_OP_CODES.getValue(canonicalIntrinsicName)
-                registerCoreImport(emitter, "$memPkg.atomicRmwWithLayout")
-                val opLayout = if (typeParams.size >= 2) layout1 else layout0
-                "atomicRmwWithLayout($p0.rawAddress, $p1, $opCode, $ord0, $layout0, $opLayout)"
-            }
-            in INT_INTRINSIC_RULES_BY_NAME ->
-                INT_INTRINSIC_RULES_BY_NAME
-                    .getValue(canonicalIntrinsicName)
-                    .renderSynthesizedBody(p0, p1, typeParams.size, layout0, layout1, memPkg, emitter)
-            in FLOAT_INTRINSIC_RULES_BY_NAME ->
-                FLOAT_INTRINSIC_RULES_BY_NAME
-                    .getValue(canonicalIntrinsicName)
-                    .renderSynthesizedBody(canonicalIntrinsicName, p0, p1, p2, layout0, layout1, intrPkg, memPkg, emitter)
-            else ->
-                if (isSimdIntrinsicName(canonicalIntrinsicName)) {
-                    renderSynthesizedSimdIntrinsicFnBody(fnItem, canonicalIntrinsicName, typeParams, intrPkg, emitter)
-                } else {
-                    null
-                }
-        }
+        val decl =
+            SynthesizedIntrinsicDeclContext(
+                fnItem = fnItem,
+                rawName = rawName,
+                canonicalName = parsedAtomic.baseName,
+                paramIdents = paramIdents,
+                typeParams = typeParams,
+                ord0 = constParams.getOrNull(0)?.let { "($it).ordinal" } ?: parsedAtomic.ord0 ?: "4",
+                ord1 = constParams.getOrNull(1)?.let { "($it).ordinal" } ?: parsedAtomic.ord1 ?: "4",
+                coreNs = resolveCoreNamespace(emitter.headerContext),
+                emitter = emitter,
+            )
+        val matchedRule = FAMILY_RULES.firstOrNull { it.matches(decl.canonicalName) } ?: return null
+        return matchedRule.renderSynthesizedDecl(decl)
     }
 
     internal fun renderZeroedLayoutReadExpression(
@@ -999,126 +1310,6 @@ public object CoreIntrinsicLowering {
             "kmDealloc(ptr, maxOf(1L, ($layoutExpr).sizeBytes), maxOf(1L, ($layoutExpr).alignBytes)); res }"
     }
 
-    private fun renderSynthesizedSimdIntrinsicFnBody(
-        fnItem: Item.Fn,
-        canonicalName: String,
-        typeParams: List<String>,
-        intrPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String {
-        if (canonicalName in SIMD_BOOL_RETURN_INTRINSICS) return "false"
-        if (canonicalName in SIMD_UNIT_RETURN_INTRINSICS) return "Unit"
-        val retSynTy = (fnItem.sig.output as? ReturnType.TypeReturn)?.ty
-        val retKtIdent =
-            retSynTy
-                ?.let { unwrapSynType(it) as? SynType.Path }
-                ?.takeIf { it.qself == null && it.path.segments.size == 1 }
-                ?.path
-                ?.segments
-                ?.toList()
-                ?.firstOrNull()
-                ?.ident
-                ?.toString()
-                ?.let(::rustTypeIdentToKotlin)
-        val layoutIdent =
-            if (retKtIdent != null && retKtIdent in typeParams) {
-                StructLayoutComputer.typeLayoutParamName(retKtIdent)
-            } else if (typeParams.isNotEmpty()) {
-                StructLayoutComputer.typeLayoutParamName(typeParams.last())
-            } else {
-                null
-            }
-        if (layoutIdent != null) {
-            return renderZeroedLayoutReadExpression(layoutIdent, intrPkg, emitter)
-        }
-        return if (retSynTy != null) {
-            emitter.renderFallbackDefaultForRenderedType(emitter.renderType(retSynTy, null))
-        } else {
-            "Unit"
-        }
-    }
-
-    private fun renderSimdCallSiteLowering(
-        canonicalName: String,
-        renderedArgs: List<String>,
-        explicitTypes: List<SynType>,
-        selfTypeName: String?,
-        intrPkg: String,
-        emitter: KotlinJ2KEmitter,
-    ): String {
-        fun wrapWithSideEffects(resultExpr: String): String {
-            if (renderedArgs.isEmpty()) return resultExpr
-            val evalPrefix = renderedArgs.mapIndexed { idx, arg -> "val simdArg$idx = $arg" }.joinToString("; ")
-            return "run { $evalPrefix; $resultExpr }"
-        }
-        if (canonicalName in SIMD_BOOL_RETURN_INTRINSICS) {
-            return wrapWithSideEffects("false")
-        }
-        if (canonicalName in SIMD_UNIT_RETURN_INTRINSICS) {
-            return wrapWithSideEffects("Unit")
-        }
-        val sameArgIndex =
-            when (canonicalName) {
-                in SIMD_SAME_ARG0_INTRINSICS -> 0
-                in SIMD_SAME_ARG1_INTRINSICS -> 1
-                in SIMD_SAME_ARG2_INTRINSICS -> 2
-                else -> -1
-            }
-        if (sameArgIndex in renderedArgs.indices) {
-            val valBind = renderedArgs.mapIndexed { idx, arg -> "val simdArg$idx = $arg" }.joinToString("; ")
-            return "run { $valBind; simdArg$sameArgIndex }"
-        }
-        val explicitRetSlot =
-            when (canonicalName) {
-                "simd_splat" -> explicitTypes.getOrNull(0)
-                "simd_shuffle" -> explicitTypes.getOrNull(2)
-                else -> explicitTypes.getOrNull(1)
-            }?.takeUnless { it is SynType.Infer }
-        if (explicitRetSlot != null) {
-            val renderedRet = emitter.renderType(explicitRetSlot, selfTypeName)
-            val fallback = emitter.renderFallbackDefaultForRenderedType(renderedRet)
-            if (!fallback.startsWith("null as ") && !fallback.startsWith("error(")) {
-                return wrapWithSideEffects(fallback)
-            }
-            val layoutExpr = resolveTypeLayoutExpression(explicitRetSlot, selfTypeName, emitter)
-            return wrapWithSideEffects(renderZeroedLayoutReadExpression(layoutExpr, intrPkg, emitter))
-        }
-        val expectedRendered = (emitter.currentExpectedParseTargetType ?: emitter.currentEnclosingReturnRenderedType)?.trim()?.takeIf { it.isNotEmpty() && it != "Unit" }
-        if (expectedRendered != null) {
-            val fallback = emitter.renderFallbackDefaultForRenderedType(expectedRendered)
-            if (!fallback.startsWith("null as ") && !fallback.startsWith("error(")) {
-                return wrapWithSideEffects(fallback)
-            }
-            val expectedBase = expectedRendered.substringBefore('<').substringAfterLast('.').trim()
-            val expectedDecl = emitter.sameFileUniqueSimpleStruct(expectedBase)
-            if (expectedDecl != null) {
-                val computed = StructLayoutComputer.computeStructLayout(expectedDecl, emitter)
-                if (computed != null && computed.requiredTypeLayoutParams.isEmpty()) {
-                    return wrapWithSideEffects(renderZeroedLayoutReadExpression("$expectedBase.typeLayout()", intrPkg, emitter))
-                }
-            }
-            return wrapWithSideEffects(renderZeroedLayoutReadExpression(resolveRenderedTypeLayoutExpression(expectedRendered, emitter), intrPkg, emitter))
-        }
-        if (renderedArgs.isNotEmpty()) {
-            val valBind = renderedArgs.mapIndexed { idx, arg -> "val simdArg$idx = $arg" }.joinToString("; ")
-            return "run { $valBind; simdArg0 }"
-        }
-        return "Unit"
-    }
-
-    private data class CoreIntrinsicCallSpec(
-        val rawName: String,
-        val canonicalName: String,
-        val ord0: String?,
-        val ord1: String?,
-        val isIntrinsicsModuleCall: Boolean,
-        val penultName: String?,
-        val rewrittenSegNames: List<String>,
-        val explicitTypes: List<SynType>,
-        val explicitConsts: List<Expr>,
-        val callArgsList: List<Expr>,
-    )
-
     private fun resolveCoreIntrinsicCallSpec(
         call: Expr.Call,
         emitter: KotlinJ2KEmitter,
@@ -1132,17 +1323,12 @@ public object CoreIntrinsicLowering {
             emitter.rewriteCrateRootAliasAndReexportSegments(
                 segments.map { it.ident.toString().removePrefix("r#") },
             )
-        val penultName =
-            rewrittenSegNames
-                .getOrNull(rewrittenSegNames.size - 2)
-                ?.removePrefix("r#")
+        val penultName = rewrittenSegNames.getOrNull(rewrittenSegNames.size - 2)?.removePrefix("r#")
         val isIntrinsicsModuleCall =
             penultName == "intrinsics" ||
                 "intrinsics" in rewrittenSegNames.dropLast(1) ||
                 (segments.size == 1 && emitter.headerContext.packageName?.endsWith(".intrinsics") == true)
         val genericArgs = (lastSeg.arguments as? PathArguments.AngleBracketed)?.args?.toList().orEmpty()
-        val explicitTypes = genericArgs.filterIsInstance<GenericArgument.TypeArg>().map { it.type }
-        val explicitConsts = genericArgs.filterIsInstance<GenericArgument.ConstArg>().map { it.expr }
         val parsedAtomic = parseLegacyAtomicOrderingSuffix(rawName)
         return CoreIntrinsicCallSpec(
             rawName = rawName,
@@ -1152,8 +1338,8 @@ public object CoreIntrinsicLowering {
             isIntrinsicsModuleCall = isIntrinsicsModuleCall,
             penultName = penultName,
             rewrittenSegNames = rewrittenSegNames,
-            explicitTypes = explicitTypes,
-            explicitConsts = explicitConsts,
+            explicitTypes = genericArgs.filterIsInstance<GenericArgument.TypeArg>().map { it.type },
+            explicitConsts = genericArgs.filterIsInstance<GenericArgument.ConstArg>().map { it.expr },
             callArgsList = call.args.toList(),
         )
     }
@@ -1165,100 +1351,28 @@ public object CoreIntrinsicLowering {
         val spec = resolveCoreIntrinsicCallSpec(call, emitter) ?: return null
         if (!spec.isIntrinsicsModuleCall) return null
         return when (spec.canonicalName) {
-            "volatile_load",
-            "unaligned_volatile_load",
-            "read_via_copy",
-            "atomic_load",
-            "atomic_xchg",
-            "atomic_xadd",
-            "atomic_xsub",
-            "atomic_and",
-            "atomic_nand",
-            "atomic_or",
-            "atomic_xor",
-            "atomic_max",
-            "atomic_min",
-            "atomic_umax",
-            "atomic_umin",
-            ->
-                spec.explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
-                    ?: (
-                        spec.callArgsList
-                            .firstOrNull()
-                            ?.let { emitter.sourceInitializerType(it) }
-                            ?.let(::unwrapSynType) as? SynType.Ptr
-                    )?.elem
+            in POINTED_LOAD_RETURN_INTRINSICS -> spec.inferredPointeeTypeAt0(emitter)
             "offset", "arith_offset" ->
                 spec.callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) }
-            "bswap",
-            "bitreverse",
-            "rotate_left",
-            "rotate_right",
-            "wrapping_add",
-            "wrapping_sub",
-            "wrapping_mul",
-            "unchecked_add",
-            "unchecked_sub",
-            "unchecked_mul",
-            "saturating_add",
-            "saturating_sub",
-            "unchecked_div",
-            "unchecked_rem",
-            "exact_div",
-            "unchecked_shl",
-            "unchecked_shr",
-            "disjoint_bitor",
-            "select_unpredictable",
-            "powi",
-            "fma",
-            "fmuladd",
+            in FIRST_ARG_RETURN_INTRINSICS,
             in GENERIC_FLOAT_UNARY_KM,
             in GENERIC_FLOAT_BINARY_OP_NAMES,
             ->
-                spec.explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
+                spec.explicitTypes.nonInferAt(0)
                     ?: spec.callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) }
             "transmute", "transmute_unchecked", "float_to_int_unchecked" ->
-                spec.explicitTypes.getOrNull(1)?.takeUnless { it is SynType.Infer }
+                spec.explicitTypes.nonInferAt(1)
             else -> null
         }
     }
 
-    private fun isUsableRenderedTypeArg(ty: String?): Boolean {
+    internal fun isUsableRenderedTypeArg(ty: String?): Boolean {
         val clean = ty?.trim() ?: return false
         if (clean.isEmpty()) return false
         if (clean in setOf("Any", "Any?", "Nothing", "RustAny", "_")) return false
         if ('*' in clean) return false
         if ("->" in clean && !clean.startsWith("(")) return false
         return !clean.startsWith("Result.Err")
-    }
-
-    internal fun resolveRenderedTypeLayoutExpression(
-        renderedType: String,
-        emitter: KotlinJ2KEmitter,
-    ): String {
-        val coreNs = resolveCoreNamespace(emitter.headerContext)
-        val memPkg = "$coreNs.mem"
-        val clean = renderedType.trim()
-        val expectedLayoutType = "$memPkg.TypeLayout<$clean>"
-        emitter.currentTypedLocals
-            .filterValues { it == expectedLayoutType }
-            .keys
-            .singleOrNull()
-            ?.let { return it }
-        val candidateParam = StructLayoutComputer.typeLayoutParamName(clean)
-        if (candidateParam in emitter.currentTypedLocals) {
-            return candidateParam
-        }
-        val structSimple = clean.substringBefore('<').substringAfterLast('.')
-        val structDecl = emitter.sameFileUniqueSimpleStruct(structSimple)
-        if (structDecl != null) {
-            val computed = StructLayoutComputer.computeStructLayout(structDecl, emitter)
-            if (computed != null && computed.requiredTypeLayoutParams.isEmpty()) {
-                return "$structSimple.typeLayout()"
-            }
-        }
-        registerCoreImport(emitter, "$memPkg.UnresolvedTypeLayout")
-        return "UnresolvedTypeLayout<$clean>()"
     }
 
     internal fun renderTransmuteCall(
@@ -1269,8 +1383,8 @@ public object CoreIntrinsicLowering {
         selfTypeName: String?,
         emitter: KotlinJ2KEmitter,
     ): String? {
-        val srcExplicitSyn = explicitTypes.getOrNull(0)?.takeUnless { it is SynType.Infer }
-        val dstExplicitSyn = explicitTypes.getOrNull(1)?.takeUnless { it is SynType.Infer }
+        val srcExplicitSyn = explicitTypes.nonInferAt(0)
+        val dstExplicitSyn = explicitTypes.nonInferAt(1)
         val expectedTarget = emitter.currentExpectedParseTargetType?.trim()?.takeIf { it.isNotEmpty() }
         val srcSyn = srcExplicitSyn ?: emitter.sourceInitializerType(argExpr)
         val dstSyn =
@@ -1289,10 +1403,8 @@ public object CoreIntrinsicLowering {
                 emitter.currentExpectedParseTargetType = prevParseTarget
             }
         val srcRendered =
-            (
-                srcSyn?.let { emitter.renderType(it, selfTypeName) }
-                    ?: emitter.inferExprRenderedType(argExpr, selfTypeName)
-            )?.takeIf(::isUsableRenderedTypeArg)
+            (srcSyn?.let { emitter.renderType(it, selfTypeName) } ?: emitter.inferExprRenderedType(argExpr, selfTypeName))
+                ?.takeIf(::isUsableRenderedTypeArg)
         val dstRendered =
             (
                 dstSyn?.let { emitter.renderType(it, selfTypeName) }
@@ -1303,53 +1415,53 @@ public object CoreIntrinsicLowering {
                         null
                     }
             )?.takeIf(::isUsableRenderedTypeArg)
+        val coreNs = resolveCoreNamespace(emitter.headerContext)
+        val memPkg = "$coreNs.mem"
         if (srcRendered != null && dstRendered != null) {
-            if (srcRendered == dstRendered && srcRendered != "Unit") {
-                return renderedArg
-            }
-            val coreNs = resolveCoreNamespace(emitter.headerContext)
-            val ptrPkg = "$coreNs.ptr"
-            val memPkg = "$coreNs.mem"
+            if (srcRendered == dstRendered && srcRendered != "Unit") return renderedArg
             if (srcSyn != null && dstSyn != null) {
-                renderFastScalarTransmute(srcSyn, dstSyn, renderedArg, ptrPkg, emitter)?.let { return it }
+                renderFastScalarTransmute(srcSyn, dstSyn, renderedArg, "$coreNs.ptr", emitter)?.let { return it }
             }
             val fromField = emitter.transparentPointerField(srcRendered, selfTypeName)
-            if (fromField != null && fromField.second == dstRendered) {
-                return "($renderedArg).${fromField.first}"
-            }
+            if (fromField != null && fromField.second == dstRendered) return "($renderedArg).${fromField.first}"
             val toField = emitter.transparentPointerField(dstRendered, selfTypeName)
-            if (toField != null && toField.second == srcRendered) {
-                return "$dstRendered($renderedArg)"
-            }
-            val srcLayout =
-                srcSyn?.let { resolveTypeLayoutExpression(it, selfTypeName, emitter) }
-                    ?: resolveRenderedTypeLayoutExpression(srcRendered, emitter)
-            val dstLayout =
-                dstSyn?.let { resolveTypeLayoutExpression(it, selfTypeName, emitter) }
-                    ?: resolveRenderedTypeLayoutExpression(dstRendered, emitter)
+            if (toField != null && toField.second == srcRendered) return "$dstRendered($renderedArg)"
+            val srcLayout = srcSyn?.let { resolveTypeLayoutExpression(it, selfTypeName, emitter) } ?: resolveRenderedTypeLayoutExpression(srcRendered, emitter)
+            val dstLayout = dstSyn?.let { resolveTypeLayoutExpression(it, selfTypeName, emitter) } ?: resolveRenderedTypeLayoutExpression(dstRendered, emitter)
             registerCoreImport(emitter, "$memPkg.transmuteWithLayouts")
             return "transmuteWithLayouts<$srcRendered, $dstRendered>($renderedArg, $srcLayout, $dstLayout)"
         }
         if ("transmute" !in emitter.inspector.declaredTopLevelFnRawNames &&
             "transmute_unchecked" !in emitter.inspector.declaredTopLevelFnRawNames
         ) {
-            val coreNs = resolveCoreNamespace(emitter.headerContext)
-            val memPkg = "$coreNs.mem"
             if (srcRendered == null && dstRendered != null) {
-                val dstLayout =
-                    dstSyn?.let { resolveTypeLayoutExpression(it, selfTypeName, emitter) }
-                        ?: resolveRenderedTypeLayoutExpression(dstRendered, emitter)
+                val dstLayout = dstSyn?.let { resolveTypeLayoutExpression(it, selfTypeName, emitter) } ?: resolveRenderedTypeLayoutExpression(dstRendered, emitter)
                 registerCoreImport(emitter, "$memPkg.transmuteWithLayouts")
                 registerCoreImport(emitter, "$memPkg.UnresolvedTypeLayout")
                 return "transmuteWithLayouts<Any?, $dstRendered>($renderedArg, UnresolvedTypeLayout<Any?>(), $dstLayout)"
             }
             val fnName = if (rawTransmuteIdent == "transmute_unchecked") "transmuteUnchecked" else "transmute"
-            if (emitter.headerContext.packageName != memPkg) {
-                registerCoreImport(emitter, "$memPkg.$fnName")
-            }
+            if (emitter.headerContext.packageName != memPkg) registerCoreImport(emitter, "$memPkg.$fnName")
             return "$fnName($renderedArg)"
         }
         return null
+    }
+
+    private fun isCoreSimdCallSite(
+        spec: CoreIntrinsicCallSpec,
+        segCount: Int,
+        emitter: KotlinJ2KEmitter,
+        allowsimdSubpath: Boolean,
+    ): Boolean {
+        val directMatch =
+            SimdIntrinsicFamilyRule.isSimdIntrinsicName(spec.canonicalName) &&
+                (
+                    spec.isIntrinsicsModuleCall ||
+                        spec.penultName == "simd" ||
+                        spec.penultName == "scalable" ||
+                        (segCount == 1 && spec.rawName !in emitter.inspector.declaredTopLevelFnRawNames)
+                )
+        return directMatch || (allowsimdSubpath && spec.isIntrinsicsModuleCall && "simd" in spec.rewrittenSegNames.dropLast(1))
     }
 
     internal fun inferCoreIntrinsicReturnRenderedType(
@@ -1358,39 +1470,14 @@ public object CoreIntrinsicLowering {
         emitter: KotlinJ2KEmitter,
     ): String? {
         val spec = resolveCoreIntrinsicCallSpec(call, emitter) ?: return null
-        if (spec.rawName in setOf("__rust_alloc", "__rust_alloc_zeroed", "__rust_realloc")) {
-            return "MutPtr"
-        }
-        val isCoreSimdCall =
-            isSimdIntrinsicName(spec.canonicalName) &&
-                (
-                    spec.isIntrinsicsModuleCall ||
-                        spec.penultName == "simd" ||
-                        spec.penultName == "scalable" ||
-                        ((call.func as? Expr.Path)?.path?.segments?.size == 1 && spec.rawName !in emitter.inspector.declaredTopLevelFnRawNames)
-                )
+        if (spec.rawName in setOf("__rust_alloc", "__rust_alloc_zeroed", "__rust_realloc")) return "MutPtr"
+        val segCount = ((call.func as? Expr.Path)?.path?.segments?.size) ?: 0
+        val isCoreSimdCall = isCoreSimdCallSite(spec, segCount, emitter, allowsimdSubpath = false)
         if (!spec.isIntrinsicsModuleCall && !isCoreSimdCall) return null
         val canonical = spec.canonicalName
-        if (canonical in setOf("ctpop", "ctlz", "ctlz_nonzero", "cttz", "cttz_nonzero")) {
-            return "UInt"
-        }
-        if (canonical in setOf("needs_drop", "raw_eq", "likely", "unlikely")) {
-            return "Boolean"
-        }
-        if (canonical in
-            setOf(
-                "ptr_offset_from",
-                "ptr_offset_from_unsigned",
-                "size_of",
-                "size_of_val",
-                "align_of",
-                "align_of_val",
-                "min_align_of_val",
-                "vtable_size",
-                "vtable_align",
-                "variant_count",
-            )
-        ) {
+        if (canonical in setOf("ctpop", "ctlz", "ctlz_nonzero", "cttz", "cttz_nonzero")) return "UInt"
+        if (canonical in setOf("needs_drop", "raw_eq", "likely", "unlikely")) return "Boolean"
+        if (canonical in USIZE_RETURN_INTRINSICS) {
             return when {
                 emitter.currentExpectedNumericKind != null -> null
                 emitter.headerContext.rawAbiMode -> "ULong"
@@ -1399,25 +1486,15 @@ public object CoreIntrinsicLowering {
         }
         if (canonical in setOf("add_with_overflow", "sub_with_overflow", "mul_with_overflow")) {
             val elemTy =
-                spec.explicitTypes
-                    .firstOrNull()
-                    ?.takeUnless { it is SynType.Infer }
-                    ?.let { emitter.renderType(it, selfTypeName) }
+                spec.explicitTypes.nonInferAt(0)?.let { emitter.renderType(it, selfTypeName) }
                     ?: spec.callArgsList.firstOrNull()?.let { emitter.inferExprRenderedType(it, selfTypeName) }
                     ?: resolveIntrinsicNumericKind(spec.explicitTypes.firstOrNull(), spec.callArgsList.take(2), selfTypeName, emitter)
-                        ?.let { emitter.numericKindToPureTypeName(it) }
+                        ?.let(emitter::numericKindToPureTypeName)
                     ?: return null
             return "Pair<$elemTy, Boolean>"
         }
         if (canonical in setOf("atomic_cxchg", "atomic_cxchgweak")) {
-            val pointeeTy =
-                spec.explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
-                    ?: (
-                        spec.callArgsList
-                            .firstOrNull()
-                            ?.let { emitter.sourceInitializerType(it) }
-                            ?.let(::unwrapSynType) as? SynType.Ptr
-                    )?.elem
+            val pointeeTy = spec.inferredPointeeTypeAt0(emitter)
             val elemTy =
                 pointeeTy?.let { emitter.renderType(it, selfTypeName) }
                     ?: spec.callArgsList.getOrNull(1)?.let { emitter.inferExprRenderedType(it, selfTypeName) }
@@ -1425,194 +1502,37 @@ public object CoreIntrinsicLowering {
             return "Pair<$elemTy, Boolean>"
         }
         val suffixedKm = SUFFIXED_FLOAT_UNARY_KM[canonical] ?: SUFFIXED_FLOAT_BINARY_KM[canonical]
-        if (suffixedKm != null) {
-            return if (suffixedKm.endsWith("f32")) "Float" else "Double"
-        }
-        if (canonical in setOf("fmaf32", "fmuladdf32", "minimumf32", "maximumf32")) {
-            return "Float"
-        }
-        if (canonical in setOf("fmaf64", "fmuladdf64", "minimumf64", "maximumf64")) {
-            return "Double"
-        }
+        if (suffixedKm != null) return if (suffixedKm.endsWith("f32")) "Float" else "Double"
+        if (canonical in setOf("fmaf32", "fmuladdf32", "minimumf32", "maximumf32")) return "Float"
+        if (canonical in setOf("fmaf64", "fmuladdf64", "minimumf64", "maximumf64")) return "Double"
         inferCoreIntrinsicReturnSynType(call, emitter)?.let { return emitter.renderType(it, selfTypeName) }
-        if (canonical in
-            setOf(
-                "bswap",
-                "bitreverse",
-                "rotate_left",
-                "rotate_right",
-                "wrapping_add",
-                "wrapping_sub",
-                "wrapping_mul",
-                "unchecked_add",
-                "unchecked_sub",
-                "unchecked_mul",
-                "saturating_add",
-                "saturating_sub",
-                "unchecked_div",
-                "unchecked_rem",
-                "exact_div",
-                "unchecked_shl",
-                "unchecked_shr",
-                "disjoint_bitor",
-                "select_unpredictable",
-                "powi",
-                "fma",
-                "fmuladd",
-            ) ||
-            canonical in GENERIC_FLOAT_UNARY_KM ||
-            canonical in GENERIC_FLOAT_BINARY_OP_NAMES
-        ) {
+        if (canonical in FIRST_ARG_RETURN_INTRINSICS || canonical in GENERIC_FLOAT_UNARY_KM || canonical in GENERIC_FLOAT_BINARY_OP_NAMES) {
             return spec.callArgsList.firstOrNull()?.let { emitter.inferExprRenderedType(it, selfTypeName) }
         }
         if (canonical in setOf("transmute", "transmute_unchecked", "float_to_int_unchecked")) {
-            return spec.explicitTypes
-                .getOrNull(1)
-                ?.takeUnless { it is SynType.Infer }
-                ?.let { emitter.renderType(it, selfTypeName) }
+            return spec.explicitTypes.nonInferAt(1)?.let { emitter.renderType(it, selfTypeName) }
         }
-        if (canonical.startsWith("sve_tuple_")) {
-            return null
-        }
-        if (canonical in CORE_SIMD_INTRINSIC_NAMES) {
-            when (canonical) {
-                "simd_splat" ->
-                    return spec.explicitTypes
-                        .firstOrNull()
-                        ?.takeUnless { it is SynType.Infer }
-                        ?.let { emitter.renderType(it, selfTypeName) }
-                "simd_shuffle" ->
-                    return spec.explicitTypes
-                        .getOrNull(2)
-                        ?.takeUnless { it is SynType.Infer }
-                        ?.let { emitter.renderType(it, selfTypeName) }
-                "simd_cast", "simd_as", "simd_bitmask" ->
-                    return spec.explicitTypes
-                        .getOrNull(1)
-                        ?.takeUnless { it is SynType.Infer }
-                        ?.let { emitter.renderType(it, selfTypeName) }
-                "simd_select" ->
-                    return spec.explicitTypes
-                        .getOrNull(1)
-                        ?.takeUnless { it is SynType.Infer }
-                        ?.let { emitter.renderType(it, selfTypeName) }
-                        ?: spec.callArgsList.getOrNull(1)?.let { emitter.inferExprRenderedType(it, selfTypeName) }
-                in SIMD_BOOL_RETURN_INTRINSICS -> return "Boolean"
-                in SIMD_UNIT_RETURN_INTRINSICS -> return "Unit"
-                in SIMD_SAME_ARG0_INTRINSICS ->
-                    return spec.explicitTypes
-                        .firstOrNull()
-                        ?.takeUnless { it is SynType.Infer }
-                        ?.let { emitter.renderType(it, selfTypeName) }
-                        ?.takeIf(::isUsableRenderedTypeArg)
-                        ?: run {
-                            val canInferFromPeerArgs =
-                                canonical !in
-                                    setOf(
-                                        "simd_insert",
-                                        "simd_insert_dyn",
-                                        "simd_gather",
-                                        "simd_arith_offset",
-                                        "simd_select_bitmask",
-                                        "simd_scatter",
-                                        "simd_masked_load",
-                                        "simd_masked_store",
-                                    )
-                            if (canInferFromPeerArgs) {
-                                spec.callArgsList.firstNotNullOfOrNull { argExpr ->
-                                    val callArg = emitter.unwrapParenOrGroupExpr(argExpr) as? Expr.Call
-                                    val rawCallName =
-                                        (callArg?.func as? Expr.Path)
-                                            ?.path
-                                            ?.segments
-                                            ?.toList()
-                                            ?.lastOrNull()
-                                            ?.ident
-                                            ?.toString()
-                                            ?.removePrefix("r#")
-                                    if (rawCallName in setOf("transmute", "transmute_unchecked")) {
-                                        null
-                                    } else {
-                                        emitter
-                                            .inferExprRenderedType(argExpr, selfTypeName)
-                                            ?.takeIf(::isUsableRenderedTypeArg)
-                                    }
-                                }
-                            } else {
-                                null
-                            }
-                        }
-                        ?: spec.callArgsList.firstOrNull()?.let { arg0 ->
-                            emitter.inferExprRenderedType(arg0, selfTypeName)?.takeIf(::isUsableRenderedTypeArg)
-                                ?: run {
-                                    val callArg = emitter.unwrapParenOrGroupExpr(arg0) as? Expr.Call
-                                    val callPath = (callArg?.func as? Expr.Path)?.takeIf { it.qself == null }?.path
-                                    val callName =
-                                        callPath
-                                            ?.segments
-                                            ?.last()
-                                            ?.ident
-                                            ?.toString()
-                                            ?.removePrefix("r#")
-                                    if (callName in setOf("transmute", "transmute_unchecked") && callArg?.args?.len() == 1) {
-                                        emitter
-                                            .inferExprRenderedType(callArg.args.first()!!, selfTypeName)
-                                            ?.takeIf(::isUsableRenderedTypeArg)
-                                    } else {
-                                        null
-                                    }
-                                }
-                        }
-                in SIMD_SAME_ARG1_INTRINSICS ->
-                    return spec.callArgsList.getOrNull(1)?.let { emitter.inferExprRenderedType(it, selfTypeName) }
-                in SIMD_SAME_ARG2_INTRINSICS ->
-                    return spec.callArgsList.getOrNull(2)?.let { emitter.inferExprRenderedType(it, selfTypeName) }
-                else ->
-                    return spec.explicitTypes
-                        .firstOrNull()
-                        ?.takeUnless { it is SynType.Infer }
-                        ?.let { emitter.renderType(it, selfTypeName) }
-                        ?: spec.callArgsList.firstOrNull()?.let { emitter.inferExprRenderedType(it, selfTypeName) }
-            }
-        }
-        return null
+        return SimdIntrinsicFamilyRule.inferReturnRenderedType(spec, selfTypeName, emitter)
     }
 
-    internal fun renderCoreIntrinsicCall(
-        call: Expr.Call,
+    private fun renderGlobalAllocOrHintCall(
+        spec: CoreIntrinsicCallSpec,
         emitter: KotlinJ2KEmitter,
         indent: String,
         selfTypeName: String?,
     ): String? {
-        val path = (call.func as? Expr.Path)?.takeIf { it.qself == null }?.path ?: return null
-        val segments = path.segments.toList()
-        if (segments.isEmpty()) return null
-        val rewrittenSegNames =
-            emitter.rewriteCrateRootAliasAndReexportSegments(
-                segments.map { it.ident.toString().removePrefix("r#") },
-            )
-        val penultName =
-            rewrittenSegNames
-                .getOrNull(rewrittenSegNames.size - 2)
-                ?.removePrefix("r#")
-        val spec = resolveCoreIntrinsicCallSpec(call, emitter) ?: return null
         val rawName = spec.rawName
-
-        // Support `alloc::alloc::__rust_alloc` / `__rust_dealloc` / `__rust_realloc` / `__rust_alloc_zeroed`
         if (rawName in setOf("__rust_alloc", "__rust_dealloc", "__rust_realloc", "__rust_alloc_zeroed")) {
             val coreNs = resolveCoreNamespace(emitter.headerContext)
             val intrPkg = "$coreNs.intrinsics"
-            val ptrPkg = "$coreNs.ptr"
             val args = spec.callArgsList.map { emitter.renderExpr(it, indent, selfTypeName) }
-            registerCoreImport(emitter, "$ptrPkg.MutPtr")
+            registerCoreImport(emitter, "$coreNs.ptr.MutPtr")
+
             fun alignArgExpr(argIdx: Int): String {
                 val alignSyn = spec.callArgsList.getOrNull(argIdx)
                 val alignTy = alignSyn?.let { emitter.inferExprRenderedType(it, selfTypeName) }?.removeSuffix("?")?.trim()
-                val isAlignmentMethodCall =
-                    (alignSyn?.let { emitter.unwrapParenOrGroupExpr(it) } as? Expr.MethodCall)
-                        ?.method
-                        ?.toString()
-                        ?.removePrefix("r#") == "alignment"
+                val methodCall = alignSyn?.let { emitter.unwrapParenOrGroupExpr(it) } as? Expr.MethodCall
+                val isAlignmentMethodCall = methodCall?.method?.toString()?.removePrefix("r#") == "alignment"
                 val rawArg = args[argIdx]
                 return if (alignTy == "Alignment" || alignTy?.endsWith(".Alignment") == true || (alignTy == null && isAlignmentMethodCall)) {
                     "($rawArg).asUsize().toLong()"
@@ -1640,555 +1560,100 @@ public object CoreIntrinsicLowering {
                 else -> null
             }
         }
-
-        val callArgsList = spec.callArgsList
-
-        // Support `core::hint::spin_loop()` / `hint::black_box(...)`
-        if (penultName == "hint" && rawName == "spin_loop" && callArgsList.isEmpty()) {
-            val coreNs = resolveCoreNamespace(emitter.headerContext)
-            registerCoreImport(emitter, "$coreNs.intrinsics.kmSpinLoopHint")
+        if (spec.penultName == "hint" && rawName == "spin_loop" && spec.callArgsList.isEmpty()) {
+            registerCoreImport(emitter, "${resolveCoreNamespace(emitter.headerContext)}.intrinsics.kmSpinLoopHint")
             return "kmSpinLoopHint()"
         }
-        if (penultName == "hint" && rawName == "black_box" && callArgsList.size == 1) {
-            val firstArgExpr = callArgsList[0]
+        if (spec.penultName == "hint" && rawName == "black_box" && spec.callArgsList.size == 1) {
+            val firstArgExpr = spec.callArgsList[0]
             val argRendered = emitter.renderExpr(firstArgExpr, indent, selfTypeName)
-            val argKind = emitter.inferExprNumericKind(firstArgExpr, selfTypeName)
-            if (argKind == NumericKind.U64) {
-                val coreNs = resolveCoreNamespace(emitter.headerContext)
-                registerCoreImport(emitter, "$coreNs.intrinsics.kmBlackBoxU64")
-                return "kmBlackBoxU64($argRendered)"
+            return when (emitter.inferExprNumericKind(firstArgExpr, selfTypeName)) {
+                NumericKind.U64 -> {
+                    registerCoreImport(emitter, "${resolveCoreNamespace(emitter.headerContext)}.intrinsics.kmBlackBoxU64")
+                    "kmBlackBoxU64($argRendered)"
+                }
+                NumericKind.I64 -> {
+                    registerCoreImport(emitter, "${resolveCoreNamespace(emitter.headerContext)}.intrinsics.kmBlackBoxU64")
+                    "kmBlackBoxU64(($argRendered).toULong()).toLong()"
+                }
+                else -> argRendered
             }
-            if (argKind == NumericKind.I64) {
-                val coreNs = resolveCoreNamespace(emitter.headerContext)
-                registerCoreImport(emitter, "$coreNs.intrinsics.kmBlackBoxU64")
-                return "kmBlackBoxU64(($argRendered).toULong()).toLong()"
-            }
-            return argRendered
         }
+        return null
+    }
 
-        val isIntrinsicsModuleCall = spec.isIntrinsicsModuleCall
-        val isCoreSimdCall =
-            (
-                isSimdIntrinsicName(spec.canonicalName) &&
-                    (
-                        isIntrinsicsModuleCall ||
-                            penultName == "simd" ||
-                            penultName == "scalable" ||
-                            (segments.size == 1 && rawName !in emitter.inspector.declaredTopLevelFnRawNames)
-                    )
-            ) ||
-                (isIntrinsicsModuleCall && "simd" in rewrittenSegNames.dropLast(1))
-        if (!isIntrinsicsModuleCall && !isCoreSimdCall) {
-            return null
-        }
+    internal fun renderCoreIntrinsicCall(
+        call: Expr.Call,
+        emitter: KotlinJ2KEmitter,
+        indent: String,
+        selfTypeName: String?,
+    ): String? {
+        val path = (call.func as? Expr.Path)?.takeIf { it.qself == null }?.path ?: return null
+        val segCount = path.segments.size
+        if (segCount == 0) return null
+        val spec = resolveCoreIntrinsicCallSpec(call, emitter) ?: return null
+        renderGlobalAllocOrHintCall(spec, emitter, indent, selfTypeName)?.let { return it }
 
-        val coreNs = resolveCoreNamespace(emitter.headerContext)
-        val intrPkg = "$coreNs.intrinsics"
-        val memPkg = "$coreNs.mem"
-        val ptrPkg = "$coreNs.ptr"
-        val explicitTypes = spec.explicitTypes
-        val explicitConsts = spec.explicitConsts
-        val simdExpectedArgTarget =
-            if (isCoreSimdCall) {
-                val canInferFromPeerArgs =
-                    spec.canonicalName !in
-                        setOf("simd_select_bitmask", "simd_gather", "simd_scatter", "simd_masked_load", "simd_masked_store")
-                explicitTypes
-                    .firstOrNull()
-                    ?.takeUnless { it is SynType.Infer }
-                    ?.let { emitter.renderType(it, selfTypeName) }
-                    ?.takeIf(::isUsableRenderedTypeArg)
-                    ?: if (canInferFromPeerArgs) {
-                        callArgsList.firstNotNullOfOrNull { argExpr ->
-                            val rawCallName =
-                                ((argExpr as? Expr.Call)?.func as? Expr.Path)
-                                    ?.path
-                                    ?.segments
-                                    ?.toList()
-                                    ?.lastOrNull()
-                                    ?.ident
-                                    ?.toString()
-                                    ?.removePrefix("r#")
-                            if (rawCallName in setOf("transmute", "transmute_unchecked")) {
-                                null
-                            } else {
-                                emitter
-                                    .inferExprRenderedType(argExpr, selfTypeName)
-                                    ?.takeIf(::isUsableRenderedTypeArg)
-                            }
-                        }
-                    } else {
-                        null
-                    }
-                    ?: if (spec.canonicalName in SIMD_SAME_ARG0_INTRINSICS &&
-                        spec.canonicalName !in setOf("simd_insert", "simd_insert_dyn", "simd_gather", "simd_arith_offset")
-                    ) {
-                        (
-                            emitter.currentExpectedParseTargetType
-                                ?: if (emitter.callArgumentNestingDepth == 0) emitter.currentEnclosingReturnRenderedType else null
-                        )?.takeIf(::isUsableRenderedTypeArg)
-                    } else {
-                        null
-                    }
-                    ?: if (canInferFromPeerArgs) {
-                        callArgsList.firstNotNullOfOrNull { argExpr ->
-                            val callArg = emitter.unwrapParenOrGroupExpr(argExpr) as? Expr.Call
-                            val rawCallName =
-                                (callArg?.func as? Expr.Path)
-                                    ?.takeIf { it.qself == null }
-                                    ?.path
-                                    ?.segments
-                                    ?.toList()
-                                    ?.lastOrNull()
-                                    ?.ident
-                                    ?.toString()
-                                    ?.removePrefix("r#")
-                            if (rawCallName in setOf("transmute", "transmute_unchecked") && callArg?.args?.len() == 1) {
-                                emitter
-                                    .inferExprRenderedType(callArg.args.first()!!, selfTypeName)
-                                    ?.takeIf(::isUsableRenderedTypeArg)
-                            } else {
-                                null
-                            }
-                        }
-                    } else {
-                        null
-                    }
-            } else {
-                null
-            }
-        emitter.callArgumentNestingDepth++
+        val isCoreSimdCall = isCoreSimdCallSite(spec, segCount, emitter, allowsimdSubpath = true)
+        if (!spec.isIntrinsicsModuleCall && !isCoreSimdCall) return null
+
+        val simdExpectedArgTarget = if (isCoreSimdCall) SimdIntrinsicFamilyRule.resolveExpectedArgTarget(spec, selfTypeName, emitter) else null
         val renderedArgs =
-            try {
-                if (simdExpectedArgTarget != null) {
-                    callArgsList.mapIndexed { argIdx, argExpr ->
-                        val shouldPropagate =
-                            when (spec.canonicalName) {
-                                "simd_shuffle" -> argIdx < 2
-                                "simd_extract" -> argIdx == 0
-                                "simd_insert" -> argIdx == 0
-                                else -> true
-                            }
-                        val prevTarget = emitter.currentExpectedParseTargetType
-                        emitter.currentExpectedParseTargetType = if (shouldPropagate) simdExpectedArgTarget else null
-                        try {
-                            emitter.renderExpr(argExpr, indent, selfTypeName)
-                        } finally {
-                            emitter.currentExpectedParseTargetType = prevTarget
+            if (spec.canonicalName == "transmute" || spec.canonicalName == "transmute_unchecked") {
+                emptyList()
+            } else {
+                renderIntrinsicCallArguments(spec, simdExpectedArgTarget, emitter, indent, selfTypeName)
+            }
+        val ctx =
+            IntrinsicCallContext(
+                spec = spec,
+                renderedArgs = renderedArgs,
+                indent = indent,
+                selfTypeName = selfTypeName,
+                coreNs = resolveCoreNamespace(emitter.headerContext),
+                isCoreSimdCall = isCoreSimdCall,
+                emitter = emitter,
+            )
+        val matchedRule = FAMILY_RULES.firstOrNull { it.matches(ctx.canonicalName, isCoreSimdCall) } ?: return null
+        return matchedRule.renderCall(ctx)
+    }
+
+    private fun renderIntrinsicCallArguments(
+        spec: CoreIntrinsicCallSpec,
+        simdExpectedArgTarget: String?,
+        emitter: KotlinJ2KEmitter,
+        indent: String,
+        selfTypeName: String?,
+    ): List<String> {
+        emitter.callArgumentNestingDepth++
+        return try {
+            if (simdExpectedArgTarget != null) {
+                spec.callArgsList.mapIndexed { argIdx, argExpr ->
+                    val shouldPropagate =
+                        when (spec.canonicalName) {
+                            "simd_shuffle" -> argIdx < 2
+                            "simd_extract", "simd_insert" -> argIdx == 0
+                            else -> true
                         }
-                    }
-                } else {
                     val prevTarget = emitter.currentExpectedParseTargetType
-                    emitter.currentExpectedParseTargetType = null
+                    emitter.currentExpectedParseTargetType = if (shouldPropagate) simdExpectedArgTarget else null
                     try {
-                        callArgsList.map { emitter.renderExpr(it, indent, selfTypeName) }
+                        emitter.renderExpr(argExpr, indent, selfTypeName)
                     } finally {
                         emitter.currentExpectedParseTargetType = prevTarget
                     }
                 }
-            } finally {
-                emitter.callArgumentNestingDepth--
-            }
-
-        val canonicalIntrinsicName = spec.canonicalName
-
-        fun orderingCode(constIdx: Int): String {
-            val legacyOrd = if (constIdx == 0) spec.ord0 else spec.ord1
-            if (legacyOrd != null && constIdx >= explicitConsts.size) return legacyOrd
-            var expr = explicitConsts.getOrNull(constIdx) ?: return legacyOrd ?: "4"
-            while (true) {
-                expr =
-                    when (val unwrapped = emitter.unwrapParenOrGroupExpr(expr)) {
-                        is Expr.BlockExpr -> (unwrapped.block.stmts.singleOrNull() as? Stmt.ExprStmt)?.expr ?: break
-                        else -> unwrapped
-                    }
-                if (expr !is Expr.BlockExpr) break
-            }
-            val variant =
-                (expr as? Expr.Path)
-                    ?.path
-                    ?.segments
-                    ?.last()
-                    ?.ident
-                    ?.toString()
-            return when (variant) {
-                "Relaxed" -> "0"
-                "Release" -> "1"
-                "Acquire" -> "2"
-                "AcqRel" -> "3"
-                "SeqCst" -> "4"
-                else -> "(${emitter.renderExpr(expr, indent, selfTypeName)}).ordinal"
-            }
-        }
-
-        fun rawAddrOf(argIdx: Int): String {
-            val argExpr = callArgsList.getOrNull(argIdx)
-            val rendered = renderedArgs[argIdx]
-            if (emitter.headerContext.rawAbiMode) return rendered
-            val inferred = argExpr?.let { emitter.inferExprRenderedType(it, selfTypeName) }
-            val atom = if (argExpr != null && emitter.isAtomicPostfixReceiver(argExpr, rendered)) rendered else "($rendered)"
-            return if (inferred == "Long") rendered else "$atom.rawAddress"
-        }
-
-        return when (canonicalIntrinsicName) {
-            "abort", "abort_immediate" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAbort")
-                "kmAbort()"
-            }
-            "unreachable" -> "error(\"Entered Rust intrinsics::unreachable\")"
-            "assume", "breakpoint", "forget", "cold_path", "assert_inhabited", "assert_zero_valid", "assert_mem_uninitialized_valid",
-            "prefetch_read_data", "prefetch_write_data", "prefetch_read_instruction", "prefetch_write_instruction",
-            -> "Unit"
-            "likely", "unlikely", "rustc_peek" -> renderedArgs.firstOrNull() ?: "Unit"
-            "select_unpredictable" ->
-                if (renderedArgs.size >= 3) "if (${renderedArgs[0]}) ${renderedArgs[1]} else ${renderedArgs[2]}" else null
-            "ub_checks", "overflow_checks", "is_val_statically_known" -> "false"
-            "black_box" -> {
-                val arg0 = renderedArgs.firstOrNull() ?: return "Unit"
-                val kind = callArgsList.firstOrNull()?.let { emitter.inferExprNumericKind(it, selfTypeName) }
-                if (kind == NumericKind.U64) {
-                    registerCoreImport(emitter, "$intrPkg.kmBlackBoxU64")
-                    "kmBlackBoxU64($arg0)"
-                } else {
-                    arg0
+            } else {
+                val prevTarget = emitter.currentExpectedParseTargetType
+                emitter.currentExpectedParseTargetType = null
+                try {
+                    spec.callArgsList.map { emitter.renderExpr(it, indent, selfTypeName) }
+                } finally {
+                    emitter.currentExpectedParseTargetType = prevTarget
                 }
             }
-            "size_of" -> {
-                val ty = explicitTypes.firstOrNull() ?: return null
-                val layout = resolveTypeLayoutExpression(ty, selfTypeName, emitter)
-                if (emitter.headerContext.rawAbiMode) "($layout).sizeBytes.toULong()" else "($layout).sizeBytes.toInt()"
-            }
-            "size_of_val" -> {
-                val ptrExpr = renderedArgs.firstOrNull() ?: return null
-                val firstArg = callArgsList.firstOrNull()
-                val pointeeTy =
-                    explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
-                        ?: when (val argTy = firstArg?.let { emitter.sourceInitializerType(it) }) {
-                            is SynType.Ptr -> argTy.elem
-                            is SynType.Reference -> argTy.elem
-                            else -> argTy
-                        }
-                        ?: return null
-                val layout = resolveTypeLayoutExpression(pointeeTy, selfTypeName, emitter)
-                if (emitter.headerContext.rawAbiMode) {
-                    "($layout).sizeBytes.toULong()"
-                } else {
-                    val isPtrArg =
-                        firstArg?.let { emitter.inferExprRenderedType(it, selfTypeName) }?.let {
-                            it.startsWith("ConstPtr") || it.startsWith("MutPtr") || ".ptr." in it
-                        } == true
-                    if (isPtrArg) {
-                        val atomPtr = if (emitter.isAtomicPostfixReceiver(firstArg, ptrExpr)) ptrExpr else "($ptrExpr)"
-                        "(if ($atomPtr.rawMeta > 0L) ($atomPtr.rawMeta * ($layout).sizeBytes).toInt() else ($layout).sizeBytes.toInt())"
-                    } else {
-                        "($layout).sizeBytes.toInt()"
-                    }
-                }
-            }
-            "align_of", "align_of_val", "min_align_of", "min_align_of_val", "pref_align_of" -> {
-                val firstArg = callArgsList.firstOrNull()
-                val ty =
-                    explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
-                        ?: when (val argTy = firstArg?.let { emitter.sourceInitializerType(it) }) {
-                            is SynType.Ptr -> argTy.elem
-                            is SynType.Reference -> argTy.elem
-                            else -> argTy
-                        }
-                        ?: return null
-                val layout = resolveTypeLayoutExpression(ty, selfTypeName, emitter)
-                if (emitter.headerContext.rawAbiMode) "($layout).alignBytes.toULong()" else "($layout).alignBytes.toInt()"
-            }
-            "vtable_size", "vtable_align" -> if (emitter.headerContext.rawAbiMode) "8uL" else "8"
-            "variant_count" -> if (emitter.headerContext.rawAbiMode) "1uL" else "1"
-            "raw_eq" -> {
-                if (renderedArgs.size < 2) return null
-                val targetTy =
-                    explicitTypes.firstOrNull()?.takeUnless { it is SynType.Infer }
-                        ?: callArgsList.firstOrNull()?.let { firstArg ->
-                            when (val argTy = emitter.sourceInitializerType(firstArg)) {
-                                is SynType.Ptr -> argTy.elem
-                                is SynType.Reference -> argTy.elem
-                                else -> argTy
-                            }
-                        }
-                        ?: return null
-                registerCoreImport(emitter, "$memPkg.rawEqWithLayout")
-                val layout = resolveTypeLayoutExpression(targetTy, selfTypeName, emitter)
-                "rawEqWithLayout(${renderedArgs[0]}, ${renderedArgs[1]}, $layout)"
-            }
-            "needs_drop" -> {
-                val ty = explicitTypes.firstOrNull() ?: return "true"
-                val primName =
-                    (ty as? SynType.Path)
-                        ?.takeIf { it.qself == null && it.path.segments.size == 1 }
-                        ?.path
-                        ?.segments
-                        ?.last()
-                        ?.ident
-                        ?.toString()
-                val isTrivial =
-                    ty is SynType.Ptr ||
-                        ty is SynType.Reference ||
-                        primName in setOf("bool", "char", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128", "isize", "usize", "f16", "f32", "f64", "f128")
-                if (isTrivial) "false" else "true"
-            }
-            "type_name" -> {
-                val ty = explicitTypes.firstOrNull()
-                val label = ty?.let { emitter.renderType(it, selfTypeName) } ?: "Any"
-                "\"$label\""
-            }
-            "offset", "arith_offset" -> {
-                val firstArg = callArgsList.firstOrNull() ?: return null
-                val ptrSynType =
-                    (explicitTypes.firstOrNull() as? SynType.Ptr)
-                        ?: (emitter.sourceInitializerType(firstArg) as? SynType.Ptr)
-                val pointeeSynType =
-                    ptrSynType?.elem
-                        ?: explicitTypes.firstOrNull()?.takeUnless { it is SynType.Ptr }
-                val inferredPtrRendered = emitter.inferExprRenderedType(firstArg, selfTypeName)
-                val isMut =
-                    (ptrSynType?.mutability is PointerMutability.Mut) ||
-                        inferredPtrRendered?.substringAfterLast('.')?.startsWith("MutPtr<") == true
-                val ctor = if (isMut) "MutPtr" else "ConstPtr"
-                registerCoreImport(emitter, "$ptrPkg.$ctor")
-                val strideExpr =
-                    if (pointeeSynType != null) {
-                        val layout = resolveTypeLayoutExpression(pointeeSynType, selfTypeName, emitter)
-                        "($layout).strideBytes"
-                    } else {
-                        "1L"
-                    }
-                "$ctor(${rawAddrOf(0)} + (${renderedArgs[1]}).toLong() * $strideExpr)"
-            }
-            "ptr_offset_from", "ptr_offset_from_unsigned" -> {
-                val pointeeSynType =
-                    explicitTypes.firstOrNull()
-                        ?: (callArgsList.firstOrNull()?.let { emitter.sourceInitializerType(it) } as? SynType.Ptr)?.elem
-                        ?: (callArgsList.getOrNull(1)?.let { emitter.sourceInitializerType(it) } as? SynType.Ptr)?.elem
-                val sizeExpr =
-                    if (pointeeSynType != null) {
-                        val layout = resolveTypeLayoutExpression(pointeeSynType, selfTypeName, emitter)
-                        "maxOf(1L, ($layout).sizeBytes)"
-                    } else {
-                        "1L"
-                    }
-                val diffDiv = "((${rawAddrOf(0)} - ${rawAddrOf(1)}) / $sizeExpr)"
-                when {
-                    canonicalIntrinsicName == "ptr_offset_from_unsigned" && emitter.headerContext.rawAbiMode -> "$diffDiv.toULong()"
-                    emitter.headerContext.rawAbiMode -> diffDiv
-                    else -> "$diffDiv.toInt()"
-                }
-            }
-            "ptr_mask" -> {
-                registerCoreImport(emitter, "$ptrPkg.ConstPtr")
-                "ConstPtr(${rawAddrOf(0)} and (${renderedArgs[1]}).toLong())"
-            }
-            "aggregate_raw_ptr" -> {
-                val isMut = emitter.currentEnclosingReturnRenderedType?.substringAfterLast('.')?.startsWith("MutPtr<") == true
-                val ctor = if (isMut) "MutPtr" else "ConstPtr"
-                registerCoreImport(emitter, "$ptrPkg.$ctor")
-                "$ctor(${rawAddrOf(0)}, (${renderedArgs[1]}).toLong())"
-            }
-            "ptr_metadata" -> {
-                val base = "${renderedArgs[0]}.rawMeta"
-                if (emitter.headerContext.rawAbiMode) "$base.toULong()" else "$base.toInt()"
-            }
-            "read_via_copy", "volatile_load", "unaligned_volatile_load" -> {
-                val isVolatile = rawName != "read_via_copy"
-                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, 0, emitter)
-                pointee?.let {
-                    DirectLoadIntrinsicEmitter(
-                        fnPrefix = if (isVolatile) "kmVolatileLoad" else "kmLoad",
-                        allowChar = true,
-                        allowFloat = true,
-                        isVolatile = isVolatile,
-                        trailingArgs = emptyList(),
-                        intrPkg = intrPkg,
-                        ptrPkg = ptrPkg,
-                        emitter = emitter,
-                    ).render(it, rawAddrOf(0)) ?: run {
-                        val layout = resolveTypeLayoutExpression(it, selfTypeName, emitter)
-                        val method = if (isVolatile) "readVolatileNative" else "readNative"
-                        "($layout).$method(${rawAddrOf(0)})"
-                    }
-                }
-            }
-            "write_via_move", "volatile_store", "unaligned_volatile_store", "nontemporal_store" -> {
-                val isVolatile = rawName == "volatile_store" || rawName == "unaligned_volatile_store"
-                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, 0, emitter)
-                pointee?.let {
-                    DirectStoreIntrinsicEmitter(
-                        fnPrefix = if (isVolatile) "kmVolatileStore" else "kmStore",
-                        allowChar = true,
-                        allowFloat = true,
-                        isVolatile = isVolatile,
-                        trailingArgs = emptyList(),
-                        intrPkg = intrPkg,
-                        ptrPkg = ptrPkg,
-                        emitter = emitter,
-                    ).render(it, rawAddrOf(0), renderedArgs[1]) ?: run {
-                        val layout = resolveTypeLayoutExpression(it, selfTypeName, emitter)
-                        val method = if (isVolatile) "writeVolatileNative" else "writeNative"
-                        "($layout).$method(${rawAddrOf(0)}, ${renderedArgs[1]})"
-                    }
-                }
-            }
-            "copy_nonoverlapping", "volatile_copy_nonoverlapping_memory", "copy", "volatile_copy_memory" -> {
-                val fnName = if (rawName.contains("nonoverlapping")) "kmCopyNonoverlapping" else "kmCopy"
-                registerCoreImport(emitter, "$intrPkg.$fnName")
-                val srcIdx = if (rawName.startsWith("volatile_")) 1 else 0
-                val dstIdx = if (rawName.startsWith("volatile_")) 0 else 1
-                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, srcIdx, emitter)
-                val bytesExpr = renderScaledByteCountExpr(pointee, renderedArgs[2], selfTypeName, emitter)
-                "$fnName(${rawAddrOf(dstIdx)}, ${rawAddrOf(srcIdx)}, $bytesExpr)"
-            }
-            "write_bytes", "volatile_set_memory" -> {
-                registerCoreImport(emitter, "$intrPkg.kmWriteBytes")
-                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, 0, emitter)
-                val bytesExpr = renderScaledByteCountExpr(pointee, renderedArgs[2], selfTypeName, emitter)
-                "kmWriteBytes(${rawAddrOf(0)}, (${renderedArgs[1]}).toUByte(), $bytesExpr)"
-            }
-            "compare_bytes" -> {
-                registerCoreImport(emitter, "$intrPkg.kmCompareBytes")
-                "kmCompareBytes(${rawAddrOf(0)}, ${rawAddrOf(1)}, (${renderedArgs[2]}).toLong())"
-            }
-            "atomic_fence" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicFence")
-                "kmAtomicFence(${orderingCode(0)})"
-            }
-            "atomic_singlethreadfence" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAtomicSignalFence")
-                "kmAtomicSignalFence(${orderingCode(0)})"
-            }
-            "atomic_load" -> {
-                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, 0, emitter) ?: return null
-                DirectLoadIntrinsicEmitter(
-                    fnPrefix = "kmAtomicLoad",
-                    allowChar = false,
-                    allowFloat = false,
-                    isVolatile = false,
-                    trailingArgs = listOf(orderingCode(0)),
-                    intrPkg = intrPkg,
-                    ptrPkg = ptrPkg,
-                    emitter = emitter,
-                ).render(pointee, rawAddrOf(0)) ?: run {
-                    registerCoreImport(emitter, "$memPkg.atomicLoadWithLayout")
-                    val layout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
-                    "atomicLoadWithLayout(${rawAddrOf(0)}, ${orderingCode(0)}, $layout)"
-                }
-            }
-            "atomic_store" -> {
-                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, 0, emitter) ?: return null
-                DirectStoreIntrinsicEmitter(
-                    fnPrefix = "kmAtomicStore",
-                    allowChar = false,
-                    allowFloat = false,
-                    isVolatile = false,
-                    trailingArgs = listOf(orderingCode(0)),
-                    intrPkg = intrPkg,
-                    ptrPkg = ptrPkg,
-                    emitter = emitter,
-                ).render(pointee, rawAddrOf(0), renderedArgs[1]) ?: run {
-                    registerCoreImport(emitter, "$memPkg.atomicStoreWithLayout")
-                    val layout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
-                    "atomicStoreWithLayout(${rawAddrOf(0)}, ${renderedArgs[1]}, ${orderingCode(0)}, $layout)"
-                }
-            }
-            "atomic_xchg" -> {
-                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, 0, emitter) ?: return null
-                DirectReadModifyWriteIntrinsicEmitter(
-                    fnPrefix = "kmAtomicXchg",
-                    trailingArgs = listOf(orderingCode(0)),
-                    intrPkg = intrPkg,
-                    ptrPkg = ptrPkg,
-                    emitter = emitter,
-                ).render(pointee, rawAddrOf(0), renderedArgs[1]) ?: run {
-                    registerCoreImport(emitter, "$memPkg.atomicXchgWithLayout")
-                    val layout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
-                    "atomicXchgWithLayout(${rawAddrOf(0)}, ${renderedArgs[1]}, ${orderingCode(0)}, $layout)"
-                }
-            }
-            "atomic_cxchg", "atomic_cxchgweak" -> {
-                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, 0, emitter) ?: return null
-                DirectCompareExchangeIntrinsicEmitter(intrPkg, ptrPkg, emitter)
-                    .render(pointee, rawAddrOf(0), renderedArgs[1], renderedArgs[2], orderingCode(0), orderingCode(1))
-                    ?: run {
-                        registerCoreImport(emitter, "$memPkg.atomicCxchgWithLayout")
-                        val layout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
-                        "atomicCxchgWithLayout(${rawAddrOf(0)}, ${renderedArgs[1]}, ${renderedArgs[2]}, ${orderingCode(0)}, ${orderingCode(1)}, $layout)"
-                    }
-            }
-            in ATOMIC_RMW_OP_CODES -> {
-                val opCode = ATOMIC_RMW_OP_CODES.getValue(canonicalIntrinsicName)
-                val pointee = resolvePointeeTypeFromArg(explicitTypes, callArgsList, 0, emitter) ?: return null
-                val operandType = explicitTypes.getOrNull(1) ?: pointee
-                val direct =
-                    if (explicitTypes.size <= 1) {
-                        DirectReadModifyWriteIntrinsicEmitter(
-                            fnPrefix = "kmAtomicRmw",
-                            trailingArgs = listOf(opCode.toString(), orderingCode(0)),
-                            intrPkg = intrPkg,
-                            ptrPkg = ptrPkg,
-                            emitter = emitter,
-                        ).render(pointee, rawAddrOf(0), renderedArgs[1])
-                    } else {
-                        null
-                    }
-                direct ?: run {
-                    registerCoreImport(emitter, "$memPkg.atomicRmwWithLayout")
-                    val dstLayout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
-                    val opLayout = resolveTypeLayoutExpression(operandType, selfTypeName, emitter)
-                    "atomicRmwWithLayout(${rawAddrOf(0)}, ${renderedArgs[1]}, $opCode, ${orderingCode(0)}, $dstLayout, $opLayout)"
-                }
-            }
-            in INT_INTRINSIC_RULES_BY_NAME ->
-                renderIntOrBitIntrinsicCall(
-                    canonicalName = canonicalIntrinsicName,
-                    renderedArgs = renderedArgs,
-                    callArgsList = callArgsList,
-                    explicitTypes = explicitTypes,
-                    selfTypeName = selfTypeName,
-                    coreNs = coreNs,
-                    intrPkg = intrPkg,
-                    memPkg = memPkg,
-                    emitter = emitter,
-                )
-            in FLOAT_INTRINSIC_RULES_BY_NAME ->
-                renderFloatIntrinsicCall(
-                    canonicalName = canonicalIntrinsicName,
-                    renderedArgs = renderedArgs,
-                    callArgsList = callArgsList,
-                    explicitTypes = explicitTypes,
-                    selfTypeName = selfTypeName,
-                    coreNs = coreNs,
-                    intrPkg = intrPkg,
-                    memPkg = memPkg,
-                    emitter = emitter,
-                )
-            "transmute", "transmute_unchecked" ->
-                callArgsList.singleOrNull()?.let { arg0 ->
-                    renderTransmuteCall(
-                        rawTransmuteIdent = rawName,
-                        explicitTypes = explicitTypes,
-                        argExpr = arg0,
-                        indent = indent,
-                        selfTypeName = selfTypeName,
-                        emitter = emitter,
-                    )
-                }
-            else ->
-                if (isCoreSimdCall) {
-                    renderSimdCallSiteLowering(
-                        canonicalName = canonicalIntrinsicName,
-                        renderedArgs = renderedArgs,
-                        explicitTypes = explicitTypes,
-                        selfTypeName = selfTypeName,
-                        intrPkg = intrPkg,
-                        emitter = emitter,
-                    )
-                } else {
-                    null
-                }
+        } finally {
+            emitter.callArgumentNestingDepth--
         }
     }
 
@@ -2206,8 +1671,7 @@ public object CoreIntrinsicLowering {
         if (srcPrim != null && srcPrim == dstPrim) return valueExpr
         if (srcResolved is SynType.Ptr && dstResolved is SynType.Ptr) {
             if (emitter.headerContext.rawAbiMode) return valueExpr
-            val isMut = dstResolved.mutability is PointerMutability.Mut
-            val ctor = if (isMut) "MutPtr" else "ConstPtr"
+            val ctor = if (dstResolved.mutability is PointerMutability.Mut) "MutPtr" else "ConstPtr"
             registerCoreImport(emitter, "$ptrPkg.$ctor")
             return "$ctor(($valueExpr).rawAddress)"
         }
@@ -2236,12 +1700,7 @@ public object CoreIntrinsicLowering {
         if (type == null) return null
         val resolved = emitter.resolveLayoutType(type, emptyMap())
         val path = (resolved as? SynType.Path)?.takeIf { it.qself == null && it.path.segments.size == 1 }?.path ?: return null
-        val ident =
-            path.segments
-                .last()
-                ?.ident
-                ?.toString()
-                ?.removePrefix("r#") ?: return null
+        val ident = path.lastCleanIdent() ?: return null
         return ident.takeIf {
             it in setOf("bool", "char", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128", "isize", "usize", "f16", "f32", "f64", "f128")
         }
@@ -2301,16 +1760,7 @@ public object CoreIntrinsicLowering {
         return null
     }
 
-    private fun resolvePointeeTypeFromArg(
-        explicitTypes: List<SynType>,
-        callArgsList: List<Expr>,
-        argIdx: Int,
-        emitter: KotlinJ2KEmitter,
-    ): SynType? =
-        explicitTypes.firstOrNull()
-            ?: (callArgsList.getOrNull(argIdx)?.let { emitter.sourceInitializerType(it) } as? SynType.Ptr)?.elem
-
-    private fun renderScaledByteCountExpr(
+    internal fun renderScaledByteCountExpr(
         pointee: SynType?,
         countExpr: String,
         selfTypeName: String?,
@@ -2320,10 +1770,7 @@ public object CoreIntrinsicLowering {
         return when {
             elemSize == 1L -> "($countExpr).toLong()"
             elemSize != null -> "($countExpr).toLong() * ${elemSize}L"
-            pointee != null -> {
-                val layout = resolveTypeLayoutExpression(pointee, selfTypeName, emitter)
-                "($countExpr).toLong() * ($layout).sizeBytes"
-            }
+            pointee != null -> "($countExpr).toLong() * (${resolveTypeLayoutExpression(pointee, selfTypeName, emitter)}).sizeBytes"
             else -> "($countExpr).toLong()"
         }
     }

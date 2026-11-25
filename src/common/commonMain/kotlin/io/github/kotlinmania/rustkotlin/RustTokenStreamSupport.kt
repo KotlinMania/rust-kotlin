@@ -5,6 +5,7 @@ import io.github.kotlinmania.procmacro2.Group
 import io.github.kotlinmania.procmacro2.Spacing
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
+import io.github.kotlinmania.syn.Lit
 
 /**
  * Extensible cursor and structural helper base class over `proc_macro2` [TokenTree] lists.
@@ -40,6 +41,34 @@ internal open class RustTokenCursor(
     fun groupAt(idx: Int, delimiter: Delimiter? = null): Group? {
         val grp = (trees.getOrNull(idx) as? TokenTree.Group)?.value ?: return null
         return if (delimiter == null || grp.delimiter() == delimiter) grp else null
+    }
+
+    fun stringLiteralAt(idx: Int): String? {
+        val litTree = trees.getOrNull(idx) as? TokenTree.Literal ?: return null
+        return (Lit.new(litTree.value) as? Lit.Str)?.value?.value()
+    }
+
+    fun extractGroupInnerSource(source: String, idx: Int, delimiter: Delimiter? = null): String? {
+        val grp = groupAt(idx, delimiter) ?: return null
+        val openEnd = grp.spanOpen().endExclusiveOffset()
+        val closeStart = grp.spanClose().startOffset()
+        return if (openEnd >= 0 && closeStart >= openEnd && closeStart <= source.length) {
+            source.substring(openEnd, closeStart)
+        } else {
+            grp.stream().toString()
+        }
+    }
+
+    fun extractSliceSource(source: String, startIdx: Int = 0, endIdx: Int = trees.size): String {
+        val slice = trees.subList(startIdx, endIdx)
+        if (slice.isEmpty()) return ""
+        val start = tokenTreeStartOffset(slice.first())
+        val end = tokenTreeEndOffset(slice.last())
+        return if (start >= 0 && end >= start && end <= source.length) {
+            source.substring(start, end)
+        } else {
+            TokenStream.fromTokenTrees(slice).toString()
+        }
     }
 
     fun isDoubleColonAt(idx: Int): Boolean {
@@ -306,6 +335,22 @@ internal open class RustTokenCursor(
     }
 
     companion object {
+        fun tokenTreeStartOffset(tt: TokenTree): Int =
+            when (tt) {
+                is TokenTree.Group -> tt.value.spanOpen().startOffset()
+                is TokenTree.Ident -> tt.value.span().startOffset()
+                is TokenTree.Punct -> tt.value.span().startOffset()
+                is TokenTree.Literal -> tt.value.span().startOffset()
+            }
+
+        fun tokenTreeEndOffset(tt: TokenTree): Int =
+            when (tt) {
+                is TokenTree.Group -> tt.value.spanClose().endExclusiveOffset()
+                is TokenTree.Ident -> tt.value.span().endExclusiveOffset()
+                is TokenTree.Punct -> tt.value.span().endExclusiveOffset()
+                is TokenTree.Literal -> tt.value.span().endExclusiveOffset()
+            }
+
         fun flattenNoneDelimitedGroups(stream: TokenStream, out: MutableList<TokenTree>) {
             for (tt in stream.clone().toList()) {
                 if (tt is TokenTree.Group && tt.value.delimiter() == Delimiter.None) {

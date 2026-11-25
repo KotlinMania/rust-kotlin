@@ -10,19 +10,22 @@ import io.github.kotlinmania.syn.ModContent
 import io.github.kotlinmania.syn.PathArguments
 import io.github.kotlinmania.syn.TraitItem
 import io.github.kotlinmania.syn.TypeParamBound
+import io.github.kotlinmania.syn.gen.Visit
 import io.github.kotlinmania.io.files.Path as KmPath
+
+private fun <K, V> putBoundedCacheEntry(
+    cache: Map<K, V>,
+    maxEntries: Int,
+    key: K,
+    value: V,
+): Map<K, V> = if (cache.size >= maxEntries) mapOf(key to value) else cache + (key to value)
 
 internal object CrateTraitAstRegistry {
     private var registry: Map<String, Map<String, Item.Trait>> = emptyMap()
 
     fun register(key: String, asts: Map<String, Item.Trait>) {
         if (asts.isEmpty()) return
-        registry =
-            if (registry.size >= 64) {
-                mapOf(key to asts)
-            } else {
-                registry + (key to asts)
-            }
+        registry = putBoundedCacheEntry(registry, 64, key, asts)
     }
 
     fun lookup(key: String?): Map<String, Item.Trait> =
@@ -88,15 +91,8 @@ internal fun discoverCrateRawAbiMetadataFromDisk(
         val entries = SystemFileSystem.list(dir).sortedBy { it.toString() }
         for (entry in entries) {
             val normEntry = entry.toString().replace('\\', '/')
-            val relEntry =
-                if (normEntry.startsWith("$normResolvedRoot/")) {
-                    normEntry.removePrefix("$normResolvedRoot/")
-                } else {
-                    entry.name
-                }
-            if (isUnsupportedTargetRustRelPath(relEntry, TranslationSession.cfgTargetProfile)) {
-                continue
-            }
+            val relEntry = if (normEntry.startsWith("$normResolvedRoot/")) normEntry.removePrefix("$normResolvedRoot/") else entry.name
+            if (isUnsupportedTargetRustRelPath(relEntry, TranslationSession.cfgTargetProfile)) continue
             if (isKmDirectory(entry)) {
                 collectDir(entry)
             } else if (isKmRegularFile(entry) && entry.name.endsWith(".rs", ignoreCase = true)) {
@@ -113,11 +109,7 @@ internal fun discoverCrateRawAbiMetadataFromDisk(
             splitModuleRoots = splitModuleRoots,
             finalStructs = finalStructs,
         )
-    if (diskCrateRawAbiMetadataCache.size >= 32) {
-        diskCrateRawAbiMetadataCache = mapOf(cacheKey to metadata)
-    } else {
-        diskCrateRawAbiMetadataCache = diskCrateRawAbiMetadataCache + (cacheKey to metadata)
-    }
+    diskCrateRawAbiMetadataCache = putBoundedCacheEntry(diskCrateRawAbiMetadataCache, 32, cacheKey, metadata)
     return metadata
 }
 
@@ -270,10 +262,10 @@ internal fun <K, V> MutableMap<K, V>.putIfMissing(
     }
 }
 
-internal fun MutableMap<String, String>.putScopedAndSimpleIfMissing(
+internal fun <V> MutableMap<String, V>.putScopedAndSimpleIfMissing(
     subpkg: String,
     simpleKey: String,
-    value: String,
+    value: V,
 ) {
     putIfMissing(simpleKey, value)
     if (subpkg.isNotEmpty()) {
@@ -294,8 +286,12 @@ internal fun buildCrateRawAbiMetadataFromSources(
     val prevRelDir = TranslationSession.currentRelativeSourceDir
     TranslationSession.rawAbiMode = rawAbiMode
     TranslationSession.finalStructs = finalStructs
-    try {
-        return scanSourcesWithActiveSession(sources, rawAbiMode, splitModuleRoots, finalStructs)
+    return try {
+        CrateAbiSessionScanner(
+            rawAbiMode = rawAbiMode,
+            splitModuleRoots = splitModuleRoots,
+            finalStructs = finalStructs,
+        ).scan(sources)
     } finally {
         TranslationSession.rawAbiMode = prevRawAbi
         TranslationSession.finalStructs = prevFinalStructs
@@ -303,85 +299,142 @@ internal fun buildCrateRawAbiMetadataFromSources(
     }
 }
 
-private fun scanSourcesWithActiveSession(
-    sources: List<Pair<String, String>>,
-    rawAbiMode: Boolean,
-    splitModuleRoots: Boolean,
-    finalStructs: Boolean,
-): CrateRawAbiMetadata {
-    val rawNormalizedSources =
-        sources
-            .map { (rel, txt) ->
-                rel.replace('\\', '/').trimStart('/') to txt
-            }.filterNot { (rel, _) ->
-                isUnsupportedTargetRustRelPath(rel, TranslationSession.cfgTargetProfile)
+/**
+ * Stateful crate-level token and AST metadata scanner over a Rust crate's `.rs` source tree.
+ */
+private class CrateAbiSessionScanner(
+    private val rawAbiMode: Boolean,
+    private val splitModuleRoots: Boolean,
+    private val finalStructs: Boolean,
+) {
+    private val selfAliases = linkedSetOf<String>()
+    private val includedSubdirModules = linkedMapOf<String, String>()
+    private val rootSelfDirModuleAliases = linkedSetOf<String>()
+    private val rootExternalModuleReexports = linkedMapOf<String, String>()
+    private val subpkgToRawLeaf = linkedMapOf<String, String>()
+    private val optionFnTypes = linkedSetOf<String>()
+    private val aliasDefaults = linkedMapOf<String, String>()
+    private val numericKinds = linkedMapOf<String, String>()
+    private val pointerAliases = linkedMapOf<String, Pair<Boolean, String>>()
+    private val aliasLeafTargets = linkedMapOf<String, String>()
+    private val qualifiedAliasLeafTargets = linkedMapOf<String, Pair<String, String>>()
+    private val fnTypeSpecs = linkedMapOf<String, RawFnTypeTokenSpec>()
+    private val structFieldTypes = linkedMapOf<String, String>()
+    private val symbolSubpackages = linkedMapOf<String, MutableSet<String>>()
+    private val recordDecls = linkedMapOf<String, RawRecordTokenDecl>()
+    private val recordDeclsBySimple = linkedMapOf<String, RawRecordTokenDecl>()
+    private val simpleEnumReprs = linkedMapOf<String, String>()
+    private val rawFnParamDeclTokens = linkedMapOf<String, MutableList<Triple<String, Boolean, List<List<TokenTree>>>>>()
+    private val rawFnReturnTypes = linkedMapOf<String, String>()
+    private val ffiReferencedIdents = linkedSetOf<String>()
+    private val constLeafTargets = mutableListOf<Triple<String, String, String>>()
+    private val traitDefaultlessAssocTypes = linkedMapOf<String, List<String>>()
+    private val traitSupertraitBindings = linkedMapOf<String, List<Pair<String, Set<String>>>>()
+    private val traitResultMethods = linkedMapOf<String, List<String>>()
+    private val fnConstParamNames = linkedMapOf<String, Pair<Int, List<String>>>()
+    private val enumVariantTypeArity = linkedMapOf<String, Int>()
+    private val unitEnumVariants = linkedSetOf<String>()
+    private val valueParamPackTemplates = linkedMapOf<String, String>()
+    private val valueReturnUnpackTemplates = linkedMapOf<String, String>()
+    private val fnPtrInvokeTemplates = linkedMapOf<String, String>()
+    private val declaredTraitAsts = linkedMapOf<String, Item.Trait>()
+    private val selfParameterizedTraits = linkedSetOf<String>()
+    private val traitSupertraits = linkedMapOf<String, List<String>>()
+
+    private val cfgProfile = TranslationSession.cfgTargetProfile
+    private val ptrWidth = cfgProfile.pointerWidth
+    private val isWindows =
+        cfgProfile.targetOs == "windows" ||
+            cfgProfile.targetFamilies?.contains("windows") == true
+
+    fun scan(sources: List<Pair<String, String>>): CrateRawAbiMetadata {
+        val rawNormalizedSources =
+            sources
+                .map { (rel, txt) -> rel.replace('\\', '/').trimStart('/') to txt }
+                .filterNot { (rel, _) -> isUnsupportedTargetRustRelPath(rel, cfgProfile) }
+        val skipCfgTest = "test" in cfgProfile.disabledCfgFlags || "test" !in cfgProfile.enabledCfgFlags
+        val disabledModulePrefixes =
+            collectCfgDisabledChildModuleRelPrefixes(
+                sourcesByRelPath = rawNormalizedSources.toMap(),
+                cfgProfile = cfgProfile,
+                skipCfgTest = skipCfgTest,
+            )
+        val normalizedSources =
+            if (disabledModulePrefixes.isEmpty()) {
+                rawNormalizedSources
+            } else {
+                rawNormalizedSources.filterNot { (rel, _) -> isRelPathUnderDisabledModulePrefix(rel, disabledModulePrefixes) }
             }
-    val rawByRelPath = rawNormalizedSources.toMap()
-    val skipCfgTest =
-        "test" in TranslationSession.cfgTargetProfile.disabledCfgFlags ||
-            "test" !in TranslationSession.cfgTargetProfile.enabledCfgFlags
-    val disabledModulePrefixes =
-        collectCfgDisabledChildModuleRelPrefixes(
-            sourcesByRelPath = rawByRelPath,
-            cfgProfile = TranslationSession.cfgTargetProfile,
-            skipCfgTest = skipCfgTest,
+        val byRelPath = normalizedSources.toMap()
+        val sharedInlineRelFiles = discoverSharedInlineModuleRelFiles(byRelPath)
+
+        byRelPath["lib.rs"]?.let { libText -> scanRootLib(libText, byRelPath) }
+        scanAllModuleTokenStreams(normalizedSources, sharedInlineRelFiles)
+        propagateAliasesAndStructFields()
+        if (rawAbiMode) {
+            populateRawAbiPackTemplates()
+        }
+        val fnParamNumericKinds = resolveAgreedFnParamNumericKinds()
+        populateSamDefaultsAndInvokeTemplates()
+        collectExpandedTraitsAndClosure(normalizedSources, sharedInlineRelFiles)
+
+        val traitRegistryKey =
+            if (declaredTraitAsts.isNotEmpty()) {
+                val sortedTraits = declaredTraitAsts.keys.sorted().joinToString(",")
+                val key = "crate:${normalizedSources.size}:$sortedTraits:$cfgProfile"
+                CrateTraitAstRegistry.register(key, declaredTraitAsts)
+                key
+            } else {
+                null
+            }
+
+        return CrateRawAbiMetadata(
+            selfCrateAliases = selfAliases,
+            includedSubdirModuleMap = includedSubdirModules,
+            rootSelfDirModuleAliases = rootSelfDirModuleAliases,
+            rootExternalModuleReexports = rootExternalModuleReexports,
+            typeAliasDefaults = aliasDefaults,
+            optionFnTypes = optionFnTypes,
+            numericTypeKinds = numericKinds,
+            pointerTypeAliases = pointerAliases.mapValues { (_, spec) -> "${if (spec.first) "mut" else "const"}:${spec.second}" },
+            structFieldTypes = structFieldTypes,
+            fnReturnTypes = rawFnReturnTypes.filterValues { it.isNotEmpty() },
+            symbolSubpackages = symbolSubpackages.mapValues { it.value.toList() },
+            subpackageRawLeafNames = subpkgToRawLeaf,
+            valueParamPackTemplates = valueParamPackTemplates,
+            valueReturnUnpackTemplates = valueReturnUnpackTemplates,
+            fnPtrInvokeTemplates = fnPtrInvokeTemplates,
+            fnParamNumericKinds = fnParamNumericKinds,
+            sharedInlineModuleRelFiles = sharedInlineRelFiles,
+            traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
+            traitResultMethods = traitResultMethods,
+            selfParameterizedTraits = selfParameterizedTraits,
+            traitSupertraits = traitSupertraits,
+            traitAstRegistryKey = traitRegistryKey,
+            fnConstParamNames = fnConstParamNames,
+            enumVariantTypeArity = enumVariantTypeArity,
+            unitEnumVariants = unitEnumVariants,
         )
-    val normalizedSources =
-        if (disabledModulePrefixes.isEmpty()) {
-            rawNormalizedSources
-        } else {
-            rawNormalizedSources.filterNot { (rel, _) -> isRelPathUnderDisabledModulePrefix(rel, disabledModulePrefixes) }
-        }
-    val byRelPath = normalizedSources.toMap()
+    }
 
-    val selfAliases = linkedSetOf<String>()
-    val includedSubdirModules = linkedMapOf<String, String>()
-    val rootSelfDirModuleAliases = linkedSetOf<String>()
-    val rootExternalModuleReexports = linkedMapOf<String, String>()
-    val subpkgToRawLeaf = linkedMapOf<String, String>()
-    val optionFnTypes = linkedSetOf<String>()
-    val aliasDefaults = linkedMapOf<String, String>()
-    val numericKinds = linkedMapOf<String, String>()
-    val pointerAliases = linkedMapOf<String, Pair<Boolean, String>>()
-    val aliasLeafTargets = linkedMapOf<String, String>()
-    val qualifiedAliasLeafTargets = linkedMapOf<String, Pair<String, String>>()
-    val fnTypeSpecs = linkedMapOf<String, RawFnTypeTokenSpec>()
-    val structFieldTypes = linkedMapOf<String, String>()
-    val symbolSubpackages = linkedMapOf<String, MutableSet<String>>()
-    val recordDecls = linkedMapOf<String, RawRecordTokenDecl>()
-    val recordDeclsBySimple = linkedMapOf<String, RawRecordTokenDecl>()
-    val simpleEnumReprs = linkedMapOf<String, String>()
-    val rawFnParamDeclTokens = linkedMapOf<String, MutableList<Triple<String, Boolean, List<List<TokenTree>>>>>()
-    val rawFnReturnTypes = linkedMapOf<String, String>()
-    val ffiReferencedIdents = linkedSetOf<String>()
-    val constLeafTargets = mutableListOf<Triple<String, String, String>>()
-    val sharedInlineRelFiles = discoverSharedInlineModuleRelFiles(byRelPath)
-    val traitDefaultlessAssocTypes = linkedMapOf<String, List<String>>()
-    val traitSupertraitBindings = linkedMapOf<String, List<Pair<String, Set<String>>>>()
-    val traitResultMethods = linkedMapOf<String, List<String>>()
-    val fnConstParamNames = linkedMapOf<String, Pair<Int, List<String>>>()
-    val enumVariantTypeArity = linkedMapOf<String, Int>()
-    val unitEnumVariants = linkedSetOf<String>()
+    private fun registerSymbolInSubpkg(ktIdent: String, subpkg: String) {
+        if (ktIdent.isEmpty() || ktIdent == "_") return
+        symbolSubpackages.getOrPut(ktIdent) { linkedSetOf() } += subpkg
+    }
 
-    fun registerFnConstParams(
-        subpkg: String,
-        key: String,
-        valueArity: Int,
-        constParams: List<String>,
-    ) {
+    private fun registerFnConstParams(subpkg: String, key: String, valueArity: Int, constParams: List<String>) {
         if (constParams.isEmpty()) return
-        if (key !in fnConstParamNames) {
-            fnConstParamNames[key] = valueArity to constParams
-        }
+        fnConstParamNames.putScopedAndSimpleIfMissing(subpkg, key, valueArity to constParams)
+    }
+
+    private fun addScopedOptionFnType(subpkg: String, ktIdent: String) {
+        optionFnTypes += ktIdent
         if (subpkg.isNotEmpty()) {
-            val scopedKey = "$subpkg.$key"
-            if (scopedKey !in fnConstParamNames) {
-                fnConstParamNames[scopedKey] = valueArity to constParams
-            }
+            optionFnTypes += "$subpkg.$ktIdent"
         }
     }
 
-    fun registerFnSignatureTokens(
+    private fun registerFnSignatureTokens(
         subpkg: String,
         key: String,
         paramTokensList: List<List<TokenTree>>?,
@@ -399,57 +452,19 @@ private fun scanSourcesWithActiveSession(
             }
         }
         if (!returnType.isNullOrEmpty()) {
-            val prevRet = rawFnReturnTypes[key]
-            rawFnReturnTypes[key] = if (prevRet == null || prevRet == returnType) returnType else ""
+            recordAgreedReturnType(key, returnType)
             if (subpkg.isNotEmpty()) {
-                val scopedKey = "$subpkg.$key"
-                val prevScopedRet = rawFnReturnTypes[scopedKey]
-                rawFnReturnTypes[scopedKey] =
-                    if (prevScopedRet == null || prevScopedRet == returnType) returnType else ""
+                recordAgreedReturnType("$subpkg.$key", returnType)
             }
         }
     }
 
-    fun registerSymbolInSubpkg(ktIdent: String, subpkg: String) {
-        if (ktIdent.isEmpty() || ktIdent == "_") return
-        symbolSubpackages.getOrPut(ktIdent) { linkedSetOf() } += subpkg
+    private fun recordAgreedReturnType(targetKey: String, returnType: String) {
+        val prev = rawFnReturnTypes[targetKey]
+        rawFnReturnTypes[targetKey] = if (prev == null || prev == returnType) returnType else ""
     }
 
-    fun putScopedDefault(subpkg: String, ktIdent: String, value: String) {
-        if (ktIdent !in aliasDefaults) {
-            aliasDefaults[ktIdent] = value
-        }
-        if (subpkg.isNotEmpty()) {
-            aliasDefaults.putIfMissing("$subpkg.$ktIdent", value)
-        }
-    }
-
-    fun putScopedNumericKind(subpkg: String, ktIdent: String, kind: String) {
-        if (ktIdent !in numericKinds) {
-            numericKinds[ktIdent] = kind
-        }
-        if (subpkg.isNotEmpty()) {
-            numericKinds.putIfMissing("$subpkg.$ktIdent", kind)
-        }
-    }
-
-    fun addScopedOptionFnType(subpkg: String, ktIdent: String) {
-        optionFnTypes += ktIdent
-        if (subpkg.isNotEmpty()) {
-            optionFnTypes += "$subpkg.$ktIdent"
-        }
-    }
-
-    fun putScopedPointerAlias(subpkg: String, ktIdent: String, spec: Pair<Boolean, String>) {
-        if (ktIdent !in pointerAliases) {
-            pointerAliases[ktIdent] = spec
-        }
-        if (subpkg.isNotEmpty()) {
-            pointerAliases.putIfMissing("$subpkg.$ktIdent", spec)
-        }
-    }
-
-    fun computeSubpkgAndRecordAncestors(relFile: String): Pair<String, String?> {
+    private fun computeSubpkgAndRecordAncestors(relFile: String, sharedInlineRelFiles: Set<String>): Pair<String, String?> {
         val relDir = relFile.substringBeforeLast('/', missingDelimiterValue = "")
         val fileName = relFile.substringAfterLast('/')
         val stem = fileName.removeSuffix(".rs").removeSuffix(".RS")
@@ -462,11 +477,7 @@ private fun scanSourcesWithActiveSession(
                 subpkgToRawLeaf.putIfMissing(ktDirSegs.joinToString("."), rawSeg)
             }
         }
-        val includeStem =
-            splitModuleRoots &&
-                !isRustModuleRootFileName(fileName) &&
-                relFile !in sharedInlineRelFiles
-        if (includeStem) {
+        if (splitModuleRoots && !isRustModuleRootFileName(fileName) && relFile !in sharedInlineRelFiles) {
             val ktStem = rustModuleIdentToKotlin(stem.replace('-', '_'))
             if (ktStem.isNotEmpty()) {
                 ktDirSegs += ktStem
@@ -476,14 +487,13 @@ private fun scanSourcesWithActiveSession(
         return ktDirSegs.joinToString(".") to relDir.ifEmpty { null }
     }
 
-    byRelPath["lib.rs"]?.let { libText ->
+    private fun scanRootLib(libText: String, byRelPath: Map<String, String>) {
         val libTokens = lexScannerTokens(libText)
         val includedSubdirs = mutableListOf<String>()
         scanRootLibDirectives(libTokens, selfAliases, includedSubdirs)
         for (subdir in includedSubdirs) {
             val subModText = byRelPath["$subdir/mod.rs"] ?: continue
-            val subTokens = lexScannerTokens(subModText)
-            for (modIdent in extractPubModIdentsFromTokens(subTokens)) {
+            for (modIdent in extractPubModIdentsFromTokens(lexScannerTokens(subModText))) {
                 includedSubdirModules[modIdent] = subdir
             }
         }
@@ -497,74 +507,56 @@ private fun scanSourcesWithActiveSession(
         )
     }
 
-    for ((relFile, text) in normalizedSources) {
-        val (subpkg, relDir) = computeSubpkgAndRecordAncestors(relFile)
-        TranslationSession.currentRelativeSourceDir = relDir
-        val tokens = lexScannerTokens(text)
-        if (tokens.isEmpty()) continue
-        val topLevelSplitInlineMods =
-            if (splitModuleRoots && "mod" in text && "{" in text) {
-                recognizeRustOrNull(text)
-                    ?.let { rec ->
-                        selectSplitCandidateInlineModsForFile(rec.file)
-                            .mapTo(linkedSetOf()) { it.ident.toString().removePrefix("r#") }
-                    }.orEmpty()
-            } else {
-                emptySet()
-            }
-        scanModuleTokenTrees(
-            trees = tokens,
-            subpkg = subpkg,
-            rawAbiMode = rawAbiMode,
-            finalStructs = finalStructs,
-            splitModuleRoots = splitModuleRoots,
-            topLevelSplitInlineMods = topLevelSplitInlineMods,
-            registerSymbol = ::registerSymbolInSubpkg,
-            registerFnSig = ::registerFnSignatureTokens,
-            subpkgToRawLeaf = subpkgToRawLeaf,
-            putScopedDefault = ::putScopedDefault,
-            putScopedNumericKind = ::putScopedNumericKind,
-            addScopedOptionFnType = ::addScopedOptionFnType,
-            putScopedPointerAlias = ::putScopedPointerAlias,
-            aliasLeafTargets = aliasLeafTargets,
-            qualifiedAliasLeafTargets = qualifiedAliasLeafTargets,
-            fnTypeSpecs = fnTypeSpecs,
-            structFieldTypes = structFieldTypes,
-            recordDecls = recordDecls,
-            recordDeclsBySimple = recordDeclsBySimple,
-            simpleEnumReprs = simpleEnumReprs,
-            ffiReferencedIdents = ffiReferencedIdents,
-            constLeafTargets = constLeafTargets,
-            traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
-            traitResultMethods = traitResultMethods,
-            registerFnConstParams = ::registerFnConstParams,
-            enumVariantTypeArity = enumVariantTypeArity,
-            unitEnumVariants = unitEnumVariants,
-        )
-    }
-
-    var ffiAliasesChanged = true
-    var ffiAliasRounds = 0
-    while (ffiAliasesChanged && ffiAliasRounds < 12) {
-        ffiAliasesChanged = false
-        ffiAliasRounds++
-        for ((aliasKt, leaf) in aliasLeafTargets) {
-            if (aliasKt in ffiReferencedIdents) {
-                val targetKt = KotlinNamingPolicy.Default.toTypeIdentifier(leaf, allowRawAbi = rawAbiMode)
-                if (ffiReferencedIdents.add(leaf) || ffiReferencedIdents.add(targetKt)) {
-                    ffiAliasesChanged = true
+    private fun scanAllModuleTokenStreams(
+        normalizedSources: List<Pair<String, String>>,
+        sharedInlineRelFiles: Set<String>,
+    ) {
+        for ((relFile, text) in normalizedSources) {
+            val (subpkg, relDir) = computeSubpkgAndRecordAncestors(relFile, sharedInlineRelFiles)
+            TranslationSession.currentRelativeSourceDir = relDir
+            val tokens = lexScannerTokens(text)
+            if (tokens.isEmpty()) continue
+            val topLevelSplitInlineMods =
+                if (splitModuleRoots && "mod" in text && "{" in text) {
+                    val rec = recognizeRustOrNull(text)
+                    val mods = rec?.let { selectSplitCandidateInlineModsForFile(it.file) }.orEmpty()
+                    mods.mapTo(linkedSetOf()) { it.ident.toString().removePrefix("r#") }
+                } else {
+                    emptySet()
                 }
-            }
+            scanModuleTokenTrees(
+                trees = tokens,
+                subpkg = subpkg,
+                rawAbiMode = rawAbiMode,
+                finalStructs = finalStructs,
+                splitModuleRoots = splitModuleRoots,
+                topLevelSplitInlineMods = topLevelSplitInlineMods,
+                registerSymbol = ::registerSymbolInSubpkg,
+                registerFnSig = ::registerFnSignatureTokens,
+                subpkgToRawLeaf = subpkgToRawLeaf,
+                putScopedDefault = { sp, k, v -> aliasDefaults.putScopedAndSimpleIfMissing(sp, k, v) },
+                putScopedNumericKind = { sp, k, v -> numericKinds.putScopedAndSimpleIfMissing(sp, k, v) },
+                addScopedOptionFnType = ::addScopedOptionFnType,
+                putScopedPointerAlias = { sp, k, v -> pointerAliases.putScopedAndSimpleIfMissing(sp, k, v) },
+                aliasLeafTargets = aliasLeafTargets,
+                qualifiedAliasLeafTargets = qualifiedAliasLeafTargets,
+                fnTypeSpecs = fnTypeSpecs,
+                structFieldTypes = structFieldTypes,
+                recordDecls = recordDecls,
+                recordDeclsBySimple = recordDeclsBySimple,
+                simpleEnumReprs = simpleEnumReprs,
+                ffiReferencedIdents = ffiReferencedIdents,
+                constLeafTargets = constLeafTargets,
+                traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
+                traitResultMethods = traitResultMethods,
+                registerFnConstParams = ::registerFnConstParams,
+                enumVariantTypeArity = enumVariantTypeArity,
+                unitEnumVariants = unitEnumVariants,
+            )
         }
     }
 
-    val cfgProfile = TranslationSession.cfgTargetProfile
-    val ptrWidth = cfgProfile.pointerWidth
-    val isWindows =
-        cfgProfile.targetOs == "windows" ||
-            cfgProfile.targetFamilies?.contains("windows") == true
-
-    fun classifyBuiltinLeaf(leaf: String, ownerKtName: String): Pair<String?, String?> =
+    private fun classifyBuiltinLeaf(leaf: String, ownerKtName: String): Pair<String?, String?> =
         when (leaf) {
             "c_long" -> if (ptrWidth == 64 && !isWindows) "0L" to "I64" else "0" to "I32"
             "c_ulong" -> if (ptrWidth == 64 && !isWindows) "0uL" to "U64" else "0u" to "U32"
@@ -597,7 +589,7 @@ private fun scanSourcesWithActiveSession(
             }
         }
 
-    fun resolveSimpleAlias(ktName: String, depth: Int = 0): Pair<String?, String?> {
+    private fun resolveSimpleAlias(ktName: String, depth: Int = 0): Pair<String?, String?> {
         if (ktName in aliasDefaults) return aliasDefaults[ktName] to numericKinds[ktName]
         if (depth >= 8) return null to null
         val leaf = aliasLeafTargets[ktName] ?: return null to null
@@ -625,116 +617,121 @@ private fun scanSourcesWithActiveSession(
         return null to null
     }
 
-    val pointeeStopIdents = setOf("c_char", "c_void", "*")
-    for ((ptrKey, spec) in pointerAliases.map { it.key to it.value }) {
-        var curPointee = spec.second
-        var hops = 0
-        while (hops < 8 && curPointee !in pointeeStopIdents) {
-            val mappedKt = KotlinNamingPolicy.Default.toTypeIdentifier(curPointee, allowRawAbi = rawAbiMode)
-            val nextLeaf = aliasLeafTargets[curPointee] ?: aliasLeafTargets[mappedKt] ?: break
-            if (nextLeaf == curPointee) break
-            curPointee = nextLeaf
-            hops++
-        }
-        if (curPointee != spec.second) {
-            pointerAliases[ptrKey] = spec.first to curPointee
-        }
+    private fun assignQualifiedAliasEntry(targetMap: MutableMap<String, String>, subpkg: String, simpleKt: String, value: String) {
+        targetMap.putScopedAndSimpleIfMissing(subpkg, simpleKt, value)
+        if (subpkg.isNotEmpty()) targetMap["$subpkg.$simpleKt"] = value
+        if (symbolSubpackages[simpleKt]?.size == 1) targetMap[simpleKt] = value
     }
 
-    for (ktName in aliasLeafTargets.keys.toList()) {
-        resolveSimpleAlias(ktName)
-    }
-    val initialStructFieldTypes = structFieldTypes.map { it.key to it.value }
-    for ((scopedKey, subpkgAndLeaf) in qualifiedAliasLeafTargets) {
-        val (subpkg, leaf) = subpkgAndLeaf
-        val simpleKt = scopedKey.substringAfterLast('.')
-        val (bDef, bKind) = classifyBuiltinLeaf(leaf, simpleKt)
-        if (bDef != null) {
-            putScopedDefault(subpkg, simpleKt, bDef)
-            if (subpkg.isNotEmpty()) aliasDefaults["$subpkg.$simpleKt"] = bDef
-            if (symbolSubpackages[simpleKt]?.size == 1) aliasDefaults[simpleKt] = bDef
-            if (bKind != null) {
-                putScopedNumericKind(subpkg, simpleKt, bKind)
-                if (subpkg.isNotEmpty()) numericKinds["$subpkg.$simpleKt"] = bKind
-                if (symbolSubpackages[simpleKt]?.size == 1) numericKinds[simpleKt] = bKind
+    private fun propagateAliasesAndStructFields() {
+        var ffiAliasesChanged = true
+        var ffiAliasRounds = 0
+        while (ffiAliasesChanged && ffiAliasRounds < 12) {
+            ffiAliasesChanged = false
+            ffiAliasRounds++
+            for ((aliasKt, leaf) in aliasLeafTargets) {
+                if (aliasKt in ffiReferencedIdents) {
+                    val targetKt = KotlinNamingPolicy.Default.toTypeIdentifier(leaf, allowRawAbi = rawAbiMode)
+                    if (ffiReferencedIdents.add(leaf) || ffiReferencedIdents.add(targetKt)) {
+                        ffiAliasesChanged = true
+                    }
+                }
             }
         }
-    }
-    repeat(2) { _ ->
+
+        val pointeeStopIdents = setOf("c_char", "c_void", "*")
+        for ((ptrKey, spec) in pointerAliases.map { it.key to it.value }) {
+            var curPointee = spec.second
+            var hops = 0
+            while (hops < 8 && curPointee !in pointeeStopIdents) {
+                val mappedKt = KotlinNamingPolicy.Default.toTypeIdentifier(curPointee, allowRawAbi = rawAbiMode)
+                val nextLeaf = aliasLeafTargets[curPointee] ?: aliasLeafTargets[mappedKt] ?: break
+                if (nextLeaf == curPointee) break
+                curPointee = nextLeaf
+                hops++
+            }
+            if (curPointee != spec.second) {
+                pointerAliases[ptrKey] = spec.first to curPointee
+            }
+        }
+
+        for (ktName in aliasLeafTargets.keys.toList()) {
+            resolveSimpleAlias(ktName)
+        }
+        val initialStructFieldTypes = structFieldTypes.map { it.key to it.value }
         for ((scopedKey, subpkgAndLeaf) in qualifiedAliasLeafTargets) {
             val (subpkg, leaf) = subpkgAndLeaf
             val simpleKt = scopedKey.substringAfterLast('.')
-            if (classifyBuiltinLeaf(leaf, simpleKt).first != null) continue
-            val targetKt = KotlinNamingPolicy.Default.toTypeIdentifier(leaf, allowRawAbi = rawAbiMode)
-            val resolvedDef = aliasDefaults["$subpkg.$targetKt"] ?: aliasDefaults[targetKt]
-            val resolvedKind = numericKinds["$subpkg.$targetKt"] ?: numericKinds[targetKt]
-            if (resolvedDef != null) {
-                putScopedDefault(subpkg, simpleKt, resolvedDef)
-                if (subpkg.isNotEmpty()) aliasDefaults["$subpkg.$simpleKt"] = resolvedDef
-                if (symbolSubpackages[simpleKt]?.size == 1) aliasDefaults[simpleKt] = resolvedDef
+            val (bDef, bKind) = classifyBuiltinLeaf(leaf, simpleKt)
+            if (bDef != null) {
+                assignQualifiedAliasEntry(aliasDefaults, subpkg, simpleKt, bDef)
+                if (bKind != null) {
+                    assignQualifiedAliasEntry(numericKinds, subpkg, simpleKt, bKind)
+                }
             }
-            if (resolvedKind != null) {
-                putScopedNumericKind(subpkg, simpleKt, resolvedKind)
-                if (subpkg.isNotEmpty()) numericKinds["$subpkg.$simpleKt"] = resolvedKind
-                if (symbolSubpackages[simpleKt]?.size == 1) numericKinds[simpleKt] = resolvedKind
-            }
-            if (targetKt in optionFnTypes || "$subpkg.$targetKt" in optionFnTypes) {
-                addScopedOptionFnType(subpkg, simpleKt)
-            }
-            val ptrAlias = pointerAliases["$subpkg.$targetKt"] ?: pointerAliases[targetKt]
-            if (ptrAlias != null) {
-                putScopedPointerAlias(subpkg, simpleKt, ptrAlias)
-            }
-            for ((sfKey, sfVal) in initialStructFieldTypes) {
-                if (subpkg.isNotEmpty() && sfKey.startsWith("$subpkg.$targetKt.")) {
-                    val fieldPart = sfKey.removePrefix("$subpkg.$targetKt.")
-                    structFieldTypes.putIfMissing("$subpkg.$simpleKt.$fieldPart", sfVal)
-                    structFieldTypes.putIfMissing("$simpleKt.$fieldPart", sfVal)
-                } else if (sfKey.startsWith("$targetKt.") && '.' !in sfKey.removePrefix("$targetKt.")) {
-                    val fieldPart = sfKey.removePrefix("$targetKt.")
-                    if (subpkg.isNotEmpty()) {
+        }
+        repeat(2) { _ ->
+            for ((scopedKey, subpkgAndLeaf) in qualifiedAliasLeafTargets) {
+                val (subpkg, leaf) = subpkgAndLeaf
+                val simpleKt = scopedKey.substringAfterLast('.')
+                if (classifyBuiltinLeaf(leaf, simpleKt).first != null) continue
+                val targetKt = KotlinNamingPolicy.Default.toTypeIdentifier(leaf, allowRawAbi = rawAbiMode)
+                (aliasDefaults["$subpkg.$targetKt"] ?: aliasDefaults[targetKt])?.let {
+                    assignQualifiedAliasEntry(aliasDefaults, subpkg, simpleKt, it)
+                }
+                (numericKinds["$subpkg.$targetKt"] ?: numericKinds[targetKt])?.let {
+                    assignQualifiedAliasEntry(numericKinds, subpkg, simpleKt, it)
+                }
+                if (targetKt in optionFnTypes || "$subpkg.$targetKt" in optionFnTypes) {
+                    addScopedOptionFnType(subpkg, simpleKt)
+                }
+                (pointerAliases["$subpkg.$targetKt"] ?: pointerAliases[targetKt])?.let {
+                    pointerAliases.putScopedAndSimpleIfMissing(subpkg, simpleKt, it)
+                }
+                for ((sfKey, sfVal) in initialStructFieldTypes) {
+                    if (subpkg.isNotEmpty() && sfKey.startsWith("$subpkg.$targetKt.")) {
+                        val fieldPart = sfKey.removePrefix("$subpkg.$targetKt.")
                         structFieldTypes.putIfMissing("$subpkg.$simpleKt.$fieldPart", sfVal)
+                        structFieldTypes.putIfMissing("$simpleKt.$fieldPart", sfVal)
+                    } else if (sfKey.startsWith("$targetKt.") && '.' !in sfKey.removePrefix("$targetKt.")) {
+                        val fieldPart = sfKey.removePrefix("$targetKt.")
+                        if (subpkg.isNotEmpty()) {
+                            structFieldTypes.putIfMissing("$subpkg.$simpleKt.$fieldPart", sfVal)
+                        }
+                        structFieldTypes.putIfMissing("$simpleKt.$fieldPart", sfVal)
                     }
-                    structFieldTypes.putIfMissing("$simpleKt.$fieldPart", sfVal)
+                }
+            }
+        }
+        for ((subpkg, ktConst, leaf) in constLeafTargets) {
+            val targetKt = KotlinNamingPolicy.Default.toTypeIdentifier(leaf, allowRawAbi = rawAbiMode)
+            val kind = classifyBuiltinLeaf(leaf, ktConst).second ?: numericKinds["$subpkg.$targetKt"] ?: numericKinds[targetKt]
+            if (kind != null) {
+                numericKinds.putScopedAndSimpleIfMissing(subpkg, ktConst, kind)
+            }
+        }
+        for ((_, decl) in recordDecls) {
+            val makeNullableForUnion = decl.isUnion && !rawAbiMode
+            for (field in decl.fields) {
+                val mappedTy =
+                    RustTypeSliceInspector(field.typeTokens).mapFieldTypeQuick(
+                        rawAbiMode = rawAbiMode,
+                        selfOwnerKt = decl.ktName,
+                        numericKinds = numericKinds,
+                        subpkg = decl.subpkg,
+                    ) ?: continue
+                val recordedTy = if (makeNullableForUnion && !mappedTy.endsWith("?")) "$mappedTy?" else mappedTy
+                if (decl.subpkg.isNotEmpty()) {
+                    structFieldTypes["${decl.subpkg}.${decl.ktName}.${field.ktName}"] = recordedTy
+                }
+                if (symbolSubpackages[decl.ktName]?.size == 1 || "${decl.ktName}.${field.ktName}" !in structFieldTypes) {
+                    structFieldTypes["${decl.ktName}.${field.ktName}"] = recordedTy
                 }
             }
         }
     }
-    for ((subpkg, ktConst, leaf) in constLeafTargets) {
-        val targetKt = KotlinNamingPolicy.Default.toTypeIdentifier(leaf, allowRawAbi = rawAbiMode)
-        val kind =
-            classifyBuiltinLeaf(leaf, ktConst).second
-                ?: numericKinds["$subpkg.$targetKt"]
-                ?: numericKinds[targetKt]
-        if (kind != null) {
-            putScopedNumericKind(subpkg, ktConst, kind)
-        }
-    }
-    for ((_, decl) in recordDecls) {
-        val makeNullableForUnion = decl.isUnion && !rawAbiMode
-        for (field in decl.fields) {
-            val mappedTy =
-                RustTypeSliceInspector(field.typeTokens).mapFieldTypeQuick(
-                    rawAbiMode = rawAbiMode,
-                    selfOwnerKt = decl.ktName,
-                    numericKinds = numericKinds,
-                    subpkg = decl.subpkg,
-                ) ?: continue
-            val recordedTy = if (makeNullableForUnion && !mappedTy.endsWith("?")) "$mappedTy?" else mappedTy
-            if (decl.subpkg.isNotEmpty()) {
-                structFieldTypes["${decl.subpkg}.${decl.ktName}.${field.ktName}"] = recordedTy
-            }
-            if (symbolSubpackages[decl.ktName]?.size == 1 || "${decl.ktName}.${field.ktName}" !in structFieldTypes) {
-                structFieldTypes["${decl.ktName}.${field.ktName}"] = recordedTy
-            }
-        }
-    }
 
-    val valueParamPackTemplates = linkedMapOf<String, String>()
-    val valueReturnUnpackTemplates = linkedMapOf<String, String>()
-    val fnPtrInvokeTemplates = linkedMapOf<String, String>()
-
-    if (rawAbiMode) {
+    private fun populateRawAbiPackTemplates() {
         for ((enumKey, reprKind) in simpleEnumReprs) {
             val packExpr =
                 when (reprKind) {
@@ -743,8 +740,7 @@ private fun scanSourcesWithActiveSession(
                     "I8", "U8" -> "(__SELF__.value.toLong() and 0xFFL)"
                     else -> "(__SELF__.value.toLong() and 0xFFFF_FFFFL)"
                 }
-            val simpleEnum = enumKey.substringAfterLast('.')
-            valueParamPackTemplates.putIfMissing(simpleEnum, packExpr)
+            valueParamPackTemplates.putIfMissing(enumKey.substringAfterLast('.'), packExpr)
             valueParamPackTemplates.putIfMissing(enumKey, packExpr)
         }
 
@@ -781,337 +777,247 @@ private fun scanSourcesWithActiveSession(
             val layout = computeLayout(scopedKey) ?: continue
             val simpleName = layout.ktName
             if (layout.sizeBytes in setOf(1, 2, 4, 8)) {
-                val packTemplate = buildRegisterPackExpr("__SELF__", layout)
-                if (packTemplate != null) {
-                    valueParamPackTemplates.putScopedAndSimpleIfMissing(layout.subpkg, simpleName, packTemplate)
+                buildRegisterPackExpr("__SELF__", layout)?.let {
+                    valueParamPackTemplates.putScopedAndSimpleIfMissing(layout.subpkg, simpleName, it)
                 }
                 if (layout.fields.size in 1..64) {
-                    val unpackTemplate = buildRegisterUnpackExpr("__TYPE__", "rawRet", layout)
-                    if (unpackTemplate != null) {
-                        valueReturnUnpackTemplates.putScopedAndSimpleIfMissing(layout.subpkg, simpleName, unpackTemplate)
+                    buildRegisterUnpackExpr("__TYPE__", "rawRet", layout)?.let {
+                        valueReturnUnpackTemplates.putScopedAndSimpleIfMissing(layout.subpkg, simpleName, it)
                     }
                 }
             } else if (layout.sizeBytes > 0) {
-                val memSlotExpr = buildMemoryCopySlotExpr("__SELF__", layout)
-                if (memSlotExpr != null) {
-                    valueParamPackTemplates.putScopedAndSimpleIfMissing(layout.subpkg, simpleName, memSlotExpr)
+                buildMemoryCopySlotExpr("__SELF__", layout)?.let {
+                    valueParamPackTemplates.putScopedAndSimpleIfMissing(layout.subpkg, simpleName, it)
                 }
             }
         }
     }
 
-    val fnParamNumericKinds = linkedMapOf<String, List<String>>()
-    for ((fnKey, entries) in rawFnParamDeclTokens) {
-        var agreedKinds: List<String>? = null
-        var conflict = false
-        for ((fnSubpkg, isExtern, paramLists) in entries) {
-            val resolvedKinds =
-                paramLists.map { pTokens ->
-                    resolveTokenTypeScalarKind(
-                        pTokens,
-                        fnSubpkg,
-                        rawAbiMode,
-                        numericKinds,
-                        aliasDefaults,
-                        insideExternBlock = isExtern,
-                    ).orEmpty()
+    private fun resolveAgreedFnParamNumericKinds(): Map<String, List<String>> {
+        val fnParamNumericKinds = linkedMapOf<String, List<String>>()
+        for ((fnKey, entries) in rawFnParamDeclTokens) {
+            var agreedKinds: List<String>? = null
+            var conflict = false
+            for ((fnSubpkg, isExtern, paramLists) in entries) {
+                val resolvedKinds =
+                    paramLists.map { pTokens ->
+                        resolveTokenTypeScalarKind(pTokens, fnSubpkg, rawAbiMode, numericKinds, aliasDefaults, insideExternBlock = isExtern).orEmpty()
+                    }
+                if (agreedKinds == null) {
+                    agreedKinds = resolvedKinds
+                } else if (agreedKinds != resolvedKinds) {
+                    conflict = true
+                    break
                 }
-            if (agreedKinds == null) {
-                agreedKinds = resolvedKinds
-            } else if (agreedKinds != resolvedKinds) {
-                conflict = true
-                break
+            }
+            if (!conflict && agreedKinds != null && agreedKinds.any { it.isNotEmpty() }) {
+                fnParamNumericKinds[fnKey] = agreedKinds
             }
         }
-        if (!conflict && agreedKinds != null && agreedKinds.any { it.isNotEmpty() }) {
-            fnParamNumericKinds[fnKey] = agreedKinds
-        }
+        return fnParamNumericKinds
     }
 
-    for ((_, spec) in fnTypeSpecs) {
-        val samName = spec.samKtName
-        val arity = spec.paramTokenLists.size
-        val retDefault = resolveFnReturnDefaultExpr(spec.retTokens, spec.subpkg, samName, rawAbiMode, aliasDefaults, ::classifyBuiltinLeaf)
-        val paramsPlaceholder =
-            if (arity == 0) {
-                ""
-            } else {
-                (0 until arity).joinToString(", ") { "_" } + " -> "
-            }
-        val bodyExpr = if (retDefault == "Unit") "" else retDefault
-        val samDefault =
-            if (paramsPlaceholder.isEmpty() && bodyExpr.isEmpty()) {
-                "$samName {}"
-            } else {
-                "$samName { ${(paramsPlaceholder + bodyExpr).trim()} }"
-            }
-        putScopedDefault(spec.subpkg, samName, samDefault)
+    private fun populateSamDefaultsAndInvokeTemplates() {
+        for ((_, spec) in fnTypeSpecs) {
+            val samName = spec.samKtName
+            val arity = spec.paramTokenLists.size
+            val retDefault = resolveFnReturnDefaultExpr(spec.retTokens, spec.subpkg, samName, rawAbiMode, aliasDefaults, ::classifyBuiltinLeaf)
+            val paramsPlaceholder = if (arity == 0) "" else (0 until arity).joinToString(", ") { "_" } + " -> "
+            val bodyExpr = if (retDefault == "Unit") "" else retDefault
+            val samDefault =
+                if (paramsPlaceholder.isEmpty() && bodyExpr.isEmpty()) {
+                    "$samName {}"
+                } else {
+                    "$samName { ${(paramsPlaceholder + bodyExpr).trim()} }"
+                }
+            aliasDefaults.putScopedAndSimpleIfMissing(spec.subpkg, samName, samDefault)
 
-        if (rawAbiMode) {
-            val wrapperExpr =
-                buildFnPtrInvokeTemplate(
-                    spec = spec,
-                    rawAbiMode = rawAbiMode,
-                    numericKinds = numericKinds,
-                    aliasDefaults = aliasDefaults,
-                    valueParamPackTemplates = valueParamPackTemplates,
-                )
-            if (wrapperExpr != null) {
-                fnPtrInvokeTemplates.putScopedAndSimpleIfMissing(spec.subpkg, samName, wrapperExpr)
+            if (rawAbiMode) {
+                buildFnPtrInvokeTemplate(spec, rawAbiMode, numericKinds, aliasDefaults, valueParamPackTemplates)?.let { wrapperExpr ->
+                    fnPtrInvokeTemplates.putScopedAndSimpleIfMissing(spec.subpkg, samName, wrapperExpr)
+                }
             }
         }
     }
 
-    val fnReturnTypes = rawFnReturnTypes.filterValues { it.isNotEmpty() }
-
-    val declaredTraitAsts = linkedMapOf<String, Item.Trait>()
-    val selfParameterizedTraits = linkedSetOf<String>()
-    val traitSupertraits = linkedMapOf<String, List<String>>()
-    val crateMacroSrcs = normalizedSources.map { it.second }.filter { "macro_rules" in it || "macro " in it }
-    val anyMacroDefinesTrait = crateMacroSrcs.any { "trait " in it || "trait\n" in it || "trait\t" in it }
-    val anyMacroDefinesItem =
-        anyMacroDefinesTrait ||
+    private fun collectExpandedTraitsAndClosure(
+        normalizedSources: List<Pair<String, String>>,
+        sharedInlineRelFiles: Set<String>,
+    ) {
+        val crateMacroSrcs = normalizedSources.map { it.second }.filter { "macro_rules" in it || "macro " in it }
+        val itemKeywords = listOf("trait", "struct", "enum", "type", "fn", "mod", "const", "union")
+        val anyMacroDefinesItem =
             crateMacroSrcs.any { src ->
-                "struct " in src || "struct\n" in src || "struct\t" in src ||
-                    "enum " in src || "enum\n" in src || "enum\t" in src ||
-                    "type " in src || "type\n" in src || "type\t" in src ||
-                    "fn " in src || "fn\n" in src || "fn\t" in src ||
-                    "mod " in src || "mod\n" in src || "mod\t" in src ||
-                    "const " in src || "const\n" in src || "const\t" in src ||
-                    "union " in src || "union\n" in src || "union\t" in src
+                itemKeywords.any { kw -> "$kw " in src || "$kw\n" in src || "$kw\t" in src }
             }
-    for ((relFile, text) in normalizedSources) {
-        if ("trait" !in text && !(anyMacroDefinesItem && "!" in text)) continue
-        val recognized = recognizeRustOrNull(text) ?: continue
-        val expandedFile = expandFileMacroRules(recognized.file, crateMacroSrcs).file
-        val (subpkg, _) = computeSubpkgAndRecordAncestors(relFile)
-        val sameFileTraitNames = linkedSetOf<String>()
-        fun collectFileTraitNames(items: List<Item>) {
-            for (item in items) {
-                if (itemHasDocOnlyCfg(item)) continue
-                when (item) {
-                    is Item.Trait ->
-                        sameFileTraitNames += KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
-                    is Item.Mod -> {
-                        val content = item.content
-                        if (content is ModContent.Inline && !hasCfgTestModAttribute(item.attrs)) {
-                            collectFileTraitNames(content.items)
-                        }
-                    }
-                    else -> {}
+        for ((relFile, text) in normalizedSources) {
+            if ("trait" !in text && !(anyMacroDefinesItem && "!" in text)) continue
+            val recognized = recognizeRustOrNull(text) ?: continue
+            val expandedFile = expandFileMacroRules(recognized.file, crateMacroSrcs).file
+            val (subpkg, _) = computeSubpkgAndRecordAncestors(relFile, sharedInlineRelFiles)
+            val splitInlineMods = if (splitModuleRoots) selectSplitCandidateInlineModsForFile(expandedFile).toSet() else emptySet()
+            CrateTraitAstCollector(subpkg, splitInlineMods).collect(expandedFile.items)
+        }
+        var selfClosureChanged = true
+        while (selfClosureChanged) {
+            selfClosureChanged = false
+            for ((ktTrait, superNames) in traitSupertraits) {
+                val simpleTrait = ktTrait.substringAfterLast('.')
+                if (simpleTrait in selfParameterizedTraits) continue
+                if (superNames.any { it in selfParameterizedTraits || it in KNOWN_SELF_PARAMETERIZED_TRAITS }) {
+                    selfParameterizedTraits += simpleTrait
+                    selfClosureChanged = true
                 }
             }
         }
-        collectFileTraitNames(expandedFile.items)
-        val splitInlineMods =
-            if (splitModuleRoots) {
-                selectSplitCandidateInlineModsForFile(expandedFile).toSet()
-            } else {
-                emptySet()
-            }
-        fun walkTraitItems(items: List<Item>, curSubpkg: String = subpkg) {
-            for (item in items) {
-                if (itemHasDocOnlyCfg(item)) continue
-                when (item) {
-                    is Item.Trait -> {
-                        val ktTrait = KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
-                        registerSymbolInSubpkg(ktTrait, curSubpkg)
-                        declaredTraitAsts.putIfMissing(ktTrait, item)
-                        if (subpkg.isNotEmpty()) {
-                            declaredTraitAsts.putIfMissing("$subpkg.$ktTrait", item)
-                        }
-                        if (traitReferencesSelfOutsideReceiver(item)) {
-                            selfParameterizedTraits += ktTrait
-                        }
-                        val superEntries =
-                            item.supertraits
-                                .toList()
-                                .mapNotNull { bound ->
-                                    val path =
-                                        (bound as? TypeParamBound.Trait)
-                                            ?.takeIf { it.maybe == null }
-                                            ?.path
-                                            ?: return@mapNotNull null
-                                    val lastSeg = path.segments.last() ?: return@mapNotNull null
-                                    val raw =
-                                        lastSeg.ident
-                                            .toString()
-                                            .removePrefix("r#")
-                                    if (raw in IGNORED_TRAIT_BOUNDS) return@mapNotNull null
-                                    val kt = KotlinNamingPolicy.Default.toTypeIdentifier(raw, allowRawAbi = rawAbiMode)
-                                    if (kt in RUST_STD_IMPLICIT_SUPERTRAITS && kt !in sameFileTraitNames) return@mapNotNull null
-                                    val boundAssocs =
-                                        (lastSeg.arguments as? PathArguments.AngleBracketed)
-                                            ?.args
-                                            ?.toList()
-                                            ?.filterIsInstance<GenericArgument.AssocTypeArg>()
-                                            ?.map {
-                                                KotlinNamingPolicy.Default.toTypeIdentifier(
-                                                    it.assoc.ident.toString(),
-                                                    allowRawAbi = false,
-                                                )
-                                            }?.toSet()
-                                            .orEmpty()
-                                    kt to boundAssocs
-                                }
-                        if (superEntries.isNotEmpty()) {
-                            val superNames = superEntries.map { it.first }.distinct()
-                            traitSupertraits[ktTrait] = superNames
-                            traitSupertraitBindings[ktTrait] = superEntries
-                            if (subpkg.isNotEmpty()) {
-                                traitSupertraits["$subpkg.$ktTrait"] = superNames
-                                traitSupertraitBindings["$subpkg.$ktTrait"] = superEntries
-                            }
-                        }
-                        val astDefaultlessAssocs = mutableListOf<String>()
-                        val astResultMethods = linkedSetOf<String>()
-                        for (tItem in item.items) {
-                            if (traitItemHasDocOnlyCfg(tItem)) continue
-                            when (tItem) {
-                                is TraitItem.AssocType ->
-                                    if (tItem.default == null) {
-                                        val assocKt = KotlinNamingPolicy.Default.toTypeIdentifier(tItem.ident.toString(), allowRawAbi = false)
-                                        if (assocKt !in astDefaultlessAssocs) astDefaultlessAssocs += assocKt
-                                    }
-                                is TraitItem.Fn -> {
-                                    val ktFn = rustFunctionIdentToKotlin(tItem.sig.ident.toString())
-                                    registerSymbolInSubpkg(ktFn, curSubpkg)
-                                    if (isSynResultReturnType(tItem.sig.output)) {
-                                        astResultMethods += ktFn
-                                    }
-                                }
-                                else -> {}
-                            }
-                        }
-                        if (astDefaultlessAssocs.isNotEmpty()) {
-                            if (subpkg.isNotEmpty()) traitDefaultlessAssocTypes["$subpkg.$ktTrait"] = astDefaultlessAssocs
-                            if (ktTrait !in traitDefaultlessAssocTypes) traitDefaultlessAssocTypes[ktTrait] = astDefaultlessAssocs
-                        }
-                        if (astResultMethods.isNotEmpty()) {
-                            if (subpkg.isNotEmpty()) traitResultMethods["$subpkg.$ktTrait"] = astResultMethods.toList()
-                            if (ktTrait !in traitResultMethods) traitResultMethods[ktTrait] = astResultMethods.toList()
+        var assocClosureChanged = true
+        while (assocClosureChanged) {
+            assocClosureChanged = false
+            for ((ktTrait, superEntries) in traitSupertraitBindings) {
+                val cur = traitDefaultlessAssocTypes[ktTrait].orEmpty().toMutableList()
+                var added = false
+                for ((superKt, boundAssocs) in superEntries) {
+                    for (assoc in traitDefaultlessAssocTypes[superKt].orEmpty()) {
+                        if (assoc !in boundAssocs && assoc !in cur) {
+                            cur += assoc
+                            added = true
                         }
                     }
-                    is Item.Struct -> {
-                        val ktType = KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
-                        registerSymbolInSubpkg(ktType, curSubpkg)
-                    }
-                    is Item.Enum -> {
-                        val ktType = KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
-                        registerSymbolInSubpkg(ktType, curSubpkg)
-                    }
-                    is Item.Union -> {
-                        val ktType = KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
-                        registerSymbolInSubpkg(ktType, curSubpkg)
-                    }
-                    is Item.ItemType -> {
-                        val ktType = KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
-                        registerSymbolInSubpkg(ktType, curSubpkg)
-                    }
-                    is Item.Fn -> {
-                        val ktFn = rustFunctionIdentToKotlin(item.sig.ident.toString())
-                        registerSymbolInSubpkg(ktFn, curSubpkg)
-                    }
-                    is Item.Const -> {
-                        val ktConst = KotlinNamingPolicy.Default.toConstIdentifier(item.ident.toString())
-                        registerSymbolInSubpkg(ktConst, curSubpkg)
-                    }
-                    is Item.Static -> {
-                        val ktStatic = rustValueIdentToKotlin(item.ident.toString())
-                        registerSymbolInSubpkg(ktStatic, curSubpkg)
-                    }
-                    is Item.Mod -> {
-                        val content = item.content
-                        if (content is ModContent.Inline && !hasCfgTestModAttribute(item.attrs)) {
-                            val rawMod = item.ident.toString().removePrefix("r#")
-                            val modKt = rustModuleIdentToKotlin(rawMod.replace('-', '_'))
-                            val nextSub =
-                                if (item in splitInlineMods && modKt.isNotEmpty()) {
-                                    val childSub = if (curSubpkg.isEmpty()) modKt else "$curSubpkg.$modKt"
-                                    subpkgToRawLeaf.putIfMissing(childSub, rawMod)
-                                    childSub
-                                } else {
-                                    curSubpkg
-                                }
-                            walkTraitItems(content.items, nextSub)
-                        }
-                    }
-                    else -> {}
+                }
+                if (added) {
+                    traitDefaultlessAssocTypes[ktTrait] = cur
+                    assocClosureChanged = true
                 }
             }
         }
-        walkTraitItems(expandedFile.items)
     }
-    var selfClosureChanged = true
-    while (selfClosureChanged) {
-        selfClosureChanged = false
-        for ((ktTrait, superNames) in traitSupertraits) {
-            val simpleTrait = ktTrait.substringAfterLast('.')
-            if (simpleTrait in selfParameterizedTraits) continue
-            if (superNames.any { it in selfParameterizedTraits || it in KNOWN_SELF_PARAMETERIZED_TRAITS }) {
-                selfParameterizedTraits += simpleTrait
-                selfClosureChanged = true
-            }
-        }
-    }
-    var assocClosureChanged = true
-    while (assocClosureChanged) {
-        assocClosureChanged = false
-        for ((ktTrait, superEntries) in traitSupertraitBindings) {
-            val cur = traitDefaultlessAssocTypes[ktTrait].orEmpty().toMutableList()
-            var added = false
-            for ((superKt, boundAssocs) in superEntries) {
-                val inherited = traitDefaultlessAssocTypes[superKt].orEmpty()
-                for (assoc in inherited) {
-                    if (assoc !in boundAssocs && assoc !in cur) {
-                        cur += assoc
-                        added = true
-                    }
-                }
-            }
-            if (added) {
-                traitDefaultlessAssocTypes[ktTrait] = cur
-                assocClosureChanged = true
-            }
-        }
-    }
-    val traitRegistryKey =
-        if (declaredTraitAsts.isNotEmpty()) {
-            val key =
-                "crate:${normalizedSources.size}:${declaredTraitAsts.keys.sorted().joinToString(",")}:${TranslationSession.cfgTargetProfile}"
-            CrateTraitAstRegistry.register(key, declaredTraitAsts)
-            key
-        } else {
-            null
+
+    private inner class CrateTraitAstCollector(
+        private val fileSubpkg: String,
+        private val splitInlineMods: Set<Item.Mod>,
+    ) : Visit() {
+        private val sameFileTraitNames = linkedSetOf<String>()
+        private var currentSubpkg: String = fileSubpkg
+        private var collectingNamesOnly: Boolean = true
+
+        fun collect(items: List<Item>) {
+            collectingNamesOnly = true
+            items.forEach(::visitItem)
+            collectingNamesOnly = false
+            currentSubpkg = fileSubpkg
+            items.forEach(::visitItem)
         }
 
-    return CrateRawAbiMetadata(
-        selfCrateAliases = selfAliases,
-        includedSubdirModuleMap = includedSubdirModules,
-        rootSelfDirModuleAliases = rootSelfDirModuleAliases,
-        rootExternalModuleReexports = rootExternalModuleReexports,
-        typeAliasDefaults = aliasDefaults,
-        optionFnTypes = optionFnTypes,
-        numericTypeKinds = numericKinds,
-        pointerTypeAliases = pointerAliases.mapValues { (_, spec) -> "${if (spec.first) "mut" else "const"}:${spec.second}" },
-        structFieldTypes = structFieldTypes,
-        fnReturnTypes = fnReturnTypes,
-        symbolSubpackages = symbolSubpackages.mapValues { it.value.toList() },
-        subpackageRawLeafNames = subpkgToRawLeaf,
-        valueParamPackTemplates = valueParamPackTemplates,
-        valueReturnUnpackTemplates = valueReturnUnpackTemplates,
-        fnPtrInvokeTemplates = fnPtrInvokeTemplates,
-        fnParamNumericKinds = fnParamNumericKinds,
-        sharedInlineModuleRelFiles = sharedInlineRelFiles,
-        traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
-        traitResultMethods = traitResultMethods,
-        selfParameterizedTraits = selfParameterizedTraits,
-        traitSupertraits = traitSupertraits,
-        traitAstRegistryKey = traitRegistryKey,
-        fnConstParamNames = fnConstParamNames,
-        enumVariantTypeArity = enumVariantTypeArity,
-        unitEnumVariants = unitEnumVariants,
-    )
+        override fun visitItem(i: Item) {
+            if (itemHasDocOnlyCfg(i)) return
+            if (collectingNamesOnly) {
+                when (i) {
+                    is Item.Trait ->
+                        sameFileTraitNames += KotlinNamingPolicy.Default.toTypeIdentifier(i.ident.toString(), allowRawAbi = rawAbiMode)
+                    is Item.Mod -> {
+                        val content = i.content
+                        if (content is ModContent.Inline && !hasCfgTestModAttribute(i.attrs)) {
+                            content.items.forEach(::visitItem)
+                        }
+                    }
+                    else -> {}
+                }
+                return
+            }
+            when (i) {
+                is Item.Trait -> inspectTraitItem(i)
+                is Item.Struct -> registerSymbolInSubpkg(KotlinNamingPolicy.Default.toTypeIdentifier(i.ident.toString(), allowRawAbi = rawAbiMode), currentSubpkg)
+                is Item.Enum -> registerSymbolInSubpkg(KotlinNamingPolicy.Default.toTypeIdentifier(i.ident.toString(), allowRawAbi = rawAbiMode), currentSubpkg)
+                is Item.Union -> registerSymbolInSubpkg(KotlinNamingPolicy.Default.toTypeIdentifier(i.ident.toString(), allowRawAbi = rawAbiMode), currentSubpkg)
+                is Item.ItemType -> registerSymbolInSubpkg(KotlinNamingPolicy.Default.toTypeIdentifier(i.ident.toString(), allowRawAbi = rawAbiMode), currentSubpkg)
+                is Item.Fn -> registerSymbolInSubpkg(rustFunctionIdentToKotlin(i.sig.ident.toString()), currentSubpkg)
+                is Item.Const -> registerSymbolInSubpkg(KotlinNamingPolicy.Default.toConstIdentifier(i.ident.toString()), currentSubpkg)
+                is Item.Static -> registerSymbolInSubpkg(rustValueIdentToKotlin(i.ident.toString()), currentSubpkg)
+                is Item.Mod -> {
+                    val content = i.content
+                    if (content is ModContent.Inline && !hasCfgTestModAttribute(i.attrs)) {
+                        val rawMod = i.ident.toString().removePrefix("r#")
+                        val modKt = rustModuleIdentToKotlin(rawMod.replace('-', '_'))
+                        val prevSub = currentSubpkg
+                        if (i in splitInlineMods && modKt.isNotEmpty()) {
+                            val childSub = if (prevSub.isEmpty()) modKt else "$prevSub.$modKt"
+                            subpkgToRawLeaf.putIfMissing(childSub, rawMod)
+                            currentSubpkg = childSub
+                        }
+                        try {
+                            content.items.forEach(::visitItem)
+                        } finally {
+                            currentSubpkg = prevSub
+                        }
+                    }
+                }
+                else -> {}
+            }
+        }
+
+        private fun inspectTraitItem(item: Item.Trait) {
+            val ktTrait = KotlinNamingPolicy.Default.toTypeIdentifier(item.ident.toString(), allowRawAbi = rawAbiMode)
+            registerSymbolInSubpkg(ktTrait, currentSubpkg)
+            declaredTraitAsts.putScopedAndSimpleIfMissing(fileSubpkg, ktTrait, item)
+            if (traitReferencesSelfOutsideReceiver(item)) {
+                selfParameterizedTraits += ktTrait
+            }
+            val superEntries =
+                item.supertraits.toList().mapNotNull { bound ->
+                    val path = (bound as? TypeParamBound.Trait)?.takeIf { it.maybe == null }?.path ?: return@mapNotNull null
+                    val lastSeg = path.segments.last() ?: return@mapNotNull null
+                    val raw = lastSeg.ident.toString().removePrefix("r#")
+                    if (raw in IGNORED_TRAIT_BOUNDS) return@mapNotNull null
+                    val kt = KotlinNamingPolicy.Default.toTypeIdentifier(raw, allowRawAbi = rawAbiMode)
+                    if (kt in RUST_STD_IMPLICIT_SUPERTRAITS && kt !in sameFileTraitNames) return@mapNotNull null
+                    val angleArgs = (lastSeg.arguments as? PathArguments.AngleBracketed)?.args?.toList()
+                    val boundAssocs =
+                        angleArgs
+                            ?.filterIsInstance<GenericArgument.AssocTypeArg>()
+                            ?.mapTo(linkedSetOf()) { KotlinNamingPolicy.Default.toTypeIdentifier(it.assoc.ident.toString(), allowRawAbi = false) }
+                            .orEmpty()
+                    kt to boundAssocs
+                }
+            if (superEntries.isNotEmpty()) {
+                val superNames = superEntries.map { it.first }.distinct()
+                traitSupertraits[ktTrait] = superNames
+                traitSupertraitBindings[ktTrait] = superEntries
+                if (fileSubpkg.isNotEmpty()) {
+                    traitSupertraits["$fileSubpkg.$ktTrait"] = superNames
+                    traitSupertraitBindings["$fileSubpkg.$ktTrait"] = superEntries
+                }
+            }
+            val astDefaultlessAssocs = mutableListOf<String>()
+            val astResultMethods = linkedSetOf<String>()
+            for (tItem in item.items) {
+                if (traitItemHasDocOnlyCfg(tItem)) continue
+                when (tItem) {
+                    is TraitItem.AssocType ->
+                        if (tItem.default == null) {
+                            val assocKt = KotlinNamingPolicy.Default.toTypeIdentifier(tItem.ident.toString(), allowRawAbi = false)
+                            if (assocKt !in astDefaultlessAssocs) astDefaultlessAssocs += assocKt
+                        }
+                    is TraitItem.Fn -> {
+                        val ktFn = rustFunctionIdentToKotlin(tItem.sig.ident.toString())
+                        registerSymbolInSubpkg(ktFn, currentSubpkg)
+                        if (isSynResultReturnType(tItem.sig.output)) {
+                            astResultMethods += ktFn
+                        }
+                    }
+                    else -> {}
+                }
+            }
+            if (astDefaultlessAssocs.isNotEmpty()) {
+                if (fileSubpkg.isNotEmpty()) traitDefaultlessAssocTypes["$fileSubpkg.$ktTrait"] = astDefaultlessAssocs
+                traitDefaultlessAssocTypes.putIfMissing(ktTrait, astDefaultlessAssocs)
+            }
+            if (astResultMethods.isNotEmpty()) {
+                val methodsList = astResultMethods.toList()
+                if (fileSubpkg.isNotEmpty()) traitResultMethods["$fileSubpkg.$ktTrait"] = methodsList
+                traitResultMethods.putIfMissing(ktTrait, methodsList)
+            }
+        }
+    }
 }
 
 internal fun lexScannerTokens(sourceText: String): List<TokenTree> {
@@ -1138,16 +1044,15 @@ private fun resolveTokenTypeScalarKind(
     insideExternBlock: Boolean = false,
 ): String? {
     if (typeTokens.isEmpty()) return null
-    val first = typeTokens[0]
-    if (first is TokenTree.Punct && (first.value.asChar() == '*' || first.value.asChar() == '&')) {
+    val cursor = RustTokenCursor(typeTokens)
+    val firstCh = cursor.punctCharAt(0)
+    if (firstCh == '*' || firstCh == '&') {
         if (rawAbiMode) return if (TranslationSession.cfgTargetProfile.pointerWidth == 64) "I64" else "I32"
-        if (insideExternBlock && first.value.asChar() == '*') {
-            return "OPAQUE_PTR"
-        }
+        if (insideExternBlock && firstCh == '*') return "OPAQUE_PTR"
         return null
     }
-    val leaf = RustTokenCursor(typeTokens).simplePathLeafIdent() ?: return null
-    if (typeTokens.any { (it as? TokenTree.Punct)?.value?.asChar() == '<' }) return null
+    val leaf = cursor.simplePathLeafIdent() ?: return null
+    if ((0 until cursor.size).any { cursor.punctCharAt(it) == '<' }) return null
     when (leaf) {
         "isize" -> return if (rawAbiMode && TranslationSession.cfgTargetProfile.pointerWidth == 64) "I64" else "I32"
         "usize" -> return if (rawAbiMode) (if (TranslationSession.cfgTargetProfile.pointerWidth == 64) "U64" else "U32") else "I32"
@@ -1157,17 +1062,14 @@ private fun resolveTokenTypeScalarKind(
     val scopedKey = if (subpkg.isEmpty()) ktIdent else "$subpkg.$ktIdent"
     numericKinds[scopedKey]?.let { return it }
     numericKinds[ktIdent]?.let { return it }
-    if ((aliasDefaults[scopedKey] ?: aliasDefaults[ktIdent]) == "false") {
-        return "BOOL"
-    }
+    if ((aliasDefaults[scopedKey] ?: aliasDefaults[ktIdent]) == "false") return "BOOL"
     return null
 }
 
 private fun parseArrayLenIntFromTokens(lenTokens: List<TokenTree>): Int? {
     if (lenTokens.size != 1) return null
-    val lit = (lenTokens[0] as? TokenTree.Literal)?.value?.toString()?.replace("_", "") ?: return null
-    val clean =
-        lit.trimEnd { it.isLetter() }
+    val rawLit = (lenTokens[0] as? TokenTree.Literal)?.value?.toString() ?: return null
+    val clean = rawLit.replace("_", "").trimEnd { it.isLetter() }
     return if (clean.startsWith("0x") || clean.startsWith("0X")) {
         clean.drop(2).toIntOrNull(16)
     } else {
@@ -1257,24 +1159,23 @@ private fun resolveFieldShape(
         return ComputedFieldShape.Scalar(sizeBytes = sz, alignBytes = al, kind = scalarKind)
     }
 
-    if (typeTokens.size == 1 && typeTokens[0] is TokenTree.Group) {
-        val grp = (typeTokens[0] as TokenTree.Group).value
-        if (grp.delimiter() == Delimiter.Bracket) {
-            val inner = grp.stream().toList()
-            val semiIdx = inner.indexOfFirst { (it as? TokenTree.Punct)?.value?.asChar() == ';' }
+    val typeSlice = RustTypeSliceInspector(typeTokens)
+    if (typeSlice.size == 1) {
+        val bracketGrp = typeSlice.groupAt(0, Delimiter.Bracket)
+        if (bracketGrp != null) {
+            val inner = bracketGrp.stream().toList()
+            val innerCursor = RustTokenCursor(inner)
+            val semiIdx = (0 until innerCursor.size).firstOrNull { innerCursor.punctCharAt(it) == ';' } ?: -1
             if (semiIdx > 0 && semiIdx + 1 < inner.size) {
                 val count = parseArrayLenIntFromTokens(inner.subList(semiIdx + 1, inner.size)) ?: return null
                 if (count <= 0) return null
-                val elemKind =
-                    resolveTokenTypeScalarKind(inner.subList(0, semiIdx), subpkg, rawAbiMode, numericKinds, aliasDefaults)
-                        ?: return null
+                val elemKind = resolveTokenTypeScalarKind(inner.subList(0, semiIdx), subpkg, rawAbiMode, numericKinds, aliasDefaults) ?: return null
                 val (elemSz, _) = scalarKindSizeAndAlign(elemKind) ?: return null
                 return ComputedFieldShape.FixedArray(elemKind = elemKind, elemSizeBytes = elemSz, count = count)
             }
         }
     }
 
-    val typeSlice = RustTypeSliceInspector(typeTokens)
     if (typeSlice.extractOptionAngleInnerTokens()?.let { RustTypeSliceInspector(it).tryParseBareFnTokens() } != null) {
         return ComputedFieldShape.CallbackPtr(samKtName = "", isNullable = true)
     }
@@ -1283,7 +1184,7 @@ private fun resolveFieldShape(
     }
 
     val leaf = typeSlice.simplePathLeafIdent() ?: return null
-    if (typeTokens.any { (it as? TokenTree.Punct)?.value?.asChar() == '<' }) return null
+    if ((0 until typeSlice.size).any { typeSlice.punctCharAt(it) == '<' }) return null
     val ktIdent = KotlinNamingPolicy.Default.toTypeIdentifier(leaf, allowRawAbi = rawAbiMode)
     val scopedKey = if (subpkg.isEmpty()) ktIdent else "$subpkg.$ktIdent"
 
@@ -1322,44 +1223,22 @@ private fun appendLittleEndianByteWrites(
     kind: String,
     stmtsOut: MutableList<String>,
 ): Boolean {
+    fun appendShiftedBytes(byteCount: Int, bitsExpr: String) {
+        for (b in 0 until byteCount) {
+            val shift = b * 8
+            val shifted = if (shift == 0) bitsExpr else "($bitsExpr ushr $shift)"
+            stmtsOut += "$bufVar[${baseOffset + b}] = ($shifted and 0xFF).toByte()"
+        }
+    }
     when (kind) {
         "I8", "U8" -> stmtsOut += "$bufVar[$baseOffset] = $valueExpr.toByte()"
         "BOOL" -> stmtsOut += "$bufVar[$baseOffset] = if ($valueExpr) 1 else 0"
-        "I16", "U16" -> {
-            stmtsOut += "$bufVar[$baseOffset] = ($valueExpr.toInt() and 0xFF).toByte()"
-            stmtsOut += "$bufVar[${baseOffset + 1}] = (($valueExpr.toInt() ushr 8) and 0xFF).toByte()"
-        }
-        "I32", "U32" -> {
-            for (b in 0..3) {
-                val shift = b * 8
-                val shifted = if (shift == 0) "$valueExpr.toInt()" else "($valueExpr.toInt() ushr $shift)"
-                stmtsOut += "$bufVar[${baseOffset + b}] = ($shifted and 0xFF).toByte()"
-            }
-        }
-        "F32" -> {
-            for (b in 0..3) {
-                val shift = b * 8
-                val shifted = if (shift == 0) "$valueExpr.toRawBits()" else "($valueExpr.toRawBits() ushr $shift)"
-                stmtsOut += "$bufVar[${baseOffset + b}] = ($shifted and 0xFF).toByte()"
-            }
-        }
-        "I64", "U64" -> {
-            for (b in 0..7) {
-                val shift = b * 8
-                val shifted = if (shift == 0) "$valueExpr.toLong()" else "($valueExpr.toLong() ushr $shift)"
-                stmtsOut += "$bufVar[${baseOffset + b}] = ($shifted and 0xFF).toByte()"
-            }
-        }
-        "F64" -> {
-            for (b in 0..7) {
-                val shift = b * 8
-                val shifted = if (shift == 0) "$valueExpr.toRawBits()" else "($valueExpr.toRawBits() ushr $shift)"
-                stmtsOut += "$bufVar[${baseOffset + b}] = ($shifted and 0xFF).toByte()"
-            }
-        }
-        "I128", "U128" -> {
-            stmtsOut += "$valueExpr.toLeBytes().asByteArray().copyInto($bufVar, destinationOffset = $baseOffset)"
-        }
+        "I16", "U16" -> appendShiftedBytes(2, "$valueExpr.toInt()")
+        "I32", "U32" -> appendShiftedBytes(4, "$valueExpr.toInt()")
+        "F32" -> appendShiftedBytes(4, "$valueExpr.toRawBits()")
+        "I64", "U64" -> appendShiftedBytes(8, "$valueExpr.toLong()")
+        "F64" -> appendShiftedBytes(8, "$valueExpr.toRawBits()")
+        "I128", "U128" -> stmtsOut += "$valueExpr.toLeBytes().asByteArray().copyInto($bufVar, destinationOffset = $baseOffset)"
         else -> return false
     }
     return true
@@ -1377,33 +1256,26 @@ private fun appendRecordByteWrites(
         val fieldAccess = "$receiverExpr.${field.ktName}"
         val fieldOff = baseOffset + field.offsetBytes
         when (val shape = field.shape) {
-            is ComputedFieldShape.Scalar -> {
+            is ComputedFieldShape.Scalar ->
                 if (!appendLittleEndianByteWrites(bufVar, fieldOff, fieldAccess, shape.kind, stmtsOut)) return false
-            }
-            is ComputedFieldShape.SimpleEnum -> {
+            is ComputedFieldShape.SimpleEnum ->
                 if (!appendLittleEndianByteWrites(bufVar, fieldOff, "$fieldAccess.value", shape.reprKind, stmtsOut)) return false
-            }
-            is ComputedFieldShape.CallbackPtr -> {
-                val slotExpr = "__FFI__.objectSlot($fieldAccess)"
-                if (!appendLittleEndianByteWrites(bufVar, fieldOff, slotExpr, "I64", stmtsOut)) return false
-            }
-            is ComputedFieldShape.FixedArray -> {
-                if (shape.elemKind == "U8") {
-                    stmtsOut += "for (i in 0 until minOf(${shape.count}, $fieldAccess.size)) $bufVar[$fieldOff + i] = $fieldAccess[i].toByte()"
-                } else if (shape.elemKind == "I8") {
-                    stmtsOut += "$fieldAccess.copyInto($bufVar, destinationOffset = $fieldOff, startIndex = 0, endIndex = minOf(${shape.count}, $fieldAccess.size))"
-                } else {
-                    for (idx in 0 until shape.count) {
-                        val elemOff = fieldOff + idx * shape.elemSizeBytes
-                        if (!appendLittleEndianByteWrites(bufVar, elemOff, "$fieldAccess[$idx]", shape.elemKind, stmtsOut)) {
-                            return false
+            is ComputedFieldShape.CallbackPtr ->
+                if (!appendLittleEndianByteWrites(bufVar, fieldOff, "__FFI__.objectSlot($fieldAccess)", "I64", stmtsOut)) return false
+            is ComputedFieldShape.FixedArray ->
+                when (shape.elemKind) {
+                    "U8" ->
+                        stmtsOut += "for (i in 0 until minOf(${shape.count}, $fieldAccess.size)) $bufVar[$fieldOff + i] = $fieldAccess[i].toByte()"
+                    "I8" ->
+                        stmtsOut += "$fieldAccess.copyInto($bufVar, destinationOffset = $fieldOff, startIndex = 0, endIndex = minOf(${shape.count}, $fieldAccess.size))"
+                    else ->
+                        for (idx in 0 until shape.count) {
+                            val elemOff = fieldOff + idx * shape.elemSizeBytes
+                            if (!appendLittleEndianByteWrites(bufVar, elemOff, "$fieldAccess[$idx]", shape.elemKind, stmtsOut)) return false
                         }
-                    }
                 }
-            }
-            is ComputedFieldShape.NestedRecord -> {
+            is ComputedFieldShape.NestedRecord ->
                 if (!appendRecordByteWrites(bufVar, fieldAccess, fieldOff, shape.layout, stmtsOut)) return false
-            }
         }
     }
     return true
@@ -1411,8 +1283,7 @@ private fun appendRecordByteWrites(
 
 private fun buildMemoryCopySlotExpr(receiverExpr: String, layout: ComputedRecordLayout): String? {
     val stmts = mutableListOf<String>()
-    if (!appendRecordByteWrites("buf", receiverExpr, 0, layout, stmts)) return null
-    if (stmts.isEmpty()) return null
+    if (!appendRecordByteWrites("buf", receiverExpr, 0, layout, stmts) || stmts.isEmpty()) return null
     return "run { val buf = ByteArray(${layout.sizeBytes}); ${stmts.joinToString("; ")}; val ptr = __FFI__.allocZeroed(${layout.sizeBytes}); __FFI__.writeBytes(ptr, buf); ptr }"
 }
 
@@ -1438,14 +1309,8 @@ private fun buildRegisterPackExpr(receiverExpr: String, layout: ComputedRecordLa
         val fieldAccess = "$receiverExpr.${field.ktName}"
         val baseBitOffset = field.offsetBytes * 8
         when (val shape = field.shape) {
-            is ComputedFieldShape.Scalar -> {
-                val term = packScalarBitsToLong(fieldAccess, shape.kind, baseBitOffset) ?: return null
-                terms += term
-            }
-            is ComputedFieldShape.SimpleEnum -> {
-                val term = packScalarBitsToLong("$fieldAccess.value", shape.reprKind, baseBitOffset) ?: return null
-                terms += term
-            }
+            is ComputedFieldShape.Scalar -> terms += packScalarBitsToLong(fieldAccess, shape.kind, baseBitOffset) ?: return null
+            is ComputedFieldShape.SimpleEnum -> terms += packScalarBitsToLong("$fieldAccess.value", shape.reprKind, baseBitOffset) ?: return null
             is ComputedFieldShape.CallbackPtr -> {
                 val slot = "__FFI__.objectSlot($fieldAccess)"
                 terms += if (baseBitOffset == 0) slot else "($slot shl $baseBitOffset)"
@@ -1453,9 +1318,7 @@ private fun buildRegisterPackExpr(receiverExpr: String, layout: ComputedRecordLa
             is ComputedFieldShape.FixedArray -> {
                 val elemBits = shape.elemSizeBytes * 8
                 for (idx in 0 until shape.count) {
-                    val elemBitOff = baseBitOffset + idx * elemBits
-                    val term = packScalarBitsToLong("$fieldAccess[$idx]", shape.elemKind, elemBitOff) ?: return null
-                    terms += term
+                    terms += packScalarBitsToLong("$fieldAccess[$idx]", shape.elemKind, baseBitOffset + idx * elemBits) ?: return null
                 }
             }
             is ComputedFieldShape.NestedRecord -> {
@@ -1469,22 +1332,25 @@ private fun buildRegisterPackExpr(receiverExpr: String, layout: ComputedRecordLa
     return if (deduped.size == 1) deduped[0] else "(${deduped.joinToString(" or ")})"
 }
 
-private fun unpackScalarFromRawLong(rawLongExpr: String, kind: String, bitOffset: Int): String? {
-    val shifted = if (bitOffset == 0) rawLongExpr else "($rawLongExpr ushr $bitOffset)"
-    return when (kind) {
-        "I8" -> "$shifted.toByte()"
-        "U8" -> "$shifted.toUByte()"
-        "I16" -> "$shifted.toShort()"
-        "U16" -> "$shifted.toUShort()"
-        "I32" -> "$shifted.toInt()"
-        "U32" -> "$shifted.toUInt()"
-        "I64" -> shifted
-        "U64" -> "$shifted.toULong()"
-        "F32" -> "Float.fromBits($shifted.toInt())"
-        "F64" -> "Double.fromBits($shifted)"
-        "BOOL" -> "(($shifted and 1L) != 0L)"
+private fun coerceRawLongToScalarKind(rawLongExpr: String, kind: String, boolMask: String): String? =
+    when (kind) {
+        "I8" -> "$rawLongExpr.toByte()"
+        "U8" -> "$rawLongExpr.toUByte()"
+        "I16" -> "$rawLongExpr.toShort()"
+        "U16" -> "$rawLongExpr.toUShort()"
+        "I32" -> "$rawLongExpr.toInt()"
+        "U32" -> "$rawLongExpr.toUInt()"
+        "I64" -> rawLongExpr
+        "U64" -> "$rawLongExpr.toULong()"
+        "F32" -> "Float.fromBits($rawLongExpr.toInt())"
+        "F64" -> "Double.fromBits($rawLongExpr)"
+        "BOOL" -> "(($rawLongExpr and $boolMask) != 0L)"
         else -> null
     }
+
+private fun unpackScalarFromRawLong(rawLongExpr: String, kind: String, bitOffset: Int): String? {
+    val shifted = if (bitOffset == 0) rawLongExpr else "($rawLongExpr ushr $bitOffset)"
+    return coerceRawLongToScalarKind(shifted, kind, boolMask = "1L")
 }
 
 private fun buildRegisterUnpackExpr(
@@ -1499,22 +1365,17 @@ private fun buildRegisterUnpackExpr(
             when (val shape = field.shape) {
                 is ComputedFieldShape.Scalar ->
                     unpackScalarFromRawLong(rawLongExpr, shape.kind, baseBitOffset) ?: return null
-                is ComputedFieldShape.SimpleEnum -> return null
-                is ComputedFieldShape.CallbackPtr -> {
-                    if (shape.isNullable) "null" else return null
-                }
+                is ComputedFieldShape.SimpleEnum, is ComputedFieldShape.NestedRecord -> return null
+                is ComputedFieldShape.CallbackPtr -> if (shape.isNullable) "null" else return null
                 is ComputedFieldShape.FixedArray -> {
-                    val arrayFactory =
-                        SCANNER_SCALAR_DESCRIPTORS_BY_KIND[shape.elemKind]?.arrayFactory ?: return null
+                    val arrayFactory = SCANNER_SCALAR_DESCRIPTORS_BY_KIND[shape.elemKind]?.arrayFactory ?: return null
                     val elemBits = shape.elemSizeBytes * 8
                     val elems =
                         (0 until shape.count).map { idx ->
-                            unpackScalarFromRawLong(rawLongExpr, shape.elemKind, baseBitOffset + idx * elemBits)
-                                ?: return null
+                            unpackScalarFromRawLong(rawLongExpr, shape.elemKind, baseBitOffset + idx * elemBits) ?: return null
                         }
                     "$arrayFactory(${elems.joinToString(", ")})"
                 }
-                is ComputedFieldShape.NestedRecord -> return null
             }
         namedArgs += "${field.ktName} = $fieldValueExpr"
     }
@@ -1531,27 +1392,19 @@ private fun resolveFnReturnDefaultExpr(
     classifyBuiltinLeaf: (String, String) -> Pair<String?, String?>,
 ): String {
     if (retTokens.isEmpty()) return "Unit"
-    val first = retTokens[0]
-    if (retTokens.size == 1 && first is TokenTree.Group && first.value.delimiter() == Delimiter.Parenthesis) {
-        if (first.value.stream().isEmpty()) return "Unit"
-    }
-    if (first is TokenTree.Punct && first.value.asChar() == '*') {
-        val qual = (retTokens.getOrNull(1) as? TokenTree.Ident)?.value?.toString()
-        return if (rawAbiMode) {
-            "0L"
-        } else if (qual == "mut") {
-            "MutPtr(0L)"
-        } else {
-            "ConstPtr(0L)"
+    val retSlice = RustTypeSliceInspector(retTokens)
+    if (retSlice.isUnitParens()) return "Unit"
+    if (retSlice.punctCharAt(0) == '*') {
+        val qual = retSlice.identAt(1)
+        return when {
+            rawAbiMode -> "0L"
+            qual == "mut" -> "MutPtr(0L)"
+            else -> "ConstPtr(0L)"
         }
     }
-    val retSlice = RustTypeSliceInspector(retTokens)
-    if (retSlice.extractOptionAngleInnerTokens() != null) {
-        return "null"
-    }
+    if (retSlice.extractOptionAngleInnerTokens() != null) return "null"
     val leaf = retSlice.simplePathLeafIdent() ?: return "Unit"
-    val (bDef, _) = classifyBuiltinLeaf(leaf, ownerKtName)
-    if (bDef != null) return bDef
+    classifyBuiltinLeaf(leaf, ownerKtName).first?.let { return it }
     val retKt = KotlinNamingPolicy.Default.toTypeIdentifier(leaf, allowRawAbi = rawAbiMode)
     val scopedRet = if (subpkg.isEmpty()) retKt else "$subpkg.$retKt"
     return aliasDefaults[scopedRet] ?: aliasDefaults[retKt] ?: if (rawAbiMode) "$retKt()" else "Unit"
@@ -1564,13 +1417,11 @@ private fun buildFnPtrInvokeTemplate(
     aliasDefaults: Map<String, String>,
     valueParamPackTemplates: Map<String, String>,
 ): String? {
-    val arity = spec.paramTokenLists.size
-    val paramNames = (0 until arity).map { "p$it" }
+    val paramNames = (0 until spec.paramTokenLists.size).map { "p$it" }
     val slotExprs =
         spec.paramTokenLists.mapIndexed { idx, paramTokens ->
             val pName = paramNames[idx]
-            val pKind = resolveTokenTypeScalarKind(paramTokens, spec.subpkg, rawAbiMode, numericKinds, aliasDefaults)
-            when (pKind) {
+            when (resolveTokenTypeScalarKind(paramTokens, spec.subpkg, rawAbiMode, numericKinds, aliasDefaults)) {
                 "BOOL" -> "if ($pName) 1L else 0L"
                 "I64" -> pName
                 "F32" -> "($pName.toRawBits().toLong() and 0xFFFF_FFFFL)"
@@ -1580,9 +1431,7 @@ private fun buildFnPtrInvokeTemplate(
                     val leaf = RustTokenCursor(paramTokens).simplePathLeafIdent()
                     val ktIdent = leaf?.let { KotlinNamingPolicy.Default.toTypeIdentifier(it, allowRawAbi = rawAbiMode) }
                     val scoped = if (ktIdent != null && spec.subpkg.isNotEmpty()) "${spec.subpkg}.$ktIdent" else ktIdent
-                    val packTpl =
-                        (scoped?.let { valueParamPackTemplates[it] })
-                            ?: (ktIdent?.let { valueParamPackTemplates[it] })
+                    val packTpl = scoped?.let(valueParamPackTemplates::get) ?: ktIdent?.let(valueParamPackTemplates::get)
                     packTpl?.replace("__SELF__", pName) ?: "__FFI__.objectSlot($pName)"
                 }
             }
@@ -1594,25 +1443,11 @@ private fun buildFnPtrInvokeTemplate(
             invokeExpr
         } else {
             val retKind = resolveTokenTypeScalarKind(spec.retTokens, spec.subpkg, rawAbiMode, numericKinds, aliasDefaults)
-            when (retKind) {
-                "I8" -> "$invokeExpr.toByte()"
-                "U8" -> "$invokeExpr.toUByte()"
-                "I16" -> "$invokeExpr.toShort()"
-                "U16" -> "$invokeExpr.toUShort()"
-                "I32" -> "$invokeExpr.toInt()"
-                "U32" -> "$invokeExpr.toUInt()"
-                "I64" -> invokeExpr
-                "U64" -> "$invokeExpr.toULong()"
-                "F32" -> "Float.fromBits($invokeExpr.toInt())"
-                "F64" -> "Double.fromBits($invokeExpr)"
-                "BOOL" -> "(($invokeExpr and 0xFFL) != 0L)"
-                else -> {
-                    if (specRetSlice.extractOptionAngleInnerTokens() != null) {
-                        "run { $invokeExpr; null }"
-                    } else {
-                        return null
-                    }
-                }
+            val coerced = retKind?.let { coerceRawLongToScalarKind(invokeExpr, it, boolMask = "0xFFL") }
+            when {
+                coerced != null -> coerced
+                specRetSlice.extractOptionAngleInnerTokens() != null -> "run { $invokeExpr; null }"
+                else -> return null
             }
         }
     val lambdaHeader = if (paramNames.isEmpty()) "" else "${paramNames.joinToString(", ")} -> "
@@ -1706,7 +1541,8 @@ internal fun discoverExternalCrateAbiFromDisk(
             if (!isKmRegularFile(propsFile)) {
                 null
             } else {
-                parseRustKotlinProperties(readKmFileText(propsFile)).projectNamespace?.trim()?.removeSuffix(".")
+                val parsed = parseRustKotlinProperties(readKmFileText(propsFile))
+                parsed.projectNamespace?.trim()?.removeSuffix(".")
             }
         }
 
@@ -1735,8 +1571,7 @@ internal fun discoverExternalCrateAbiFromDisk(
         }
         val exactPropsNsRoot =
             candidateRepos.firstNotNullOfOrNull { dir ->
-                val propsNs = readRepoPropsNs(dir) ?: return@firstNotNullOfOrNull null
-                if (propsNs != crateNs) return@firstNotNullOfOrNull null
+                if (readRepoPropsNs(dir) != crateNs) return@firstNotNullOfOrNull null
                 KmPath(dir, "src/common/commonMain/kotlin").takeIf(::isKmDirectory)
             }
         val prefixRoot =
@@ -1782,13 +1617,11 @@ internal fun discoverExternalCrateAbiFromDisk(
     val unitEnumVariants = linkedSetOf<String>()
 
     for (matched in matchedCrates) {
-        val crateKey = matched.crateKey
-        val crateNs = matched.crateNs
         val pkgMapBySym = linkedMapOf<String, LinkedHashSet<String>>()
         for (ktFile in matched.ktFiles) {
             ExternalKotlinSymbolWalker(
                 sourceText = readKmFileText(ktFile),
-                expectedCrateNs = crateNs,
+                expectedCrateNs = matched.crateNs,
                 pkgMapBySym = pkgMapBySym,
                 twoFieldResultFns = twoFieldResultFns,
                 nullableReturnFns = nullableReturnFns,
@@ -1799,11 +1632,11 @@ internal fun discoverExternalCrateAbiFromDisk(
             ).scan()
         }
         if (pkgMapBySym.isNotEmpty()) {
-            symbolPackages[crateKey] =
+            symbolPackages[matched.crateKey] =
                 pkgMapBySym.mapValues { (_, pkgs) ->
                     pkgs.sortedWith(
                         compareBy<String>(
-                            { it != crateNs },
+                            { it != matched.crateNs },
                             { ".generic." in it || it.endsWith(".generic") },
                             { it.count { ch -> ch == '.' } },
                             { it },
@@ -1824,11 +1657,7 @@ internal fun discoverExternalCrateAbiFromDisk(
             unitEnumVariants = unitEnumVariants,
         )
     if (symbolPackages.isNotEmpty()) {
-        if (diskExternalCrateAbiCache.size >= 32) {
-            diskExternalCrateAbiCache = mapOf(cacheKey to metadata)
-        } else {
-            diskExternalCrateAbiCache = diskExternalCrateAbiCache + (cacheKey to metadata)
-        }
+        diskExternalCrateAbiCache = putBoundedCacheEntry(diskExternalCrateAbiCache, 32, cacheKey, metadata)
     }
     return metadata
 }
@@ -1870,26 +1699,17 @@ private class ExternalKotlinSymbolWalker(
     }
 
     private fun parsePackageHeader(): String? {
-        var idx = nextNonTriviaIndex(0)
-        while (punctAt(idx) == '@') {
-            idx = nextNonTriviaIndex(skipAnnotation(idx))
-        }
+        val idx = skipLeadingAnnotations(nextNonTriviaIndex(0))
         if (identTextAt(idx) != "package") return null
-        val (pkg, _) = readDottedIdentifier(nextNonTriviaIndex(idx + 1)) ?: return null
-        return pkg
+        return readDottedIdentifier(nextNonTriviaIndex(idx + 1))?.first
     }
 
-    private fun readDottedIdentifier(startIdx: Int, limit: Int = tokens.size): Pair<String, Int>? {
-        val first = identTextAt(startIdx) ?: return null
-        val sb = StringBuilder(first)
-        var cur = nextNonTriviaIndex(startIdx + 1, limit)
-        while (punctAt(cur) == '.') {
-            val segIdx = nextNonTriviaIndex(cur + 1, limit)
-            val seg = identTextAt(segIdx) ?: break
-            sb.append('.').append(seg)
-            cur = nextNonTriviaIndex(segIdx + 1, limit)
+    private fun skipLeadingAnnotations(startIdx: Int, limit: Int = tokens.size): Int {
+        var idx = startIdx
+        while (punctAt(idx) == '@') {
+            idx = nextNonTriviaIndex(skipAnnotation(idx, limit), limit)
         }
-        return sb.toString() to cur
+        return idx
     }
 
     private fun recordExternalVariantArity(
@@ -1925,17 +1745,12 @@ private class ExternalKotlinSymbolWalker(
 
         while (idx < endExclusive) {
             val tok = tokens[idx]
-            if (tok is KotlinLexToken.Whitespace ||
-                tok is KotlinLexToken.LineComment ||
-                tok is KotlinLexToken.BlockComment
-            ) {
+            if (tok is KotlinLexToken.Whitespace || tok is KotlinLexToken.LineComment || tok is KotlinLexToken.BlockComment) {
                 idx++
                 continue
             }
             if (tok is KotlinLexToken.Newline) {
-                if (parenDepth == 0 && bracketDepth == 0) {
-                    atStatementStart = true
-                }
+                if (parenDepth == 0 && bracketDepth == 0) atStatementStart = true
                 idx++
                 continue
             }
@@ -1984,10 +1799,7 @@ private class ExternalKotlinSymbolWalker(
         ownerCls: String?,
         inCompanion: Boolean,
     ): Int? {
-        var cur = declStartIdx
-        while (punctAt(cur) == '@') {
-            cur = nextNonTriviaIndex(skipAnnotation(cur, endExclusive), endExclusive)
-        }
+        var cur = skipLeadingAnnotations(declStartIdx, endExclusive)
         val modifiers = linkedSetOf<String>()
         while (cur < endExclusive) {
             val mod = identTextAt(cur) ?: break
@@ -2053,10 +1865,7 @@ private class ExternalKotlinSymbolWalker(
             }
         }
 
-        var ctorScan = afterName
-        while (punctAt(ctorScan) == '@') {
-            ctorScan = nextNonTriviaIndex(skipAnnotation(ctorScan, endExclusive), endExclusive)
-        }
+        var ctorScan = skipLeadingAnnotations(afterName, endExclusive)
         while (identTextAt(ctorScan) in setOf("public", "internal", "private", "protected")) {
             ctorScan = nextNonTriviaIndex(ctorScan + 1, endExclusive)
         }
@@ -2085,9 +1894,7 @@ private class ExternalKotlinSymbolWalker(
                     tupleStructArity.putIfMissing(clsName, 1)
                 } else if (ctorNames.size >= 2 && ctorNames[0] in setOf("field0", "field0CtorArg")) {
                     val fieldCount = ctorNames.count { TUPLE_CTOR_FIELD_REGEX.matches(it) }
-                    if (fieldCount >= 2) {
-                        tupleStructArity.putIfMissing(clsName, fieldCount)
-                    }
+                    if (fieldCount >= 2) tupleStructArity.putIfMissing(clsName, fieldCount)
                 }
                 if ("data" in modifiers && declKw == "class" && countPrimaryCtorProperties(openParenIdx, closeParenIdx) == 2) {
                     twoFieldClasses += clsName
@@ -2130,8 +1937,7 @@ private class ExternalKotlinSymbolWalker(
         endExclusive: Int,
     ) {
         if ("data" in modifiers && declKw == "object" && punctAt(afterHeaderIdx) == ':') {
-            val baseOwner = identTextAt(nextNonTriviaIndex(afterHeaderIdx + 1, endExclusive))
-            if (baseOwner == ownerCls) {
+            if (identTextAt(nextNonTriviaIndex(afterHeaderIdx + 1, endExclusive)) == ownerCls) {
                 recordExternalVariantArity(ownerCls, variantName, 0, isUnit = false)
             }
             return
@@ -2140,9 +1946,7 @@ private class ExternalKotlinSymbolWalker(
             val typeArity = splitTopLevelCommaList(typeParamSlice).size
             if (typeArity <= 0) return
             val baseIdx = nextNonTriviaIndex(afterHeaderIdx + 1, endExclusive)
-            if (identTextAt(baseIdx) != ownerCls || punctAt(nextNonTriviaIndex(baseIdx + 1, endExclusive)) != '<') {
-                return
-            }
+            if (identTextAt(baseIdx) != ownerCls || punctAt(nextNonTriviaIndex(baseIdx + 1, endExclusive)) != '<') return
             val isEmptyUnitParens =
                 !hasExplicitCtorKw &&
                     "data" !in modifiers &&
@@ -2154,27 +1958,22 @@ private class ExternalKotlinSymbolWalker(
     private fun findDeclarationBodyBrace(afterHeaderIdx: Int, endExclusive: Int): Int {
         if (punctAt(afterHeaderIdx) == '{') return afterHeaderIdx
         if (punctAt(afterHeaderIdx) != ':' && identTextAt(afterHeaderIdx) != "where") return -1
-        var k = afterHeaderIdx
-        var parenDepth = 0
-        var angleDepth = 0
-        while (k < endExclusive) {
-            val tok = tokens[k]
-            if (tok is KotlinLexToken.Newline && parenDepth == 0 && angleDepth == 0) {
-                val next = nextNonTriviaIndex(k + 1, endExclusive)
-                if (startsSiblingDeclaration(next, endExclusive)) return -1
-            } else if (tok.interpolationDepth == 0 && tok is KotlinLexToken.Punct) {
-                when (tok.ch) {
-                    '(' -> parenDepth++
-                    ')' -> if (parenDepth > 0) parenDepth--
-                    '<' -> angleDepth++
-                    '>' -> if (angleDepth > 0) angleDepth--
-                    '{' -> if (parenDepth == 0 && angleDepth == 0) return k
-                    ';' -> if (parenDepth == 0 && angleDepth == 0) return -1
-                }
+        var foundBrace = -1
+        walkTopLevelTokens(afterHeaderIdx, endExclusive) { idx, tok, isAtTopLevel ->
+            if (!isAtTopLevel) return@walkTopLevelTokens true
+            if (tok is KotlinLexToken.Newline && startsSiblingDeclaration(nextNonTriviaIndex(idx + 1, endExclusive), endExclusive)) {
+                return@walkTopLevelTokens false
             }
-            k++
+            when (punctAt(idx)) {
+                '{' -> {
+                    foundBrace = idx
+                    false
+                }
+                ';' -> false
+                else -> true
+            }
         }
-        return -1
+        return foundBrace
     }
 
     private fun startsSiblingDeclaration(tokenIdx: Int, endExclusive: Int): Boolean {
@@ -2209,13 +2008,8 @@ private class ExternalKotlinSymbolWalker(
         val paramNames = extractNonDefaultParamNames(parenIdx, closeParen)
         if (paramNames.isNotEmpty()) {
             val shape = paramNames.size to paramNames
-            if (ownerCls == null) {
-                fnConstParams.putIfMissing("$packageName.$fnName", shape)
-                fnConstParams.putIfMissing(fnName, shape)
-            } else {
-                fnConstParams.putIfMissing("$packageName.$ownerCls.$fnName", shape)
-                fnConstParams.putIfMissing("$ownerCls.$fnName", shape)
-            }
+            val simpleKey = if (ownerCls == null) fnName else "$ownerCls.$fnName"
+            fnConstParams.putScopedAndSimpleIfMissing(packageName, simpleKey, shape)
         }
         if (ownerCls != null) return
 
@@ -2237,39 +2031,19 @@ private class ExternalKotlinSymbolWalker(
         }
 
         val retTokens = mutableListOf<KotlinLexToken>()
-        var k = retStart
-        var angleDepth = 0
-        var parenDepth = 0
-        var bracketDepth = 0
-        while (k < endExclusive) {
-            val tok = tokens[k]
-            val atTop = angleDepth == 0 && parenDepth == 0 && bracketDepth == 0
-            if (atTop) {
-                if (tok is KotlinLexToken.Newline && startsSiblingDeclaration(nextNonTriviaIndex(k + 1, endExclusive), endExclusive)) {
-                    break
+        walkTopLevelTokens(retStart, endExclusive) { idx, tok, isAtTopLevel ->
+            if (isAtTopLevel) {
+                if (tok is KotlinLexToken.Newline && startsSiblingDeclaration(nextNonTriviaIndex(idx + 1, endExclusive), endExclusive)) {
+                    return@walkTopLevelTokens false
                 }
-                if (identTextAt(k) == "where") break
-                val ch = punctAt(k)
-                if (ch == '=' || ch == '{' || ch == ';') break
+                if (identTextAt(idx) == "where") return@walkTopLevelTokens false
+                val ch = punctAt(idx)
+                if (ch == '=' || ch == '{' || ch == ';') return@walkTopLevelTokens false
             }
-            if (tok.interpolationDepth == 0 && tok is KotlinLexToken.Punct) {
-                when (tok.ch) {
-                    '<' -> angleDepth++
-                    '>' -> if (angleDepth > 0) angleDepth--
-                    '(' -> parenDepth++
-                    ')' -> if (parenDepth > 0) parenDepth--
-                    '[' -> bracketDepth++
-                    ']' -> if (bracketDepth > 0) bracketDepth--
-                }
-            }
-            if (tok !is KotlinLexToken.Whitespace &&
-                tok !is KotlinLexToken.Newline &&
-                tok !is KotlinLexToken.LineComment &&
-                tok !is KotlinLexToken.BlockComment
-            ) {
+            if (!isTriviaToken(tok)) {
                 retTokens += tok
             }
-            k++
+            true
         }
         if (retTokens.isEmpty()) return
         val lastTok = retTokens.last()
@@ -2311,73 +2085,25 @@ private class ExternalKotlinSymbolWalker(
         }
     }
 
-    private fun splitParameterTokenClauses(openParenIdx: Int, closeParenIdx: Int): List<IntRange> {
-        val clauses = mutableListOf<IntRange>()
-        var clauseStart = openParenIdx + 1
-        var angleDepth = 0
-        var parenDepth = 0
-        var bracketDepth = 0
-        var braceDepth = 0
-        for (k in (openParenIdx + 1) until closeParenIdx) {
-            val ch = punctAt(k) ?: continue
-            when (ch) {
-                '<' -> angleDepth++
-                '>' -> if (angleDepth > 0) angleDepth--
-                '(' -> parenDepth++
-                ')' -> if (parenDepth > 0) parenDepth--
-                '[' -> bracketDepth++
-                ']' -> if (bracketDepth > 0) bracketDepth--
-                '{' -> braceDepth++
-                '}' -> if (braceDepth > 0) braceDepth--
-                ',' ->
-                    if (angleDepth == 0 && parenDepth == 0 && bracketDepth == 0 && braceDepth == 0) {
-                        clauses += clauseStart until k
-                        clauseStart = k + 1
-                    }
-            }
-        }
-        if (clauseStart < closeParenIdx) {
-            clauses += clauseStart until closeParenIdx
-        }
-        return clauses
-    }
-
     private fun extractNonDefaultParamNames(openParenIdx: Int, closeParenIdx: Int): List<String> {
         val names = mutableListOf<String>()
-        for (range in splitParameterTokenClauses(openParenIdx, closeParenIdx)) {
+        for (range in splitTopLevelCommaTokenRanges(openParenIdx + 1, closeParenIdx)) {
             val rangeEnd = range.last + 1
-            var k = nextNonTriviaIndex(range.first, rangeEnd)
-            while (punctAt(k) == '@') {
-                k = nextNonTriviaIndex(skipAnnotation(k, rangeEnd), rangeEnd)
-            }
-            if (k >= rangeEnd) continue
+            val start = skipLeadingAnnotations(nextNonTriviaIndex(range.first, rangeEnd), rangeEnd)
+            if (start >= rangeEnd) continue
             var colonIdx = -1
             var hasDefault = false
-            var angleDepth = 0
-            var parenDepth = 0
-            var bracketDepth = 0
-            while (k < rangeEnd) {
-                val ch = punctAt(k)
-                if (ch != null) {
-                    when (ch) {
-                        '<' -> angleDepth++
-                        '>' -> if (angleDepth > 0) angleDepth--
-                        '(' -> parenDepth++
-                        ')' -> if (parenDepth > 0) parenDepth--
-                        '[' -> bracketDepth++
-                        ']' -> if (bracketDepth > 0) bracketDepth--
-                        ':' ->
-                            if (colonIdx < 0 && angleDepth == 0 && parenDepth == 0 && bracketDepth == 0) {
-                                colonIdx = k
-                            }
-                        '=' ->
-                            if (angleDepth == 0 && parenDepth == 0 && bracketDepth == 0) {
-                                hasDefault = true
-                                break
-                            }
+            walkTopLevelTokens(start, rangeEnd) { idx, _, isAtTopLevel ->
+                if (isAtTopLevel) {
+                    when (punctAt(idx)) {
+                        ':' -> if (colonIdx < 0) colonIdx = idx
+                        '=' -> {
+                            hasDefault = true
+                            return@walkTopLevelTokens false
+                        }
                     }
                 }
-                k++
+                true
             }
             if (hasDefault || colonIdx <= range.first) continue
             val prevTok = previousNonTriviaToken(colonIdx)
@@ -2396,15 +2122,11 @@ private class ExternalKotlinSymbolWalker(
 
     private fun countPrimaryCtorProperties(openParenIdx: Int, closeParenIdx: Int): Int {
         var count = 0
-        for (range in splitParameterTokenClauses(openParenIdx, closeParenIdx)) {
+        for (range in splitTopLevelCommaTokenRanges(openParenIdx + 1, closeParenIdx)) {
             val rangeEnd = range.last + 1
-            var k = nextNonTriviaIndex(range.first, rangeEnd)
-            while (punctAt(k) == '@') {
-                k = nextNonTriviaIndex(skipAnnotation(k, rangeEnd), rangeEnd)
-            }
+            var k = skipLeadingAnnotations(nextNonTriviaIndex(range.first, rangeEnd), rangeEnd)
             while (k < rangeEnd) {
-                val ch = punctAt(k)
-                if (ch == ':') break
+                if (punctAt(k) == ':') break
                 val word = identTextAt(k)
                 if (word == "val" || word == "var") {
                     count++

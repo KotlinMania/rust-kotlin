@@ -6,14 +6,15 @@ import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.Fields
 import io.github.kotlinmania.syn.FnArg
-import io.github.kotlinmania.syn.GenericArgument
 import io.github.kotlinmania.syn.GenericParam
 import io.github.kotlinmania.syn.Generics
 import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.Lit
 import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.Pat
+import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
+import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.ReceiverKind
 import io.github.kotlinmania.syn.Signature
 import io.github.kotlinmania.syn.SynType
@@ -85,6 +86,13 @@ public object StructLayoutComputer {
         return if (rem == 0L) offset else offset + (align - rem)
     }
 
+    private fun parsePowerOfTwoGroupArg(tokens: List<TokenTree>, nextIndex: Int): Long? {
+        val nextGroup = tokens.getOrNull(nextIndex) as? TokenTree.Group ?: return null
+        val streamText = nextGroup.value.stream().toString()
+        val parsed = streamText.trim().toLongOrNull() ?: return null
+        return parsed.takeIf { it > 0L && (it and (it - 1L)) == 0L }
+    }
+
     public fun parseStructRepr(attrs: List<Attribute>): StructReprSpec {
         var isReprC = false
         var isTransparent = false
@@ -97,21 +105,13 @@ public object StructLayoutComputer {
             val tokens = repr.tokens.clone().toList()
             var index = 0
             while (index < tokens.size) {
-                val ident = (tokens[index] as? TokenTree.Ident)?.value?.toString()
-                when (ident) {
+                when ((tokens[index] as? TokenTree.Ident)?.value?.toString()) {
                     "C" -> isReprC = true
                     "transparent" -> isTransparent = true
                     "packed" -> {
-                        val nextGroup = tokens.getOrNull(index + 1) as? TokenTree.Group
-                        val parsedN =
-                            nextGroup
-                                ?.value
-                                ?.stream()
-                                ?.toString()
-                                ?.trim()
-                                ?.toLongOrNull()
+                        val parsedN = parsePowerOfTwoGroupArg(tokens, index + 1)
                         val packVal =
-                            if (parsedN != null && parsedN > 0L && (parsedN and (parsedN - 1L)) == 0L) {
+                            if (parsedN != null) {
                                 index++
                                 parsedN
                             } else {
@@ -120,15 +120,7 @@ public object StructLayoutComputer {
                         packedAlign = packedAlign?.let { minOf(it, packVal) } ?: packVal
                     }
                     "align" -> {
-                        val nextGroup = tokens.getOrNull(index + 1) as? TokenTree.Group
-                        val parsedN =
-                            nextGroup
-                                ?.value
-                                ?.stream()
-                                ?.toString()
-                                ?.trim()
-                                ?.toLongOrNull()
-                        if (parsedN != null && parsedN > 0L && (parsedN and (parsedN - 1L)) == 0L) {
+                        parsePowerOfTwoGroupArg(tokens, index + 1)?.let { parsedN ->
                             explicitAlign = explicitAlign?.let { maxOf(it, parsedN) } ?: parsedN
                             index++
                         }
@@ -177,21 +169,6 @@ public object StructLayoutComputer {
         }
         return computed
     }
-
-    private val PRIMITIVE_KOTLIN_ARRAY_TYPES: Set<String> =
-        setOf(
-            "BooleanArray",
-            "ByteArray",
-            "UByteArray",
-            "ShortArray",
-            "UShortArray",
-            "IntArray",
-            "UIntArray",
-            "LongArray",
-            "ULongArray",
-            "FloatArray",
-            "DoubleArray",
-        )
 
     internal fun shouldEmitStructTypeLayout(
         item: Item.Struct,
@@ -522,7 +499,7 @@ public object StructLayoutComputer {
         }
         if (resolved is SynType.Ptr) {
             val pointeeKt = emitter.renderType(resolved.elem, selfTypeName)
-            val isMut = resolved.mutability is io.github.kotlinmania.syn.PointerMutability.Mut
+            val isMut = resolved.mutability is PointerMutability.Mut
             val factory = if (isMut) "mutPtrLayout" else "constPtrLayout"
             val primitiveLayoutsRef = qualOrImportMemSymbol("PrimitiveLayouts", memPkg, emitter)
             return FieldLayoutSpec(
@@ -578,35 +555,19 @@ public object StructLayoutComputer {
                 layoutExpr = layoutExpr,
             )
         }
-        val path = (resolved as? SynType.Path)?.takeIf { it.qself == null }?.path ?: return null
+        val path = resolved.unqualifiedPath() ?: return null
         if (path.segments.last()?.arguments !is PathArguments.None) return null
-        val singleIdent =
-            path.segments
-                .toList()
-                .singleOrNull()
-                ?.ident
-                ?.toString()
-                ?.removePrefix("r#")
+        val singleSeg = path.segments.toList().singleOrNull()
+        val singleIdent = singleSeg?.cleanIdent()
         if (singleIdent != null) {
             val ktParam = rustTypeIdentToKotlin(singleIdent)
             val paramLayoutVar = genericParamLayouts[ktParam]
             if (paramLayoutVar != null) {
                 usedTypeParams += ktParam
-                return FieldLayoutSpec(
-                    staticSize = null,
-                    staticAlign = null,
-                    sizeExpr = "$paramLayoutVar.sizeBytes",
-                    alignExpr = "$paramLayoutVar.alignBytes",
-                    layoutExpr = paramLayoutVar,
-                )
+                return FieldLayoutSpec(null, null, "$paramLayoutVar.sizeBytes", "$paramLayoutVar.alignBytes", paramLayoutVar)
             }
         }
-        val targetLeaf =
-            path.segments
-                .last()
-                ?.ident
-                ?.toString()
-                ?.removePrefix("r#") ?: return null
+        val targetLeaf = path.lastCleanIdent() ?: return null
         scalarLayoutSpec(targetLeaf, cleanRenderedKt, ptrBytes, memPkg, emitter)?.let { return it }
         val targetKt = rustTypeIdentToKotlin(targetLeaf)
         val nestedDecl = emitter.sameFileUniqueSimpleStruct(targetKt)
@@ -635,72 +596,43 @@ public object StructLayoutComputer {
         emitter: KotlinJ2KEmitter,
     ): FieldLayoutSpec? {
         val primitiveLayoutsRef = qualOrImportMemSymbol("PrimitiveLayouts", memPkg, emitter)
-        if (renderedFieldKt == "Boolean") {
-            return FieldLayoutSpec(1L, 1L, "1L", "1L", "$primitiveLayoutsRef.BOOL")
-        }
-        if (renderedFieldKt == "Char") {
-            return FieldLayoutSpec(4L, 4L, "4L", "4L", "$primitiveLayoutsRef.CHAR")
-        }
-        if (renderedFieldKt == "F16") {
-            return FieldLayoutSpec(2L, 2L, "2L", "2L", "$primitiveLayoutsRef.F16_LAYOUT")
-        }
-        if (renderedFieldKt == "F128") {
-            return FieldLayoutSpec(16L, 16L, "16L", "16L", "$primitiveLayoutsRef.F128_LAYOUT")
+
+        fun fixed(bytes: Long, member: String): FieldLayoutSpec =
+            FieldLayoutSpec(bytes, bytes, "${bytes}L", "${bytes}L", "$primitiveLayoutsRef.$member")
+
+        when (renderedFieldKt) {
+            "Boolean" -> return fixed(1L, "BOOL")
+            "Char" -> return fixed(4L, "CHAR")
+            "F16" -> return fixed(2L, "F16_LAYOUT")
+            "F128" -> return fixed(16L, "F128_LAYOUT")
         }
         val numKind = emitter.resolveNumericKind(renderedFieldKt) ?: return null
-        if (numKind == NumericKind.I32 && rustLeafIdent == "isize") {
-            val layoutConst = if (ptrBytes == 8L) "ISIZE64" else "ISIZE32"
-            return FieldLayoutSpec(ptrBytes, ptrBytes, "${ptrBytes}L", "${ptrBytes}L", "$primitiveLayoutsRef.$layoutConst")
-        }
-        if (numKind == NumericKind.I32 && rustLeafIdent == "usize") {
-            val layoutConst = if (ptrBytes == 8L) "USIZE64" else "USIZE32"
-            return FieldLayoutSpec(ptrBytes, ptrBytes, "${ptrBytes}L", "${ptrBytes}L", "$primitiveLayoutsRef.$layoutConst")
+        if (numKind == NumericKind.I32 && (rustLeafIdent == "isize" || rustLeafIdent == "usize")) {
+            val prefix = if (rustLeafIdent == "isize") "ISIZE" else "USIZE"
+            return fixed(ptrBytes, "$prefix${if (ptrBytes == 8L) "64" else "32"}")
         }
         return when (numKind) {
-            NumericKind.I8 -> FieldLayoutSpec(1L, 1L, "1L", "1L", "$primitiveLayoutsRef.I8")
-            NumericKind.U8 -> FieldLayoutSpec(1L, 1L, "1L", "1L", "$primitiveLayoutsRef.U8")
-            NumericKind.I16 -> FieldLayoutSpec(2L, 2L, "2L", "2L", "$primitiveLayoutsRef.I16")
-            NumericKind.U16 -> FieldLayoutSpec(2L, 2L, "2L", "2L", "$primitiveLayoutsRef.U16")
-            NumericKind.I32 -> FieldLayoutSpec(4L, 4L, "4L", "4L", "$primitiveLayoutsRef.I32")
-            NumericKind.U32 -> FieldLayoutSpec(4L, 4L, "4L", "4L", "$primitiveLayoutsRef.U32")
-            NumericKind.F16 -> FieldLayoutSpec(2L, 2L, "2L", "2L", "$primitiveLayoutsRef.F16_LAYOUT")
-            NumericKind.F32 -> FieldLayoutSpec(4L, 4L, "4L", "4L", "$primitiveLayoutsRef.F32")
-            NumericKind.I64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$primitiveLayoutsRef.I64")
-            NumericKind.U64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$primitiveLayoutsRef.U64")
-            NumericKind.F64 -> FieldLayoutSpec(8L, 8L, "8L", "8L", "$primitiveLayoutsRef.F64")
-            NumericKind.F128 -> FieldLayoutSpec(16L, 16L, "16L", "16L", "$primitiveLayoutsRef.F128_LAYOUT")
-            NumericKind.I128 ->
-                FieldLayoutSpec(
-                    16L,
-                    16L,
-                    "16L",
-                    "16L",
-                    "$primitiveLayoutsRef.i128Layout(::I128, { it.high }, { it.low })",
-                )
-            NumericKind.U128 ->
-                FieldLayoutSpec(
-                    16L,
-                    16L,
-                    "16L",
-                    "16L",
-                    "$primitiveLayoutsRef.u128Layout(::U128, { it.high }, { it.low })",
-                )
+            NumericKind.I8 -> fixed(1L, "I8")
+            NumericKind.U8 -> fixed(1L, "U8")
+            NumericKind.I16 -> fixed(2L, "I16")
+            NumericKind.U16 -> fixed(2L, "U16")
+            NumericKind.I32 -> fixed(4L, "I32")
+            NumericKind.U32 -> fixed(4L, "U32")
+            NumericKind.F16 -> fixed(2L, "F16_LAYOUT")
+            NumericKind.F32 -> fixed(4L, "F32")
+            NumericKind.I64 -> fixed(8L, "I64")
+            NumericKind.U64 -> fixed(8L, "U64")
+            NumericKind.F64 -> fixed(8L, "F64")
+            NumericKind.F128 -> fixed(16L, "F128_LAYOUT")
+            NumericKind.I128 -> fixed(16L, "i128Layout(::I128, { it.high }, { it.low })")
+            NumericKind.U128 -> fixed(16L, "u128Layout(::U128, { it.high }, { it.low })")
         }
     }
 
     private fun extractStaticIntLiteral(expr: Expr): Long? {
-        var cur = expr
-        while (true) {
-            cur =
-                when (cur) {
-                    is Expr.Paren -> cur.expr
-                    is Expr.Group -> cur.expr
-                    else -> break
-                }
-        }
-        val lit = (cur as? Expr.Lit)?.lit as? Lit.Int ?: return null
-        val digits = lit.value.base10Digits()
-        return digits.toLongOrNull()
+        val unwrapped = unwrapExprParens(expr)
+        val lit = (unwrapped as? Expr.Lit)?.lit as? Lit.Int ?: return null
+        return lit.value.base10Digits().toLongOrNull()
     }
 
     private fun adaptReadExprForFieldType(
@@ -712,39 +644,21 @@ public object StructLayoutComputer {
         if (fieldLayoutExpr.contains("PrimitiveArrayLayouts.")) {
             return if (clean.startsWith("MutableList<")) "$rawReadExpr.toMutableList()" else rawReadExpr
         }
-        return when (clean) {
-            "BooleanArray" -> "$rawReadExpr.toBooleanArray()"
-            "ByteArray" -> "$rawReadExpr.toByteArray()"
-            "UByteArray" -> "$rawReadExpr.toUByteArray()"
-            "ShortArray" -> "$rawReadExpr.toShortArray()"
-            "UShortArray" -> "$rawReadExpr.toUShortArray()"
-            "IntArray" -> "$rawReadExpr.toIntArray()"
-            "UIntArray" -> "$rawReadExpr.toUIntArray()"
-            "LongArray" -> "$rawReadExpr.toLongArray()"
-            "ULongArray" -> "$rawReadExpr.toULongArray()"
-            "FloatArray" -> "$rawReadExpr.toFloatArray()"
-            "DoubleArray" -> "$rawReadExpr.toDoubleArray()"
-            else -> {
-                val inner2d =
-                    if (clean.startsWith("List<") && clean.endsWith(">")) {
-                        clean.removePrefix("List<").removeSuffix(">").trim()
-                    } else {
-                        null
-                    }
-                if (inner2d != null && inner2d in PRIMITIVE_KOTLIN_ARRAY_TYPES) {
-                    "$rawReadExpr.map { ${adaptReadExprForFieldType("it", inner2d, "")} }"
-                } else if (clean.startsWith("MutableList<")) {
-                    val innerMut = clean.removePrefix("MutableList<").removeSuffix(">").trim()
-                    if (innerMut in PRIMITIVE_KOTLIN_ARRAY_TYPES) {
-                        "$rawReadExpr.map { ${adaptReadExprForFieldType("it", innerMut, "")} }.toMutableList()"
-                    } else {
-                        "$rawReadExpr.toMutableList()"
-                    }
-                } else {
-                    rawReadExpr
-                }
+        PrimitiveArrayTypeCatalog.toArrayMethodName(clean)?.let { return "$rawReadExpr.$it()" }
+        if (clean.startsWith("List<") && clean.endsWith(">")) {
+            val inner2d = clean.removePrefix("List<").removeSuffix(">").trim()
+            if (PrimitiveArrayTypeCatalog.isPrimitiveArrayType(inner2d)) {
+                return "$rawReadExpr.map { ${adaptReadExprForFieldType("it", inner2d, "")} }"
+            }
+        } else if (clean.startsWith("MutableList<")) {
+            val innerMut = clean.removePrefix("MutableList<").removeSuffix(">").trim()
+            return if (PrimitiveArrayTypeCatalog.isPrimitiveArrayType(innerMut)) {
+                "$rawReadExpr.map { ${adaptReadExprForFieldType("it", innerMut, "")} }.toMutableList()"
+            } else {
+                "$rawReadExpr.toMutableList()"
             }
         }
+        return rawReadExpr
     }
 
     private fun adaptWriteValueExprForFieldType(
@@ -752,25 +666,20 @@ public object StructLayoutComputer {
         ktFieldType: String,
         fieldLayoutExpr: String,
     ): String {
-        if (fieldLayoutExpr.contains("PrimitiveArrayLayouts.")) {
-            return rawValueExpr
-        }
+        if (fieldLayoutExpr.contains("PrimitiveArrayLayouts.")) return rawValueExpr
         val clean = ktFieldType.trim()
-        if (clean in PRIMITIVE_KOTLIN_ARRAY_TYPES) {
-            return "$rawValueExpr.toList()"
-        }
+        if (PrimitiveArrayTypeCatalog.isPrimitiveArrayType(clean)) return "$rawValueExpr.toList()"
         val innerList =
             when {
-                clean.startsWith("List<") && clean.endsWith(">") ->
-                    clean.removePrefix("List<").removeSuffix(">").trim()
-                clean.startsWith("MutableList<") && clean.endsWith(">") ->
-                    clean.removePrefix("MutableList<").removeSuffix(">").trim()
+                clean.startsWith("List<") && clean.endsWith(">") -> clean.removePrefix("List<").removeSuffix(">").trim()
+                clean.startsWith("MutableList<") && clean.endsWith(">") -> clean.removePrefix("MutableList<").removeSuffix(">").trim()
                 else -> null
             }
-        if (innerList != null && innerList in PRIMITIVE_KOTLIN_ARRAY_TYPES) {
-            return "$rawValueExpr.map { it.toList() }"
+        return if (innerList != null && PrimitiveArrayTypeCatalog.isPrimitiveArrayType(innerList)) {
+            "$rawValueExpr.map { it.toList() }"
+        } else {
+            rawValueExpr
         }
-        return rawValueExpr
     }
 
     private fun toByteOffsetExpr(offsetExpr: String): String =
@@ -835,80 +744,52 @@ public object StructLayoutComputer {
                 sb.append("$indent                )\n")
             }
         }
+        fun appendStructWriteBody(
+            methodSig: String,
+            buildWriteStmt: (ComputedStructFieldLayout, String) -> String,
+        ) {
+            sb.append("$indent            override fun $methodSig {\n")
+            for (field in layout.fields) {
+                val effectiveType = emittedFieldTypesByName[field.kotlinFieldName] ?: field.kotlinFieldType
+                val writeValExpr = adaptWriteValueExprForFieldType("value.${field.kotlinFieldName}", effectiveType, field.layoutExpr)
+                sb.append("$indent                ${buildWriteStmt(field, writeValExpr)}\n")
+            }
+            sb.append("$indent            }\n")
+        }
         appendStructReadBody("readNative(addr: Long)") { field ->
             val addrExpr = if (field.offsetExpr == "0L") "addr" else "addr + ${field.offsetExpr}"
             "(${field.layoutExpr}).readNative($addrExpr)"
         }
-        sb.append("$indent            override fun writeNative(addr: Long, value: $selfTypeWithGenerics) {\n")
-        for (field in layout.fields) {
-            val effectiveType = emittedFieldTypesByName[field.kotlinFieldName] ?: field.kotlinFieldType
+        appendStructWriteBody("writeNative(addr: Long, value: $selfTypeWithGenerics)") { field, writeValExpr ->
             val addrExpr = if (field.offsetExpr == "0L") "addr" else "addr + ${field.offsetExpr}"
-            val writeValExpr = adaptWriteValueExprForFieldType("value.${field.kotlinFieldName}", effectiveType, field.layoutExpr)
-            sb.append("$indent                (${field.layoutExpr}).writeNative($addrExpr, $writeValExpr)\n")
+            "(${field.layoutExpr}).writeNative($addrExpr, $writeValExpr)"
         }
-        sb.append("$indent            }\n")
         appendStructReadBody("readBytes(buf: ByteArray, offset: Int)") { field ->
-            val byteOff = toByteOffsetExpr(field.offsetExpr)
-            "(${field.layoutExpr}).readBytes(buf, $byteOff)"
+            "(${field.layoutExpr}).readBytes(buf, ${toByteOffsetExpr(field.offsetExpr)})"
         }
-        sb.append("$indent            override fun writeBytes(buf: ByteArray, offset: Int, value: $selfTypeWithGenerics) {\n")
-        for (field in layout.fields) {
-            val effectiveType = emittedFieldTypesByName[field.kotlinFieldName] ?: field.kotlinFieldType
-            val byteOff = toByteOffsetExpr(field.offsetExpr)
-            val writeValExpr = adaptWriteValueExprForFieldType("value.${field.kotlinFieldName}", effectiveType, field.layoutExpr)
-            sb.append("$indent                (${field.layoutExpr}).writeBytes(buf, $byteOff, $writeValExpr)\n")
+        appendStructWriteBody("writeBytes(buf: ByteArray, offset: Int, value: $selfTypeWithGenerics)") { field, writeValExpr ->
+            "(${field.layoutExpr}).writeBytes(buf, ${toByteOffsetExpr(field.offsetExpr)}, $writeValExpr)"
         }
-        sb.append("$indent            }\n")
         sb.append("$indent        }")
         return sb.toString()
     }
 }
 
 private val KNOWN_STDLIB_FIRST_TYPE_LAYOUT_FUNCTIONS: Set<String> =
-    setOf(
-        "size_of",
-        "align_of",
-        "min_align_of",
-        "pref_align_of",
-        "zeroed",
-        "read",
-        "read_unaligned",
-        "read_volatile",
-        "write",
-        "write_unaligned",
-        "write_volatile",
-        "write_bytes",
-        "copy",
-        "copy_nonoverlapping",
-        "dangling",
-        "dangling_mut",
+    wordSet(
+        "size_of align_of min_align_of pref_align_of zeroed read read_unaligned read_volatile",
+        "write write_unaligned write_volatile write_bytes copy copy_nonoverlapping dangling dangling_mut",
     )
 
 private val POINTER_STRIDE_OR_ACCESS_METHODS: Set<String> =
-    setOf(
-        "offset",
-        "add",
-        "sub",
-        "wrapping_offset",
-        "wrapping_add",
-        "wrapping_sub",
-        "offset_from",
-        "offset_from_unsigned",
-        "sub_ptr",
-        "read",
-        "read_volatile",
-        "read_unaligned",
-        "write",
-        "write_volatile",
-        "write_unaligned",
-        "write_bytes",
-        "copy_to",
-        "copy_to_nonoverlapping",
-        "copy_from",
-        "copy_from_nonoverlapping",
-        "as_ref",
-        "as_mut",
+    wordSet(
+        "offset add sub wrapping_offset wrapping_add wrapping_sub offset_from offset_from_unsigned sub_ptr",
+        "read read_volatile read_unaligned write write_volatile write_unaligned write_bytes",
+        "copy_to copy_to_nonoverlapping copy_from copy_from_nonoverlapping as_ref as_mut",
     )
+
+private val SIZED_CORE_CONST_NAMES: Set<String> = wordSet("IS_ZST LAYOUT MAX_SLICE_LEN ALIGNMENT")
+private val MEM_OR_PTR_SEGS: Set<String> = wordSet("mem ptr")
 
 /**
  * Discovers which generic type parameters of [sig] (plus any enclosing `impl<T>` [ownerGenerics])
@@ -926,10 +807,10 @@ internal fun KotlinJ2KEmitter.computeRequiredTypeLayoutParameters(
     val rawTypeParams =
         buildList {
             ownerGenerics?.params?.toList()?.filterIsInstance<GenericParam.TypeParam>()?.forEach {
-                add(it.ident.toString().removePrefix("r#"))
+                add(it.ident.cleanIdent())
             }
             sig.generics.params.toList().filterIsInstance<GenericParam.TypeParam>().forEach {
-                val raw = it.ident.toString().removePrefix("r#")
+                val raw = it.ident.cleanIdent()
                 if (raw !in this) add(raw)
             }
         }
@@ -937,277 +818,19 @@ internal fun KotlinJ2KEmitter.computeRequiredTypeLayoutParameters(
     val identStart = sig.ident.span().start()
     val cacheKey = "${selfTypeName.orEmpty()}::${sig.ident}@${identStart.line}:${identStart.column}"
     requiredTypeLayoutParamsCache[cacheKey]?.let { return it }
-    val rawTypeParamSet = rawTypeParams.toSet()
-
-    val localFnItems = mutableMapOf<String, Item.Fn>()
-    object : Visit() {
-        override fun visitItemFn(i: Item.Fn) {
-            localFnItems[
-                i.sig.ident
-                    .toString()
-                    .removePrefix("r#"),
-            ] = i
-        }
-    }.visitBlock(block)
-
-    val paramSynTypes = linkedMapOf<String, SynType>()
-    val recvArg = sig.inputs.firstOrNull() as? FnArg.Receiver
-    if (recvArg != null && recvArg.kind !is ReceiverKind.Reference && currentStandaloneImplSelfSynType != null) {
-        paramSynTypes["self"] = requireNotNull(currentStandaloneImplSelfSynType)
-    }
-    for (input in sig.inputs.toList()) {
-        if (input is FnArg.Typed) {
-            val rawName = (input.patType.pat as? Pat.Ident)?.ident?.toString()?.removePrefix("r#")
-            if (rawName != null) {
-                paramSynTypes[rawName] = input.patType.ty
-            }
-        }
-    }
-
-    val requiredRawParams = linkedSetOf<String>()
-
-    fun recordRequiredFromSynType(ty: SynType?) {
-        if (ty == null) return
-        object : Visit() {
-            override fun visitTypePath(t: SynType.Path) {
-                if (t.qself == null && t.path.segments.size == 1) {
-                    val raw =
-                        t.path.segments
-                            .last()
-                            ?.ident
-                            ?.toString()
-                            ?.removePrefix("r#")
-                    if (raw != null && raw in rawTypeParamSet) {
-                        requiredRawParams += raw
-                    }
-                }
-                super.visitTypePath(t)
-            }
-        }.visitType(ty)
-    }
-
-    fun inferLocalSynType(expr: Expr): SynType? {
-        val unwrapped = unwrapParenOrGroupExpr(expr)
-        if (unwrapped is Expr.Path && unwrapped.qself == null && unwrapped.path.segments.size == 1) {
-            val raw =
-                unwrapped.path.segments
-                    .last()
-                    ?.ident
-                    ?.toString()
-                    ?.removePrefix("r#")
-            paramSynTypes[raw]?.let { return it }
-        }
-        if (unwrapped is Expr.Unary && unwrapped.op is UnOp.Deref) {
-            val innerPath = unwrapParenOrGroupExpr(unwrapped.expr) as? Expr.Path
-            if (recvArg != null &&
-                recvArg.kind is ReceiverKind.Reference &&
-                currentStandaloneImplSelfSynType != null &&
-                innerPath != null &&
-                innerPath.qself == null &&
-                innerPath.path.segments.size == 1 &&
-                innerPath.path.segments
-                    .first()
-                    ?.ident
-                    ?.toString() == "self"
-            ) {
-                return currentStandaloneImplSelfSynType
-            }
-            val refTy = inferLocalSynType(unwrapped.expr)
-            if (refTy is SynType.Reference) {
-                return refTy.elem
-            }
-        }
-        if (unwrapped is Expr.Cast) return unwrapped.ty
-        return null
-    }
-
-    object : Visit() {
-        override fun visitItemFn(i: Item.Fn) {
-            // Do not attribute nested fn's own type parameters to the outer function unless called.
-        }
-
-        override fun visitExprUnary(e: Expr.Unary) {
-            if (e.op is UnOp.Deref) {
-                val innerTy = inferLocalSynType(e.expr)
-                if (innerTy is SynType.Ptr) {
-                    recordRequiredFromSynType(innerTy.elem)
-                }
-            }
-            super.visitExprUnary(e)
-        }
-
-        override fun visitExprMethodCall(e: Expr.MethodCall) {
-            val methodRaw = e.method.toString().removePrefix("r#")
-            if (methodRaw in POINTER_STRIDE_OR_ACCESS_METHODS) {
-                val recvTy = inferLocalSynType(e.receiver)
-                if (recvTy is SynType.Ptr) {
-                    recordRequiredFromSynType(recvTy.elem)
-                }
-            }
-            super.visitExprMethodCall(e)
-        }
-
-        override fun visitExprPath(e: Expr.Path) {
-            val constIdent =
-                e.path.segments
-                    .toList()
-                    .lastOrNull()
-                    ?.ident
-                    ?.toString()
-                    ?.removePrefix("r#")
-            if (constIdent in SIZED_TYPE_PROPERTY_NAMES) {
-                val qself = e.qself
-                if (qself != null) {
-                    val segs = e.path.segments.toList()
-                    val traitSegName =
-                        if (qself.position > 0) {
-                            segs
-                                .getOrNull(qself.position - 1)
-                                ?.ident
-                                ?.toString()
-                                ?.removePrefix("r#")
-                        } else {
-                            null
-                        }
-                    if (qself.position == 0 ||
-                        traitSegName == "SizedTypeProperties" ||
-                        constIdent in setOf("IS_ZST", "LAYOUT", "MAX_SLICE_LEN", "ALIGNMENT")
-                    ) {
-                        recordRequiredFromSynType(qself.ty)
-                    }
-                } else {
-                    val segs = e.path.segments.toList()
-                    if (segs.size == 2) {
-                        val ownerRaw = segs[0].ident.toString().removePrefix("r#")
-                        val ownerKt = rustTypeIdentToKotlin(ownerRaw)
-                        val isSizedProp =
-                            ownerRaw != "Self" &&
-                                (
-                                    constIdent in setOf("IS_ZST", "LAYOUT", "MAX_SLICE_LEN", "ALIGNMENT") ||
-                                        !isScreamingSnakeIdent(ownerRaw)
-                                ) &&
-                                ownerKt !in inspector.unitStructNames &&
-                                constIdent !in inspector.declaredConstNames
-                        if (isSizedProp) {
-                            recordRequiredFromSynType(
-                                SynType.Path(
-                                    null,
-                                    io.github.kotlinmania.syn.Path
-                                        .from(segs[0].ident),
-                                ),
-                            )
-                            (segs[0].arguments as? PathArguments.AngleBracketed)
-                                ?.args
-                                ?.toList()
-                                .orEmpty()
-                                .filterIsInstance<GenericArgument.TypeArg>()
-                                .forEach { recordRequiredFromSynType(it.type) }
-                        }
-                    } else if (segs.size >= 3 && constIdent in setOf("IS_ZST", "LAYOUT", "MAX_SLICE_LEN", "ALIGNMENT")) {
-                        recordRequiredFromSynType(
-                            SynType.Path(
-                                null,
-                                io.github.kotlinmania.syn.Path
-                                    .from(segs[0].ident),
-                            ),
-                        )
-                    }
-                }
-            }
-            super.visitExprPath(e)
-        }
-
-        override fun visitExprCall(e: Expr.Call) {
-            val callArgsList = e.args.toList()
-            val path = (e.func as? Expr.Path)?.takeIf { it.qself == null }?.path
-            if (path != null) {
-                val segs = path.segments.toList()
-                val lastSeg = segs.lastOrNull()
-                val lastName = lastSeg?.ident?.toString()?.removePrefix("r#")
-                val penultName =
-                    segs
-                        .getOrNull(segs.size - 2)
-                        ?.ident
-                        ?.toString()
-                        ?.removePrefix("r#")
-                val explicitTypeArgs =
-                    ((lastSeg?.arguments as? PathArguments.AngleBracketed)?.args?.toList().orEmpty())
-                        .filterIsInstance<GenericArgument.TypeArg>()
-                        .map { it.type }
-
-                if (penultName == "intrinsics" && lastName != null) {
-                    val consumedIndices = CoreIntrinsicLowering.layoutConsumingTypeArgIndices(lastName, explicitTypeArgs.size)
-                    for (idx in consumedIndices) {
-                        explicitTypeArgs.getOrNull(idx)?.let(::recordRequiredFromSynType)
-                    }
-                    if (consumedIndices.contains(0) && explicitTypeArgs.isEmpty() && callArgsList.isNotEmpty()) {
-                        val firstArgTy = inferLocalSynType(callArgsList[0])
-                        if (firstArgTy is SynType.Ptr) {
-                            recordRequiredFromSynType(firstArgTy.elem)
-                        } else {
-                            recordRequiredFromSynType(firstArgTy)
-                        }
-                    }
-                } else if (penultName == "Layout" && (lastName == "new" || lastName == "array")) {
-                    explicitTypeArgs.firstOrNull()?.let(::recordRequiredFromSynType)
-                } else if (lastName in KNOWN_STDLIB_FIRST_TYPE_LAYOUT_FUNCTIONS &&
-                    (segs.size == 1 || penultName in setOf("mem", "ptr"))
-                ) {
-                    if (explicitTypeArgs.isNotEmpty()) {
-                        recordRequiredFromSynType(explicitTypeArgs.first())
-                    } else if (callArgsList.isNotEmpty()) {
-                        val firstArgTy = inferLocalSynType(callArgsList[0])
-                        if (firstArgTy is SynType.Ptr) {
-                            recordRequiredFromSynType(firstArgTy.elem)
-                        }
-                    }
-                } else if (segs.size == 1 && lastName != null) {
-                    val targetFn = localFnItems[lastName] ?: sameFileUniqueTopFn(lastName)
-                    val targetStart =
-                        targetFn
-                            ?.sig
-                            ?.ident
-                            ?.span()
-                            ?.start()
-                    val targetKey = "::${targetFn?.sig?.ident}@${targetStart?.line}:${targetStart?.column}"
-                    if (targetFn != null && targetKey !in visitingFnKeys &&
-                        targetFn.sig.generics.params
-                            .any { it is GenericParam.TypeParam }
-                    ) {
-                        val calleeReqs =
-                            computeRequiredTypeLayoutParameters(
-                                sig = targetFn.sig,
-                                block = targetFn.block,
-                                ownerGenerics = null,
-                                selfTypeName = null,
-                                visitingFnKeys = visitingFnKeys + cacheKey + targetKey,
-                            )
-                        if (calleeReqs.isNotEmpty()) {
-                            val calleeParams =
-                                targetFn.sig.generics.params
-                                    .toList()
-                                    .filterIsInstance<GenericParam.TypeParam>()
-                                    .map { it.ident.toString().removePrefix("r#") }
-                            for ((reqParamName, _) in calleeReqs) {
-                                val calleeKtParam = reqParamName.removePrefix("typeLayout")
-                                val paramIdx = calleeParams.indexOfFirst { rustTypeIdentToKotlin(it) == calleeKtParam }
-                                if (paramIdx >= 0) {
-                                    explicitTypeArgs.getOrNull(paramIdx)?.let(::recordRequiredFromSynType)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            super.visitExprCall(e)
-        }
-    }.visitBlock(block)
-
+    val requiredRawParams =
+        RequiredTypeLayoutAnalyzer(
+            emitter = this,
+            sig = sig,
+            rawTypeParamSet = rawTypeParams.toSet(),
+            cacheKey = cacheKey,
+            visitingFnKeys = visitingFnKeys,
+        ).analyze(block)
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
     val existingTransparentLeaf = transparentConstructorField(selfTypeName, block)?.second
     val computed =
         requiredRawParams
-            .map { rustTypeIdentToKotlin(it) }
+            .map(::rustTypeIdentToKotlin)
             .filter { it != existingTransparentLeaf }
             .map { ktParam ->
                 CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.TypeLayout")
@@ -1217,4 +840,185 @@ internal fun KotlinJ2KEmitter.computeRequiredTypeLayoutParameters(
         requiredTypeLayoutParamsCache[cacheKey] = computed
     }
     return computed
+}
+
+private class RequiredTypeLayoutAnalyzer(
+    private val emitter: KotlinJ2KEmitter,
+    private val sig: Signature,
+    private val rawTypeParamSet: Set<String>,
+    private val cacheKey: String,
+    private val visitingFnKeys: Set<String>,
+) : Visit() {
+    private val localFnItems = mutableMapOf<String, Item.Fn>()
+    private val paramSynTypes = linkedMapOf<String, SynType>()
+    private val recvArg = sig.inputs.firstOrNull() as? FnArg.Receiver
+    private val requiredRawParams = linkedSetOf<String>()
+
+    private val synTypeParamRecorder =
+        object : Visit() {
+            override fun visitTypePath(t: SynType.Path) {
+                if (t.qself == null && t.path.segments.size == 1) {
+                    val raw = t.path.lastCleanIdent()
+                    if (raw != null && raw in rawTypeParamSet) requiredRawParams += raw
+                }
+                super.visitTypePath(t)
+            }
+        }
+
+    init {
+        if (recvArg != null && recvArg.kind !is ReceiverKind.Reference && emitter.currentStandaloneImplSelfSynType != null) {
+            paramSynTypes["self"] = requireNotNull(emitter.currentStandaloneImplSelfSynType)
+        }
+        for (input in sig.inputs.toList()) {
+            if (input is FnArg.Typed) {
+                val rawName = (input.patType.pat as? Pat.Ident)?.ident?.cleanIdent()
+                if (rawName != null) paramSynTypes[rawName] = input.patType.ty
+            }
+        }
+    }
+
+    fun analyze(block: Block): Set<String> {
+        val fnCollector =
+            object : Visit() {
+                override fun visitItemFn(i: Item.Fn) {
+                    localFnItems[i.sig.ident.cleanIdent()] = i
+                }
+            }
+        fnCollector.visitBlock(block)
+        visitBlock(block)
+        return requiredRawParams
+    }
+
+    private fun recordRequiredFromSynType(ty: SynType?) {
+        if (ty != null) synTypeParamRecorder.visitType(ty)
+    }
+
+    private fun inferLocalSynType(expr: Expr): SynType? {
+        val unwrapped = unwrapExprParens(expr)
+        if (unwrapped is Expr.Path && unwrapped.qself == null && unwrapped.path.segments.size == 1) {
+            paramSynTypes[unwrapped.path.lastCleanIdent()]?.let { return it }
+        }
+        if (unwrapped is Expr.Unary && unwrapped.op is UnOp.Deref) {
+            val innerPath = unwrapExprParens(unwrapped.expr) as? Expr.Path
+            if (recvArg != null &&
+                recvArg.kind is ReceiverKind.Reference &&
+                emitter.currentStandaloneImplSelfSynType != null &&
+                innerPath != null &&
+                innerPath.qself == null &&
+                innerPath.path.isIdent("self")
+            ) {
+                return emitter.currentStandaloneImplSelfSynType
+            }
+            return (inferLocalSynType(unwrapped.expr) as? SynType.Reference)?.elem
+        }
+        return (unwrapped as? Expr.Cast)?.ty
+    }
+
+    override fun visitItemFn(i: Item.Fn) {
+        // Do not attribute nested fn's own type parameters to the outer function unless called.
+    }
+
+    override fun visitExprUnary(e: Expr.Unary) {
+        if (e.op is UnOp.Deref) {
+            (inferLocalSynType(e.expr) as? SynType.Ptr)?.elem?.let(::recordRequiredFromSynType)
+        }
+        super.visitExprUnary(e)
+    }
+
+    override fun visitExprMethodCall(e: Expr.MethodCall) {
+        if (e.method.cleanIdent() in POINTER_STRIDE_OR_ACCESS_METHODS) {
+            (inferLocalSynType(e.receiver) as? SynType.Ptr)?.elem?.let(::recordRequiredFromSynType)
+        }
+        super.visitExprMethodCall(e)
+    }
+
+    override fun visitExprPath(e: Expr.Path) {
+        val constIdent = e.path.lastCleanIdent()
+        if (constIdent in SIZED_TYPE_PROPERTY_NAMES) {
+            val qself = e.qself
+            val segs = e.path.segments.toList()
+            if (qself != null) {
+                val traitSegName = if (qself.position > 0) segs.getOrNull(qself.position - 1)?.cleanIdent() else null
+                if (qself.position == 0 || traitSegName == "SizedTypeProperties" || constIdent in SIZED_CORE_CONST_NAMES) {
+                    recordRequiredFromSynType(qself.ty)
+                }
+            } else if (segs.size == 2) {
+                val ownerRaw = segs[0].cleanIdent()
+                val ownerKt = rustTypeIdentToKotlin(ownerRaw)
+                val isSizedProp =
+                    ownerRaw != "Self" &&
+                        (constIdent in SIZED_CORE_CONST_NAMES || !emitter.isScreamingSnakeIdent(ownerRaw)) &&
+                        ownerKt !in emitter.inspector.unitStructNames &&
+                        constIdent !in emitter.inspector.declaredConstNames
+                if (isSizedProp) {
+                    recordRequiredFromSynType(SynType.Path(null, Path.from(segs[0].ident)))
+                    segs[0].arguments.angleTypeArgs().forEach(::recordRequiredFromSynType)
+                }
+            } else if (segs.size >= 3 && constIdent in SIZED_CORE_CONST_NAMES) {
+                recordRequiredFromSynType(SynType.Path(null, Path.from(segs[0].ident)))
+            }
+        }
+        super.visitExprPath(e)
+    }
+
+    override fun visitExprCall(e: Expr.Call) {
+        val callArgsList = e.args.toList()
+        val path = e.func.unqualifiedPath()
+        if (path != null) {
+            val segs = path.segments.toList()
+            val lastSeg = segs.lastOrNull()
+            val lastName = lastSeg?.cleanIdent()
+            val penultName = segs.getOrNull(segs.size - 2)?.cleanIdent()
+            val explicitTypeArgs = lastSeg?.arguments?.angleTypeArgs().orEmpty()
+            when {
+                penultName == "intrinsics" && lastName != null -> {
+                    val consumedIndices = CoreIntrinsicLowering.layoutConsumingTypeArgIndices(lastName, explicitTypeArgs.size)
+                    for (idx in consumedIndices) {
+                        explicitTypeArgs.getOrNull(idx)?.let(::recordRequiredFromSynType)
+                    }
+                    if (consumedIndices.contains(0) && explicitTypeArgs.isEmpty() && callArgsList.isNotEmpty()) {
+                        val firstArgTy = inferLocalSynType(callArgsList[0])
+                        recordRequiredFromSynType((firstArgTy as? SynType.Ptr)?.elem ?: firstArgTy)
+                    }
+                }
+                penultName == "Layout" && (lastName == "new" || lastName == "array") ->
+                    explicitTypeArgs.firstOrNull()?.let(::recordRequiredFromSynType)
+                lastName in KNOWN_STDLIB_FIRST_TYPE_LAYOUT_FUNCTIONS && (segs.size == 1 || penultName in MEM_OR_PTR_SEGS) -> {
+                    if (explicitTypeArgs.isNotEmpty()) {
+                        recordRequiredFromSynType(explicitTypeArgs.first())
+                    } else if (callArgsList.isNotEmpty()) {
+                        (inferLocalSynType(callArgsList[0]) as? SynType.Ptr)?.elem?.let(::recordRequiredFromSynType)
+                    }
+                }
+                segs.size == 1 && lastName != null -> inspectSameFileCallee(lastName, explicitTypeArgs)
+            }
+        }
+        super.visitExprCall(e)
+    }
+
+    private fun inspectSameFileCallee(lastName: String, explicitTypeArgs: List<SynType>) {
+        val targetFn = localFnItems[lastName] ?: emitter.sameFileUniqueTopFn(lastName) ?: return
+        val targetSpan = targetFn.sig.ident.span()
+        val targetStart = targetSpan.start()
+        val targetKey = "::${targetFn.sig.ident}@${targetStart.line}:${targetStart.column}"
+        val targetParams = targetFn.sig.generics.params
+        if (targetKey in visitingFnKeys || targetParams.none { it is GenericParam.TypeParam }) return
+        val calleeReqs =
+            emitter.computeRequiredTypeLayoutParameters(
+                sig = targetFn.sig,
+                block = targetFn.block,
+                visitingFnKeys = visitingFnKeys + cacheKey + targetKey,
+            )
+        if (calleeReqs.isEmpty()) return
+        val calleeParams =
+            targetFn.sig.generics.params
+                .toList()
+                .filterIsInstance<GenericParam.TypeParam>()
+                .map { it.ident.cleanIdent() }
+        for ((reqParamName, _) in calleeReqs) {
+            val calleeKtParam = reqParamName.removePrefix("typeLayout")
+            val paramIdx = calleeParams.indexOfFirst { rustTypeIdentToKotlin(it) == calleeKtParam }
+            if (paramIdx >= 0) explicitTypeArgs.getOrNull(paramIdx)?.let(::recordRequiredFromSynType)
+        }
+    }
 }

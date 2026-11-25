@@ -1,7 +1,6 @@
 package io.github.kotlinmania.rustkotlin
 
 import io.github.kotlinmania.procmacro2.TokenStream
-import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.Attribute
 import io.github.kotlinmania.syn.BinOp
 import io.github.kotlinmania.syn.Expr
@@ -14,6 +13,7 @@ import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.Pat
 import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
+import io.github.kotlinmania.syn.PathSegment
 import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
@@ -71,6 +71,33 @@ private val BOXED_INT_FROM_SUFFIX_BY_KIND: Map<NumericKind, String> =
         NumericKind.U64 to "fromULong",
     )
 
+private val ZERO_OR_NULL_POINTER_LITERALS = setOf("0", "0L", "0u", "0uL", "null")
+
+private val KOTLIN_BUILTIN_VALUE_TYPE_NAMES: Set<String> =
+    setOf(
+        "Byte",
+        "Short",
+        "Int",
+        "Long",
+        "UByte",
+        "UShort",
+        "UInt",
+        "ULong",
+        "Float",
+        "Double",
+        "Boolean",
+        "Char",
+        "String",
+        "Unit",
+        "Any",
+    )
+
+private val C_POINTER_WIDTH_UNSIGNED_TYPE_NAMES =
+    setOf("size_t", "SizeT", "uintptr_t", "UintptrT", "rsize_t", "RsizeT", "__size_t")
+
+private val C_POINTER_WIDTH_SIGNED_TYPE_NAMES =
+    setOf("ssize_t", "SsizeT", "ptrdiff_t", "PtrdiffT", "intptr_t", "IntptrT", "__ssize_t")
+
 internal fun isDecimalOrHexLiteralDigits(text: String): Boolean {
     if (text.isEmpty()) return false
     if (text.all { it.isDigit() || it == '_' }) return true
@@ -81,136 +108,188 @@ internal fun isDecimalOrHexLiteralDigits(text: String): Boolean {
     return false
 }
 
-internal fun KotlinJ2KEmitter.renderCastExpression(
-    inner: String,
-    targetType: String,
-    sourceExpr: Expr,
-    selfTypeName: String? = null,
-    pointerLayoutType: SynType? = null,
-): String {
-    if (targetType == "RustAny") {
-        return if (inferExprRenderedType(sourceExpr, selfTypeName) == "RustAny") inner else "RustAny.from($inner)"
+/**
+ * Lowers Rust `as` cast expressions across `RustAny`, `ConstPtr`/`MutPtr` raw pointers,
+ * integer/float/128-bit/char scalar conversions, C-ABI callback pointers, and nullable targets.
+ */
+internal class CastExpressionLowering(
+    private val emitter: KotlinJ2KEmitter,
+    private val inner: String,
+    private val targetType: String,
+    private val sourceExpr: Expr,
+    private val selfTypeName: String?,
+) {
+    private val atomicRecv: String by lazy {
+        if (emitter.isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
     }
-    val targetBase = targetType.removeSuffix("?").trim()
-    val aliasPtrTarget =
-        (inspector.typeAliasTargets[targetBase] as? SynType.Ptr)?.let { renderType(it, selfTypeName) }
-    val resolvedPtrTarget = if (rawPointerPointeeType(targetType) != null) targetType else aliasPtrTarget
-    val pointerPointee = rawPointerPointeeType(resolvedPtrTarget)
-    if (pointerPointee != null) {
-        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-        val ptrCtor = if (isMutRawPointerRenderedType(resolvedPtrTarget)) "MutPtr" else "ConstPtr"
-        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.$ptrCtor")
-        if (inner in setOf("0", "0L", "0u", "0uL", "null")) {
-            return "$ptrCtor<$pointerPointee>(0L)"
+    private val localTy: String? = emitter.currentTypedLocals[inner]
+    private val isZeroOrNullLit: Boolean = inner in ZERO_OR_NULL_POINTER_LITERALS
+
+    private fun isIntegerOrNumericSource(includeBitwiseNot: Boolean): Boolean =
+        emitter.isKnownIntegerBitmaskExpr(sourceExpr) ||
+            (sourceExpr is Expr.Unary && (sourceExpr.op is UnOp.Neg || (includeBitwiseNot && sourceExpr.op is UnOp.NotOp))) ||
+            (localTy != null && emitter.resolveNumericKind(localTy) != null) ||
+            emitter.inferExprNumericKind(sourceExpr, selfTypeName) != null
+
+    fun render(): String {
+        if (targetType == "RustAny") {
+            return if (emitter.inferExprRenderedType(sourceExpr, selfTypeName) == "RustAny") inner else "RustAny.from($inner)"
         }
-        val reference = unwrapParenOrGroupExpr(sourceExpr) as? Expr.Reference
-        val referencePlace = reference?.expr?.let { unwrapParenOrGroupExpr(it) } as? Expr.Path
-        val referenceLocal =
-            referencePlace
-                ?.takeIf { it.qself == null && it.path.segments.size == 1 }
-                ?.path
-                ?.segments
-                ?.first()
-                ?.ident
-                ?.toString()
-                ?.removePrefix("r#")
-                ?.let { scopeBuilder.resolveLocalKotlinName(it) ?: rustValueIdentToKotlin(it) }
-        val referenceStorage = referenceLocal?.let { currentAddressableLocals[it] }
+        val targetBase = targetType.removeSuffix("?").trim()
+        val aliasPtrTarget = (emitter.inspector.typeAliasTargets[targetBase] as? SynType.Ptr)?.let { emitter.renderType(it, selfTypeName) }
+        val resolvedPtrTarget = if (rawPointerPointeeType(targetType) != null) targetType else aliasPtrTarget
+        val pointerPointee = rawPointerPointeeType(resolvedPtrTarget)
+        if (pointerPointee != null) {
+            return renderRawPointerTargetCast(resolvedPtrTarget, pointerPointee)
+        }
+
+        val targetNumericKind = emitter.resolveNumericKind(targetType)
+        val canonicalNumericTarget =
+            when (targetNumericKind) {
+                NumericKind.F32 -> emitter.kotlinF32TypeName()
+                null -> if (targetType == "Char" || targetType == "RustChar") targetType else null
+                else -> emitter.numericKindToPureTypeName(targetNumericKind)
+            }
+        val sourceInferredForNum = emitter.inferExprRenderedType(sourceExpr, selfTypeName)
+        val isSourceRawPtrOrAlias =
+            rawPointerPointeeType(sourceInferredForNum) != null ||
+                (
+                    sourceInferredForNum != null &&
+                        (
+                            emitter.inspector.typeAliasTargets[sourceInferredForNum.removeSuffix("?")] is SynType.Ptr ||
+                                emitter.scopedAbiKeysForRenderedType(sourceInferredForNum.removeSuffix("?")).any { it in emitter.headerContext.cratePointerTypeAliases }
+                        )
+                )
+        if (canonicalNumericTarget != null) {
+            return renderNumericTargetCast(canonicalNumericTarget, sourceInferredForNum, isSourceRawPtrOrAlias)
+        }
+        tryRenderCratePointerAliasCast(targetBase, isSourceRawPtrOrAlias)?.let { return it }
+        tryRenderNullableTargetCast()?.let { return it }
+        if (targetType == inner) return inner
+        return "(($inner as Any?) as $targetType)"
+    }
+
+    private fun renderRawPointerTargetCast(resolvedPtrTarget: String?, pointerPointee: String): String {
+        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
+        val ptrCtor = if (isMutRawPointerRenderedType(resolvedPtrTarget)) "MutPtr" else "ConstPtr"
+        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.ptr.$ptrCtor")
+        if (isZeroOrNullLit) return "$ptrCtor<$pointerPointee>(0L)"
+
+        val reference = emitter.unwrapParenOrGroupExpr(sourceExpr) as? Expr.Reference
+        val referencePlace = reference?.expr?.let(emitter::unwrapParenOrGroupExpr) as? Expr.Path
+        val singleRefSeg = referencePlace?.takeIf { it.qself == null && it.path.segments.size == 1 }?.path
+        val firstRefIdent = singleRefSeg?.segments?.first()?.ident
+        val rawRefIdent = firstRefIdent?.toString()?.removePrefix("r#")
+        val referenceLocal = rawRefIdent?.let { emitter.scopeBuilder.resolveLocalKotlinName(it) ?: rustValueIdentToKotlin(it) }
+        val referenceStorage = referenceLocal?.let { emitter.currentAddressableLocals[it] }
         if (referenceStorage != null) {
-            return if (referenceLocal in currentAddressableArrayElementTypes) {
+            return if (referenceLocal in emitter.currentAddressableArrayElementTypes) {
                 "$ptrCtor<$pointerPointee>($referenceStorage.elementMutPtr(0).rawAddress)"
             } else {
                 "$ptrCtor<$pointerPointee>($referenceStorage.asMutPtr().rawAddress)"
             }
         }
-        val sourceType = inferExprRenderedType(sourceExpr, selfTypeName)
-        val sourceReceiver = unwrapParenOrGroupExpr(sourceExpr) as? Expr.Path
-        val unwrappedRefReceiver = (reference?.expr?.let { unwrapParenOrGroupExpr(it) } as? Expr.Path) ?: sourceReceiver
+
+        val sourceType = emitter.inferExprRenderedType(sourceExpr, selfTypeName)
+        val sourceReceiver = emitter.unwrapParenOrGroupExpr(sourceExpr) as? Expr.Path
+        val unwrappedRefReceiver = referencePlace ?: sourceReceiver
         if (unwrappedRefReceiver?.qself == null && unwrappedRefReceiver?.path?.isIdent("self") == true &&
-            selfTypeName != null && currentTypedLocals["this"] == selfTypeName
+            selfTypeName != null && emitter.currentTypedLocals["this"] == selfTypeName
         ) {
-            val declaration = transparentDeclaration(selfTypeName)
-            if (declaration != null && sourceTransparentField(declaration, selfTypeName) != null) {
+            val declaration = emitter.transparentDeclaration(selfTypeName)
+            if (declaration != null && emitter.sourceTransparentField(declaration, selfTypeName) != null) {
                 return "$ptrCtor<$pointerPointee>(this.fieldStorage.rawAddress)"
             }
         }
-        val borrowedPointee = mutableReferencePointeeType(sourceType)
-        if (borrowedPointee != null) {
-            val recv = if (isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
-            return "$ptrCtor<$pointerPointee>($recv.asMutPtr().rawAddress)"
+        if (mutableReferencePointeeType(sourceType) != null) {
+            return "$ptrCtor<$pointerPointee>($atomicRecv.asMutPtr().rawAddress)"
         }
         val sourceAliasPtr =
             sourceType?.removeSuffix("?")?.trim()?.let { st ->
-                (inspector.typeAliasTargets[st] as? SynType.Ptr)?.let { renderType(it, selfTypeName) }
+                (emitter.inspector.typeAliasTargets[st] as? SynType.Ptr)?.let { emitter.renderType(it, selfTypeName) }
             }
         val effectiveSourcePtrType = if (rawPointerPointeeType(sourceType) != null) sourceType else sourceAliasPtr
         if (rawPointerPointeeType(effectiveSourcePtrType) != null ||
-            (sourceType != null && scopedAbiKeysForRenderedType(sourceType.removeSuffix("?")).any { it in headerContext.cratePointerTypeAliases })
+            (sourceType != null && emitter.scopedAbiKeysForRenderedType(sourceType.removeSuffix("?")).any { it in emitter.headerContext.cratePointerTypeAliases })
         ) {
             if (effectiveSourcePtrType == resolvedPtrTarget && sourceType == targetType) return inner
-            val rawSource = unwrapParenOrGroupExpr(sourceExpr)
-            if (rawSource is Expr.Path && isAtomicPostfixReceiver(sourceExpr, inner)) {
+            if (emitter.unwrapParenOrGroupExpr(sourceExpr) is Expr.Path && emitter.isAtomicPostfixReceiver(sourceExpr, inner)) {
                 return "$ptrCtor<$pointerPointee>($inner.rawAddress, $inner.rawMeta)"
             }
             return "($inner).let { ptrSrc -> $ptrCtor<$pointerPointee>(ptrSrc.rawAddress, ptrSrc.rawMeta) }"
         }
-        val localTyForPtr = currentTypedLocals[inner]
-        if (isKnownIntegerBitmaskExpr(sourceExpr) ||
-            (sourceExpr is Expr.Unary && (sourceExpr.op is UnOp.Neg || sourceExpr.op is UnOp.NotOp)) ||
-            (localTyForPtr != null && resolveNumericKind(localTyForPtr) != null) ||
-            inferExprNumericKind(sourceExpr, selfTypeName) != null
-        ) {
-            val recv = if (isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
-            val longArg = convertNumericReceiver(recv, "Long", inferExprNumericKind(sourceExpr, selfTypeName))
+        if (isIntegerOrNumericSource(includeBitwiseNot = true)) {
+            val longArg = emitter.convertNumericReceiver(atomicRecv, "Long", emitter.inferExprNumericKind(sourceExpr, selfTypeName))
             return "$ptrCtor<$pointerPointee>($longArg)"
         }
         val castHelper = if (ptrCtor == "MutPtr") "mutPtrFromRustCast" else "constPtrFromRustCast"
-        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.$castHelper")
+        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.mem.$castHelper")
         return "$castHelper<$pointerPointee>($inner)"
     }
-    val targetNumericKind = resolveNumericKind(targetType)
-    val canonicalNumericTarget =
-        when (targetNumericKind) {
-            NumericKind.I8 -> "Byte"
-            NumericKind.I16 -> "Short"
-            NumericKind.I32 -> "Int"
-            NumericKind.I64 -> "Long"
-            NumericKind.I128 -> "I128"
-            NumericKind.U8 -> "UByte"
-            NumericKind.U16 -> "UShort"
-            NumericKind.U32 -> "UInt"
-            NumericKind.U64 -> "ULong"
-            NumericKind.U128 -> "U128"
-            NumericKind.F16 -> "F16"
-            NumericKind.F32 -> kotlinF32TypeName()
-            NumericKind.F64 -> "Double"
-            NumericKind.F128 -> "F128"
-            null -> if (targetType == "Char" || targetType == "RustChar") targetType else null
+
+    private fun renderNumericTargetCast(
+        canonicalNumericTarget: String,
+        sourceInferredForNum: String?,
+        isSourceRawPtrOrAlias: Boolean,
+    ): String {
+        if (isSourceRawPtrOrAlias) {
+            return emitter.convertNumericReceiver("$atomicRecv.rawAddress", canonicalNumericTarget, NumericKind.I64)
         }
-    val sourceInferredForNum = inferExprRenderedType(sourceExpr, selfTypeName)
-    val isSourceRawPtrOrAlias =
-        rawPointerPointeeType(sourceInferredForNum) != null ||
-            (
-                sourceInferredForNum != null && (
-                    inspector.typeAliasTargets[sourceInferredForNum.removeSuffix("?")] is SynType.Ptr ||
-                        scopedAbiKeysForRenderedType(sourceInferredForNum.removeSuffix("?")).any { it in headerContext.cratePointerTypeAliases }
-                )
-            )
-    if (canonicalNumericTarget != null && isSourceRawPtrOrAlias) {
-        val recv = if (isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
-        return convertNumericReceiver("$recv.rawAddress", canonicalNumericTarget, NumericKind.I64)
-    }
-    if (canonicalNumericTarget != null && mutableReferencePointeeType(sourceInferredForNum) != null) {
-        val recv = if (isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
-        return convertNumericReceiver("$recv.pointer.rawAddress", canonicalNumericTarget, NumericKind.I64)
-    }
-    if (canonicalNumericTarget != null && (isKnownBooleanCastSource(sourceExpr) || sourceInferredForNum?.removeSuffix("?")?.trim() == "Boolean")) {
-        val cleanCond =
-            if (hasOuterBalancedParens(inner)) {
-                inner.substring(1, inner.length - 1)
-            } else {
-                inner
+        if (mutableReferencePointeeType(sourceInferredForNum) != null) {
+            return emitter.convertNumericReceiver("$atomicRecv.pointer.rawAddress", canonicalNumericTarget, NumericKind.I64)
+        }
+        if (emitter.isKnownBooleanCastSource(sourceExpr) || sourceInferredForNum?.removeSuffix("?")?.trim() == "Boolean") {
+            return renderBooleanToNumericCast(canonicalNumericTarget)
+        }
+        if (!emitter.headerContext.rawAbiMode) {
+            val cleanLocalBase = localTy?.removeSuffix("?")
+            if (inner in emitter.currentNullableLocals || localTy?.endsWith("?") == true) {
+                error("Cannot expose an address for $inner ($localTy): the Rust pointer requires address-bearing storage")
             }
+            if (cleanLocalBase != null &&
+                (cleanLocalBase.endsWith("Callback") || cleanLocalBase.endsWith("Fn") || cleanLocalBase in emitter.synthesizedSamDeclarations)
+            ) {
+                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
+                CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.ffi.ExternFnPtr")
+                return emitter.convertNumericReceiver(
+                    "(($atomicRecv as? ExternFnPtr)?.rawAddress ?: error(\"Kotlin closure callback has no native C function address\"))",
+                    canonicalNumericTarget,
+                    NumericKind.I64,
+                )
+            }
+            val fieldTy = emitter.resolveFieldRenderedType(sourceExpr, selfTypeName)
+            if (fieldTy != null && rawPointerPointeeType(fieldTy) != null) {
+                return emitter.convertNumericReceiver("$atomicRecv.rawAddress", canonicalNumericTarget, NumericKind.I64)
+            }
+            if (fieldTy != null && fieldTy.endsWith("?")) {
+                error("Cannot expose an address for $inner ($fieldTy): the Rust field requires address-bearing storage")
+            }
+        }
+        val unwrappedSource = emitter.unwrapParenOrGroupExpr(emitter.unwrapTransparentCastExpr(sourceExpr))
+        val cleanSourceCharTy = sourceInferredForNum?.removeSuffix("?")?.trim()
+        val inferredRustCharSource = emitter.headerContext.scalarChar && cleanSourceCharTy == "RustChar"
+        val inferredKtCharSource = !emitter.headerContext.scalarChar && cleanSourceCharTy == "Char"
+        if ((unwrappedSource as? Expr.Lit)?.lit is Lit.Char || inferredRustCharSource || inferredKtCharSource) {
+            if ((inferredRustCharSource && canonicalNumericTarget == "RustChar") || (inferredKtCharSource && canonicalNumericTarget == "Char")) {
+                return inner
+            }
+            val charCodeKind = if (emitter.headerContext.scalarChar && !inferredKtCharSource) NumericKind.U32 else NumericKind.I32
+            return emitter.convertNumericReceiver("$atomicRecv.code", canonicalNumericTarget, charCodeKind)
+        }
+        val sourceKind = emitter.inferExprNumericKind(sourceExpr, selfTypeName)
+        if (sourceKind == null) {
+            tryRenderEnumDiscriminantCast(unwrappedSource, canonicalNumericTarget)?.let { return it }
+        }
+        if ((sourceKind != null && emitter.numericKindToPureTypeName(sourceKind) == canonicalNumericTarget) ||
+            emitter.isAlreadyRenderedAsNumericKind(inner, emitter.resolveNumericKind(canonicalNumericTarget))
+        ) {
+            return inner
+        }
+        return emitter.convertNumericReceiver(atomicRecv, canonicalNumericTarget, sourceKind)
+    }
+
+    private fun renderBooleanToNumericCast(canonicalNumericTarget: String): String {
+        val cleanCond = if (emitter.hasOuterBalancedParens(inner)) inner.substring(1, inner.length - 1) else inner
         val intBranch = "(if ($cleanCond) 1 else 0)"
         return when (canonicalNumericTarget) {
             "Byte" -> "$intBranch.toByte()"
@@ -227,166 +306,93 @@ internal fun KotlinJ2KEmitter.renderCastExpression(
             "Double" -> "(if ($cleanCond) 1.0 else 0.0)"
             "Char" -> "$intBranch.toChar()"
             "RustChar" -> {
-                usesRustChar = true
+                emitter.usesRustChar = true
                 "(if ($cleanCond) RustChar(1u) else RustChar(0u))"
             }
             else -> "($inner as $targetType)"
         }
     }
-    val unwrappedSource = unwrapParenOrGroupExpr(unwrapTransparentCastExpr(sourceExpr))
-    val localTy = currentTypedLocals[inner]
-    if (canonicalNumericTarget != null) {
-        if (!headerContext.rawAbiMode) {
-            val cleanLocalBase = localTy?.removeSuffix("?")
-            if (
-                inner in currentNullableLocals ||
-                localTy?.endsWith("?") == true
-            ) {
-                error("Cannot expose an address for $inner ($localTy): the Rust pointer requires address-bearing storage")
-            }
-            if (
-                cleanLocalBase != null &&
-                (
-                    cleanLocalBase.endsWith("Callback") ||
-                        cleanLocalBase.endsWith("Fn") ||
-                        cleanLocalBase in synthesizedSamDeclarations
-                )
-            ) {
-                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ffi.ExternFnPtr")
-                val recv = if (isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
-                return convertNumericReceiver(
-                    "(($recv as? ExternFnPtr)?.rawAddress ?: error(\"Kotlin closure callback has no native C function address\"))",
-                    canonicalNumericTarget,
-                    NumericKind.I64,
-                )
-            }
-            val fieldTy = resolveFieldRenderedType(sourceExpr, selfTypeName)
-            if (fieldTy != null && rawPointerPointeeType(fieldTy) != null) {
-                val recv = if (isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
-                return convertNumericReceiver("$recv.rawAddress", canonicalNumericTarget, NumericKind.I64)
-            }
-            if (fieldTy != null && fieldTy.endsWith("?")) {
-                error("Cannot expose an address for $inner ($fieldTy): the Rust field requires address-bearing storage")
-            }
-        }
-        val cleanSourceCharTy = sourceInferredForNum?.removeSuffix("?")?.trim()
-        val inferredRustCharSource = headerContext.scalarChar && cleanSourceCharTy == "RustChar"
-        val inferredKtCharSource = !headerContext.scalarChar && cleanSourceCharTy == "Char"
-        if ((unwrappedSource as? Expr.Lit)?.lit is Lit.Char || inferredRustCharSource || inferredKtCharSource) {
-            if ((inferredRustCharSource && canonicalNumericTarget == "RustChar") ||
-                (inferredKtCharSource && canonicalNumericTarget == "Char")
-            ) {
-                return inner
-            }
-            val recv = if (isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
-            val charCodeKind = if (headerContext.scalarChar && !inferredKtCharSource) NumericKind.U32 else NumericKind.I32
-            return convertNumericReceiver("$recv.code", canonicalNumericTarget, charCodeKind)
-        }
-        val sourceKind = inferExprNumericKind(sourceExpr, selfTypeName)
-        if (sourceKind == null && unwrappedSource is Expr.Path && unwrappedSource.qself == null) {
+
+    private fun tryRenderEnumDiscriminantCast(unwrappedSource: Expr, canonicalNumericTarget: String): String? {
+        if (unwrappedSource is Expr.Path && unwrappedSource.qself == null) {
             val segs = unwrappedSource.path.segments.toList()
             if (segs.size >= 2) {
-                val prevIdentStr = segs[segs.size - 2].ident.toString()
-                val prevRaw = prevIdentStr.removePrefix("r#")
+                val prevRaw = segs[segs.size - 2].ident.toString().removePrefix("r#")
                 val prevKtType = rustTypeIdentToKotlin(prevRaw)
-                val lastIdentStr = segs.last().ident.toString()
-                val lastRaw = lastIdentStr.removePrefix("r#")
+                val lastIdent = segs.last().ident.toString()
+                val lastRaw = lastIdent.removePrefix("r#")
                 val isPrevKnownType =
                     (
                         prevRaw.first().isUpperCase() ||
-                            prevKtType in inspector.declaredTypeNames ||
-                            scopedAbiKeysForRenderedType(prevKtType).any { it in headerContext.crateSymbolSubpackages }
+                            prevKtType in emitter.inspector.declaredTypeNames ||
+                            emitter.scopedAbiKeysForRenderedType(prevKtType).any { it in emitter.headerContext.crateSymbolSubpackages }
                     ) &&
-                        resolveNumericKind(prevKtType) == null
+                        emitter.resolveNumericKind(prevKtType) == null
                 if (isPrevKnownType &&
                     lastRaw !in setOf("MAX", "MIN", "BITS", "ZERO") &&
                     lastRaw.first().isUpperCase() &&
-                    (!isScreamingSnakeIdent(lastRaw) || !prevRaw.first().isUpperCase())
+                    (!emitter.isScreamingSnakeIdent(lastRaw) || !prevRaw.first().isUpperCase())
                 ) {
-                    val recv = if (isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
                     val enumKind =
-                        scopedAbiKeysForRenderedType(prevKtType).firstNotNullOfOrNull {
-                            numericKindFromScannerCode(headerContext.crateNumericTypeKinds[it])
+                        emitter.scopedAbiKeysForRenderedType(prevKtType).firstNotNullOfOrNull {
+                            emitter.numericKindFromScannerCode(emitter.headerContext.crateNumericTypeKinds[it])
                         } ?: NumericKind.U32
-                    return convertNumericReceiver("$recv.value", canonicalNumericTarget, enumKind)
+                    return emitter.convertNumericReceiver("$atomicRecv.value", canonicalNumericTarget, enumKind)
                 }
             }
         }
-        if (sourceKind == null) {
-            val inferredSourceType = inferExprRenderedType(sourceExpr, selfTypeName)?.removeSuffix("?")?.trim()
-            if (inferredSourceType != null && resolveNumericKind(inferredSourceType) == null) {
-                val inferredEnumKind =
-                    scopedAbiKeysForRenderedType(inferredSourceType).firstNotNullOfOrNull {
-                        numericKindFromScannerCode(headerContext.crateNumericTypeKinds[it])
-                    } ?: NumericKind.I8.takeIf {
-                        (inferredSourceType == "Ordering" || inferredSourceType.endsWith(".cmp.Ordering")) &&
-                            headerContext.packageName?.contains(".sync.atomic") != true
-                    }
-                if (inferredEnumKind != null) {
-                    val recv = if (isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
-                    return convertNumericReceiver("$recv.value", canonicalNumericTarget, inferredEnumKind)
-                }
-            }
-        }
-        if ((sourceKind != null && numericKindToPureTypeName(sourceKind) == canonicalNumericTarget) ||
-            isAlreadyRenderedAsNumericKind(inner, resolveNumericKind(canonicalNumericTarget))
-        ) {
-            return inner
-        }
-        val recv = if (isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
-        return convertNumericReceiver(recv, canonicalNumericTarget, sourceKind)
+        val inferredSourceType = emitter.inferExprRenderedType(sourceExpr, selfTypeName)?.removeSuffix("?")?.trim() ?: return null
+        if (emitter.resolveNumericKind(inferredSourceType) != null) return null
+        val inferredEnumKind =
+            emitter.scopedAbiKeysForRenderedType(inferredSourceType).firstNotNullOfOrNull {
+                emitter.numericKindFromScannerCode(emitter.headerContext.crateNumericTypeKinds[it])
+            } ?: NumericKind.I8.takeIf {
+                (inferredSourceType == "Ordering" || inferredSourceType.endsWith(".cmp.Ordering")) &&
+                    emitter.headerContext.packageName?.contains(".sync.atomic") != true
+            } ?: return null
+        return emitter.convertNumericReceiver("$atomicRecv.value", canonicalNumericTarget, inferredEnumKind)
     }
-    val targetPtrAliasKind =
-        scopedAbiKeysForRenderedType(targetBase)
-            .firstNotNullOfOrNull { headerContext.cratePointerTypeAliases[it] }
-    if (targetPtrAliasKind != null) {
-        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+
+    private fun tryRenderCratePointerAliasCast(targetBase: String, isSourceRawPtrOrAlias: Boolean): String? {
+        val targetPtrAliasKind =
+            emitter
+                .scopedAbiKeysForRenderedType(targetBase)
+                .firstNotNullOfOrNull { emitter.headerContext.cratePointerTypeAliases[it] } ?: return null
+        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
         val ptrCtor = if (targetPtrAliasKind.startsWith("const:")) "ConstPtr" else "MutPtr"
-        CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.ptr.$ptrCtor")
-        val isZeroLit = inner == "0" || inner == "0L" || inner == "0u" || inner == "0uL" || inner == "null"
-        if (isZeroLit) {
-            return "$ptrCtor(0L)"
-        }
-        if (isSourceRawPtrOrAlias) {
-            val recv = if (isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
-            return "$ptrCtor($recv.rawAddress)"
-        }
-        if (inner in currentNullableLocals) {
+        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.ptr.$ptrCtor")
+        if (isZeroOrNullLit) return "$ptrCtor(0L)"
+        if (isSourceRawPtrOrAlias) return "$ptrCtor($atomicRecv.rawAddress)"
+        if (inner in emitter.currentNullableLocals) {
             error("Cannot cast $inner ($localTy) to $targetType: the Rust pointer requires address-bearing storage")
         }
-        if (isKnownIntegerBitmaskExpr(sourceExpr) ||
-            (sourceExpr is Expr.Unary && (sourceExpr.op is UnOp.Neg || sourceExpr.op is UnOp.NotOp)) ||
-            (localTy != null && resolveNumericKind(localTy) != null) ||
-            inferExprNumericKind(sourceExpr, selfTypeName) != null
-        ) {
-            val recv = if (isAtomicPostfixReceiver(sourceExpr, inner)) inner else "($inner)"
-            val longArg = convertNumericReceiver(recv, "Long", inferExprNumericKind(sourceExpr, selfTypeName))
+        if (isIntegerOrNumericSource(includeBitwiseNot = true)) {
+            val longArg = emitter.convertNumericReceiver(atomicRecv, "Long", emitter.inferExprNumericKind(sourceExpr, selfTypeName))
             return "$ptrCtor($longArg)"
         }
+        return null
     }
-    if (targetType.endsWith("?")) {
+
+    private fun tryRenderNullableTargetCast(): String? {
+        if (!targetType.endsWith("?")) return null
+        if (isZeroOrNullLit) return "null"
         val nonNullTarget = targetType.removeSuffix("?")
-        val isZeroLit = inner == "0" || inner == "0L" || inner == "0u" || inner == "0uL" || inner == "null"
-        if (isZeroLit) {
-            return "null"
+        val isNumericSource = emitter.isKnownBooleanCastSource(sourceExpr) || isIntegerOrNumericSource(includeBitwiseNot = false)
+        if (!isNumericSource) return null
+        if (emitter.resolveNumericKind(nonNullTarget) != null) {
+            return emitter.renderCastExpression(inner, nonNullTarget, sourceExpr, selfTypeName)
         }
-        val isNumericSource =
-            isKnownIntegerBitmaskExpr(sourceExpr) ||
-                isKnownBooleanCastSource(sourceExpr) ||
-                (sourceExpr is Expr.Unary && sourceExpr.op is UnOp.Neg) ||
-                (localTy != null && resolveNumericKind(localTy) != null) ||
-                inferExprNumericKind(sourceExpr, selfTypeName) != null
-        if (resolveNumericKind(nonNullTarget) != null && isNumericSource) {
-            return renderCastExpression(inner, nonNullTarget, sourceExpr, selfTypeName)
-        }
-        if (isNumericSource) {
-            return if (nonNullTarget == "String") "\"\\uFFFF\"" else "null"
-        }
+        return if (nonNullTarget == "String") "\"\\uFFFF\"" else "null"
     }
-    if (targetType == inner) return inner
-    return "(($inner as Any?) as $targetType)"
 }
+
+internal fun KotlinJ2KEmitter.renderCastExpression(
+    inner: String,
+    targetType: String,
+    sourceExpr: Expr,
+    selfTypeName: String? = null,
+): String =
+    CastExpressionLowering(this, inner, targetType, sourceExpr, selfTypeName).render()
 
 private fun hasTopLevelOperatorOutsidePostfix(s: String): Boolean =
     !KotlinTokenWalker.scanTopLevelTokens(s, trackAllBrackets = true) { tok, depth ->
@@ -423,9 +429,7 @@ internal fun KotlinJ2KEmitter.isAlreadyRenderedAsNumericKind(rendered: String, k
     if (s.endsWith(expectedSuffix)) return true
     if (kind == NumericKind.F16 && (s.startsWith("F16.") || s == "F16()")) return true
     if (kind == NumericKind.F128 && (s.startsWith("F128.") || s == "F128()")) return true
-    if (s.endsWith(".code") && kind == NumericKind.I32) return true
-    if (s.endsWith(".size") && kind == NumericKind.I32) return true
-    if (s.endsWith(".hashCode()") && kind == NumericKind.I32) return true
+    if (kind == NumericKind.I32 && (s.endsWith(".code") || s.endsWith(".size") || s.endsWith(".hashCode()"))) return true
     if (s.endsWith(".rawValue") && kind == NumericKind.I64) return true
     val withoutSign = if (s.startsWith("-")) s.drop(1).trim() else s
     if (kind == NumericKind.I32 && isDecimalOrHexLiteralDigits(withoutSign)) return true
@@ -457,13 +461,11 @@ private fun convertTo128BitBoxedNumeric(
 ): String {
     if (sourceKind == directSelfKind) return recv
     if (sourceKind == directPeerKind) return "$recv.$directPeerMethod()"
-    BOXED_INT_FROM_SUFFIX_BY_KIND[sourceKind]?.let { suffix ->
-        return "$targetBoxType.$suffix($recv)"
-    }
-    return when (sourceKind) {
-        NumericKind.F16, NumericKind.F32, NumericKind.F64, NumericKind.F128 ->
+    BOXED_INT_FROM_SUFFIX_BY_KIND[sourceKind]?.let { suffix -> return "$targetBoxType.$suffix($recv)" }
+    return when {
+        sourceKind != null && PrimitiveNumericOpCatalog.isFloatKind(sourceKind) ->
             "$targetBoxType.$floatFallbackMethod($recv.$floatFallbackCast())"
-        null ->
+        sourceKind == null ->
             when {
                 recv.endsWith("uL") -> "$targetBoxType.fromULong($recv)"
                 recv.endsWith("u") -> "$targetBoxType.fromUInt($recv)"
@@ -480,9 +482,7 @@ private fun convertToBoxedFloatNumeric(
     sourceKind: NumericKind?,
 ): String {
     if (sourceKind == targetSelfKind) return recv
-    BOXED_INT_FROM_SUFFIX_BY_KIND[sourceKind]?.let { suffix ->
-        return "$targetBoxType.$suffix($recv)"
-    }
+    BOXED_INT_FROM_SUFFIX_BY_KIND[sourceKind]?.let { suffix -> return "$targetBoxType.$suffix($recv)" }
     return when (sourceKind) {
         NumericKind.F16 -> "$targetBoxType.fromF16($recv)"
         NumericKind.F32 -> "$targetBoxType.fromFloat($recv)"
@@ -503,14 +503,9 @@ internal fun KotlinJ2KEmitter.convertNumericReceiver(
         return recv
     }
     return when (canonicalNumericTarget) {
-        "Byte" -> "$recv.toByte()"
-        "Short" -> "$recv.toShort()"
-        "Int" -> "$recv.toInt()"
-        "Long" -> "$recv.toLong()"
-        "UByte" -> "$recv.toUByte()"
-        "UShort" -> "$recv.toUShort()"
-        "UInt" -> "$recv.toUInt()"
-        "ULong" -> "$recv.toULong()"
+        "Byte", "Short", "Int", "Long", "UByte", "UShort", "UInt", "ULong", "Double" ->
+            "$recv${NUMERIC_SUFFIX_BY_KIND.getValue(requireNotNull(targetKind))}"
+        "Float", "kotlin.Float" -> "$recv.toFloat()"
         "U128" ->
             convertTo128BitBoxedNumeric(
                 recv = recv,
@@ -533,8 +528,6 @@ internal fun KotlinJ2KEmitter.convertNumericReceiver(
                 floatFallbackMethod = "fromLong",
                 floatFallbackCast = "toLong",
             )
-        "Float", "kotlin.Float" -> "$recv.toFloat()"
-        "Double" -> "$recv.toDouble()"
         "F16" -> convertToBoxedFloatNumeric(recv, "F16", NumericKind.F16, sourceKind)
         "F128" -> convertToBoxedFloatNumeric(recv, "F128", NumericKind.F128, sourceKind)
         "Char" -> "$recv.toInt().toChar()"
@@ -596,78 +589,10 @@ internal fun KotlinJ2KEmitter.hasNoTopLevelSpacesOrColons(text: String): Boolean
 
 internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): String =
     when (ty) {
-        is SynType.Reference -> {
-            val mutElem = if (ty.mutability != null) unwrapSynType(ty.elem) else null
-            val mutVecElemType =
-                if (mutElem is SynType.Path &&
-                    mutElem.qself == null &&
-                    "Vec" !in inspector.declaredTypeNames
-                ) {
-                    val segs = mutElem.path.segments.toList()
-                    val lastSeg = segs.lastOrNull()
-                    val prefixOk =
-                        segs.dropLast(1).all { seg ->
-                            val raw = seg.ident.toString().removePrefix("r#")
-                            raw in STDLIB_TYPE_PATH_PREFIXES || raw == "vec"
-                        }
-                    if (prefixOk && lastSeg?.ident?.toString()?.removePrefix("r#") == "Vec") {
-                        (lastSeg.arguments as? PathArguments.AngleBracketed)
-                            ?.args
-                            ?.toList()
-                            .orEmpty()
-                            .filterIsInstance<GenericArgument.TypeArg>()
-                            .firstOrNull()
-                            ?.type
-                    } else {
-                        null
-                    }
-                } else {
-                    null
-                }
-            if (mutElem is SynType.Slice) {
-                "MutableList<${renderType(mutElem.elem, selfTypeName)}>"
-            } else if (mutVecElemType != null) {
-                "MutableList<${renderType(mutVecElemType, selfTypeName)}>"
-            } else if (ty.mutability != null && shouldUseAddressBackedMutableReference(ty.elem, selfTypeName)) {
-                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.RustMutableReference")
-                "RustMutableReference<${renderType(ty.elem, selfTypeName)}>"
-            } else {
-                renderType(ty.elem, selfTypeName)
-            }
-        }
+        is SynType.Reference -> renderReferenceType(ty, selfTypeName)
         is SynType.Ptr -> renderPointerType(ty, selfTypeName)
         is SynType.Slice -> "List<${renderType(ty.elem, selfTypeName)}>"
-        is SynType.Array -> {
-            val elemRendered = renderType(ty.elem, selfTypeName)
-            if (elemRendered == "Boolean") {
-                "BooleanArray"
-            } else {
-                when (resolveNumericKind(elemRendered)) {
-                    NumericKind.I8 -> "ByteArray"
-                    NumericKind.U8 -> "UByteArray"
-                    NumericKind.I16 -> "ShortArray"
-                    NumericKind.U16 -> "UShortArray"
-                    NumericKind.I32 -> "IntArray"
-                    NumericKind.U32 -> "UIntArray"
-                    NumericKind.I64 -> "LongArray"
-                    NumericKind.U64 -> "ULongArray"
-                    NumericKind.F32 -> "FloatArray"
-                    NumericKind.F64 -> "DoubleArray"
-                    NumericKind.I128, NumericKind.U128, NumericKind.F16, NumericKind.F128, null -> {
-                        val nonNullElem =
-                            when {
-                                elemRendered.endsWith("?") ->
-                                    elemRendered.removeSuffix("?")
-                                isOptionFnTypeAliasRenderedType(elemRendered) ->
-                                    "${elemRendered}Fn"
-                                else -> elemRendered
-                            }
-                        "List<$nonNullElem>"
-                    }
-                }
-            }
-        }
+        is SynType.Array -> renderArrayType(ty, selfTypeName)
         is SynType.Tuple -> {
             val elems = ty.elems.toList()
             val pairType = if ("Pair" in inspector.declaredTypeNames) "kotlin.Pair" else "Pair"
@@ -683,16 +608,9 @@ internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): St
         is SynType.Path -> {
             val qself = ty.qself
             if (qself != null) {
-                val lastSeg =
-                    ty.path.segments
-                        .last()
-                        ?.ident
-                        ?.toString()
-                if (lastSeg != null && lastSeg != "Self") {
-                    rustTypeIdentToKotlin(lastSeg)
-                } else {
-                    renderType(qself.ty, selfTypeName)
-                }
+                val pathSegs = ty.path.segments
+                val lastSeg = pathSegs.last()?.ident?.toString()
+                if (lastSeg != null && lastSeg != "Self") rustTypeIdentToKotlin(lastSeg) else renderType(qself.ty, selfTypeName)
             } else {
                 renderPathAsType(ty.path, selfTypeName)
             }
@@ -706,28 +624,21 @@ internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): St
                 inExternParamType = prevParam
             }
         }
-        is SynType.ImplTrait -> {
-            val bounds = ty.bounds.toList().mapNotNull { renderTypeParamBound(it, selfTypeName) }
-            bounds.firstOrNull() ?: "Any"
-        }
-        is SynType.TraitObject -> {
+        is SynType.ImplTrait -> ty.bounds.toList().firstNotNullOfOrNull { renderTypeParamBound(it, selfTypeName) } ?: "Any"
+        is SynType.TraitObject ->
             if (isStdlibDynAnyTraitObject(ty)) {
                 "RustAny"
             } else {
-                val bounds = ty.bounds.toList().mapNotNull { renderTypeParamBound(it, selfTypeName) }
-                bounds.firstOrNull() ?: "Any"
+                ty.bounds.toList().firstNotNullOfOrNull { renderTypeParamBound(it, selfTypeName) } ?: "Any"
             }
-        }
         is SynType.Paren -> renderType(ty.elem, selfTypeName)
         is SynType.Group -> renderType(ty.elem, selfTypeName)
         is SynType.Never -> if ("Nothing" in inspector.declaredTypeNames) "kotlin.Nothing" else "Nothing"
         is SynType.Infer -> "Any?"
         is SynType.Macro -> {
-            val macroName =
-                ty.mac.path.segments
-                    .last()
-                    ?.ident
-                    ?.toString()
+            val macPath = ty.mac.path
+            val macroSegs = macPath.segments.toList()
+            val macroName = macroSegs.lastOrNull()?.ident?.toString()
             if (macroName == "Token") {
                 RustTokenCursor.resolveSynTokenStreamTypeName(ty.mac.tokens) ?: "Token"
             } else {
@@ -737,24 +648,64 @@ internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): St
         is SynType.Verbatim -> "Any"
     }
 
-private val KOTLIN_BUILTIN_VALUE_TYPE_NAMES: Set<String> =
-    setOf(
-        "Byte",
-        "Short",
-        "Int",
-        "Long",
-        "UByte",
-        "UShort",
-        "UInt",
-        "ULong",
-        "Float",
-        "Double",
-        "Boolean",
-        "Char",
-        "String",
-        "Unit",
-        "Any",
-    )
+private fun KotlinJ2KEmitter.renderReferenceType(ty: SynType.Reference, selfTypeName: String?): String {
+    val mutElem = if (ty.mutability != null) unwrapSynType(ty.elem) else null
+    val mutVecElemType =
+        if (mutElem is SynType.Path && mutElem.qself == null && "Vec" !in inspector.declaredTypeNames) {
+            val segs = mutElem.path.segments.toList()
+            val lastSeg = segs.lastOrNull()
+            val prefixOk =
+                segs.dropLast(1).all { seg ->
+                    val raw = seg.ident.toString().removePrefix("r#")
+                    raw in STDLIB_TYPE_PATH_PREFIXES || raw == "vec"
+                }
+            val lastName = lastSeg?.ident?.toString()?.removePrefix("r#")
+            if (prefixOk && lastName == "Vec") {
+                val angleArgs = (lastSeg.arguments as? PathArguments.AngleBracketed)?.args?.toList()
+                angleArgs?.firstNotNullOfOrNull { (it as? GenericArgument.TypeArg)?.type }
+            } else {
+                null
+            }
+        } else {
+            null
+        }
+    return when {
+        mutElem is SynType.Slice -> "MutableList<${renderType(mutElem.elem, selfTypeName)}>"
+        mutVecElemType != null -> "MutableList<${renderType(mutVecElemType, selfTypeName)}>"
+        ty.mutability != null && shouldUseAddressBackedMutableReference(ty.elem, selfTypeName) -> {
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.RustMutableReference")
+            "RustMutableReference<${renderType(ty.elem, selfTypeName)}>"
+        }
+        else -> renderType(ty.elem, selfTypeName)
+    }
+}
+
+private fun KotlinJ2KEmitter.renderArrayType(ty: SynType.Array, selfTypeName: String?): String {
+    val elemRendered = renderType(ty.elem, selfTypeName)
+    if (elemRendered == "Boolean") return "BooleanArray"
+    return when (resolveNumericKind(elemRendered)) {
+        NumericKind.I8 -> "ByteArray"
+        NumericKind.U8 -> "UByteArray"
+        NumericKind.I16 -> "ShortArray"
+        NumericKind.U16 -> "UShortArray"
+        NumericKind.I32 -> "IntArray"
+        NumericKind.U32 -> "UIntArray"
+        NumericKind.I64 -> "LongArray"
+        NumericKind.U64 -> "ULongArray"
+        NumericKind.F32 -> "FloatArray"
+        NumericKind.F64 -> "DoubleArray"
+        NumericKind.I128, NumericKind.U128, NumericKind.F16, NumericKind.F128, null -> {
+            val nonNullElem =
+                when {
+                    elemRendered.endsWith("?") -> elemRendered.removeSuffix("?")
+                    isOptionFnTypeAliasRenderedType(elemRendered) -> "${elemRendered}Fn"
+                    else -> elemRendered
+                }
+            "List<$nonNullElem>"
+        }
+    }
+}
 
 internal fun KotlinJ2KEmitter.kotlinBuiltinTypeName(simpleType: String): String {
     if (simpleType !in KOTLIN_BUILTIN_VALUE_TYPE_NAMES) return simpleType
@@ -768,99 +719,440 @@ internal fun KotlinJ2KEmitter.kotlinBuiltinTypeName(simpleType: String): String 
     return if (shadowed) "kotlin.$simpleType" else simpleType
 }
 
-internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?): String {
-    val rawSegments = path.segments.toList()
-    if (rawSegments.isEmpty()) return "Any"
-    if (rawSegments.size >= 2 && rawSegments[0].ident.toString() == "Self") {
-        val assocIdent = rawSegments.last().ident.toString()
-        val assocTy = currentImplAssocTypes[assocIdent]
-        if (assocTy != null) {
-            val prev = currentImplAssocTypes
-            currentImplAssocTypes = prev - assocIdent
-            return try {
-                renderType(assocTy, selfTypeName)
-            } finally {
-                currentImplAssocTypes = prev
-            }
-        }
-        return rustTypeIdentToKotlin(assocIdent)
-    }
-    if (rawSegments.size == 1 && rawSegments[0].arguments is PathArguments.None) {
-        val singleKt = rustTypeIdentToKotlin(rawSegments[0].ident.toString())
-        substitutedTypeParamTypes[singleKt]?.let { return it }
-        renamedTypeParamIdentifiers[singleKt]?.let { return it }
-    }
-    if (rawSegments.size == 2 &&
-        rawSegments[0].arguments is PathArguments.None &&
-        rustTypeIdentToKotlin(rawSegments[0].ident.toString()) in activeTypeParamNames
-    ) {
-        return rustTypeIdentToKotlin(rawSegments[1].ident.toString())
-    }
-    val lastSeg = rawSegments.last()
-    val rawName = lastSeg.ident.toString()
-    if (rawName == "PhantomData" && "PhantomData" !in inspector.declaredTypeNames) {
-        return "Unit"
-    }
-    val fmtSegNames =
-        rewriteCrateRootAliasAndReexportSegments(
+/**
+ * Shared state and trait/nominal generic-argument resolution for lowering a `syn.Path` in type position.
+ */
+internal class TypePathLoweringContext(
+    val emitter: KotlinJ2KEmitter,
+    val path: Path,
+    val rawSegments: List<PathSegment>,
+    val selfTypeName: String?,
+) {
+    val lastSeg: PathSegment = rawSegments.last()
+    val rawName: String = lastSeg.ident.toString()
+    val rewrittenCleanSegs: List<String> by lazy {
+        emitter.rewriteCrateRootAliasAndReexportSegments(
             rawSegments.map { it.ident.toString().removePrefix("r#") },
         )
-    val isStdlibFmtModule =
-        (
-            fmtSegNames.size >= 3 &&
-                fmtSegNames[0] in STDLIB_CRATE_ROOTS &&
-                fmtSegNames[1] == "fmt"
-        ) ||
-            (
-                fmtSegNames.size == 2 &&
-                    fmtSegNames[0] == "fmt" &&
-                    (
-                        scopeBuilder.resolveModuleBinding("fmt") != null ||
-                            headerContext.rawAbiMode ||
-                            headerContext.finalClasses ||
-                            currentAttachedImplTraitPath
-                                ?.segments
-                                ?.last()
-                                ?.ident
-                                ?.toString() in FMT_TRAIT_NAMES
-                    )
-            )
-    if (isStdlibFmtModule) {
-        if (rawName == "Formatter") return "StringBuilder"
-        if (rawName == "Write") return "Appendable"
-        if ((rawName == "Result" || rawName == "Error") &&
-            headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") != true
+    }
+    private val cachedRenderedAngleArgs: List<String> by lazy {
+        val angle = lastSeg.arguments as? PathArguments.AngleBracketed ?: return@lazy emptyList()
+        angle.args.toList().mapNotNull { emitter.renderGenericArgument(it, selfTypeName) }
+    }
+    var externalQualifiedOverride: String? = null
+    var prefixQualifier: String = ""
+
+    val isPrimitivePrefix: Boolean =
+        rawSegments.size == 1 ||
+            rawSegments.dropLast(1).all {
+                val p = it.ident.toString()
+                p in IGNORED_PATH_PREFIXES || p == "primitive"
+            }
+
+    fun renderedAngleTypeArgs(): List<String> = cachedRenderedAngleArgs
+
+    fun resolvePrefixAndQualification() {
+        val crossTarget =
+            if (rawSegments.size >= 2 && rawSegments.dropLast(1).all { it.arguments is PathArguments.None }) {
+                emitter.resolveCrossModulePathTarget(rawSegments.map { it.ident.toString() }, inTypePosition = true)
+            } else {
+                null
+            }
+        if (crossTarget != null) {
+            val (resolvedSym, trailing) = crossTarget
+            val boundHead = emitter.bindOrQualifyResolvedCrossSymbol(resolvedSym)
+            if (trailing.isEmpty()) {
+                externalQualifiedOverride = boundHead
+                prefixQualifier = ""
+            } else {
+                val midPrefix = trailing.dropLast(1).map(::rustTypeIdentToKotlin)
+                prefixQualifier = (listOf(boundHead) + midPrefix).joinToString(".") + "."
+            }
+            return
+        }
+        val prefixSegments =
+            rawSegments
+                .dropLast(1)
+                .map { it.ident.toString() }
+                .filter {
+                    it !in IGNORED_PATH_PREFIXES &&
+                        it !in STDLIB_PRELUDE_REEXPORT_MODULES &&
+                        it !in emitter.inspector.localInlineModuleNames &&
+                        (it.first().isUpperCase() || (emitter.scopeBuilder.isImportedModuleInScope(it) && !emitter.isSuppressedStdlibModuleAlias(it)))
+                }.map {
+                    if (it.first().isUpperCase()) {
+                        rustTypeIdentToKotlin(it)
+                    } else {
+                        emitter.scopeBuilder.resolveModuleBinding(it)?.kotlinName ?: rustModuleIdentToKotlin(it)
+                    }
+                }
+        prefixQualifier = if (prefixSegments.isNotEmpty()) prefixSegments.joinToString(".") + "." else ""
+    }
+
+    fun renderNominalOrTraitTypePath(): String {
+        val mappedRawBaseIdent = rustTypeIdentToKotlin(rawName)
+        val ktBaseIdent =
+            if (rawSegments.size == 1 && prefixQualifier.isEmpty() && externalQualifiedOverride == null) {
+                emitter.samePackageUseRenames[mappedRawBaseIdent] ?: mappedRawBaseIdent
+            } else {
+                mappedRawBaseIdent
+            }
+        qualifyEnumVariantShadowedOuterTypeIfNeeded(ktBaseIdent)
+        bindSameCrateSubpackageSymbolIfNeeded(ktBaseIdent)
+
+        val mappedBase =
+            when {
+                rawName == "Self" -> selfTypeName ?: "Any"
+                externalQualifiedOverride != null -> externalQualifiedOverride!!
+                else -> prefixQualifier + ktBaseIdent
+            }
+
+        val traitDecl = emitter.lookupDeclaredTraitAst(ktBaseIdent, path)
+        val isCoreOpsName =
+            ktBaseIdent in CORE_OPS_BINARY_TRAITS ||
+                ktBaseIdent in CORE_OPS_UNARY_OUTPUT_TRAITS ||
+                ktBaseIdent in CORE_OPS_ASSIGN_TRAITS
+        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
+        val selfOpsSubpkg = emitter.resolveBestSubpackageForSymbol(ktBaseIdent)
+        val isExternalCoreOps =
+            traitDecl == null &&
+                ktBaseIdent !in emitter.inspector.declaredTypeNames &&
+                isCoreOpsName &&
+                (
+                    (prefixQualifier.isEmpty() && externalQualifiedOverride == null && (selfOpsSubpkg == null || selfOpsSubpkg.startsWith("ops"))) ||
+                        emitter.importedSimpleNameToPkg[ktBaseIdent]?.startsWith("$coreNs.ops") == true ||
+                        prefixQualifier == "ops." ||
+                        prefixQualifier.endsWith(".ops.")
+                )
+        val bounded = emitter.currentBoundedTypeName
+        val opsDefaultRhs = bounded ?: selfTypeName ?: "Any?"
+        val traitGenerics = traitDecl?.generics
+        val rawTraitParams = traitGenerics?.params?.toList().orEmpty()
+        val declaredTypeParams = rawTraitParams.filterIsInstance<GenericParam.TypeParam>()
+        val lookupAssocs = emitter.lookupTraitDefaultlessAssocTypes(ktBaseIdent, path)
+        val effectiveLookupAssocs =
+            when {
+                lookupAssocs.isNotEmpty() -> lookupAssocs
+                isExternalCoreOps && (ktBaseIdent in CORE_OPS_BINARY_TRAITS || ktBaseIdent in CORE_OPS_UNARY_OUTPUT_TRAITS) -> listOf("Output")
+                else -> emptyList()
+            }
+        if (isExternalCoreOps &&
+            prefixQualifier.isEmpty() &&
+            externalQualifiedOverride == null &&
+            ktBaseIdent !in emitter.importedSimpleNameToPkg &&
+            !emitter.headerContext.rawAbiMode &&
+            "core" in emitter.headerContext.crateNamespaces
         ) {
+            val coreExtPkgs = emitter.headerContext.externalCrateSymbolPackages["core"]
+            val extCoreOpsPkg = coreExtPkgs?.get(ktBaseIdent)?.firstOrNull()
+            val selfCoreOpsPkg = selfOpsSubpkg?.let { if (it.isEmpty()) coreNs else "$coreNs.$it" }
+            val opsFqcn =
+                when {
+                    extCoreOpsPkg != null -> "$extCoreOpsPkg.$ktBaseIdent"
+                    selfCoreOpsPkg != null -> "$selfCoreOpsPkg.$ktBaseIdent"
+                    else -> "$coreNs.ops.$ktBaseIdent"
+                }
+            CoreIntrinsicLowering.registerCoreImport(emitter, opsFqcn)
+        }
+
+        return when (val args = lastSeg.arguments) {
+            is PathArguments.None ->
+                renderUnparameterizedPathArgs(mappedBase, ktBaseIdent, isExternalCoreOps, opsDefaultRhs, bounded, declaredTypeParams, effectiveLookupAssocs)
+            is PathArguments.AngleBracketed ->
+                renderAngleBracketedPathArgs(args, mappedBase, ktBaseIdent, coreNs, traitDecl, isExternalCoreOps, opsDefaultRhs, bounded, declaredTypeParams, effectiveLookupAssocs)
+            is PathArguments.Parenthesized -> {
+                val inputs = args.inputs.toList().joinToString(", ") { emitter.renderType(it.ty, selfTypeName) }
+                val out = extractReturnSynType(args.output)?.let { emitter.renderType(it, selfTypeName) } ?: "Unit"
+                "($inputs) -> $out"
+            }
+        }
+    }
+
+    private fun qualifyEnumVariantShadowedOuterTypeIfNeeded(ktBaseIdent: String) {
+        if (rawSegments.size != 1 ||
+            prefixQualifier.isNotEmpty() ||
+            externalQualifiedOverride != null ||
+            rawName == "Self" ||
+            ktBaseIdent == selfTypeName?.substringBefore('<')?.trim() ||
+            ktBaseIdent !in emitter.activeEnclosingEnumVariantNames ||
+            ktBaseIdent in emitter.activeTypeParamNames ||
+            rawName in PRIMITIVE_TYPE_NAMES
+        ) {
+            return
+        }
+        val outerPkg =
+            emitter.importedSimpleNameToPkg[ktBaseIdent]
+                ?: emitter.headerContext.packageName?.takeIf {
+                    it.isNotEmpty() &&
+                        (ktBaseIdent in emitter.inspector.declaredTypeNames || ktBaseIdent in emitter.headerContext.moduleDeclaredTypeNames)
+                }
+                ?: emitter.resolveBestSubpackageForSymbol(ktBaseIdent)?.let { sub ->
+                    emitter.currentNamespacePrefix()?.let { ns -> if (sub.isEmpty()) ns else "$ns.$sub" }
+                }
+        if (!outerPkg.isNullOrEmpty()) {
+            externalQualifiedOverride = "$outerPkg.$ktBaseIdent"
+        }
+    }
+
+    private fun bindSameCrateSubpackageSymbolIfNeeded(ktBaseIdent: String) {
+        if (prefixQualifier.isNotEmpty() ||
+            externalQualifiedOverride != null ||
+            rawSegments.size > 2 ||
+            rawName == "Self" ||
+            !isPrimitivePrefix ||
+            ktBaseIdent in emitter.inspector.declaredTypeNames ||
+            ktBaseIdent in emitter.activeTypeParamNames ||
+            (ktBaseIdent.length == 1 && ktBaseIdent[0] in 'A'..'Z') ||
+            ktBaseIdent in emitter.inspector.enumVariantSimpleNames ||
+            ktBaseIdent in emitter.inspector.importedEnumVariantSimpleNames ||
+            (ktBaseIdent in KOTLIN_STDLIB_SHADOWED_IMPORTS && rawName != "Float") ||
+            emitter.headerContext.crateSymbolSubpackages.isEmpty()
+        ) {
+            return
+        }
+        val bestSubpkg = emitter.resolveBestSubpackageForSymbol(ktBaseIdent) ?: return
+        val nsPrefix = emitter.currentNamespacePrefix() ?: return
+        val targetPkg = if (bestSubpkg.isEmpty()) nsPrefix else "$nsPrefix.$bestSubpkg"
+        if (targetPkg.isEmpty() || targetPkg == emitter.headerContext.packageName) return
+        val collidedPkg = emitter.importedSimpleNameToPkg[ktBaseIdent]
+        if (collidedPkg != null && collidedPkg != targetPkg) {
+            externalQualifiedOverride = "$targetPkg.$ktBaseIdent"
+        } else {
+            emitter.importedSimpleNameToPkg[ktBaseIdent] = targetPkg
+            emitter.extraTypePathImports += "import $targetPkg.$ktBaseIdent"
+        }
+    }
+
+    private fun renderUnparameterizedPathArgs(
+        mappedBase: String,
+        ktBaseIdent: String,
+        isExternalCoreOps: Boolean,
+        opsDefaultRhs: String,
+        bounded: String?,
+        declaredTypeParams: List<GenericParam.TypeParam>,
+        effectiveLookupAssocs: List<String>,
+    ): String {
+        if (isExternalCoreOps) {
+            when (ktBaseIdent) {
+                in CORE_OPS_BINARY_TRAITS ->
+                    return if (emitter.suppressTraitAssocPlaceholders) "$mappedBase<$opsDefaultRhs>" else "$mappedBase<$opsDefaultRhs, Any?>"
+                in CORE_OPS_UNARY_OUTPUT_TRAITS ->
+                    return if (emitter.suppressTraitAssocPlaceholders) mappedBase else "$mappedBase<Any?>"
+                in CORE_OPS_ASSIGN_TRAITS ->
+                    return "$mappedBase<$opsDefaultRhs>"
+            }
+        }
+        val defaultedParams =
+            declaredTypeParams.mapNotNull { gp ->
+                gp.default?.type?.let { emitter.renderType(it, selfTypeName = bounded ?: selfTypeName) }
+            }
+        val typeArgs =
+            buildList {
+                addAll(defaultedParams)
+                if (bounded != null && emitter.isSelfParameterizedTraitName(ktBaseIdent)) {
+                    add(bounded)
+                } else if (bounded == null &&
+                    !emitter.suppressTraitAssocPlaceholders &&
+                    emitter.isSelfParameterizedTraitName(ktBaseIdent) &&
+                    defaultedParams.isEmpty() &&
+                    effectiveLookupAssocs.isEmpty() &&
+                    ktBaseIdent !in emitter.activeTypeParamNames
+                ) {
+                    add("*")
+                }
+                for (assocKt in effectiveLookupAssocs) {
+                    if (assocKt in emitter.currentTraitAssocParamNames) {
+                        add(assocKt)
+                    } else if (bounded != null && !emitter.suppressTraitAssocPlaceholders) {
+                        add("Any?")
+                    }
+                }
+            }
+        return if (typeArgs.isEmpty()) mappedBase else "$mappedBase<${typeArgs.joinToString(", ")}>"
+    }
+
+    private fun renderAngleBracketedPathArgs(
+        args: PathArguments.AngleBracketed,
+        mappedBase: String,
+        ktBaseIdent: String,
+        coreNs: String,
+        traitDecl: Item.Trait?,
+        isExternalCoreOps: Boolean,
+        opsDefaultRhs: String,
+        bounded: String?,
+        declaredTypeParams: List<GenericParam.TypeParam>,
+        effectiveLookupAssocs: List<String>,
+    ): String {
+        val declaredTraitAssocs =
+            if (effectiveLookupAssocs.isNotEmpty() || ktBaseIdent in emitter.inspector.declaredTypeNames || isExternalCoreOps) {
+                effectiveLookupAssocs
+            } else {
+                null
+            }
+        val rawArgList = args.args.toList()
+        if (traitDecl != null || isExternalCoreOps) {
+            val explicitPositionalArgs =
+                rawArgList
+                    .filter { it !is GenericArgument.AssocTypeArg && it !is GenericArgument.LifetimeArg }
+                    .mapNotNull { emitter.renderGenericArgument(it, selfTypeName) }
+                    .toMutableList()
+            val explicitAssocByName = linkedMapOf<String, String>()
+            for (ga in rawArgList) {
+                if (ga is GenericArgument.AssocTypeArg) {
+                    val assocKt = rustTypeIdentToKotlin(ga.assoc.ident.toString())
+                    if (declaredTraitAssocs == null || assocKt in declaredTraitAssocs) {
+                        explicitAssocByName[assocKt] = emitter.renderType(ga.assoc.ty, selfTypeName)
+                    }
+                }
+            }
+            if (isExternalCoreOps) {
+                if ((ktBaseIdent in CORE_OPS_BINARY_TRAITS || ktBaseIdent in CORE_OPS_ASSIGN_TRAITS) && explicitPositionalArgs.isEmpty()) {
+                    explicitPositionalArgs += opsDefaultRhs
+                }
+            } else if (declaredTypeParams.isNotEmpty() && explicitPositionalArgs.size < declaredTypeParams.size) {
+                for (idx in explicitPositionalArgs.size until declaredTypeParams.size) {
+                    val defTy = declaredTypeParams[idx].default?.type ?: break
+                    explicitPositionalArgs += emitter.renderType(defTy, selfTypeName = bounded ?: selfTypeName)
+                }
+            }
+            val finalAssocs =
+                effectiveLookupAssocs.mapNotNull { assocKt ->
+                    explicitAssocByName[assocKt]
+                        ?: when {
+                            assocKt in emitter.currentTraitAssocParamNames -> assocKt
+                            !emitter.suppressTraitAssocPlaceholders && (bounded != null || isExternalCoreOps) -> "Any?"
+                            else -> null
+                        }
+                }
+            val typeArgs =
+                buildList {
+                    addAll(explicitPositionalArgs)
+                    if (bounded != null && emitter.isSelfParameterizedTraitName(ktBaseIdent)) {
+                        add(bounded)
+                    }
+                    addAll(finalAssocs)
+                    addAll(emitter.sourceAssociatedArguments(path, selfTypeName))
+                }
+            return if (typeArgs.isEmpty()) mappedBase else "$mappedBase<${typeArgs.joinToString(", ")}>"
+        }
+
+        val filteredArgs =
+            rawArgList.filter { ga ->
+                ga !is GenericArgument.AssocTypeArg || declaredTraitAssocs == null || rustTypeIdentToKotlin(ga.assoc.ident.toString()) in declaredTraitAssocs
+            }
+        val rawSegNames = rawSegments.map { it.ident.toString().removePrefix("r#") }
+        val explicitArgs = filteredArgs.mapNotNull { emitter.renderGenericArgument(it, selfTypeName) }
+        val rawTypeArgs = rawArgList.filterIsInstance<GenericArgument.TypeArg>()
+        if (ktBaseIdent == "Atomic" &&
+            "Atomic" !in emitter.inspector.declaredTypeNames &&
+            !emitter.headerContext.rawAbiMode &&
+            "core" in emitter.headerContext.crateNamespaces &&
+            rawTypeArgs.size == 1
+        ) {
+            resolveConcreteStdlibAtomicSimpleName(rawTypeArgs[0].type, explicitArgs.firstOrNull())?.let {
+                return emitter.bindOrQualifyResolvedCrossSymbol("$coreNs.sync.atomic.$it")
+            }
+        }
+        val explicitAssocNames =
+            rawArgList
+                .filterIsInstance<GenericArgument.AssocTypeArg>()
+                .mapTo(hashSetOf()) { rustTypeIdentToKotlin(it.assoc.ident.toString()) }
+        val defaultedArgs = emitter.appendStdlibDefaultTypeArgsIfNeeded(mappedBase, rawName, rawSegNames, explicitArgs, selfTypeName)
+        val extraAssocs =
+            emitter
+                .lookupTraitDefaultlessAssocTypes(ktBaseIdent, path)
+                .filter { it in emitter.currentTraitAssocParamNames && it !in explicitAssocNames && it !in explicitArgs }
+        val typeArgs = defaultedArgs + extraAssocs + emitter.sourceAssociatedArguments(path, selfTypeName)
+        return if (typeArgs.isEmpty()) mappedBase else "$mappedBase<${typeArgs.joinToString(", ")}>"
+    }
+}
+
+internal abstract class TypePathLoweringRule {
+    abstract fun tryRender(ctx: TypePathLoweringContext): String?
+}
+
+private object SelfAndTypeParamPathRule : TypePathLoweringRule() {
+    override fun tryRender(ctx: TypePathLoweringContext): String? {
+        val emitter = ctx.emitter
+        val segs = ctx.rawSegments
+        if (segs.size >= 2 && segs[0].ident.toString() == "Self") {
+            val assocIdent = segs.last().ident.toString()
+            val assocTy = emitter.currentImplAssocTypes[assocIdent]
+            if (assocTy != null) {
+                val prev = emitter.currentImplAssocTypes
+                emitter.currentImplAssocTypes = prev - assocIdent
+                return try {
+                    emitter.renderType(assocTy, ctx.selfTypeName)
+                } finally {
+                    emitter.currentImplAssocTypes = prev
+                }
+            }
+            return rustTypeIdentToKotlin(assocIdent)
+        }
+        if (segs.size == 1 && segs[0].arguments is PathArguments.None) {
+            val singleKt = rustTypeIdentToKotlin(segs[0].ident.toString())
+            emitter.substitutedTypeParamTypes[singleKt]?.let { return it }
+            emitter.renamedTypeParamIdentifiers[singleKt]?.let { return it }
+        }
+        if (segs.size == 2 &&
+            segs[0].arguments is PathArguments.None &&
+            rustTypeIdentToKotlin(segs[0].ident.toString()) in emitter.activeTypeParamNames
+        ) {
+            return rustTypeIdentToKotlin(segs[1].ident.toString())
+        }
+        if (ctx.rawName == "PhantomData" && "PhantomData" !in emitter.inspector.declaredTypeNames) {
             return "Unit"
         }
-        if (rawName == "DebugStruct" && "DebugStruct" !in inspector.declaredTypeNames) {
-            return "DebugStruct"
-        }
-        if (rawName == "DebugTuple" && "DebugTuple" !in inspector.declaredTypeNames) {
-            return "DebugTuple"
-        }
+        return null
     }
-    if (rawSegments.size == 1 && lastSeg.arguments is PathArguments.None) {
-        if (rawName == "DebugStruct" && "DebugStruct" !in inspector.declaredTypeNames) {
-            return "DebugStruct"
+}
+
+private object StdlibFmtAndFfiTypePathRule : TypePathLoweringRule() {
+    override fun tryRender(ctx: TypePathLoweringContext): String? {
+        val emitter = ctx.emitter
+        val rawName = ctx.rawName
+        val fmtSegNames = ctx.rewrittenCleanSegs
+        val attachedTraitSegs = emitter.currentAttachedImplTraitPath?.segments?.toList()
+        val attachedTraitLast = attachedTraitSegs?.lastOrNull()?.ident?.toString()
+        val isStdlibFmtModule =
+            (fmtSegNames.size >= 3 && fmtSegNames[0] in STDLIB_CRATE_ROOTS && fmtSegNames[1] == "fmt") ||
+                (
+                    fmtSegNames.size == 2 &&
+                        fmtSegNames[0] == "fmt" &&
+                        (
+                            emitter.scopeBuilder.resolveModuleBinding("fmt") != null ||
+                                emitter.headerContext.rawAbiMode ||
+                                emitter.headerContext.finalClasses ||
+                                attachedTraitLast in FMT_TRAIT_NAMES
+                        )
+                )
+        if (isStdlibFmtModule) {
+            when {
+                rawName == "Formatter" -> return "StringBuilder"
+                rawName == "Write" -> return "Appendable"
+                (rawName == "Result" || rawName == "Error") &&
+                    emitter.headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") != true ->
+                    return "Unit"
+                (rawName == "DebugStruct" || rawName == "DebugTuple") && rawName !in emitter.inspector.declaredTypeNames ->
+                    return rawName
+            }
         }
-        if (rawName == "DebugTuple" && "DebugTuple" !in inspector.declaredTypeNames) {
-            return "DebugTuple"
+        if (ctx.rawSegments.size == 1 && ctx.lastSeg.arguments is PathArguments.None) {
+            if ((rawName == "DebugStruct" || rawName == "DebugTuple") && rawName !in emitter.inspector.declaredTypeNames) {
+                return rawName
+            }
         }
-    }
-    if (rawName == "ThreadId" && "ThreadId" !in inspector.declaredTypeNames) {
-        return "Any"
-    }
-    if (!headerContext.rawAbiMode && lastSeg.arguments is PathArguments.None) {
-        val rawSegNames =
-            rewriteCrateRootAliasAndReexportSegments(
-                rawSegments.map { it.ident.toString().removePrefix("r#") },
-            )
+        if (rawName == "ThreadId" && "ThreadId" !in emitter.inspector.declaredTypeNames) {
+            return "Any"
+        }
+        if (emitter.headerContext.rawAbiMode || ctx.lastSeg.arguments !is PathArguments.None) return null
+
+        val rawSegNames = ctx.rewrittenCleanSegs
         val symLeaf = rawSegNames.last()
         val isSelfContainedLibcFfi =
             rawSegNames.size == 2 &&
                 rawSegNames[0] == "libc" &&
-                FfiInteropCollector.resolveLibcNamespace(headerContext) == null
+                FfiInteropCollector.resolveLibcNamespace(emitter.headerContext) == null
         val isStdlibFfiModule =
             (rawSegNames.size == 3 && rawSegNames[0] in setOf("core", "std") && rawSegNames[1] == "ffi") ||
                 (rawSegNames.size == 4 && rawSegNames[0] == "std" && rawSegNames[1] == "os" && rawSegNames[2] == "raw") ||
@@ -868,17 +1160,13 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                 (
                     rawSegNames.size == 2 && rawSegNames[0] in setOf("ffi", "raw") &&
                         run {
-                            val imp = scopeBuilder.resolveModuleBinding(rawSegNames[0])?.importedPath
+                            val imp = emitter.scopeBuilder.resolveModuleBinding(rawSegNames[0])?.importedPath
                             imp == null || imp.startsWith("core.") || imp.startsWith("std.") || imp.startsWith("alloc.")
                         }
                 )
-        val isAllocFfiCString =
-            rawSegNames.size == 3 &&
-                rawSegNames[0] == "alloc" &&
-                rawSegNames[1] == "ffi" &&
-                symLeaf == "CString"
+        val isAllocFfiCString = rawSegNames.size == 3 && rawSegNames[0] == "alloc" && rawSegNames[1] == "ffi" && symLeaf == "CString"
         if (isSelfContainedLibcFfi && symLeaf !in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS) {
-            val ptr64 = activeCfgProfile.pointerWidth != 32
+            val ptr64 = emitter.activeCfgProfile.pointerWidth != 32
             when (symLeaf) {
                 "size_t", "usize", "uintptr_t" -> return if (ptr64) "ULong" else "UInt"
                 "ssize_t", "isize", "intptr_t", "ptrdiff_t" -> return if (ptr64) "Long" else "Int"
@@ -895,101 +1183,75 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
         val resolvedFfiImport =
             when {
                 isAllocFfiCString || (isStdlibFfiModule && symLeaf == "CString") ->
-                    resolveStdlibFfiSymbolImport("CString", isAllocCString = true)
+                    emitter.resolveStdlibFfiSymbolImport("CString", isAllocCString = true)
                 isStdlibFfiModule && symLeaf in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS ->
-                    resolveStdlibFfiSymbolImport(symLeaf)
+                    emitter.resolveStdlibFfiSymbolImport(symLeaf)
                 else -> null
-            }
-        if (resolvedFfiImport != null) {
-            return bindOrQualifyResolvedCrossSymbol(resolvedFfiImport)
-        }
+            } ?: return null
+        return emitter.bindOrQualifyResolvedCrossSymbol(resolvedFfiImport)
     }
+}
 
-    if (!headerContext.rawAbiMode && rawName == "Result") {
-        val rawSegNames =
-            rewriteCrateRootAliasAndReexportSegments(
-                rawSegments.map { it.ident.toString().removePrefix("r#") },
-            )
+private object StdlibResultTypePathRule : TypePathLoweringRule() {
+    override fun tryRender(ctx: TypePathLoweringContext): String? {
+        val emitter = ctx.emitter
+        if (emitter.headerContext.rawAbiMode || ctx.rawName != "Result") return null
+        val rawSegNames = ctx.rewrittenCleanSegs
         val modHead = rawSegNames.getOrNull(rawSegNames.size - 2)
-        val resolvedModImp =
-            if (rawSegNames.size == 2 && modHead != null) {
-                scopeBuilder.resolveModuleBinding(modHead)?.importedPath
-            } else {
-                null
-            }
+        val resolvedModImp = if (rawSegNames.size == 2 && modHead != null) emitter.scopeBuilder.resolveModuleBinding(modHead)?.importedPath else null
         val isTaggedOrRustLangStd =
-            usesTaggedCoreResult() ||
-                headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true
-        if ("Ok" !in inspector.declaredTypeNames) {
-            val matchesCoreOrStdMod: (String) -> Boolean = { expected ->
+            emitter.usesTaggedCoreResult() ||
+                emitter.headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true
+        if ("Ok" !in emitter.inspector.declaredTypeNames) {
+            fun matchesCoreOrStdMod(expected: String): Boolean {
                 val modIdx = rawSegNames.size - 2
-                (
-                    modIdx >= 0 &&
-                        rawSegNames[modIdx] == expected &&
-                        (modIdx == 0 || rawSegNames[modIdx - 1] in setOf("core", "std", "alloc"))
-                ) ||
+                return (modIdx >= 0 && rawSegNames[modIdx] == expected && (modIdx == 0 || rawSegNames[modIdx - 1] in setOf("core", "std", "alloc"))) ||
                     resolvedModImp == expected ||
                     resolvedModImp == "core.$expected" ||
                     resolvedModImp == "std.$expected" ||
                     resolvedModImp == "alloc.$expected"
             }
-            if (lastSeg.arguments is PathArguments.None &&
+            if (ctx.lastSeg.arguments is PathArguments.None &&
                 rawSegNames.size >= 2 &&
                 matchesCoreOrStdMod("fmt") &&
                 isTaggedOrRustLangStd &&
-                ("Result" !in inspector.declaredTypeNames || rawSegNames.dropLast(1).lastOrNull() == "fmt" || resolvedModImp != null)
+                ("Result" !in emitter.inspector.declaredTypeNames || rawSegNames.dropLast(1).lastOrNull() == "fmt" || resolvedModImp != null)
             ) {
-                if (!usesTaggedCoreResult()) {
-                    return if ("Result" in inspector.declaredTypeNames) "kotlin.Result<Unit>" else "Result<Unit>"
+                if (!emitter.usesTaggedCoreResult()) {
+                    return if ("Result" in emitter.inspector.declaredTypeNames) "kotlin.Result<Unit>" else "Result<Unit>"
                 }
-                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                val errRef = bindOrQualifyResolvedCrossSymbol("$coreNs.fmt.Error")
+                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
+                val errRef = emitter.bindOrQualifyResolvedCrossSymbol("$coreNs.fmt.Error")
                 val resName =
-                    if (hasDeclaredResultEnum()) {
-                        "Result"
-                    } else if ("Result" in inspector.declaredTypeNames) {
-                        "$coreNs.result.Result"
-                    } else {
-                        sourceResultName()
+                    when {
+                        emitter.hasDeclaredResultEnum() -> "Result"
+                        "Result" in emitter.inspector.declaredTypeNames -> "$coreNs.result.Result"
+                        else -> emitter.sourceResultName()
                     }
                 return "$resName<Unit, $errRef>"
             }
-            if (!hasDeclaredResultEnum() && lastSeg.arguments is PathArguments.AngleBracketed) {
-                val isStdOrCoreResult =
-                    rawSegNames.size == 1 ||
-                        matchesCoreOrStdMod("result") ||
-                        (rawSegNames.size == 2 && modHead == "result")
-                val argsList =
-                    (lastSeg.arguments as PathArguments.AngleBracketed)
-                        .args
-                        .toList()
-                        .mapNotNull { renderGenericArgument(it, selfTypeName) }
-                if (isStdOrCoreResult &&
-                    argsList.size == 2 &&
-                    (rawSegNames.size >= 2 || "Result" !in inspector.declaredTypeNames)
-                ) {
+            if (!emitter.hasDeclaredResultEnum() && ctx.lastSeg.arguments is PathArguments.AngleBracketed) {
+                val isStdOrCoreResult = rawSegNames.size == 1 || matchesCoreOrStdMod("result") || (rawSegNames.size == 2 && modHead == "result")
+                val argsList = ctx.renderedAngleTypeArgs()
+                if (isStdOrCoreResult && argsList.size == 2 && (rawSegNames.size >= 2 || "Result" !in emitter.inspector.declaredTypeNames)) {
                     return when {
-                        usesTaggedCoreResult() && "Result" in inspector.declaredTypeNames ->
-                            "${CoreIntrinsicLowering.resolveCoreNamespace(headerContext)}.result.Result<${argsList.joinToString(", ")}>"
-                        usesTaggedCoreResult() -> "${sourceResultName()}<${argsList.joinToString(", ")}>"
-                        "Result" in inspector.declaredTypeNames -> "kotlin.Result<${argsList[0]}>"
+                        emitter.usesTaggedCoreResult() && "Result" in emitter.inspector.declaredTypeNames ->
+                            "${CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)}.result.Result<${argsList.joinToString(", ")}>"
+                        emitter.usesTaggedCoreResult() -> "${emitter.sourceResultName()}<${argsList.joinToString(", ")}>"
+                        "Result" in emitter.inspector.declaredTypeNames -> "kotlin.Result<${argsList[0]}>"
                         else -> "Result<${argsList[0]}>"
                     }
                 }
             }
         }
-        if ("Result" !in inspector.declaredTypeNames &&
-            !hasDeclaredResultEnum() &&
+        if ("Result" !in emitter.inspector.declaredTypeNames &&
+            !emitter.hasDeclaredResultEnum() &&
             isTaggedOrRustLangStd &&
-            lastSeg.arguments is PathArguments.AngleBracketed
+            ctx.lastSeg.arguments is PathArguments.AngleBracketed
         ) {
-            val typeArgs =
-                (lastSeg.arguments as PathArguments.AngleBracketed)
-                    .args
-                    .toList()
-                    .mapNotNull { renderGenericArgument(it, selfTypeName) }
+            val typeArgs = ctx.renderedAngleTypeArgs()
             if (typeArgs.size == 1) {
-                val matchesStdCrateMod = { expected: String ->
+                fun matchesStdCrateMod(expected: String): Boolean =
                     modHead == expected &&
                         (
                             (rawSegNames.size == 3 && rawSegNames[0] in setOf("std", "crate")) ||
@@ -999,28 +1261,21 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                                             resolvedModImp == null ||
                                                 resolvedModImp.startsWith("std.") ||
                                                 resolvedModImp.startsWith("crate.") ||
-                                                headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.std") == true
+                                                emitter.headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.std") == true
                                         )
                                 )
                         )
-                }
-                val resName = if (usesTaggedCoreResult()) sourceResultName() else "Result"
+                val resName = if (emitter.usesTaggedCoreResult()) emitter.sourceResultName() else "Result"
                 if (matchesStdCrateMod("io")) {
+                    val crateNsMap = emitter.headerContext.crateNamespaces
+                    val rawStd = crateNsMap["std"]?.trim()?.removeSuffix(".")
                     val stdNs =
-                        headerContext.crateNamespaces["std"]
-                            ?.trim()
-                            ?.removeSuffix(".")
-                            ?.takeIf { it.isNotEmpty() }
-                            ?: "io.github.kotlinmania.rustlang.std".takeIf {
-                                headerContext.packageName?.startsWith(it) == true
-                            }
-                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
+                        rawStd?.takeIf { it.isNotEmpty() }
+                            ?: "io.github.kotlinmania.rustlang.std".takeIf { emitter.headerContext.packageName?.startsWith(it) == true }
+                    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
                     val ioErr =
-                        if (stdNs != null ||
-                            "core" in headerContext.crateNamespaces ||
-                            headerContext.packageName?.startsWith("$coreNs.") == true
-                        ) {
-                            bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.Error")
+                        if (stdNs != null || "core" in emitter.headerContext.crateNamespaces || emitter.headerContext.packageName?.startsWith("$coreNs.") == true) {
+                            emitter.bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.Error")
                         } else {
                             "Error"
                         }
@@ -1031,465 +1286,173 @@ internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?
                 }
             }
         }
+        return null
+    }
+}
+
+private object StdlibContainerAndPrimitiveTypePathRule : TypePathLoweringRule() {
+    private val erasedSmartPointers = setOf("Box", "Rc", "Arc", "NoDrop", "ManuallyDrop")
+    private val builtinScalarMap =
+        mapOf(
+            "i8" to "Byte",
+            "i16" to "Short",
+            "i32" to "Int",
+            "i64" to "Long",
+            "isize" to "Int",
+            "u8" to "UByte",
+            "u16" to "UShort",
+            "u32" to "UInt",
+            "u64" to "ULong",
+            "usize" to "Int",
+            "f64" to "Double",
+            "bool" to "Boolean",
+            "str" to "String",
+            "char" to "Char",
+        )
+
+    override fun tryRender(ctx: TypePathLoweringContext): String? {
+        val emitter = ctx.emitter
+        val rawName = ctx.rawName
+        val rawSegments = ctx.rawSegments
+        val isStdlibUnqualified =
+            (ctx.prefixQualifier.isEmpty() && ctx.externalQualifiedOverride == null) ||
+                rawSegments.dropLast(1).all { it.ident.toString() in STDLIB_TYPE_PATH_PREFIXES }
+        if (isStdlibUnqualified && ctx.lastSeg.arguments is PathArguments.AngleBracketed) {
+            renderStdlibGenericType(ctx, emitter, rawName, rawSegments)?.let { return it }
+        } else if (isStdlibUnqualified && ctx.lastSeg.arguments is PathArguments.None && rawName == "Vec" && "Vec" !in emitter.inspector.declaredTypeNames) {
+            return "List<*>"
+        }
+
+        if (rawName == "TypeId" &&
+            ctx.lastSeg.arguments is PathArguments.None &&
+            "TypeId" !in emitter.inspector.declaredTypeNames &&
+            emitter.isStdlibAnyPathSegments(rawSegments.map { it.ident.toString() })
+        ) {
+            return "RustTypeId"
+        }
+
+        if (!ctx.isPrimitivePrefix || ctx.lastSeg.arguments !is PathArguments.None) return null
+        if (emitter.inExternAbiSignature || emitter.headerContext.rawAbiMode) {
+            when (rawName) {
+                "usize" ->
+                    return when (emitter.activeCfgProfile.pointerWidth) {
+                        16 -> "UShort"
+                        32 -> "UInt"
+                        else -> "ULong"
+                    }
+                "isize" ->
+                    return when (emitter.activeCfgProfile.pointerWidth) {
+                        16 -> "Short"
+                        32 -> "Int"
+                        else -> "Long"
+                    }
+            }
+        }
+        when {
+            rawName == "f16" -> return "F16"
+            rawName == "f32" -> return emitter.kotlinF32TypeName()
+            rawName == "f128" -> return "F128"
+            rawName == "char" && emitter.headerContext.scalarChar && "Char" !in emitter.inspector.declaredTypeNames -> {
+                emitter.usesRustChar = true
+                return "RustChar"
+            }
+        }
+        builtinScalarMap[rawName]?.let { return emitter.kotlinBuiltinTypeName(it) }
+        if (rawName == "c_void" &&
+            !emitter.headerContext.rawAbiMode &&
+            "CVoid" !in emitter.inspector.declaredTypeNames &&
+            "CVoid" !in emitter.importedSimpleNameToPkg &&
+            emitter.resolveBestSubpackageForSymbol("CVoid") == null
+        ) {
+            emitter.resolveStdlibFfiSymbolImport("c_void")?.let {
+                CoreIntrinsicLowering.registerCoreImport(emitter, it)
+            }
+        }
+        return null
     }
 
-    var externalQualifiedOverride: String? = null
-    val crossTarget =
-        if (rawSegments.size >= 2 && rawSegments.dropLast(1).all { it.arguments is PathArguments.None }) {
-            resolveCrossModulePathTarget(rawSegments.map { it.ident.toString() }, inTypePosition = true)
-        } else {
-            null
-        }
-    val prefixQualifier =
-        if (crossTarget != null) {
-            val (resolvedSym, trailing) = crossTarget
-            val boundHead = bindOrQualifyResolvedCrossSymbol(resolvedSym)
-            if (trailing.isEmpty()) {
-                externalQualifiedOverride = boundHead
-                ""
-            } else {
-                val midPrefix = trailing.dropLast(1).map(::rustTypeIdentToKotlin)
-                (listOf(boundHead) + midPrefix).joinToString(".") + "."
-            }
-        } else {
-            val prefixSegments =
-                rawSegments
-                    .dropLast(1)
-                    .map { it.ident.toString() }
-                    .filter {
-                        it !in IGNORED_PATH_PREFIXES &&
-                            it !in STDLIB_PRELUDE_REEXPORT_MODULES &&
-                            it !in inspector.localInlineModuleNames &&
-                            (it.first().isUpperCase() || (scopeBuilder.isImportedModuleInScope(it) && !isSuppressedStdlibModuleAlias(it)))
-                    }.map {
-                        if (it.first().isUpperCase()) {
-                            rustTypeIdentToKotlin(it)
-                        } else {
-                            scopeBuilder.resolveModuleBinding(it)?.kotlinName ?: rustModuleIdentToKotlin(it)
-                        }
-                    }
-            if (prefixSegments.isNotEmpty()) prefixSegments.joinToString(".") + "." else ""
-        }
-
-    val isStdlibUnqualified =
-        (prefixQualifier.isEmpty() && externalQualifiedOverride == null) ||
-            rawSegments.dropLast(1).all { it.ident.toString() in STDLIB_TYPE_PATH_PREFIXES }
-    if (isStdlibUnqualified && lastSeg.arguments is PathArguments.AngleBracketed) {
-        val typeArgs =
-            (lastSeg.arguments as PathArguments.AngleBracketed)
-                .args
-                .toList()
-                .mapNotNull { renderGenericArgument(it, selfTypeName) }
-        if (rawName == "Option" && !hasDeclaredOptionEnum() && typeArgs.size == 1) {
+    private fun renderStdlibGenericType(
+        ctx: TypePathLoweringContext,
+        emitter: KotlinJ2KEmitter,
+        rawName: String,
+        rawSegments: List<PathSegment>,
+    ): String? {
+        val typeArgs = ctx.renderedAngleTypeArgs()
+        if (rawName == "Option" && !emitter.hasDeclaredOptionEnum() && typeArgs.size == 1) {
             val inner = typeArgs[0]
-            return if (isAlreadyNullableRenderedType(inner)) inner else "$inner?"
+            return if (emitter.isAlreadyNullableRenderedType(inner)) inner else "$inner?"
         }
-        if (rawName == "Padding" && "Padding" !in inspector.declaredTypeNames && typeArgs.size == 1) {
+        if (rawName == "Padding" && "Padding" !in emitter.inspector.declaredTypeNames && typeArgs.size == 1) {
             return typeArgs[0]
         }
-        if (rawName == "MaybeUninit" && "MaybeUninit" !in inspector.declaredTypeNames && typeArgs.size == 1) {
-            val inner = typeArgs[0]
-            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.maybeuninit.MaybeUninit")
-            return "MaybeUninit<$inner>"
+        if (rawName == "MaybeUninit" && "MaybeUninit" !in emitter.inspector.declaredTypeNames && typeArgs.size == 1) {
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
+            CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.mem.maybeuninit.MaybeUninit")
+            return "MaybeUninit<${typeArgs[0]}>"
         }
-        val pathHasSlice = rawSegments.any { it.ident.toString() == "slice" }
-        val pathHasVecOrOption = rawSegments.any { it.ident.toString() == "vec" || it.ident.toString() == "option" }
-        if ((rawName == "Iter" || rawName == "IterMut") && pathHasSlice && typeArgs.isNotEmpty()) {
+        if ((rawName == "Iter" || rawName == "IterMut") && rawSegments.any { it.ident.toString() == "slice" } && typeArgs.isNotEmpty()) {
             return "ArrayDeque<${typeArgs[0]}>"
         }
-        if (rawName == "IntoIter" && pathHasVecOrOption && typeArgs.isNotEmpty()) {
+        if (rawName == "IntoIter" && rawSegments.any { it.ident.toString() == "vec" || it.ident.toString() == "option" } && typeArgs.isNotEmpty()) {
             return "ArrayDeque<${typeArgs[0]}>"
         }
-        // `std::result::Result` names the standard type even when this file declares its own
-        // `Result` (commonly `type Result<T> = std::result::Result<T, Error>`); qualify it so it
-        // cannot resolve to that local declaration.
         val isExplicitStdResultPath =
             rawName == "Result" &&
                 rawSegments.size >= 3 &&
                 rawSegments[rawSegments.size - 3].ident.toString() in setOf("std", "core") &&
                 rawSegments[rawSegments.size - 2].ident.toString() == "result"
-        if (isExplicitStdResultPath && rawName in inspector.declaredTypeNames && typeArgs.isNotEmpty()) {
-            val coreNs =
-                headerContext.crateNamespaces["core"]
-                    ?.trim()
-                    ?.removeSuffix(".")
-                    ?.takeIf { it.isNotEmpty() }
+        if (isExplicitStdResultPath && rawName in emitter.inspector.declaredTypeNames && typeArgs.isNotEmpty()) {
+            val crateNsMap = emitter.headerContext.crateNamespaces
+            val rawCore = crateNsMap["core"]?.trim()?.removeSuffix(".")
+            val coreNs = rawCore?.takeIf { it.isNotEmpty() }
             return if (coreNs != null && typeArgs.size == 2) {
                 "$coreNs.result.Result<${typeArgs.joinToString(", ")}>"
             } else {
                 "kotlin.Result<${typeArgs[0]}>"
             }
         }
-        if (rawName !in inspector.declaredTypeNames) {
-            if (rawName in setOf("Cell", "RefCell", "OnceCell") && typeArgs.size == 1) {
-                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-                val subpkg = if (rawName == "OnceCell") "cell.once" else "cell"
-                CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.$subpkg.$rawName")
-                return "$rawName<${typeArgs[0]}>"
-            }
-            val isErasedSmartPointer =
-                rawName == "Box" ||
-                    rawName == "Rc" ||
-                    rawName == "Arc" ||
-                    rawName == "NoDrop" ||
-                    rawName == "ManuallyDrop"
-            when {
-                rawName == "Vec" && typeArgs.isNotEmpty() -> return "List<${typeArgs[0]}>"
-                rawName == "Cow" && typeArgs.isNotEmpty() -> return typeArgs.last()
-                (rawName == "Range" || rawName == "RangeInclusive") && typeArgs.size == 1 && typeArgs[0] == "Int" ->
-                    return "IntRange"
-                isErasedSmartPointer && typeArgs.isNotEmpty() -> return typeArgs[0]
-                (rawName == "HashMap" || rawName == "BTreeMap") && typeArgs.size >= 2 ->
-                    return "MutableMap<${typeArgs[0]}, ${typeArgs[1]}>"
-                (rawName == "HashSet" || rawName == "BTreeSet") && typeArgs.isNotEmpty() ->
-                    return "MutableSet<${typeArgs[0]}>"
-                rawName == "Result" && "Ok" !in inspector.declaredTypeNames && !hasDeclaredResultEnum() && usesTaggedCoreResult() && typeArgs.size == 2 ->
-                    return "${sourceResultName()}<${typeArgs.joinToString(", ")}>"
-                rawName == "Result" && "Ok" !in inspector.declaredTypeNames && !hasDeclaredResultEnum() && !usesTaggedCoreResult() && typeArgs.isNotEmpty() ->
-                    return "Result<${typeArgs[0]}>"
-            }
+        if (rawName in emitter.inspector.declaredTypeNames) return null
+        if (rawName in setOf("Cell", "RefCell", "OnceCell") && typeArgs.size == 1) {
+            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
+            val subpkg = if (rawName == "OnceCell") "cell.once" else "cell"
+            CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.$subpkg.$rawName")
+            return "$rawName<${typeArgs[0]}>"
         }
-    } else if (isStdlibUnqualified && lastSeg.arguments is PathArguments.None && rawName == "Vec" && "Vec" !in inspector.declaredTypeNames) {
-        return "List<*>"
-    }
-
-    if (rawName == "TypeId" &&
-        lastSeg.arguments is PathArguments.None &&
-        "TypeId" !in inspector.declaredTypeNames &&
-        isStdlibAnyPathSegments(rawSegments.map { it.ident.toString() })
-    ) {
-        return "RustTypeId"
-    }
-
-    val isPrimitivePrefix =
-        rawSegments.size == 1 ||
-            rawSegments.dropLast(1).all {
-                val p = it.ident.toString()
-                p in IGNORED_PATH_PREFIXES || p == "primitive"
-            }
-    if ((inExternAbiSignature || headerContext.rawAbiMode) && lastSeg.arguments is PathArguments.None && isPrimitivePrefix) {
-        if (rawName == "usize") {
-            return when (activeCfgProfile.pointerWidth) {
-                16 -> "UShort"
-                32 -> "UInt"
-                else -> "ULong"
-            }
-        }
-        if (rawName == "isize") {
-            return when (activeCfgProfile.pointerWidth) {
-                16 -> "Short"
-                32 -> "Int"
-                else -> "Long"
-            }
-        }
-    }
-
-    if (isPrimitivePrefix && lastSeg.arguments is PathArguments.None) {
-        if (rawName == "f16") return "F16"
-        if (rawName == "f32") return kotlinF32TypeName()
-        if (rawName == "f128") return "F128"
-        if (rawName == "char" && headerContext.scalarChar && "Char" !in inspector.declaredTypeNames) {
-            usesRustChar = true
-            return "RustChar"
-        }
-        when (rawName) {
-            "i8" -> return kotlinBuiltinTypeName("Byte")
-            "i16" -> return kotlinBuiltinTypeName("Short")
-            "i32" -> return kotlinBuiltinTypeName("Int")
-            "i64" -> return kotlinBuiltinTypeName("Long")
-            "isize" -> return kotlinBuiltinTypeName("Int")
-            "u8" -> return kotlinBuiltinTypeName("UByte")
-            "u16" -> return kotlinBuiltinTypeName("UShort")
-            "u32" -> return kotlinBuiltinTypeName("UInt")
-            "u64" -> return kotlinBuiltinTypeName("ULong")
-            "usize" -> return kotlinBuiltinTypeName("Int")
-            "f64" -> return kotlinBuiltinTypeName("Double")
-            "bool" -> return kotlinBuiltinTypeName("Boolean")
-            "str" -> return kotlinBuiltinTypeName("String")
-            "char" -> return kotlinBuiltinTypeName("Char")
-        }
-        if (rawName == "c_void" &&
-            !headerContext.rawAbiMode &&
-            "CVoid" !in inspector.declaredTypeNames &&
-            "CVoid" !in importedSimpleNameToPkg &&
-            resolveBestSubpackageForSymbol("CVoid") == null
-        ) {
-            resolveStdlibFfiSymbolImport("c_void")?.let {
-                CoreIntrinsicLowering.registerCoreImport(this, it)
-            }
-        }
-    }
-    val mappedRawBaseIdent = rustTypeIdentToKotlin(rawName)
-    val ktBaseIdent =
-        if (rawSegments.size == 1 && prefixQualifier.isEmpty() && externalQualifiedOverride == null) {
-            samePackageUseRenames[mappedRawBaseIdent] ?: mappedRawBaseIdent
-        } else {
-            mappedRawBaseIdent
-        }
-    if (rawSegments.size == 1 &&
-        prefixQualifier.isEmpty() &&
-        externalQualifiedOverride == null &&
-        rawName != "Self" &&
-        ktBaseIdent != selfTypeName?.substringBefore('<')?.trim() &&
-        ktBaseIdent in activeEnclosingEnumVariantNames &&
-        ktBaseIdent !in activeTypeParamNames &&
-        rawName !in PRIMITIVE_TYPE_NAMES
-    ) {
-        val outerPkg =
-            importedSimpleNameToPkg[ktBaseIdent]
-                ?: headerContext.packageName
-                    ?.takeIf {
-                        it.isNotEmpty() &&
-                            (ktBaseIdent in inspector.declaredTypeNames || ktBaseIdent in headerContext.moduleDeclaredTypeNames)
-                    }
-                ?: resolveBestSubpackageForSymbol(ktBaseIdent)?.let { sub ->
-                    currentNamespacePrefix()?.let { ns ->
-                        if (sub.isEmpty()) ns else "$ns.$sub"
-                    }
-                }
-        if (!outerPkg.isNullOrEmpty()) {
-            externalQualifiedOverride = "$outerPkg.$ktBaseIdent"
-        }
-    }
-    if (prefixQualifier.isEmpty() &&
-        externalQualifiedOverride == null &&
-        rawSegments.size <= 2 &&
-        rawName != "Self" &&
-        isPrimitivePrefix &&
-        ktBaseIdent !in inspector.declaredTypeNames &&
-        ktBaseIdent !in activeTypeParamNames &&
-        !(ktBaseIdent.length == 1 && ktBaseIdent[0] in 'A'..'Z') &&
-        ktBaseIdent !in inspector.enumVariantSimpleNames &&
-        ktBaseIdent !in inspector.importedEnumVariantSimpleNames &&
-        (ktBaseIdent !in KOTLIN_STDLIB_SHADOWED_IMPORTS || rawName == "Float") &&
-        headerContext.crateSymbolSubpackages.isNotEmpty()
-    ) {
-        val bestSubpkg = resolveBestSubpackageForSymbol(ktBaseIdent)
-        val nsPrefix = currentNamespacePrefix()
-        if (bestSubpkg != null && nsPrefix != null) {
-            val targetPkg = if (bestSubpkg.isEmpty()) nsPrefix else "$nsPrefix.$bestSubpkg"
-            if (targetPkg.isNotEmpty() && targetPkg != headerContext.packageName) {
-                val collidedPkg = importedSimpleNameToPkg[ktBaseIdent]
-                if (collidedPkg != null && collidedPkg != targetPkg) {
-                    externalQualifiedOverride = "$targetPkg.$ktBaseIdent"
-                } else {
-                    importedSimpleNameToPkg[ktBaseIdent] = targetPkg
-                    extraTypePathImports += "import $targetPkg.$ktBaseIdent"
-                }
-            }
-        }
-    }
-    val mappedBase =
-        when {
-            rawName == "Self" -> selfTypeName ?: "Any"
-            externalQualifiedOverride != null -> externalQualifiedOverride
-            else -> prefixQualifier + ktBaseIdent
-        }
-
-    val traitDecl = lookupDeclaredTraitAst(ktBaseIdent, path)
-    val isCoreOpsName =
-        ktBaseIdent in CORE_OPS_BINARY_TRAITS ||
-            ktBaseIdent in CORE_OPS_UNARY_OUTPUT_TRAITS ||
-            ktBaseIdent in CORE_OPS_ASSIGN_TRAITS
-    val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
-    val selfOpsSubpkg = resolveBestSubpackageForSymbol(ktBaseIdent)
-    val isExternalCoreOps =
-        traitDecl == null &&
-            ktBaseIdent !in inspector.declaredTypeNames &&
-            isCoreOpsName &&
-            (
-                (
-                    prefixQualifier.isEmpty() &&
-                        externalQualifiedOverride == null &&
-                        (selfOpsSubpkg == null || selfOpsSubpkg.startsWith("ops"))
-                ) ||
-                    importedSimpleNameToPkg[ktBaseIdent]?.startsWith("$coreNs.ops") == true ||
-                    prefixQualifier == "ops." ||
-                    prefixQualifier.endsWith(".ops.")
-            )
-    val bounded = currentBoundedTypeName
-    val opsDefaultRhs = bounded ?: selfTypeName ?: "Any?"
-    val declaredTypeParams =
-        traitDecl
-            ?.generics
-            ?.params
-            ?.toList()
-            ?.filterIsInstance<GenericParam.TypeParam>()
-            .orEmpty()
-    val lookupAssocs = lookupTraitDefaultlessAssocTypes(ktBaseIdent, path)
-    val isKnownCoreOps = isExternalCoreOps
-    val effectiveLookupAssocs =
-        if (lookupAssocs.isNotEmpty()) {
-            lookupAssocs
-        } else if (isKnownCoreOps && (ktBaseIdent in CORE_OPS_BINARY_TRAITS || ktBaseIdent in CORE_OPS_UNARY_OUTPUT_TRAITS)) {
-            listOf("Output")
-        } else {
-            emptyList()
-        }
-    if (isKnownCoreOps &&
-        prefixQualifier.isEmpty() &&
-        externalQualifiedOverride == null &&
-        ktBaseIdent !in importedSimpleNameToPkg &&
-        !headerContext.rawAbiMode &&
-        "core" in headerContext.crateNamespaces
-    ) {
-        val extCoreOpsPkg = headerContext.externalCrateSymbolPackages["core"]?.get(ktBaseIdent)?.firstOrNull()
-        val selfCoreOpsPkg = selfOpsSubpkg?.let { if (it.isEmpty()) coreNs else "$coreNs.$it" }
-        val opsFqcn =
-            when {
-                extCoreOpsPkg != null -> "$extCoreOpsPkg.$ktBaseIdent"
-                selfCoreOpsPkg != null -> "$selfCoreOpsPkg.$ktBaseIdent"
-                else -> "$coreNs.ops.$ktBaseIdent"
-            }
-        CoreIntrinsicLowering.registerCoreImport(this, opsFqcn)
-    }
-
-    return when (val args = lastSeg.arguments) {
-        is PathArguments.None -> {
-            when {
-                isExternalCoreOps && ktBaseIdent in CORE_OPS_BINARY_TRAITS ->
-                    if (suppressTraitAssocPlaceholders) {
-                        "$mappedBase<$opsDefaultRhs>"
-                    } else {
-                        "$mappedBase<$opsDefaultRhs, Any?>"
-                    }
-                isExternalCoreOps && ktBaseIdent in CORE_OPS_UNARY_OUTPUT_TRAITS ->
-                    if (suppressTraitAssocPlaceholders) mappedBase else "$mappedBase<Any?>"
-                isExternalCoreOps && ktBaseIdent in CORE_OPS_ASSIGN_TRAITS ->
-                    "$mappedBase<$opsDefaultRhs>"
-                else -> {
-                    val defaultedParams =
-                        declaredTypeParams.mapNotNull { gp ->
-                            gp.default?.type?.let { renderType(it, selfTypeName = bounded ?: selfTypeName) }
-                        }
-                    val typeArgs =
-                        buildList {
-                            addAll(defaultedParams)
-                            if (bounded != null && isSelfParameterizedTraitName(ktBaseIdent)) {
-                                add(bounded)
-                            } else if (bounded == null &&
-                                !suppressTraitAssocPlaceholders &&
-                                isSelfParameterizedTraitName(ktBaseIdent) &&
-                                defaultedParams.isEmpty() &&
-                                effectiveLookupAssocs.isEmpty() &&
-                                ktBaseIdent !in activeTypeParamNames
-                            ) {
-                                add("*")
-                            }
-                            for (assocKt in effectiveLookupAssocs) {
-                                if (assocKt in currentTraitAssocParamNames) {
-                                    add(assocKt)
-                                } else if (bounded != null && !suppressTraitAssocPlaceholders) {
-                                    add("Any?")
-                                }
-                            }
-                        }
-                    if (typeArgs.isEmpty()) mappedBase else "$mappedBase<${typeArgs.joinToString(", ")}>"
-                }
-            }
-        }
-        is PathArguments.AngleBracketed -> {
-            val declaredTraitAssocs =
-                if (effectiveLookupAssocs.isNotEmpty() || ktBaseIdent in inspector.declaredTypeNames || isKnownCoreOps) {
-                    effectiveLookupAssocs
-                } else {
-                    null
-                }
-            val rawArgList = args.args.toList()
-            if (traitDecl != null || isKnownCoreOps) {
-                val explicitPositionalArgs =
-                    rawArgList
-                        .filter { it !is GenericArgument.AssocTypeArg && it !is GenericArgument.LifetimeArg }
-                        .mapNotNull { renderGenericArgument(it, selfTypeName) }
-                        .toMutableList()
-                val explicitAssocByName = linkedMapOf<String, String>()
-                for (ga in rawArgList) {
-                    if (ga is GenericArgument.AssocTypeArg) {
-                        val assocKt = rustTypeIdentToKotlin(ga.assoc.ident.toString())
-                        if (declaredTraitAssocs == null || assocKt in declaredTraitAssocs) {
-                            explicitAssocByName[assocKt] = renderType(ga.assoc.ty, selfTypeName)
-                        }
-                    }
-                }
-                if (isKnownCoreOps) {
-                    if ((ktBaseIdent in CORE_OPS_BINARY_TRAITS || ktBaseIdent in CORE_OPS_ASSIGN_TRAITS) &&
-                        explicitPositionalArgs.isEmpty()
-                    ) {
-                        explicitPositionalArgs += opsDefaultRhs
-                    }
-                } else if (declaredTypeParams.isNotEmpty() && explicitPositionalArgs.size < declaredTypeParams.size) {
-                    for (idx in explicitPositionalArgs.size until declaredTypeParams.size) {
-                        val defTy = declaredTypeParams[idx].default?.type ?: break
-                        explicitPositionalArgs += renderType(defTy, selfTypeName = bounded ?: selfTypeName)
-                    }
-                }
-                val finalAssocs =
-                    effectiveLookupAssocs.mapNotNull { assocKt ->
-                        explicitAssocByName[assocKt]
-                            ?: if (assocKt in currentTraitAssocParamNames) {
-                                assocKt
-                            } else if (!suppressTraitAssocPlaceholders && (bounded != null || isKnownCoreOps)) {
-                                "Any?"
-                            } else {
-                                null
-                            }
-                    }
-                val typeArgs =
-                    buildList {
-                        addAll(explicitPositionalArgs)
-                        if (bounded != null && isSelfParameterizedTraitName(ktBaseIdent)) {
-                            add(bounded)
-                        }
-                        addAll(finalAssocs)
-                        addAll(sourceAssociatedArguments(path, selfTypeName))
-                    }
-                if (typeArgs.isEmpty()) mappedBase else "$mappedBase<${typeArgs.joinToString(", ")}>"
-            } else {
-                val filteredArgs =
-                    rawArgList.filter { ga ->
-                        if (ga is GenericArgument.AssocTypeArg && declaredTraitAssocs != null) {
-                            rustTypeIdentToKotlin(ga.assoc.ident.toString()) in declaredTraitAssocs
-                        } else {
-                            true
-                        }
-                    }
-                val rawSegNames = rawSegments.map { it.ident.toString().removePrefix("r#") }
-                val explicitArgs = filteredArgs.mapNotNull { renderGenericArgument(it, selfTypeName) }
-                val rawTypeArgs = rawArgList.filterIsInstance<GenericArgument.TypeArg>()
-                if (ktBaseIdent == "Atomic" &&
-                    "Atomic" !in inspector.declaredTypeNames &&
-                    !headerContext.rawAbiMode &&
-                    "core" in headerContext.crateNamespaces &&
-                    rawTypeArgs.size == 1
-                ) {
-                    val concreteAtomic = resolveConcreteStdlibAtomicSimpleName(rawTypeArgs[0].type, explicitArgs.firstOrNull())
-                    if (concreteAtomic != null) {
-                        return bindOrQualifyResolvedCrossSymbol("$coreNs.sync.atomic.$concreteAtomic")
-                    }
-                }
-                val explicitAssocNames =
-                    rawArgList
-                        .filterIsInstance<GenericArgument.AssocTypeArg>()
-                        .mapTo(hashSetOf()) { rustTypeIdentToKotlin(it.assoc.ident.toString()) }
-                val defaultedArgs = appendStdlibDefaultTypeArgsIfNeeded(mappedBase, rawName, rawSegNames, explicitArgs, selfTypeName)
-                val lookupAssocs =
-                    lookupTraitDefaultlessAssocTypes(ktBaseIdent, path)
-                        .filter { it in currentTraitAssocParamNames && it !in explicitAssocNames && it !in explicitArgs }
-                val typeArgs = defaultedArgs + lookupAssocs + sourceAssociatedArguments(path, selfTypeName)
-                if (typeArgs.isEmpty()) mappedBase else "$mappedBase<${typeArgs.joinToString(", ")}>"
-            }
-        }
-        is PathArguments.Parenthesized -> {
-            val inputs = args.inputs.toList().joinToString(", ") { renderType(it.ty, selfTypeName) }
-            val out = extractReturnSynType(args.output)?.let { renderType(it, selfTypeName) } ?: "Unit"
-            "($inputs) -> $out"
+        return when {
+            rawName == "Vec" && typeArgs.isNotEmpty() -> "List<${typeArgs[0]}>"
+            rawName == "Cow" && typeArgs.isNotEmpty() -> typeArgs.last()
+            (rawName == "Range" || rawName == "RangeInclusive") && typeArgs.size == 1 && typeArgs[0] == "Int" -> "IntRange"
+            rawName in erasedSmartPointers && typeArgs.isNotEmpty() -> typeArgs[0]
+            (rawName == "HashMap" || rawName == "BTreeMap") && typeArgs.size >= 2 -> "MutableMap<${typeArgs[0]}, ${typeArgs[1]}>"
+            (rawName == "HashSet" || rawName == "BTreeSet") && typeArgs.isNotEmpty() -> "MutableSet<${typeArgs[0]}>"
+            rawName == "Result" && "Ok" !in emitter.inspector.declaredTypeNames && !emitter.hasDeclaredResultEnum() && emitter.usesTaggedCoreResult() && typeArgs.size == 2 ->
+                "${emitter.sourceResultName()}<${typeArgs.joinToString(", ")}>"
+            rawName == "Result" && "Ok" !in emitter.inspector.declaredTypeNames && !emitter.hasDeclaredResultEnum() && !emitter.usesTaggedCoreResult() && typeArgs.isNotEmpty() ->
+                "Result<${typeArgs[0]}>"
+            else -> null
         }
     }
 }
 
-// Rust const generic identifiers can parse as type arguments. Keep bound
-// value names out of Kotlin's type list and forward them as runtime arguments.
+private val EARLY_TYPE_PATH_RULES: List<TypePathLoweringRule> =
+    listOf(
+        SelfAndTypeParamPathRule,
+        StdlibFmtAndFfiTypePathRule,
+        StdlibResultTypePathRule,
+    )
+
+internal fun KotlinJ2KEmitter.renderPathAsType(path: Path, selfTypeName: String?): String {
+    val rawSegments = path.segments.toList()
+    if (rawSegments.isEmpty()) return "Any"
+    val ctx = TypePathLoweringContext(this, path, rawSegments, selfTypeName)
+    for (rule in EARLY_TYPE_PATH_RULES) {
+        rule.tryRender(ctx)?.let { return it }
+    }
+    ctx.resolvePrefixAndQualification()
+    StdlibContainerAndPrimitiveTypePathRule.tryRender(ctx)?.let { return it }
+    return ctx.renderNominalOrTraitTypePath()
+}
+
 internal fun KotlinJ2KEmitter.runtimeConstTypeArgument(arg: GenericArgument.TypeArg): String? {
     val ty = arg.type as? SynType.Path ?: return null
     if (ty.qself != null) return null
@@ -1534,63 +1497,182 @@ internal fun KotlinJ2KEmitter.renderGenericArgument(arg: GenericArgument, selfTy
         is GenericArgument.ConstraintArg -> null
     }
 
+/**
+ * Emits Kotlin generic type parameter declarations (`<T : Bound>`), type argument lists (`<T, Assoc>`),
+ * trait bounds, and merged `where` clauses from Rust `syn.Generics` and `WhereClause` ASTs.
+ */
+internal class TypeParameterClauseEmitter(
+    private val emitter: KotlinJ2KEmitter,
+    private val selfTypeName: String?,
+) {
+    fun renderTypeParameters(generics: Generics, excludeNames: Set<String> = emptySet()): String {
+        val ownerSimple = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
+        val declared = renderTypeParametersFromParams(generics.params.toList(), excludeNames).removePrefix("<").removeSuffix(">")
+        val associated =
+            emitter
+                .sourceAssociatedParameters(generics, ownerSimple)
+                .map { it.associated }
+                .distinct()
+                .filter { it !in excludeNames }
+        val parts = listOf(declared).filter(String::isNotEmpty) + associated
+        return if (parts.isEmpty()) "" else "<${parts.joinToString(", ")}>"
+    }
+
+    fun renderTypeParametersFromParams(params: List<GenericParam>, excludeNames: Set<String> = emptySet()): String {
+        val rendered = mutableListOf<String>()
+        val seenNames = hashSetOf<String>()
+        for (param in params) {
+            if (param is GenericParam.TypeParam) {
+                val rawTpName = rustTypeIdentToKotlin(param.ident.toString())
+                val name = emitter.renamedTypeParamIdentifiers[rawTpName] ?: rawTpName
+                if (rawTpName in excludeNames || name in excludeNames || !seenNames.add(name)) continue
+                val bounds = collectRenderedBoundsForTypeParam(param, name, excludeSimdElement = true)
+                rendered += if (bounds.size == 1) "$name : ${bounds[0]}" else name
+            }
+        }
+        return if (rendered.isEmpty()) "" else "<${rendered.joinToString(", ")}>"
+    }
+
+    fun renderCombinedWhereClause(
+        ownerWhere: WhereClause?,
+        fnWhere: WhereClause?,
+        params: List<GenericParam>,
+        excludeNames: Set<String> = emptySet(),
+        extraDeclaredNames: Set<String> = emptySet(),
+    ): String {
+        val declaredFromParams =
+            params
+                .mapNotNull { (it as? GenericParam.TypeParam)?.ident?.toString()?.let(::rustTypeIdentToKotlin) }
+                .filter { it !in excludeNames }
+                .map { emitter.renamedTypeParamIdentifiers[it] ?: it }
+                .filter { it !in excludeNames }
+        val declaredTypeParamNames = (declaredFromParams + extraDeclaredNames.filter { it !in excludeNames }).toSet()
+        if (declaredTypeParamNames.isEmpty()) return ""
+        val clauses = mutableListOf<String>()
+        val seenParamNames = hashSetOf<String>()
+        for (param in params) {
+            if (param is GenericParam.TypeParam) {
+                val rawTpName = rustTypeIdentToKotlin(param.ident.toString())
+                val name = emitter.renamedTypeParamIdentifiers[rawTpName] ?: rawTpName
+                if (rawTpName in excludeNames || name in excludeNames || !seenParamNames.add(name)) continue
+                val bounds = collectRenderedBoundsForTypeParam(param, name, excludeSimdElement = false)
+                if (bounds.size > 1) {
+                    bounds.forEach { clauses += "$name : $it" }
+                }
+            }
+        }
+        val predicates =
+            buildList {
+                ownerWhere?.predicates?.let { addAll(it.toList()) }
+                fnWhere?.predicates?.let { addAll(it.toList()) }
+            }
+        for (pred in predicates) {
+            if (pred is WherePredicate.TypePredicate) {
+                if (!emitter.isSimpleTypeParamWhereTarget(pred.boundedTy)) continue
+                val boundedTy = emitter.renderType(pred.boundedTy, selfTypeName)
+                if (boundedTy in excludeNames || !emitter.isValidKotlinIdentifierText(boundedTy)) continue
+                if (boundedTy !in declaredTypeParamNames) continue
+                val prevBounded = emitter.currentBoundedTypeName
+                emitter.currentBoundedTypeName = boundedTy
+                try {
+                    for (bound in pred.bounds.toList()) {
+                        val b = renderTypeParamBound(bound)
+                        if (b != null && b != "Any" && b != boundedTy && !b.contains("->") && !b.startsWith("SimdElement")) {
+                            clauses += "$boundedTy : $b"
+                        }
+                    }
+                } finally {
+                    emitter.currentBoundedTypeName = prevBounded
+                }
+            }
+        }
+        val distinct = clauses.distinct()
+        return if (distinct.isEmpty()) "" else " where ${distinct.joinToString(", ")}"
+    }
+
+    fun renderTypeParamBound(bound: TypeParamBound): String? {
+        if (bound !is TypeParamBound.Trait || bound.maybe != null) return null
+        val segs = bound.path.segments.toList()
+        val lastSeg = segs.lastOrNull() ?: return null
+        val last = lastSeg.ident.toString()
+        val ktTrait = rustTypeIdentToKotlin(last)
+        val boundedTp = emitter.currentBoundedTypeName
+        val isPrivateSealedBound = segs.size >= 2 && segs[segs.size - 2].ident.toString() in setOf("private", "sealed") && last == "Sealed"
+        if (isPrivateSealedBound ||
+            last in IGNORED_TRAIT_BOUNDS ||
+            isFixedScalarCodecAssocTrait(last, ktTrait, bound.path) ||
+            (boundedTp != null && ktTrait in emitter.currentWitnessedTraitBounds[boundedTp].orEmpty())
+        ) {
+            return null
+        }
+        if (boundedTp != null &&
+            (last == "IntoIterator" || last in setOf("Iterator", "DoubleEndedIterator", "ExactSizeIterator", "FusedIterator")) &&
+            ktTrait !in emitter.inspector.declaredTypeNames
+        ) {
+            val angleArgs = (lastSeg.arguments as? PathArguments.AngleBracketed)?.args?.toList()
+            val itemTy =
+                angleArgs?.firstNotNullOfOrNull { ga ->
+                    if (ga is GenericArgument.AssocTypeArg && ga.assoc.ident.toString() == "Item") {
+                        emitter.renderType(ga.assoc.ty, selfTypeName)
+                    } else {
+                        null
+                    }
+                }
+            return when {
+                itemTy != null -> if (last == "IntoIterator") "Iterable<$itemTy>" else "Iterator<$itemTy>"
+                last != "IntoIterator" && "Item" in emitter.activeTypeParamNames -> "Iterator<Item>"
+                else -> null
+            }
+        }
+        if (emitter.isImplicitStdlibSupertraitPath(bound.path)) return null
+        return emitter.renderPathAsType(bound.path, selfTypeName)
+    }
+
+    private fun isFixedScalarCodecAssocTrait(last: String, ktTrait: String, boundPath: Path): Boolean {
+        if (emitter.lookupTraitDefaultlessAssocTypes(ktTrait, boundPath).isEmpty()) return false
+        return sameFileNestedItems(emitter.file.items).filterIsInstance<Item.Impl>().any { implItem ->
+            val traitPath = implItem.traitPath?.path
+            val traitSegs = traitPath?.segments?.toList()
+            traitSegs?.lastOrNull()?.ident?.toString() == last && fixedScalarPointerCodec(implItem.selfType) != null
+        }
+    }
+
+    private fun collectRenderedBoundsForTypeParam(
+        param: GenericParam.TypeParam,
+        boundedName: String,
+        excludeSimdElement: Boolean,
+    ): List<String> {
+        val prevBounded = emitter.currentBoundedTypeName
+        emitter.currentBoundedTypeName = boundedName
+        return try {
+            param.bounds
+                .toList()
+                .mapNotNull(::renderTypeParamBound)
+                .filter {
+                    it != "Any" &&
+                        it != boundedName &&
+                        !it.contains("->") &&
+                        (!excludeSimdElement || !it.startsWith("SimdElement"))
+                }
+        } finally {
+            emitter.currentBoundedTypeName = prevBounded
+        }
+    }
+}
+
 internal fun KotlinJ2KEmitter.renderTypeParameters(
     generics: Generics,
     selfTypeName: String?,
     excludeNames: Set<String> = emptySet(),
-): String {
-    val ownerSimple = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
-    val declared = renderTypeParametersFromParams(generics.params.toList(), selfTypeName, excludeNames).removePrefix("<").removeSuffix(">")
-    val associated =
-        sourceAssociatedParameters(generics, ownerSimple)
-            .map { it.associated }
-            .distinct()
-            .filter { it !in excludeNames }
-    val parts = listOf(declared).filter(String::isNotEmpty) + associated
-    return if (parts.isEmpty()) "" else "<${parts.joinToString(", ")}>"
-}
-
-private fun KotlinJ2KEmitter.collectRenderedBoundsForTypeParam(
-    param: GenericParam.TypeParam,
-    boundedName: String,
-    selfTypeName: String?,
-    excludeSimdElement: Boolean,
-): List<String> {
-    val prevBounded = currentBoundedTypeName
-    currentBoundedTypeName = boundedName
-    return try {
-        param.bounds
-            .toList()
-            .mapNotNull { renderTypeParamBound(it, selfTypeName) }
-            .filter {
-                it != "Any" &&
-                    it != boundedName &&
-                    !it.contains("->") &&
-                    (!excludeSimdElement || !it.startsWith("SimdElement"))
-            }
-    } finally {
-        currentBoundedTypeName = prevBounded
-    }
-}
+): String =
+    TypeParameterClauseEmitter(this, selfTypeName).renderTypeParameters(generics, excludeNames)
 
 internal fun KotlinJ2KEmitter.renderTypeParametersFromParams(
     params: List<GenericParam>,
     selfTypeName: String?,
     excludeNames: Set<String> = emptySet(),
-): String {
-    val rendered = mutableListOf<String>()
-    val seenNames = hashSetOf<String>()
-    for (param in params) {
-        if (param is GenericParam.TypeParam) {
-            val rawTpName = rustTypeIdentToKotlin(param.ident.toString())
-            val name = renamedTypeParamIdentifiers[rawTpName] ?: rawTpName
-            if (rawTpName in excludeNames || name in excludeNames || !seenNames.add(name)) continue
-            val bounds = collectRenderedBoundsForTypeParam(param, name, selfTypeName, excludeSimdElement = true)
-            rendered += if (bounds.size == 1) "$name : ${bounds[0]}" else name
-        }
-    }
-    return if (rendered.isEmpty()) "" else "<${rendered.joinToString(", ")}>"
-}
+): String =
+    TypeParameterClauseEmitter(this, selfTypeName).renderTypeParametersFromParams(params, excludeNames)
 
 internal fun KotlinJ2KEmitter.renderTypeArgumentsFromGenerics(
     generics: Generics,
@@ -1598,10 +1680,9 @@ internal fun KotlinJ2KEmitter.renderTypeArgumentsFromGenerics(
 ): String {
     val names =
         generics.params.toList().mapNotNull { param ->
-            (param as? GenericParam.TypeParam)?.ident?.toString()?.let { rawIdent ->
-                val rawTp = rustTypeIdentToKotlin(rawIdent)
-                renamedTypeParamIdentifiers[rawTp] ?: rawTp
-            }
+            val rawIdent = (param as? GenericParam.TypeParam)?.ident?.toString() ?: return@mapNotNull null
+            val rawTp = rustTypeIdentToKotlin(rawIdent)
+            renamedTypeParamIdentifiers[rawTp] ?: rawTp
         }
     val allNames = (names + sourceAssociatedParameters(generics, ownerTypeSimpleName).map { it.associated }).distinct()
     return if (allNames.isEmpty()) "" else "<${allNames.joinToString(", ")}>"
@@ -1631,126 +1712,11 @@ internal fun KotlinJ2KEmitter.renderCombinedWhereClause(
     selfTypeName: String?,
     excludeNames: Set<String> = emptySet(),
     extraDeclaredNames: Set<String> = emptySet(),
-): String {
-    val declaredTypeParamNames =
-        (
-            params
-                .mapNotNull { (it as? GenericParam.TypeParam)?.ident?.toString()?.let(::rustTypeIdentToKotlin) }
-                .filter { it !in excludeNames }
-                .map { renamedTypeParamIdentifiers[it] ?: it }
-                .filter { it !in excludeNames } +
-                extraDeclaredNames.filter { it !in excludeNames }
-        ).toSet()
-    if (declaredTypeParamNames.isEmpty()) return ""
-    val clauses = mutableListOf<String>()
-    val seenParamNames = hashSetOf<String>()
-    for (param in params) {
-        if (param is GenericParam.TypeParam) {
-            val rawTpName = rustTypeIdentToKotlin(param.ident.toString())
-            val name = renamedTypeParamIdentifiers[rawTpName] ?: rawTpName
-            if (rawTpName in excludeNames || name in excludeNames || !seenParamNames.add(name)) continue
-            val bounds = collectRenderedBoundsForTypeParam(param, name, selfTypeName, excludeSimdElement = false)
-            if (bounds.size > 1) {
-                bounds.forEach { clauses += "$name : $it" }
-            }
-        }
-    }
-    val predicates =
-        buildList {
-            ownerWhere?.predicates?.toList()?.let { addAll(it) }
-            fnWhere?.predicates?.toList()?.let { addAll(it) }
-        }
-    for (pred in predicates) {
-        if (pred is WherePredicate.TypePredicate) {
-            if (!isSimpleTypeParamWhereTarget(pred.boundedTy)) continue
-            val boundedTy = renderType(pred.boundedTy, selfTypeName)
-            if (boundedTy in excludeNames || !isValidKotlinIdentifierText(boundedTy)) continue
-            if (boundedTy !in declaredTypeParamNames) continue
-            val prevBounded = currentBoundedTypeName
-            currentBoundedTypeName = boundedTy
-            try {
-                for (bound in pred.bounds.toList()) {
-                    val b = renderTypeParamBound(bound, selfTypeName)
-                    if (b != null && b != "Any" && b != boundedTy && !b.contains("->") && !b.startsWith("SimdElement")) {
-                        clauses += "$boundedTy : $b"
-                    }
-                }
-            } finally {
-                currentBoundedTypeName = prevBounded
-            }
-        }
-    }
-    val distinct = clauses.distinct()
-    return if (distinct.isEmpty()) "" else " where ${distinct.joinToString(", ")}"
-}
+): String =
+    TypeParameterClauseEmitter(this, selfTypeName).renderCombinedWhereClause(ownerWhere, fnWhere, params, excludeNames, extraDeclaredNames)
 
 internal fun KotlinJ2KEmitter.renderTypeParamBound(bound: TypeParamBound, selfTypeName: String?): String? =
-    when (bound) {
-        is TypeParamBound.LifetimeBound -> null
-        is TypeParamBound.PreciseCapture -> null
-        is TypeParamBound.Verbatim -> null
-        is TypeParamBound.Trait -> {
-            if (bound.maybe != null) {
-                null
-            } else {
-                val segs = bound.path.segments.toList()
-                val lastSeg = segs.lastOrNull()
-                val last = lastSeg?.ident?.toString()
-                val ktTrait = last?.let(::rustTypeIdentToKotlin)
-                val boundedTp = currentBoundedTypeName
-                val isPrivateSealedBound =
-                    segs.size >= 2 &&
-                        segs[segs.size - 2].ident.toString() in setOf("private", "sealed") &&
-                        last == "Sealed"
-                if (last == null ||
-                    isPrivateSealedBound ||
-                    last in IGNORED_TRAIT_BOUNDS ||
-                    (
-                        ktTrait != null &&
-                            lookupTraitDefaultlessAssocTypes(ktTrait, bound.path).isNotEmpty() &&
-                            sameFileNestedItems(file.items).filterIsInstance<Item.Impl>().any {
-                                it.traitPath
-                                    ?.path
-                                    ?.segments
-                                    ?.last()
-                                    ?.ident
-                                    .toString() == last && fixedScalarPointerCodec(it.selfType) != null
-                            }
-                    ) ||
-                    (boundedTp != null && ktTrait != null && ktTrait in currentWitnessedTraitBounds[boundedTp].orEmpty())
-                ) {
-                    null
-                } else if (boundedTp != null &&
-                    (last == "IntoIterator" || last in setOf("Iterator", "DoubleEndedIterator", "ExactSizeIterator", "FusedIterator")) &&
-                    ktTrait !in inspector.declaredTypeNames
-                ) {
-                    val angle = lastSeg.arguments as? PathArguments.AngleBracketed
-                    val itemTy =
-                        angle
-                            ?.args
-                            ?.toList()
-                            ?.firstNotNullOfOrNull { ga ->
-                                if (ga is GenericArgument.AssocTypeArg && ga.assoc.ident.toString() == "Item") {
-                                    renderType(ga.assoc.ty, selfTypeName)
-                                } else {
-                                    null
-                                }
-                            }
-                    if (itemTy != null) {
-                        if (last == "IntoIterator") "Iterable<$itemTy>" else "Iterator<$itemTy>"
-                    } else if (last != "IntoIterator" && "Item" in activeTypeParamNames) {
-                        "Iterator<Item>"
-                    } else {
-                        null
-                    }
-                } else if (isImplicitStdlibSupertraitPath(bound.path)) {
-                    null
-                } else {
-                    renderPathAsType(bound.path, selfTypeName)
-                }
-            }
-        }
-    }
+    TypeParameterClauseEmitter(this, selfTypeName).renderTypeParamBound(bound)
 
 internal fun KotlinJ2KEmitter.renderVisibility(vis: Visibility): String =
     when (vis) {
@@ -1763,15 +1729,11 @@ internal fun KotlinJ2KEmitter.hasTestAttribute(attrs: List<Attribute>): Boolean 
     for (attr in attrs) {
         val path = attr.path()
         if (path.isIdent("test")) return true
-        val lastSeg =
-            path.segments
-                .last()
-                ?.ident
-                ?.toString()
-        if (lastSeg == "test") return true
+        val segs = path.segments.toList()
+        if (segs.lastOrNull()?.ident?.toString() == "test") return true
         val meta = attr.meta
-        if (meta is Meta.List && meta.path.isIdent("cfg")) {
-            if (containsPositiveCfgTestIdent(meta.tokens.clone())) return true
+        if (meta is Meta.List && meta.path.isIdent("cfg") && containsPositiveCfgTestIdent(meta.tokens.clone())) {
+            return true
         }
     }
     return false
@@ -1806,10 +1768,10 @@ internal fun KotlinJ2KEmitter.isTransparentWrapperPath(path: Path): Boolean {
 internal fun KotlinJ2KEmitter.isTransparentIdentityExpr(body: Expr, rawParamName: String): Boolean =
     when (body) {
         is Expr.Path -> {
-            val firstSeg = body.path.segments.first()
-            val identText = firstSeg?.ident?.toString()
+            val pathSegs = body.path.segments
+            val identText = pathSegs.first()?.ident?.toString()
             body.qself == null &&
-                body.path.segments.size == 1 &&
+                pathSegs.size == 1 &&
                 identText?.removePrefix("r#") == rawParamName
         }
         is Expr.Paren -> isTransparentIdentityExpr(body.expr, rawParamName)
@@ -1832,11 +1794,7 @@ internal fun KotlinJ2KEmitter.isTransparentWrapperOrIdentityMapArg(argExpr: Expr
         is Expr.Path -> argExpr.qself == null && isTransparentWrapperPath(argExpr.path)
         is Expr.Closure -> {
             val singleInput = argExpr.inputs.toList().singleOrNull()
-            val rawParam =
-                when (val unwrappedPat = singleInput?.let(this::unwrapTransparentPat)) {
-                    is Pat.Ident -> unwrappedPat.ident.toString().removePrefix("r#")
-                    else -> null
-                }
+            val rawParam = (singleInput?.let(this::unwrapTransparentPat) as? Pat.Ident)?.ident?.toString()?.removePrefix("r#")
             rawParam != null && isTransparentIdentityExpr(argExpr.body, rawParam)
         }
         is Expr.Paren -> isTransparentWrapperOrIdentityMapArg(argExpr.expr)
@@ -1847,8 +1805,8 @@ internal fun KotlinJ2KEmitter.isTransparentWrapperOrIdentityMapArg(argExpr: Expr
 internal fun KotlinJ2KEmitter.isSimpleTypeParamWhereTarget(ty: SynType): Boolean {
     val pathTy = unwrapSynType(ty) as? SynType.Path ?: return false
     if (pathTy.qself != null || pathTy.path.leadingColon != null) return false
-    val segList = pathTy.path.segments.toList()
-    val singleSeg = segList.singleOrNull() ?: return false
+    val pathSegs = pathTy.path.segments
+    val singleSeg = pathSegs.toList().singleOrNull() ?: return false
     return singleSeg.arguments is PathArguments.None
 }
 
@@ -1871,41 +1829,17 @@ internal fun KotlinJ2KEmitter.collectGenericTypeParamNames(generics: Generics?):
     if (generics == null) return emptySet()
     return generics.params
         .toList()
-        .mapNotNull { param ->
-            (param as? GenericParam.TypeParam)?.ident?.toString()?.let(::rustTypeIdentToKotlin)
-        }.toSet()
+        .mapNotNull { (it as? GenericParam.TypeParam)?.ident?.toString()?.let(::rustTypeIdentToKotlin) }
+        .toSet()
 }
 
 internal fun KotlinJ2KEmitter.collectGenericConstParamNames(generics: Generics?): Set<String> {
     if (generics == null) return emptySet()
     return generics.params
         .toList()
-        .mapNotNull { param ->
-            (param as? GenericParam.ConstParam)?.ident?.toString()?.let(::rustValueIdentToKotlin)
-        }.toSet()
+        .mapNotNull { (it as? GenericParam.ConstParam)?.ident?.toString()?.let(::rustValueIdentToKotlin) }
+        .toSet()
 }
-
-private val C_POINTER_WIDTH_UNSIGNED_TYPE_NAMES =
-    setOf(
-        "size_t",
-        "SizeT",
-        "uintptr_t",
-        "UintptrT",
-        "rsize_t",
-        "RsizeT",
-        "__size_t",
-    )
-
-private val C_POINTER_WIDTH_SIGNED_TYPE_NAMES =
-    setOf(
-        "ssize_t",
-        "SsizeT",
-        "ptrdiff_t",
-        "PtrdiffT",
-        "intptr_t",
-        "IntptrT",
-        "__ssize_t",
-    )
 
 internal fun isCPointerWidthUnsignedTypeName(name: String): Boolean =
     name in C_POINTER_WIDTH_UNSIGNED_TYPE_NAMES
@@ -1931,7 +1865,6 @@ internal fun extractSinglePrimitiveTargetIdent(ty: SynType): String? {
 internal fun KotlinJ2KEmitter.resolveNumericKind(kotlinType: String, depth: Int = 0): NumericKind? {
     val base = kotlinType.trim()
     if (base.endsWith("?")) return null
-    val simpleBase = base.substringAfterLast('.')
     when (base) {
         "Byte" -> return NumericKind.I8
         "Short" -> return NumericKind.I16
@@ -1949,6 +1882,7 @@ internal fun KotlinJ2KEmitter.resolveNumericKind(kotlinType: String, depth: Int 
         "F16" -> return NumericKind.F16
         "F128" -> return NumericKind.F128
     }
+    val simpleBase = base.substringAfterLast('.')
     val ptrWidth = activeCfgProfile.pointerWidth
     val isWindows =
         activeCfgProfile.targetOs == "windows" ||
@@ -1974,9 +1908,7 @@ internal fun KotlinJ2KEmitter.resolveNumericKind(kotlinType: String, depth: Int 
                 ?: inspector.typeAliasTargets[simpleBase]
                 ?: inspector.typeAliasTargets[rustTypeIdentToKotlin(simpleBase)]
         if (aliasTarget != null) {
-            if (!headerContext.rawAbiMode && unwrapSynType(aliasTarget) is SynType.Ptr) {
-                return null
-            }
+            if (!headerContext.rawAbiMode && unwrapSynType(aliasTarget) is SynType.Ptr) return null
             val primTarget = extractSinglePrimitiveTargetIdent(aliasTarget)
             val isFfiAlias =
                 headerContext.rawAbiMode ||
@@ -1984,22 +1916,14 @@ internal fun KotlinJ2KEmitter.resolveNumericKind(kotlinType: String, depth: Int 
                     base in inspector.ffiReferencedTypeNames ||
                     simpleBase in inspector.ffiReferencedTypeNames
             val keyVariants = distinctBaseAndSimpleKeys(base, simpleBase)
-            val isScannerPointerWidthUnsigned =
+            fun hasScannerPointerWidthKind(codes: Set<String>): Boolean =
                 keyVariants.any { candidate ->
-                    scopedAbiKeysForRenderedType(candidate).any {
-                        headerContext.crateNumericTypeKinds[it] in setOf("U64", "U32", "U16")
-                    }
+                    scopedAbiKeysForRenderedType(candidate).any { headerContext.crateNumericTypeKinds[it] in codes }
                 }
-            val isScannerPointerWidthSigned =
-                keyVariants.any { candidate ->
-                    scopedAbiKeysForRenderedType(candidate).any {
-                        headerContext.crateNumericTypeKinds[it] in setOf("I64", "I32", "I16")
-                    }
-                }
-            if (primTarget == "usize" && (isFfiAlias || isCPointerWidthUnsignedTypeName(simpleBase) || isScannerPointerWidthUnsigned)) {
+            if (primTarget == "usize" && (isFfiAlias || isCPointerWidthUnsignedTypeName(simpleBase) || hasScannerPointerWidthKind(setOf("U64", "U32", "U16")))) {
                 return ptrUnsigned
             }
-            if (primTarget == "isize" && (isFfiAlias || isCPointerWidthSignedTypeName(simpleBase) || isScannerPointerWidthSigned)) {
+            if (primTarget == "isize" && (isFfiAlias || isCPointerWidthSignedTypeName(simpleBase) || hasScannerPointerWidthKind(setOf("I64", "I32", "I16")))) {
                 return ptrSigned
             }
             val prevParam = inExternParamType
@@ -2021,19 +1945,12 @@ internal fun KotlinJ2KEmitter.resolveNumericKind(kotlinType: String, depth: Int 
     ) {
         return null
     }
-    if (simpleBase == "CLong" || simpleBase == "c_long") {
+    if (simpleBase == "CLong" || simpleBase == "c_long" || simpleBase == "CUlong" || simpleBase == "c_ulong") {
         val curSub = currentSubpackageString()
         if (curSub.isNotEmpty()) {
             numericKindFromScannerCode(headerContext.crateNumericTypeKinds["$curSub.$simpleBase"])?.let { return it }
         }
-        return cLongSigned
-    }
-    if (simpleBase == "CUlong" || simpleBase == "c_ulong") {
-        val curSub = currentSubpackageString()
-        if (curSub.isNotEmpty()) {
-            numericKindFromScannerCode(headerContext.crateNumericTypeKinds["$curSub.$simpleBase"])?.let { return it }
-        }
-        return cLongUnsigned
+        return if (simpleBase == "CLong" || simpleBase == "c_long") cLongSigned else cLongUnsigned
     }
     for (variant in distinctBaseAndSimpleKeys(base, simpleBase)) {
         for (key in scopedAbiKeysForRenderedType(variant)) {
@@ -2050,7 +1967,6 @@ internal fun KotlinJ2KEmitter.resolveNumericKind(kotlinType: String, depth: Int 
         "CInt", "c_int", "Int32T", "int32_t", "PidT", "pid_t", "ClockidT", "clockid_t", "WcharT", "wchar_t",
         "KeyT", "key_t", "IdT", "id_t", "SusecondsT", "suseconds_t",
         -> NumericKind.I32
-        "CLong", "c_long" -> cLongSigned
         "CLonglong", "c_longlong", "Int64T", "int64_t", "OffT", "off_t", "Off64T", "off64_t",
         "TimeT", "time_t", "BlkcntT", "blkcnt_t", "BlksizeT", "blksize_t",
         -> NumericKind.I64
@@ -2060,7 +1976,6 @@ internal fun KotlinJ2KEmitter.resolveNumericKind(kotlinType: String, depth: Int 
         "CUint", "c_uint", "Uint32T", "uint32_t", "CanidT", "canid_t", "UidT", "uid_t", "GidT", "gid_t",
         "ModeT", "mode_t", "SocklenT", "socklen_t", "InAddrT", "in_addr_t",
         -> NumericKind.U32
-        "CUlong", "c_ulong" -> cLongUnsigned
         "CUlonglong", "c_ulonglong", "Uint64T", "uint64_t" -> NumericKind.U64
         "CFloat", "c_float" -> NumericKind.F32
         "CDouble", "c_double" -> NumericKind.F64
@@ -2082,92 +1997,42 @@ internal fun KotlinJ2KEmitter.renderTypedNumericInitializer(
         } finally {
             currentExpectedNumericKind = prev
         }
-    if (kind == null) return rendered
-    if (isAlreadyRenderedAsNumericKind(rendered, kind)) return rendered
+    if (kind == null || isAlreadyRenderedAsNumericKind(rendered, kind)) return rendered
     val core = unwrapTransparentCastExpr(expr)
-    val isCompound =
-        core is Expr.Binary ||
-            (core is Expr.Unary && (core.op is UnOp.NotOp || core.op is UnOp.Neg))
+    val isCompound = core is Expr.Binary || (core is Expr.Unary && (core.op is UnOp.NotOp || core.op is UnOp.Neg))
+    val recv = if (isAtomicPostfixReceiver(expr, rendered)) rendered else "($rendered)"
     if (!isCompound) {
         if (core is Expr.Lit) return rendered
         val inferred = inferExprNumericKind(expr, selfTypeName)
         if (inferred == null || inferred == kind) return rendered
-        val recv = if (isAtomicPostfixReceiver(expr, rendered)) rendered else "($rendered)"
         return when (kind) {
-            NumericKind.U8 -> if (rendered.endsWith(".toUByte()")) rendered else "$recv.toUByte()"
-            NumericKind.U16 -> if (rendered.endsWith(".toUShort()")) rendered else "$recv.toUShort()"
-            NumericKind.U32 -> if (rendered.endsWith(".toUInt()")) rendered else "$recv.toUInt()"
-            NumericKind.U64 -> if (rendered.endsWith(".toULong()")) rendered else "$recv.toULong()"
-            NumericKind.I8 -> if (rendered.endsWith(".toByte()")) rendered else "$recv.toByte()"
-            NumericKind.I16 -> if (rendered.endsWith(".toShort()")) rendered else "$recv.toShort()"
-            NumericKind.I32 -> if (rendered.endsWith(".toInt()")) rendered else "$recv.toInt()"
-            NumericKind.I64 -> if (rendered.endsWith(".toLong()")) rendered else "$recv.toLong()"
             NumericKind.F16 -> convertNumericReceiver(recv, "F16", inferred)
-            NumericKind.F32 -> if (rendered.endsWith(".toFloat()")) rendered else "$recv.toFloat()"
-            NumericKind.F64 -> if (rendered.endsWith(".toDouble()")) rendered else "$recv.toDouble()"
             NumericKind.F128 -> convertNumericReceiver(recv, "F128", inferred)
-            else -> rendered
+            NumericKind.I128, NumericKind.U128 -> rendered
+            else -> {
+                val suffix = NUMERIC_SUFFIX_BY_KIND.getValue(kind)
+                if (rendered.endsWith(suffix)) rendered else "$recv$suffix"
+            }
         }
     }
-    if ((kind == NumericKind.U8 || kind == NumericKind.U16) &&
+    val isBitwiseCompound =
         (
-            (
-                core is Expr.Binary &&
-                    (
-                        core.op is BinOp.BitAnd ||
-                            core.op is BinOp.BitOr ||
-                            core.op is BinOp.BitXor ||
-                            core.op is BinOp.Shl ||
-                            core.op is BinOp.Shr
-                    )
-            ) ||
-                (core is Expr.Unary && core.op is UnOp.NotOp)
-        ) &&
-        inferExprNumericKind(core, selfTypeName) == kind
-    ) {
+            core is Expr.Binary &&
+                (core.op is BinOp.BitAnd || core.op is BinOp.BitOr || core.op is BinOp.BitXor || core.op is BinOp.Shl || core.op is BinOp.Shr)
+        ) ||
+            (core is Expr.Unary && core.op is UnOp.NotOp)
+    if ((kind == NumericKind.U8 || kind == NumericKind.U16) && isBitwiseCompound && inferExprNumericKind(core, selfTypeName) == kind) {
         return rendered
     }
-    return when (kind) {
-        NumericKind.U8 ->
-            if (rendered.endsWith(".toUByte()")) {
-                rendered
-            } else if (isAtomicPostfixReceiver(expr, rendered)) {
-                "$rendered.toUByte()"
-            } else {
-                "($rendered).toUByte()"
-            }
-        NumericKind.U16 ->
-            if (rendered.endsWith(".toUShort()")) {
-                rendered
-            } else if (isAtomicPostfixReceiver(expr, rendered)) {
-                "$rendered.toUShort()"
-            } else {
-                "($rendered).toUShort()"
-            }
-        NumericKind.I8 ->
-            if (rendered.endsWith(".toByte()")) {
-                rendered
-            } else if (isAtomicPostfixReceiver(expr, rendered)) {
-                "$rendered.toByte()"
-            } else {
-                "($rendered).toByte()"
-            }
-        NumericKind.I16 ->
-            if (rendered.endsWith(".toShort()")) {
-                rendered
-            } else if (isAtomicPostfixReceiver(expr, rendered)) {
-                "$rendered.toShort()"
-            } else {
-                "($rendered).toShort()"
-            }
-        else -> rendered
+    if (kind == NumericKind.U8 || kind == NumericKind.U16 || kind == NumericKind.I8 || kind == NumericKind.I16) {
+        val suffix = NUMERIC_SUFFIX_BY_KIND.getValue(kind)
+        return if (rendered.endsWith(suffix)) rendered else "$recv$suffix"
     }
+    return rendered
 }
 
 internal fun KotlinJ2KEmitter.renderPointerType(ptr: SynType.Ptr, selfTypeName: String?): String {
-    if (headerContext.rawAbiMode) {
-        return "Long"
-    }
+    if (headerContext.rawAbiMode) return "Long"
     val prevParam = inExternParamType
     inExternParamType = false
     return try {
@@ -2181,19 +2046,8 @@ internal fun KotlinJ2KEmitter.renderPointerType(ptr: SynType.Ptr, selfTypeName: 
     }
 }
 
-internal fun KotlinJ2KEmitter.isAlreadyNullableRenderedType(rendered: String): Boolean {
-    val trimmed = rendered.trim()
-    if (trimmed.endsWith("?")) return true
-    val simple = trimmed.substringAfterLast('.')
-    if (inspector.typeAliasTargets[simple]?.let(::unwrapSynType)?.let(::extractOptionBareFn) != null) {
-        return true
-    }
-    val keys = scopedAbiKeysForRenderedType(trimmed)
-    if (keys.any { it in headerContext.crateOptionFnTypes }) {
-        return true
-    }
-    return false
-}
+internal fun KotlinJ2KEmitter.isAlreadyNullableRenderedType(rendered: String): Boolean =
+    rendered.trim().endsWith("?") || isOptionFnTypeAliasRenderedType(rendered)
 
 internal fun KotlinJ2KEmitter.isOptionFnTypeAliasRenderedType(rendered: String): Boolean {
     val trimmed = rendered.trim().removeSuffix("?")
@@ -2271,12 +2125,9 @@ internal fun KotlinJ2KEmitter.renderBareFnSamInterface(
         val paramTypes = mutableListOf<String>()
         val params =
             bareFn.inputs.toList().mapIndexed { idx, arg ->
-                val rawName =
-                    arg.name
-                        ?.ident
-                        ?.toString()
-                        ?.removePrefix("r#")
-                        ?.takeIf { it.isNotEmpty() && it != "_" }
+                val argIdent = arg.name?.ident
+                val rawIdent = argIdent?.toString()?.removePrefix("r#")
+                val rawName = rawIdent?.takeIf { it.isNotEmpty() && it != "_" }
                 val rawBase = rawName?.let(::rustValueIdentToKotlin) ?: "arg$idx"
                 val baseName = if (rawBase == "errno") "errnum" else rawBase
                 val pName = if (usedNames.add(baseName)) baseName else "${baseName}$idx"
@@ -2292,12 +2143,7 @@ internal fun KotlinJ2KEmitter.renderBareFnSamInterface(
         }
         if (samName !in synthesizedSamDefaultsByName) {
             val retDefault = if (retType == "Unit") "" else renderFallbackDefaultForRenderedType(retType)
-            val lambdaParams =
-                if (paramTypes.isEmpty()) {
-                    ""
-                } else {
-                    paramTypes.indices.joinToString(", ") { "_" } + " -> "
-                }
+            val lambdaParams = if (paramTypes.isEmpty()) "" else paramTypes.indices.joinToString(", ") { "_" } + " -> "
             synthesizedSamDefaultsByName[samName] =
                 if (lambdaParams.isEmpty() && retDefault.isEmpty()) {
                     "$samName {}"
@@ -2306,16 +2152,8 @@ internal fun KotlinJ2KEmitter.renderBareFnSamInterface(
                 }
         }
         val retSuffix = if (retType == "Unit") "" else ": $retType"
-        buildString {
-            append("$indent${vis}fun interface $samName {\n")
-            append(indent)
-                .append("    public operator fun invoke(")
-                .append(params.joinToString(", "))
-                .append(')')
-                .append(retSuffix)
-                .append('\n')
-            append(indent).append('}')
-        }
+        val joinedParams = params.joinToString(", ")
+        "$indent${vis}fun interface $samName {\n$indent    public operator fun invoke($joinedParams)$retSuffix\n$indent}"
     } finally {
         currentSamNameHint = prevHint
         inExternAbiSignature = prevExternAbi
@@ -2326,12 +2164,11 @@ internal fun KotlinJ2KEmitter.extractEnumReprKotlinType(attrs: List<Attribute>):
     for (attr in attrs) {
         val meta = attr.meta
         if (meta is Meta.List && meta.path.isIdent("repr")) {
-            for (tt in meta.tokens.clone().toList()) {
-                if (tt is TokenTree.Ident) {
-                    val ident = tt.value.toString()
-                    if (ident != "C" && ident != "transparent" && ident != "packed" && ident != "align") {
-                        return rustTypeIdentToKotlin(ident)
-                    }
+            val cursor = RustTokenCursor(meta.tokens.clone().toList())
+            for (idx in 0 until cursor.size) {
+                val ident = cursor.identAt(idx) ?: continue
+                if (ident != "C" && ident != "transparent" && ident != "packed" && ident != "align") {
+                    return rustTypeIdentToKotlin(ident)
                 }
             }
         }
@@ -2341,12 +2178,10 @@ internal fun KotlinJ2KEmitter.extractEnumReprKotlinType(attrs: List<Attribute>):
 
 internal fun KotlinJ2KEmitter.hasReprSimdAttr(attrs: List<Attribute>): Boolean =
     attrs.any { attr ->
-        val meta = attr.meta
-        meta is Meta.List &&
-            meta.path.isIdent("repr") &&
-            meta.tokens.clone().toList().any { tt ->
-                (tt as? TokenTree.Ident)?.value?.toString() == "simd"
-            }
+        val meta = attr.meta as? Meta.List ?: return@any false
+        if (!meta.path.isIdent("repr")) return@any false
+        val cursor = RustTokenCursor(meta.tokens.clone().toList())
+        (0 until cursor.size).any { cursor.identAt(it) == "simd" }
     }
 
 internal fun KotlinJ2KEmitter.isStdlibAnyPathSegments(segNames: List<String>): Boolean {
@@ -2369,10 +2204,8 @@ internal fun KotlinJ2KEmitter.isStdlibDynAnyTraitObject(ty: SynType.TraitObject)
             is TypeParamBound.LifetimeBound -> continue
             is TypeParamBound.Trait -> {
                 if (bound.maybe != null) continue
-                val segNames =
-                    bound.path.segments
-                        .toList()
-                        .map { it.ident.toString() }
+                val segs = bound.path.segments.toList()
+                val segNames = segs.map { it.ident.toString() }
                 val last = segNames.lastOrNull() ?: return false
                 if (last in setOf("Send", "Sync", "Unpin")) continue
                 if (last == "Any" && isStdlibAnyPathSegments(segNames)) {
@@ -2394,27 +2227,20 @@ internal fun KotlinJ2KEmitter.isSuppressedStdlibModuleAlias(id: String): Boolean
         val isMappedOrSelfStdCrate =
             (
                 segs[0] in STDLIB_CRATE_ROOTS &&
-                    (
-                        segs[0] in headerContext.crateNamespaces ||
-                            headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true
-                    )
+                    (segs[0] in headerContext.crateNamespaces || headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true)
             ) ||
                 (segs[0] == "crate" && headerContext.packageName?.startsWith("io.github.kotlinmania.rustlang.") == true)
         if (isMappedOrSelfStdCrate && segs[1].firstOrNull()?.isLowerCase() == true && !isKnownFunctionLeafIdent(segs[1])) {
             return true
         }
     }
-    if (segs.size == 6 &&
+    return segs.size == 6 &&
         segs[0] == "io" &&
         segs[1] == "github" &&
         segs[2] == "kotlinmania" &&
         segs[3] == "rustlang" &&
         segs[5].firstOrNull()?.isLowerCase() == true &&
         !isKnownFunctionLeafIdent(segs[5])
-    ) {
-        return true
-    }
-    return false
 }
 
 private fun distinctBaseAndSimpleKeys(base: String, simpleBase: String): List<String> =

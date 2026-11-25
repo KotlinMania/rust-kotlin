@@ -2,6 +2,7 @@ package io.github.kotlinmania.rustkotlin
 
 import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.procmacro2.Group
+import io.github.kotlinmania.procmacro2.Ident
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.Attribute
@@ -16,17 +17,21 @@ import io.github.kotlinmania.syn.GenericParam
 import io.github.kotlinmania.syn.Generics
 import io.github.kotlinmania.syn.ImplItem
 import io.github.kotlinmania.syn.Item
+import io.github.kotlinmania.syn.Macro
 import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.ModContent
 import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
+import io.github.kotlinmania.syn.PathSegment
 import io.github.kotlinmania.syn.ReturnType
+import io.github.kotlinmania.syn.Signature
 import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.TraitItem
 import io.github.kotlinmania.syn.TypeParamBound
 import io.github.kotlinmania.syn.UseTree
 import io.github.kotlinmania.syn.Variant
+import io.github.kotlinmania.syn.WherePredicate
 import io.github.kotlinmania.syn.gen.Visit
 
 internal data class AssocTypeDecl(
@@ -160,6 +165,41 @@ internal fun unwrapSynType(ty: SynType): SynType =
         else -> ty
     }
 
+internal fun Ident.cleanIdent(): String = toString().removePrefix("r#")
+
+internal fun PathSegment.identText(): String = ident.toString()
+
+internal fun PathSegment.cleanIdent(): String = ident.cleanIdent()
+
+internal fun Path.identStrings(): List<String> = segments.toList().map { it.ident.toString() }
+
+internal fun Path.cleanIdentStrings(): List<String> = segments.toList().map { it.cleanIdent() }
+
+internal fun Macro.clonedTokenList(): List<TokenTree> = tokens.clone().toList()
+
+internal fun Path.lastIdentText(): String? = segments.last()?.ident?.toString()
+
+internal fun Path.lastCleanIdent(): String? = lastIdentText()?.removePrefix("r#")
+
+internal fun Path.lastKotlinTypeName(): String? = lastIdentText()?.let(::rustTypeIdentToKotlin)
+
+internal fun Path.firstIdentText(): String? = segments.first()?.ident?.toString()
+
+internal fun Path.firstCleanIdent(): String? = firstIdentText()?.removePrefix("r#")
+
+internal fun Path.firstKotlinTypeName(): String? = firstIdentText()?.let(::rustTypeIdentToKotlin)
+
+internal fun Signature.cleanFnName(): String = ident.toString().removePrefix("r#")
+
+internal fun Signature.hasSelfReceiver(): Boolean = inputs.toList().firstOrNull() is FnArg.Receiver
+
+internal fun Generics.wherePredicatesList(): List<WherePredicate> = whereClause?.predicates?.toList().orEmpty()
+
+internal fun String.simpleKotlinTypeName(): String = substringBefore('<').substringAfterLast('.').trim()
+
+internal fun File.findStructByKotlinName(ownerName: String): Item.Struct? =
+    items.filterIsInstance<Item.Struct>().singleOrNull { rustTypeIdentToKotlin(it.ident.toString()) == ownerName }
+
 internal fun isExternalIdentityTypeReexportAlias(
     i: Item.ItemType,
     selfCrateAliases: Set<String>,
@@ -252,6 +292,47 @@ internal class CrateSymbolInspector(
     var hasImportedEnumGlob: Boolean = false
     var hasLocalNoneVariant: Boolean = false
     private var blockDepth: Int = 0
+
+    fun mergeSharedModuleSymbols(other: CrateSymbolInspector) {
+        declaredTypeNames.addAll(other.declaredTypeNames)
+        unitStructNames.addAll(other.unitStructNames)
+        unionTypeNames.addAll(other.unionTypeNames)
+        typeAliasTargets.putAll(other.typeAliasTargets)
+        declaredConstNames.putAll(other.declaredConstNames)
+        declaredConstTypes.putAll(other.declaredConstTypes)
+        structFieldNamesByType.putAll(other.structFieldNamesByType)
+        structFieldSynTypesByType.putAll(other.structFieldSynTypesByType)
+        declaredTopLevelFnRawNames.addAll(other.declaredTopLevelFnRawNames)
+        externFnKotlinNames.addAll(other.externFnKotlinNames)
+        topLevelFnReturnSynTypes.putAll(other.topLevelFnReturnSynTypes)
+        implMethodReturnSynTypes.putAll(other.implMethodReturnSynTypes)
+        localInlineModuleNames.addAll(other.localInlineModuleNames)
+        localExternalModuleNames.addAll(other.localExternalModuleNames)
+        allUseItems.addAll(other.allUseItems)
+        enumTypeNames.addAll(other.enumTypeNames)
+        enumVariantSimpleNames.addAll(other.enumVariantSimpleNames)
+        importedEnumVariantSimpleNames.addAll(other.importedEnumVariantSimpleNames)
+        ffiReferencedTypeNames.addAll(other.ffiReferencedTypeNames)
+        referencedUnqualifiedTypeIdents.addAll(other.referencedUnqualifiedTypeIdents)
+        referencedPathPrefixTypeIdents.addAll(other.referencedPathPrefixTypeIdents)
+        declaredTraitsByName.putAll(other.declaredTraitsByName)
+        typeDefaultArgsByType.putAll(other.typeDefaultArgsByType)
+        tupleStructArityByType.putAll(other.tupleStructArityByType)
+        tupleEnumVariantArity.putAll(other.tupleEnumVariantArity)
+        genericUnitEnumVariants.addAll(other.genericUnitEnumVariants)
+        enumTypeParamsByVariant.putAll(other.enumTypeParamsByVariant)
+        enumVariantFieldTypes.putAll(other.enumVariantFieldTypes)
+        collidingInlineForeignFnRenames.putAll(other.collidingInlineForeignFnRenames)
+        collidingTopLevelForeignFnRenames.putAll(other.collidingTopLevelForeignFnRenames)
+        selfParameterizedTraits.addAll(other.selfParameterizedTraits)
+        traitSupertraits.putAll(other.traitSupertraits)
+        traitSupertraitBindings.putAll(other.traitSupertraitBindings)
+        traitDefaultlessAssocTypes.putAll(other.traitDefaultlessAssocTypes)
+        traitResultMethods.putAll(other.traitResultMethods)
+        instanceMethodsByType.putAll(other.instanceMethodsByType)
+        companionMethodsByType.putAll(other.companionMethodsByType)
+        if (other.hasImportedEnumGlob) hasImportedEnumGlob = true
+    }
 
     private fun recordFfiReferencedType(ty: SynType) {
         val collector =

@@ -736,39 +736,28 @@ private class MacroCfgAttributeParser(
         return CfgConditionAst.Flag(constName, mergedDefault)
     }
 
-    private fun extractCfgLiteralValue(tokens: List<TokenTree>): String {
+    private fun extractCfgLiteralValue(tokens: List<TokenTree>): String =
+        joinCfgIdentParts(tokens, includeGroups = false).ifEmpty { "enabled" }
+
+    private fun joinCfgIdentParts(tokens: List<TokenTree>, includeGroups: Boolean = true): String {
         val parts = mutableListOf<String>()
         for (tt in tokens) {
             when (tt) {
+                is TokenTree.Ident -> {
+                    val clean = sanitizeConstIdentifierSegment(tt.value.toString())
+                    if (clean.isNotEmpty()) parts += clean
+                }
                 is TokenTree.Literal -> {
                     val raw = tt.value.strValue().value ?: tt.value.toString().trim('"')
                     val clean = sanitizeConstIdentifierSegment(raw)
                     if (clean.isNotEmpty()) parts += clean
                 }
-                is TokenTree.Ident -> {
-                    val clean = sanitizeConstIdentifierSegment(tt.value.toString())
-                    if (clean.isNotEmpty()) parts += clean
-                }
-                else -> Unit
-            }
-        }
-        return parts.joinToString("_").ifEmpty { "enabled" }
-    }
-
-    private fun joinCfgIdentParts(tokens: List<TokenTree>): String {
-        val parts = mutableListOf<String>()
-        for (tt in tokens) {
-            when (tt) {
-                is TokenTree.Ident -> {
-                    val clean = sanitizeConstIdentifierSegment(tt.value.toString())
-                    if (clean.isNotEmpty()) parts += clean
-                }
-                is TokenTree.Literal -> parts += extractCfgLiteralValue(listOf(tt))
-                is TokenTree.Group -> {
-                    val groupStream = tt.value.stream()
-                    val nested = joinCfgIdentParts(groupStream.clone().toList())
-                    if (nested.isNotEmpty()) parts += nested
-                }
+                is TokenTree.Group ->
+                    if (includeGroups) {
+                        val grpStream = tt.value.stream()
+                        val nested = joinCfgIdentParts(grpStream.clone().toList(), includeGroups = true)
+                        if (nested.isNotEmpty()) parts += nested
+                    }
                 else -> Unit
             }
         }
@@ -918,27 +907,25 @@ private fun sanitizeMacroParamName(ktIdent: String): String =
         else -> ktIdent
     }
 
+private val RUST_TEMPLATE_KEYWORD_MAP: Map<String, String> =
+    mapOf(
+        "pub" to "public",
+        "fn" to "fun",
+        "struct" to "class",
+        "enum" to "sealed class",
+        "trait" to "interface",
+        "impl" to "class",
+        "let" to "val",
+        "mut" to "var",
+        "match" to "when",
+        "use" to "import",
+        "macro_rules" to "macro",
+    )
+
 private fun translateMacroTemplateIdent(rawIdent: String): String {
     val word = rawIdent.removePrefix("r#")
-    return when (word) {
-        "pub" -> "public"
-        "fn" -> "fun"
-        "struct" -> "class"
-        "enum" -> "sealed class"
-        "trait" -> "interface"
-        "impl" -> "class"
-        "let" -> "val"
-        "mut" -> "var"
-        "match" -> "when"
-        "use" -> "import"
-        "macro_rules" -> "macro"
-        else ->
-            if (word.firstOrNull()?.isUpperCase() == true) {
-                rustTypeIdentToKotlin(word)
-            } else {
-                rustValueIdentToKotlin(word)
-            }
-    }
+    return RUST_TEMPLATE_KEYWORD_MAP[word]
+        ?: if (word.firstOrNull()?.isUpperCase() == true) rustTypeIdentToKotlin(word) else rustValueIdentToKotlin(word)
 }
 
 private fun extractScalarLiteralFromMacroBody(bodyTokens: TokenStream): ScalarMacroLiteral? {
@@ -953,20 +940,13 @@ private fun extractScalarLiteralFromExpr(expr: Expr): ScalarMacroLiteral? =
         is Expr.Paren -> extractScalarLiteralFromExpr(expr.expr)
         is Expr.BlockExpr -> {
             val tailStmt = expr.block.stmts.lastOrNull()
-            if (tailStmt is Stmt.ExprStmt && tailStmt.semiToken == null) {
-                extractScalarLiteralFromExpr(tailStmt.expr)
-            } else {
-                null
-            }
+            if (tailStmt is Stmt.ExprStmt && tailStmt.semiToken == null) extractScalarLiteralFromExpr(tailStmt.expr) else null
         }
         is Expr.Unary ->
             if (expr.op is UnOp.Neg) {
-                val inner = extractScalarLiteralFromExpr(expr.expr)
-                if (inner != null && (inner.kotlinType == "Int" || inner.kotlinType == "Long" || inner.kotlinType == "Double")) {
-                    ScalarMacroLiteral(inner.kotlinType, "-${inner.renderedExpr}")
-                } else {
-                    null
-                }
+                extractScalarLiteralFromExpr(expr.expr)
+                    ?.takeIf { it.kotlinType == "Int" || it.kotlinType == "Long" || it.kotlinType == "Double" }
+                    ?.let { ScalarMacroLiteral(it.kotlinType, "-${it.renderedExpr}") }
             } else {
                 null
             }
@@ -994,21 +974,7 @@ private fun convertSynLitToScalar(lit: Lit): ScalarMacroLiteral? =
         is Lit.Str -> ScalarMacroLiteral("String", renderKotlinDoubleQuotedString(lit.value.value()))
         is Lit.Char -> {
             val cp = lit.value.value()
-            if (cp in 0..0xFFFF) {
-                ScalarMacroLiteral("Char", quoteKotlinCharLiteral(cp.toChar()))
-            } else {
-                null
-            }
+            if (cp in 0..0xFFFF) ScalarMacroLiteral("Char", formatBmpKotlinCharLiteral(cp.toChar(), useUnicodeEscapeForNonAscii = false)) else null
         }
         else -> null
-    }
-
-private fun quoteKotlinCharLiteral(value: Char): String =
-    when (value) {
-        '\\' -> "'\\\\'"
-        '\'' -> "'\\''"
-        '\n' -> "'\\n'"
-        '\r' -> "'\\r'"
-        '\t' -> "'\\t'"
-        else -> "'$value'"
     }
