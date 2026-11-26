@@ -1453,4 +1453,61 @@ class SingleFileTranslationSynAndMacrosTest {
         assertFalse(idx.hasMemberCall("fake"))
         assertTrue(idx.hasZeroArgDotInvCall)
     }
+
+    @Test
+    fun kotlinRenderedTypeDeclarationWalkerAndRustItemStreamScannerInvariants() {
+        val nestedResult = "io.github.kotlinmania.Result<Pair<Int, List<String>>, Error>?".asKotlinRenderedType()!!
+        assertTrue(nestedResult.isNullable)
+        assertEquals("Result", nestedResult.simpleName)
+        assertEquals(listOf("Pair<Int, List<String>>", "Error"), nestedResult.typeArgs)
+        assertEquals("Pair<Int, List<String>>" to "Error", nestedResult.pairArgsOf("Result"))
+        assertEquals("io.github.kotlinmania.Result<*, *>", nestedResult.withStarProjection())
+
+        val nullableFn = "((Int, String) -> Result<Int, Error>)?".asKotlinRenderedType()!!
+        assertTrue(nullableFn.isNullable)
+        assertEquals("Result<Int, Error>", nullableFn.callableReturnType)
+
+        val fnMutTrait = "FnMut<Pair<Int, Int>, ULong>".asKotlinRenderedType()!!
+        assertEquals("ULong", fnMutTrait.callableReturnType)
+
+        val headerTargets = linkedSetOf<String>()
+        extractHeaderCommentsFromSource(
+            """
+            val ignored = "// Header: fake.h"
+            // Header: `sys/mman.h`
+            /// Header: unistd.h
+            """.trimIndent(),
+            headerTargets,
+        )
+        assertEquals(setOf("sys/mman.h", "unistd.h"), headerTargets)
+
+        val rsTrees =
+            lexRustTokenTrees(
+                """
+                #[macro_use]
+                mod local_macros;
+                pub(crate) mod exposed_mod;
+                macro_rules! skip_me { () => {}; }
+                """.trimIndent(),
+            )
+        val visitedMods = mutableListOf<Pair<Boolean, String>>()
+        object : RustItemStreamScanner(rsTrees) {
+            fun run() {
+                walkItemStream { i, _ ->
+                    matchMacroRulesDefAt(i)?.let { return@walkItemStream it.second }
+                    matchModDeclAt(i)?.let { (isPub, name, next) ->
+                        visitedMods += (isPub || hasPendingAttrIdent("macro_use")) to name
+                        return@walkItemStream next
+                    }
+                    null
+                }
+            }
+        }.run()
+        assertEquals(listOf(true to "local_macros", true to "exposed_mod"), visitedMods)
+
+        val arrCursor = RustTokenCursor(lexRustTokenTrees("[core::mem::MaybeUninit<u8>; 16]"))
+        val (elemSlice, lenSlice) = arrCursor.extractBracketArrayTypeAndLen(0)!!
+        assertEquals("MaybeUninit", RustTokenCursor(elemSlice).simplePathLeafIdent())
+        assertEquals(16, RustTokenCursor(lenSlice).intLiteralAt(0))
+    }
 }

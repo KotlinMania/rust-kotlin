@@ -564,9 +564,7 @@ private class BlockEmissionScope(
         if (!initCall.args.isEmpty() || initCall.turbofish != null) return null
         val callMethod = initCall.method.toString().removePrefix("r#")
         if (callMethod != "borrow" && callMethod != "borrow_mut") return null
-        val recvTy = emitter.inferExprRenderedType(initCall.receiver, selfTypeName)?.removeSuffix("?")?.trim() ?: return null
-        if (recvTy.substringBefore('<').substringAfterLast('.') != "RefCell" || '<' !in recvTy || !recvTy.endsWith('>')) return null
-        val innerTy = recvTy.substringAfter('<').dropLast(1).trim()
+        val innerTy = emitter.inferExprRenderedType(initCall.receiver, selfTypeName).asKotlinRenderedType()?.singleArgOf("RefCell") ?: return null
         val rawVar = identPat.ident.toString().removePrefix("r#")
         val dropIdx = (idx + 1 until endIdx).firstOrNull { emitter.isDropOfLocalStmt(stmts[it], rawVar) }
         val scopeEnd = dropIdx ?: endIdx
@@ -1023,9 +1021,12 @@ internal fun KotlinJ2KEmitter.recordLocalInferredType(
                 if (isConcreteTupleElemType(elemTy)) currentTypedLocals = currentTypedLocals + (ktName to elemTy!!)
             }
         } else {
-            val tupTy = inferExprRenderedType(initExpr, selfTypeName)?.removeSuffix("?")?.trim()
-            if (tupTy != null && (tupTy.startsWith("Pair<") || tupTy.startsWith("Triple<")) && tupTy.endsWith(">")) {
-                val elemTypes = PhantomRawPointerTypeStripper.splitTopLevelCommaList(tupTy.substringAfter('<').dropLast(1))
+            val elemTypes =
+                inferExprRenderedType(initExpr, selfTypeName)
+                    .asKotlinRenderedType()
+                    ?.takeIf { it.headPath == "Pair" || it.headPath == "Triple" }
+                    ?.typeArgs
+            if (elemTypes != null) {
                 for (idx in 0 until minOf(patElems.size, elemTypes.size)) {
                     val pIdent = extractRawParamIdent(patElems[idx]) ?: continue
                     val ktName = scopeBuilder.resolveLocalKotlinName(pIdent) ?: rustValueIdentToKotlin(pIdent)

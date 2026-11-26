@@ -14,6 +14,7 @@ import io.github.kotlinmania.syn.ImplItem
 import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.ItemParse
 import io.github.kotlinmania.syn.Pat
+import io.github.kotlinmania.syn.PathSegment
 import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.TraitItem
@@ -866,5 +867,28 @@ private class ConstVerbatimTokenStripper(
         val ch = punctCharAt(startIdx)
         if ((ch == '~' || ch == '?') && identAt(startIdx + 1) == "const") return 2
         return 0
+    }
+}
+
+/**
+ * Reusable [Fold] base class for rewriting unqualified [SynType.Path] nodes (type parameter
+ * substitutions and `Owner::Assoc` projections) without repeating boilerplate `Fold` subclasses.
+ */
+internal abstract class SynTypeProjectionFolder : Fold() {
+    protected open val foldReplacementResult: Boolean = false
+
+    protected abstract fun rewriteUnqualifiedTypePath(
+        type: SynType,
+        segments: List<PathSegment>,
+    ): SynType?
+
+    override fun foldType(t: SynType): SynType {
+        val segments = t.unqualifiedPath()?.segments?.toList()
+        if (segments != null) {
+            rewriteUnqualifiedTypePath(t, segments)?.let { replacement ->
+                return if (foldReplacementResult) super.foldType(replacement) else replacement
+            }
+        }
+        return super.foldType(t)
     }
 }

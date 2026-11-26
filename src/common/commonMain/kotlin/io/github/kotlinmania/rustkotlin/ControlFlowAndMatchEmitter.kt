@@ -15,7 +15,6 @@ import io.github.kotlinmania.syn.RangeLimits
 import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.UnOp
-import io.github.kotlinmania.syn.gen.Visit
 import io.github.kotlinmania.syn.span
 
 private inline fun <T> KotlinJ2KEmitter.withNeutralConditionContext(block: () -> T): T {
@@ -966,7 +965,7 @@ internal class MatchArmBindingExtractor(
 private class DerefedIdentMutationVisitor(
     private val emitter: KotlinJ2KEmitter,
     private val rawIdent: String,
-) : Visit() {
+) : ScopedBlockAstVisitor(skipNestedClosures = true) {
     private val predicates = PatternPredicateInspector(emitter)
     private var mutates = false
     private var shadowed = false
@@ -978,11 +977,8 @@ private class DerefedIdentMutationVisitor(
 
     override fun visitItem(i: Item) {}
 
-    override fun visitExprClosure(e: Expr.Closure) {}
-
-    override fun visitStmt(s: Stmt) {
-        if (isLeadingCfgStmtDisabled(s)) return
-        super.visitStmt(s)
+    override fun onActiveStmt(s: Stmt) {
+        super.onActiveStmt(s)
         if (s is Stmt.Local && predicates.bindsRawIdent(s.pat, rawIdent)) {
             shadowed = true
         }

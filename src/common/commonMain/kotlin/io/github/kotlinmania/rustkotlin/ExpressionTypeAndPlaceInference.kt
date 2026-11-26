@@ -1361,15 +1361,12 @@ internal fun KotlinJ2KEmitter.mutablePlaceReturnType(
         if (tail.semiToken != null) return null
         // A second exit would need its own place proof. Do not change the
         // function contract based on only one of multiple return paths.
-        var hasExplicitReturn = false
         val returnVisitor =
-            object : Visit() {
-                override fun visitExprReturn(e: Expr.Return) {
-                    hasExplicitReturn = true
-                }
+            object : ScopedPredicateAstVisitor(skipNestedClosures = true) {
+                override fun visitExprReturn(e: Expr.Return) = markMatched()
             }
         for (stmt in fn.block.stmts) returnVisitor.visitStmt(stmt)
-        if (hasExplicitReturn) return null
+        if (returnVisitor.matched) return null
         val call = unwrapParenOrGroupExpr(tail.expr) as? Expr.MethodCall ?: return null
         if (!call.args.isEmpty() || call.turbofish != null) return null
         val receiver = unwrapParenOrGroupExpr(call.receiver) as? Expr.Path ?: return null

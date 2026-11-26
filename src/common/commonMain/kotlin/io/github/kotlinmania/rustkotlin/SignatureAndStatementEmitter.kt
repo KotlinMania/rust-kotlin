@@ -24,7 +24,6 @@ import io.github.kotlinmania.syn.TypeParamBound
 import io.github.kotlinmania.syn.UnOp
 import io.github.kotlinmania.syn.WhereClause
 import io.github.kotlinmania.syn.WherePredicate
-import io.github.kotlinmania.syn.gen.Visit
 import io.github.kotlinmania.syn.span
 
 internal data class TypeParamWitnessSpec(
@@ -241,13 +240,7 @@ private class TypeParamWitnessAnalyzer(
 
     private fun scanTupleStructPatternBindings() {
         val patScanner =
-            object : Visit() {
-                override fun visitItemFn(i: Item.Fn) {}
-
-                override fun visitStmt(s: Stmt) {
-                    if (!isLeadingCfgStmtDisabled(s)) super.visitStmt(s)
-                }
-
+            object : ScopedBlockAstVisitor() {
                 override fun visitPatTupleStruct(p: Pat.TupleStruct) {
                     val segList = p.path.segments.toList()
                     val variantKey =
@@ -309,13 +302,10 @@ private class TypeParamWitnessAnalyzer(
         val clonedTypeParams = linkedSetOf<String>()
 
         val visitor =
-            object : Visit() {
+            object : ScopedBlockAstVisitor() {
                 private var pendingCallReturnHint: Pair<Expr.Call, String>? = null
 
-                override fun visitItemFn(i: Item.Fn) {}
-
-                override fun visitStmt(s: Stmt) {
-                    if (isLeadingCfgStmtDisabled(s)) return
+                override fun onActiveStmt(s: Stmt) {
                     when (s) {
                         is Stmt.Local -> {
                             val rawLocal = emitter.extractRawParamIdent(s.pat)
@@ -325,7 +315,7 @@ private class TypeParamWitnessAnalyzer(
                             if (unwrappedInit is Expr.Call && annTy != null) {
                                 pendingCallReturnHint = unwrappedInit to annTy
                             }
-                            super.visitStmt(s)
+                            super.onActiveStmt(s)
                             if (rawLocal != null) {
                                 val ktLocal = rustValueIdentToKotlin(rawLocal)
                                 if (annTy != null) {
@@ -359,7 +349,7 @@ private class TypeParamWitnessAnalyzer(
                         }
                         else -> {}
                     }
-                    super.visitStmt(s)
+                    super.onActiveStmt(s)
                 }
 
                 override fun visitExprReturn(e: Expr.Return) {
@@ -696,69 +686,37 @@ private fun KotlinJ2KEmitter.blockCallsSameAritySelfMethod(
     rawMethodName: String,
     expectedArgCount: Int,
 ): Boolean {
-    var found = false
     val cleanTarget = rawMethodName.removePrefix("r#")
     val visitor =
-        object : Visit() {
+        object : ScopedPredicateAstVisitor() {
             override fun visitExprMethodCall(e: Expr.MethodCall) {
                 if (e.method.toString().removePrefix("r#") == cleanTarget) {
                     val recv = unwrapParenOrGroupExpr(e.receiver)
                     val nonUnitCount = e.args.toList().count { !(it is Expr.Tuple && it.elems.isEmpty()) }
                     if (recv is Expr.Path && recv.qself == null && recv.path.isIdent("self") && nonUnitCount == expectedArgCount) {
-                        found = true
+                        markMatched()
+                        return
                     }
                 }
                 super.visitExprMethodCall(e)
             }
         }
     visitor.visitBlock(block)
-    return found
+    return visitor.matched
 }
-
-private fun visitMatchesRawIdent(
-    rawIdent: String,
-    drive: (Visit) -> Unit,
-): Boolean {
-    var found = false
-    val visitor =
-        object : Visit() {
-            override fun visitTypePath(t: SynType.Path) {
-                val segs = t.path.segments.toList()
-                if (segs.any { it.ident.toString().removePrefix("r#") == rawIdent }) {
-                    found = true
-                    return
-                }
-                super.visitTypePath(t)
-            }
-
-            override fun visitExprPath(e: Expr.Path) {
-                val segs = e.path.segments.toList()
-                if (segs.any { it.ident.toString().removePrefix("r#") == rawIdent }) {
-                    found = true
-                    return
-                }
-                super.visitExprPath(e)
-            }
-        }
-    drive(visitor)
-    return found
-}
-
-private fun synTypeMentionsIdent(ty: SynType?, rawIdent: String): Boolean =
-    ty != null && visitMatchesRawIdent(rawIdent) { it.visitType(ty) }
 
 private fun genericsMentionIdent(generics: Generics?, rawIdent: String): Boolean {
     if (generics == null) return false
     for (gp in generics.params.toList()) {
         if (gp is GenericParam.TypeParam) {
-            if (visitMatchesRawIdent(rawIdent) { v -> gp.bounds.toList().forEach(v::visitTypeParamBound) }) return true
-            if (synTypeMentionsIdent(gp.default?.type, rawIdent)) return true
+            if (synNodeMentionsRawIdent(rawIdent) { v -> gp.bounds.toList().forEach(v::visitTypeParamBound) }) return true
+            if (gp.default?.type?.let { synTypeReferencesIdent(it, rawIdent) } == true) return true
         }
     }
     for (pred in generics.wherePredicatesList()) {
         if (pred is WherePredicate.TypePredicate) {
-            if (synTypeMentionsIdent(pred.boundedTy, rawIdent)) return true
-            if (visitMatchesRawIdent(rawIdent) { v -> pred.bounds.toList().forEach(v::visitTypeParamBound) }) return true
+            if (synTypeReferencesIdent(pred.boundedTy, rawIdent)) return true
+            if (synNodeMentionsRawIdent(rawIdent) { v -> pred.bounds.toList().forEach(v::visitTypeParamBound) }) return true
         }
     }
     return false
@@ -965,9 +923,9 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
                         "actual" !in openPrefix &&
                         "expect" !in visPrefix &&
                         (
-                            inputs.any { it is FnArg.Typed && synTypeMentionsIdent(it.patType.ty, rawConst) } ||
-                                synTypeMentionsIdent(rawReturnSynType, rawConst) ||
-                                synTypeMentionsIdent(currentStandaloneImplSelfSynType, rawConst) ||
+                            inputs.any { it is FnArg.Typed && synTypeReferencesIdent(it.patType.ty, rawConst) } ||
+                                synTypeReferencesIdent(rawReturnSynType, rawConst) ||
+                                synTypeReferencesIdent(currentStandaloneImplSelfSynType, rawConst) ||
                                 genericsMentionIdent(ownerGenerics ?: implGenerics, rawConst)
                         )
                     ) {
@@ -1336,19 +1294,18 @@ internal fun KotlinJ2KEmitter.isSingleCallExternForwardingWrapper(sig: Signature
             .mapNotNull { (it as? FnArg.Typed)?.let { t -> extractRawParamIdent(t.patType.pat) } }
             .filterTo(linkedSetOf()) { it != "_" }
     if (paramRawNames.isEmpty()) return true
-    var derefsParam = false
     val visitor =
-        object : Visit() {
+        object : ScopedPredicateAstVisitor() {
             override fun visitExprUnary(e: Expr.Unary) {
                 if (e.op is UnOp.Deref && singlePlainPathCleanIdent(e.expr) in paramRawNames) {
-                    derefsParam = true
+                    markMatched()
                     return
                 }
                 super.visitExprUnary(e)
             }
         }
     visitor.visitBlock(block)
-    return !derefsParam
+    return !visitor.matched
 }
 
 private fun KotlinJ2KEmitter.appendDestructuredParamLines(
@@ -1411,27 +1368,25 @@ private fun KotlinJ2KEmitter.appendDestructuredParamLines(
 internal abstract class ScopedMutationAstScanner(
     protected val emitter: KotlinJ2KEmitter,
     private val includeCompoundBinaryAssign: Boolean = true,
-) : Visit() {
-    var mutated: Boolean = false
-        protected set
+) : ScopedPredicateAstVisitor() {
+    val mutated: Boolean
+        get() = matched
 
     protected abstract fun matchesLhs(lhs: Expr): Boolean
 
-    final override fun visitItemFn(i: Item.Fn) {}
-
     override fun visitExprAssign(e: Expr.Assign) {
-        if (mutated) return
+        if (matched) return
         if (matchesLhs(e.left)) {
-            mutated = true
+            markMatched()
             return
         }
         super.visitExprAssign(e)
     }
 
     override fun visitExprBinary(e: Expr.Binary) {
-        if (mutated) return
+        if (matched) return
         if (includeCompoundBinaryAssign && emitter.isCompoundAssignOp(e.op) && matchesLhs(e.left)) {
-            mutated = true
+            markMatched()
             return
         }
         super.visitExprBinary(e)
@@ -1456,14 +1411,14 @@ private class IdentReassignmentScanner(
         emitter.extractAssignedRootIdent(lhs) == targetRawIdent
 
     override fun visitExprMatch(e: Expr.Match) {
-        if (mutated) return
+        if (matched) return
         val subj = emitter.unwrapParenOrGroupExpr(e.expr)
         if (subj is Expr.Reference &&
             subj.mutability != null &&
             emitter.extractAssignedRootIdent(subj.expr) == targetRawIdent &&
             e.arms.any { emitter.matchArmMutatesTupleVariantBinding(it) }
         ) {
-            mutated = true
+            markMatched()
             return
         }
         super.visitExprMatch(e)

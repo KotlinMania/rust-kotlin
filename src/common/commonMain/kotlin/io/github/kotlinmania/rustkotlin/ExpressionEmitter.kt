@@ -5,7 +5,6 @@ import io.github.kotlinmania.rustkotlin.reused.starlark.AssignCount
 import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.FieldValue
-import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.Member
 import io.github.kotlinmania.syn.Pat
 import io.github.kotlinmania.syn.RangeLimits
@@ -344,25 +343,21 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                             ?.ident
                             ?.toString() in setOf("transmute", "transmute_unchecked")
                 }
-            val expectedTupleTarget =
+            val expectedTupleParsed =
                 (
                     currentExpectedParseTargetType
                         ?: if (hasTransmuteElem) currentEnclosingReturnRenderedType else null
-                )?.removeSuffix("?")?.trim()
+                ).asKotlinRenderedType()
             val expectedElemTypes =
-                if (expectedTupleTarget != null &&
-                    elems.size in 2..3 &&
-                    (
-                        (elems.size == 2 && (expectedTupleTarget.startsWith("Pair<") || expectedTupleTarget.startsWith("kotlin.Pair<"))) ||
-                            (elems.size == 3 && (expectedTupleTarget.startsWith("Triple<") || expectedTupleTarget.startsWith("kotlin.Triple<")))
-                    ) &&
-                    expectedTupleTarget.endsWith(">")
-                ) {
-                    val inner = expectedTupleTarget.substringAfter('<').dropLast(1)
-                    PhantomRawPointerTypeStripper.splitTopLevelCommaList(inner).takeIf { it.size == elems.size }
-                } else {
-                    null
-                }
+                expectedTupleParsed
+                    ?.takeIf {
+                        elems.size in 2..3 &&
+                            (
+                                (elems.size == 2 && (it.headPath == "Pair" || it.headPath == "kotlin.Pair")) ||
+                                    (elems.size == 3 && (it.headPath == "Triple" || it.headPath == "kotlin.Triple"))
+                            ) &&
+                            it.arity == elems.size
+                    }?.typeArgs
             fun renderTupleElem(idx: Int): String {
                 val elemTarget = expectedElemTypes?.get(idx)?.trim()?.takeIf { it.isNotEmpty() }
                 if (elemTarget == null) return renderExpr(elems[idx], indent, selfTypeName)
@@ -390,21 +385,17 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
         is Expr.Struct -> renderExprStruct(expr, indent, selfTypeName)
         is Expr.Assign -> renderExprAssign(expr, indent, selfTypeName)
         is Expr.Range -> {
-            val expectedRangeTarget =
+            val elemTy =
                 (currentExpectedParseTargetType ?: currentEnclosingReturnRenderedType)
-                    ?.removeSuffix("?")
-                    ?.trim()
-            val rangeBase = expectedRangeTarget?.substringBefore('<')?.substringAfterLast('.')?.trim()
+                    .asKotlinRenderedType()
+                    ?.singleArgOf("RangeInclusive")
             val exprStart = expr.start
             val exprEnd = expr.end
             if (expr.limits is RangeLimits.Closed &&
-                rangeBase == "RangeInclusive" &&
-                '<' in expectedRangeTarget &&
-                expectedRangeTarget.endsWith('>') &&
+                elemTy != null &&
                 exprStart != null &&
                 exprEnd != null
             ) {
-                val elemTy = expectedRangeTarget.substringAfter('<').dropLast(1).trim()
                 val elemKind = resolveNumericKind(elemTy)
                 val savedKind = currentExpectedNumericKind
                 val savedParseTarget = currentExpectedParseTargetType
@@ -565,30 +556,22 @@ internal fun KotlinJ2KEmitter.isPureArithmeticOrSideEffectFreeExpr(expr: Expr): 
     }
 
 internal fun KotlinJ2KEmitter.exprReferencesIdent(expr: Expr, identName: String): Boolean {
-    var found = false
     val visitor =
-        object : Visit() {
+        object : SynPathPredicateVisitor() {
             override fun visitExprPath(e: Expr.Path) {
-                if (e.qself == null &&
-                    e.path.segments.len() == 1 &&
-                    e.path.segments
-                        .first()
-                        ?.ident
-                        ?.toString()
-                        ?.removePrefix("r#") == identName
-                ) {
-                    found = true
+                if (e.unqualifiedPath()?.singleSegment()?.cleanIdent() == identName) {
+                    markMatched()
                     return
                 }
                 super.visitExprPath(e)
             }
         }
     visitor.visitExpr(expr)
-    return found
+    return visitor.matched
 }
 
 internal fun KotlinJ2KEmitter.tupleAccessMemberName(baseExpr: Expr, index: Int, selfTypeName: String?): String {
-    val ownerBase = selfTypeName?.substringBefore('<')?.trim()
+    val ownerBase = selfTypeName.asKotlinRenderedType()?.headPath
     if (baseExpr is Expr.Path && baseExpr.path.isIdent("self")) {
         if (ownerBase == "Pair") return if (index == 0) "first" else "second"
         if (ownerBase == "Triple") {
@@ -601,22 +584,12 @@ internal fun KotlinJ2KEmitter.tupleAccessMemberName(baseExpr: Expr, index: Int, 
         val arity = ownerBase?.let { inspector.tupleStructArityByType[it] } ?: 1
         return tupleFieldPropertyName(index, arity)
     }
-    val baseTy =
-        inferExprRenderedType(baseExpr, selfTypeName)
-            ?.removeSuffix("?")
-            ?.substringBefore('<')
-            ?.substringAfterLast('.')
-            ?.trim()
+    val baseTy = inferExprRenderedType(baseExpr, selfTypeName).asKotlinRenderedType()?.simpleName
     val effectiveBaseTy =
         baseTy?.let { bt ->
             inspector.typeAliasTargets[bt]
-                ?.let {
-                    renderType(it, null)
-                        .removeSuffix("?")
-                        .substringBefore('<')
-                        .substringAfterLast('.')
-                        .trim()
-                }?.takeIf { it.isNotEmpty() }
+                ?.let { renderType(it, null).asKotlinRenderedType()?.simpleName }
+                ?.takeIf { it.isNotEmpty() }
                 ?: bt
         }
     if (effectiveBaseTy == "Pair" || effectiveBaseTy == "Triple") {
@@ -998,27 +971,14 @@ internal fun KotlinJ2KEmitter.renderExprClosure(expr: Expr.Closure, indent: Stri
 }
 
 internal fun KotlinJ2KEmitter.exprContainsDirectClosureReturn(body: Expr): Boolean {
-    var found = false
     val visitor =
-        object : Visit() {
-            override fun visitExprClosure(e: Expr.Closure) {
-                // Nested closures have their own return target.
-            }
+        object : ScopedPredicateAstVisitor(skipNestedClosures = true) {
+            override fun visitExprReturn(e: Expr.Return) = markMatched()
 
-            override fun visitItemFn(i: Item.Fn) {
-                // Nested functions have their own return target.
-            }
-
-            override fun visitExprReturn(e: Expr.Return) {
-                found = true
-            }
-
-            override fun visitExprTry(e: Expr.Try) {
-                found = true
-            }
+            override fun visitExprTry(e: Expr.Try) = markMatched()
         }
     visitor.visitExpr(body)
-    return found
+    return visitor.matched
 }
 
 internal fun KotlinJ2KEmitter.renderClosureParam(

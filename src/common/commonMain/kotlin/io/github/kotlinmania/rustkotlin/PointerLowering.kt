@@ -15,6 +15,7 @@ import io.github.kotlinmania.syn.Member
 import io.github.kotlinmania.syn.ModContent
 import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
+import io.github.kotlinmania.syn.PathSegment
 import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
@@ -23,7 +24,6 @@ import io.github.kotlinmania.syn.TypeParamBound
 import io.github.kotlinmania.syn.UnOp
 import io.github.kotlinmania.syn.UseTree
 import io.github.kotlinmania.syn.WherePredicate
-import io.github.kotlinmania.syn.gen.Fold
 import io.github.kotlinmania.syn.gen.Visit
 import io.github.kotlinmania.syn.span
 import io.github.kotlinmania.syn.token.Const
@@ -161,20 +161,15 @@ internal fun KotlinJ2KEmitter.sourceTransparentField(
     val name = field.ident?.toString()?.let(::rustFieldIdentToKotlin) ?: tupleFieldPropertyName(0, 1)
     val associated = sourceAssociatedParameters(item.generics)
     val fieldType =
-        object : Fold() {
-            override fun foldType(t: SynType): SynType {
-                val projection = t.unqualifiedPath()?.segments?.toList()
+        object : SynTypeProjectionFolder() {
+            override fun rewriteUnqualifiedTypePath(type: SynType, segments: List<PathSegment>): SynType? {
                 val parameter =
                     associated.singleOrNull {
-                        projection?.size == 2 &&
-                            projection.first().identText() == it.owner &&
-                            projection.last().identText() == it.associated
-                    }
-                if (parameter != null) {
-                    val lastSpan = requireNotNull(projection).last().ident.span()
-                    return SynType.Path(null, Path.from(Ident.new(parameter.associated, lastSpan)))
-                }
-                return super.foldType(t)
+                        segments.size == 2 &&
+                            segments.first().identText() == it.owner &&
+                            segments.last().identText() == it.associated
+                    } ?: return null
+                return SynType.Path(null, Path.from(Ident.new(parameter.associated, segments.last().ident.span())))
             }
         }.foldType(field.ty.deepCopy())
     return name to renderType(fieldType, selfType)
@@ -607,14 +602,9 @@ internal fun KotlinJ2KEmitter.sourceAssociatedArguments(path: Path, selfType: St
 }
 
 internal fun substituteSourceType(type: SynType, substitutions: Map<String, SynType>): SynType =
-    object : Fold() {
-        override fun foldType(t: SynType): SynType {
-            val singleName = singleUnqualifiedPathIdent(t)
-            if (singleName != null) {
-                substitutions[singleName]?.let { return it.deepCopy() }
-            }
-            return super.foldType(t)
-        }
+    object : SynTypeProjectionFolder() {
+        override fun rewriteUnqualifiedTypePath(type: SynType, segments: List<PathSegment>): SynType? =
+            singleUnqualifiedPathIdent(type)?.let(substitutions::get)?.deepCopy()
     }.foldType(type.deepCopy())
 
 internal fun KotlinJ2KEmitter.sourceAssociatedBinding(
@@ -673,16 +663,11 @@ internal fun KotlinJ2KEmitter.resolveLayoutType(
     }
 
     val substituted =
-        object : Fold() {
-            override fun foldType(t: SynType): SynType {
-                val projection = t.unqualifiedPath()?.segments?.toList()
-                if (projection?.size == 2) {
-                    resolveProjectionBinding(projection.first().identText(), projection.last().identText())?.let {
-                        return super.foldType(it)
-                    }
-                }
-                return super.foldType(t)
-            }
+        object : SynTypeProjectionFolder() {
+            override val foldReplacementResult: Boolean = true
+
+            override fun rewriteUnqualifiedTypePath(type: SynType, segments: List<PathSegment>): SynType? =
+                if (segments.size == 2) resolveProjectionBinding(segments.first().identText(), segments.last().identText()) else null
         }.foldType(substituteSourceType(type, substitutions))
     val path = substituted.unqualifiedPath() ?: return substituted
     val key = substituted.toTokenStream().toString()

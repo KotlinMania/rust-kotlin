@@ -238,9 +238,8 @@ internal fun KotlinJ2KEmitter.renderDistinctSuperTraits(
 }
 
 internal fun KotlinJ2KEmitter.structImplsMutateField(attachedImpls: List<Item.Impl>, rawFieldIdent: String): Boolean {
-    var mutated = false
     val visitor =
-        object : Visit() {
+        object : SynPathPredicateVisitor() {
             override fun visitExprMethodCall(e: Expr.MethodCall) {
                 if (e.method.toString() in MUTATING_VEC_METHODS) {
                     val recv = e.receiver
@@ -248,9 +247,9 @@ internal fun KotlinJ2KEmitter.structImplsMutateField(attachedImpls: List<Item.Im
                         recv.base is Expr.Path &&
                         (recv.base as Expr.Path).path.isIdent("self") &&
                         recv.member is Member.Named &&
-                        (recv.member as Member.Named).ident.toString().removePrefix("r#") == rawFieldIdent
+                        (recv.member as Member.Named).ident.cleanIdent() == rawFieldIdent
                     ) {
-                        mutated = true
+                        markMatched()
                         return
                     }
                 }
@@ -259,7 +258,7 @@ internal fun KotlinJ2KEmitter.structImplsMutateField(attachedImpls: List<Item.Im
         }
     for (impl in attachedImpls) {
         visitor.visitItemImpl(impl)
-        if (mutated) return true
+        if (visitor.matched) return true
     }
     return false
 }
