@@ -1,0 +1,195 @@
+# ==============================================================================
+# Associated Constants, Crate/Stdlib `use` Path Routing & C ABI Bridge Catalogs
+# ==============================================================================
+# Authoritative declarative rules for:
+# - `MacroEmitter.kt`
+# - `ExpressionCallEmitter.kt` (`resolveOptionalSynParsePeekToken`)
+# - `StdlibTypeAndLayoutHelpers.kt` (`resolveStdlibUnitStructValueExpr`)
+# - `UseAndModulePathResolver.kt`
+# - `FfiInteropEmitter.kt`
+
+# `core::f32::consts` and `core::f64::consts` mathematical constants.
+rustFloatMathConstants:
+  - { name: PI, f32: "3.1415927f", f64: "kotlin.math.PI" }
+  - { name: TAU, f32: "6.2831855f", f64: "6.283185307179586" }
+  - { name: FRAC_PI_2, f32: "1.5707964f", f64: "1.5707963267948966" }
+  - { name: FRAC_PI_3, f32: "1.0471976f", f64: "1.0471975511965979" }
+  - { name: FRAC_PI_4, f32: "0.7853982f", f64: "0.7853981633974483" }
+  - { name: FRAC_PI_6, f32: "0.5235988f", f64: "0.5235987755982989" }
+  - { name: FRAC_PI_8, f32: "0.3926991f", f64: "0.39269908169872414" }
+  - { name: FRAC_1_PI, f32: "0.31830987f", f64: "0.3183098861837907" }
+  - { name: FRAC_2_PI, f32: "0.63661975f", f64: "0.6366197723675814" }
+  - { name: FRAC_2_SQRT_PI, f32: "1.1283792f", f64: "1.1283791670955126" }
+  - { name: SQRT_2, f32: "1.4142135f", f64: "1.4142135623730951" }
+  - { name: FRAC_1_SQRT_2, f32: "0.70710677f", f64: "0.7071067811865476" }
+  - { name: E, f32: "2.7182817f", f64: "kotlin.math.E" }
+  - { name: LOG2_E, f32: "1.442695f", f64: "1.4426950408889634" }
+  - { name: LOG2_10, f32: "3.321928f", f64: "3.321928094887362" }
+  - { name: LOG10_E, f32: "0.4342945f", f64: "0.4342944819032518" }
+  - { name: LOG10_2, f32: "0.30103f", f64: "0.3010299956639812" }
+  - { name: LN_2, f32: "0.6931472f", f64: "0.6931471805599453" }
+  - { name: LN_10, f32: "2.3025851f", f64: "2.302585092994046" }
+
+intBitsByPrim:
+  u8: "8u"
+  i8: "8u"
+  u16: "16u"
+  i16: "16u"
+  u32: "32u"
+  i32: "32u"
+  u64: "64u"
+  i64: "64u"
+  u128: "128u"
+  i128: "128u"
+
+# IEEE-754 associated constants for `f32` and `f64`.
+f32AssocConstTemplates:
+  MIN: "(-{typeName}.MAX_VALUE)"
+  MAX: "{typeName}.MAX_VALUE"
+  MIN_POSITIVE: "1.17549435E-38f"
+  EPSILON: "1.1920929E-7f"
+  INFINITY: "{typeName}.POSITIVE_INFINITY"
+  NEG_INFINITY: "{typeName}.NEGATIVE_INFINITY"
+  NAN: "{typeName}.NaN"
+  RADIX: "2u"
+  MANTISSA_DIGITS: "24u"
+  DIGITS: "6u"
+  MIN_EXP: "(-125)"
+  MAX_EXP: "128"
+  MIN_10_EXP: "(-37)"
+  MAX_10_EXP: "38"
+
+f64AssocConstTemplates:
+  MIN: "(-{typeName}.MAX_VALUE)"
+  MAX: "{typeName}.MAX_VALUE"
+  MIN_POSITIVE: "2.2250738585072014E-308"
+  EPSILON: "2.220446049250313E-16"
+  INFINITY: "{typeName}.POSITIVE_INFINITY"
+  NEG_INFINITY: "{typeName}.NEGATIVE_INFINITY"
+  NAN: "{typeName}.NaN"
+  RADIX: "2u"
+  MANTISSA_DIGITS: "53u"
+  DIGITS: "15u"
+  MIN_EXP: "(-1021)"
+  MAX_EXP: "1024"
+  MIN_10_EXP: "(-307)"
+  MAX_10_EXP: "308"
+
+f16F128AssocConsts:
+  - "MIN MAX MIN_POSITIVE EPSILON INFINITY NEG_INFINITY NAN ZERO ONE NEG_ZERO"
+  - "RADIX MANTISSA_DIGITS DIGITS MIN_EXP MAX_EXP MIN_10_EXP MAX_10_EXP BITS"
+  - "SIGN_MASK EXP_MASK SIG_MASK IMPLICIT_BIT SIG_TOP_BIT SIG_BITS EXP_BITS"
+  - "EXP_SAT EXP_BIAS EXP_MAX EXP_MIN EXP_MIN_SUBNORM TINY_BITS MIN_POSITIVE_SUBNORMAL"
+
+booleanCastSourceMethods: "is_empty is_some is_none is_ok is_err contains starts_with ends_with"
+valuePosInstanceConvMethods: "intoInner asRef asMut asSlice asBytes intoVec intoBoxedSlice intoString toOwned"
+
+selfTypeToRustPrim:
+  Float: f32
+  kotlin.Float: f32
+  Double: f64
+  F16: f16
+  F128: f128
+  Byte: i8
+  UByte: u8
+  Short: i16
+  UShort: u16
+  Int: i32
+  UInt: u32
+  Long: i64
+  ULong: u64
+  I128: i128
+  U128: u128
+
+# Optional `syn::ParseStream::parse::<Option<T>>()` peek-token mappings.
+synOptionalParsePeekTokenAliases:
+  Abi: Extern
+  BoundLifetimes: For
+  WhereClause: Where
+  Label: Lifetime
+
+synSelfPeekingTokenClasses:
+  - "Ident Lifetime Lit LitStr LitByteStr LitCStr LitByte LitChar"
+  - "LitInt LitFloat LitBool SelfType SelfValue SynTypeToken Underscore"
+
+# Cross-crate zero-arg unit structs resolved in value position (`AllocError`, `LayoutError`, etc.).
+stdlibCoreUnitStructs:
+  AllocError: "alloc.AllocError"
+  LayoutError: "alloc.layout.LayoutError"
+  ParseBoolError: "str.error.ParseBoolError"
+
+# ==============================================================================
+# Crate/Stdlib `use` Path Routing & Platform Subpackage Affinity Rules
+# ==============================================================================
+
+externalReexportSearchCrates: [core, alloc, libm]
+coreRootPrimitiveWrapperSymbols: "U128 I128 F16 F128"
+coreMemSubpkgSymbols: "sizeOf sizeOfVal alignOf alignOfVal transmute transmuteUnchecked needsDrop forget drop"
+
+# Platform/architecture subpackage affinity token groups (`SubpackageAffinityScorer`).
+highArchSegs: "b64 aarch64 x8664 notx32"
+bsdFamilySegs: "freebsdlike netbsdlike freebsd"
+unixBiasSegs: "apple bsd linuxlike linux gnu unix"
+bits32PenaltySegs: "b32 x32 x86 arm mips mips32 powerpc sparc riscv32 i386 uclibc"
+unixFamilySegs: "unix linux android apple macos ios tvos watchos darwin posix"
+foreignPlatformSegs: "windows wasi wasip1 wasip2 wasip3 unsupported stubs hermit solid uefi xous zkvm motor sgx teeos vexos"
+nonSignificantSegs: "new sys pal mod bsd linuxlike freebsdlike netbsdlike solarish"
+wasiForeignPenaltySegs: "windows hermit solid uefi xous zkvm motor sgx unsupported stubs"
+wasipVersionSegs: "wasip1 wasip2 wasip3"
+
+kotlinBuiltinQualifySimpleTypeNames: "String Boolean Char Byte Short Int Long UByte UShort UInt ULong Float Double Unit Nothing Any"
+
+stdlibUnimportedSubmodules:
+  - "alloc any arch ascii bool borrow boxed cell char clone cmp collections convert core default"
+  - "env error f32 f64 ffi fmt fs hash hint i128 i16 i32 i64 i8 io isize iter marker mem net num"
+  - "ops option panic path pin process ptr rc result slice std str string sync task thread time"
+  - "u128 u16 u32 u64 u8 usize vec"
+
+coreMemIntrinsics: "transmute transmute_unchecked size_of size_of_val align_of align_of_val needs_drop forget"
+
+stdlibCoreSubmodules:
+  - "ffi mem ptr option result fmt marker cmp ops slice str iter convert default hash clone"
+  - "any arch cell hint num panic pin sync task time char borrow error"
+
+coreIntrinsicOrPreludeLeaves:
+  - "Option Some None Result Ok Err Vec Box Rc Arc Cow PhantomData ManuallyDrop MaybeUninit"
+  - "Cell RefCell OnceCell Iter IterMut IntoIter Range RangeInclusive min max once empty drop"
+  - "transmute transmute_unchecked size_of size_of_val align_of align_of_val needs_drop forget"
+
+stdlibCellTypes: "Cell RefCell Ref RefMut"
+stdlibPrimitiveOrPreludeSecondSegs: "f32 f64 f16 f128 i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize consts prelude"
+stdlibUnindexedSkipSecondSegs: "convert marker default clone hash borrow iter option hint panic pin task error fmt"
+stdlibAllowedWildcardSubmodules: "alloc cell cmp ffi mem num ops ptr result sync atomic"
+
+unloweredStdModules: "env fs process net path time collections"
+windowsOsPreludeSyms: [OsStrExt, OsStringExt, encode_wide]
+unixOsPreludeSyms: [OsStrExt, OsStringExt, as_bytes, into_vec, from_bytes, from_vec]
+floatOrConstsSegs: "f16 f32 f64 f128 consts"
+dropMarkerLeaves: "NoDrop TrivialDrop"
+constPanicOrErrorSuffixes: [".panic.constPanic", ".panic.constAssert", ".io.constError", ".error.constError"]
+
+# ==============================================================================
+# C ABI Multi-Platform Bridge Descriptors (`FfiInteropEmitter.kt`)
+# ==============================================================================
+
+cAbiBridgeDescriptors:
+  - { kind: VOID, cType: void, cFailureLiteral: "", wasmWasiScalarType: Unit, wasmJsType: Unit, jniKotlinType: Unit, jniCType: void, kotlinScalarType: Unit }
+  - { kind: NEVER, cType: void, cFailureLiteral: "", wasmWasiScalarType: Unit, wasmJsType: Unit, jniKotlinType: Unit, jniCType: void, kotlinScalarType: Unit }
+  - { kind: BOOL, cType: bool, cFailureLiteral: "false", wasmWasiScalarType: Int, wasmJsType: Boolean, jniKotlinType: Boolean, jniCType: jboolean, kotlinScalarType: Boolean }
+  - { kind: I8, cType: int8_t, cFailureLiteral: "-1", numericKind: I8, defaultReturnConv: toByte, wasmWasiScalarType: Int, wasmJsType: Int, jniKotlinType: Byte, jniCType: jbyte, kotlinScalarType: Byte }
+  - { kind: U8, cType: uint8_t, cFailureLiteral: "0", numericKind: U8, defaultReturnConv: toUByte, wasmWasiScalarType: Int, wasmJsType: Int, jniKotlinType: Byte, jniCType: jbyte, kotlinScalarType: UByte }
+  - { kind: I16, cType: int16_t, cFailureLiteral: "-1", numericKind: I16, defaultReturnConv: toShort, wasmWasiScalarType: Int, wasmJsType: Int, jniKotlinType: Short, jniCType: jshort, kotlinScalarType: Short }
+  - { kind: U16, cType: uint16_t, cFailureLiteral: "0", numericKind: U16, defaultReturnConv: toUShort, wasmWasiScalarType: Int, wasmJsType: Int, jniKotlinType: Short, jniCType: jshort, kotlinScalarType: UShort }
+  - { kind: I32, cType: int32_t, cFailureLiteral: "-1", numericKind: I32, wasmWasiScalarType: Int, wasmJsType: Int, jniKotlinType: Int, jniCType: jint, kotlinScalarType: Int }
+  - { kind: U32, cType: uint32_t, cFailureLiteral: "0", numericKind: U32, defaultReturnConv: toUInt, wasmWasiScalarType: Int, wasmJsType: Int, jniKotlinType: Int, jniCType: jint, kotlinScalarType: UInt }
+  - { kind: I64, cType: int64_t, cFailureLiteral: "-1", numericKind: I64, wasmWasiScalarType: Long, jniKotlinType: Long, jniCType: jlong, kotlinScalarType: Long }
+  - { kind: U64, cType: uint64_t, cFailureLiteral: "0", numericKind: U64, defaultReturnConv: toULong, wasmWasiScalarType: Long, jniKotlinType: Long, jniCType: jlong, kotlinScalarType: ULong }
+  - { kind: F32, cType: float, cFailureLiteral: "0.0f", numericKind: F32, wasmWasiScalarType: Float, wasmJsType: Double, jniKotlinType: Float, jniCType: jfloat, kotlinScalarType: Float }
+  - { kind: F64, cType: double, cFailureLiteral: "0.0", numericKind: F64, wasmWasiScalarType: Double, wasmJsType: Double, jniKotlinType: Double, jniCType: jdouble, kotlinScalarType: Double }
+  - { kind: CONST_CSTR, cType: "const char*", cFailureLiteral: "NULL", jniKotlinType: Long, jniCType: jlong, isPointerAddress: true }
+  - { kind: MUT_CSTR, cType: "char*", cFailureLiteral: "NULL", jniKotlinType: Long, jniCType: jlong, isPointerAddress: true }
+  - { kind: OPAQUE_PTR, cType: "void*", cFailureLiteral: "NULL", jniKotlinType: Long, jniCType: jlong, isPointerAddress: true }
+  - { kind: FILE_PTR, cType: "void*", cFailureLiteral: "NULL", jniKotlinType: Long, jniCType: jlong, isPointerAddress: true }
+  - { kind: DIR_PTR, cType: "void*", cFailureLiteral: "NULL", jniKotlinType: Long, jniCType: jlong, isPointerAddress: true }
+  - { kind: CALLBACK_PTR, cType: "void*", cFailureLiteral: "NULL", jniKotlinType: Long, jniCType: jlong, isPointerAddress: true }
+  - { kind: BY_VALUE_OBJECT, cType: "void*", cFailureLiteral: "NULL", wasmJsType: Unit, jniKotlinType: Long, jniCType: jlong }

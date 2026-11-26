@@ -10,11 +10,8 @@ import io.github.kotlinmania.syn.PathArguments
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.TraitItem
 
-private val HOMOGENEOUS_BINARY_SIMD_INTRINSICS =
-    wordSet(
-        "simd_add simd_sub simd_mul simd_div simd_rem simd_and simd_or simd_xor simd_shl simd_shr",
-        "simd_eq simd_ne simd_lt simd_le simd_gt simd_ge simd_fmin simd_fmax",
-    )
+private val HOMOGENEOUS_BINARY_SIMD_INTRINSICS: Set<String>
+    get() = YamlRuleCatalogs.CoreIntrinsics.homogeneousBinarySimdIntrinsics
 
 private val BYTE_SWAP_CALLEE_KIND: Map<String, NumericKind?> =
     buildMap {
@@ -37,17 +34,14 @@ private val BYTE_SWAP_CALLEE_KIND: Map<String, NumericKind?> =
         }
     }
 
-private val INTEGER_COMPANION_MIN_MAX_OWNERS =
-    wordSet("Byte UByte Short UShort Int UInt Long ULong")
+private val INTEGER_COMPANION_MIN_MAX_OWNERS: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.integerCompanionMinMaxOwners
 
-private val COMPANION_CONVERT_PRIMITIVES =
-    INTEGER_COMPANION_MIN_MAX_OWNERS + wordSet("I128 U128 Boolean Float Double F16 F128")
+private val COMPANION_CONVERT_PRIMITIVES: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.companionConvertPrimitives
 
-private val KNOWN_STD_UFCS_RECEIVER_METHODS =
-    wordSet(
-        "clone cmp partialCmp eq ne hash fmt deref derefMut asRef borrow borrowMut",
-        "toString toOwned writeFmt write writeAll flush read readExact readToEnd readToString",
-    )
+private val KNOWN_STD_UFCS_RECEIVER_METHODS: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.knownStdUfcsReceiverMethods
 
 private fun isFmtTraitMethodCallee(calleeBase: String): Boolean {
     if (!calleeBase.endsWith(".fmt")) return false
@@ -748,16 +742,45 @@ private object DefaultAndNullPointerCallRule : CalleeDispatchRule() {
     }
 }
 
+private object YamlCalleePatternDispatchRule : CalleeDispatchRule() {
+    override fun tryRender(ctx: CallLoweringContext): String? {
+        val emitter = ctx.emitter
+        val argCount = ctx.nonUnitArgs.size
+        for (rule in YamlRuleCatalogs.TypeAndMethodPatterns.calleePatternRules) {
+            if (rule.matches(
+                    callee = ctx.callee,
+                    calleeBase = ctx.calleeBase,
+                    argCount = argCount,
+                    declaredTypeNames = emitter.inspector.declaredTypeNames,
+                    declaredTopLevelFnRawNames = emitter.inspector.declaredTopLevelFnRawNames,
+                    topLevelSignatureCounts = emitter.topLevelSignatureCounts,
+                )
+            ) {
+                val renderedArgs = arrayOfNulls<String>(argCount)
+                return rule.action.render(
+                    rawAbi = emitter.headerContext.rawAbiMode,
+                    onImport = { CoreIntrinsicLowering.registerCoreImport(emitter, it) },
+                ) { key ->
+                    when (key) {
+                        "turbofish" -> ctx.turbofishSuffix
+                        "coreNs" -> CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
+                        "arg0" -> renderedArgs[0] ?: ctx.renderArg(0).also { renderedArgs[0] = it }
+                        "arg1" -> renderedArgs[1] ?: ctx.renderArg(1).also { renderedArgs[1] = it }
+                        else -> null
+                    }
+                }
+            }
+        }
+        return null
+    }
+}
+
 private object MemoryLayoutAndSliceCallRule : CalleeDispatchRule() {
     override fun tryRender(ctx: CallLoweringContext): String? {
         val emitter = ctx.emitter
         val cb = ctx.calleeBase
         val args = ctx.nonUnitArgs
         when {
-            args.size == 1 &&
-                "drop" !in emitter.inspector.declaredTopLevelFnRawNames &&
-                (cb == "drop" || ctx.matchesCalleeOrSuffix("mem.drop")) ->
-                return "(${ctx.renderArg(0)}).let { }"
             args.size == 2 && isSliceFromRawPartsCallee(cb) -> {
                 val isMutSlice = cb.endsWith("Mut") || cb.endsWith("_mut")
                 return if ("core" in emitter.headerContext.crateNamespaces) {
@@ -806,8 +829,6 @@ private object MemoryLayoutAndSliceCallRule : CalleeDispatchRule() {
                 return ctx.renderArg(0)
             args.isEmpty() && (cb == "typeName" || cb == "type_name" || cb.endsWith(".any.typeName") || cb.endsWith(".any.type_name")) ->
                 return renderKotlinDoubleQuotedString(ctx.selfTypeName?.substringBefore('<')?.trim() ?: "Any")
-            args.isEmpty() && (ctx.matchesCalleeOrSuffix("TypeId.of") || ctx.matchesCalleeOrSuffix("RustTypeId.of")) ->
-                return "RustTypeId.of${ctx.turbofishSuffix}()"
             else -> return null
         }
     }
@@ -863,7 +884,6 @@ private object MemoryLayoutAndSliceCallRule : CalleeDispatchRule() {
 }
 
 private object OptionResultAndSmartPtrCallRule : CalleeDispatchRule() {
-    private val smartPtrNewOwners = setOf("Box", "Rc", "Arc", "NoDrop", "ManuallyDrop")
     private val rcCloneOwners = setOf("Arc", "Rc")
 
     override fun tryRender(ctx: CallLoweringContext): String? {
@@ -896,22 +916,11 @@ private object OptionResultAndSmartPtrCallRule : CalleeDispatchRule() {
             return if (emitter.currentEnclosingReturnRenderedType == "Unit") "Unit" else "$callee(Unit)"
         }
         if (args.size != 1) return null
-        if ("Cow" !in emitter.inspector.declaredTypeNames &&
-            (callee == "Cow.Borrowed" || callee == "Cow.Owned" || callee.endsWith(".Cow.Borrowed") || callee.endsWith(".Cow.Owned"))
-        ) {
-            return ctx.renderArg(0)
-        }
         for (owner in rcCloneOwners) {
             if (owner !in emitter.inspector.declaredTypeNames && (callee == "$owner.clone" || callee.endsWith(".$owner.clone"))) {
                 val innerArg = emitter.unwrapParenOrGroupExpr(args[0])
                 val targetArg = if (innerArg is Expr.Reference) innerArg.expr else args[0]
                 return emitter.renderExpr(targetArg, ctx.indent, ctx.selfTypeName)
-            }
-        }
-        if (callee.endsWith(".new")) {
-            val owner = callee.removeSuffix(".new")
-            if (owner in smartPtrNewOwners && owner !in emitter.inspector.declaredTypeNames) {
-                return ctx.renderArg(0)
             }
         }
         return null
@@ -920,53 +929,34 @@ private object OptionResultAndSmartPtrCallRule : CalleeDispatchRule() {
 
 private object StdlibCollectionFactoryCallRule : CalleeDispatchRule() {
     override fun tryRender(ctx: CallLoweringContext): String? {
-        val emitter = ctx.emitter
-        val callee = ctx.callee
-        val cb = ctx.calleeBase
         val args = ctx.nonUnitArgs
-        if ("Vec" !in emitter.inspector.declaredTypeNames) {
-            when {
-                callee == "Vec.new" && args.isEmpty() -> return "mutableListOf()"
-                callee == "Vec.withCapacity" && args.size == 1 -> return "ArrayList(${ctx.renderArg(0)})"
-                callee == "Vec.from" && args.size == 1 -> return "${ctx.renderArg(0)}.toMutableList()"
-            }
+        if (args.size != 1) return null
+        val emitter = ctx.emitter
+        val cb = ctx.calleeBase
+        if (cb == "String.from" && "String" !in emitter.inspector.declaredTypeNames) {
+            val argExpr = args[0]
+            val renderedArg = ctx.renderArg(0)
+            val isStr =
+                (emitter.unwrapParenOrGroupExpr(argExpr) as? Expr.Lit)?.lit is Lit.Str ||
+                    emitter.inferExprRenderedType(argExpr, ctx.selfTypeName)?.removeSuffix("?")?.trim() == "String"
+            return if (isStr) renderedArg else "($renderedArg).toString()"
         }
-        if (callee == "VecDeque.from" && args.size == 1 && "VecDeque" !in emitter.inspector.declaredTypeNames) {
-            return "ArrayDeque(${ctx.renderArg(0)})"
+        if ((cb == "HashMap.from" || cb == "BTreeMap.from") &&
+            "HashMap" !in emitter.inspector.declaredTypeNames &&
+            "BTreeMap" !in emitter.inspector.declaredTypeNames
+        ) {
+            return renderMapFromArg(ctx, args[0])
         }
-        if ("String" !in emitter.inspector.declaredTypeNames) {
-            if ((cb == "String.new" || cb == "String.withCapacity") && args.size <= 1) {
-                return "\"\""
-            }
-            if (cb == "String.from" && args.size == 1) {
-                val argExpr = args[0]
-                val renderedArg = ctx.renderArg(0)
-                val isStr =
-                    (emitter.unwrapParenOrGroupExpr(argExpr) as? Expr.Lit)?.lit is Lit.Str ||
-                        emitter.inferExprRenderedType(argExpr, ctx.selfTypeName)?.removeSuffix("?")?.trim() == "String"
-                return if (isStr) renderedArg else "($renderedArg).toString()"
-            }
-        }
-        if ("HashMap" !in emitter.inspector.declaredTypeNames && "BTreeMap" !in emitter.inspector.declaredTypeNames) {
-            if ((cb == "HashMap.new" || cb == "BTreeMap.new" || cb == "HashMap.withCapacity" || cb == "BTreeMap.withCapacity") && args.size <= 1) {
-                return "mutableMapOf${ctx.turbofishSuffix}()"
-            }
-            if ((cb == "HashMap.from" || cb == "BTreeMap.from") && args.size == 1) {
-                return renderMapFromArg(ctx, args[0])
-            }
-        }
-        if ("HashSet" !in emitter.inspector.declaredTypeNames && "BTreeSet" !in emitter.inspector.declaredTypeNames) {
-            if ((cb == "HashSet.new" || cb == "BTreeSet.new" || cb == "HashSet.withCapacity" || cb == "BTreeSet.withCapacity") && args.size <= 1) {
-                return "mutableSetOf${ctx.turbofishSuffix}()"
-            }
-            if ((cb == "HashSet.from" || cb == "BTreeSet.from") && args.size == 1) {
-                val arrExpr = emitter.unwrapParenOrGroupExpr(args[0]) as? Expr.Array
-                return if (arrExpr != null) {
-                    val elems = arrExpr.elems.toList().joinToString(", ") { emitter.renderExpr(it, ctx.indent, ctx.selfTypeName) }
-                    "mutableSetOf${ctx.turbofishSuffix}($elems)"
-                } else {
-                    "(${ctx.renderArg(0)}).toMutableSet()"
-                }
+        if ((cb == "HashSet.from" || cb == "BTreeSet.from") &&
+            "HashSet" !in emitter.inspector.declaredTypeNames &&
+            "BTreeSet" !in emitter.inspector.declaredTypeNames
+        ) {
+            val arrExpr = emitter.unwrapParenOrGroupExpr(args[0]) as? Expr.Array
+            return if (arrExpr != null) {
+                val elems = arrExpr.elems.toList().joinToString(", ") { emitter.renderExpr(it, ctx.indent, ctx.selfTypeName) }
+                "mutableSetOf${ctx.turbofishSuffix}($elems)"
+            } else {
+                "(${ctx.renderArg(0)}).toMutableSet()"
             }
         }
         return null
@@ -1042,20 +1032,10 @@ private object ScalarCharConversionCallRule : CalleeDispatchRule() {
 
 private object IterFmtAndNumericMinMaxCallRule : CalleeDispatchRule() {
     override fun tryRender(ctx: CallLoweringContext): String? {
-        val emitter = ctx.emitter
         val callee = ctx.callee
         val cb = ctx.calleeBase
         val args = ctx.nonUnitArgs
         when {
-            (callee == "empty" || callee == "iter.empty") && args.isEmpty() && "empty" !in emitter.topLevelSignatureCounts ->
-                return "ArrayDeque()"
-            (cb == "once" || ctx.matchesCalleeOrSuffix("iter.once")) &&
-                args.size == 1 &&
-                "once" !in emitter.topLevelSignatureCounts &&
-                "once" !in emitter.inspector.declaredTopLevelFnRawNames ->
-                return "listOf${ctx.turbofishSuffix}(${ctx.renderArg(0)})"
-            (callee == "min" || callee == "cmp.min") && args.size == 2 && "min" !in emitter.inspector.declaredTopLevelFnRawNames ->
-                return "minOf(${ctx.renderArg(0)}, ${ctx.renderArg(1)})"
             isFmtTraitMethodCallee(cb) && args.size == 2 ->
                 return "${ctx.renderArg(1)}.append((${ctx.renderArg(0)}).toString())"
             callee in BYTE_SWAP_CALLEE_KIND && args.size == 1 -> {
@@ -1086,6 +1066,7 @@ private object IterFmtAndNumericMinMaxCallRule : CalleeDispatchRule() {
 private val CALLEE_DISPATCH_RULES: List<CalleeDispatchRule> =
     listOf(
         DefaultAndNullPointerCallRule,
+        YamlCalleePatternDispatchRule,
         MemoryLayoutAndSliceCallRule,
         OptionResultAndSmartPtrCallRule,
         StdlibCollectionFactoryCallRule,
@@ -1155,36 +1136,16 @@ internal fun KotlinJ2KEmitter.resolveOptionalSynParsePeekToken(innerTarget: Stri
     if (innerTarget.isEmpty() || !innerTarget.all { it.isLetterOrDigit() || it == '_' || it == '.' }) {
         return null
     }
-    return when (innerTarget) {
-        "Abi" -> "Extern"
-        "BoundLifetimes" -> "For"
-        "WhereClause" -> "Where"
-        "Label" -> "Lifetime"
-        "Ident",
-        "Lifetime",
-        "Lit",
-        "LitStr",
-        "LitByteStr",
-        "LitCStr",
-        "LitByte",
-        "LitChar",
-        "LitInt",
-        "LitFloat",
-        "LitBool",
-        "SelfType",
-        "SelfValue",
-        "SynTypeToken",
-        "Underscore",
-        -> innerTarget
-        in SYN_PUNCT_TOKEN_CLASS_NAMES -> innerTarget
-        in SYN_KEYWORD_TOKEN_CLASS_NAMES -> innerTarget
-        else ->
-            if (innerTarget.startsWith("token.") || innerTarget.startsWith("kw.")) {
-                innerTarget
-            } else {
-                null
-            }
+    YamlRuleCatalogs.PathsConstsAndCAbi.synOptionalParsePeekTokenAliases[innerTarget]?.let { return it }
+    if (innerTarget in YamlRuleCatalogs.PathsConstsAndCAbi.synSelfPeekingTokenClasses ||
+        innerTarget in SYN_PUNCT_TOKEN_CLASS_NAMES ||
+        innerTarget in SYN_KEYWORD_TOKEN_CLASS_NAMES ||
+        innerTarget.startsWith("token.") ||
+        innerTarget.startsWith("kw.")
+    ) {
+        return innerTarget
     }
+    return null
 }
 
 internal fun KotlinJ2KEmitter.resolvePrimitiveFromBytesSpec(expr: Expr.Call): Triple<String, String, Boolean>? {

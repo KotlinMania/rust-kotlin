@@ -282,20 +282,18 @@ internal fun KotlinJ2KEmitter.resolveStdlibUnitStructValueExpr(rawSegNames: List
     val leaf = rawSegNames.lastOrNull()?.removePrefix("r#") ?: return null
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
     val fq =
-        when (leaf) {
-            "AllocError" -> "$coreNs.alloc.AllocError"
-            "LayoutError" -> "$coreNs.alloc.layout.LayoutError"
-            "ParseBoolError" -> "$coreNs.str.error.ParseBoolError"
-            "Global" -> headerContext.crateNamespaces["alloc"]?.let { "$it.alloc.Global" }
-            "System" -> headerContext.crateNamespaces["std"]?.let { "$it.alloc.System" }
-            "Error" ->
-                if (rawSegNames.size >= 2 && rawSegNames[rawSegNames.lastIndex - 1].removePrefix("r#") == "fmt") {
-                    "$coreNs.fmt.Error"
-                } else {
-                    null
-                }
-            else -> null
-        } ?: return null
+        YamlRuleCatalogs.PathsConstsAndCAbi.stdlibCoreUnitStructs[leaf]?.let { "$coreNs.$it" }
+            ?: when (leaf) {
+                "Global" -> headerContext.crateNamespaces["alloc"]?.let { "$it.alloc.Global" }
+                "System" -> headerContext.crateNamespaces["std"]?.let { "$it.alloc.System" }
+                "Error" ->
+                    if (rawSegNames.size >= 2 && rawSegNames[rawSegNames.lastIndex - 1].removePrefix("r#") == "fmt") {
+                        "$coreNs.fmt.Error"
+                    } else {
+                        null
+                    }
+                else -> null
+            } ?: return null
     return "${bindOrQualifyResolvedCrossSymbol(fq)}()"
 }
 

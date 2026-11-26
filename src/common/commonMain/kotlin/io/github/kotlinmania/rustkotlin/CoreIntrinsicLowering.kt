@@ -489,39 +489,15 @@ private object TransmuteIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
 }
 
 private object SimdIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
-    val NAMES: Set<String> =
-        wordSet(
-            "simd_insert simd_extract simd_insert_dyn simd_extract_dyn simd_splat simd_add simd_sub simd_mul simd_div",
-            "simd_rem simd_shl simd_shr simd_funnel_shl simd_funnel_shr simd_carryless_mul simd_and simd_or simd_xor",
-            "simd_cast simd_as simd_neg simd_fabs simd_minimum_number_nsz simd_maximum_number_nsz simd_eq simd_ne",
-            "simd_lt simd_le simd_gt simd_ge simd_shuffle simd_gather simd_scatter simd_masked_load simd_masked_store",
-            "simd_saturating_add simd_saturating_sub simd_reduce_add_ordered simd_reduce_add_unordered",
-            "simd_reduce_mul_ordered simd_reduce_mul_unordered simd_reduce_all simd_reduce_any simd_reduce_max",
-            "simd_reduce_min simd_reduce_and simd_reduce_or simd_reduce_xor simd_bitmask simd_select simd_select_bitmask",
-            "simd_arith_offset simd_cast_ptr simd_expose_provenance simd_with_exposed_provenance simd_bswap",
-            "simd_bitreverse simd_ctlz simd_ctpop simd_cttz simd_ceil simd_floor simd_round simd_round_ties_even",
-            "simd_trunc simd_fsqrt simd_fma simd_relaxed_fma simd_fsin simd_fcos simd_fexp simd_fexp2 simd_flog10",
-            "simd_flog2 simd_flog",
-        )
-    val BOOL_RETURN_NAMES: Set<String> = setOf("simd_reduce_all", "simd_reduce_any")
-    val UNIT_RETURN_NAMES: Set<String> = setOf("simd_scatter", "simd_masked_store")
-    val SAME_ARG0_NAMES: Set<String> =
-        wordSet(
-            "simd_insert simd_insert_dyn simd_add simd_sub simd_mul simd_div simd_rem simd_shl simd_shr",
-            "simd_funnel_shl simd_funnel_shr simd_carryless_mul simd_and simd_or simd_xor simd_neg simd_fabs",
-            "simd_minimum_number_nsz simd_maximum_number_nsz simd_gather simd_saturating_add simd_saturating_sub",
-            "simd_arith_offset simd_bswap simd_bitreverse simd_ctlz simd_ctpop simd_cttz simd_ceil simd_floor",
-            "simd_round simd_round_ties_even simd_trunc simd_fsqrt simd_fma simd_relaxed_fma simd_fsin simd_fcos",
-            "simd_fexp simd_fexp2 simd_flog10 simd_flog2 simd_flog",
-        )
-    private val SAME_ARG1_NAMES: Set<String> =
-        setOf("simd_reduce_add_ordered", "simd_reduce_mul_ordered", "simd_select", "simd_select_bitmask")
-    private val SAME_ARG2_NAMES: Set<String> = setOf("simd_masked_load")
-    private val NO_PEER_INFER_EXPECTED =
-        setOf("simd_select_bitmask", "simd_gather", "simd_scatter", "simd_masked_load", "simd_masked_store")
-    private val NO_EXPECTED_TARGET_PROPAGATION =
-        setOf("simd_insert", "simd_insert_dyn", "simd_gather", "simd_arith_offset")
-    private val NO_PEER_INFER_RETURN = NO_PEER_INFER_EXPECTED + NO_EXPECTED_TARGET_PROPAGATION
+    val NAMES: Set<String> = YamlRuleCatalogs.CoreIntrinsics.simdIntrinsicNames
+    val BOOL_RETURN_NAMES: Set<String> = YamlRuleCatalogs.CoreIntrinsics.simdBoolReturnNames
+    val UNIT_RETURN_NAMES: Set<String> = YamlRuleCatalogs.CoreIntrinsics.simdUnitReturnNames
+    val SAME_ARG0_NAMES: Set<String> = YamlRuleCatalogs.CoreIntrinsics.simdSameArg0Names
+    private val SAME_ARG1_NAMES: Set<String> = YamlRuleCatalogs.CoreIntrinsics.simdSameArg1Names
+    private val SAME_ARG2_NAMES: Set<String> = YamlRuleCatalogs.CoreIntrinsics.simdSameArg2Names
+    private val NO_PEER_INFER_EXPECTED: Set<String> = YamlRuleCatalogs.CoreIntrinsics.simdNoPeerInferExpected
+    private val NO_EXPECTED_TARGET_PROPAGATION: Set<String> = YamlRuleCatalogs.CoreIntrinsics.simdNoExpectedTargetPropagation
+    private val NO_PEER_INFER_RETURN: Set<String> = NO_PEER_INFER_EXPECTED + NO_EXPECTED_TARGET_PROPAGATION
 
     fun isSimdIntrinsicName(name: String): Boolean = name in NAMES || name.startsWith("sve_tuple_")
 
@@ -1342,7 +1318,7 @@ public object CoreIntrinsicLowering {
     }
 
     internal val RUST_GLOBAL_ALLOC_FN_NAMES: Set<String> =
-        wordSet("__rust_alloc __rust_alloc_zeroed __rust_dealloc __rust_realloc")
+        YamlRuleCatalogs.CoreIntrinsics.rustGlobalAllocActionsByName.keys
 
     internal fun renderRustGlobalAllocExpr(
         rawFnName: String,
@@ -1352,33 +1328,22 @@ public object CoreIntrinsicLowering {
         sizeToLongAt: (Int) -> String,
         alignToLongAt: (Int) -> String,
     ): String? {
-        if (rawFnName !in RUST_GLOBAL_ALLOC_FN_NAMES) return null
+        val action = YamlRuleCatalogs.CoreIntrinsics.rustGlobalAllocActionsByName[rawFnName] ?: return null
         val coreNs = resolveCoreNamespace(emitter.headerContext)
-        val intrPkg = "$coreNs.intrinsics"
-
-        fun wrapRet(callExpr: String): String {
-            if (rawAbiMode) return callExpr
-            registerCoreImport(emitter, "$coreNs.ptr.MutPtr")
-            return "MutPtr($callExpr)"
-        }
-        return when (rawFnName) {
-            "__rust_alloc" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAlloc")
-                wrapRet("kmAlloc(${sizeToLongAt(0)}, ${alignToLongAt(1)})")
+        return action.render(
+            rawAbi = rawAbiMode,
+            onImport = { registerCoreImport(emitter, it) },
+        ) { key ->
+            when (key) {
+                "coreNs" -> coreNs
+                "ptr0" -> ptrRawAddressAt(0)
+                "size0" -> sizeToLongAt(0)
+                "size1" -> sizeToLongAt(1)
+                "size3" -> sizeToLongAt(3)
+                "align1" -> alignToLongAt(1)
+                "align2" -> alignToLongAt(2)
+                else -> null
             }
-            "__rust_alloc_zeroed" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAllocZeroed")
-                wrapRet("kmAllocZeroed(${sizeToLongAt(0)}, ${alignToLongAt(1)})")
-            }
-            "__rust_dealloc" -> {
-                registerCoreImport(emitter, "$intrPkg.kmDealloc")
-                "kmDealloc(${ptrRawAddressAt(0)}, ${sizeToLongAt(1)}, ${alignToLongAt(2)})"
-            }
-            "__rust_realloc" -> {
-                registerCoreImport(emitter, "$intrPkg.kmRealloc")
-                wrapRet("kmRealloc(${ptrRawAddressAt(0)}, ${sizeToLongAt(1)}, ${alignToLongAt(2)}, ${sizeToLongAt(3)})")
-            }
-            else -> null
         }
     }
 

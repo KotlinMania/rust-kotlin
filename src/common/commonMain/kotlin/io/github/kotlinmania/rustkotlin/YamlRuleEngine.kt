@@ -748,6 +748,7 @@ internal class DeclarativeReplacementAction(
     private val replaceTemplate: YamlTemplate,
     private val rawAbiTemplate: YamlTemplate?,
     private val importTemplates: List<YamlTemplate>,
+    private val rawAbiImportTemplates: List<YamlTemplate>? = null,
 ) {
     fun render(
         rawAbi: Boolean = false,
@@ -755,7 +756,8 @@ internal class DeclarativeReplacementAction(
         lookup: (String) -> String?,
     ): String {
         val activeTemplate = if (rawAbi && rawAbiTemplate != null) rawAbiTemplate else replaceTemplate
-        for (imp in importTemplates) {
+        val activeImports = if (rawAbi && rawAbiImportTemplates != null) rawAbiImportTemplates else importTemplates
+        for (imp in activeImports) {
             val renderedImp = imp.render(lookup)
             if (renderedImp.isNotEmpty()) onImport(renderedImp)
         }
@@ -768,6 +770,12 @@ internal class DeclarativeReplacementAction(
                 replaceTemplate = YamlTemplate.compile(node.string(replaceKey)),
                 rawAbiTemplate = node.optionalString(rawAbiKey)?.let(YamlTemplate::compile),
                 importTemplates = node.explicitStringList("imports").map(YamlTemplate::compile),
+                rawAbiImportTemplates =
+                    if ("rawAbiImports" in node.entries) {
+                        node.explicitStringList("rawAbiImports").map(YamlTemplate::compile)
+                    } else {
+                        null
+                    },
             )
     }
 }
@@ -826,13 +834,16 @@ internal class DeclarativeTypePathPatternRule(
 
 /**
  * Declarative pattern-match and template-replacement rule for method calls on typed receivers
- * (`rawPtr`, `dequeIter`, `vec`, `any`, etc.).
+ * (`rawPtr`, `dequeIter`, `vec`, `charsIter`, `erasedOption`, `unconstrainedCmp`, etc.).
  */
 internal class DeclarativeMethodPatternRule(
     val methods: Set<String>,
     val receiverGuard: String,
     val arity: Int?,
+    val maxArity: Int?,
     val noTurbofish: Boolean,
+    val requireTypeArgs: Boolean,
+    val unlessDeclaredTypes: Set<String>,
     val action: DeclarativeReplacementAction,
 ) {
     fun matchesHeader(
@@ -840,11 +851,15 @@ internal class DeclarativeMethodPatternRule(
         receiverKind: String,
         argCount: Int,
         hasTurbofish: Boolean,
+        declaredTypeNames: Set<String> = emptySet(),
     ): Boolean {
         if (rawMethod !in methods) return false
         if (receiverGuard != receiverKind) return false
         if (arity != null && argCount != arity) return false
+        if (maxArity != null && argCount > maxArity) return false
         if (noTurbofish && hasTurbofish) return false
+        if (requireTypeArgs && !hasTurbofish) return false
+        if (unlessDeclaredTypes.isNotEmpty() && unlessDeclaredTypes.any { it in declaredTypeNames }) return false
         return true
     }
 
@@ -854,7 +869,62 @@ internal class DeclarativeMethodPatternRule(
                 methods = node.wordSet("match"),
                 receiverGuard = node.optionalString("receiver") ?: "any",
                 arity = node.optionalInt("arity"),
+                maxArity = node.optionalInt("maxArity"),
                 noTurbofish = node.bool("noTurbofish", default = false),
+                requireTypeArgs = node.bool("requireTypeArgs", default = false),
+                unlessDeclaredTypes = node.optionalWordSet("unlessDeclaredTypes"),
+                action = DeclarativeReplacementAction.fromYaml(node),
+            )
+    }
+}
+
+/**
+ * Declarative pattern-match and template-replacement rule for free and associated function calls
+ * (`Vec.new`, `String.new`, `HashMap.new`, `Box.new`, `Cow.Borrowed`, `mem.drop`, `iter.once`, etc.).
+ */
+internal class DeclarativeCalleePatternRule(
+    val exactCallees: Set<String>,
+    val suffixCallees: Set<String>,
+    val matchOnBase: Boolean,
+    val arity: Int?,
+    val maxArity: Int?,
+    val unlessDeclaredTypes: Set<String>,
+    val unlessDeclaredTopFns: Set<String>,
+    val unlessTopSignatures: Set<String>,
+    val action: DeclarativeReplacementAction,
+) {
+    fun matches(
+        callee: String,
+        calleeBase: String,
+        argCount: Int,
+        declaredTypeNames: Set<String>,
+        declaredTopLevelFnRawNames: Set<String>,
+        topLevelSignatureCounts: Map<String, Int>,
+    ): Boolean {
+        if (arity != null && argCount != arity) return false
+        if (maxArity != null && argCount > maxArity) return false
+        val target = if (matchOnBase) calleeBase else callee
+        val nameMatched =
+            (exactCallees.isNotEmpty() && target in exactCallees) ||
+                suffixCallees.any { suf -> calleeBase == suf || calleeBase.endsWith(".$suf") }
+        if (!nameMatched) return false
+        if (unlessDeclaredTypes.any { it in declaredTypeNames }) return false
+        if (unlessDeclaredTopFns.any { it in declaredTopLevelFnRawNames }) return false
+        if (unlessTopSignatures.any { it in topLevelSignatureCounts }) return false
+        return true
+    }
+
+    companion object {
+        fun fromYaml(node: YamlNode.Mapping): DeclarativeCalleePatternRule =
+            DeclarativeCalleePatternRule(
+                exactCallees = node.optionalWordSet("match"),
+                suffixCallees = node.optionalWordSet("matchSuffix"),
+                matchOnBase = node.bool("matchOnBase", default = true),
+                arity = node.optionalInt("arity"),
+                maxArity = node.optionalInt("maxArity"),
+                unlessDeclaredTypes = node.optionalWordSet("unlessDeclaredTypes"),
+                unlessDeclaredTopFns = node.optionalWordSet("unlessDeclaredTopFns"),
+                unlessTopSignatures = node.optionalWordSet("unlessTopSignatures"),
                 action = DeclarativeReplacementAction.fromYaml(node),
             )
     }

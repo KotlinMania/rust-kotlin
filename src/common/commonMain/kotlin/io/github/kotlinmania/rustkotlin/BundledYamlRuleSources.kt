@@ -7,6 +7,7 @@ internal object BundledYamlRuleSources {
         mapOf(
             "core-intrinsics.yml" to CORE_INTRINSICS,
             "naming-and-comments.yml" to NAMING_AND_COMMENTS,
+            "paths-consts-and-c-abi.yml" to PATHS_CONSTS_AND_C_ABI,
             "stdlib-syn-and-ffi.yml" to STDLIB_SYN_AND_FFI,
             "type-and-method-patterns.yml" to TYPE_AND_METHOD_PATTERNS,
         )
@@ -350,6 +351,68 @@ internal object BundledYamlRuleSources {
         |  fdiv_algebraic: fdiv
         |  frem_fast: frem
         |  frem_algebraic: frem
+        |
+        |# ==============================================================================
+        |# SIMD Intrinsics & Rust Global Allocator Lowering Rules
+        |# ==============================================================================
+        |
+        |homogeneousBinarySimdIntrinsics:
+        |  - "simd_add simd_sub simd_mul simd_div simd_rem simd_and simd_or simd_xor simd_shl simd_shr"
+        |  - "simd_eq simd_ne simd_lt simd_le simd_gt simd_ge simd_fmin simd_fmax"
+        |
+        |simdIntrinsicNames:
+        |  - "simd_insert simd_extract simd_insert_dyn simd_extract_dyn simd_splat simd_add simd_sub simd_mul simd_div"
+        |  - "simd_rem simd_shl simd_shr simd_funnel_shl simd_funnel_shr simd_carryless_mul simd_and simd_or simd_xor"
+        |  - "simd_cast simd_as simd_neg simd_fabs simd_minimum_number_nsz simd_maximum_number_nsz simd_eq simd_ne"
+        |  - "simd_lt simd_le simd_gt simd_ge simd_shuffle simd_gather simd_scatter simd_masked_load simd_masked_store"
+        |  - "simd_saturating_add simd_saturating_sub simd_reduce_add_ordered simd_reduce_add_unordered"
+        |  - "simd_reduce_mul_ordered simd_reduce_mul_unordered simd_reduce_all simd_reduce_any simd_reduce_max"
+        |  - "simd_reduce_min simd_reduce_and simd_reduce_or simd_reduce_xor simd_bitmask simd_select simd_select_bitmask"
+        |  - "simd_arith_offset simd_cast_ptr simd_expose_provenance simd_with_exposed_provenance simd_bswap"
+        |  - "simd_bitreverse simd_ctlz simd_ctpop simd_cttz simd_ceil simd_floor simd_round simd_round_ties_even"
+        |  - "simd_trunc simd_fsqrt simd_fma simd_relaxed_fma simd_fsin simd_fcos simd_fexp simd_fexp2 simd_flog10"
+        |  - "simd_flog2 simd_flog"
+        |
+        |simdBoolReturnNames: "simd_reduce_all simd_reduce_any"
+        |simdUnitReturnNames: "simd_scatter simd_masked_store"
+        |
+        |simdSameArg0Names:
+        |  - "simd_insert simd_insert_dyn simd_add simd_sub simd_mul simd_div simd_rem simd_shl simd_shr"
+        |  - "simd_funnel_shl simd_funnel_shr simd_carryless_mul simd_and simd_or simd_xor simd_neg simd_fabs"
+        |  - "simd_minimum_number_nsz simd_maximum_number_nsz simd_gather simd_saturating_add simd_saturating_sub"
+        |  - "simd_arith_offset simd_bswap simd_bitreverse simd_ctlz simd_ctpop simd_cttz simd_ceil simd_floor"
+        |  - "simd_round simd_round_ties_even simd_trunc simd_fsqrt simd_fma simd_relaxed_fma simd_fsin simd_fcos"
+        |  - "simd_fexp simd_fexp2 simd_flog10 simd_flog2 simd_flog"
+        |
+        |simdSameArg1Names: "simd_reduce_add_ordered simd_reduce_mul_ordered simd_select simd_select_bitmask"
+        |simdSameArg2Names: "simd_masked_load"
+        |simdNoPeerInferExpected: "simd_select_bitmask simd_gather simd_scatter simd_masked_load simd_masked_store"
+        |simdNoExpectedTargetPropagation: "simd_insert simd_insert_dyn simd_gather simd_arith_offset"
+        |
+        |rustGlobalAllocRules:
+        |  - name: "__rust_alloc"
+        |    imports: ["{coreNs}.intrinsics.kmAlloc", "{coreNs}.ptr.MutPtr"]
+        |    rawAbiImports: ["{coreNs}.intrinsics.kmAlloc"]
+        |    replace: "MutPtr(kmAlloc({size0}, {align1}))"
+        |    rawAbiReplace: "kmAlloc({size0}, {align1})"
+        |
+        |  - name: "__rust_alloc_zeroed"
+        |    imports: ["{coreNs}.intrinsics.kmAllocZeroed", "{coreNs}.ptr.MutPtr"]
+        |    rawAbiImports: ["{coreNs}.intrinsics.kmAllocZeroed"]
+        |    replace: "MutPtr(kmAllocZeroed({size0}, {align1}))"
+        |    rawAbiReplace: "kmAllocZeroed({size0}, {align1})"
+        |
+        |  - name: "__rust_dealloc"
+        |    imports: ["{coreNs}.intrinsics.kmDealloc"]
+        |    rawAbiImports: ["{coreNs}.intrinsics.kmDealloc"]
+        |    replace: "kmDealloc({ptr0}, {size1}, {align2})"
+        |    rawAbiReplace: "kmDealloc({ptr0}, {size1}, {align2})"
+        |
+        |  - name: "__rust_realloc"
+        |    imports: ["{coreNs}.intrinsics.kmRealloc", "{coreNs}.ptr.MutPtr"]
+        |    rawAbiImports: ["{coreNs}.intrinsics.kmRealloc"]
+        |    replace: "MutPtr(kmRealloc({ptr0}, {size1}, {align2}, {size3}))"
+        |    rawAbiReplace: "kmRealloc({ptr0}, {size1}, {align2}, {size3})"
         """.trimMargin() + "\n"
 
     val NAMING_AND_COMMENTS: String =
@@ -591,6 +654,205 @@ internal object BundledYamlRuleSources {
         |
         |# Rust item keywords recognized when deciding whether a KDoc fence parses as a File vs Block.
         |topLevelItemKeywords: "fn struct enum trait impl mod type const static"
+        """.trimMargin() + "\n"
+
+    val PATHS_CONSTS_AND_C_ABI: String =
+        """
+        |# ==============================================================================
+        |# Associated Constants, Crate/Stdlib `use` Path Routing & C ABI Bridge Catalogs
+        |# ==============================================================================
+        |# Authoritative declarative rules for:
+        |# - `MacroEmitter.kt`
+        |# - `ExpressionCallEmitter.kt` (`resolveOptionalSynParsePeekToken`)
+        |# - `StdlibTypeAndLayoutHelpers.kt` (`resolveStdlibUnitStructValueExpr`)
+        |# - `UseAndModulePathResolver.kt`
+        |# - `FfiInteropEmitter.kt`
+        |
+        |# `core::f32::consts` and `core::f64::consts` mathematical constants.
+        |rustFloatMathConstants:
+        |  - { name: PI, f32: "3.1415927f", f64: "kotlin.math.PI" }
+        |  - { name: TAU, f32: "6.2831855f", f64: "6.283185307179586" }
+        |  - { name: FRAC_PI_2, f32: "1.5707964f", f64: "1.5707963267948966" }
+        |  - { name: FRAC_PI_3, f32: "1.0471976f", f64: "1.0471975511965979" }
+        |  - { name: FRAC_PI_4, f32: "0.7853982f", f64: "0.7853981633974483" }
+        |  - { name: FRAC_PI_6, f32: "0.5235988f", f64: "0.5235987755982989" }
+        |  - { name: FRAC_PI_8, f32: "0.3926991f", f64: "0.39269908169872414" }
+        |  - { name: FRAC_1_PI, f32: "0.31830987f", f64: "0.3183098861837907" }
+        |  - { name: FRAC_2_PI, f32: "0.63661975f", f64: "0.6366197723675814" }
+        |  - { name: FRAC_2_SQRT_PI, f32: "1.1283792f", f64: "1.1283791670955126" }
+        |  - { name: SQRT_2, f32: "1.4142135f", f64: "1.4142135623730951" }
+        |  - { name: FRAC_1_SQRT_2, f32: "0.70710677f", f64: "0.7071067811865476" }
+        |  - { name: E, f32: "2.7182817f", f64: "kotlin.math.E" }
+        |  - { name: LOG2_E, f32: "1.442695f", f64: "1.4426950408889634" }
+        |  - { name: LOG2_10, f32: "3.321928f", f64: "3.321928094887362" }
+        |  - { name: LOG10_E, f32: "0.4342945f", f64: "0.4342944819032518" }
+        |  - { name: LOG10_2, f32: "0.30103f", f64: "0.3010299956639812" }
+        |  - { name: LN_2, f32: "0.6931472f", f64: "0.6931471805599453" }
+        |  - { name: LN_10, f32: "2.3025851f", f64: "2.302585092994046" }
+        |
+        |intBitsByPrim:
+        |  u8: "8u"
+        |  i8: "8u"
+        |  u16: "16u"
+        |  i16: "16u"
+        |  u32: "32u"
+        |  i32: "32u"
+        |  u64: "64u"
+        |  i64: "64u"
+        |  u128: "128u"
+        |  i128: "128u"
+        |
+        |# IEEE-754 associated constants for `f32` and `f64`.
+        |f32AssocConstTemplates:
+        |  MIN: "(-{typeName}.MAX_VALUE)"
+        |  MAX: "{typeName}.MAX_VALUE"
+        |  MIN_POSITIVE: "1.17549435E-38f"
+        |  EPSILON: "1.1920929E-7f"
+        |  INFINITY: "{typeName}.POSITIVE_INFINITY"
+        |  NEG_INFINITY: "{typeName}.NEGATIVE_INFINITY"
+        |  NAN: "{typeName}.NaN"
+        |  RADIX: "2u"
+        |  MANTISSA_DIGITS: "24u"
+        |  DIGITS: "6u"
+        |  MIN_EXP: "(-125)"
+        |  MAX_EXP: "128"
+        |  MIN_10_EXP: "(-37)"
+        |  MAX_10_EXP: "38"
+        |
+        |f64AssocConstTemplates:
+        |  MIN: "(-{typeName}.MAX_VALUE)"
+        |  MAX: "{typeName}.MAX_VALUE"
+        |  MIN_POSITIVE: "2.2250738585072014E-308"
+        |  EPSILON: "2.220446049250313E-16"
+        |  INFINITY: "{typeName}.POSITIVE_INFINITY"
+        |  NEG_INFINITY: "{typeName}.NEGATIVE_INFINITY"
+        |  NAN: "{typeName}.NaN"
+        |  RADIX: "2u"
+        |  MANTISSA_DIGITS: "53u"
+        |  DIGITS: "15u"
+        |  MIN_EXP: "(-1021)"
+        |  MAX_EXP: "1024"
+        |  MIN_10_EXP: "(-307)"
+        |  MAX_10_EXP: "308"
+        |
+        |f16F128AssocConsts:
+        |  - "MIN MAX MIN_POSITIVE EPSILON INFINITY NEG_INFINITY NAN ZERO ONE NEG_ZERO"
+        |  - "RADIX MANTISSA_DIGITS DIGITS MIN_EXP MAX_EXP MIN_10_EXP MAX_10_EXP BITS"
+        |  - "SIGN_MASK EXP_MASK SIG_MASK IMPLICIT_BIT SIG_TOP_BIT SIG_BITS EXP_BITS"
+        |  - "EXP_SAT EXP_BIAS EXP_MAX EXP_MIN EXP_MIN_SUBNORM TINY_BITS MIN_POSITIVE_SUBNORMAL"
+        |
+        |booleanCastSourceMethods: "is_empty is_some is_none is_ok is_err contains starts_with ends_with"
+        |valuePosInstanceConvMethods: "intoInner asRef asMut asSlice asBytes intoVec intoBoxedSlice intoString toOwned"
+        |
+        |selfTypeToRustPrim:
+        |  Float: f32
+        |  kotlin.Float: f32
+        |  Double: f64
+        |  F16: f16
+        |  F128: f128
+        |  Byte: i8
+        |  UByte: u8
+        |  Short: i16
+        |  UShort: u16
+        |  Int: i32
+        |  UInt: u32
+        |  Long: i64
+        |  ULong: u64
+        |  I128: i128
+        |  U128: u128
+        |
+        |# Optional `syn::ParseStream::parse::<Option<T>>()` peek-token mappings.
+        |synOptionalParsePeekTokenAliases:
+        |  Abi: Extern
+        |  BoundLifetimes: For
+        |  WhereClause: Where
+        |  Label: Lifetime
+        |
+        |synSelfPeekingTokenClasses:
+        |  - "Ident Lifetime Lit LitStr LitByteStr LitCStr LitByte LitChar"
+        |  - "LitInt LitFloat LitBool SelfType SelfValue SynTypeToken Underscore"
+        |
+        |# Cross-crate zero-arg unit structs resolved in value position (`AllocError`, `LayoutError`, etc.).
+        |stdlibCoreUnitStructs:
+        |  AllocError: "alloc.AllocError"
+        |  LayoutError: "alloc.layout.LayoutError"
+        |  ParseBoolError: "str.error.ParseBoolError"
+        |
+        |# ==============================================================================
+        |# Crate/Stdlib `use` Path Routing & Platform Subpackage Affinity Rules
+        |# ==============================================================================
+        |
+        |externalReexportSearchCrates: [core, alloc, libm]
+        |coreRootPrimitiveWrapperSymbols: "U128 I128 F16 F128"
+        |coreMemSubpkgSymbols: "sizeOf sizeOfVal alignOf alignOfVal transmute transmuteUnchecked needsDrop forget drop"
+        |
+        |# Platform/architecture subpackage affinity token groups (`SubpackageAffinityScorer`).
+        |highArchSegs: "b64 aarch64 x8664 notx32"
+        |bsdFamilySegs: "freebsdlike netbsdlike freebsd"
+        |unixBiasSegs: "apple bsd linuxlike linux gnu unix"
+        |bits32PenaltySegs: "b32 x32 x86 arm mips mips32 powerpc sparc riscv32 i386 uclibc"
+        |unixFamilySegs: "unix linux android apple macos ios tvos watchos darwin posix"
+        |foreignPlatformSegs: "windows wasi wasip1 wasip2 wasip3 unsupported stubs hermit solid uefi xous zkvm motor sgx teeos vexos"
+        |nonSignificantSegs: "new sys pal mod bsd linuxlike freebsdlike netbsdlike solarish"
+        |wasiForeignPenaltySegs: "windows hermit solid uefi xous zkvm motor sgx unsupported stubs"
+        |wasipVersionSegs: "wasip1 wasip2 wasip3"
+        |
+        |kotlinBuiltinQualifySimpleTypeNames: "String Boolean Char Byte Short Int Long UByte UShort UInt ULong Float Double Unit Nothing Any"
+        |
+        |stdlibUnimportedSubmodules:
+        |  - "alloc any arch ascii bool borrow boxed cell char clone cmp collections convert core default"
+        |  - "env error f32 f64 ffi fmt fs hash hint i128 i16 i32 i64 i8 io isize iter marker mem net num"
+        |  - "ops option panic path pin process ptr rc result slice std str string sync task thread time"
+        |  - "u128 u16 u32 u64 u8 usize vec"
+        |
+        |coreMemIntrinsics: "transmute transmute_unchecked size_of size_of_val align_of align_of_val needs_drop forget"
+        |
+        |stdlibCoreSubmodules:
+        |  - "ffi mem ptr option result fmt marker cmp ops slice str iter convert default hash clone"
+        |  - "any arch cell hint num panic pin sync task time char borrow error"
+        |
+        |coreIntrinsicOrPreludeLeaves:
+        |  - "Option Some None Result Ok Err Vec Box Rc Arc Cow PhantomData ManuallyDrop MaybeUninit"
+        |  - "Cell RefCell OnceCell Iter IterMut IntoIter Range RangeInclusive min max once empty drop"
+        |  - "transmute transmute_unchecked size_of size_of_val align_of align_of_val needs_drop forget"
+        |
+        |stdlibCellTypes: "Cell RefCell Ref RefMut"
+        |stdlibPrimitiveOrPreludeSecondSegs: "f32 f64 f16 f128 i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize consts prelude"
+        |stdlibUnindexedSkipSecondSegs: "convert marker default clone hash borrow iter option hint panic pin task error fmt"
+        |stdlibAllowedWildcardSubmodules: "alloc cell cmp ffi mem num ops ptr result sync atomic"
+        |
+        |unloweredStdModules: "env fs process net path time collections"
+        |windowsOsPreludeSyms: [OsStrExt, OsStringExt, encode_wide]
+        |unixOsPreludeSyms: [OsStrExt, OsStringExt, as_bytes, into_vec, from_bytes, from_vec]
+        |floatOrConstsSegs: "f16 f32 f64 f128 consts"
+        |dropMarkerLeaves: "NoDrop TrivialDrop"
+        |constPanicOrErrorSuffixes: [".panic.constPanic", ".panic.constAssert", ".io.constError", ".error.constError"]
+        |
+        |# ==============================================================================
+        |# C ABI Multi-Platform Bridge Descriptors (`FfiInteropEmitter.kt`)
+        |# ==============================================================================
+        |
+        |cAbiBridgeDescriptors:
+        |  - { kind: VOID, cType: void, cFailureLiteral: "", wasmWasiScalarType: Unit, wasmJsType: Unit, jniKotlinType: Unit, jniCType: void, kotlinScalarType: Unit }
+        |  - { kind: NEVER, cType: void, cFailureLiteral: "", wasmWasiScalarType: Unit, wasmJsType: Unit, jniKotlinType: Unit, jniCType: void, kotlinScalarType: Unit }
+        |  - { kind: BOOL, cType: bool, cFailureLiteral: "false", wasmWasiScalarType: Int, wasmJsType: Boolean, jniKotlinType: Boolean, jniCType: jboolean, kotlinScalarType: Boolean }
+        |  - { kind: I8, cType: int8_t, cFailureLiteral: "-1", numericKind: I8, defaultReturnConv: toByte, wasmWasiScalarType: Int, wasmJsType: Int, jniKotlinType: Byte, jniCType: jbyte, kotlinScalarType: Byte }
+        |  - { kind: U8, cType: uint8_t, cFailureLiteral: "0", numericKind: U8, defaultReturnConv: toUByte, wasmWasiScalarType: Int, wasmJsType: Int, jniKotlinType: Byte, jniCType: jbyte, kotlinScalarType: UByte }
+        |  - { kind: I16, cType: int16_t, cFailureLiteral: "-1", numericKind: I16, defaultReturnConv: toShort, wasmWasiScalarType: Int, wasmJsType: Int, jniKotlinType: Short, jniCType: jshort, kotlinScalarType: Short }
+        |  - { kind: U16, cType: uint16_t, cFailureLiteral: "0", numericKind: U16, defaultReturnConv: toUShort, wasmWasiScalarType: Int, wasmJsType: Int, jniKotlinType: Short, jniCType: jshort, kotlinScalarType: UShort }
+        |  - { kind: I32, cType: int32_t, cFailureLiteral: "-1", numericKind: I32, wasmWasiScalarType: Int, wasmJsType: Int, jniKotlinType: Int, jniCType: jint, kotlinScalarType: Int }
+        |  - { kind: U32, cType: uint32_t, cFailureLiteral: "0", numericKind: U32, defaultReturnConv: toUInt, wasmWasiScalarType: Int, wasmJsType: Int, jniKotlinType: Int, jniCType: jint, kotlinScalarType: UInt }
+        |  - { kind: I64, cType: int64_t, cFailureLiteral: "-1", numericKind: I64, wasmWasiScalarType: Long, jniKotlinType: Long, jniCType: jlong, kotlinScalarType: Long }
+        |  - { kind: U64, cType: uint64_t, cFailureLiteral: "0", numericKind: U64, defaultReturnConv: toULong, wasmWasiScalarType: Long, jniKotlinType: Long, jniCType: jlong, kotlinScalarType: ULong }
+        |  - { kind: F32, cType: float, cFailureLiteral: "0.0f", numericKind: F32, wasmWasiScalarType: Float, wasmJsType: Double, jniKotlinType: Float, jniCType: jfloat, kotlinScalarType: Float }
+        |  - { kind: F64, cType: double, cFailureLiteral: "0.0", numericKind: F64, wasmWasiScalarType: Double, wasmJsType: Double, jniKotlinType: Double, jniCType: jdouble, kotlinScalarType: Double }
+        |  - { kind: CONST_CSTR, cType: "const char*", cFailureLiteral: "NULL", jniKotlinType: Long, jniCType: jlong, isPointerAddress: true }
+        |  - { kind: MUT_CSTR, cType: "char*", cFailureLiteral: "NULL", jniKotlinType: Long, jniCType: jlong, isPointerAddress: true }
+        |  - { kind: OPAQUE_PTR, cType: "void*", cFailureLiteral: "NULL", jniKotlinType: Long, jniCType: jlong, isPointerAddress: true }
+        |  - { kind: FILE_PTR, cType: "void*", cFailureLiteral: "NULL", jniKotlinType: Long, jniCType: jlong, isPointerAddress: true }
+        |  - { kind: DIR_PTR, cType: "void*", cFailureLiteral: "NULL", jniKotlinType: Long, jniCType: jlong, isPointerAddress: true }
+        |  - { kind: CALLBACK_PTR, cType: "void*", cFailureLiteral: "NULL", jniKotlinType: Long, jniCType: jlong, isPointerAddress: true }
+        |  - { kind: BY_VALUE_OBJECT, cType: "void*", cFailureLiteral: "NULL", wasmJsType: Unit, jniKotlinType: Long, jniCType: jlong }
         """.trimMargin() + "\n"
 
     val STDLIB_SYN_AND_FFI: String =
@@ -1468,5 +1730,297 @@ internal object BundledYamlRuleSources {
         |    arity: 0
         |    noTurbofish: true
         |    replace: "{recv}.firstOrNull()"
+        |
+        |  # --- `core::str::Chars` iterator methods ---
+        |  - { receiver: charsIter, match: "next", arity: 0, replace: "{recvAtom}.next()" }
+        |  - { receiver: charsIter, match: "as_str", arity: 0, replace: "{recvAtom}.asStr()" }
+        |  - { receiver: charsIter, match: "clone", arity: 0, replace: "{recvAtom}.clone()" }
+        |  - { receiver: charsIter, match: "enumerate", arity: 0, replace: "{recvAtom}.enumerate()" }
+        |
+        |  # --- `fmt::Formatter` / `StringBuilder` write methods ---
+        |  - receiver: fmtBuilder
+        |    match: "write_str write_char pad write_fmt"
+        |    arity: 1
+        |    replace: "{recv}.append({arg0})"
+        |
+        |  # --- General iterator / token / debug / queue transform methods ---
+        |  - { receiver: generalTransform, match: "append_all", arity: 1, replace: "for (item in {arg0}) item.toTokens({recv})" }
+        |  - { receiver: generalTransform, match: "find", arity: 1, replace: "{recv}.indexOf({arg0}).takeIf {{ it >= 0 }}" }
+        |  - { receiver: generalTransform, match: "position", arity: 1, replace: "{recvAtom}.indexOfFirst({arg0}).takeIf {{ it >= 0 }}" }
+        |  - { receiver: generalTransform, match: "rposition", arity: 1, replace: "{recvAtom}.indexOfLast({arg0}).takeIf {{ it >= 0 }}" }
+        |  - { receiver: generalTransform, match: "enumerate", arity: 0, replace: "{recvAtom}.mapIndexed {{ index, item -> Pair(index, item) }}" }
+        |  - { receiver: generalTransform, match: "debug_struct", arity: 1, unlessDeclaredTypes: "DebugStruct", replace: "DebugStruct({recv}, {arg0})" }
+        |  - { receiver: generalTransform, match: "debug_tuple", arity: 1, unlessDeclaredTypes: "DebugTuple", replace: "DebugTuple({recv}, {arg0})" }
+        |  - { receiver: generalTransform, match: "push_back", arity: 1, replace: "{recv}.addLast({arg0})" }
+        |
+        |  # --- Mutable `Vec`, `Map`, and `Set` container methods ---
+        |  - { receiver: vecMut, match: "push", arity: 1, replace: "{recv}.add({arg0})" }
+        |  - { receiver: vecMut, match: "insert", arity: 2, replace: "{recv}.add({arg0}, {arg1})" }
+        |  - { receiver: vecMut, match: "clone_from", arity: 1, replace: "run {{ {recv}.clear(); {recv}.addAll({arg0}) }}" }
+        |  - { receiver: mapMut, match: "insert", arity: 2, replace: "{recvAtom}.put({arg0}, {arg1})" }
+        |  - { receiver: mapMut, match: "clone", arity: 0, replace: "{recvAtom}.toMutableMap()" }
+        |  - { receiver: mapMut, match: "get get_mut", arity: 1, replace: "{recvAtom}.get({arg0})" }
+        |  - { receiver: setMut, match: "clone", arity: 0, replace: "{recvAtom}.toMutableSet()" }
+        |
+        |  # --- String prefix/suffix stripping, `ArrayDeque` inspection & `RustAny` reflection ---
+        |  - { receiver: stringStrip, match: "strip_prefix", arity: 1, replace: "{recvAtom}.takeIf {{ it.startsWith({arg0}) }}?.removePrefix({arg0})" }
+        |  - { receiver: stringStrip, match: "strip_suffix", arity: 1, replace: "{recvAtom}.takeIf {{ it.endsWith({arg0}) }}?.removeSuffix({arg0})" }
+        |  - { receiver: dequeSliceHint, match: "as_slice", arity: 0, replace: "{recvAtom}.toList()" }
+        |  - { receiver: dequeSliceHint, match: "size_hint", arity: 0, replace: "run {{ val n = {recvAtom}.size; Pair(n, n) }}" }
+        |  - { receiver: rustAny, match: "is", arity: 0, requireTypeArgs: true, replace: "{recvAtom}.isType{typeArgs}()" }
+        |  - { receiver: rustAny, match: "downcast_ref", arity: 0, requireTypeArgs: true, replace: "{recvAtom}.downcastRef{typeArgs}()" }
+        |  - { receiver: rustAny, match: "downcast_mut", arity: 0, requireTypeArgs: true, replace: "{recvAtom}.downcastMut{typeArgs}()" }
+        |  - { receiver: rustAny, match: "downcast", arity: 0, requireTypeArgs: true, replace: "{recvAtom}.downcast{typeArgs}()" }
+        |
+        |  # --- Erased nullable `Option<T>` (`T?`) combinator methods ---
+        |  - { receiver: erasedOption, match: "unwrap", arity: 0, replace: "{recvAtom}!!" }
+        |  - { receiver: erasedOption, match: "expect", arity: 1, replace: "({recv} ?: error({arg0}))" }
+        |  - { receiver: erasedOption, match: "clone cloned copied flatten", arity: 0, replace: "{recv}" }
+        |  - { receiver: erasedOption, match: "into_iter", arity: 0, replace: "ArrayDeque(listOfNotNull({recv}))" }
+        |  - { receiver: erasedOption, match: "map and_then", arity: 1, replace: "{recvAtom}?.let({cb0})" }
+        |  - { receiver: erasedOption, match: "map_or_else", arity: 2, replace: "({recvAtom}?.let({cb1}) ?: {zeroClosure0})" }
+        |
+        |  # --- Unconstrained `PartialOrd` / `Ord` generic runtime value comparisons ---
+        |  - receiver: unconstrainedCmp
+        |    match: "partial_cmp partialCmp"
+        |    arity: 1
+        |    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+        |    replace: "kmPartialCompareValues({recv}, {arg0})?.let {{ cmpSign -> when {{ cmpSign < 0 -> {ordRef}.Less; cmpSign > 0 -> {ordRef}.Greater; else -> {ordRef}.Equal }} }}"
+        |
+        |  - receiver: unconstrainedCmp
+        |    match: "cmp"
+        |    arity: 1
+        |    imports: ["{coreNs}.mem.kmCompareValues"]
+        |    replace: "kmCompareValues({recv}, {arg0}).let {{ cmpSign -> when {{ cmpSign < 0 -> {ordRef}.Less; cmpSign > 0 -> {ordRef}.Greater; else -> {ordRef}.Equal }} }}"
+        |
+        |  - receiver: unconstrainedCmp
+        |    match: "lt"
+        |    arity: 1
+        |    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+        |    replace: "(kmPartialCompareValues({recv}, {arg0})?.let {{ cmpSign -> cmpSign < 0 }} == true)"
+        |
+        |  - receiver: unconstrainedCmp
+        |    match: "le"
+        |    arity: 1
+        |    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+        |    replace: "(kmPartialCompareValues({recv}, {arg0})?.let {{ cmpSign -> cmpSign <= 0 }} == true)"
+        |
+        |  - receiver: unconstrainedCmp
+        |    match: "gt"
+        |    arity: 1
+        |    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+        |    replace: "(kmPartialCompareValues({recv}, {arg0})?.let {{ cmpSign -> cmpSign > 0 }} == true)"
+        |
+        |  - receiver: unconstrainedCmp
+        |    match: "ge"
+        |    arity: 1
+        |    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+        |    replace: "(kmPartialCompareValues({recv}, {arg0})?.let {{ cmpSign -> cmpSign >= 0 }} == true)"
+        |
+        |  - receiver: unconstrainedCmp
+        |    match: "__chaining_less chainingLess"
+        |    arity: 1
+        |    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+        |    replace: "kmPartialCompareValues({recv}, {arg0}).let {{ cmpSign -> if (cmpSign == 0) {cfRef}.Continue<Boolean, Unit>(Unit) else {cfRef}.Break<Boolean, Unit>(cmpSign != null && cmpSign < 0) }}"
+        |
+        |  - receiver: unconstrainedCmp
+        |    match: "__chaining_greater chainingGreater"
+        |    arity: 1
+        |    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+        |    replace: "kmPartialCompareValues({recv}, {arg0}).let {{ cmpSign -> if (cmpSign == 0) {cfRef}.Continue<Boolean, Unit>(Unit) else {cfRef}.Break<Boolean, Unit>(cmpSign != null && cmpSign > 0) }}"
+        |
+        |# ==============================================================================
+        |# Declarative Free & Associated Function Call Pattern/Replacement Rules
+        |# ==============================================================================
+        |
+        |calleePatternRules:
+        |  - { match: "drop", matchSuffix: "mem.drop", arity: 1, unlessDeclaredTopFns: "drop", replace: "({arg0}).let {{ }}" }
+        |  - { matchSuffix: "TypeId.of RustTypeId.of", arity: 0, replace: "RustTypeId.of{turbofish}()" }
+        |  - { match: "Cow.Borrowed Cow.Owned", matchSuffix: "Cow.Borrowed Cow.Owned", arity: 1, unlessDeclaredTypes: "Cow", replace: "{arg0}" }
+        |  - { match: "Box.new", matchOnBase: false, arity: 1, unlessDeclaredTypes: "Box", replace: "{arg0}" }
+        |  - { match: "Rc.new", matchOnBase: false, arity: 1, unlessDeclaredTypes: "Rc", replace: "{arg0}" }
+        |  - { match: "Arc.new", matchOnBase: false, arity: 1, unlessDeclaredTypes: "Arc", replace: "{arg0}" }
+        |  - { match: "NoDrop.new", matchOnBase: false, arity: 1, unlessDeclaredTypes: "NoDrop", replace: "{arg0}" }
+        |  - { match: "ManuallyDrop.new", matchOnBase: false, arity: 1, unlessDeclaredTypes: "ManuallyDrop", replace: "{arg0}" }
+        |  - { match: "Vec.new", matchOnBase: false, arity: 0, unlessDeclaredTypes: "Vec", replace: "mutableListOf()" }
+        |  - { match: "Vec.withCapacity", matchOnBase: false, arity: 1, unlessDeclaredTypes: "Vec", replace: "ArrayList({arg0})" }
+        |  - { match: "Vec.from", matchOnBase: false, arity: 1, unlessDeclaredTypes: "Vec", replace: "{arg0}.toMutableList()" }
+        |  - { match: "VecDeque.from", matchOnBase: false, arity: 1, unlessDeclaredTypes: "VecDeque", replace: "ArrayDeque({arg0})" }
+        |  - { match: "String.new String.withCapacity", maxArity: 1, unlessDeclaredTypes: "String", replace: "\"\"" }
+        |  - { match: "HashMap.new BTreeMap.new HashMap.withCapacity BTreeMap.withCapacity", maxArity: 1, unlessDeclaredTypes: "HashMap BTreeMap", replace: "mutableMapOf{turbofish}()" }
+        |  - { match: "HashSet.new BTreeSet.new HashSet.withCapacity BTreeSet.withCapacity", maxArity: 1, unlessDeclaredTypes: "HashSet BTreeSet", replace: "mutableSetOf{turbofish}()" }
+        |  - { match: "empty iter.empty", matchOnBase: false, arity: 0, unlessTopSignatures: "empty", replace: "ArrayDeque()" }
+        |  - { match: "once", matchSuffix: "iter.once", arity: 1, unlessTopSignatures: "once", unlessDeclaredTopFns: "once", replace: "listOf{turbofish}({arg0})" }
+        |  - { match: "min cmp.min", matchOnBase: false, arity: 2, unlessDeclaredTopFns: "min", replace: "minOf({arg0}, {arg1})" }
+        |
+        |# ==============================================================================
+        |# Method, Call, Type-Inference & Trait Lowering Classification Catalogs
+        |# ==============================================================================
+        |
+        |rawPointerArithMethods:
+        |  - "offset add sub wrapping_offset wrapping_add wrapping_sub"
+        |  - "byte_offset byte_add byte_sub wrapping_byte_offset wrapping_byte_add wrapping_byte_sub"
+        |
+        |rawAbiByteOffsetMethods: "byte_offset byte_add byte_sub wrapping_byte_offset wrapping_byte_add wrapping_byte_sub"
+        |iterReceiverMethods: "iter iter_mut into_iter"
+        |pointerDistanceSubMethods: "checked_sub wrapping_sub unchecked_sub saturating_sub offset_from offset_from_unsigned sub_ptr byte_offset_from"
+        |indexedIterUnwrapMethods: "zip any all map filter filter_map flat_map fold for_each forEach enumerate count sum find position"
+        |
+        |numericReceiverKindMethods:
+        |  - "wrapping_add wrapping_sub wrapping_mul wrapping_div wrapping_rem wrapping_shl wrapping_shr"
+        |  - "unchecked_shl unchecked_shr checked_add checked_sub checked_mul checked_div checked_rem"
+        |  - "checked_div_euclid checked_rem_euclid checked_shl checked_shr checked_pow"
+        |  - "saturating_add saturating_sub saturating_mul overflowing_add overflowing_sub overflowing_mul"
+        |  - "overflowing_shl overflowing_shr div_euclid rem_euclid rotate_left rotate_right"
+        |  - "pow powf powi min max atan2 hypot log mul_add to_digit"
+        |
+        |u32ShiftOrExpMethods:
+        |  - "wrapping_shl wrapping_shr checked_shl checked_shr overflowing_shl overflowing_shr"
+        |  - "rotate_left rotate_right pow checked_pow"
+        |
+        |atomicSingleValueMethods: "store swap fetch_add fetch_sub fetch_and fetch_or fetch_xor fetch_max fetch_min"
+        |stringLikeTypes: "String CharSequence StringBuilder"
+        |optionBorrowIdentityMethods: "as_deref as_deref_mut as_ref as_mut"
+        |sizedCollectionPrefixes: ["List<", "MutableList<", "Set<", "MutableSet<", "Map<", "MutableMap<", "Collection<", "ArrayDeque<"]
+        |intoIterCollectionPrefixes: ["Iterable<", "Collection<", "List<", "MutableList<", "Set<", "MutableSet<"]
+        |stdlibIntTypes: "Byte Short Int Long I128 UByte UShort UInt ULong U128"
+        |
+        |tryIntoFromOnlyTargetsBySrc:
+        |  Byte: "Short Long I128"
+        |  Short: "Long I128"
+        |  Long: "I128"
+        |  UByte: "Short Int Long I128 UShort UInt ULong U128"
+        |  UShort: "Long I128 UInt ULong U128"
+        |  UInt: "Long I128 ULong U128"
+        |  ULong: "I128 U128"
+        |
+        |coreSliceOrPtrMethods: "asPtr asMutPtr chunksMut chunks"
+        |nonSliceCoreOwnerTypes: "MaybeUninit ConstPtr MutPtr AddressableLocal AddressableArrayLocal"
+        |peekMacroMethods: "peek peek2 peek3"
+        |callbackWrapMethods: "map map_err and_then or_else"
+        |
+        |integerCompanionMinMaxOwners: "Byte UByte Short UShort Int UInt Long ULong"
+        |companionConvertPrimitivesExtra: "I128 U128 Boolean Float Double F16 F128"
+        |knownStdUfcsReceiverMethods:
+        |  - "clone cmp partialCmp eq ne hash fmt deref derefMut asRef borrow borrowMut"
+        |  - "toString toOwned writeFmt write writeAll flush read readExact readToEnd readToString"
+        |
+        |primitiveArraySpecs:
+        |  - { arrayType: BooleanArray, elemType: Boolean, layoutFactory: booleanArray }
+        |  - { arrayType: ByteArray, elemType: Byte, numericKind: I8, layoutFactory: byteArray }
+        |  - { arrayType: UByteArray, elemType: UByte, numericKind: U8, layoutFactory: uByteArray }
+        |  - { arrayType: ShortArray, elemType: Short, numericKind: I16, layoutFactory: shortArray }
+        |  - { arrayType: UShortArray, elemType: UShort, numericKind: U16, layoutFactory: uShortArray }
+        |  - { arrayType: IntArray, elemType: Int, numericKind: I32, layoutFactory: intArray }
+        |  - { arrayType: UIntArray, elemType: UInt, numericKind: U32, layoutFactory: uIntArray }
+        |  - { arrayType: LongArray, elemType: Long, numericKind: I64, layoutFactory: longArray }
+        |  - { arrayType: ULongArray, elemType: ULong, numericKind: U64, layoutFactory: uLongArray }
+        |  - { arrayType: FloatArray, elemType: Float, numericKind: F32, layoutFactory: floatArray }
+        |  - { arrayType: DoubleArray, elemType: Double, numericKind: F64, layoutFactory: doubleArray }
+        |
+        |numericKindByElem:
+        |  Byte: I8
+        |  UByte: U8
+        |  Short: I16
+        |  UShort: U16
+        |  Int: I32
+        |  UInt: U32
+        |  Long: I64
+        |  ULong: U64
+        |  I128: I128
+        |  U128: U128
+        |  F16: F16
+        |  Float: F32
+        |  kotlin.Float: F32
+        |  Double: F64
+        |  F128: F128
+        |
+        |strPrimitiveParseMethods:
+        |  Boolean: "toBooleanStrictOrNull()"
+        |  Byte: "toByteOrNull()"
+        |  UByte: "toUByteOrNull()"
+        |  Short: "toShortOrNull()"
+        |  UShort: "toUShortOrNull()"
+        |  Int: "toIntOrNull()"
+        |  UInt: "toUIntOrNull()"
+        |  Long: "toLongOrNull()"
+        |  ULong: "toULongOrNull()"
+        |  Float: "toFloatOrNull()"
+        |  kotlin.Float: "toFloatOrNull()"
+        |  Double: "toDoubleOrNull()"
+        |
+        |mapSimpleNames: "MutableMap Map LinkedHashMap HashMap"
+        |setSimpleNames: "MutableSet Set LinkedHashSet HashSet"
+        |indexedSliceBases: "List MutableList Array ArrayDeque"
+        |
+        |nonOptionMethodNames: "ok_or ok_or_else is_ok is_err is_some is_none map_err to_lowercase to_uppercase"
+        |optionChainPreservingMethods: "map and_then flatten or or_else as_ref as_mut cloned copied filter"
+        |nullableNewWrapperOwners: "NonNull NonZero Alignment"
+        |layoutQueryFnIdents: "size_of size_of_val align_of align_of_val"
+        |mutPtrContainerBases: "NonNull Unique BoxRaw"
+        |endianIntMethods: "to_be from_be swap_bytes to_le from_le"
+        |optionUnwrapSingleArgMethods: "expect unwrap_or unwrap_or_else"
+        |optionZeroArgIdentityMethods: "cloned copied as_ref as_mut"
+        |atomicValueReturningMethods: "load swap into_inner fetch_add fetch_sub fetch_and fetch_or fetch_xor fetch_max fetch_min"
+        |
+        |fmtDebugBuilderReturns:
+        |  debug_struct: DebugStruct
+        |  debug_tuple: DebugTuple
+        |  debug_list: DebugList
+        |  debug_set: DebugSet
+        |  debug_map: DebugMap
+        |
+        |floatSuffixNumericKinds:
+        |  f16: F16
+        |  f32: F32
+        |  f64: F64
+        |  f128: F128
+        |
+        |intSuffixNumericKinds:
+        |  i8: I8
+        |  u8: U8
+        |  i16: I16
+        |  u16: U16
+        |  i32: I32
+        |  u32: U32
+        |  i64: I64
+        |  u64: U64
+        |  i128: I128
+        |  u128: U128
+        |
+        |numericCoerceSuffixByKind:
+        |  U8: "toUByte()"
+        |  U16: "toUShort()"
+        |  U32: "toUInt()"
+        |  U64: "toULong()"
+        |  I8: "toByte()"
+        |  I16: "toShort()"
+        |  I32: "toInt()"
+        |  I64: "toLong()"
+        |  F32: "toFloat()"
+        |  F64: "toDouble()"
+        |
+        |coreOpsOutputAssocTraits: "Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr Neg Not"
+        |
+        |stdlibDefaultlessAssocTypes:
+        |  Iterator: [Item]
+        |  IntoIterator: [Item, IntoIter]
+        |  Fn: [Output]
+        |  FnMut: [Output]
+        |  FnOnce: [Output]
+        |  Try: [Output, Residual]
+        |  Deref: [Target]
+        |  SliceIndex: [Output]
+        |  Future: [Output]
+        |  IntoFuture: [Output, IntoFuture]
+        |  FromStr: [Err]
+        |  TryFrom: [Error]
+        |  TryInto: [Error]
+        |  Pattern: [Searcher]
+        |  BuildHasher: [Hasher]
+        |  DoubleEndedIterator: [Item]
+        |  ExactSizeIterator: [Item]
+        |  FusedIterator: [Item]
+        |  AsyncIterator: [Item]
         """.trimMargin() + "\n"
 }

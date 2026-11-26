@@ -334,3 +334,65 @@ genericFloatBinaryOpNames:
   fdiv_algebraic: fdiv
   frem_fast: frem
   frem_algebraic: frem
+
+# ==============================================================================
+# SIMD Intrinsics & Rust Global Allocator Lowering Rules
+# ==============================================================================
+
+homogeneousBinarySimdIntrinsics:
+  - "simd_add simd_sub simd_mul simd_div simd_rem simd_and simd_or simd_xor simd_shl simd_shr"
+  - "simd_eq simd_ne simd_lt simd_le simd_gt simd_ge simd_fmin simd_fmax"
+
+simdIntrinsicNames:
+  - "simd_insert simd_extract simd_insert_dyn simd_extract_dyn simd_splat simd_add simd_sub simd_mul simd_div"
+  - "simd_rem simd_shl simd_shr simd_funnel_shl simd_funnel_shr simd_carryless_mul simd_and simd_or simd_xor"
+  - "simd_cast simd_as simd_neg simd_fabs simd_minimum_number_nsz simd_maximum_number_nsz simd_eq simd_ne"
+  - "simd_lt simd_le simd_gt simd_ge simd_shuffle simd_gather simd_scatter simd_masked_load simd_masked_store"
+  - "simd_saturating_add simd_saturating_sub simd_reduce_add_ordered simd_reduce_add_unordered"
+  - "simd_reduce_mul_ordered simd_reduce_mul_unordered simd_reduce_all simd_reduce_any simd_reduce_max"
+  - "simd_reduce_min simd_reduce_and simd_reduce_or simd_reduce_xor simd_bitmask simd_select simd_select_bitmask"
+  - "simd_arith_offset simd_cast_ptr simd_expose_provenance simd_with_exposed_provenance simd_bswap"
+  - "simd_bitreverse simd_ctlz simd_ctpop simd_cttz simd_ceil simd_floor simd_round simd_round_ties_even"
+  - "simd_trunc simd_fsqrt simd_fma simd_relaxed_fma simd_fsin simd_fcos simd_fexp simd_fexp2 simd_flog10"
+  - "simd_flog2 simd_flog"
+
+simdBoolReturnNames: "simd_reduce_all simd_reduce_any"
+simdUnitReturnNames: "simd_scatter simd_masked_store"
+
+simdSameArg0Names:
+  - "simd_insert simd_insert_dyn simd_add simd_sub simd_mul simd_div simd_rem simd_shl simd_shr"
+  - "simd_funnel_shl simd_funnel_shr simd_carryless_mul simd_and simd_or simd_xor simd_neg simd_fabs"
+  - "simd_minimum_number_nsz simd_maximum_number_nsz simd_gather simd_saturating_add simd_saturating_sub"
+  - "simd_arith_offset simd_bswap simd_bitreverse simd_ctlz simd_ctpop simd_cttz simd_ceil simd_floor"
+  - "simd_round simd_round_ties_even simd_trunc simd_fsqrt simd_fma simd_relaxed_fma simd_fsin simd_fcos"
+  - "simd_fexp simd_fexp2 simd_flog10 simd_flog2 simd_flog"
+
+simdSameArg1Names: "simd_reduce_add_ordered simd_reduce_mul_ordered simd_select simd_select_bitmask"
+simdSameArg2Names: "simd_masked_load"
+simdNoPeerInferExpected: "simd_select_bitmask simd_gather simd_scatter simd_masked_load simd_masked_store"
+simdNoExpectedTargetPropagation: "simd_insert simd_insert_dyn simd_gather simd_arith_offset"
+
+rustGlobalAllocRules:
+  - name: "__rust_alloc"
+    imports: ["{coreNs}.intrinsics.kmAlloc", "{coreNs}.ptr.MutPtr"]
+    rawAbiImports: ["{coreNs}.intrinsics.kmAlloc"]
+    replace: "MutPtr(kmAlloc({size0}, {align1}))"
+    rawAbiReplace: "kmAlloc({size0}, {align1})"
+
+  - name: "__rust_alloc_zeroed"
+    imports: ["{coreNs}.intrinsics.kmAllocZeroed", "{coreNs}.ptr.MutPtr"]
+    rawAbiImports: ["{coreNs}.intrinsics.kmAllocZeroed"]
+    replace: "MutPtr(kmAllocZeroed({size0}, {align1}))"
+    rawAbiReplace: "kmAllocZeroed({size0}, {align1})"
+
+  - name: "__rust_dealloc"
+    imports: ["{coreNs}.intrinsics.kmDealloc"]
+    rawAbiImports: ["{coreNs}.intrinsics.kmDealloc"]
+    replace: "kmDealloc({ptr0}, {size1}, {align2})"
+    rawAbiReplace: "kmDealloc({ptr0}, {size1}, {align2})"
+
+  - name: "__rust_realloc"
+    imports: ["{coreNs}.intrinsics.kmRealloc", "{coreNs}.ptr.MutPtr"]
+    rawAbiImports: ["{coreNs}.intrinsics.kmRealloc"]
+    replace: "MutPtr(kmRealloc({ptr0}, {size1}, {align2}, {size3}))"
+    rawAbiReplace: "kmRealloc({ptr0}, {size1}, {align2}, {size3})"

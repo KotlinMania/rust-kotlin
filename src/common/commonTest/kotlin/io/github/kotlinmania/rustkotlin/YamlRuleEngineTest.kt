@@ -121,4 +121,50 @@ class YamlRuleEngineTest {
         assertContains(kt, "if (cond) 10 else 20")
         assertContains(kt, "(bits).toRawBits().toUInt()")
     }
+
+    @Test
+    fun drivesCalleePostArgMethodConstAndCAbiYamlCatalogsEndToEnd() {
+        assertEquals(5, BundledYamlRuleSources.filesByName.size)
+        assertEquals(20, YamlRuleCatalogs.PathsConstsAndCAbi.cAbiBridgeDescriptorNodes.size)
+        assertEquals("32u", YamlRuleCatalogs.PathsConstsAndCAbi.intBitsByPrim["u32"])
+        assertTrue(YamlRuleCatalogs.TypeAndMethodPatterns.calleePatternRules.isNotEmpty())
+        assertTrue(YamlRuleCatalogs.TypeAndMethodPatterns.erasedOptionMethodRules.containsKey("map_or_else"))
+        assertTrue(YamlRuleCatalogs.TypeAndMethodPatterns.unconstrainedCmpMethodRules.containsKey("partial_cmp"))
+        assertTrue(YamlRuleCatalogs.CoreIntrinsics.rustGlobalAllocActionsByName.containsKey("__rust_realloc"))
+
+        val rustSource =
+            """
+            use std::borrow::Cow;
+
+            pub fn exercise_wave2_yaml_rules(
+                text: &str,
+                opt: Option<i32>,
+            ) -> i32 {
+                let mut items: Vec<i32> = Vec::with_capacity(4);
+                let boxed = Box::new(7i32);
+                items.push(boxed);
+                let cow: Cow<str> = Cow::Borrowed(text);
+                let stripped = cow.strip_prefix("pre_");
+                std::mem::drop(stripped);
+                let _tau = std::f64::consts::TAU;
+                let _eps = f32::EPSILON;
+                let _bits = u32::BITS;
+                let mapped = opt.map_or_else(|| 0i32, |v| v + 1);
+                std::cmp::min(mapped, items.len() as i32)
+            }
+            """.trimIndent()
+
+        val kt = renderSingleKotlinFile(rustSource, FileHeaderContext(packageName = "sample.wave2")).text
+        assertContains(kt, "ArrayList(4)")
+        assertContains(kt, "val boxed = 7")
+        assertContains(kt, "items.add(boxed)")
+        assertContains(kt, "val cow: String = text")
+        assertContains(kt, ".takeIf { it.startsWith(\"pre_\") }?.removePrefix(\"pre_\")")
+        assertContains(kt, "(stripped).let { }")
+        assertContains(kt, "6.283185307179586")
+        assertContains(kt, "1.1920929E-7f")
+        assertContains(kt, "32u")
+        assertContains(kt, "opt?.let({ v -> v + 1 }) ?: 0")
+        assertContains(kt, "minOf(mapped, items.size)")
+    }
 }

@@ -53,31 +53,11 @@ internal fun KotlinJ2KEmitter.isSelfParameterizedTraitName(ktTrait: String): Boo
         ktTrait in KNOWN_SELF_PARAMETERIZED_TRAITS
 }
 
-private val CORE_OPS_OUTPUT_ASSOC_TRAITS =
-    wordSet("Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr Neg Not")
+private val CORE_OPS_OUTPUT_ASSOC_TRAITS: Set<String> =
+    YamlRuleCatalogs.TypeAndMethodPatterns.coreOpsOutputAssocTraits
 
 private val STDLIB_DEFAULTLESS_ASSOC_TYPES: Map<String, List<String>> =
-    mapOf(
-        "Iterator" to listOf("Item"),
-        "IntoIterator" to listOf("Item", "IntoIter"),
-        "Fn" to listOf("Output"),
-        "FnMut" to listOf("Output"),
-        "FnOnce" to listOf("Output"),
-        "Try" to listOf("Output", "Residual"),
-        "Deref" to listOf("Target"),
-        "SliceIndex" to listOf("Output"),
-        "Future" to listOf("Output"),
-        "IntoFuture" to listOf("Output", "IntoFuture"),
-        "FromStr" to listOf("Err"),
-        "TryFrom" to listOf("Error"),
-        "TryInto" to listOf("Error"),
-        "Pattern" to listOf("Searcher"),
-        "BuildHasher" to listOf("Hasher"),
-        "DoubleEndedIterator" to listOf("Item"),
-        "ExactSizeIterator" to listOf("Item"),
-        "FusedIterator" to listOf("Item"),
-        "AsyncIterator" to listOf("Item"),
-    )
+    YamlRuleCatalogs.TypeAndMethodPatterns.stdlibDefaultlessAssocTypes
 
 internal fun KotlinJ2KEmitter.lookupTraitDefaultlessAssocTypes(ktTrait: String, traitPath: Path? = null): List<String> {
     lookupScopedTraitMetadata(

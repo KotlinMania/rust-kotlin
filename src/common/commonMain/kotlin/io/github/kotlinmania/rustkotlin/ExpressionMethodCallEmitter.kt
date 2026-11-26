@@ -11,29 +11,11 @@ import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.UnOp
 
-private val ITER_RECEIVER_METHODS: Set<String> = wordSet("iter iter_mut into_iter")
-
-private val POINTER_DISTANCE_SUB_METHODS: Set<String> =
-    wordSet("checked_sub wrapping_sub unchecked_sub saturating_sub offset_from offset_from_unsigned sub_ptr byte_offset_from")
-
-private val INDEXED_ITER_UNWRAP_METHODS: Set<String> =
-    wordSet("zip any all map filter filter_map flat_map fold for_each forEach enumerate count sum find position")
-
-private val NUMERIC_RECEIVER_KIND_METHODS: Set<String> =
-    wordSet(
-        "wrapping_add wrapping_sub wrapping_mul wrapping_div wrapping_rem wrapping_shl wrapping_shr",
-        "unchecked_shl unchecked_shr checked_add checked_sub checked_mul checked_div checked_rem",
-        "checked_div_euclid checked_rem_euclid checked_shl checked_shr checked_pow",
-        "saturating_add saturating_sub saturating_mul overflowing_add overflowing_sub overflowing_mul",
-        "overflowing_shl overflowing_shr div_euclid rem_euclid rotate_left rotate_right",
-        "pow powf powi min max atan2 hypot log mul_add to_digit",
-    )
-
-private val U32_SHIFT_OR_EXP_METHODS: Set<String> =
-    wordSet(
-        "wrapping_shl wrapping_shr checked_shl checked_shr overflowing_shl overflowing_shr",
-        "rotate_left rotate_right pow checked_pow",
-    )
+private val ITER_RECEIVER_METHODS: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.iterReceiverMethods
+private val POINTER_DISTANCE_SUB_METHODS: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.pointerDistanceSubMethods
+private val INDEXED_ITER_UNWRAP_METHODS: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.indexedIterUnwrapMethods
+private val NUMERIC_RECEIVER_KIND_METHODS: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.numericReceiverKindMethods
+private val U32_SHIFT_OR_EXP_METHODS: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.u32ShiftOrExpMethods
 
 private fun unwrapTrailingIterReceiver(expr: Expr): Expr {
     val mc = expr as? Expr.MethodCall ?: return expr
@@ -484,9 +466,42 @@ private class MethodCallLoweringContext(
         return synPath.path.lastCleanIdent() == "NonNull"
     }
 
+    fun tryRenderPostArgPatternRule(
+        rulesByMethod: Map<String, DeclarativeMethodPatternRule>,
+        receiverGuard: String,
+    ): String? {
+        val rule = rulesByMethod[rawMethod] ?: return null
+        if (!rule.matchesHeader(rawMethod, receiverGuard, renderedValueArgs.size, typeArgs.isNotEmpty(), emitter.inspector.declaredTypeNames)) {
+            return null
+        }
+        return rule.action.render(
+            rawAbi = emitter.headerContext.rawAbiMode,
+            onImport = { CoreIntrinsicLowering.registerCoreImport(emitter, it) },
+        ) { key ->
+            when (key) {
+                "recv" -> receiver
+                "recvAtom" -> recvAtom
+                "typeArgs" -> typeArgs
+                "coreNs" -> coreNs
+                "arg0" -> renderedValueArgs.getOrNull(0)
+                "arg1" -> renderedValueArgs.getOrNull(1)
+                "cb0" ->
+                    allMethodArgs.getOrNull(0)?.let { argExpr ->
+                        renderedValueArgs.getOrNull(0)?.let { emitter.wrapMapCallbackArg(argExpr, it) }
+                    }
+                "cb1" ->
+                    allMethodArgs.getOrNull(1)?.let { argExpr ->
+                        renderedValueArgs.getOrNull(1)?.let { emitter.wrapMapCallbackArg(argExpr, it) }
+                    }
+                "zeroClosure0" -> renderedValueArgs.getOrNull(0)?.let(emitter::unwrapZeroArgClosureText)
+                else -> null
+            }
+        }
+    }
+
     companion object {
-        private val ATOMIC_SINGLE_VALUE_METHODS =
-            wordSet("store swap fetch_add fetch_sub fetch_and fetch_or fetch_xor fetch_max fetch_min")
+        private val ATOMIC_SINGLE_VALUE_METHODS: Set<String>
+            get() = YamlRuleCatalogs.TypeAndMethodPatterns.atomicSingleValueMethods
         private val RAW_PTR_OWNER_NAMES = wordSet("MutPtr ConstPtr")
     }
 }
@@ -720,24 +735,17 @@ private object EarlyReceiverStateAndCollectionRule : MethodLoweringRule() {
             (segs == listOf("current") && scope.resolveModuleBinding("current")?.importedPath == "std.thread.current")
     }
 
-    private val STRING_LIKE_TYPES = wordSet("String CharSequence StringBuilder")
-    private val OPTION_BORROW_IDENTITY_METHODS = wordSet("as_deref as_deref_mut as_ref as_mut")
-    private val SIZED_COLLECTION_PREFIXES =
-        listOf("List<", "MutableList<", "Set<", "MutableSet<", "Map<", "MutableMap<", "Collection<", "ArrayDeque<")
+    private val STRING_LIKE_TYPES: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.stringLikeTypes
+    private val OPTION_BORROW_IDENTITY_METHODS: Set<String>
+        get() = YamlRuleCatalogs.TypeAndMethodPatterns.optionBorrowIdentityMethods
+    private val SIZED_COLLECTION_PREFIXES: List<String>
+        get() = YamlRuleCatalogs.TypeAndMethodPatterns.sizedCollectionPrefixes
 }
 
 private object TryIntoStdlibIntegerMethodRule : MethodLoweringRule() {
-    private val STDLIB_INT_TYPES = wordSet("Byte Short Int Long I128 UByte UShort UInt ULong U128")
-    private val FROM_ONLY_TARGETS_BY_SRC: Map<String, Set<String>> =
-        mapOf(
-            "Byte" to wordSet("Short Long I128"),
-            "Short" to wordSet("Long I128"),
-            "Long" to wordSet("I128"),
-            "UByte" to wordSet("Short Int Long I128 UShort UInt ULong U128"),
-            "UShort" to wordSet("Long I128 UInt ULong U128"),
-            "UInt" to wordSet("Long I128 ULong U128"),
-            "ULong" to wordSet("I128 U128"),
-        )
+    private val STDLIB_INT_TYPES: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.stdlibIntTypes
+    private val FROM_ONLY_TARGETS_BY_SRC: Map<String, Set<String>>
+        get() = YamlRuleCatalogs.TypeAndMethodPatterns.tryIntoFromOnlyTargetsBySrc
 
     override fun tryRender(ctx: MethodCallLoweringContext): String? {
         val emitter = ctx.emitter
@@ -819,8 +827,8 @@ private object EarlyIntoIterAndCloneWitnessRule : MethodLoweringRule() {
         return null
     }
 
-    private val INTO_ITER_COLLECTION_PREFIXES =
-        listOf("Iterable<", "Collection<", "List<", "MutableList<", "Set<", "MutableSet<")
+    private val INTO_ITER_COLLECTION_PREFIXES: List<String>
+        get() = YamlRuleCatalogs.TypeAndMethodPatterns.intoIterCollectionPrefixes
 }
 
 private object SynAndStringParseMethodRule : MethodLoweringRule() {
@@ -966,13 +974,7 @@ private object CoreStrAndCharMethodRule : MethodLoweringRule() {
             (recvTyForStr == "Chars" || recvTyForStr?.endsWith(".Chars") == true) &&
                 !(headerCtx.packageName == "$coreNs.str.iter" && ctx.selfTypeName == "Chars") &&
                 args.isEmpty() ->
-                when (rawMethod) {
-                    "next" -> "$atomicRecv.next()"
-                    "as_str" -> "$atomicRecv.asStr()"
-                    "clone" -> "$atomicRecv.clone()"
-                    "enumerate" -> "$atomicRecv.enumerate()"
-                    else -> null
-                }
+                ctx.tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.charsIterMethodRules, "charsIter")
             rawMethod == "to_digit" &&
                 args.size == 1 &&
                 (recvTyForStr == "Char" || (emitter.unwrapParenOrGroupExpr(ctx.expr.receiver) as? Expr.Lit)?.lit is Lit.Char) &&
@@ -1001,9 +1003,8 @@ private object ConcreteNumericDispatchMethodRule : MethodLoweringRule() {
 }
 
 private object FmtAndCollectionTransformRule : MethodLoweringRule() {
-    private val RAW_ABI_BYTE_OFFSET_METHODS =
-        wordSet("byte_offset byte_add byte_sub wrapping_byte_offset wrapping_byte_add wrapping_byte_sub")
-    private val FMT_WRITE_METHODS = wordSet("write_str write_char pad write_fmt")
+    private val RAW_ABI_BYTE_OFFSET_METHODS: Set<String>
+        get() = YamlRuleCatalogs.TypeAndMethodPatterns.rawAbiByteOffsetMethods
 
     override fun tryRender(ctx: MethodCallLoweringContext): String? {
         if (ctx.rawMethod == "collect" && ctx.renderedValueArgs.isEmpty()) return tryRenderCollect(ctx)
@@ -1013,9 +1014,13 @@ private object FmtAndCollectionTransformRule : MethodLoweringRule() {
         val rawMethod = ctx.rawMethod
         val receiver = ctx.receiver
         val args = ctx.renderedValueArgs
-        if (rawMethod == "append_all" && args.size == 1) return "for (item in ${args[0]}) item.toTokens($receiver)"
-        if (rawMethod in FMT_WRITE_METHODS && args.size == 1 && emitter.isFmtStringBuilderReceiver(expr.receiver, receiver, ctx.selfTypeName)) {
-            return "$receiver.append(${args[0]})"
+        ctx
+            .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.generalTransformMethodRules, "generalTransform")
+            ?.let { return it }
+        if (args.size == 1 && emitter.isFmtStringBuilderReceiver(expr.receiver, receiver, ctx.selfTypeName)) {
+            ctx
+                .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.fmtBuilderMethodRules, "fmtBuilder")
+                ?.let { return it }
         }
         val isStringLitRecv = emitter.unwrapParenOrGroupExpr(expr.receiver).let { it is Expr.Lit && it.lit is Lit.Str }
         if (rawMethod == "fmt" &&
@@ -1025,12 +1030,6 @@ private object FmtAndCollectionTransformRule : MethodLoweringRule() {
         ) {
             return "${args[0]}.append($receiver)"
         }
-        if (rawMethod == "find" && args.size == 1) return "$receiver.indexOf(${args[0]}).takeIf { it >= 0 }"
-        if ((rawMethod == "position" || rawMethod == "rposition") && args.size == 1) {
-            val idxFn = if (rawMethod == "position") "indexOfFirst" else "indexOfLast"
-            return "${ctx.recvAtom}.$idxFn(${args[0]}).takeIf { it >= 0 }"
-        }
-        if (rawMethod == "enumerate" && args.isEmpty()) return "${ctx.recvAtom}.mapIndexed { index, item -> Pair(index, item) }"
         if (rawMethod == "take" && args.size == 1) {
             emitter.unwrapRepeatSourceArg(expr.receiver, ctx.indent, ctx.selfTypeName)?.let { repArg ->
                 return "List(${args[0]}) { ${emitter.renderExpr(repArg, ctx.indent, ctx.selfTypeName)} }"
@@ -1056,13 +1055,6 @@ private object FmtAndCollectionTransformRule : MethodLoweringRule() {
             val deltaExpr = emitter.convertNumericReceiver(deltaRecv, "Long", emitter.inferExprNumericKind(ctx.allMethodArgs[0], ctx.selfTypeName))
             return "($receiver $deltaSign $deltaExpr)"
         }
-        if (rawMethod == "debug_struct" && args.size == 1 && "DebugStruct" !in emitter.inspector.declaredTypeNames) {
-            return "DebugStruct($receiver, ${args[0]})"
-        }
-        if (rawMethod == "debug_tuple" && args.size == 1 && "DebugTuple" !in emitter.inspector.declaredTypeNames) {
-            return "DebugTuple($receiver, ${args[0]})"
-        }
-        if (rawMethod == "push_back" && args.size == 1) return "$receiver.addLast(${args[0]})"
         return null
     }
 
@@ -1101,23 +1093,21 @@ private object ContainerMutationAndIndexingRule : MethodLoweringRule() {
         val args = ctx.renderedValueArgs
         val noTypeArgs = ctx.typeArgs.isEmpty()
         if (ctx.isVecReceiver && noTypeArgs) {
-            when {
-                rawMethod == "push" && args.size == 1 -> return "$receiver.add(${args[0]})"
-                rawMethod == "insert" && args.size == 2 -> return "$receiver.add(${args[0]}, ${args[1]})"
-                rawMethod == "clone_from" && args.size == 1 -> return "run { $receiver.clear(); $receiver.addAll(${args[0]}) }"
-                (rawMethod == "get" || rawMethod == "get_mut") &&
-                    args.size == 1 &&
-                    emitter.unwrapParenOrGroupExpr(ctx.allMethodArgs[0]) !is Expr.Range -> return ctx.renderIndexedGetOrNull(receiver)
+            ctx
+                .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.vecMutMethodRules, "vecMut")
+                ?.let { return it }
+            if ((rawMethod == "get" || rawMethod == "get_mut") &&
+                args.size == 1 &&
+                emitter.unwrapParenOrGroupExpr(ctx.allMethodArgs[0]) !is Expr.Range
+            ) {
+                return ctx.renderIndexedGetOrNull(receiver)
             }
         }
         val recvCollectionTy = emitter.currentTypedLocals[receiver] ?: emitter.inferExprRenderedType(ctx.expr.receiver, ctx.selfTypeName)
         if (isMapRenderedType(recvCollectionTy) && noTypeArgs) {
-            val recvAtom = ctx.recvAtom
-            when {
-                rawMethod == "insert" && args.size == 2 -> return "$recvAtom.put(${args[0]}, ${args[1]})"
-                rawMethod == "clone" && args.isEmpty() -> return "$recvAtom.toMutableMap()"
-                (rawMethod == "get" || rawMethod == "get_mut") && args.size == 1 -> return "$recvAtom.get(${args[0]})"
-            }
+            ctx
+                .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.mapMutMethodRules, "mapMut")
+                ?.let { return it }
         }
         if ((rawMethod == "get" || rawMethod == "get_mut") &&
             args.size == 1 &&
@@ -1128,11 +1118,12 @@ private object ContainerMutationAndIndexingRule : MethodLoweringRule() {
             return ctx.renderIndexedGetOrNull(ctx.recvAtom)
         }
         if (isSetRenderedType(recvCollectionTy) && noTypeArgs) {
-            val recvAtom = ctx.recvAtom
-            when {
-                rawMethod == "insert" && (args.size == 1 || (args.size == 2 && args[1] == "Unit")) -> return "$recvAtom.add(${args[0]})"
-                rawMethod == "clone" && args.isEmpty() -> return "$recvAtom.toMutableSet()"
+            if (rawMethod == "insert" && (args.size == 1 || (args.size == 2 && args[1] == "Unit"))) {
+                return "${ctx.recvAtom}.add(${args[0]})"
             }
+            ctx
+                .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.setMutMethodRules, "setMut")
+                ?.let { return it }
         }
         if (rawMethod == "clone_from" &&
             args.size == 1 &&
@@ -1167,13 +1158,10 @@ private object StringCaseAndSplitMethodRule : MethodLoweringRule() {
         val receiver = ctx.receiver
         val args = ctx.renderedValueArgs
         val atomicRecv = ctx.recvAtom
-        if ((rawMethod == "strip_prefix" || rawMethod == "strip_suffix") && args.size == 1) {
-            val recvTy = ctx.inferredRecvTy
-            if (recvTy == null || recvTy == "String") {
-                val pred = if (rawMethod == "strip_prefix") "startsWith" else "endsWith"
-                val rem = if (rawMethod == "strip_prefix") "removePrefix" else "removeSuffix"
-                return "$atomicRecv.takeIf { it.$pred(${args[0]}) }?.$rem(${args[0]})"
-            }
+        if (ctx.inferredRecvTy == null || ctx.inferredRecvTy == "String") {
+            ctx
+                .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.stringStripMethodRules, "stringStrip")
+                ?.let { return it }
         }
         if ((rawMethod == "split_once" || rawMethod == "rsplit_once") && args.size == 1) {
             val recvTy = ctx.localOrInferredRecvTy
@@ -1219,11 +1207,10 @@ private object StringCaseAndSplitMethodRule : MethodLoweringRule() {
                     receiver.endsWith(".asSlice()")
             if (isListOrByteSlice) return "$atomicRecv.toMutableList()"
         }
-        if ((rawMethod == "as_slice" || rawMethod == "size_hint") &&
-            args.isEmpty() &&
-            (receiver in emitter.currentDequeLocals || ctx.isDequeIterReceiver || inferredMethodRecvTy?.startsWith("ArrayDeque<") == true)
-        ) {
-            return if (rawMethod == "as_slice") "$atomicRecv.toList()" else "run { val n = $atomicRecv.size; Pair(n, n) }"
+        if (receiver in emitter.currentDequeLocals || ctx.isDequeIterReceiver || inferredMethodRecvTy?.startsWith("ArrayDeque<") == true) {
+            ctx
+                .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.dequeSliceHintMethodRules, "dequeSliceHint")
+                ?.let { return it }
         }
         return null
     }
@@ -1235,14 +1222,10 @@ private object AnyReflectionAndUncheckedShiftRule : MethodLoweringRule() {
         val rawMethod = ctx.rawMethod
         val args = ctx.renderedValueArgs
         val inferredMethodRecvTy = ctx.inferredRecvTy
-        if (inferredMethodRecvTy == "RustAny" && args.isEmpty() && ctx.typeArgs.isNotEmpty()) {
-            val atomicRecv = ctx.recvAtom
-            when (rawMethod) {
-                "is" -> return "$atomicRecv.isType${ctx.typeArgs}()"
-                "downcast_ref" -> return "$atomicRecv.downcastRef${ctx.typeArgs}()"
-                "downcast_mut" -> return "$atomicRecv.downcastMut${ctx.typeArgs}()"
-                "downcast" -> return "$atomicRecv.downcast${ctx.typeArgs}()"
-            }
+        if (inferredMethodRecvTy == "RustAny") {
+            ctx
+                .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.rustAnyMethodRules, "rustAny")
+                ?.let { return it }
         }
         if (ctx.typeArgs.isNotEmpty()) return null
         if (rawMethod == "type_id" &&
@@ -1306,15 +1289,11 @@ private object ErasedOptionCombinatorMethodRule : MethodLoweringRule() {
             return "$receiver.also { $receiver = null }"
         }
         val atomicRecv = ctx.recvAtom
+        ctx
+            .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.erasedOptionMethodRules, "erasedOption")
+            ?.let { return it }
         return when {
-            rawMethod == "unwrap" && args.isEmpty() -> "$atomicRecv!!"
-            rawMethod == "expect" && args.size == 1 -> "($receiver ?: error(${args[0]}))"
-            (rawMethod == "clone" || rawMethod == "cloned" || rawMethod == "copied") && args.isEmpty() -> receiver
             (rawMethod == "ok_or" || rawMethod == "ok_or_else") && args.size == 1 -> renderOkOr(ctx)
-            rawMethod == "into_iter" && args.isEmpty() -> "ArrayDeque(listOfNotNull($receiver))"
-            rawMethod == "flatten" && args.isEmpty() -> receiver
-            (rawMethod == "map" || rawMethod == "and_then") && args.size == 1 ->
-                "$atomicRecv?.let(${emitter.wrapMapCallbackArg(ctx.allMethodArgs[0], args[0])})"
             rawMethod == "map_or" && args.size == 2 -> {
                 val callback = emitter.wrapMapCallbackArg(ctx.allMethodArgs[1], args[1])
                 val defaultExpr = ctx.allMethodArgs[0]
@@ -1328,8 +1307,6 @@ private object ErasedOptionCombinatorMethodRule : MethodLoweringRule() {
                     runtimeIfExpr = { recvTmp, defTmp -> "if ($recvTmp != null) $recvTmp.let($callback) else $defTmp" },
                 )
             }
-            rawMethod == "map_or_else" && args.size == 2 ->
-                "($atomicRecv?.let(${emitter.wrapMapCallbackArg(ctx.allMethodArgs[1], args[1])}) ?: ${emitter.unwrapZeroArgClosureText(args[0])})"
             (rawMethod == "or_else" || rawMethod == "unwrap_or_else") && args.size == 1 -> {
                 val renderedClosure = renderWithOptionElemKind(ctx, ctx.allMethodArgs[0], args[0], asTypedInitializer = false)
                 "($receiver ?: ${emitter.unwrapZeroArgClosureText(renderedClosure)})"
@@ -1480,10 +1457,14 @@ private val POST_ARG_METHOD_RULES: List<MethodLoweringRule> =
         NullAccumulatorFoldMethodRule,
     )
 
-private val CORE_SLICE_OR_PTR_METHODS = wordSet("asPtr asMutPtr chunksMut chunks")
-private val NON_SLICE_CORE_OWNER_TYPES = wordSet("MaybeUninit ConstPtr MutPtr AddressableLocal AddressableArrayLocal")
-private val PEEK_MACRO_METHODS = wordSet("peek peek2 peek3")
-private val CALLBACK_WRAP_METHODS = wordSet("map map_err and_then or_else")
+private val CORE_SLICE_OR_PTR_METHODS: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.coreSliceOrPtrMethods
+private val NON_SLICE_CORE_OWNER_TYPES: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.nonSliceCoreOwnerTypes
+private val PEEK_MACRO_METHODS: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.peekMacroMethods
+private val CALLBACK_WRAP_METHODS: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.callbackWrapMethods
 
 private fun MethodCallLoweringContext.renderStandardMethodCall(): String {
     val adjustedRenderedValueArgs =
@@ -1838,9 +1819,6 @@ private fun KotlinJ2KEmitter.renderCopyFromSliceCall(
     return null
 }
 
-private val UNCONSTRAINED_CMP_METHODS: Set<String> =
-    wordSet("partial_cmp partialCmp cmp lt le gt ge __chaining_less chainingLess __chaining_greater chainingGreater")
-
 internal fun KotlinJ2KEmitter.tryRenderUnconstrainedCmpLowering(
     rawMethod: String,
     cleanRecvTy: String?,
@@ -1848,6 +1826,7 @@ internal fun KotlinJ2KEmitter.tryRenderUnconstrainedCmpLowering(
     argRendered: String,
     allowWhenRecvUninferred: Boolean = false,
 ): String? {
+    val rule = YamlRuleCatalogs.TypeAndMethodPatterns.unconstrainedCmpMethodRules[rawMethod] ?: return null
     val recvBase = cleanRecvTy?.simpleKotlinTypeName()
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
     val isCoreRuntimeActive =
@@ -1855,7 +1834,6 @@ internal fun KotlinJ2KEmitter.tryRenderUnconstrainedCmpLowering(
             headerContext.packageName == coreNs ||
             headerContext.packageName?.startsWith("$coreNs.") == true
     if (!isCoreRuntimeActive ||
-        rawMethod !in UNCONSTRAINED_CMP_METHODS ||
         "PartialOrd" in inspector.declaredTypeNames ||
         "Ord" in inspector.declaredTypeNames
     ) {
@@ -1867,34 +1845,19 @@ internal fun KotlinJ2KEmitter.tryRenderUnconstrainedCmpLowering(
             (allowWhenRecvUninferred && cleanRecvTy == null)
     if (!isEligibleRecv) return null
 
-    return when (rawMethod) {
-        "partial_cmp", "partialCmp" -> {
-            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.kmPartialCompareValues")
-            val ordRef = bindOrQualifyResolvedCrossSymbol("$coreNs.cmp.Ordering")
-            "kmPartialCompareValues($recvRendered, $argRendered)?.let { cmpSign -> when { cmpSign < 0 -> $ordRef.Less; cmpSign > 0 -> $ordRef.Greater; else -> $ordRef.Equal } }"
+    var cachedOrdRef: String? = null
+    var cachedCfRef: String? = null
+    return rule.action.render(
+        rawAbi = headerContext.rawAbiMode,
+        onImport = { CoreIntrinsicLowering.registerCoreImport(this, it) },
+    ) { key ->
+        when (key) {
+            "coreNs" -> coreNs
+            "recv" -> recvRendered
+            "arg0" -> argRendered
+            "ordRef" -> cachedOrdRef ?: bindOrQualifyResolvedCrossSymbol("$coreNs.cmp.Ordering").also { cachedOrdRef = it }
+            "cfRef" -> cachedCfRef ?: bindOrQualifyResolvedCrossSymbol("$coreNs.ops.controlflow.ControlFlow").also { cachedCfRef = it }
+            else -> null
         }
-        "cmp" -> {
-            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.kmCompareValues")
-            val ordRef = bindOrQualifyResolvedCrossSymbol("$coreNs.cmp.Ordering")
-            "kmCompareValues($recvRendered, $argRendered).let { cmpSign -> when { cmpSign < 0 -> $ordRef.Less; cmpSign > 0 -> $ordRef.Greater; else -> $ordRef.Equal } }"
-        }
-        "lt", "le", "gt", "ge" -> {
-            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.kmPartialCompareValues")
-            val cmpOp =
-                when (rawMethod) {
-                    "lt" -> "< 0"
-                    "le" -> "<= 0"
-                    "gt" -> "> 0"
-                    else -> ">= 0"
-                }
-            "(kmPartialCompareValues($recvRendered, $argRendered)?.let { cmpSign -> cmpSign $cmpOp } == true)"
-        }
-        "__chaining_less", "chainingLess", "__chaining_greater", "chainingGreater" -> {
-            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.kmPartialCompareValues")
-            val cfRef = bindOrQualifyResolvedCrossSymbol("$coreNs.ops.controlflow.ControlFlow")
-            val cmpOp = if (rawMethod == "__chaining_less" || rawMethod == "chainingLess") "< 0" else "> 0"
-            "kmPartialCompareValues($recvRendered, $argRendered).let { cmpSign -> if (cmpSign == 0) $cfRef.Continue<Boolean, Unit>(Unit) else $cfRef.Break<Boolean, Unit>(cmpSign != null && cmpSign $cmpOp) }"
-        }
-        else -> null
     }
 }

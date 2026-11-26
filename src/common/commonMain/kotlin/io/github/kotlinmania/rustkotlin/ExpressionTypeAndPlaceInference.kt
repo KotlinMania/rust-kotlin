@@ -28,10 +28,7 @@ import io.github.kotlinmania.syn.UnOp
 import io.github.kotlinmania.syn.gen.Visit
 
 internal val RAW_POINTER_ARITH_METHODS: Set<String> =
-    wordSet(
-        "offset add sub wrapping_offset wrapping_add wrapping_sub",
-        "byte_offset byte_add byte_sub wrapping_byte_offset wrapping_byte_add wrapping_byte_sub",
-    )
+    YamlRuleCatalogs.TypeAndMethodPatterns.rawPointerArithMethods
 
 internal fun Expr.MethodCall.firstTurbofishTypeArg(): SynType? {
     val argList = turbofish?.args?.toList() ?: return null
@@ -78,19 +75,14 @@ internal object PrimitiveArrayTypeCatalog {
     )
 
     private val SPECS: List<Spec> =
-        listOf(
-            Spec("BooleanArray", "Boolean", null, "booleanArray"),
-            Spec("ByteArray", "Byte", NumericKind.I8, "byteArray"),
-            Spec("UByteArray", "UByte", NumericKind.U8, "uByteArray"),
-            Spec("ShortArray", "Short", NumericKind.I16, "shortArray"),
-            Spec("UShortArray", "UShort", NumericKind.U16, "uShortArray"),
-            Spec("IntArray", "Int", NumericKind.I32, "intArray"),
-            Spec("UIntArray", "UInt", NumericKind.U32, "uIntArray"),
-            Spec("LongArray", "Long", NumericKind.I64, "longArray"),
-            Spec("ULongArray", "ULong", NumericKind.U64, "uLongArray"),
-            Spec("FloatArray", "Float", NumericKind.F32, "floatArray"),
-            Spec("DoubleArray", "Double", NumericKind.F64, "doubleArray"),
-        )
+        YamlRuleCatalogs.TypeAndMethodPatterns.primitiveArraySpecNodes.map { node ->
+            Spec(
+                arrayType = node.string("arrayType"),
+                elemType = node.string("elemType"),
+                numericKind = node.optionalString("numericKind")?.let(NumericKind::valueOf),
+                layoutFactory = node.string("layoutFactory"),
+            )
+        }
 
     private val BY_ARRAY_TYPE: Map<String, Spec> = SPECS.associateBy { it.arrayType }
     private val FACTORY_BY_KIND: Map<NumericKind, String> =
@@ -101,23 +93,7 @@ internal object PrimitiveArrayTypeCatalog {
         SPECS.associate { it.elemType to it.arrayType } + ("kotlin.Float" to "FloatArray")
 
     private val NUMERIC_KIND_BY_ELEM: Map<String, NumericKind> =
-        mapOf(
-            "Byte" to NumericKind.I8,
-            "UByte" to NumericKind.U8,
-            "Short" to NumericKind.I16,
-            "UShort" to NumericKind.U16,
-            "Int" to NumericKind.I32,
-            "UInt" to NumericKind.U32,
-            "Long" to NumericKind.I64,
-            "ULong" to NumericKind.U64,
-            "I128" to NumericKind.I128,
-            "U128" to NumericKind.U128,
-            "F16" to NumericKind.F16,
-            "Float" to NumericKind.F32,
-            "kotlin.Float" to NumericKind.F32,
-            "Double" to NumericKind.F64,
-            "F128" to NumericKind.F128,
-        )
+        YamlRuleCatalogs.TypeAndMethodPatterns.numericKindByElem
 
     fun elemKind(containerType: String, coreNs: String): NumericKind? {
         BY_ARRAY_TYPE[containerType]?.numericKind?.let { return it }
@@ -1125,62 +1101,30 @@ private class ExprTypeInferenceEngine(
                 listOf("core", "option", "Option", "None"),
                 listOf("std", "option", "Option", "None"),
             )
-        private val NON_OPTION_METHOD_NAMES: Set<String> =
-            wordSet("ok_or ok_or_else is_ok is_err is_some is_none map_err to_lowercase to_uppercase")
-        private val OPTION_CHAIN_PRESERVING_METHODS: Set<String> =
-            wordSet("map and_then flatten or or_else as_ref as_mut cloned copied filter")
-        private val NULLABLE_NEW_WRAPPER_OWNERS: Set<String> = wordSet("NonNull NonZero Alignment")
-        private val LAYOUT_QUERY_FN_IDENTS: Set<String> = wordSet("size_of size_of_val align_of align_of_val")
-        private val MUT_PTR_CONTAINER_BASES: Set<String> = wordSet("NonNull Unique BoxRaw")
-        private val ENDIAN_INT_METHODS: Set<String> = wordSet("to_be from_be swap_bytes to_le from_le")
-        private val OPTION_UNWRAP_SINGLE_ARG_METHODS: Set<String> = wordSet("expect unwrap_or unwrap_or_else")
-        private val OPTION_ZERO_ARG_IDENTITY_METHODS: Set<String> = wordSet("cloned copied as_ref as_mut")
-        private val ATOMIC_VALUE_RETURNING_METHODS: Set<String> =
-            wordSet("load swap into_inner fetch_add fetch_sub fetch_and fetch_or fetch_xor fetch_max fetch_min")
-        private val FMT_DEBUG_BUILDER_RETURNS: Map<String, String> =
-            mapOf(
-                "debug_struct" to "DebugStruct",
-                "debug_tuple" to "DebugTuple",
-                "debug_list" to "DebugList",
-                "debug_set" to "DebugSet",
-                "debug_map" to "DebugMap",
-            )
-        private val FLOAT_SUFFIX_NUMERIC_KINDS: Map<String, NumericKind> =
-            mapOf(
-                "f16" to NumericKind.F16,
-                "f32" to NumericKind.F32,
-                "f64" to NumericKind.F64,
-                "f128" to NumericKind.F128,
-            )
-        private val INT_SUFFIX_NUMERIC_KINDS: Map<String, NumericKind> =
-            mapOf(
-                "i8" to NumericKind.I8,
-                "u8" to NumericKind.U8,
-                "i16" to NumericKind.I16,
-                "u16" to NumericKind.U16,
-                "i32" to NumericKind.I32,
-                "u32" to NumericKind.U32,
-                "i64" to NumericKind.I64,
-                "u64" to NumericKind.U64,
-                "i128" to NumericKind.I128,
-                "u128" to NumericKind.U128,
-            )
+        private val NON_OPTION_METHOD_NAMES: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.nonOptionMethodNames
+        private val OPTION_CHAIN_PRESERVING_METHODS: Set<String>
+            get() = YamlRuleCatalogs.TypeAndMethodPatterns.optionChainPreservingMethods
+        private val NULLABLE_NEW_WRAPPER_OWNERS: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.nullableNewWrapperOwners
+        private val LAYOUT_QUERY_FN_IDENTS: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.layoutQueryFnIdents
+        private val MUT_PTR_CONTAINER_BASES: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.mutPtrContainerBases
+        private val ENDIAN_INT_METHODS: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.endianIntMethods
+        private val OPTION_UNWRAP_SINGLE_ARG_METHODS: Set<String>
+            get() = YamlRuleCatalogs.TypeAndMethodPatterns.optionUnwrapSingleArgMethods
+        private val OPTION_ZERO_ARG_IDENTITY_METHODS: Set<String>
+            get() = YamlRuleCatalogs.TypeAndMethodPatterns.optionZeroArgIdentityMethods
+        private val ATOMIC_VALUE_RETURNING_METHODS: Set<String>
+            get() = YamlRuleCatalogs.TypeAndMethodPatterns.atomicValueReturningMethods
+        private val FMT_DEBUG_BUILDER_RETURNS: Map<String, String>
+            get() = YamlRuleCatalogs.TypeAndMethodPatterns.fmtDebugBuilderReturns
+        private val FLOAT_SUFFIX_NUMERIC_KINDS: Map<String, NumericKind>
+            get() = YamlRuleCatalogs.TypeAndMethodPatterns.floatSuffixNumericKinds
+        private val INT_SUFFIX_NUMERIC_KINDS: Map<String, NumericKind>
+            get() = YamlRuleCatalogs.TypeAndMethodPatterns.intSuffixNumericKinds
     }
 }
 
 internal val NUMERIC_COERCE_SUFFIX_BY_KIND: Map<NumericKind, String> =
-    mapOf(
-        NumericKind.U8 to "toUByte()",
-        NumericKind.U16 to "toUShort()",
-        NumericKind.U32 to "toUInt()",
-        NumericKind.U64 to "toULong()",
-        NumericKind.I8 to "toByte()",
-        NumericKind.I16 to "toShort()",
-        NumericKind.I32 to "toInt()",
-        NumericKind.I64 to "toLong()",
-        NumericKind.F32 to "toFloat()",
-        NumericKind.F64 to "toDouble()",
-    )
+    YamlRuleCatalogs.TypeAndMethodPatterns.numericCoerceSuffixByKind
 
 private val NUMERIC_KIND_BY_NAME: Map<String, NumericKind> = NumericKind.entries.associateBy { it.name }
 
@@ -1379,27 +1323,14 @@ internal fun KotlinJ2KEmitter.mutablePlaceReturnType(
 }
 
 internal val STR_PRIMITIVE_PARSE_METHODS: Map<String, String> =
-    mapOf(
-        "Boolean" to "toBooleanStrictOrNull()",
-        "Byte" to "toByteOrNull()",
-        "UByte" to "toUByteOrNull()",
-        "Short" to "toShortOrNull()",
-        "UShort" to "toUShortOrNull()",
-        "Int" to "toIntOrNull()",
-        "UInt" to "toUIntOrNull()",
-        "Long" to "toLongOrNull()",
-        "ULong" to "toULongOrNull()",
-        "Float" to "toFloatOrNull()",
-        "kotlin.Float" to "toFloatOrNull()",
-        "Double" to "toDoubleOrNull()",
-    )
+    YamlRuleCatalogs.TypeAndMethodPatterns.strPrimitiveParseMethods
 
 internal fun refCellGuardPointeeType(type: String?): String? =
     type.asKotlinRenderedType()?.singleArgOf("Ref", "RefMut")
 
-private val MAP_SIMPLE_NAMES = wordSet("MutableMap Map LinkedHashMap HashMap")
-private val SET_SIMPLE_NAMES = wordSet("MutableSet Set LinkedHashSet HashSet")
-private val INDEXED_SLICE_BASES = wordSet("List MutableList Array ArrayDeque")
+private val MAP_SIMPLE_NAMES: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.mapSimpleNames
+private val SET_SIMPLE_NAMES: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.setSimpleNames
+private val INDEXED_SLICE_BASES: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.indexedSliceBases
 
 internal fun isMapRenderedType(type: String?): Boolean {
     val parsed = type.asKotlinRenderedType() ?: return false

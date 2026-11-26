@@ -214,28 +214,22 @@ private data class TargetCWidthProfile(
 }
 
 internal val C_ABI_BRIDGE_DESCRIPTORS: Map<CAbiBridgeKind, CAbiBridgeDescriptor> =
-    mapOf(
-        CAbiBridgeKind.VOID to CAbiBridgeDescriptor("void", "", wasmWasiScalarType = "Unit", wasmJsType = "Unit", jniKotlinType = "Unit", jniCType = "void", kotlinScalarType = "Unit"),
-        CAbiBridgeKind.NEVER to CAbiBridgeDescriptor("void", "", wasmWasiScalarType = "Unit", wasmJsType = "Unit", jniKotlinType = "Unit", jniCType = "void", kotlinScalarType = "Unit"),
-        CAbiBridgeKind.BOOL to CAbiBridgeDescriptor("bool", "false", wasmWasiScalarType = "Int", wasmJsType = "Boolean", jniKotlinType = "Boolean", jniCType = "jboolean", kotlinScalarType = "Boolean"),
-        CAbiBridgeKind.I8 to CAbiBridgeDescriptor("int8_t", "-1", NumericKind.I8, "toByte", "Int", "Int", "Byte", "jbyte", "Byte"),
-        CAbiBridgeKind.U8 to CAbiBridgeDescriptor("uint8_t", "0", NumericKind.U8, "toUByte", "Int", "Int", "Byte", "jbyte", "UByte"),
-        CAbiBridgeKind.I16 to CAbiBridgeDescriptor("int16_t", "-1", NumericKind.I16, "toShort", "Int", "Int", "Short", "jshort", "Short"),
-        CAbiBridgeKind.U16 to CAbiBridgeDescriptor("uint16_t", "0", NumericKind.U16, "toUShort", "Int", "Int", "Short", "jshort", "UShort"),
-        CAbiBridgeKind.I32 to CAbiBridgeDescriptor("int32_t", "-1", NumericKind.I32, null, "Int", "Int", "Int", "jint", "Int"),
-        CAbiBridgeKind.U32 to CAbiBridgeDescriptor("uint32_t", "0", NumericKind.U32, "toUInt", "Int", "Int", "Int", "jint", "UInt"),
-        CAbiBridgeKind.I64 to CAbiBridgeDescriptor("int64_t", "-1", NumericKind.I64, null, "Long", null, "Long", "jlong", "Long"),
-        CAbiBridgeKind.U64 to CAbiBridgeDescriptor("uint64_t", "0", NumericKind.U64, "toULong", "Long", null, "Long", "jlong", "ULong"),
-        CAbiBridgeKind.F32 to CAbiBridgeDescriptor("float", "0.0f", NumericKind.F32, null, "Float", "Double", "Float", "jfloat", "Float"),
-        CAbiBridgeKind.F64 to CAbiBridgeDescriptor("double", "0.0", NumericKind.F64, null, "Double", "Double", "Double", "jdouble", "Double"),
-        CAbiBridgeKind.CONST_CSTR to CAbiBridgeDescriptor("const char*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
-        CAbiBridgeKind.MUT_CSTR to CAbiBridgeDescriptor("char*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
-        CAbiBridgeKind.OPAQUE_PTR to CAbiBridgeDescriptor("void*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
-        CAbiBridgeKind.FILE_PTR to CAbiBridgeDescriptor("void*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
-        CAbiBridgeKind.DIR_PTR to CAbiBridgeDescriptor("void*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
-        CAbiBridgeKind.CALLBACK_PTR to CAbiBridgeDescriptor("void*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
-        CAbiBridgeKind.BY_VALUE_OBJECT to CAbiBridgeDescriptor("void*", "NULL", wasmJsType = "Unit", jniKotlinType = "Long", jniCType = "jlong"),
-    )
+    YamlRuleCatalogs.PathsConstsAndCAbi.cAbiBridgeDescriptorNodes.associate { node ->
+        val kind = CAbiBridgeKind.valueOf(node.string("kind"))
+        kind to
+            CAbiBridgeDescriptor(
+                cType = node.string("cType"),
+                cFailureLiteral = node.string("cFailureLiteral"),
+                numericKind = node.optionalString("numericKind")?.let(NumericKind::valueOf),
+                defaultReturnConv = node.optionalString("defaultReturnConv"),
+                wasmWasiScalarType = node.optionalString("wasmWasiScalarType"),
+                wasmJsType = node.optionalString("wasmJsType"),
+                jniKotlinType = node.string("jniKotlinType"),
+                jniCType = node.string("jniCType"),
+                kotlinScalarType = node.optionalString("kotlinScalarType"),
+                isPointerAddress = node.bool("isPointerAddress"),
+            )
+    }
 
 private val NUMERIC_KIND_TO_BRIDGE_KIND: Map<NumericKind, CAbiBridgeKind> =
     C_ABI_BRIDGE_DESCRIPTORS.entries

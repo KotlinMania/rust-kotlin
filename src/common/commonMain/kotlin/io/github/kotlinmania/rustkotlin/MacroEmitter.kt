@@ -28,109 +28,23 @@ import io.github.kotlinmania.syn.token.PathSep
 import kotlin.io.encoding.Base64
 import io.github.kotlinmania.io.files.Path as KmPath
 
-/** Maps Rust `core::f*::consts` names to Kotlin `(f32Literal, f64Literal)` pairs. */
-private val RUST_FLOAT_MATH_CONSTANTS: Map<String, Pair<String, String>> =
-    mapOf(
-        "PI" to ("3.1415927f" to "kotlin.math.PI"),
-        "TAU" to ("6.2831855f" to "6.283185307179586"),
-        "FRAC_PI_2" to ("1.5707964f" to "1.5707963267948966"),
-        "FRAC_PI_3" to ("1.0471976f" to "1.0471975511965979"),
-        "FRAC_PI_4" to ("0.7853982f" to "0.7853981633974483"),
-        "FRAC_PI_6" to ("0.5235988f" to "0.5235987755982989"),
-        "FRAC_PI_8" to ("0.3926991f" to "0.39269908169872414"),
-        "FRAC_1_PI" to ("0.31830987f" to "0.3183098861837907"),
-        "FRAC_2_PI" to ("0.63661975f" to "0.6366197723675814"),
-        "FRAC_2_SQRT_PI" to ("1.1283792f" to "1.1283791670955126"),
-        "SQRT_2" to ("1.4142135f" to "1.4142135623730951"),
-        "FRAC_1_SQRT_2" to ("0.70710677f" to "0.7071067811865476"),
-        "E" to ("2.7182817f" to "kotlin.math.E"),
-        "LOG2_E" to ("1.442695f" to "1.4426950408889634"),
-        "LOG2_10" to ("3.321928f" to "3.321928094887362"),
-        "LOG10_E" to ("0.4342945f" to "0.4342944819032518"),
-        "LOG10_2" to ("0.30103f" to "0.3010299956639812"),
-        "LN_2" to ("0.6931472f" to "0.6931471805599453"),
-        "LN_10" to ("2.3025851f" to "2.302585092994046"),
-    )
+private val RUST_FLOAT_MATH_CONSTANTS: Map<String, Pair<String, String>>
+    get() = YamlRuleCatalogs.PathsConstsAndCAbi.rustFloatMathConstants
 
-private val INT_BITS_BY_PRIM: Map<String, String> =
-    mapOf(
-        "u8" to "8u",
-        "i8" to "8u",
-        "u16" to "16u",
-        "i16" to "16u",
-        "u32" to "32u",
-        "i32" to "32u",
-        "u64" to "64u",
-        "i64" to "64u",
-        "u128" to "128u",
-        "i128" to "128u",
-    )
+private val INT_BITS_BY_PRIM: Map<String, String>
+    get() = YamlRuleCatalogs.PathsConstsAndCAbi.intBitsByPrim
 
-private class FloatPrimitiveConstSpec(
-    private val minPositive: String,
-    private val epsilon: String,
-    private val mantissaDigits: String,
-    private val digits: String,
-    private val minExp: String,
-    private val maxExp: String,
-    private val min10Exp: String,
-    private val max10Exp: String,
-) {
-    fun render(typeName: String, constName: String): String? =
-        when (constName) {
-            "MIN" -> "(-$typeName.MAX_VALUE)"
-            "MAX" -> "$typeName.MAX_VALUE"
-            "MIN_POSITIVE" -> minPositive
-            "EPSILON" -> epsilon
-            "INFINITY" -> "$typeName.POSITIVE_INFINITY"
-            "NEG_INFINITY" -> "$typeName.NEGATIVE_INFINITY"
-            "NAN" -> "$typeName.NaN"
-            "RADIX" -> "2u"
-            "MANTISSA_DIGITS" -> mantissaDigits
-            "DIGITS" -> digits
-            "MIN_EXP" -> minExp
-            "MAX_EXP" -> maxExp
-            "MIN_10_EXP" -> min10Exp
-            "MAX_10_EXP" -> max10Exp
-            else -> null
-        }
-}
+private val F16_F128_ASSOC_CONSTS: Set<String>
+    get() = YamlRuleCatalogs.PathsConstsAndCAbi.f16F128AssocConsts
 
-private val F32_CONST_SPEC = FloatPrimitiveConstSpec("1.17549435E-38f", "1.1920929E-7f", "24u", "6u", "(-125)", "128", "(-37)", "38")
-private val F64_CONST_SPEC = FloatPrimitiveConstSpec("2.2250738585072014E-308", "2.220446049250313E-16", "53u", "15u", "(-1021)", "1024", "(-307)", "308")
+private val BOOLEAN_CAST_SOURCE_METHODS: Set<String>
+    get() = YamlRuleCatalogs.PathsConstsAndCAbi.booleanCastSourceMethods
 
-private val F16_F128_ASSOC_CONSTS: Set<String> =
-    wordSet(
-        "MIN MAX MIN_POSITIVE EPSILON INFINITY NEG_INFINITY NAN ZERO ONE NEG_ZERO",
-        "RADIX MANTISSA_DIGITS DIGITS MIN_EXP MAX_EXP MIN_10_EXP MAX_10_EXP BITS",
-        "SIGN_MASK EXP_MASK SIG_MASK IMPLICIT_BIT SIG_TOP_BIT SIG_BITS EXP_BITS",
-        "EXP_SAT EXP_BIAS EXP_MAX EXP_MIN EXP_MIN_SUBNORM TINY_BITS MIN_POSITIVE_SUBNORMAL",
-    )
+private val VALUE_POS_INSTANCE_CONV_METHODS: Set<String>
+    get() = YamlRuleCatalogs.PathsConstsAndCAbi.valuePosInstanceConvMethods
 
-private val BOOLEAN_CAST_SOURCE_METHODS: Set<String> =
-    wordSet("is_empty is_some is_none is_ok is_err contains starts_with ends_with")
-
-private val VALUE_POS_INSTANCE_CONV_METHODS: Set<String> =
-    wordSet("intoInner asRef asMut asSlice asBytes intoVec intoBoxedSlice intoString toOwned")
-
-private val SELF_TYPE_TO_RUST_PRIM: Map<String, String> =
-    mapOf(
-        "Float" to "f32",
-        "kotlin.Float" to "f32",
-        "Double" to "f64",
-        "F16" to "f16",
-        "F128" to "f128",
-        "Byte" to "i8",
-        "UByte" to "u8",
-        "Short" to "i16",
-        "UShort" to "u16",
-        "Int" to "i32",
-        "UInt" to "u32",
-        "Long" to "i64",
-        "ULong" to "u64",
-        "I128" to "i128",
-        "U128" to "u128",
-    )
+private val SELF_TYPE_TO_RUST_PRIM: Map<String, String>
+    get() = YamlRuleCatalogs.PathsConstsAndCAbi.selfTypeToRustPrim
 
 internal inline fun <T> KotlinJ2KEmitter.withExpectedTargetAndKind(
     targetType: String?,
@@ -2059,8 +1973,13 @@ private class ExprPathResolutionEmitter(
         if (norm.size == 2) {
             val prim = norm[0]
             val c = norm[1]
-            if (prim == "f32") return F32_CONST_SPEC.render(emitter.kotlinF32TypeName(), c)
-            if (prim == "f64") return F64_CONST_SPEC.render("Double", c)
+            if (prim == "f32") {
+                val f32Name = emitter.kotlinF32TypeName()
+                return YamlRuleCatalogs.PathsConstsAndCAbi.f32AssocConstTemplates[c]?.render { if (it == "typeName") f32Name else null }
+            }
+            if (prim == "f64") {
+                return YamlRuleCatalogs.PathsConstsAndCAbi.f64AssocConstTemplates[c]?.render { if (it == "typeName") "Double" else null }
+            }
             if (prim == "f16" || prim == "f128") {
                 if (c !in F16_F128_ASSOC_CONSTS) return null
                 val owner = if (prim == "f16") "F16" else "F128"

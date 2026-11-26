@@ -145,6 +145,78 @@ internal object YamlRuleCatalogs {
         val fmtOrQueueMethodRules: Map<String, DeclarativeMethodPatternRule> = indexMethodRulesByReceiver(allMethodRules, "fmtOrQueue")
         val dequeIterMethodRules: Map<String, DeclarativeMethodPatternRule> = indexMethodRulesByReceiver(allMethodRules, "dequeIter")
         val vecMethodRules: Map<String, DeclarativeMethodPatternRule> = indexMethodRulesByReceiver(allMethodRules, "vec")
+        val charsIterMethodRules: Map<String, DeclarativeMethodPatternRule> = indexMethodRulesByReceiver(allMethodRules, "charsIter")
+        val fmtBuilderMethodRules: Map<String, DeclarativeMethodPatternRule> = indexMethodRulesByReceiver(allMethodRules, "fmtBuilder")
+        val generalTransformMethodRules: Map<String, DeclarativeMethodPatternRule> =
+            indexMethodRulesByReceiver(allMethodRules, "generalTransform")
+        val vecMutMethodRules: Map<String, DeclarativeMethodPatternRule> = indexMethodRulesByReceiver(allMethodRules, "vecMut")
+        val mapMutMethodRules: Map<String, DeclarativeMethodPatternRule> = indexMethodRulesByReceiver(allMethodRules, "mapMut")
+        val setMutMethodRules: Map<String, DeclarativeMethodPatternRule> = indexMethodRulesByReceiver(allMethodRules, "setMut")
+        val stringStripMethodRules: Map<String, DeclarativeMethodPatternRule> = indexMethodRulesByReceiver(allMethodRules, "stringStrip")
+        val dequeSliceHintMethodRules: Map<String, DeclarativeMethodPatternRule> =
+            indexMethodRulesByReceiver(allMethodRules, "dequeSliceHint")
+        val rustAnyMethodRules: Map<String, DeclarativeMethodPatternRule> = indexMethodRulesByReceiver(allMethodRules, "rustAny")
+        val erasedOptionMethodRules: Map<String, DeclarativeMethodPatternRule> = indexMethodRulesByReceiver(allMethodRules, "erasedOption")
+        val unconstrainedCmpMethodRules: Map<String, DeclarativeMethodPatternRule> =
+            indexMethodRulesByReceiver(allMethodRules, "unconstrainedCmp")
+
+        val calleePatternRules: List<DeclarativeCalleePatternRule> =
+            root.mappingList("calleePatternRules").map(DeclarativeCalleePatternRule::fromYaml)
+
+        val rawPointerArithMethods: Set<String> = root.wordSet("rawPointerArithMethods")
+        val rawAbiByteOffsetMethods: Set<String> = root.wordSet("rawAbiByteOffsetMethods")
+        val iterReceiverMethods: Set<String> = root.wordSet("iterReceiverMethods")
+        val pointerDistanceSubMethods: Set<String> = root.wordSet("pointerDistanceSubMethods")
+        val indexedIterUnwrapMethods: Set<String> = root.wordSet("indexedIterUnwrapMethods")
+        val numericReceiverKindMethods: Set<String> = root.wordSet("numericReceiverKindMethods")
+        val u32ShiftOrExpMethods: Set<String> = root.wordSet("u32ShiftOrExpMethods")
+        val atomicSingleValueMethods: Set<String> = root.wordSet("atomicSingleValueMethods")
+        val stringLikeTypes: Set<String> = root.wordSet("stringLikeTypes")
+        val optionBorrowIdentityMethods: Set<String> = root.wordSet("optionBorrowIdentityMethods")
+        val sizedCollectionPrefixes: List<String> = root.explicitStringList("sizedCollectionPrefixes")
+        val intoIterCollectionPrefixes: List<String> = root.explicitStringList("intoIterCollectionPrefixes")
+        val stdlibIntTypes: Set<String> = root.wordSet("stdlibIntTypes")
+        val tryIntoFromOnlyTargetsBySrc: Map<String, Set<String>> =
+            root.mapping("tryIntoFromOnlyTargetsBySrc").entries.keys.associateWith { k ->
+                root.mapping("tryIntoFromOnlyTargetsBySrc").wordSet(k)
+            }
+        val coreSliceOrPtrMethods: Set<String> = root.wordSet("coreSliceOrPtrMethods")
+        val nonSliceCoreOwnerTypes: Set<String> = root.wordSet("nonSliceCoreOwnerTypes")
+        val peekMacroMethods: Set<String> = root.wordSet("peekMacroMethods")
+        val callbackWrapMethods: Set<String> = root.wordSet("callbackWrapMethods")
+        val integerCompanionMinMaxOwners: Set<String> = root.wordSet("integerCompanionMinMaxOwners")
+        val companionConvertPrimitives: Set<String> =
+            integerCompanionMinMaxOwners + root.wordSet("companionConvertPrimitivesExtra")
+        val knownStdUfcsReceiverMethods: Set<String> = root.wordSet("knownStdUfcsReceiverMethods")
+
+        val primitiveArraySpecNodes: List<YamlNode.Mapping> = root.mappingList("primitiveArraySpecs")
+        val numericKindByElem: Map<String, NumericKind> =
+            root.stringMap("numericKindByElem").mapValues { (_, v) -> NumericKind.valueOf(v) }
+        val strPrimitiveParseMethods: Map<String, String> = root.stringMap("strPrimitiveParseMethods")
+        val mapSimpleNames: Set<String> = root.wordSet("mapSimpleNames")
+        val setSimpleNames: Set<String> = root.wordSet("setSimpleNames")
+        val indexedSliceBases: Set<String> = root.wordSet("indexedSliceBases")
+        val nonOptionMethodNames: Set<String> = root.wordSet("nonOptionMethodNames")
+        val optionChainPreservingMethods: Set<String> = root.wordSet("optionChainPreservingMethods")
+        val nullableNewWrapperOwners: Set<String> = root.wordSet("nullableNewWrapperOwners")
+        val layoutQueryFnIdents: Set<String> = root.wordSet("layoutQueryFnIdents")
+        val mutPtrContainerBases: Set<String> = root.wordSet("mutPtrContainerBases")
+        val endianIntMethods: Set<String> = root.wordSet("endianIntMethods")
+        val optionUnwrapSingleArgMethods: Set<String> = root.wordSet("optionUnwrapSingleArgMethods")
+        val optionZeroArgIdentityMethods: Set<String> = root.wordSet("optionZeroArgIdentityMethods")
+        val atomicValueReturningMethods: Set<String> = root.wordSet("atomicValueReturningMethods")
+        val fmtDebugBuilderReturns: Map<String, String> = root.stringMap("fmtDebugBuilderReturns")
+        val floatSuffixNumericKinds: Map<String, NumericKind> =
+            root.stringMap("floatSuffixNumericKinds").mapValues { (_, v) -> NumericKind.valueOf(v) }
+        val intSuffixNumericKinds: Map<String, NumericKind> =
+            root.stringMap("intSuffixNumericKinds").mapValues { (_, v) -> NumericKind.valueOf(v) }
+        val numericCoerceSuffixByKind: Map<NumericKind, String> =
+            root.stringMap("numericCoerceSuffixByKind").entries.associate { (k, v) -> NumericKind.valueOf(k) to v }
+        val coreOpsOutputAssocTraits: Set<String> = root.wordSet("coreOpsOutputAssocTraits")
+        val stdlibDefaultlessAssocTypes: Map<String, List<String>> =
+            root.mapping("stdlibDefaultlessAssocTypes").entries.keys.associateWith { k ->
+                root.mapping("stdlibDefaultlessAssocTypes").explicitStringList(k)
+            }
     }
 
     object CoreIntrinsics {
@@ -196,5 +268,70 @@ internal object YamlRuleCatalogs {
         val suffixedFloatBinaryKm: Map<String, String> = root.stringMap("suffixedFloatBinaryKm")
         val suffixedFloatTernaryKm: Map<String, String> = root.stringMap("suffixedFloatTernaryKm")
         val genericFloatBinaryOpNames: Map<String, String> = root.stringMap("genericFloatBinaryOpNames")
+
+        val homogeneousBinarySimdIntrinsics: Set<String> = root.wordSet("homogeneousBinarySimdIntrinsics")
+        val simdIntrinsicNames: Set<String> = root.wordSet("simdIntrinsicNames")
+        val simdBoolReturnNames: Set<String> = root.wordSet("simdBoolReturnNames")
+        val simdUnitReturnNames: Set<String> = root.wordSet("simdUnitReturnNames")
+        val simdSameArg0Names: Set<String> = root.wordSet("simdSameArg0Names")
+        val simdSameArg1Names: Set<String> = root.wordSet("simdSameArg1Names")
+        val simdSameArg2Names: Set<String> = root.wordSet("simdSameArg2Names")
+        val simdNoPeerInferExpected: Set<String> = root.wordSet("simdNoPeerInferExpected")
+        val simdNoExpectedTargetPropagation: Set<String> = root.wordSet("simdNoExpectedTargetPropagation")
+        val rustGlobalAllocActionsByName: Map<String, DeclarativeReplacementAction> =
+            root.mappingList("rustGlobalAllocRules").associate { node ->
+                node.string("name") to DeclarativeReplacementAction.fromYaml(node)
+            }
+    }
+
+    object PathsConstsAndCAbi {
+        private val root: YamlNode.Mapping = parseCatalog("paths-consts-and-c-abi.yml")
+
+        val rustFloatMathConstants: Map<String, Pair<String, String>> =
+            root.mappingList("rustFloatMathConstants").associate { node ->
+                node.string("name") to (node.string("f32") to node.string("f64"))
+            }
+        val intBitsByPrim: Map<String, String> = root.stringMap("intBitsByPrim")
+        val f32AssocConstTemplates: Map<String, YamlTemplate> =
+            root.stringMap("f32AssocConstTemplates").mapValues { (_, pat) -> YamlTemplate.compile(pat) }
+        val f64AssocConstTemplates: Map<String, YamlTemplate> =
+            root.stringMap("f64AssocConstTemplates").mapValues { (_, pat) -> YamlTemplate.compile(pat) }
+        val f16F128AssocConsts: Set<String> = root.wordSet("f16F128AssocConsts")
+        val booleanCastSourceMethods: Set<String> = root.wordSet("booleanCastSourceMethods")
+        val valuePosInstanceConvMethods: Set<String> = root.wordSet("valuePosInstanceConvMethods")
+        val selfTypeToRustPrim: Map<String, String> = root.stringMap("selfTypeToRustPrim")
+        val synOptionalParsePeekTokenAliases: Map<String, String> = root.stringMap("synOptionalParsePeekTokenAliases")
+        val synSelfPeekingTokenClasses: Set<String> = root.wordSet("synSelfPeekingTokenClasses")
+        val stdlibCoreUnitStructs: Map<String, String> = root.stringMap("stdlibCoreUnitStructs")
+
+        val externalReexportSearchCrates: List<String> = root.explicitStringList("externalReexportSearchCrates")
+        val coreRootPrimitiveWrapperSymbols: Set<String> = root.wordSet("coreRootPrimitiveWrapperSymbols")
+        val coreMemSubpkgSymbols: Set<String> = root.wordSet("coreMemSubpkgSymbols")
+        val highArchSegs: Set<String> = root.wordSet("highArchSegs")
+        val bsdFamilySegs: Set<String> = root.wordSet("bsdFamilySegs")
+        val unixBiasSegs: Set<String> = root.wordSet("unixBiasSegs")
+        val bits32PenaltySegs: Set<String> = root.wordSet("bits32PenaltySegs")
+        val unixFamilySegs: Set<String> = root.wordSet("unixFamilySegs")
+        val foreignPlatformSegs: Set<String> = root.wordSet("foreignPlatformSegs")
+        val nonSignificantSegs: Set<String> = root.wordSet("nonSignificantSegs")
+        val wasiForeignPenaltySegs: Set<String> = root.wordSet("wasiForeignPenaltySegs")
+        val wasipVersionSegs: Set<String> = root.wordSet("wasipVersionSegs")
+        val kotlinBuiltinQualifySimpleTypeNames: Set<String> = root.wordSet("kotlinBuiltinQualifySimpleTypeNames")
+        val stdlibUnimportedSubmodules: Set<String> = root.wordSet("stdlibUnimportedSubmodules")
+        val coreMemIntrinsics: Set<String> = root.wordSet("coreMemIntrinsics")
+        val stdlibCoreSubmodules: Set<String> = root.wordSet("stdlibCoreSubmodules")
+        val coreIntrinsicOrPreludeLeaves: Set<String> = root.wordSet("coreIntrinsicOrPreludeLeaves")
+        val stdlibCellTypes: Set<String> = root.wordSet("stdlibCellTypes")
+        val stdlibPrimitiveOrPreludeSecondSegs: Set<String> = root.wordSet("stdlibPrimitiveOrPreludeSecondSegs")
+        val stdlibUnindexedSkipSecondSegs: Set<String> = root.wordSet("stdlibUnindexedSkipSecondSegs")
+        val stdlibAllowedWildcardSubmodules: Set<String> = root.wordSet("stdlibAllowedWildcardSubmodules")
+        val unloweredStdModules: Set<String> = root.wordSet("unloweredStdModules")
+        val windowsOsPreludeSyms: List<String> = root.explicitStringList("windowsOsPreludeSyms")
+        val unixOsPreludeSyms: List<String> = root.explicitStringList("unixOsPreludeSyms")
+        val floatOrConstsSegs: Set<String> = root.wordSet("floatOrConstsSegs")
+        val dropMarkerLeaves: Set<String> = root.wordSet("dropMarkerLeaves")
+        val constPanicOrErrorSuffixes: List<String> = root.explicitStringList("constPanicOrErrorSuffixes")
+
+        val cAbiBridgeDescriptorNodes: List<YamlNode.Mapping> = root.mappingList("cAbiBridgeDescriptors")
     }
 }

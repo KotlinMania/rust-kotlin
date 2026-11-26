@@ -451,3 +451,295 @@ methodCallPatternRules:
     arity: 0
     noTurbofish: true
     replace: "{recv}.firstOrNull()"
+
+  # --- `core::str::Chars` iterator methods ---
+  - { receiver: charsIter, match: "next", arity: 0, replace: "{recvAtom}.next()" }
+  - { receiver: charsIter, match: "as_str", arity: 0, replace: "{recvAtom}.asStr()" }
+  - { receiver: charsIter, match: "clone", arity: 0, replace: "{recvAtom}.clone()" }
+  - { receiver: charsIter, match: "enumerate", arity: 0, replace: "{recvAtom}.enumerate()" }
+
+  # --- `fmt::Formatter` / `StringBuilder` write methods ---
+  - receiver: fmtBuilder
+    match: "write_str write_char pad write_fmt"
+    arity: 1
+    replace: "{recv}.append({arg0})"
+
+  # --- General iterator / token / debug / queue transform methods ---
+  - { receiver: generalTransform, match: "append_all", arity: 1, replace: "for (item in {arg0}) item.toTokens({recv})" }
+  - { receiver: generalTransform, match: "find", arity: 1, replace: "{recv}.indexOf({arg0}).takeIf {{ it >= 0 }}" }
+  - { receiver: generalTransform, match: "position", arity: 1, replace: "{recvAtom}.indexOfFirst({arg0}).takeIf {{ it >= 0 }}" }
+  - { receiver: generalTransform, match: "rposition", arity: 1, replace: "{recvAtom}.indexOfLast({arg0}).takeIf {{ it >= 0 }}" }
+  - { receiver: generalTransform, match: "enumerate", arity: 0, replace: "{recvAtom}.mapIndexed {{ index, item -> Pair(index, item) }}" }
+  - { receiver: generalTransform, match: "debug_struct", arity: 1, unlessDeclaredTypes: "DebugStruct", replace: "DebugStruct({recv}, {arg0})" }
+  - { receiver: generalTransform, match: "debug_tuple", arity: 1, unlessDeclaredTypes: "DebugTuple", replace: "DebugTuple({recv}, {arg0})" }
+  - { receiver: generalTransform, match: "push_back", arity: 1, replace: "{recv}.addLast({arg0})" }
+
+  # --- Mutable `Vec`, `Map`, and `Set` container methods ---
+  - { receiver: vecMut, match: "push", arity: 1, replace: "{recv}.add({arg0})" }
+  - { receiver: vecMut, match: "insert", arity: 2, replace: "{recv}.add({arg0}, {arg1})" }
+  - { receiver: vecMut, match: "clone_from", arity: 1, replace: "run {{ {recv}.clear(); {recv}.addAll({arg0}) }}" }
+  - { receiver: mapMut, match: "insert", arity: 2, replace: "{recvAtom}.put({arg0}, {arg1})" }
+  - { receiver: mapMut, match: "clone", arity: 0, replace: "{recvAtom}.toMutableMap()" }
+  - { receiver: mapMut, match: "get get_mut", arity: 1, replace: "{recvAtom}.get({arg0})" }
+  - { receiver: setMut, match: "clone", arity: 0, replace: "{recvAtom}.toMutableSet()" }
+
+  # --- String prefix/suffix stripping, `ArrayDeque` inspection & `RustAny` reflection ---
+  - { receiver: stringStrip, match: "strip_prefix", arity: 1, replace: "{recvAtom}.takeIf {{ it.startsWith({arg0}) }}?.removePrefix({arg0})" }
+  - { receiver: stringStrip, match: "strip_suffix", arity: 1, replace: "{recvAtom}.takeIf {{ it.endsWith({arg0}) }}?.removeSuffix({arg0})" }
+  - { receiver: dequeSliceHint, match: "as_slice", arity: 0, replace: "{recvAtom}.toList()" }
+  - { receiver: dequeSliceHint, match: "size_hint", arity: 0, replace: "run {{ val n = {recvAtom}.size; Pair(n, n) }}" }
+  - { receiver: rustAny, match: "is", arity: 0, requireTypeArgs: true, replace: "{recvAtom}.isType{typeArgs}()" }
+  - { receiver: rustAny, match: "downcast_ref", arity: 0, requireTypeArgs: true, replace: "{recvAtom}.downcastRef{typeArgs}()" }
+  - { receiver: rustAny, match: "downcast_mut", arity: 0, requireTypeArgs: true, replace: "{recvAtom}.downcastMut{typeArgs}()" }
+  - { receiver: rustAny, match: "downcast", arity: 0, requireTypeArgs: true, replace: "{recvAtom}.downcast{typeArgs}()" }
+
+  # --- Erased nullable `Option<T>` (`T?`) combinator methods ---
+  - { receiver: erasedOption, match: "unwrap", arity: 0, replace: "{recvAtom}!!" }
+  - { receiver: erasedOption, match: "expect", arity: 1, replace: "({recv} ?: error({arg0}))" }
+  - { receiver: erasedOption, match: "clone cloned copied flatten", arity: 0, replace: "{recv}" }
+  - { receiver: erasedOption, match: "into_iter", arity: 0, replace: "ArrayDeque(listOfNotNull({recv}))" }
+  - { receiver: erasedOption, match: "map and_then", arity: 1, replace: "{recvAtom}?.let({cb0})" }
+  - { receiver: erasedOption, match: "map_or_else", arity: 2, replace: "({recvAtom}?.let({cb1}) ?: {zeroClosure0})" }
+
+  # --- Unconstrained `PartialOrd` / `Ord` generic runtime value comparisons ---
+  - receiver: unconstrainedCmp
+    match: "partial_cmp partialCmp"
+    arity: 1
+    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+    replace: "kmPartialCompareValues({recv}, {arg0})?.let {{ cmpSign -> when {{ cmpSign < 0 -> {ordRef}.Less; cmpSign > 0 -> {ordRef}.Greater; else -> {ordRef}.Equal }} }}"
+
+  - receiver: unconstrainedCmp
+    match: "cmp"
+    arity: 1
+    imports: ["{coreNs}.mem.kmCompareValues"]
+    replace: "kmCompareValues({recv}, {arg0}).let {{ cmpSign -> when {{ cmpSign < 0 -> {ordRef}.Less; cmpSign > 0 -> {ordRef}.Greater; else -> {ordRef}.Equal }} }}"
+
+  - receiver: unconstrainedCmp
+    match: "lt"
+    arity: 1
+    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+    replace: "(kmPartialCompareValues({recv}, {arg0})?.let {{ cmpSign -> cmpSign < 0 }} == true)"
+
+  - receiver: unconstrainedCmp
+    match: "le"
+    arity: 1
+    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+    replace: "(kmPartialCompareValues({recv}, {arg0})?.let {{ cmpSign -> cmpSign <= 0 }} == true)"
+
+  - receiver: unconstrainedCmp
+    match: "gt"
+    arity: 1
+    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+    replace: "(kmPartialCompareValues({recv}, {arg0})?.let {{ cmpSign -> cmpSign > 0 }} == true)"
+
+  - receiver: unconstrainedCmp
+    match: "ge"
+    arity: 1
+    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+    replace: "(kmPartialCompareValues({recv}, {arg0})?.let {{ cmpSign -> cmpSign >= 0 }} == true)"
+
+  - receiver: unconstrainedCmp
+    match: "__chaining_less chainingLess"
+    arity: 1
+    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+    replace: "kmPartialCompareValues({recv}, {arg0}).let {{ cmpSign -> if (cmpSign == 0) {cfRef}.Continue<Boolean, Unit>(Unit) else {cfRef}.Break<Boolean, Unit>(cmpSign != null && cmpSign < 0) }}"
+
+  - receiver: unconstrainedCmp
+    match: "__chaining_greater chainingGreater"
+    arity: 1
+    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+    replace: "kmPartialCompareValues({recv}, {arg0}).let {{ cmpSign -> if (cmpSign == 0) {cfRef}.Continue<Boolean, Unit>(Unit) else {cfRef}.Break<Boolean, Unit>(cmpSign != null && cmpSign > 0) }}"
+
+# ==============================================================================
+# Declarative Free & Associated Function Call Pattern/Replacement Rules
+# ==============================================================================
+
+calleePatternRules:
+  - { match: "drop", matchSuffix: "mem.drop", arity: 1, unlessDeclaredTopFns: "drop", replace: "({arg0}).let {{ }}" }
+  - { matchSuffix: "TypeId.of RustTypeId.of", arity: 0, replace: "RustTypeId.of{turbofish}()" }
+  - { match: "Cow.Borrowed Cow.Owned", matchSuffix: "Cow.Borrowed Cow.Owned", arity: 1, unlessDeclaredTypes: "Cow", replace: "{arg0}" }
+  - { match: "Box.new", matchOnBase: false, arity: 1, unlessDeclaredTypes: "Box", replace: "{arg0}" }
+  - { match: "Rc.new", matchOnBase: false, arity: 1, unlessDeclaredTypes: "Rc", replace: "{arg0}" }
+  - { match: "Arc.new", matchOnBase: false, arity: 1, unlessDeclaredTypes: "Arc", replace: "{arg0}" }
+  - { match: "NoDrop.new", matchOnBase: false, arity: 1, unlessDeclaredTypes: "NoDrop", replace: "{arg0}" }
+  - { match: "ManuallyDrop.new", matchOnBase: false, arity: 1, unlessDeclaredTypes: "ManuallyDrop", replace: "{arg0}" }
+  - { match: "Vec.new", matchOnBase: false, arity: 0, unlessDeclaredTypes: "Vec", replace: "mutableListOf()" }
+  - { match: "Vec.withCapacity", matchOnBase: false, arity: 1, unlessDeclaredTypes: "Vec", replace: "ArrayList({arg0})" }
+  - { match: "Vec.from", matchOnBase: false, arity: 1, unlessDeclaredTypes: "Vec", replace: "{arg0}.toMutableList()" }
+  - { match: "VecDeque.from", matchOnBase: false, arity: 1, unlessDeclaredTypes: "VecDeque", replace: "ArrayDeque({arg0})" }
+  - { match: "String.new String.withCapacity", maxArity: 1, unlessDeclaredTypes: "String", replace: "\"\"" }
+  - { match: "HashMap.new BTreeMap.new HashMap.withCapacity BTreeMap.withCapacity", maxArity: 1, unlessDeclaredTypes: "HashMap BTreeMap", replace: "mutableMapOf{turbofish}()" }
+  - { match: "HashSet.new BTreeSet.new HashSet.withCapacity BTreeSet.withCapacity", maxArity: 1, unlessDeclaredTypes: "HashSet BTreeSet", replace: "mutableSetOf{turbofish}()" }
+  - { match: "empty iter.empty", matchOnBase: false, arity: 0, unlessTopSignatures: "empty", replace: "ArrayDeque()" }
+  - { match: "once", matchSuffix: "iter.once", arity: 1, unlessTopSignatures: "once", unlessDeclaredTopFns: "once", replace: "listOf{turbofish}({arg0})" }
+  - { match: "min cmp.min", matchOnBase: false, arity: 2, unlessDeclaredTopFns: "min", replace: "minOf({arg0}, {arg1})" }
+
+# ==============================================================================
+# Method, Call, Type-Inference & Trait Lowering Classification Catalogs
+# ==============================================================================
+
+rawPointerArithMethods:
+  - "offset add sub wrapping_offset wrapping_add wrapping_sub"
+  - "byte_offset byte_add byte_sub wrapping_byte_offset wrapping_byte_add wrapping_byte_sub"
+
+rawAbiByteOffsetMethods: "byte_offset byte_add byte_sub wrapping_byte_offset wrapping_byte_add wrapping_byte_sub"
+iterReceiverMethods: "iter iter_mut into_iter"
+pointerDistanceSubMethods: "checked_sub wrapping_sub unchecked_sub saturating_sub offset_from offset_from_unsigned sub_ptr byte_offset_from"
+indexedIterUnwrapMethods: "zip any all map filter filter_map flat_map fold for_each forEach enumerate count sum find position"
+
+numericReceiverKindMethods:
+  - "wrapping_add wrapping_sub wrapping_mul wrapping_div wrapping_rem wrapping_shl wrapping_shr"
+  - "unchecked_shl unchecked_shr checked_add checked_sub checked_mul checked_div checked_rem"
+  - "checked_div_euclid checked_rem_euclid checked_shl checked_shr checked_pow"
+  - "saturating_add saturating_sub saturating_mul overflowing_add overflowing_sub overflowing_mul"
+  - "overflowing_shl overflowing_shr div_euclid rem_euclid rotate_left rotate_right"
+  - "pow powf powi min max atan2 hypot log mul_add to_digit"
+
+u32ShiftOrExpMethods:
+  - "wrapping_shl wrapping_shr checked_shl checked_shr overflowing_shl overflowing_shr"
+  - "rotate_left rotate_right pow checked_pow"
+
+atomicSingleValueMethods: "store swap fetch_add fetch_sub fetch_and fetch_or fetch_xor fetch_max fetch_min"
+stringLikeTypes: "String CharSequence StringBuilder"
+optionBorrowIdentityMethods: "as_deref as_deref_mut as_ref as_mut"
+sizedCollectionPrefixes: ["List<", "MutableList<", "Set<", "MutableSet<", "Map<", "MutableMap<", "Collection<", "ArrayDeque<"]
+intoIterCollectionPrefixes: ["Iterable<", "Collection<", "List<", "MutableList<", "Set<", "MutableSet<"]
+stdlibIntTypes: "Byte Short Int Long I128 UByte UShort UInt ULong U128"
+
+tryIntoFromOnlyTargetsBySrc:
+  Byte: "Short Long I128"
+  Short: "Long I128"
+  Long: "I128"
+  UByte: "Short Int Long I128 UShort UInt ULong U128"
+  UShort: "Long I128 UInt ULong U128"
+  UInt: "Long I128 ULong U128"
+  ULong: "I128 U128"
+
+coreSliceOrPtrMethods: "asPtr asMutPtr chunksMut chunks"
+nonSliceCoreOwnerTypes: "MaybeUninit ConstPtr MutPtr AddressableLocal AddressableArrayLocal"
+peekMacroMethods: "peek peek2 peek3"
+callbackWrapMethods: "map map_err and_then or_else"
+
+integerCompanionMinMaxOwners: "Byte UByte Short UShort Int UInt Long ULong"
+companionConvertPrimitivesExtra: "I128 U128 Boolean Float Double F16 F128"
+knownStdUfcsReceiverMethods:
+  - "clone cmp partialCmp eq ne hash fmt deref derefMut asRef borrow borrowMut"
+  - "toString toOwned writeFmt write writeAll flush read readExact readToEnd readToString"
+
+primitiveArraySpecs:
+  - { arrayType: BooleanArray, elemType: Boolean, layoutFactory: booleanArray }
+  - { arrayType: ByteArray, elemType: Byte, numericKind: I8, layoutFactory: byteArray }
+  - { arrayType: UByteArray, elemType: UByte, numericKind: U8, layoutFactory: uByteArray }
+  - { arrayType: ShortArray, elemType: Short, numericKind: I16, layoutFactory: shortArray }
+  - { arrayType: UShortArray, elemType: UShort, numericKind: U16, layoutFactory: uShortArray }
+  - { arrayType: IntArray, elemType: Int, numericKind: I32, layoutFactory: intArray }
+  - { arrayType: UIntArray, elemType: UInt, numericKind: U32, layoutFactory: uIntArray }
+  - { arrayType: LongArray, elemType: Long, numericKind: I64, layoutFactory: longArray }
+  - { arrayType: ULongArray, elemType: ULong, numericKind: U64, layoutFactory: uLongArray }
+  - { arrayType: FloatArray, elemType: Float, numericKind: F32, layoutFactory: floatArray }
+  - { arrayType: DoubleArray, elemType: Double, numericKind: F64, layoutFactory: doubleArray }
+
+numericKindByElem:
+  Byte: I8
+  UByte: U8
+  Short: I16
+  UShort: U16
+  Int: I32
+  UInt: U32
+  Long: I64
+  ULong: U64
+  I128: I128
+  U128: U128
+  F16: F16
+  Float: F32
+  kotlin.Float: F32
+  Double: F64
+  F128: F128
+
+strPrimitiveParseMethods:
+  Boolean: "toBooleanStrictOrNull()"
+  Byte: "toByteOrNull()"
+  UByte: "toUByteOrNull()"
+  Short: "toShortOrNull()"
+  UShort: "toUShortOrNull()"
+  Int: "toIntOrNull()"
+  UInt: "toUIntOrNull()"
+  Long: "toLongOrNull()"
+  ULong: "toULongOrNull()"
+  Float: "toFloatOrNull()"
+  kotlin.Float: "toFloatOrNull()"
+  Double: "toDoubleOrNull()"
+
+mapSimpleNames: "MutableMap Map LinkedHashMap HashMap"
+setSimpleNames: "MutableSet Set LinkedHashSet HashSet"
+indexedSliceBases: "List MutableList Array ArrayDeque"
+
+nonOptionMethodNames: "ok_or ok_or_else is_ok is_err is_some is_none map_err to_lowercase to_uppercase"
+optionChainPreservingMethods: "map and_then flatten or or_else as_ref as_mut cloned copied filter"
+nullableNewWrapperOwners: "NonNull NonZero Alignment"
+layoutQueryFnIdents: "size_of size_of_val align_of align_of_val"
+mutPtrContainerBases: "NonNull Unique BoxRaw"
+endianIntMethods: "to_be from_be swap_bytes to_le from_le"
+optionUnwrapSingleArgMethods: "expect unwrap_or unwrap_or_else"
+optionZeroArgIdentityMethods: "cloned copied as_ref as_mut"
+atomicValueReturningMethods: "load swap into_inner fetch_add fetch_sub fetch_and fetch_or fetch_xor fetch_max fetch_min"
+
+fmtDebugBuilderReturns:
+  debug_struct: DebugStruct
+  debug_tuple: DebugTuple
+  debug_list: DebugList
+  debug_set: DebugSet
+  debug_map: DebugMap
+
+floatSuffixNumericKinds:
+  f16: F16
+  f32: F32
+  f64: F64
+  f128: F128
+
+intSuffixNumericKinds:
+  i8: I8
+  u8: U8
+  i16: I16
+  u16: U16
+  i32: I32
+  u32: U32
+  i64: I64
+  u64: U64
+  i128: I128
+  u128: U128
+
+numericCoerceSuffixByKind:
+  U8: "toUByte()"
+  U16: "toUShort()"
+  U32: "toUInt()"
+  U64: "toULong()"
+  I8: "toByte()"
+  I16: "toShort()"
+  I32: "toInt()"
+  I64: "toLong()"
+  F32: "toFloat()"
+  F64: "toDouble()"
+
+coreOpsOutputAssocTraits: "Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr Neg Not"
+
+stdlibDefaultlessAssocTypes:
+  Iterator: [Item]
+  IntoIterator: [Item, IntoIter]
+  Fn: [Output]
+  FnMut: [Output]
+  FnOnce: [Output]
+  Try: [Output, Residual]
+  Deref: [Target]
+  SliceIndex: [Output]
+  Future: [Output]
+  IntoFuture: [Output, IntoFuture]
+  FromStr: [Err]
+  TryFrom: [Error]
+  TryInto: [Error]
+  Pattern: [Searcher]
+  BuildHasher: [Hasher]
+  DoubleEndedIterator: [Item]
+  ExactSizeIterator: [Item]
+  FusedIterator: [Item]
+  AsyncIterator: [Item]
