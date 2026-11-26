@@ -49,7 +49,6 @@ tools/ast_distance/build/
 tools/ast_distance
 tools/*
 !tools/check-native-cli.py
-!tools/sync-yaml-rules.py
 
 # JVM heap dumps
 *.hprof

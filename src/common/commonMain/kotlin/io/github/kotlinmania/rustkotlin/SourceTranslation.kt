@@ -67,7 +67,7 @@ internal fun translateRustSourceToKotlinArtifacts(
     }
 
 private val UNSIGNED_ARRAY_IDENTS: Set<String>
-    get() = YamlRuleCatalogs.PathsConstsAndCAbi.unsignedArrayIdents
+    get() = activeRules().words("unsignedArrayIdents")
 
 internal class IndexedFnEntry(
     val order: Int,
@@ -958,7 +958,7 @@ private class KotlinFileImportSynthesizer(
         val hasCoreCrate = "core" in headerContext.crateNamespaces
         return buildList {
             var emittedAlwaysFfi = false
-            for (route in YamlRuleCatalogs.PathsConstsAndCAbi.coreAutoImportRoutes) {
+            for (route in activeRules().coreImportRoutes("coreAutoImportRoutes")) {
                 if (route.condition != "always" && !emittedAlwaysFfi) {
                     emittedAlwaysFfi = true
                     if (!headerContext.rawAbiMode) {
@@ -990,7 +990,7 @@ private class KotlinFileImportSynthesizer(
         bodyTokens: KotlinCodeTokenIndex,
         combinedExtraTypeImports: MutableSet<String>,
     ) {
-        for ((ownerSubpkg, variants) in YamlRuleCatalogs.PathsConstsAndCAbi.coreEnumVariantImports) {
+        for ((ownerSubpkg, variants) in activeRules().coreEnumVariantImports) {
             val variantOwner = "$activeCoreNs.$ownerSubpkg"
             val ownerPkg = variantOwner.substringBeforeLast('.')
             for (variantName in variants) {
@@ -1010,7 +1010,7 @@ private class KotlinFileImportSynthesizer(
         bodyTokens: KotlinCodeTokenIndex,
     ): List<Pair<String, String>> =
         buildList {
-            for (route in YamlRuleCatalogs.PathsConstsAndCAbi.coreExtensionImportRoutes) {
+            for (route in activeRules().coreImportRoutes("coreExtensionImportRoutes")) {
                 val active =
                     when (route.condition) {
                         "always" -> true

@@ -53,11 +53,11 @@ internal fun KotlinJ2KEmitter.isSelfParameterizedTraitName(ktTrait: String): Boo
         ktTrait in KNOWN_SELF_PARAMETERIZED_TRAITS
 }
 
-private val CORE_OPS_OUTPUT_ASSOC_TRAITS: Set<String> =
-    YamlRuleCatalogs.TypeAndMethodPatterns.coreOpsOutputAssocTraits
+private val CORE_OPS_OUTPUT_ASSOC_TRAITS: Set<String>
+    get() = activeRules().words("coreOpsOutputAssocTraits")
 
-private val STDLIB_DEFAULTLESS_ASSOC_TYPES: Map<String, List<String>> =
-    YamlRuleCatalogs.TypeAndMethodPatterns.stdlibDefaultlessAssocTypes
+private val STDLIB_DEFAULTLESS_ASSOC_TYPES: Map<String, List<String>>
+    get() = activeRules().stdlibDefaultlessAssocTypes
 
 internal fun KotlinJ2KEmitter.lookupTraitDefaultlessAssocTypes(ktTrait: String, traitPath: Path? = null): List<String> {
     lookupScopedTraitMetadata(

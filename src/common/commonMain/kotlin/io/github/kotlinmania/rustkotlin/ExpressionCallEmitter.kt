@@ -11,7 +11,7 @@ import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.TraitItem
 
 private val HOMOGENEOUS_BINARY_SIMD_INTRINSICS: Set<String>
-    get() = YamlRuleCatalogs.CoreIntrinsics.homogeneousBinarySimdIntrinsics
+    get() = activeRules().words("homogeneousBinarySimdIntrinsics")
 
 private val BYTE_SWAP_CALLEE_KIND: Map<String, NumericKind?> =
     buildMap {
@@ -35,13 +35,13 @@ private val BYTE_SWAP_CALLEE_KIND: Map<String, NumericKind?> =
     }
 
 private val INTEGER_COMPANION_MIN_MAX_OWNERS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.integerCompanionMinMaxOwners
+    get() = activeRules().words("integerCompanionMinMaxOwners")
 
 private val COMPANION_CONVERT_PRIMITIVES: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.companionConvertPrimitives
+    get() = activeRules().unionWords("integerCompanionMinMaxOwners", "companionConvertPrimitivesExtra")
 
 private val KNOWN_STD_UFCS_RECEIVER_METHODS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.knownStdUfcsReceiverMethods
+    get() = activeRules().words("knownStdUfcsReceiverMethods")
 
 private fun isFmtTraitMethodCallee(calleeBase: String): Boolean {
     if (!calleeBase.endsWith(".fmt")) return false
@@ -746,7 +746,7 @@ private object YamlCalleePatternDispatchRule : CalleeDispatchRule() {
     override fun tryRender(ctx: CallLoweringContext): String? {
         val emitter = ctx.emitter
         val argCount = ctx.nonUnitArgs.size
-        for (rule in YamlRuleCatalogs.TypeAndMethodPatterns.calleePatternRules) {
+        for (rule in activeRules().calleeRules) {
             if (rule.matches(
                     callee = ctx.callee,
                     calleeBase = ctx.calleeBase,
@@ -1136,8 +1136,9 @@ internal fun KotlinJ2KEmitter.resolveOptionalSynParsePeekToken(innerTarget: Stri
     if (innerTarget.isEmpty() || !innerTarget.all { it.isLetterOrDigit() || it == '_' || it == '.' }) {
         return null
     }
-    YamlRuleCatalogs.PathsConstsAndCAbi.synOptionalParsePeekTokenAliases[innerTarget]?.let { return it }
-    if (innerTarget in YamlRuleCatalogs.PathsConstsAndCAbi.synSelfPeekingTokenClasses ||
+    val rules = activeRules()
+    rules.map("synOptionalParsePeekTokenAliases")[innerTarget]?.let { return it }
+    if (innerTarget in rules.words("synSelfPeekingTokenClasses") ||
         innerTarget in SYN_PUNCT_TOKEN_CLASS_NAMES ||
         innerTarget in SYN_KEYWORD_TOKEN_CLASS_NAMES ||
         innerTarget.startsWith("token.") ||

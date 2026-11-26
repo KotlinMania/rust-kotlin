@@ -11,11 +11,11 @@ import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.UnOp
 
-private val ITER_RECEIVER_METHODS: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.iterReceiverMethods
-private val POINTER_DISTANCE_SUB_METHODS: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.pointerDistanceSubMethods
-private val INDEXED_ITER_UNWRAP_METHODS: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.indexedIterUnwrapMethods
-private val NUMERIC_RECEIVER_KIND_METHODS: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.numericReceiverKindMethods
-private val U32_SHIFT_OR_EXP_METHODS: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.u32ShiftOrExpMethods
+private val ITER_RECEIVER_METHODS: Set<String> get() = activeRules().words("iterReceiverMethods")
+private val POINTER_DISTANCE_SUB_METHODS: Set<String> get() = activeRules().words("pointerDistanceSubMethods")
+private val INDEXED_ITER_UNWRAP_METHODS: Set<String> get() = activeRules().words("indexedIterUnwrapMethods")
+private val NUMERIC_RECEIVER_KIND_METHODS: Set<String> get() = activeRules().words("numericReceiverKindMethods")
+private val U32_SHIFT_OR_EXP_METHODS: Set<String> get() = activeRules().words("u32ShiftOrExpMethods")
 
 private fun unwrapTrailingIterReceiver(expr: Expr): Expr {
     val mc = expr as? Expr.MethodCall ?: return expr
@@ -466,34 +466,95 @@ private class MethodCallLoweringContext(
         return synPath.path.lastCleanIdent() == "NonNull"
     }
 
-    fun tryRenderPostArgPatternRule(
-        rulesByMethod: Map<String, DeclarativeMethodPatternRule>,
-        receiverGuard: String,
-    ): String? {
-        val rule = rulesByMethod[rawMethod] ?: return null
-        if (!rule.matchesHeader(rawMethod, receiverGuard, renderedValueArgs.size, typeArgs.isNotEmpty(), emitter.inspector.declaredTypeNames)) {
-            return null
+    private fun matchesReceiverGuard(guard: String): Boolean {
+        val headerCtx = emitter.headerContext
+        return when (guard) {
+            "any", "fmtOrQueue" -> true
+            "potentialOption" ->
+                !emitter.hasDeclaredOptionEnum() &&
+                    !emitter.isKnownNonNullableNonOptionReceiver(expr.receiver, receiver, selfTypeName)
+            "nullableOption" ->
+                emitter.isKnownNullableOptionExpr(expr.receiver, receiver, selfTypeName)
+            "erasedOption" ->
+                !emitter.hasDeclaredOptionEnum() &&
+                    emitter.isKnownNullableOptionExpr(expr.receiver, receiver, selfTypeName) &&
+                    !(rawMethod == "map" && allMethodArgs.size == 1 && emitter.isTransparentWrapperOrIdentityMapArg(allMethodArgs[0]))
+            "dequeIter" -> isDequeIterReceiver
+            "dequeOrIter" ->
+                receiver in emitter.currentDequeLocals ||
+                    isDequeIterReceiver ||
+                    inferredRecvTy?.startsWith("ArrayDeque<") == true
+            "vec" -> isVecReceiver
+            "vecOrMutableList" -> isVecReceiver || localOrInferredRecvTy?.startsWith("MutableList<") == true
+            "map" -> {
+                val collTy = emitter.currentTypedLocals[receiver] ?: emitter.inferExprRenderedType(expr.receiver, selfTypeName)
+                isMapRenderedType(collTy)
+            }
+            "set" -> {
+                val collTy = emitter.currentTypedLocals[receiver] ?: emitter.inferExprRenderedType(expr.receiver, selfTypeName)
+                isSetRenderedType(collTy)
+            }
+            "charsIter" -> {
+                val recvTy = localOrInferredRecvTy
+                "core" in headerCtx.crateNamespaces &&
+                    (recvTy == "Chars" || recvTy?.endsWith(".Chars") == true) &&
+                    !(headerCtx.packageName == "$coreNs.str.iter" && selfTypeName == "Chars")
+            }
+            "fmtBuilder" -> emitter.isFmtStringBuilderReceiver(expr.receiver, receiver, selfTypeName)
+            "stringOrUninferred" -> inferredRecvTy == null || inferredRecvTy == "String"
+            "rustAny" -> inferredRecvTy == "RustAny"
+            else -> false
         }
-        return rule.action.render(
+    }
+
+    fun tryRenderDeclarativeMethodRules(
+        rulesByName: Map<String, List<DeclarativeMethodPatternRule>>,
+        preArg: Boolean,
+    ): String? {
+        val candidates = rulesByName[rawMethod] ?: return null
+        val argCount = if (preArg) nonUnitArgs.size else renderedValueArgs.size
+        val hasTurbofish = if (preArg) expr.turbofish != null else typeArgs.isNotEmpty()
+        val declaredTypes = emitter.inspector.declaredTypeNames
+        val instanceMethods = emitter.inspector.instanceMethodsByType.values
+        val matched =
+            candidates.firstOrNull { rule ->
+                rule.matches(
+                    rawMethod = rawMethod,
+                    argCount = argCount,
+                    hasTurbofish = hasTurbofish,
+                    declaredTypeNames = declaredTypes,
+                    instanceMethodSets = instanceMethods,
+                    receiverPredicate = ::matchesReceiverGuard,
+                )
+            } ?: return null
+        return matched.action.render(
             rawAbi = emitter.headerContext.rawAbiMode,
             onImport = { CoreIntrinsicLowering.registerCoreImport(emitter, it) },
         ) { key ->
             when (key) {
                 "recv" -> receiver
                 "recvAtom" -> recvAtom
-                "typeArgs" -> typeArgs
+                "typeArgs" -> if (preArg) "" else typeArgs
                 "coreNs" -> coreNs
-                "arg0" -> renderedValueArgs.getOrNull(0)
-                "arg1" -> renderedValueArgs.getOrNull(1)
+                "arg0" -> if (preArg) null else renderedValueArgs.getOrNull(0)
+                "arg1" -> if (preArg) null else renderedValueArgs.getOrNull(1)
                 "cb0" ->
-                    allMethodArgs.getOrNull(0)?.let { argExpr ->
-                        renderedValueArgs.getOrNull(0)?.let { emitter.wrapMapCallbackArg(argExpr, it) }
+                    if (preArg) {
+                        null
+                    } else {
+                        allMethodArgs.getOrNull(0)?.let { argExpr ->
+                            renderedValueArgs.getOrNull(0)?.let { emitter.wrapMapCallbackArg(argExpr, it) }
+                        }
                     }
                 "cb1" ->
-                    allMethodArgs.getOrNull(1)?.let { argExpr ->
-                        renderedValueArgs.getOrNull(1)?.let { emitter.wrapMapCallbackArg(argExpr, it) }
+                    if (preArg) {
+                        null
+                    } else {
+                        allMethodArgs.getOrNull(1)?.let { argExpr ->
+                            renderedValueArgs.getOrNull(1)?.let { emitter.wrapMapCallbackArg(argExpr, it) }
+                        }
                     }
-                "zeroClosure0" -> renderedValueArgs.getOrNull(0)?.let(emitter::unwrapZeroArgClosureText)
+                "zeroClosure0" -> if (preArg) null else renderedValueArgs.getOrNull(0)?.let(emitter::unwrapZeroArgClosureText)
                 else -> null
             }
         }
@@ -501,7 +562,7 @@ private class MethodCallLoweringContext(
 
     companion object {
         private val ATOMIC_SINGLE_VALUE_METHODS: Set<String>
-            get() = YamlRuleCatalogs.TypeAndMethodPatterns.atomicSingleValueMethods
+            get() = activeRules().words("atomicSingleValueMethods")
         private val RAW_PTR_OWNER_NAMES = wordSet("MutPtr ConstPtr")
     }
 }
@@ -552,8 +613,8 @@ private object RawPointerMethodCallRule : MethodLoweringRule() {
                 CoreIntrinsicLowering.registerCoreImport(emitter, "$ptrPkg.$ptrCtor")
                 return "$ptrCtor<$destinationPointee>(($receiver).rawAddress)"
             }
-            val ptrRule = YamlRuleCatalogs.TypeAndMethodPatterns.rawPtrMethodRules[rawMethod]
-            if (ptrRule != null && ptrRule.matchesHeader(rawMethod, "rawPtr", nonUnitArgs.size, expr.turbofish != null)) {
+            val ptrRule = activeRules().rawPtrMethodRulesByName[rawMethod]
+            if (ptrRule != null && ptrRule.matches(rawMethod, nonUnitArgs.size, expr.turbofish != null) { true }) {
                 var cachedLayout: String? = null
                 val renderedArgs = arrayOfNulls<String>(nonUnitArgs.size)
                 return ptrRule.action.render(
@@ -647,12 +708,6 @@ private object EarlyReceiverStateAndCollectionRule : MethodLoweringRule() {
         if (rawMethod == "is_empty" && noTurbofish && ctx.refCellInnerType() != null) {
             return "${ctx.recvAtom}.value.isEmpty()"
         }
-        if ((rawMethod == "is_none" || rawMethod == "is_some") &&
-            !emitter.hasDeclaredOptionEnum() &&
-            !emitter.isKnownNonNullableNonOptionReceiver(expr.receiver, receiver, ctx.selfTypeName)
-        ) {
-            return if (rawMethod == "is_none") "$receiver == null" else "$receiver != null"
-        }
         if (rawMethod == "as_bytes" && noTurbofish) {
             val effectiveBytesTy = ctx.refCellInnerType() ?: ctx.localOrInferredRecvTy
             if (effectiveBytesTy == null || effectiveBytesTy in STRING_LIKE_TYPES) {
@@ -688,27 +743,9 @@ private object EarlyReceiverStateAndCollectionRule : MethodLoweringRule() {
             emitter.usesCurrentThreadToken = true
             return "currentThreadBoundToken()"
         }
-        YamlRuleCatalogs.TypeAndMethodPatterns.fmtOrQueueMethodRules[rawMethod]?.let { rule ->
-            if (rule.matchesHeader(rawMethod, "fmtOrQueue", 0, !noTurbofish)) {
-                return rule.action.render { if (it == "recv") receiver else null }
-            }
-        }
-        if (rawMethod in OPTION_BORROW_IDENTITY_METHODS &&
-            noTurbofish &&
-            emitter.isKnownNullableOptionExpr(expr.receiver, receiver, ctx.selfTypeName)
-        ) {
-            return receiver
-        }
-        if (ctx.isDequeIterReceiver && noTurbofish) {
-            YamlRuleCatalogs.TypeAndMethodPatterns.dequeIterMethodRules[rawMethod]?.let { rule ->
-                return rule.action.render { if (it == "recv") receiver else null }
-            }
-        }
-        if (ctx.isVecReceiver && noTurbofish) {
-            YamlRuleCatalogs.TypeAndMethodPatterns.vecMethodRules[rawMethod]?.let { rule ->
-                return rule.action.render { if (it == "recv") receiver else null }
-            }
-        }
+        ctx
+            .tryRenderDeclarativeMethodRules(activeRules().preArgMethodRulesByName, preArg = true)
+            ?.let { return it }
         if (rawMethod == "into" && noTurbofish && receiver in emitter.currentIntoSubstitutedParams) return receiver
         if (rawMethod == "sve_into" && noTurbofish) {
             val recvSimple = ctx.inferredRecvTy?.simpleKotlinTypeName()
@@ -735,17 +772,15 @@ private object EarlyReceiverStateAndCollectionRule : MethodLoweringRule() {
             (segs == listOf("current") && scope.resolveModuleBinding("current")?.importedPath == "std.thread.current")
     }
 
-    private val STRING_LIKE_TYPES: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.stringLikeTypes
-    private val OPTION_BORROW_IDENTITY_METHODS: Set<String>
-        get() = YamlRuleCatalogs.TypeAndMethodPatterns.optionBorrowIdentityMethods
+    private val STRING_LIKE_TYPES: Set<String> get() = activeRules().words("stringLikeTypes")
     private val SIZED_COLLECTION_PREFIXES: List<String>
-        get() = YamlRuleCatalogs.TypeAndMethodPatterns.sizedCollectionPrefixes
+        get() = activeRules().stringList("sizedCollectionPrefixes")
 }
 
 private object TryIntoStdlibIntegerMethodRule : MethodLoweringRule() {
-    private val STDLIB_INT_TYPES: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.stdlibIntTypes
+    private val STDLIB_INT_TYPES: Set<String> get() = activeRules().words("stdlibIntTypes")
     private val FROM_ONLY_TARGETS_BY_SRC: Map<String, Set<String>>
-        get() = YamlRuleCatalogs.TypeAndMethodPatterns.tryIntoFromOnlyTargetsBySrc
+        get() = activeRules().tryIntoFromOnlyTargetsBySrc
 
     override fun tryRender(ctx: MethodCallLoweringContext): String? {
         val emitter = ctx.emitter
@@ -828,7 +863,7 @@ private object EarlyIntoIterAndCloneWitnessRule : MethodLoweringRule() {
     }
 
     private val INTO_ITER_COLLECTION_PREFIXES: List<String>
-        get() = YamlRuleCatalogs.TypeAndMethodPatterns.intoIterCollectionPrefixes
+        get() = activeRules().stringList("intoIterCollectionPrefixes")
 }
 
 private object SynAndStringParseMethodRule : MethodLoweringRule() {
@@ -971,10 +1006,6 @@ private object CoreStrAndCharMethodRule : MethodLoweringRule() {
                 ctx.registerCoreSubpkgImport("str", "chars")
                 "$atomicRecv.chars()"
             }
-            (recvTyForStr == "Chars" || recvTyForStr?.endsWith(".Chars") == true) &&
-                !(headerCtx.packageName == "$coreNs.str.iter" && ctx.selfTypeName == "Chars") &&
-                args.isEmpty() ->
-                ctx.tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.charsIterMethodRules, "charsIter")
             rawMethod == "to_digit" &&
                 args.size == 1 &&
                 (recvTyForStr == "Char" || (emitter.unwrapParenOrGroupExpr(ctx.expr.receiver) as? Expr.Lit)?.lit is Lit.Char) &&
@@ -1002,9 +1033,14 @@ private object ConcreteNumericDispatchMethodRule : MethodLoweringRule() {
         )
 }
 
+private object DeclarativePostArgMethodRule : MethodLoweringRule() {
+    override fun tryRender(ctx: MethodCallLoweringContext): String? =
+        ctx.tryRenderDeclarativeMethodRules(activeRules().postArgMethodRulesByName, preArg = false)
+}
+
 private object FmtAndCollectionTransformRule : MethodLoweringRule() {
     private val RAW_ABI_BYTE_OFFSET_METHODS: Set<String>
-        get() = YamlRuleCatalogs.TypeAndMethodPatterns.rawAbiByteOffsetMethods
+        get() = activeRules().words("rawAbiByteOffsetMethods")
 
     override fun tryRender(ctx: MethodCallLoweringContext): String? {
         if (ctx.rawMethod == "collect" && ctx.renderedValueArgs.isEmpty()) return tryRenderCollect(ctx)
@@ -1014,14 +1050,6 @@ private object FmtAndCollectionTransformRule : MethodLoweringRule() {
         val rawMethod = ctx.rawMethod
         val receiver = ctx.receiver
         val args = ctx.renderedValueArgs
-        ctx
-            .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.generalTransformMethodRules, "generalTransform")
-            ?.let { return it }
-        if (args.size == 1 && emitter.isFmtStringBuilderReceiver(expr.receiver, receiver, ctx.selfTypeName)) {
-            ctx
-                .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.fmtBuilderMethodRules, "fmtBuilder")
-                ?.let { return it }
-        }
         val isStringLitRecv = emitter.unwrapParenOrGroupExpr(expr.receiver).let { it is Expr.Lit && it.lit is Lit.Str }
         if (rawMethod == "fmt" &&
             args.size == 1 &&
@@ -1043,11 +1071,6 @@ private object FmtAndCollectionTransformRule : MethodLoweringRule() {
             if (ctx.localOrInferredRecvTy == "String" && receiver.all { it.isLetterOrDigit() || it == '_' || it == '.' }) {
                 return "$receiver = \"\""
             }
-        }
-        if (rawMethod == "extend_from_slice" && args.size == 1 &&
-            (ctx.isVecReceiver || ctx.localOrInferredRecvTy?.startsWith("MutableList<") == true)
-        ) {
-            return "$receiver.addAll(${args[0]})"
         }
         if (rawMethod in RAW_ABI_BYTE_OFFSET_METHODS && args.size == 1 && emitter.headerContext.rawAbiMode) {
             val deltaSign = if (rawMethod.endsWith("sub")) "-" else "+"
@@ -1092,23 +1115,14 @@ private object ContainerMutationAndIndexingRule : MethodLoweringRule() {
         val receiver = ctx.receiver
         val args = ctx.renderedValueArgs
         val noTypeArgs = ctx.typeArgs.isEmpty()
-        if (ctx.isVecReceiver && noTypeArgs) {
-            ctx
-                .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.vecMutMethodRules, "vecMut")
-                ?.let { return it }
-            if ((rawMethod == "get" || rawMethod == "get_mut") &&
-                args.size == 1 &&
-                emitter.unwrapParenOrGroupExpr(ctx.allMethodArgs[0]) !is Expr.Range
-            ) {
-                return ctx.renderIndexedGetOrNull(receiver)
-            }
+        if (ctx.isVecReceiver && noTypeArgs &&
+            (rawMethod == "get" || rawMethod == "get_mut") &&
+            args.size == 1 &&
+            emitter.unwrapParenOrGroupExpr(ctx.allMethodArgs[0]) !is Expr.Range
+        ) {
+            return ctx.renderIndexedGetOrNull(receiver)
         }
         val recvCollectionTy = emitter.currentTypedLocals[receiver] ?: emitter.inferExprRenderedType(ctx.expr.receiver, ctx.selfTypeName)
-        if (isMapRenderedType(recvCollectionTy) && noTypeArgs) {
-            ctx
-                .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.mapMutMethodRules, "mapMut")
-                ?.let { return it }
-        }
         if ((rawMethod == "get" || rawMethod == "get_mut") &&
             args.size == 1 &&
             noTypeArgs &&
@@ -1117,17 +1131,17 @@ private object ContainerMutationAndIndexingRule : MethodLoweringRule() {
         ) {
             return ctx.renderIndexedGetOrNull(ctx.recvAtom)
         }
-        if (isSetRenderedType(recvCollectionTy) && noTypeArgs) {
-            if (rawMethod == "insert" && (args.size == 1 || (args.size == 2 && args[1] == "Unit"))) {
-                return "${ctx.recvAtom}.add(${args[0]})"
-            }
-            ctx
-                .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.setMutMethodRules, "setMut")
-                ?.let { return it }
+        if (isSetRenderedType(recvCollectionTy) &&
+            noTypeArgs &&
+            rawMethod == "insert" &&
+            (args.size == 1 || (args.size == 2 && args[1] == "Unit"))
+        ) {
+            return "${ctx.recvAtom}.add(${args[0]})"
         }
         if (rawMethod == "clone_from" &&
             args.size == 1 &&
             noTypeArgs &&
+            !ctx.isVecReceiver &&
             (ctx.expr.receiver is Expr.Field || receiver in emitter.currentNullableLocals)
         ) {
             return "$receiver = ${args[0]}"
@@ -1158,11 +1172,6 @@ private object StringCaseAndSplitMethodRule : MethodLoweringRule() {
         val receiver = ctx.receiver
         val args = ctx.renderedValueArgs
         val atomicRecv = ctx.recvAtom
-        if (ctx.inferredRecvTy == null || ctx.inferredRecvTy == "String") {
-            ctx
-                .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.stringStripMethodRules, "stringStrip")
-                ?.let { return it }
-        }
         if ((rawMethod == "split_once" || rawMethod == "rsplit_once") && args.size == 1) {
             val recvTy = ctx.localOrInferredRecvTy
             val refInner = ctx.refCellInnerType()
@@ -1190,9 +1199,6 @@ private object StringCaseAndSplitMethodRule : MethodLoweringRule() {
                 return "$atomicRecv.$ktFn()"
             }
         }
-        if (rawMethod == "filter_map" && args.size == 1 && instanceMethods.none { "filterMap" in it }) {
-            return "$atomicRecv.mapNotNull(${emitter.wrapMapCallbackArg(ctx.allMethodArgs[0], args[0])})"
-        }
         val inferredMethodRecvTy = ctx.inferredRecvTy
         if (rawMethod == "to_vec" && args.isEmpty()) {
             val unwrappedRecvExpr = emitter.unwrapTransparentCastExpr(ctx.expr.receiver)
@@ -1207,27 +1213,17 @@ private object StringCaseAndSplitMethodRule : MethodLoweringRule() {
                     receiver.endsWith(".asSlice()")
             if (isListOrByteSlice) return "$atomicRecv.toMutableList()"
         }
-        if (receiver in emitter.currentDequeLocals || ctx.isDequeIterReceiver || inferredMethodRecvTy?.startsWith("ArrayDeque<") == true) {
-            ctx
-                .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.dequeSliceHintMethodRules, "dequeSliceHint")
-                ?.let { return it }
-        }
         return null
     }
 }
 
 private object AnyReflectionAndUncheckedShiftRule : MethodLoweringRule() {
     override fun tryRender(ctx: MethodCallLoweringContext): String? {
+        if (ctx.typeArgs.isNotEmpty()) return null
         val emitter = ctx.emitter
         val rawMethod = ctx.rawMethod
         val args = ctx.renderedValueArgs
         val inferredMethodRecvTy = ctx.inferredRecvTy
-        if (inferredMethodRecvTy == "RustAny") {
-            ctx
-                .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.rustAnyMethodRules, "rustAny")
-                ?.let { return it }
-        }
-        if (ctx.typeArgs.isNotEmpty()) return null
         if (rawMethod == "type_id" &&
             args.isEmpty() &&
             "TypeId" !in emitter.inspector.declaredTypeNames &&
@@ -1289,9 +1285,6 @@ private object ErasedOptionCombinatorMethodRule : MethodLoweringRule() {
             return "$receiver.also { $receiver = null }"
         }
         val atomicRecv = ctx.recvAtom
-        ctx
-            .tryRenderPostArgPatternRule(YamlRuleCatalogs.TypeAndMethodPatterns.erasedOptionMethodRules, "erasedOption")
-            ?.let { return it }
         return when {
             (rawMethod == "ok_or" || rawMethod == "ok_or_else") && args.size == 1 -> renderOkOr(ctx)
             rawMethod == "map_or" && args.size == 2 -> {
@@ -1450,6 +1443,7 @@ private val POST_ARG_METHOD_RULES: List<MethodLoweringRule> =
         CoreStrAndCharMethodRule,
         ConcreteNumericDispatchMethodRule,
         FmtAndCollectionTransformRule,
+        DeclarativePostArgMethodRule,
         ContainerMutationAndIndexingRule,
         StringCaseAndSplitMethodRule,
         AnyReflectionAndUncheckedShiftRule,
@@ -1458,13 +1452,13 @@ private val POST_ARG_METHOD_RULES: List<MethodLoweringRule> =
     )
 
 private val CORE_SLICE_OR_PTR_METHODS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.coreSliceOrPtrMethods
+    get() = activeRules().words("coreSliceOrPtrMethods")
 private val NON_SLICE_CORE_OWNER_TYPES: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.nonSliceCoreOwnerTypes
+    get() = activeRules().words("nonSliceCoreOwnerTypes")
 private val PEEK_MACRO_METHODS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.peekMacroMethods
+    get() = activeRules().words("peekMacroMethods")
 private val CALLBACK_WRAP_METHODS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.callbackWrapMethods
+    get() = activeRules().words("callbackWrapMethods")
 
 private fun MethodCallLoweringContext.renderStandardMethodCall(): String {
     val adjustedRenderedValueArgs =
@@ -1826,7 +1820,7 @@ internal fun KotlinJ2KEmitter.tryRenderUnconstrainedCmpLowering(
     argRendered: String,
     allowWhenRecvUninferred: Boolean = false,
 ): String? {
-    val rule = YamlRuleCatalogs.TypeAndMethodPatterns.unconstrainedCmpMethodRules[rawMethod] ?: return null
+    val rule = activeRules().unconstrainedCmpRulesByName[rawMethod] ?: return null
     val recvBase = cleanRecvTy?.simpleKotlinTypeName()
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
     val isCoreRuntimeActive =

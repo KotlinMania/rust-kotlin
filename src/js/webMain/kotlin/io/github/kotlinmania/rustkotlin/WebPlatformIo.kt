@@ -1,5 +1,6 @@
 package io.github.kotlinmania.rustkotlin
 
+import io.github.kotlinmania.io.Source
 import io.github.kotlinmania.io.files.SystemFileSystem
 import io.github.kotlinmania.io.files.writeString
 import io.github.kotlinmania.libc.unix.bsd.O_CREAT
@@ -130,3 +131,11 @@ public actual fun writeNew(path: String, text: String) {
     }
     SystemFileSystem.writeString(KmPath(path), text)
 }
+
+internal actual fun readPlatformEnvironmentVariable(name: String): String? = null
+
+internal actual fun resolvePlatformExecutablePath(): String? = null
+
+internal actual fun listPlatformPackagedRuleFiles(resourceDirPath: String): List<String> = emptyList()
+
+internal actual fun openPlatformPackagedRuleSource(resourcePath: String): Source? = null

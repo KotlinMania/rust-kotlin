@@ -109,10 +109,10 @@ public class KotlinNamingPolicy {
     }
 
     private fun sanitizeStubWord(ident: String): String =
-        YamlRuleCatalogs.NamingAndComments.valueStubWordReplacements[ident.lowercase()] ?: ident
+        activeRules().map("valueStubWordReplacements")[ident.lowercase()] ?: ident
 
     private fun sanitizeConstStubWord(ident: String): String =
-        YamlRuleCatalogs.NamingAndComments.constStubWordReplacements[ident.uppercase()] ?: ident
+        activeRules().map("constStubWordReplacements")[ident.uppercase()] ?: ident
 
     internal fun isScreamingSnakeCase(s: String): Boolean {
         var hasUpper = false
@@ -150,10 +150,10 @@ public class KotlinNamingPolicy {
         public val Default: KotlinNamingPolicy = KotlinNamingPolicy()
 
         private val PRIMITIVE_AND_BUILTIN_TYPE_MAP: Map<String, String>
-            get() = YamlRuleCatalogs.NamingAndComments.primitiveAndBuiltinTypes
+            get() = activeRules().map("primitiveAndBuiltinTypes")
 
         private val KOTLIN_KEYWORD_REPLACEMENTS: Map<String, String>
-            get() = YamlRuleCatalogs.NamingAndComments.kotlinHardKeywordEscapes
+            get() = activeRules().map("kotlinHardKeywordEscapes")
     }
 }
 
@@ -172,7 +172,7 @@ internal fun rustMethodIdentToKotlin(raw: String): String =
 internal fun rustFieldIdentToKotlin(raw: String): String {
     val ident = KotlinNamingPolicy.Default.toValueIdentifier(raw, preserveScreamingSnake = false)
     if (TranslationSession.rawAbiMode || TranslationSession.finalStructs) {
-        return YamlRuleCatalogs.NamingAndComments.rawAbiFieldRenames[ident] ?: ident
+        return activeRules().map("rawAbiFieldRenames")[ident] ?: ident
     }
     return ident
 }
@@ -203,11 +203,11 @@ internal fun tupleFieldPropertyName(index: Int, arity: Int): String =
 
 internal fun defaultInitializerForType(kotlinType: String): String {
     if (kotlinType == "CChar") return if (TranslationSession.rawAbiMode) "0" else "0u"
-    YamlRuleCatalogs.NamingAndComments.defaultTypeInitializers[kotlinType]?.let { return it }
+    activeRules().groupedMap("defaultTypeInitializers")[kotlinType]?.let { return it }
     if (isConstRawPointerRenderedType(kotlinType)) return "ConstPtr(0L)"
     if (isMutRawPointerRenderedType(kotlinType)) return "MutPtr(0L)"
     if (kotlinType.endsWith("?") || kotlinType in TranslationSession.crateOptionFnTypes) return "null"
-    for ((prefix, initExpr) in YamlRuleCatalogs.NamingAndComments.prefixDefaultTypeInitializers) {
+    for ((prefix, initExpr) in activeRules().prefixDefaultTypeInitializers) {
         if (kotlinType.startsWith(prefix)) return initExpr
     }
     TranslationSession.crateTypeAliasDefaults[kotlinType]?.let { return it }

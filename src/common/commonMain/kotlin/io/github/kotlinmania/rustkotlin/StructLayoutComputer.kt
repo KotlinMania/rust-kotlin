@@ -784,13 +784,13 @@ public object StructLayoutComputer {
 }
 
 private val KNOWN_STDLIB_FIRST_TYPE_LAYOUT_FUNCTIONS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.knownStdlibFirstTypeLayoutFunctions
+    get() = activeRules().words("knownStdlibFirstTypeLayoutFunctions")
 
 private val POINTER_STRIDE_OR_ACCESS_METHODS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.pointerStrideOrAccessMethods
+    get() = activeRules().words("pointerStrideOrAccessMethods")
 
 private val SIZED_CORE_CONST_NAMES: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.sizedCoreConstNames
+    get() = activeRules().words("sizedCoreConstNames")
 private val MEM_OR_PTR_SEGS: Set<String> = wordSet("mem ptr")
 
 /**

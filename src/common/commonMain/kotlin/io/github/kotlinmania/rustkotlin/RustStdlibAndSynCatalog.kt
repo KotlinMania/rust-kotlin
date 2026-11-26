@@ -10,19 +10,32 @@ import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.TypeParamBound
 import io.github.kotlinmania.syn.WherePredicate
 
-internal val PRIMITIVE_ARRAY_TYPES: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.primitiveArrayTypes
-internal val IGNORED_USE_ROOTS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.ignoredUseRoots
-internal val STDLIB_CRATE_ROOTS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.stdlibCrateRoots
-internal val STDLIB_MACRO_OR_PRIMITIVE_MODULES: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.stdlibMacroOrPrimitiveModules
-internal val FLAT_KOTLINMANIA_CRATES: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.flatKotlinmaniaCrates
-internal val STDLIB_TYPE_PATH_PREFIXES: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.stdlibTypePathPrefixes
-internal val IGNORED_PATH_PREFIXES: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.ignoredPathPrefixes
-internal val STDLIB_PRELUDE_REEXPORT_MODULES: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.stdlibPreludeReexportModules
-internal val IGNORED_TRAIT_BOUNDS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.ignoredTraitBounds
-internal val FMT_TRAIT_NAMES: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.fmtTraitNames
-internal val RUST_STD_IMPLICIT_SUPERTRAITS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.rustStdImplicitSupertraits
-internal val STDLIB_TRAIT_SUBMODULES: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.stdlibTraitSubmodules
-internal val STDLIB_EXPLICIT_SUPERTRAITS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.stdlibExplicitSupertraits
+internal val PRIMITIVE_ARRAY_TYPES: Set<String>
+    get() = activeRules().words("primitiveArrayTypes")
+internal val IGNORED_USE_ROOTS: Set<String>
+    get() = activeRules().words("ignoredUseRoots")
+internal val STDLIB_CRATE_ROOTS: Set<String>
+    get() = activeRules().words("stdlibCrateRoots")
+internal val STDLIB_MACRO_OR_PRIMITIVE_MODULES: Set<String>
+    get() = activeRules().words("stdlibMacroOrPrimitiveModules")
+internal val FLAT_KOTLINMANIA_CRATES: Set<String>
+    get() = activeRules().words("flatKotlinmaniaCrates")
+internal val STDLIB_TYPE_PATH_PREFIXES: Set<String>
+    get() = activeRules().words("stdlibTypePathPrefixes")
+internal val IGNORED_PATH_PREFIXES: Set<String>
+    get() = activeRules().words("ignoredPathPrefixes")
+internal val STDLIB_PRELUDE_REEXPORT_MODULES: Set<String>
+    get() = activeRules().words("stdlibPreludeReexportModules")
+internal val IGNORED_TRAIT_BOUNDS: Set<String>
+    get() = activeRules().words("ignoredTraitBounds")
+internal val FMT_TRAIT_NAMES: Set<String>
+    get() = activeRules().words("fmtTraitNames")
+internal val RUST_STD_IMPLICIT_SUPERTRAITS: Set<String>
+    get() = activeRules().unionWords("fmtTraitNames", "rustStdImplicitSupertraitsExtra")
+internal val STDLIB_TRAIT_SUBMODULES: Set<String>
+    get() = activeRules().words("stdlibTraitSubmodules")
+internal val STDLIB_EXPLICIT_SUPERTRAITS: Set<String>
+    get() = activeRules().unionWords("fmtTraitNames", "rustStdImplicitSupertraitsExtra", "stdlibExplicitSupertraitsExtra")
 
 private fun SynType.singleUnqualifiedIdent(): String? {
     val seg = unqualifiedPath()?.singleSegment() ?: return null
@@ -166,23 +179,49 @@ private class KDocSpacingRewriter(
     }
 }
 
-internal val STDLIB_ERASED_OR_BUILTIN_IMPORTS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.stdlibErasedOrBuiltinImports
-internal val KNOWN_SELF_PARAMETERIZED_TRAITS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.knownSelfParameterizedTraits
-internal val KOTLIN_COLLECTION_INTERFACES: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.kotlinCollectionInterfaces
-internal val MUTATING_VEC_METHODS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.mutatingVecMethods
-internal val KNOWN_OPTION_RETURNING_METHODS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.knownOptionReturningMethods
-internal val KOTLIN_JVM_VALUE_TYPES: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.kotlinJvmValueTypes
-internal val NUMERIC_CAST_TARGETS: Set<String> = KOTLIN_JVM_VALUE_TYPES - "Boolean"
-internal val KOTLIN_STDLIB_SHADOWED_IMPORTS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.kotlinStdlibShadowedImports
-internal val FORWARD_DESERIALIZE_KEYS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.forwardDeserializeKeys
-internal val PRIMITIVE_TYPE_NAMES: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.primitiveTypeNames
-internal val IGNORED_QUOTE_KEYWORDS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.ignoredQuoteKeywords
+internal val STDLIB_ERASED_OR_BUILTIN_IMPORTS: Set<String>
+    get() = activeRules().unionWords("fmtTraitNames", "rustStdImplicitSupertraitsExtra", "stdlibErasedOrBuiltinImportsExtra")
+internal val KNOWN_SELF_PARAMETERIZED_TRAITS: Set<String>
+    get() = activeRules().words("knownSelfParameterizedTraits")
+internal val KOTLIN_COLLECTION_INTERFACES: Set<String>
+    get() = activeRules().words("kotlinCollectionInterfaces")
+internal val MUTATING_VEC_METHODS: Set<String>
+    get() = activeRules().words("mutatingVecMethods")
+internal val KNOWN_OPTION_RETURNING_METHODS: Set<String>
+    get() = activeRules().words("knownOptionReturningMethods")
+internal val KOTLIN_JVM_VALUE_TYPES: Set<String>
+    get() = activeRules().words("kotlinJvmValueTypes")
 
-internal val SYN_KEYWORD_TOKENS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.synKeywordTokens
-internal val SYN_PUNCT_TOKEN_NAMES: Map<String, String> = YamlRuleCatalogs.StdlibSynAndFfi.synPunctTokens
+private val NUMERIC_CAST_TARGETS_MEMO =
+    RegistryMemo { reg -> reg.words("kotlinJvmValueTypes") - "Boolean" }
 
-internal val SYN_KEYWORD_TOKEN_CLASS_NAMES =
-    SYN_KEYWORD_TOKENS.mapTo(linkedSetOf()) { it[0].uppercaseChar() + it.substring(1) }
+internal val NUMERIC_CAST_TARGETS: Set<String>
+    get() = NUMERIC_CAST_TARGETS_MEMO.get()
 
-internal val SYN_PUNCT_TOKEN_CLASS_NAMES =
-    SYN_PUNCT_TOKEN_NAMES.values.toSet()
+internal val KOTLIN_STDLIB_SHADOWED_IMPORTS: Set<String>
+    get() = activeRules().unionWords("kotlinJvmValueTypes", "kotlinStdlibShadowedImportsExtra")
+internal val FORWARD_DESERIALIZE_KEYS: Set<String>
+    get() = activeRules().words("forwardDeserializeKeys")
+internal val PRIMITIVE_TYPE_NAMES: Set<String>
+    get() = activeRules().words("primitiveTypeNames")
+internal val IGNORED_QUOTE_KEYWORDS: Set<String>
+    get() = activeRules().unionWords("ignoredQuoteKeywordsExtra", "primitiveTypeNames")
+
+internal val SYN_KEYWORD_TOKENS: Set<String>
+    get() = activeRules().words("synKeywordTokens")
+internal val SYN_PUNCT_TOKEN_NAMES: Map<String, String>
+    get() = activeRules().map("synPunctTokens")
+
+private val SYN_KEYWORD_TOKEN_CLASS_NAMES_MEMO =
+    RegistryMemo { reg ->
+        reg.words("synKeywordTokens").mapTo(linkedSetOf()) { it[0].uppercaseChar() + it.substring(1) }
+    }
+
+private val SYN_PUNCT_TOKEN_CLASS_NAMES_MEMO =
+    RegistryMemo { reg -> reg.map("synPunctTokens").values.toSet() }
+
+internal val SYN_KEYWORD_TOKEN_CLASS_NAMES: Set<String>
+    get() = SYN_KEYWORD_TOKEN_CLASS_NAMES_MEMO.get()
+
+internal val SYN_PUNCT_TOKEN_CLASS_NAMES: Set<String>
+    get() = SYN_PUNCT_TOKEN_CLASS_NAMES_MEMO.get()

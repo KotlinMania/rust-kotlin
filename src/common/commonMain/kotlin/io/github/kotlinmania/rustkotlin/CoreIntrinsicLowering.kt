@@ -178,12 +178,15 @@ private fun SynthesizedIntrinsicDeclContext.renderDeclarativeBody(
 }
 
 private object ControlAndHintIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
+    private val rulesByName: Map<String, DeclarativeIntrinsicPatternRule>
+        get() = activeRules().intrinsicRules("controlAndHintIntrinsicRules")
+
     override fun matches(canonicalName: String, isCoreSimdCall: Boolean): Boolean =
-        canonicalName == "black_box" || canonicalName in YamlRuleCatalogs.CoreIntrinsics.controlAndHintRulesByName
+        canonicalName == "black_box" || canonicalName in rulesByName
 
     override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? {
         if (decl.canonicalName == "black_box") return decl.p0
-        return decl.renderDeclarativeBody(YamlRuleCatalogs.CoreIntrinsics.controlAndHintRulesByName)
+        return decl.renderDeclarativeBody(rulesByName)
     }
 
     override fun renderCall(ctx: IntrinsicCallContext): String? {
@@ -192,7 +195,7 @@ private object ControlAndHintIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
             val kind = ctx.callArgsList.firstOrNull()?.let { ctx.emitter.inferExprNumericKind(it, ctx.selfTypeName) }
             return if (kind == NumericKind.U64) ctx.callIntr("kmBlackBoxU64", arg0) else arg0
         }
-        val rule = YamlRuleCatalogs.CoreIntrinsics.controlAndHintRulesByName[ctx.canonicalName] ?: return null
+        val rule = rulesByName[ctx.canonicalName] ?: return null
         val callAction = rule.callAction ?: return null
         if (ctx.renderedArgs.size < rule.minCallArgs) return null
         return callAction.render(
@@ -214,13 +217,15 @@ private object ControlAndHintIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
 private object LayoutAndReflectionIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
     private val ALIGN_NAMES = setOf("align_of", "align_of_val", "min_align_of", "min_align_of_val", "pref_align_of")
     private val TRIVIAL_SCALARS: Set<String>
-        get() = YamlRuleCatalogs.CoreIntrinsics.trivialDropScalars
+        get() = activeRules().words("trivialDropScalars")
+    private val declRulesByName: Map<String, DeclarativeIntrinsicPatternRule>
+        get() = activeRules().intrinsicRules("layoutSynthesizedDeclRules")
 
     override fun matches(canonicalName: String, isCoreSimdCall: Boolean): Boolean =
-        canonicalName in YamlRuleCatalogs.CoreIntrinsics.layoutDeclRulesByName
+        canonicalName in declRulesByName
 
     override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? =
-        decl.renderDeclarativeBody(YamlRuleCatalogs.CoreIntrinsics.layoutDeclRulesByName)
+        decl.renderDeclarativeBody(declRulesByName)
 
     override fun renderCall(ctx: IntrinsicCallContext): String? =
         when (ctx.canonicalName) {
@@ -289,7 +294,7 @@ private object PointerAndMemoryIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
         canonicalName in PTR_OPS || canonicalName in LOAD_NAMES || canonicalName in STORE_NAMES || canonicalName in COPY_NAMES || canonicalName in SET_NAMES
 
     override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? =
-        decl.renderDeclarativeBody(YamlRuleCatalogs.CoreIntrinsics.pointerDeclRulesByName)
+        decl.renderDeclarativeBody(activeRules().intrinsicRules("pointerSynthesizedDeclRules"))
 
     override fun renderCall(ctx: IntrinsicCallContext): String? =
         when (ctx.canonicalName) {
@@ -377,21 +382,25 @@ private object PointerAndMemoryIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
 }
 
 private object AtomicMemoryIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
-    val RMW_OP_CODES: Map<String, Int> = YamlRuleCatalogs.CoreIntrinsics.atomicRmwOpCodes
-    val NON_RMW_NAMES: Set<String> = YamlRuleCatalogs.CoreIntrinsics.atomicNonRmwNames
+    val RMW_OP_CODES: Map<String, Int>
+        get() = activeRules().atomicRmwOpCodes
+    val NON_RMW_NAMES: Set<String>
+        get() = activeRules().words("atomicNonRmwNames")
+    private val atomicRulesByName: Map<String, DeclarativeIntrinsicPatternRule>
+        get() = activeRules().intrinsicRules("atomicSynthesizedDeclRules")
 
     override fun matches(canonicalName: String, isCoreSimdCall: Boolean): Boolean =
         canonicalName in NON_RMW_NAMES || canonicalName in RMW_OP_CODES
 
     override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? {
-        decl.renderDeclarativeBody(YamlRuleCatalogs.CoreIntrinsics.atomicRulesByName)?.let { return it }
+        decl.renderDeclarativeBody(atomicRulesByName)?.let { return it }
         val rmwCode = RMW_OP_CODES[decl.canonicalName]?.toString() ?: return null
         val opLayout = if (decl.typeParams.size >= 2) decl.layout1 else decl.layout0
         return decl.callMem("atomicRmwWithLayout", "${decl.p0}.rawAddress", decl.p1, rmwCode, decl.ord0, decl.layout0, opLayout)
     }
 
     override fun renderCall(ctx: IntrinsicCallContext): String? {
-        YamlRuleCatalogs.CoreIntrinsics.atomicRulesByName[ctx.canonicalName]?.callAction?.let { action ->
+        atomicRulesByName[ctx.canonicalName]?.callAction?.let { action ->
             return action.render(
                 rawAbi = ctx.rawAbi,
                 onImport = { CoreIntrinsicLowering.registerCoreImport(ctx.emitter, it) },
@@ -489,15 +498,16 @@ private object TransmuteIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
 }
 
 private object SimdIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
-    val NAMES: Set<String> = YamlRuleCatalogs.CoreIntrinsics.simdIntrinsicNames
-    val BOOL_RETURN_NAMES: Set<String> = YamlRuleCatalogs.CoreIntrinsics.simdBoolReturnNames
-    val UNIT_RETURN_NAMES: Set<String> = YamlRuleCatalogs.CoreIntrinsics.simdUnitReturnNames
-    val SAME_ARG0_NAMES: Set<String> = YamlRuleCatalogs.CoreIntrinsics.simdSameArg0Names
-    private val SAME_ARG1_NAMES: Set<String> = YamlRuleCatalogs.CoreIntrinsics.simdSameArg1Names
-    private val SAME_ARG2_NAMES: Set<String> = YamlRuleCatalogs.CoreIntrinsics.simdSameArg2Names
-    private val NO_PEER_INFER_EXPECTED: Set<String> = YamlRuleCatalogs.CoreIntrinsics.simdNoPeerInferExpected
-    private val NO_EXPECTED_TARGET_PROPAGATION: Set<String> = YamlRuleCatalogs.CoreIntrinsics.simdNoExpectedTargetPropagation
-    private val NO_PEER_INFER_RETURN: Set<String> = NO_PEER_INFER_EXPECTED + NO_EXPECTED_TARGET_PROPAGATION
+    val NAMES: Set<String> get() = activeRules().words("simdIntrinsicNames")
+    val BOOL_RETURN_NAMES: Set<String> get() = activeRules().words("simdBoolReturnNames")
+    val UNIT_RETURN_NAMES: Set<String> get() = activeRules().words("simdUnitReturnNames")
+    val SAME_ARG0_NAMES: Set<String> get() = activeRules().words("simdSameArg0Names")
+    private val SAME_ARG1_NAMES: Set<String> get() = activeRules().words("simdSameArg1Names")
+    private val SAME_ARG2_NAMES: Set<String> get() = activeRules().words("simdSameArg2Names")
+    private val NO_PEER_INFER_EXPECTED: Set<String> get() = activeRules().words("simdNoPeerInferExpected")
+    private val NO_EXPECTED_TARGET_PROPAGATION: Set<String> get() = activeRules().words("simdNoExpectedTargetPropagation")
+    private val NO_PEER_INFER_RETURN: Set<String>
+        get() = activeRules().unionWords("simdNoPeerInferExpected", "simdNoExpectedTargetPropagation")
 
     fun isSimdIntrinsicName(name: String): Boolean = name in NAMES || name.startsWith("sve_tuple_")
 
@@ -694,8 +704,8 @@ public object CoreIntrinsicLowering {
     public const val DEFAULT_CORE_NAMESPACE: String = "io.github.kotlinmania.rustlang.core"
     public const val DEFAULT_ALLOC_NAMESPACE: String = "io.github.kotlinmania.rustlang.alloc"
 
-    public val STDLIB_CORE_FFI_SYMBOLS: Map<String, String> =
-        YamlRuleCatalogs.CoreIntrinsics.stdlibCoreFfiSymbols
+    public val STDLIB_CORE_FFI_SYMBOLS: Map<String, String>
+        get() = activeRules().map("stdlibCoreFfiSymbols")
 
     public fun defaultStdlibFfiSymbolPackage(
         ktSym: String,
@@ -709,35 +719,35 @@ public object CoreIntrinsicLowering {
             else -> "$coreNs.ffi.primitives"
         }
 
-    private val FIRST_TYPE_ARG_LAYOUT_INTRINSICS: Set<String> =
-        YamlRuleCatalogs.CoreIntrinsics.firstTypeArgLayoutIntrinsics
+    private val FIRST_TYPE_ARG_LAYOUT_INTRINSICS: Set<String>
+        get() = activeRules().words("firstTypeArgLayoutIntrinsics")
 
-    private val TWO_TYPE_ARG_LAYOUT_INTRINSICS: Set<String> =
-        YamlRuleCatalogs.CoreIntrinsics.twoTypeArgLayoutIntrinsics
+    private val TWO_TYPE_ARG_LAYOUT_INTRINSICS: Set<String>
+        get() = activeRules().words("twoTypeArgLayoutIntrinsics")
 
-    internal val GENERIC_FLOAT_UNARY_KM: Map<String, Pair<String, String>> =
-        YamlRuleCatalogs.CoreIntrinsics.genericFloatUnaryKm
+    internal val GENERIC_FLOAT_UNARY_KM: Map<String, Pair<String, String>>
+        get() = activeRules().genericFloatUnaryKm
 
-    internal val SUFFIXED_FLOAT_UNARY_KM: Map<String, String> =
-        YamlRuleCatalogs.CoreIntrinsics.suffixedFloatUnaryKm
+    internal val SUFFIXED_FLOAT_UNARY_KM: Map<String, String>
+        get() = activeRules().suffixedFloatUnaryKm
 
-    internal val SUFFIXED_FLOAT_BINARY_KM: Map<String, String> =
-        YamlRuleCatalogs.CoreIntrinsics.suffixedFloatBinaryKm
+    internal val SUFFIXED_FLOAT_BINARY_KM: Map<String, String>
+        get() = activeRules().map("suffixedFloatBinaryKm")
 
-    internal val GENERIC_FLOAT_BINARY_OP_NAMES: Map<String, String> =
-        YamlRuleCatalogs.CoreIntrinsics.genericFloatBinaryOpNames
+    internal val GENERIC_FLOAT_BINARY_OP_NAMES: Map<String, String>
+        get() = activeRules().map("genericFloatBinaryOpNames")
 
-    private val KNOWN_STDLIB_LAYOUT_FUNCTIONS: Set<String> =
-        YamlRuleCatalogs.CoreIntrinsics.knownStdlibLayoutFunctions
+    private val KNOWN_STDLIB_LAYOUT_FUNCTIONS: Set<String>
+        get() = activeRules().words("knownStdlibLayoutFunctions")
 
-    private val POINTED_LOAD_RETURN_INTRINSICS: Set<String> =
-        YamlRuleCatalogs.CoreIntrinsics.pointedLoadReturnIntrinsics
+    private val POINTED_LOAD_RETURN_INTRINSICS: Set<String>
+        get() = activeRules().words("pointedLoadReturnIntrinsics")
 
-    private val FIRST_ARG_RETURN_INTRINSICS: Set<String> =
-        YamlRuleCatalogs.CoreIntrinsics.firstArgReturnIntrinsics
+    private val FIRST_ARG_RETURN_INTRINSICS: Set<String>
+        get() = activeRules().words("firstArgReturnIntrinsics")
 
-    private val USIZE_RETURN_INTRINSICS: Set<String> =
-        YamlRuleCatalogs.CoreIntrinsics.usizeReturnIntrinsics
+    private val USIZE_RETURN_INTRINSICS: Set<String>
+        get() = activeRules().words("usizeReturnIntrinsics")
 
     private val FAMILY_RULES: List<CoreIntrinsicFamilyRule> =
         listOf(
@@ -784,8 +794,8 @@ public object CoreIntrinsicLowering {
         val ord1: String? = null,
     )
 
-    private val LEGACY_ORDERING_CODES: Map<String, String> =
-        YamlRuleCatalogs.CoreIntrinsics.legacyOrderingCodes
+    private val LEGACY_ORDERING_CODES: Map<String, String>
+        get() = activeRules().map("legacyOrderingCodes")
 
     private fun parseLegacyAtomicOrderingSuffix(rawName: String): ParsedIntrinsicName {
         if (!rawName.startsWith("atomic_")) return ParsedIntrinsicName(rawName)
@@ -1317,8 +1327,8 @@ public object CoreIntrinsicLowering {
         return SimdIntrinsicFamilyRule.inferReturnRenderedType(spec, selfTypeName, emitter)
     }
 
-    internal val RUST_GLOBAL_ALLOC_FN_NAMES: Set<String> =
-        YamlRuleCatalogs.CoreIntrinsics.rustGlobalAllocActionsByName.keys
+    internal val RUST_GLOBAL_ALLOC_FN_NAMES: Set<String>
+        get() = activeRules().rustGlobalAllocActionsByName.keys
 
     internal fun renderRustGlobalAllocExpr(
         rawFnName: String,
@@ -1328,7 +1338,7 @@ public object CoreIntrinsicLowering {
         sizeToLongAt: (Int) -> String,
         alignToLongAt: (Int) -> String,
     ): String? {
-        val action = YamlRuleCatalogs.CoreIntrinsics.rustGlobalAllocActionsByName[rawFnName] ?: return null
+        val action = activeRules().rustGlobalAllocActionsByName[rawFnName] ?: return null
         val coreNs = resolveCoreNamespace(emitter.headerContext)
         return action.render(
             rawAbi = rawAbiMode,
@@ -1491,7 +1501,7 @@ public object CoreIntrinsicLowering {
             return "$ctor(($valueExpr).rawAddress)"
         }
         if (srcPrim == null || dstPrim == null) return null
-        val tmpl = YamlRuleCatalogs.CoreIntrinsics.fastScalarTransmuteTemplates["$srcPrim->$dstPrim"] ?: return null
+        val tmpl = activeRules().templates("fastScalarTransmuteTemplates")["$srcPrim->$dstPrim"] ?: return null
         return tmpl.render { key ->
             when (key) {
                 "val" -> valueExpr

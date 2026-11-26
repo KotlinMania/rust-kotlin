@@ -1,10 +1,14 @@
 package io.github.kotlinmania.rustkotlin
 
+import io.github.kotlinmania.io.files.SystemFileSystem
+import io.github.kotlinmania.io.files.readString
+import io.github.kotlinmania.io.files.writeString
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
+import io.github.kotlinmania.io.files.Path as KmPath
 
 class YamlRuleEngineTest {
     @Test
@@ -79,12 +83,14 @@ class YamlRuleEngineTest {
     }
 
     @Test
-    fun loadsAllBundledYamlCatalogsAndDrivesEndToEndPatternReplacements() {
-        assertEquals(46, YamlRuleCatalogs.StdlibSynAndFfi.synPunctTokens.size)
-        assertEquals("Pound", YamlRuleCatalogs.StdlibSynAndFfi.synPunctTokens["#"])
-        assertTrue(YamlRuleCatalogs.TypeAndMethodPatterns.stdlibGenericTypeRules.isNotEmpty())
-        assertTrue(YamlRuleCatalogs.TypeAndMethodPatterns.rawPtrMethodRules.containsKey("write_bytes"))
-        assertTrue(YamlRuleCatalogs.CoreIntrinsics.controlAndHintRulesByName.containsKey("select_unpredictable"))
+    fun streamsAllRuntimeYamlRuleFilesAndDrivesEndToEndPatternReplacements() {
+        val reg = activeRules()
+        assertEquals(5, reg.loadedFileNames.size)
+        assertEquals(46, reg.map("synPunctTokens").size)
+        assertEquals("Pound", reg.map("synPunctTokens")["#"])
+        assertTrue(reg.typeRulesByName.isNotEmpty())
+        assertTrue(reg.rawPtrMethodRulesByName.containsKey("write_bytes"))
+        assertTrue(reg.intrinsicRules("controlAndHintIntrinsicRules").containsKey("select_unpredictable"))
 
         val rustSource =
             """
@@ -123,14 +129,14 @@ class YamlRuleEngineTest {
     }
 
     @Test
-    fun drivesCalleePostArgMethodConstAndCAbiYamlCatalogsEndToEnd() {
-        assertEquals(5, BundledYamlRuleSources.filesByName.size)
-        assertEquals(20, YamlRuleCatalogs.PathsConstsAndCAbi.cAbiBridgeDescriptorNodes.size)
-        assertEquals("32u", YamlRuleCatalogs.PathsConstsAndCAbi.intBitsByPrim["u32"])
-        assertTrue(YamlRuleCatalogs.TypeAndMethodPatterns.calleePatternRules.isNotEmpty())
-        assertTrue(YamlRuleCatalogs.TypeAndMethodPatterns.erasedOptionMethodRules.containsKey("map_or_else"))
-        assertTrue(YamlRuleCatalogs.TypeAndMethodPatterns.unconstrainedCmpMethodRules.containsKey("partial_cmp"))
-        assertTrue(YamlRuleCatalogs.CoreIntrinsics.rustGlobalAllocActionsByName.containsKey("__rust_realloc"))
+    fun drivesCalleeUnifiedMethodConstAndCAbiYamlRulesEndToEnd() {
+        val reg = activeRules()
+        assertEquals(20, reg.mappings("cAbiBridgeDescriptors").size)
+        assertEquals("32u", reg.map("intBitsByPrim")["u32"])
+        assertTrue(reg.calleeRules.isNotEmpty())
+        assertTrue(reg.postArgMethodRulesByName.containsKey("map_or_else"))
+        assertTrue(reg.unconstrainedCmpRulesByName.containsKey("partial_cmp"))
+        assertTrue(reg.rustGlobalAllocActionsByName.containsKey("__rust_realloc"))
 
         val rustSource =
             """
@@ -169,14 +175,15 @@ class YamlRuleEngineTest {
     }
 
     @Test
-    fun drivesCoreImportRoutingCastPointerLayoutAndFfiFallbackYamlCatalogs() {
-        assertTrue(YamlRuleCatalogs.PathsConstsAndCAbi.coreAutoImportRoutes.isNotEmpty())
-        assertTrue(YamlRuleCatalogs.PathsConstsAndCAbi.coreExtensionImportRoutes.isNotEmpty())
-        assertTrue("register" in YamlRuleCatalogs.PathsConstsAndCAbi.cReservedParamNames)
-        assertEquals("(-1).toByte()", YamlRuleCatalogs.PathsConstsAndCAbi.numericDefaultFallbackByKind[NumericKind.I8])
-        assertEquals("Byte" to "8u", YamlRuleCatalogs.PathsConstsAndCAbi.primOwnerAndBitsByKind[NumericKind.I8])
-        assertEquals("I32", YamlRuleCatalogs.TypeAndMethodPatterns.fixedScalarCodecs["i32"])
-        assertEquals("UInt", YamlRuleCatalogs.TypeAndMethodPatterns.literalCodecTypes["U32"])
+    fun drivesCoreImportRoutingCastPointerLayoutAndFfiFallbackYamlRules() {
+        val reg = activeRules()
+        assertTrue(reg.coreImportRoutes("coreAutoImportRoutes").isNotEmpty())
+        assertTrue(reg.coreImportRoutes("coreExtensionImportRoutes").isNotEmpty())
+        assertTrue("register" in reg.words("cReservedParamNames"))
+        assertEquals("(-1).toByte()", reg.numericKindKeyMap("numericDefaultFallbackByKind")[NumericKind.I8])
+        assertEquals("Byte" to "8u", reg.primOwnerAndBitsByKind[NumericKind.I8])
+        assertEquals("I32", reg.map("fixedScalarCodecs")["i32"])
+        assertEquals("UInt", reg.map("literalCodecTypes")["U32"])
 
         val headerCtx =
             FileHeaderContext(
@@ -200,5 +207,79 @@ class YamlRuleEngineTest {
         assertContains(kt, "import io.github.kotlinmania.rustlang.core.mem.PrimitiveLayouts")
         assertContains(kt, "AddressableLocal(12, PrimitiveLayouts.I32)")
         assertContains(kt, "return rawLen.toLong()")
+    }
+
+    @Test
+    fun reloadsModifiedYamlRuleDirectoryAtRuntimeWithoutRecompilingKotlin() {
+        val srcRulesDir = resolveFilesystemRulesDirectory(explicitDir = null) ?: error("Missing rules directory in test workspace")
+        val customDir = KmPath("build/tmp-runtime-yaml-override-test")
+        fun cleanupCustomDir() {
+            if (SystemFileSystem.exists(customDir)) {
+                for (child in SystemFileSystem.list(customDir)) {
+                    SystemFileSystem.delete(child, mustExist = false)
+                }
+                SystemFileSystem.delete(customDir, mustExist = false)
+            }
+        }
+        cleanupCustomDir()
+        SystemFileSystem.createDirectories(customDir, mustCreate = true)
+        try {
+            for (srcFile in SystemFileSystem.list(srcRulesDir)) {
+                if (!srcFile.name.endsWith(".yml")) continue
+                val original = SystemFileSystem.readString(srcFile)
+                val customized =
+                    when (srcFile.name) {
+                        "type-and-method-patterns.yml" ->
+                            original.replace(
+                                "replace: \"ArrayList({arg0})\"",
+                                "replace: \"CustomVecPool.allocate({arg0})\"",
+                            )
+                        "paths-consts-and-c-abi.yml" ->
+                            original.replace(
+                                "- { name: TAU, f32: \"6.2831855f\", f64: \"6.283185307179586\" }",
+                                "- { name: TAU, f32: \"6.28f\", f64: \"CustomMath.TAU_CONST\" }",
+                            )
+                        else -> original
+                    }
+                SystemFileSystem.writeString(KmPath("$customDir/${srcFile.name}"), customized)
+            }
+
+            val rustSnippet =
+                """
+                pub fn custom_rules_probe() -> f64 {
+                    let _buf: Vec<i32> = Vec::with_capacity(16);
+                    std::f64::consts::TAU
+                }
+                """.trimIndent()
+
+            val customRendered =
+                RuntimeRuleRegistry.withRulesFromDirectory(customDir.toString()) {
+                    renderSingleKotlinFile(rustSnippet, FileHeaderContext(packageName = "sample.custom")).text
+                }
+            assertContains(customRendered, "CustomVecPool.allocate(16)")
+            assertContains(customRendered, "CustomMath.TAU_CONST")
+
+            val inputRs = KmPath("$customDir/probe.rs")
+            val outputKt = KmPath("$customDir/ProbeOut.kt")
+            SystemFileSystem.writeString(inputRs, rustSnippet)
+            runSingleFileCommand(
+                arrayOf(
+                    "translate",
+                    "--rules-dir",
+                    customDir.toString(),
+                    inputRs.toString(),
+                    outputKt.toString(),
+                ),
+            )
+            val cliKt = SystemFileSystem.readString(outputKt)
+            assertContains(cliKt, "CustomVecPool.allocate(16)")
+            assertContains(cliKt, "CustomMath.TAU_CONST")
+
+            val restoredDefault = renderSingleKotlinFile(rustSnippet, FileHeaderContext(packageName = "sample.restored")).text
+            assertContains(restoredDefault, "ArrayList(16)")
+            assertContains(restoredDefault, "6.283185307179586")
+        } finally {
+            cleanupCustomDir()
+        }
     }
 }

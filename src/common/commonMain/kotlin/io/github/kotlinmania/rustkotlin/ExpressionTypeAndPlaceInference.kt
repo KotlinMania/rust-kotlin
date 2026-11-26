@@ -27,8 +27,8 @@ import io.github.kotlinmania.syn.TraitItem
 import io.github.kotlinmania.syn.UnOp
 import io.github.kotlinmania.syn.gen.Visit
 
-internal val RAW_POINTER_ARITH_METHODS: Set<String> =
-    YamlRuleCatalogs.TypeAndMethodPatterns.rawPointerArithMethods
+internal val RAW_POINTER_ARITH_METHODS: Set<String>
+    get() = activeRules().words("rawPointerArithMethods")
 
 internal fun Expr.MethodCall.firstTurbofishTypeArg(): SynType? {
     val argList = turbofish?.args?.toList() ?: return null
@@ -74,26 +74,44 @@ internal object PrimitiveArrayTypeCatalog {
         val layoutFactory: String,
     )
 
-    private val SPECS: List<Spec> =
-        YamlRuleCatalogs.TypeAndMethodPatterns.primitiveArraySpecNodes.map { node ->
-            Spec(
-                arrayType = node.string("arrayType"),
-                elemType = node.string("elemType"),
-                numericKind = node.optionalString("numericKind")?.let(NumericKind::valueOf),
-                layoutFactory = node.string("layoutFactory"),
+    private class Tables(
+        val byArrayType: Map<String, Spec>,
+        val factoryByKind: Map<NumericKind, String>,
+        val arrayByElem: Map<String, String>,
+    )
+
+    private val tablesMemo =
+        RegistryMemo { reg ->
+            val specs =
+                reg.mappings("primitiveArraySpecs").map { node ->
+                    Spec(
+                        arrayType = node.string("arrayType"),
+                        elemType = node.string("elemType"),
+                        numericKind = node.optionalString("numericKind")?.let(NumericKind::valueOf),
+                        layoutFactory = node.string("layoutFactory"),
+                    )
+                }
+            Tables(
+                byArrayType = specs.associateBy { it.arrayType },
+                factoryByKind =
+                    specs
+                        .mapNotNull { spec -> spec.numericKind?.let { it to spec.layoutFactory } }
+                        .toMap(),
+                arrayByElem = specs.associate { it.elemType to it.arrayType } + ("kotlin.Float" to "FloatArray"),
             )
         }
 
-    private val BY_ARRAY_TYPE: Map<String, Spec> = SPECS.associateBy { it.arrayType }
-    private val FACTORY_BY_KIND: Map<NumericKind, String> =
-        SPECS
-            .mapNotNull { spec -> spec.numericKind?.let { it to spec.layoutFactory } }
-            .toMap()
-    private val ARRAY_BY_ELEM: Map<String, String> =
-        SPECS.associate { it.elemType to it.arrayType } + ("kotlin.Float" to "FloatArray")
+    private val BY_ARRAY_TYPE: Map<String, Spec>
+        get() = tablesMemo.get().byArrayType
 
-    private val NUMERIC_KIND_BY_ELEM: Map<String, NumericKind> =
-        YamlRuleCatalogs.TypeAndMethodPatterns.numericKindByElem
+    private val FACTORY_BY_KIND: Map<NumericKind, String>
+        get() = tablesMemo.get().factoryByKind
+
+    private val ARRAY_BY_ELEM: Map<String, String>
+        get() = tablesMemo.get().arrayByElem
+
+    private val NUMERIC_KIND_BY_ELEM: Map<String, NumericKind>
+        get() = activeRules().numericKindValMap("numericKindByElem")
 
     fun elemKind(containerType: String, coreNs: String): NumericKind? {
         BY_ARRAY_TYPE[containerType]?.numericKind?.let { return it }
@@ -1101,30 +1119,30 @@ private class ExprTypeInferenceEngine(
                 listOf("core", "option", "Option", "None"),
                 listOf("std", "option", "Option", "None"),
             )
-        private val NON_OPTION_METHOD_NAMES: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.nonOptionMethodNames
+        private val NON_OPTION_METHOD_NAMES: Set<String> get() = activeRules().words("nonOptionMethodNames")
         private val OPTION_CHAIN_PRESERVING_METHODS: Set<String>
-            get() = YamlRuleCatalogs.TypeAndMethodPatterns.optionChainPreservingMethods
-        private val NULLABLE_NEW_WRAPPER_OWNERS: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.nullableNewWrapperOwners
-        private val LAYOUT_QUERY_FN_IDENTS: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.layoutQueryFnIdents
-        private val MUT_PTR_CONTAINER_BASES: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.mutPtrContainerBases
-        private val ENDIAN_INT_METHODS: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.endianIntMethods
+            get() = activeRules().words("optionChainPreservingMethods")
+        private val NULLABLE_NEW_WRAPPER_OWNERS: Set<String> get() = activeRules().words("nullableNewWrapperOwners")
+        private val LAYOUT_QUERY_FN_IDENTS: Set<String> get() = activeRules().words("layoutQueryFnIdents")
+        private val MUT_PTR_CONTAINER_BASES: Set<String> get() = activeRules().words("mutPtrContainerBases")
+        private val ENDIAN_INT_METHODS: Set<String> get() = activeRules().words("endianIntMethods")
         private val OPTION_UNWRAP_SINGLE_ARG_METHODS: Set<String>
-            get() = YamlRuleCatalogs.TypeAndMethodPatterns.optionUnwrapSingleArgMethods
+            get() = activeRules().words("optionUnwrapSingleArgMethods")
         private val OPTION_ZERO_ARG_IDENTITY_METHODS: Set<String>
-            get() = YamlRuleCatalogs.TypeAndMethodPatterns.optionZeroArgIdentityMethods
+            get() = activeRules().words("optionZeroArgIdentityMethods")
         private val ATOMIC_VALUE_RETURNING_METHODS: Set<String>
-            get() = YamlRuleCatalogs.TypeAndMethodPatterns.atomicValueReturningMethods
+            get() = activeRules().words("atomicValueReturningMethods")
         private val FMT_DEBUG_BUILDER_RETURNS: Map<String, String>
-            get() = YamlRuleCatalogs.TypeAndMethodPatterns.fmtDebugBuilderReturns
+            get() = activeRules().map("fmtDebugBuilderReturns")
         private val FLOAT_SUFFIX_NUMERIC_KINDS: Map<String, NumericKind>
-            get() = YamlRuleCatalogs.TypeAndMethodPatterns.floatSuffixNumericKinds
+            get() = activeRules().numericKindValMap("floatSuffixNumericKinds")
         private val INT_SUFFIX_NUMERIC_KINDS: Map<String, NumericKind>
-            get() = YamlRuleCatalogs.TypeAndMethodPatterns.intSuffixNumericKinds
+            get() = activeRules().numericKindValMap("intSuffixNumericKinds")
     }
 }
 
-internal val NUMERIC_COERCE_SUFFIX_BY_KIND: Map<NumericKind, String> =
-    YamlRuleCatalogs.TypeAndMethodPatterns.numericCoerceSuffixByKind
+internal val NUMERIC_COERCE_SUFFIX_BY_KIND: Map<NumericKind, String>
+    get() = activeRules().numericKindKeyMap("numericCoerceSuffixByKind")
 
 private val NUMERIC_KIND_BY_NAME: Map<String, NumericKind> = NumericKind.entries.associateBy { it.name }
 
@@ -1322,15 +1340,15 @@ internal fun KotlinJ2KEmitter.mutablePlaceReturnType(
     }
 }
 
-internal val STR_PRIMITIVE_PARSE_METHODS: Map<String, String> =
-    YamlRuleCatalogs.TypeAndMethodPatterns.strPrimitiveParseMethods
+internal val STR_PRIMITIVE_PARSE_METHODS: Map<String, String>
+    get() = activeRules().map("strPrimitiveParseMethods")
 
 internal fun refCellGuardPointeeType(type: String?): String? =
     type.asKotlinRenderedType()?.singleArgOf("Ref", "RefMut")
 
-private val MAP_SIMPLE_NAMES: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.mapSimpleNames
-private val SET_SIMPLE_NAMES: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.setSimpleNames
-private val INDEXED_SLICE_BASES: Set<String> get() = YamlRuleCatalogs.TypeAndMethodPatterns.indexedSliceBases
+private val MAP_SIMPLE_NAMES: Set<String> get() = activeRules().words("mapSimpleNames")
+private val SET_SIMPLE_NAMES: Set<String> get() = activeRules().words("setSimpleNames")
+private val INDEXED_SLICE_BASES: Set<String> get() = activeRules().words("indexedSliceBases")
 
 internal fun isMapRenderedType(type: String?): Boolean {
     val parsed = type.asKotlinRenderedType() ?: return false

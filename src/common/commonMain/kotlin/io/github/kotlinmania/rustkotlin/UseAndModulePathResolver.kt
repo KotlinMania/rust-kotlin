@@ -12,7 +12,7 @@ internal data class UseLeaf(
 )
 
 private val EXTERNAL_REEXPORT_SEARCH_CRATES: List<String>
-    get() = YamlRuleCatalogs.PathsConstsAndCAbi.externalReexportSearchCrates
+    get() = activeRules().stringList("externalReexportSearchCrates")
 
 internal fun KotlinJ2KEmitter.normalizeNetcLibcSegments(segs: List<String>): List<String> =
     if (segs.firstOrNull()?.removePrefix("r#") == "netc" && FfiInteropCollector.resolveLibcNamespace(headerContext) != null) {
@@ -105,9 +105,9 @@ internal fun KotlinJ2KEmitter.resolveExternalDepReexportPkg(
 }
 
 private val CORE_ROOT_PRIMITIVE_WRAPPER_SYMBOLS: Set<String>
-    get() = YamlRuleCatalogs.PathsConstsAndCAbi.coreRootPrimitiveWrapperSymbols
+    get() = activeRules().words("coreRootPrimitiveWrapperSymbols")
 private val CORE_MEM_SUBPKG_SYMBOLS: Set<String>
-    get() = YamlRuleCatalogs.PathsConstsAndCAbi.coreMemSubpkgSymbols
+    get() = activeRules().words("coreMemSubpkgSymbols")
 
 internal fun KotlinJ2KEmitter.resolveBestSubpackageForSymbol(ktSymbol: String): String? {
     val nsPrefix = currentNamespacePrefix()
@@ -205,15 +205,15 @@ private class SubpackageAffinityScorer(
     }
 
     companion object {
-        private val HIGH_ARCH_SEGS: Set<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.highArchSegs
-        private val BSD_FAMILY_SEGS: Set<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.bsdFamilySegs
-        private val UNIX_BIAS_SEGS: Set<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.unixBiasSegs
-        private val BITS32_PENALTY_SEGS: Set<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.bits32PenaltySegs
-        private val UNIX_FAMILY_SEGS: Set<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.unixFamilySegs
-        private val FOREIGN_PLATFORM_SEGS: Set<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.foreignPlatformSegs
-        private val NON_SIGNIFICANT_SEGS: Set<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.nonSignificantSegs
-        private val WASI_FOREIGN_PENALTY_SEGS: Set<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.wasiForeignPenaltySegs
-        private val WASIP_VERSION_SEGS: Set<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.wasipVersionSegs
+        private val HIGH_ARCH_SEGS: Set<String> get() = activeRules().words("highArchSegs")
+        private val BSD_FAMILY_SEGS: Set<String> get() = activeRules().words("bsdFamilySegs")
+        private val UNIX_BIAS_SEGS: Set<String> get() = activeRules().words("unixBiasSegs")
+        private val BITS32_PENALTY_SEGS: Set<String> get() = activeRules().words("bits32PenaltySegs")
+        private val UNIX_FAMILY_SEGS: Set<String> get() = activeRules().words("unixFamilySegs")
+        private val FOREIGN_PLATFORM_SEGS: Set<String> get() = activeRules().words("foreignPlatformSegs")
+        private val NON_SIGNIFICANT_SEGS: Set<String> get() = activeRules().words("nonSignificantSegs")
+        private val WASI_FOREIGN_PENALTY_SEGS: Set<String> get() = activeRules().words("wasiForeignPenaltySegs")
+        private val WASIP_VERSION_SEGS: Set<String> get() = activeRules().words("wasipVersionSegs")
     }
 }
 
@@ -315,14 +315,14 @@ internal fun KotlinJ2KEmitter.scopedAbiKeysForRenderedType(renderedType: String)
 }
 
 private val KOTLIN_BUILTIN_QUALIFY_SIMPLE_TYPE_NAMES: Set<String>
-    get() = YamlRuleCatalogs.PathsConstsAndCAbi.kotlinBuiltinQualifySimpleTypeNames
+    get() = activeRules().words("kotlinBuiltinQualifySimpleTypeNames")
 
 internal fun KotlinJ2KEmitter.isDeclaredTopLevelFnKotlinName(ktName: String): Boolean =
     ktName == currentEnclosingFunctionName ||
         inspector.declaredTopLevelFnRawNames.any { rustFunctionIdentToKotlin(it) == ktName }
 
 private val STDLIB_UNIMPORTED_SUBMODULES: Set<String>
-    get() = YamlRuleCatalogs.PathsConstsAndCAbi.stdlibUnimportedSubmodules
+    get() = activeRules().words("stdlibUnimportedSubmodules")
 
 internal fun KotlinJ2KEmitter.bindOrQualifyResolvedCrossSymbol(resolvedFullImport: String): String {
     val rawTarget = resolvedFullImport.substringBefore(" as ").trim()
@@ -651,14 +651,14 @@ internal open class RustModulePathResolver(
             thirdClean == "atomic"
 
     companion object {
-        internal val CORE_MEM_INTRINSICS: Set<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.coreMemIntrinsics
+        internal val CORE_MEM_INTRINSICS: Set<String> get() = activeRules().words("coreMemIntrinsics")
         private val ALLOC_STD_CRATE_ROOTS = wordSet("alloc std crate")
         private val ARC_WEAK_SYMBOLS = wordSet("Arc Weak")
         private val RC_WEAK_SYMBOLS = wordSet("Rc Weak")
         internal val CORE_STD_CRATE_ROOTS = wordSet("core std crate")
-        internal val STDLIB_CORE_SUBMODULES: Set<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.stdlibCoreSubmodules
+        internal val STDLIB_CORE_SUBMODULES: Set<String> get() = activeRules().words("stdlibCoreSubmodules")
         internal val CORE_INTRINSIC_OR_PRELUDE_LEAVES: Set<String>
-            get() = YamlRuleCatalogs.PathsConstsAndCAbi.coreIntrinsicOrPreludeLeaves
+            get() = activeRules().words("coreIntrinsicOrPreludeLeaves")
     }
 }
 
@@ -1740,13 +1740,13 @@ private class KotlinImportPathResolver(
         private val FFI_SEGS = listOf("ffi")
         private val PROC_OR_SERDE_DERIVE_CRATES = wordSet("proc_macro serde_derive serde_derive_internals")
         private val STDLIB_SEARCH_CRATES = listOf("core", "alloc", "std")
-        private val STDLIB_CELL_TYPES: Set<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.stdlibCellTypes
+        private val STDLIB_CELL_TYPES: Set<String> get() = activeRules().words("stdlibCellTypes")
         private val STDLIB_PRIMITIVE_OR_PRELUDE_SECOND_SEGS: Set<String>
-            get() = YamlRuleCatalogs.PathsConstsAndCAbi.stdlibPrimitiveOrPreludeSecondSegs
+            get() = activeRules().words("stdlibPrimitiveOrPreludeSecondSegs")
         private val STDLIB_UNINDEXED_SKIP_SECOND_SEGS: Set<String>
-            get() = YamlRuleCatalogs.PathsConstsAndCAbi.stdlibUnindexedSkipSecondSegs
+            get() = activeRules().words("stdlibUnindexedSkipSecondSegs")
         private val STDLIB_ALLOWED_WILDCARD_SUBMODULES: Set<String>
-            get() = YamlRuleCatalogs.PathsConstsAndCAbi.stdlibAllowedWildcardSubmodules
+            get() = activeRules().words("stdlibAllowedWildcardSubmodules")
     }
 }
 
@@ -2105,12 +2105,12 @@ private class UseItemImportEmitter(
 
     companion object {
         private val FILE_OR_DIR_NAMES = wordSet("FILE DIR")
-        private val UNLOWERED_STD_MODULES: Set<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.unloweredStdModules
-        private val WINDOWS_OS_PRELUDE_SYMS: List<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.windowsOsPreludeSyms
-        private val UNIX_OS_PRELUDE_SYMS: List<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.unixOsPreludeSyms
-        private val FLOAT_OR_CONSTS_SEGS: Set<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.floatOrConstsSegs
-        private val DROP_MARKER_LEAVES: Set<String> get() = YamlRuleCatalogs.PathsConstsAndCAbi.dropMarkerLeaves
+        private val UNLOWERED_STD_MODULES: Set<String> get() = activeRules().words("unloweredStdModules")
+        private val WINDOWS_OS_PRELUDE_SYMS: List<String> get() = activeRules().stringList("windowsOsPreludeSyms")
+        private val UNIX_OS_PRELUDE_SYMS: List<String> get() = activeRules().stringList("unixOsPreludeSyms")
+        private val FLOAT_OR_CONSTS_SEGS: Set<String> get() = activeRules().words("floatOrConstsSegs")
+        private val DROP_MARKER_LEAVES: Set<String> get() = activeRules().words("dropMarkerLeaves")
         private val CONST_PANIC_OR_ERROR_SUFFIXES: List<String>
-            get() = YamlRuleCatalogs.PathsConstsAndCAbi.constPanicOrErrorSuffixes
+            get() = activeRules().stringList("constPanicOrErrorSuffixes")
     }
 }

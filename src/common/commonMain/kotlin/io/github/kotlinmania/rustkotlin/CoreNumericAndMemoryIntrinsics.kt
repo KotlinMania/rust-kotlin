@@ -338,52 +338,56 @@ private object ThreeWayCompareIntrinsicRule : IntIntrinsicLoweringRule("three_wa
     }
 }
 
-private val INT_INTRINSIC_RULES: List<IntIntrinsicLoweringRule> =
-    YamlRuleCatalogs.CoreIntrinsics.intIntrinsicRuleNodes.map { node ->
-        val names = node.wordSet("names")
-        val withLayoutFn = node.string("withLayoutFn")
-        when (val kind = node.string("kind")) {
-            "bitwiseUnsigned" ->
-                BitwiseUnsignedIntrinsicRule(
-                    names = names,
-                    kmStem = node.string("kmStem"),
-                    withLayoutFn = withLayoutFn,
-                    returnsUIntCount = node.bool("returnsUIntCount"),
-                    takesUIntShift = node.bool("takesUIntShift"),
-                    identityOnByte = node.bool("identityOnByte"),
-                )
-            "binaryInfix" ->
-                BinaryInfixIntIntrinsicRule(
-                    names = names,
-                    opSymbol = node.string("opSymbol"),
-                    withLayoutFn = withLayoutFn,
-                    u128Fn = node.optionalString("u128Fn"),
-                )
-            "widthTaggedBinary" ->
-                WidthTaggedBinaryIntrinsicRule(
-                    name = names.single(),
-                    kmPrefix = node.string("kmPrefix"),
-                    withLayoutFn = withLayoutFn,
-                    wrapPairOverflow = node.bool("wrapPairOverflow"),
-                )
-            "uncheckedShift" ->
-                UncheckedShiftIntrinsicRule(
-                    name = names.single(),
-                    isLeft = node.bool("isLeft"),
-                    withLayoutFn = withLayoutFn,
-                )
-            "disjointBitor" -> DisjointBitorIntrinsicRule
-            "threeWayCompare" -> ThreeWayCompareIntrinsicRule
-            else -> throw IllegalArgumentException("Unknown intIntrinsicRules kind: '$kind'")
+private val INT_INTRINSIC_RULES_BY_NAME_MEMO =
+    RegistryMemo { reg ->
+        val rules =
+            reg.mappings("intIntrinsicRules").map { node ->
+                val names = node.wordSet("names")
+                val withLayoutFn = node.string("withLayoutFn")
+                when (val kind = node.string("kind")) {
+                    "bitwiseUnsigned" ->
+                        BitwiseUnsignedIntrinsicRule(
+                            names = names,
+                            kmStem = node.string("kmStem"),
+                            withLayoutFn = withLayoutFn,
+                            returnsUIntCount = node.bool("returnsUIntCount"),
+                            takesUIntShift = node.bool("takesUIntShift"),
+                            identityOnByte = node.bool("identityOnByte"),
+                        )
+                    "binaryInfix" ->
+                        BinaryInfixIntIntrinsicRule(
+                            names = names,
+                            opSymbol = node.string("opSymbol"),
+                            withLayoutFn = withLayoutFn,
+                            u128Fn = node.optionalString("u128Fn"),
+                        )
+                    "widthTaggedBinary" ->
+                        WidthTaggedBinaryIntrinsicRule(
+                            name = names.single(),
+                            kmPrefix = node.string("kmPrefix"),
+                            withLayoutFn = withLayoutFn,
+                            wrapPairOverflow = node.bool("wrapPairOverflow"),
+                        )
+                    "uncheckedShift" ->
+                        UncheckedShiftIntrinsicRule(
+                            name = names.single(),
+                            isLeft = node.bool("isLeft"),
+                            withLayoutFn = withLayoutFn,
+                        )
+                    "disjointBitor" -> DisjointBitorIntrinsicRule
+                    "threeWayCompare" -> ThreeWayCompareIntrinsicRule
+                    else -> throw IllegalArgumentException("Unknown intIntrinsicRules kind: '$kind'")
+                }
+            }
+        buildMap {
+            for (rule in rules) {
+                for (name in rule.names) put(name, rule)
+            }
         }
     }
 
-internal val INT_INTRINSIC_RULES_BY_NAME: Map<String, IntIntrinsicLoweringRule> =
-    buildMap {
-        for (rule in INT_INTRINSIC_RULES) {
-            for (name in rule.names) put(name, rule)
-        }
-    }
+internal val INT_INTRINSIC_RULES_BY_NAME: Map<String, IntIntrinsicLoweringRule>
+    get() = INT_INTRINSIC_RULES_BY_NAME_MEMO.get()
 
 internal fun renderIntOrBitIntrinsicCall(call: IntrinsicCallContext): String? {
     val rule = INT_INTRINSIC_RULES_BY_NAME[call.canonicalName] ?: return null
@@ -629,25 +633,29 @@ private object FloatToIntUncheckedIntrinsicRule : FloatIntrinsicLoweringRule(set
     }
 }
 
-private val FLOAT_INTRINSIC_RULES: List<FloatIntrinsicLoweringRule> =
-    listOf(
-        FixedKmFloatIntrinsicRule(CoreIntrinsicLowering.SUFFIXED_FLOAT_UNARY_KM, arity = 1),
-        FixedKmFloatIntrinsicRule(CoreIntrinsicLowering.SUFFIXED_FLOAT_BINARY_KM, arity = 2),
-        FixedKmFloatIntrinsicRule(YamlRuleCatalogs.CoreIntrinsics.suffixedFloatTernaryKm, arity = 3),
-        FixedMinMaxFloatIntrinsicRule,
-        GenericUnaryFloatIntrinsicRule(),
-        GenericBinaryFloatOpIntrinsicRule(),
-        GenericPowiFloatIntrinsicRule,
-        GenericFmaFloatIntrinsicRule,
-        FloatToIntUncheckedIntrinsicRule,
-    )
-
-internal val FLOAT_INTRINSIC_RULES_BY_NAME: Map<String, FloatIntrinsicLoweringRule> =
-    buildMap {
-        for (rule in FLOAT_INTRINSIC_RULES) {
-            for (name in rule.names) put(name, rule)
+private val FLOAT_INTRINSIC_RULES_BY_NAME_MEMO =
+    RegistryMemo { reg ->
+        val rules =
+            listOf(
+                FixedKmFloatIntrinsicRule(reg.suffixedFloatUnaryKm, arity = 1),
+                FixedKmFloatIntrinsicRule(reg.map("suffixedFloatBinaryKm"), arity = 2),
+                FixedKmFloatIntrinsicRule(reg.map("suffixedFloatTernaryKm"), arity = 3),
+                FixedMinMaxFloatIntrinsicRule,
+                GenericUnaryFloatIntrinsicRule(),
+                GenericBinaryFloatOpIntrinsicRule(),
+                GenericPowiFloatIntrinsicRule,
+                GenericFmaFloatIntrinsicRule,
+                FloatToIntUncheckedIntrinsicRule,
+            )
+        buildMap {
+            for (rule in rules) {
+                for (name in rule.names) put(name, rule)
+            }
         }
     }
+
+internal val FLOAT_INTRINSIC_RULES_BY_NAME: Map<String, FloatIntrinsicLoweringRule>
+    get() = FLOAT_INTRINSIC_RULES_BY_NAME_MEMO.get()
 
 internal fun renderFloatIntrinsicCall(call: IntrinsicCallContext): String? {
     val rule = FLOAT_INTRINSIC_RULES_BY_NAME[call.canonicalName] ?: return null

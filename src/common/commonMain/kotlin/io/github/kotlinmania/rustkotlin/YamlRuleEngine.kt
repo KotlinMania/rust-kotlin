@@ -1,5 +1,13 @@
 package io.github.kotlinmania.rustkotlin
 
+import io.github.kotlinmania.io.Buffer
+import io.github.kotlinmania.io.Source
+import io.github.kotlinmania.io.readLine
+import io.github.kotlinmania.io.writeString
+import io.github.kotlinmania.rustkotlin.reused.starlark.FormatParser
+import io.github.kotlinmania.rustkotlin.reused.starlark.FormatToken
+import io.github.kotlinmania.rustlang.core.cell.once.OnceCell
+
 /**
  * Pure-KMP YAML AST, strict comment-aware parser, and pre-compiled declarative
  * pattern-matching / template-replacement engine for data-driven Rust-to-Kotlin rules.
@@ -156,8 +164,17 @@ internal object YamlDocumentParser {
         val strippedContent: String,
     )
 
+    fun parse(source: Source, sourceName: String = "<yaml>"): YamlNode.Mapping {
+        val rawLines = preprocessStream(source, sourceName)
+        return parsePreprocessedLines(rawLines, sourceName)
+    }
+
     fun parse(source: String, sourceName: String = "<yaml>"): YamlNode.Mapping {
-        val rawLines = preprocessLines(source, sourceName)
+        val buf = Buffer().apply { writeString(source) }
+        return parse(buf, sourceName)
+    }
+
+    private fun parsePreprocessedLines(rawLines: List<RawLine>, sourceName: String): YamlNode.Mapping {
         val firstIdx = nextMeaningfulLine(rawLines, 0)
         if (firstIdx >= rawLines.size) return YamlNode.Mapping(emptyMap())
         val (root, nextIdx) = parseBlock(rawLines, firstIdx, rawLines[firstIdx].indent, sourceName)
@@ -169,22 +186,25 @@ internal object YamlDocumentParser {
             ?: fail(sourceName, rawLines[firstIdx].lineNo, "Top-level YAML document must be a mapping")
     }
 
-    private fun preprocessLines(source: String, sourceName: String): List<RawLine> {
-        val split = source.split('\n')
-        val out = ArrayList<RawLine>(split.size)
-        for ((idx, rawWithCr) in split.withIndex()) {
-            val lineNo = idx + 1
-            val raw = rawWithCr.trimEnd('\r')
-            var indent = 0
-            while (indent < raw.length && (raw[indent] == ' ' || raw[indent] == '\t')) {
-                if (raw[indent] == '\t') {
-                    fail(sourceName, lineNo, "Tab indentation is not allowed in YAML")
+    private fun preprocessStream(source: Source, sourceName: String): List<RawLine> {
+        val out = ArrayList<RawLine>()
+        source.use { reader ->
+            var lineNo = 0
+            while (true) {
+                val rawLine = reader.readLine() ?: break
+                lineNo++
+                val raw = if (lineNo == 1) rawLine.removePrefix("\uFEFF") else rawLine
+                var indent = 0
+                while (indent < raw.length && (raw[indent] == ' ' || raw[indent] == '\t')) {
+                    if (raw[indent] == '\t') {
+                        fail(sourceName, lineNo, "Tab indentation is not allowed in YAML")
+                    }
+                    indent++
                 }
-                indent++
+                val stripped = stripCommentsOutsideQuotes(raw.substring(indent))
+                val content = if (stripped == "---" || stripped == "...") "" else stripped
+                out.add(RawLine(lineNo = lineNo, rawText = raw, indent = indent, strippedContent = content))
             }
-            val stripped = stripCommentsOutsideQuotes(raw.substring(indent))
-            val content = if (stripped == "---" || stripped == "...") "" else stripped
-            out.add(RawLine(lineNo = lineNo, rawText = raw, indent = indent, strippedContent = content))
         }
         return out
     }
@@ -702,39 +722,32 @@ internal class YamlTemplate private constructor(
             val segments = ArrayList<Segment>()
             val placeholders = LinkedHashSet<String>()
             val literalBuf = StringBuilder()
-            var i = 0
-            while (i < pattern.length) {
-                val ch = pattern[i]
-                if (ch == '{') {
-                    if (i + 1 < pattern.length && pattern[i + 1] == '{') {
-                        literalBuf.append('{')
-                        i += 2
-                        continue
-                    }
-                    val close = pattern.indexOf('}', startIndex = i + 1)
-                    require(close > i + 1) { "Invalid or unclosed placeholder in YAML template: '$pattern'" }
-                    if (literalBuf.isNotEmpty()) {
-                        segments.add(Segment.Literal(literalBuf.toString()))
-                        literalBuf.clear()
-                    }
-                    val key = pattern.substring(i + 1, close)
-                    placeholders.add(key)
-                    segments.add(Segment.Placeholder(key))
-                    i = close + 1
-                } else if (ch == '}') {
-                    require(i + 1 < pattern.length && pattern[i + 1] == '}') {
-                        "Unescaped '}' in YAML template (use '}}' for a literal brace): '$pattern'"
-                    }
-                    literalBuf.append('}')
-                    i += 2
-                } else {
-                    literalBuf.append(ch)
-                    i++
+
+            fun flushLiteral() {
+                if (literalBuf.isNotEmpty()) {
+                    segments.add(Segment.Literal(literalBuf.toString()))
+                    literalBuf.clear()
                 }
             }
-            if (literalBuf.isNotEmpty()) {
-                segments.add(Segment.Literal(literalBuf.toString()))
+
+            val parser = FormatParser(pattern)
+            while (true) {
+                val token =
+                    parser.next().getOrElse { err ->
+                        throw IllegalArgumentException("Invalid YAML template '$pattern': ${err.message}", err)
+                    } ?: break
+                when (token) {
+                    is FormatToken.Text -> literalBuf.append(token.text)
+                    is FormatToken.Escape -> literalBuf.append(token.escape.asStr())
+                    is FormatToken.Capture -> {
+                        require(token.capture.isNotEmpty()) { "Empty placeholder '{}' in YAML template: '$pattern'" }
+                        flushLiteral()
+                        placeholders.add(token.capture)
+                        segments.add(Segment.Placeholder(token.capture))
+                    }
+                }
             }
+            flushLiteral()
             return YamlTemplate(segments, placeholders)
         }
     }
@@ -833,10 +846,11 @@ internal class DeclarativeTypePathPatternRule(
 }
 
 /**
- * Declarative pattern-match and template-replacement rule for method calls on typed receivers
- * (`rawPtr`, `dequeIter`, `vec`, `charsIter`, `erasedOption`, `unconstrainedCmp`, etc.).
+ * Declarative pattern-match and template-replacement rule for method calls on typed receivers,
+ * evaluated uniformly across `preArg`, `postArg`, `rawPtr`, and `unconstrainedCmp` phases.
  */
 internal class DeclarativeMethodPatternRule(
+    val phase: String,
     val methods: Set<String>,
     val receiverGuard: String,
     val arity: Int?,
@@ -844,37 +858,49 @@ internal class DeclarativeMethodPatternRule(
     val noTurbofish: Boolean,
     val requireTypeArgs: Boolean,
     val unlessDeclaredTypes: Set<String>,
+    val unlessAnyInstanceMethod: String?,
     val action: DeclarativeReplacementAction,
 ) {
-    fun matchesHeader(
+    fun matches(
         rawMethod: String,
-        receiverKind: String,
         argCount: Int,
         hasTurbofish: Boolean,
         declaredTypeNames: Set<String> = emptySet(),
+        instanceMethodSets: Collection<Set<String>> = emptyList(),
+        receiverPredicate: (String) -> Boolean,
     ): Boolean {
         if (rawMethod !in methods) return false
-        if (receiverGuard != receiverKind) return false
         if (arity != null && argCount != arity) return false
         if (maxArity != null && argCount > maxArity) return false
         if (noTurbofish && hasTurbofish) return false
         if (requireTypeArgs && !hasTurbofish) return false
         if (unlessDeclaredTypes.isNotEmpty() && unlessDeclaredTypes.any { it in declaredTypeNames }) return false
-        return true
+        if (unlessAnyInstanceMethod != null && instanceMethodSets.any { unlessAnyInstanceMethod in it }) return false
+        return receiverPredicate(receiverGuard)
     }
 
     companion object {
-        fun fromYaml(node: YamlNode.Mapping): DeclarativeMethodPatternRule =
-            DeclarativeMethodPatternRule(
+        fun fromYaml(node: YamlNode.Mapping): DeclarativeMethodPatternRule {
+            val recv = node.optionalString("receiver") ?: "any"
+            val defaultPhase =
+                when (recv) {
+                    "rawPtr" -> "rawPtr"
+                    "unconstrainedCmp" -> "unconstrainedCmp"
+                    else -> "postArg"
+                }
+            return DeclarativeMethodPatternRule(
+                phase = node.optionalString("phase") ?: defaultPhase,
                 methods = node.wordSet("match"),
-                receiverGuard = node.optionalString("receiver") ?: "any",
+                receiverGuard = recv,
                 arity = node.optionalInt("arity"),
                 maxArity = node.optionalInt("maxArity"),
                 noTurbofish = node.bool("noTurbofish", default = false),
                 requireTypeArgs = node.bool("requireTypeArgs", default = false),
                 unlessDeclaredTypes = node.optionalWordSet("unlessDeclaredTypes"),
+                unlessAnyInstanceMethod = node.optionalString("unlessAnyInstanceMethod"),
                 action = DeclarativeReplacementAction.fromYaml(node),
             )
+        }
     }
 }
 
@@ -990,5 +1016,269 @@ internal class DeclarativeCoreImportRouteRule(
                 subpkg = node.string("subpkg"),
                 symbols = node.wordSet("symbols").toList(),
             )
+    }
+}
+
+internal fun activeRules(): RuntimeRuleRegistry =
+    TranslationSession.activeRuleRegistryOverride ?: RuntimeRuleRegistry.default()
+
+/**
+ * Per-[RuntimeRuleRegistry] memoized projection for derived domain tables outside `YamlRuleEngine`,
+ * refreshing automatically if `--rules-dir` or [RuntimeRuleRegistry.withRulesFromDirectory] swaps
+ * the active registry.
+ */
+internal class RegistryMemo<T : Any>(
+    private val compute: (RuntimeRuleRegistry) -> T,
+) {
+    private var cachedRegistry: RuntimeRuleRegistry? = null
+    private var cachedValue: T? = null
+
+    fun get(): T {
+        val reg = activeRules()
+        val existing = cachedValue
+        if (cachedRegistry === reg && existing != null) {
+            return existing
+        }
+        val computed = compute(reg)
+        cachedRegistry = reg
+        cachedValue = computed
+        return computed
+    }
+}
+
+/**
+ * Unified runtime YAML rule registry streamed from `.yml` files via `km-io` [Source] and cached
+ * via `rust-lang-kotlin`'s [OnceCell]. Replaces compiled-in Kotlin rule strings and 1-to-1 catalog
+ * boilerplate with memoized generic table queries and O(1) symbol-indexed pattern rule tables.
+ */
+internal class RuntimeRuleRegistry(
+    val root: YamlNode.Mapping,
+    val loadedFileNames: List<String>,
+) {
+    private val wordsCache = HashMap<String, Set<String>>()
+    private val stringMapCache = HashMap<String, Map<String, String>>()
+    private val groupedMapCache = HashMap<String, Map<String, String>>()
+    private val intGroupMapCache = HashMap<String, Map<String, Int>>()
+    private val stringListCache = HashMap<String, List<String>>()
+    private val templateMapCache = HashMap<String, Map<String, YamlTemplate>>()
+    private val numericKindKeyCache = HashMap<String, Map<NumericKind, String>>()
+    private val numericKindValCache = HashMap<String, Map<String, NumericKind>>()
+    private val intrinsicSectionCache = HashMap<String, Map<String, DeclarativeIntrinsicPatternRule>>()
+    private val coreRouteCache = HashMap<String, List<DeclarativeCoreImportRouteRule>>()
+
+    fun words(key: String): Set<String> =
+        wordsCache.getOrPut(key) { root.wordSet(key) }
+
+    fun unionWords(vararg keys: String): Set<String> =
+        wordsCache.getOrPut(keys.joinToString("+")) {
+            val out = LinkedHashSet<String>()
+            for (k in keys) out.addAll(words(k))
+            out
+        }
+
+    fun map(key: String): Map<String, String> =
+        stringMapCache.getOrPut(key) { root.stringMap(key) }
+
+    fun unionMaps(vararg keys: String): Map<String, String> =
+        stringMapCache.getOrPut(keys.joinToString("+")) {
+            val out = LinkedHashMap<String, String>()
+            for (k in keys) out.putAll(map(k))
+            out
+        }
+
+    fun groupedMap(key: String): Map<String, String> =
+        groupedMapCache.getOrPut(key) { root.groupedTargetMap(key) }
+
+    fun intGroupMap(key: String): Map<String, Int> =
+        intGroupMapCache.getOrPut(key) { root.intKeyedWordGroups(key) }
+
+    fun stringList(key: String): List<String> =
+        stringListCache.getOrPut(key) { root.explicitStringList(key) }
+
+    fun mappings(key: String): List<YamlNode.Mapping> =
+        root.mappingList(key)
+
+    fun templates(key: String): Map<String, YamlTemplate> =
+        templateMapCache.getOrPut(key) {
+            map(key).mapValues { (_, pattern) -> YamlTemplate.compile(pattern) }
+        }
+
+    fun numericKindKeyMap(key: String): Map<NumericKind, String> =
+        numericKindKeyCache.getOrPut(key) {
+            map(key).entries.associate { (k, v) -> NumericKind.valueOf(k) to v }
+        }
+
+    fun numericKindValMap(key: String): Map<String, NumericKind> =
+        numericKindValCache.getOrPut(key) {
+            map(key).mapValues { (_, v) -> NumericKind.valueOf(v) }
+        }
+
+    fun intrinsicRules(section: String): Map<String, DeclarativeIntrinsicPatternRule> =
+        intrinsicSectionCache.getOrPut(section) {
+            val out = LinkedHashMap<String, DeclarativeIntrinsicPatternRule>()
+            for (node in mappings(section)) {
+                val rule = DeclarativeIntrinsicPatternRule.fromYaml(node)
+                for (name in rule.names) out[name] = rule
+            }
+            out
+        }
+
+    fun coreImportRoutes(section: String): List<DeclarativeCoreImportRouteRule> =
+        coreRouteCache.getOrPut(section) {
+            mappings(section).map(DeclarativeCoreImportRouteRule::fromYaml)
+        }
+
+    val typeRulesByName: Map<String, List<DeclarativeTypePathPatternRule>> by lazy {
+        val out = LinkedHashMap<String, MutableList<DeclarativeTypePathPatternRule>>()
+        for (node in mappings("stdlibGenericTypeRules")) {
+            val rule = DeclarativeTypePathPatternRule.fromYaml(node)
+            for (name in rule.names) out.getOrPut(name) { ArrayList() }.add(rule)
+        }
+        out
+    }
+
+    private val allMethodRules: List<DeclarativeMethodPatternRule> by lazy {
+        mappings("methodCallPatternRules").map(DeclarativeMethodPatternRule::fromYaml)
+    }
+
+    val rawPtrMethodRulesByName: Map<String, DeclarativeMethodPatternRule> by lazy {
+        indexSinglePhaseMethodRules("rawPtr")
+    }
+
+    val unconstrainedCmpRulesByName: Map<String, DeclarativeMethodPatternRule> by lazy {
+        indexSinglePhaseMethodRules("unconstrainedCmp")
+    }
+
+    val preArgMethodRulesByName: Map<String, List<DeclarativeMethodPatternRule>> by lazy {
+        indexMultiRulePhase("preArg")
+    }
+
+    val postArgMethodRulesByName: Map<String, List<DeclarativeMethodPatternRule>> by lazy {
+        indexMultiRulePhase("postArg")
+    }
+
+    val calleeRules: List<DeclarativeCalleePatternRule> by lazy {
+        mappings("calleePatternRules").map(DeclarativeCalleePatternRule::fromYaml)
+    }
+
+    val rustGlobalAllocActionsByName: Map<String, DeclarativeReplacementAction> by lazy {
+        mappings("rustGlobalAllocRules").associate { node ->
+            node.string("name") to DeclarativeReplacementAction.fromYaml(node)
+        }
+    }
+
+    val genericFloatUnaryKm: Map<String, Pair<String, String>> by lazy {
+        map("genericFloatUnaryKmStems").mapValues { (_, stem) -> "${stem}f32" to "${stem}f64" }
+    }
+
+    val suffixedFloatUnaryKm: Map<String, String> by lazy {
+        buildMap {
+            for ((op, fns) in genericFloatUnaryKm) {
+                if (op != "round_ties_even") {
+                    put("${op}f32", fns.first)
+                    put("${op}f64", fns.second)
+                }
+            }
+            putAll(map("suffixedFloatUnaryExtras"))
+        }
+    }
+
+    val atomicRmwOpCodes: Map<String, Int> by lazy {
+        map("atomicRmwOpCodes").mapValues { (k, v) ->
+            v.toIntOrNull() ?: throw IllegalArgumentException("Invalid atomicRmwOpCodes[$k]: '$v'")
+        }
+    }
+
+    val rustFloatMathConstants: Map<String, Pair<String, String>> by lazy {
+        mappings("rustFloatMathConstants").associate { node ->
+            node.string("name") to (node.string("f32") to node.string("f64"))
+        }
+    }
+
+    val primOwnerAndBitsByKind: Map<NumericKind, Pair<String, String>> by lazy {
+        mappings("primOwnerAndBitsByKind").associate { node ->
+            NumericKind.valueOf(node.string("kind")) to (node.string("owner") to node.string("bits"))
+        }
+    }
+
+    val coreEnumVariantImports: List<Pair<String, List<String>>> by lazy {
+        mappings("coreEnumVariantImports").map { node ->
+            node.string("ownerSubpkg") to node.wordSet("variants").toList()
+        }
+    }
+
+    val stdlibDefaultlessAssocTypes: Map<String, List<String>> by lazy {
+        val m = root.mapping("stdlibDefaultlessAssocTypes")
+        m.entries.keys.associateWith { k -> m.explicitStringList(k) }
+    }
+
+    val tryIntoFromOnlyTargetsBySrc: Map<String, Set<String>> by lazy {
+        val m = root.mapping("tryIntoFromOnlyTargetsBySrc")
+        m.entries.keys.associateWith { k -> m.wordSet(k) }
+    }
+
+    val prefixDefaultTypeInitializers: List<Pair<String, String>> by lazy {
+        map("prefixDefaultTypeInitializers").entries.map { it.key to it.value }
+    }
+
+    private fun indexSinglePhaseMethodRules(phase: String): Map<String, DeclarativeMethodPatternRule> {
+        val out = LinkedHashMap<String, DeclarativeMethodPatternRule>()
+        for (rule in allMethodRules) {
+            if (rule.phase == phase) {
+                for (m in rule.methods) out[m] = rule
+            }
+        }
+        return out
+    }
+
+    private fun indexMultiRulePhase(phase: String): Map<String, List<DeclarativeMethodPatternRule>> {
+        val out = LinkedHashMap<String, MutableList<DeclarativeMethodPatternRule>>()
+        for (rule in allMethodRules) {
+            if (rule.phase == phase) {
+                for (m in rule.methods) out.getOrPut(m) { ArrayList() }.add(rule)
+            }
+        }
+        return out
+    }
+
+    companion object {
+        private val DEFAULT_INSTANCE: OnceCell<RuntimeRuleRegistry> = OnceCell.new()
+
+        fun default(): RuntimeRuleRegistry =
+            DEFAULT_INSTANCE.getOrInit { loadFromStreamProviders(openRuntimeRuleStreams(explicitDir = null)) }
+
+        fun loadFromDirectory(directoryPath: String): RuntimeRuleRegistry =
+            loadFromStreamProviders(openRuntimeRuleStreams(explicitDir = directoryPath))
+
+        fun loadFromStreamProviders(streams: List<Pair<String, () -> Source>>): RuntimeRuleRegistry {
+            val merged = LinkedHashMap<String, YamlNode>()
+            val ownerByKey = HashMap<String, String>()
+            val names = ArrayList<String>(streams.size)
+            for ((fileName, openSource) in streams) {
+                names += fileName
+                val parsed = YamlDocumentParser.parse(openSource(), sourceName = fileName)
+                for ((k, v) in parsed.entries) {
+                    val prevFile = ownerByKey.put(k, fileName)
+                    require(prevFile == null) {
+                        "Duplicate top-level YAML rule key '$k' in '$fileName' (already defined in '$prevFile')"
+                    }
+                    merged[k] = v
+                }
+            }
+            return RuntimeRuleRegistry(YamlNode.Mapping(merged), names)
+        }
+
+        inline fun <T> withRulesFromDirectory(directoryPath: String, block: () -> T): T {
+            val prevDir = TranslationSession.rulesDirOverride
+            val prevReg = TranslationSession.activeRuleRegistryOverride
+            TranslationSession.rulesDirOverride = directoryPath
+            TranslationSession.activeRuleRegistryOverride = loadFromDirectory(directoryPath)
+            return try {
+                block()
+            } finally {
+                TranslationSession.rulesDirOverride = prevDir
+                TranslationSession.activeRuleRegistryOverride = prevReg
+            }
+        }
     }
 }

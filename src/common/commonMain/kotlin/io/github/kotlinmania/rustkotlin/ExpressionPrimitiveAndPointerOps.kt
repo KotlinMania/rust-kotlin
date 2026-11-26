@@ -10,8 +10,8 @@ import io.github.kotlinmania.syn.QSelf
 import io.github.kotlinmania.syn.RangeLimits
 import io.github.kotlinmania.syn.SynType
 
-private val PRIMITIVE_LAYOUT_NAME_BY_KT_TYPE: Map<String, String> =
-    YamlRuleCatalogs.TypeAndMethodPatterns.primitiveLayoutsByKtType
+private val PRIMITIVE_LAYOUT_NAME_BY_KT_TYPE: Map<String, String>
+    get() = activeRules().map("primitiveLayoutsByKtType")
 
 /**
  * Single authoritative catalog of Rust integer and floating-point primitive operations,
@@ -19,62 +19,84 @@ private val PRIMITIVE_LAYOUT_NAME_BY_KT_TYPE: Map<String, String> =
  * inference query one declarative source of truth.
  */
 internal object PrimitiveNumericOpCatalog {
-    val integerBitCountMethods: Map<String, String> =
-        YamlRuleCatalogs.TypeAndMethodPatterns.integerBitCountMethods
+    val integerBitCountMethods: Map<String, String>
+        get() = activeRules().map("integerBitCountMethods")
 
-    val integerUnaryOpMethods: Map<String, String> =
-        YamlRuleCatalogs.TypeAndMethodPatterns.integerUnaryOpMethods
+    val integerUnaryOpMethods: Map<String, String>
+        get() = activeRules().unionMaps("integerUnaryCoreMethods", "integerBitCountMethods")
 
-    val integerShiftOrPowMethods: Map<String, String> =
-        YamlRuleCatalogs.TypeAndMethodPatterns.integerShiftOrPowMethods
+    val integerShiftOrPowMethods: Map<String, String>
+        get() = activeRules().map("integerShiftOrPowMethods")
 
-    val integerBinaryOpMethods: Map<String, String> =
-        YamlRuleCatalogs.TypeAndMethodPatterns.integerBinaryOpMethods
+    val integerBinaryOpMethods: Map<String, String>
+        get() = activeRules().map("integerBinaryOpMethods")
 
-    private val allIntegerOpNames: Set<String> =
-        integerUnaryOpMethods.keys + integerShiftOrPowMethods.keys + integerBinaryOpMethods.keys
+    private val allIntegerOpNamesMemo =
+        RegistryMemo { reg ->
+            reg.unionMaps("integerUnaryCoreMethods", "integerBitCountMethods").keys +
+                reg.map("integerShiftOrPowMethods").keys +
+                reg.map("integerBinaryOpMethods").keys
+        }
 
-    val signedOnlyIntegerMethods: Set<String> =
-        YamlRuleCatalogs.TypeAndMethodPatterns.signedOnlyIntegerMethods
+    private val allIntegerOpNames: Set<String>
+        get() = allIntegerOpNamesMemo.get()
 
-    val endian128Methods: Map<String, String> =
-        YamlRuleCatalogs.TypeAndMethodPatterns.endian128Methods
+    val signedOnlyIntegerMethods: Set<String>
+        get() = activeRules().words("signedOnlyIntegerMethods")
 
-    val standaloneCheckedI32Ops: Map<String, String> =
-        YamlRuleCatalogs.TypeAndMethodPatterns.standaloneCheckedI32Ops
+    val endian128Methods: Map<String, String>
+        get() = activeRules().map("endian128Methods")
 
-    val floatStdlibBoolPredicates: Map<String, String> =
-        YamlRuleCatalogs.TypeAndMethodPatterns.floatStdlibBoolPredicates
+    val standaloneCheckedI32Ops: Map<String, String>
+        get() = activeRules().map("standaloneCheckedI32Ops")
 
-    val floatCoreBoolPredicates: Map<String, String> =
-        YamlRuleCatalogs.TypeAndMethodPatterns.floatCoreBoolPredicates
+    val floatStdlibBoolPredicates: Map<String, String>
+        get() = activeRules().map("floatStdlibBoolPredicates")
 
-    val floatCoreSelfMethods: Map<String, String> =
-        YamlRuleCatalogs.TypeAndMethodPatterns.floatCoreSelfMethods
+    val floatCoreBoolPredicates: Map<String, String>
+        get() = activeRules().map("floatCoreBoolPredicates")
 
-    val floatLibraryMethods: Map<String, String> =
-        floatCoreBoolPredicates + mapOf("classify" to "classify") + floatCoreSelfMethods
+    val floatCoreSelfMethods: Map<String, String>
+        get() = activeRules().map("floatCoreSelfMethods")
 
-    val floatKmUnaryBases: Map<String, String> =
-        YamlRuleCatalogs.TypeAndMethodPatterns.floatKmUnaryBases
+    private val floatLibraryMethodsMemo =
+        RegistryMemo { reg ->
+            reg.map("floatCoreBoolPredicates") + mapOf("classify" to "classify") + reg.map("floatCoreSelfMethods")
+        }
 
-    val floatLibmUnaryOps: Set<String> =
-        YamlRuleCatalogs.TypeAndMethodPatterns.floatLibmUnaryOps
+    val floatLibraryMethods: Map<String, String>
+        get() = floatLibraryMethodsMemo.get()
 
-    val floatLibmBinaryOps: Set<String> =
-        YamlRuleCatalogs.TypeAndMethodPatterns.floatLibmBinaryOps
+    val floatKmUnaryBases: Map<String, String>
+        get() = activeRules().map("floatKmUnaryBases")
 
-    val floatKmBinaryBases: Map<String, String> =
-        YamlRuleCatalogs.TypeAndMethodPatterns.floatKmBinaryBases
+    val floatLibmUnaryOps: Set<String>
+        get() = activeRules().words("floatLibmUnaryOps")
 
-    private val floatSameTypeReturnMethods: Set<String> =
-        (floatKmUnaryBases.keys - "round_ties_even") +
-            floatLibmUnaryOps +
-            floatLibmBinaryOps +
-            YamlRuleCatalogs.TypeAndMethodPatterns.floatAdditionalSameTypeReturnMethods
+    val floatLibmBinaryOps: Set<String>
+        get() = activeRules().words("floatLibmBinaryOps")
 
-    private val floatBoolReturnMethods: Set<String> =
-        floatStdlibBoolPredicates.keys + floatCoreBoolPredicates.keys
+    val floatKmBinaryBases: Map<String, String>
+        get() = activeRules().map("floatKmBinaryBases")
+
+    private val floatSameTypeReturnMethodsMemo =
+        RegistryMemo { reg ->
+            (reg.map("floatKmUnaryBases").keys - "round_ties_even") +
+                reg.words("floatLibmUnaryOps") +
+                reg.words("floatLibmBinaryOps") +
+                reg.words("floatAdditionalSameTypeReturnMethods")
+        }
+
+    private val floatSameTypeReturnMethods: Set<String>
+        get() = floatSameTypeReturnMethodsMemo.get()
+
+    private val floatBoolReturnMethodsMemo =
+        RegistryMemo { reg ->
+            reg.map("floatStdlibBoolPredicates").keys + reg.map("floatCoreBoolPredicates").keys
+        }
+
+    private val floatBoolReturnMethods: Set<String>
+        get() = floatBoolReturnMethodsMemo.get()
 
     fun isFloatKind(kind: NumericKind): Boolean =
         kind == NumericKind.F16 || kind == NumericKind.F32 || kind == NumericKind.F64 || kind == NumericKind.F128

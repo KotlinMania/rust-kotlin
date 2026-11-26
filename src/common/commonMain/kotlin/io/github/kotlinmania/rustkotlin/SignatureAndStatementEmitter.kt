@@ -36,25 +36,25 @@ internal data class TypeParamWitnessSpec(
 )
 
 internal val COMPANION_CAPABLE_VALUE_TYPES: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.companionCapableValueTypes
+    get() = activeRules().words("companionCapableValueTypes")
 
 private val ITERATOR_ASSOC_TRAITS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.iteratorAssocTraits
+    get() = activeRules().words("iteratorAssocTraits")
 
 private val WITNESS_MUT_REF_SCALARS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.witnessMutRefScalars
+    get() = activeRules().words("witnessMutRefScalars")
 
 private val ZERO_ARG_SELF_PRODUCER_METHODS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.zeroArgSelfProducerMethods
+    get() = activeRules().words("zeroArgSelfProducerMethods")
 
 private val EXTERNAL_OVERRIDABLE_STDLIB_TRAITS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.externalOverridableStdlibTraits
+    get() = activeRules().words("externalOverridableStdlibTraits")
 
 private val CORE_OPS_FORWARD_REF_TRAITS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.coreOpsForwardRefTraits
+    get() = activeRules().words("coreOpsForwardRefTraits")
 
 private val KOTLIN_BUILTIN_ARITH_TYPES: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.kotlinBuiltinArithTypes
+    get() = activeRules().words("kotlinBuiltinArithTypes")
 
 private fun collectCombinedWherePredicates(
     ownerWhere: WhereClause?,

@@ -48,13 +48,13 @@ private fun singleUnqualifiedPathIdent(type: SynType?): String? =
         ?.lastIdentText()
 
 private val FIXED_SCALAR_CODECS: Map<String, String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.fixedScalarCodecs
+    get() = activeRules().map("fixedScalarCodecs")
 
 private val EXTENDED_SCALAR_POINTED_PRIMITIVES: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.extendedScalarPointedPrimitives
+    get() = activeRules().words("extendedScalarPointedPrimitives")
 
 private val ADDRESS_BACKED_SYS_ROOTS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.addressBackedSysRoots
+    get() = activeRules().words("addressBackedSysRoots")
 
 /** Keep pointer identity distinct from Kotlin's nullable pointee/value types. */
 internal fun rawPointerPointeeType(type: String?): String? {
@@ -167,13 +167,13 @@ internal fun KotlinJ2KEmitter.sourceTransparentField(
 }
 
 private val RAW_MEMORY_AND_LAYOUT_IDENTS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.rawMemoryAndLayoutIdents
+    get() = activeRules().words("rawMemoryAndLayoutIdents")
 
 private val MANAGED_SLICE_BASES: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.managedSliceBases
+    get() = activeRules().words("managedSliceBases")
 
 private val VIEW_OFFSET_SLICE_BASES: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.viewOffsetSliceBases
+    get() = activeRules().words("viewOffsetSliceBases")
 
 private fun KotlinJ2KEmitter.extractManagedSliceAsPtrTarget(
     expr: Expr,
@@ -1241,11 +1241,11 @@ private class SourceAstTypeInferrer(
 
     companion object {
         private val POINTER_CAST_METHODS: Set<String>
-            get() = YamlRuleCatalogs.TypeAndMethodPatterns.pointerCastMethods
+            get() = activeRules().words("pointerCastMethods")
         private val POINTER_CONTAINER_WRAPPERS: Set<String>
-            get() = YamlRuleCatalogs.TypeAndMethodPatterns.pointerContainerWrappers
+            get() = activeRules().words("pointerContainerWrappers")
         private val INTEGER_LITERAL_SUFFIXES: Set<String>
-            get() = YamlRuleCatalogs.TypeAndMethodPatterns.integerLiteralSuffixes
+            get() = activeRules().words("integerLiteralSuffixes")
 
         private fun parseU8SynType(): SynType = SynAstFragmentParser.u8SynType()
     }

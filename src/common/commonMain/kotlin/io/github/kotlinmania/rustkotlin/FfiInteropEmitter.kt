@@ -213,28 +213,44 @@ private data class TargetCWidthProfile(
     }
 }
 
-internal val C_ABI_BRIDGE_DESCRIPTORS: Map<CAbiBridgeKind, CAbiBridgeDescriptor> =
-    YamlRuleCatalogs.PathsConstsAndCAbi.cAbiBridgeDescriptorNodes.associate { node ->
-        val kind = CAbiBridgeKind.valueOf(node.string("kind"))
-        kind to
-            CAbiBridgeDescriptor(
-                cType = node.string("cType"),
-                cFailureLiteral = node.string("cFailureLiteral"),
-                numericKind = node.optionalString("numericKind")?.let(NumericKind::valueOf),
-                defaultReturnConv = node.optionalString("defaultReturnConv"),
-                wasmWasiScalarType = node.optionalString("wasmWasiScalarType"),
-                wasmJsType = node.optionalString("wasmJsType"),
-                jniKotlinType = node.string("jniKotlinType"),
-                jniCType = node.string("jniCType"),
-                kotlinScalarType = node.optionalString("kotlinScalarType"),
-                isPointerAddress = node.bool("isPointerAddress"),
-            )
+private class CAbiBridgeTables(
+    val byKind: Map<CAbiBridgeKind, CAbiBridgeDescriptor>,
+    val numericToBridge: Map<NumericKind, CAbiBridgeKind>,
+)
+
+private val C_ABI_BRIDGE_TABLES_MEMO =
+    RegistryMemo { reg ->
+        val byKind =
+            reg.mappings("cAbiBridgeDescriptors").associate { node ->
+                val kind = CAbiBridgeKind.valueOf(node.string("kind"))
+                kind to
+                    CAbiBridgeDescriptor(
+                        cType = node.string("cType"),
+                        cFailureLiteral = node.string("cFailureLiteral"),
+                        numericKind = node.optionalString("numericKind")?.let(NumericKind::valueOf),
+                        defaultReturnConv = node.optionalString("defaultReturnConv"),
+                        wasmWasiScalarType = node.optionalString("wasmWasiScalarType"),
+                        wasmJsType = node.optionalString("wasmJsType"),
+                        jniKotlinType = node.string("jniKotlinType"),
+                        jniCType = node.string("jniCType"),
+                        kotlinScalarType = node.optionalString("kotlinScalarType"),
+                        isPointerAddress = node.bool("isPointerAddress"),
+                    )
+            }
+        CAbiBridgeTables(
+            byKind = byKind,
+            numericToBridge =
+                byKind.entries
+                    .mapNotNull { (kind, desc) -> desc.numericKind?.let { it to kind } }
+                    .toMap(),
+        )
     }
 
-private val NUMERIC_KIND_TO_BRIDGE_KIND: Map<NumericKind, CAbiBridgeKind> =
-    C_ABI_BRIDGE_DESCRIPTORS.entries
-        .mapNotNull { (kind, desc) -> desc.numericKind?.let { it to kind } }
-        .toMap()
+internal val C_ABI_BRIDGE_DESCRIPTORS: Map<CAbiBridgeKind, CAbiBridgeDescriptor>
+    get() = C_ABI_BRIDGE_TABLES_MEMO.get().byKind
+
+private val NUMERIC_KIND_TO_BRIDGE_KIND: Map<NumericKind, CAbiBridgeKind>
+    get() = C_ABI_BRIDGE_TABLES_MEMO.get().numericToBridge
 
 internal fun bridgeDescriptorFor(kind: CAbiBridgeKind): CAbiBridgeDescriptor =
     C_ABI_BRIDGE_DESCRIPTORS.getValue(kind)
@@ -1306,7 +1322,7 @@ private fun extractImportLocalName(imp: String): String {
 }
 
 internal val UMBRELLA_LINK_LIBRARIES: Set<String>
-    get() = YamlRuleCatalogs.PathsConstsAndCAbi.umbrellaLinkLibraries
+    get() = activeRules().words("umbrellaLinkLibraries")
 
 internal fun extractLinkLibraryNamesFromLinkArgs(
     tokens: TokenStream,
@@ -1577,7 +1593,7 @@ internal fun sanitizeCParamIdentifier(raw: String, index: Int): String {
 }
 
 private val C_RESERVED_PARAM_NAMES: Set<String>
-    get() = YamlRuleCatalogs.PathsConstsAndCAbi.cReservedParamNames
+    get() = activeRules().words("cReservedParamNames")
 
 internal fun jniMangleSegment(segment: String): String =
     buildString(segment.length + 4) {
@@ -1662,10 +1678,10 @@ internal fun escapeCString(raw: String): String =
     }
 
 internal fun conversionMethodForNumericKind(kind: NumericKind): String =
-    YamlRuleCatalogs.PathsConstsAndCAbi.numericConversionMethodByKind.getValue(kind)
+    activeRules().numericKindKeyMap("numericConversionMethodByKind").getValue(kind)
 
 private fun defaultKotlinFallbackForNumericKind(numKind: NumericKind): String =
-    YamlRuleCatalogs.PathsConstsAndCAbi.numericDefaultFallbackByKind.getValue(numKind)
+    activeRules().numericKindKeyMap("numericDefaultFallbackByKind").getValue(numKind)
 
 internal fun defaultKotlinFallbackForBridge(
     kind: CAbiBridgeKind,
@@ -1702,7 +1718,7 @@ internal fun extractIdentifierTokens(
     KotlinTokenWalker(expr).collectFilteredIdentifiers(if (includeBuiltins) emptySet() else BUILTIN_KOTLIN_IDENTS)
 
 internal val BUILTIN_KOTLIN_IDENTS: Set<String>
-    get() = YamlRuleCatalogs.PathsConstsAndCAbi.builtinKotlinIdents
+    get() = activeRules().words("builtinKotlinIdents")
 
 /**
  * Token-cursor parser for `c!` / `cpp!` inline FFI blocks (`[mut x: T as "CType", ...] -> Ret as "CRet" { ... }`).

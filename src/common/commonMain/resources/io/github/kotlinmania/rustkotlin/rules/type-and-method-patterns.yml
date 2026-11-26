@@ -371,135 +371,83 @@ methodCallPatternRules:
     imports: ["{coreNs}.ptr.{ptrCtor}"]
     replace: "{ptrCtor}(({arg0}).toLong())"
 
-  # --- Formatter debug builder & VecDeque / Vec / ArrayDeque adapter methods ---
-  - receiver: fmtOrQueue
+  # --- Pre-argument phase (`phase: preArg`): Formatter debug builders, Option checks & Vec/Deque adapters ---
+  - { phase: preArg, receiver: potentialOption, match: "is_none", arity: 0, replace: "{recv} == null" }
+  - { phase: preArg, receiver: potentialOption, match: "is_some", arity: 0, replace: "{recv} != null" }
+  - { phase: preArg, receiver: nullableOption, match: "as_deref as_deref_mut as_ref as_mut", arity: 0, noTurbofish: true, replace: "{recv}" }
+
+  - phase: preArg
+    receiver: fmtOrQueue
     match: "debug_list"
     arity: 0
     replace: "object {{ val entries = mutableListOf<Any?>(); fun entry(v: Any?) = apply {{ entries.add(v) }}; fun entries(iter: Iterable<*>) = apply {{ for (e in iter) entries.add(e) }}; fun finish() {{ {recv}.append(entries.joinToString(\", \", \"[\", \"]\")) }} }}"
 
-  - receiver: fmtOrQueue
+  - phase: preArg
+    receiver: fmtOrQueue
     match: "debug_set"
     arity: 0
     replace: "object {{ val entries = mutableListOf<Any?>(); fun entry(v: Any?) = apply {{ entries.add(v) }}; fun entries(iter: Iterable<*>) = apply {{ for (e in iter) entries.add(e) }}; fun finish() {{ {recv}.append(entries.joinToString(\", \", \"{{\", \"}}\")) }} }}"
 
-  - receiver: fmtOrQueue
+  - phase: preArg
+    receiver: fmtOrQueue
     match: "debug_map"
     arity: 0
     replace: "object {{ val entries = mutableListOf<String>(); fun entry(k: Any?, v: Any?) = apply {{ entries.add(\"$k: $v\") }}; fun finish() {{ {recv}.append(entries.joinToString(\", \", \"{{\", \"}}\")) }} }}"
 
-  - receiver: fmtOrQueue
-    match: "pop_front"
-    arity: 0
-    replace: "{recv}.removeFirstOrNull()"
+  - { phase: preArg, receiver: fmtOrQueue, match: "pop_front", arity: 0, replace: "{recv}.removeFirstOrNull()" }
+  - { phase: preArg, receiver: dequeIter, match: "next", arity: 0, noTurbofish: true, replace: "{recv}.removeFirstOrNull()" }
+  - { phase: preArg, receiver: dequeIter, match: "next_back", arity: 0, noTurbofish: true, replace: "{recv}.removeLastOrNull()" }
+  - { phase: preArg, receiver: dequeIter, match: "len", arity: 0, noTurbofish: true, replace: "{recv}.size" }
+  - { phase: preArg, receiver: dequeIter, match: "clone", arity: 0, noTurbofish: true, replace: "ArrayDeque({recv})" }
+  - { phase: preArg, receiver: vec, match: "pop", arity: 0, noTurbofish: true, replace: "{recv}.removeLastOrNull()" }
+  - { phase: preArg, receiver: vec, match: "len", arity: 0, noTurbofish: true, replace: "{recv}.size" }
+  - { phase: preArg, receiver: vec, match: "into_iter iter iter_mut", arity: 0, noTurbofish: true, replace: "ArrayDeque({recv})" }
+  - { phase: preArg, receiver: vec, match: "clone", arity: 0, noTurbofish: true, replace: "{recv}.toMutableList()" }
+  - { phase: preArg, receiver: vec, match: "last_mut", arity: 0, noTurbofish: true, replace: "{recv}.lastOrNull()" }
+  - { phase: preArg, receiver: vec, match: "first_mut", arity: 0, noTurbofish: true, replace: "{recv}.firstOrNull()" }
 
-  - receiver: dequeIter
-    match: "next"
-    arity: 0
-    noTurbofish: true
-    replace: "{recv}.removeFirstOrNull()"
+  # --- Post-argument phase (`phase: postArg`): unified predicate-driven method lowering ---
+  - { receiver: charsIter, match: "next", arity: 0, noTurbofish: true, replace: "{recvAtom}.next()" }
+  - { receiver: charsIter, match: "as_str", arity: 0, noTurbofish: true, replace: "{recvAtom}.asStr()" }
+  - { receiver: charsIter, match: "clone", arity: 0, noTurbofish: true, replace: "{recvAtom}.clone()" }
+  - { receiver: charsIter, match: "enumerate", arity: 0, noTurbofish: true, replace: "{recvAtom}.enumerate()" }
 
-  - receiver: dequeIter
-    match: "next_back"
-    arity: 0
-    noTurbofish: true
-    replace: "{recv}.removeLastOrNull()"
+  - { receiver: fmtBuilder, match: "write_str write_char pad write_fmt", arity: 1, noTurbofish: true, replace: "{recv}.append({arg0})" }
 
-  - receiver: dequeIter
-    match: "len"
-    arity: 0
-    noTurbofish: true
-    replace: "{recv}.size"
+  - { receiver: any, match: "append_all", arity: 1, noTurbofish: true, replace: "for (item in {arg0}) item.toTokens({recv})" }
+  - { receiver: any, match: "find", arity: 1, noTurbofish: true, replace: "{recv}.indexOf({arg0}).takeIf {{ it >= 0 }}" }
+  - { receiver: any, match: "position", arity: 1, noTurbofish: true, replace: "{recvAtom}.indexOfFirst({arg0}).takeIf {{ it >= 0 }}" }
+  - { receiver: any, match: "rposition", arity: 1, noTurbofish: true, replace: "{recvAtom}.indexOfLast({arg0}).takeIf {{ it >= 0 }}" }
+  - { receiver: any, match: "enumerate", arity: 0, noTurbofish: true, replace: "{recvAtom}.mapIndexed {{ index, item -> Pair(index, item) }}" }
+  - { receiver: any, match: "debug_struct", arity: 1, noTurbofish: true, unlessDeclaredTypes: "DebugStruct", replace: "DebugStruct({recv}, {arg0})" }
+  - { receiver: any, match: "debug_tuple", arity: 1, noTurbofish: true, unlessDeclaredTypes: "DebugTuple", replace: "DebugTuple({recv}, {arg0})" }
+  - { receiver: any, match: "push_back", arity: 1, noTurbofish: true, replace: "{recv}.addLast({arg0})" }
+  - { receiver: vecOrMutableList, match: "extend_from_slice", arity: 1, noTurbofish: true, replace: "{recv}.addAll({arg0})" }
 
-  - receiver: dequeIter
-    match: "clone"
-    arity: 0
-    noTurbofish: true
-    replace: "ArrayDeque({recv})"
+  - { receiver: vec, match: "push", arity: 1, noTurbofish: true, replace: "{recv}.add({arg0})" }
+  - { receiver: vec, match: "insert", arity: 2, noTurbofish: true, replace: "{recv}.add({arg0}, {arg1})" }
+  - { receiver: vec, match: "clone_from", arity: 1, noTurbofish: true, replace: "run {{ {recv}.clear(); {recv}.addAll({arg0}) }}" }
+  - { receiver: map, match: "insert", arity: 2, noTurbofish: true, replace: "{recvAtom}.put({arg0}, {arg1})" }
+  - { receiver: map, match: "clone", arity: 0, noTurbofish: true, replace: "{recvAtom}.toMutableMap()" }
+  - { receiver: map, match: "get get_mut", arity: 1, noTurbofish: true, replace: "{recvAtom}.get({arg0})" }
+  - { receiver: set, match: "clone", arity: 0, noTurbofish: true, replace: "{recvAtom}.toMutableSet()" }
 
-  - receiver: vec
-    match: "pop"
-    arity: 0
-    noTurbofish: true
-    replace: "{recv}.removeLastOrNull()"
-
-  - receiver: vec
-    match: "len"
-    arity: 0
-    noTurbofish: true
-    replace: "{recv}.size"
-
-  - receiver: vec
-    match: "into_iter iter iter_mut"
-    arity: 0
-    noTurbofish: true
-    replace: "ArrayDeque({recv})"
-
-  - receiver: vec
-    match: "clone"
-    arity: 0
-    noTurbofish: true
-    replace: "{recv}.toMutableList()"
-
-  - receiver: vec
-    match: "last_mut"
-    arity: 0
-    noTurbofish: true
-    replace: "{recv}.lastOrNull()"
-
-  - receiver: vec
-    match: "first_mut"
-    arity: 0
-    noTurbofish: true
-    replace: "{recv}.firstOrNull()"
-
-  # --- `core::str::Chars` iterator methods ---
-  - { receiver: charsIter, match: "next", arity: 0, replace: "{recvAtom}.next()" }
-  - { receiver: charsIter, match: "as_str", arity: 0, replace: "{recvAtom}.asStr()" }
-  - { receiver: charsIter, match: "clone", arity: 0, replace: "{recvAtom}.clone()" }
-  - { receiver: charsIter, match: "enumerate", arity: 0, replace: "{recvAtom}.enumerate()" }
-
-  # --- `fmt::Formatter` / `StringBuilder` write methods ---
-  - receiver: fmtBuilder
-    match: "write_str write_char pad write_fmt"
-    arity: 1
-    replace: "{recv}.append({arg0})"
-
-  # --- General iterator / token / debug / queue transform methods ---
-  - { receiver: generalTransform, match: "append_all", arity: 1, replace: "for (item in {arg0}) item.toTokens({recv})" }
-  - { receiver: generalTransform, match: "find", arity: 1, replace: "{recv}.indexOf({arg0}).takeIf {{ it >= 0 }}" }
-  - { receiver: generalTransform, match: "position", arity: 1, replace: "{recvAtom}.indexOfFirst({arg0}).takeIf {{ it >= 0 }}" }
-  - { receiver: generalTransform, match: "rposition", arity: 1, replace: "{recvAtom}.indexOfLast({arg0}).takeIf {{ it >= 0 }}" }
-  - { receiver: generalTransform, match: "enumerate", arity: 0, replace: "{recvAtom}.mapIndexed {{ index, item -> Pair(index, item) }}" }
-  - { receiver: generalTransform, match: "debug_struct", arity: 1, unlessDeclaredTypes: "DebugStruct", replace: "DebugStruct({recv}, {arg0})" }
-  - { receiver: generalTransform, match: "debug_tuple", arity: 1, unlessDeclaredTypes: "DebugTuple", replace: "DebugTuple({recv}, {arg0})" }
-  - { receiver: generalTransform, match: "push_back", arity: 1, replace: "{recv}.addLast({arg0})" }
-
-  # --- Mutable `Vec`, `Map`, and `Set` container methods ---
-  - { receiver: vecMut, match: "push", arity: 1, replace: "{recv}.add({arg0})" }
-  - { receiver: vecMut, match: "insert", arity: 2, replace: "{recv}.add({arg0}, {arg1})" }
-  - { receiver: vecMut, match: "clone_from", arity: 1, replace: "run {{ {recv}.clear(); {recv}.addAll({arg0}) }}" }
-  - { receiver: mapMut, match: "insert", arity: 2, replace: "{recvAtom}.put({arg0}, {arg1})" }
-  - { receiver: mapMut, match: "clone", arity: 0, replace: "{recvAtom}.toMutableMap()" }
-  - { receiver: mapMut, match: "get get_mut", arity: 1, replace: "{recvAtom}.get({arg0})" }
-  - { receiver: setMut, match: "clone", arity: 0, replace: "{recvAtom}.toMutableSet()" }
-
-  # --- String prefix/suffix stripping, `ArrayDeque` inspection & `RustAny` reflection ---
-  - { receiver: stringStrip, match: "strip_prefix", arity: 1, replace: "{recvAtom}.takeIf {{ it.startsWith({arg0}) }}?.removePrefix({arg0})" }
-  - { receiver: stringStrip, match: "strip_suffix", arity: 1, replace: "{recvAtom}.takeIf {{ it.endsWith({arg0}) }}?.removeSuffix({arg0})" }
-  - { receiver: dequeSliceHint, match: "as_slice", arity: 0, replace: "{recvAtom}.toList()" }
-  - { receiver: dequeSliceHint, match: "size_hint", arity: 0, replace: "run {{ val n = {recvAtom}.size; Pair(n, n) }}" }
+  - { receiver: stringOrUninferred, match: "strip_prefix", arity: 1, noTurbofish: true, replace: "{recvAtom}.takeIf {{ it.startsWith({arg0}) }}?.removePrefix({arg0})" }
+  - { receiver: stringOrUninferred, match: "strip_suffix", arity: 1, noTurbofish: true, replace: "{recvAtom}.takeIf {{ it.endsWith({arg0}) }}?.removeSuffix({arg0})" }
+  - { receiver: any, match: "filter_map", arity: 1, noTurbofish: true, unlessAnyInstanceMethod: "filterMap", replace: "{recvAtom}.mapNotNull({cb0})" }
+  - { receiver: dequeOrIter, match: "as_slice", arity: 0, noTurbofish: true, replace: "{recvAtom}.toList()" }
+  - { receiver: dequeOrIter, match: "size_hint", arity: 0, noTurbofish: true, replace: "run {{ val n = {recvAtom}.size; Pair(n, n) }}" }
   - { receiver: rustAny, match: "is", arity: 0, requireTypeArgs: true, replace: "{recvAtom}.isType{typeArgs}()" }
   - { receiver: rustAny, match: "downcast_ref", arity: 0, requireTypeArgs: true, replace: "{recvAtom}.downcastRef{typeArgs}()" }
   - { receiver: rustAny, match: "downcast_mut", arity: 0, requireTypeArgs: true, replace: "{recvAtom}.downcastMut{typeArgs}()" }
   - { receiver: rustAny, match: "downcast", arity: 0, requireTypeArgs: true, replace: "{recvAtom}.downcast{typeArgs}()" }
 
-  # --- Erased nullable `Option<T>` (`T?`) combinator methods ---
-  - { receiver: erasedOption, match: "unwrap", arity: 0, replace: "{recvAtom}!!" }
-  - { receiver: erasedOption, match: "expect", arity: 1, replace: "({recv} ?: error({arg0}))" }
-  - { receiver: erasedOption, match: "clone cloned copied flatten", arity: 0, replace: "{recv}" }
-  - { receiver: erasedOption, match: "into_iter", arity: 0, replace: "ArrayDeque(listOfNotNull({recv}))" }
-  - { receiver: erasedOption, match: "map and_then", arity: 1, replace: "{recvAtom}?.let({cb0})" }
-  - { receiver: erasedOption, match: "map_or_else", arity: 2, replace: "({recvAtom}?.let({cb1}) ?: {zeroClosure0})" }
+  - { receiver: erasedOption, match: "unwrap", arity: 0, noTurbofish: true, replace: "{recvAtom}!!" }
+  - { receiver: erasedOption, match: "expect", arity: 1, noTurbofish: true, replace: "({recv} ?: error({arg0}))" }
+  - { receiver: erasedOption, match: "clone cloned copied flatten", arity: 0, noTurbofish: true, replace: "{recv}" }
+  - { receiver: erasedOption, match: "into_iter", arity: 0, noTurbofish: true, replace: "ArrayDeque(listOfNotNull({recv}))" }
+  - { receiver: erasedOption, match: "map and_then", arity: 1, noTurbofish: true, replace: "{recvAtom}?.let({cb0})" }
+  - { receiver: erasedOption, match: "map_or_else", arity: 2, noTurbofish: true, replace: "({recvAtom}?.let({cb1}) ?: {zeroClosure0})" }
 
   # --- Unconstrained `PartialOrd` / `Ord` generic runtime value comparisons ---
   - receiver: unconstrainedCmp

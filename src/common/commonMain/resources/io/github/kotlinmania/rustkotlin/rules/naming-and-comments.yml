@@ -2,9 +2,8 @@
 # Rust-to-Kotlin Identifier Naming, Default Initializers & Comment Sanitization
 # ==============================================================================
 # Authoritative declarative catalog for `KotlinNames.kt` and `KotlinComments.kt`.
-# After editing any `.yml` file in this directory, run:
-#   python3 tools/sync-yaml-rules.py
-# to refresh `BundledYamlRuleSources.kt` for standalone Native/JS/Wasm targets.
+# Streamed directly at runtime via `km-io` (`--rules-dir`, `RUST_KOTLIN_RULES_DIR`,
+# executable-relative `rules/`, or packaged JVM JAR resources) with zero codegen.
 
 # Direct Rust primitive and builtin C/stdlib type -> Kotlin type mappings.
 primitiveAndBuiltinTypes:

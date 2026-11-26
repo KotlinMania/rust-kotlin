@@ -702,31 +702,43 @@ internal fun symbolPlatformGuard(cSymbol: String): String? =
 private fun headersForCSymbol(symbol: String): List<PlatformHeaderSpec> =
     C_SYMBOL_HEADERS[symbol].orEmpty()
 
-private val WINDOWS_ONLY_HEADERS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.windowsOnlyHeaders
-private val PORTABLE_STD_HEADERS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.portableStdHeaders
-private val COMMON_POSIX_HEADERS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.commonPosixHeaders
-private val LINUX_ONLY_SYMBOLS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.linuxOnlySymbols
-private val BSD_APPLE_ONLY_SYMBOLS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.bsdAppleOnlySymbols
-private val POSIX_NON_WIN32_SYMBOLS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.posixNonWin32Symbols
+private val WINDOWS_ONLY_HEADERS: Set<String>
+    get() = activeRules().words("windowsOnlyHeaders")
+private val PORTABLE_STD_HEADERS: Set<String>
+    get() = activeRules().words("portableStdHeaders")
+private val COMMON_POSIX_HEADERS: Set<String>
+    get() = activeRules().words("commonPosixHeaders")
+private val LINUX_ONLY_SYMBOLS: Set<String>
+    get() = activeRules().words("linuxOnlySymbols")
+private val BSD_APPLE_ONLY_SYMBOLS: Set<String>
+    get() = activeRules().words("bsdAppleOnlySymbols")
+private val POSIX_NON_WIN32_SYMBOLS: Set<String>
+    get() = activeRules().words("posixNonWin32Symbols")
 
 internal fun isDirectCallSafeSymbol(fn: ForeignFnInteropSpec): Boolean =
     fn.dllName == null && DIRECT_C_SYMBOL_ARITY[fn.cSymbolName] == fn.params.size
 
-private val DIRECT_C_SYMBOL_ARITY: Map<String, Int> = YamlRuleCatalogs.StdlibSynAndFfi.directCSymbolArity
+private val DIRECT_C_SYMBOL_ARITY: Map<String, Int>
+    get() = activeRules().intGroupMap("directCSymbolArity")
 
-private val C_SYMBOL_HEADERS: Map<String, List<PlatformHeaderSpec>> =
-    buildMap {
-        for (ruleNode in YamlRuleCatalogs.StdlibSynAndFfi.cSymbolHeaderRuleNodes) {
-            val specs =
-                ruleNode.mappingList("headers").map { hdrNode ->
-                    PlatformHeaderSpec(
-                        hdrNode.string("name"),
-                        hdrNode.optionalString("guard"),
-                        hdrNode.explicitStringList("windowsFallbacks"),
-                    )
+private val C_SYMBOL_HEADERS_MEMO =
+    RegistryMemo { reg ->
+        buildMap {
+            for (ruleNode in reg.mappings("cSymbolHeaderRules")) {
+                val specs =
+                    ruleNode.mappingList("headers").map { hdrNode ->
+                        PlatformHeaderSpec(
+                            hdrNode.string("name"),
+                            hdrNode.optionalString("guard"),
+                            hdrNode.explicitStringList("windowsFallbacks"),
+                        )
+                    }
+                for (sym in ruleNode.wordSet("symbols")) {
+                    put(sym, specs)
                 }
-            for (sym in ruleNode.wordSet("symbols")) {
-                put(sym, specs)
             }
         }
     }
+
+private val C_SYMBOL_HEADERS: Map<String, List<PlatformHeaderSpec>>
+    get() = C_SYMBOL_HEADERS_MEMO.get()

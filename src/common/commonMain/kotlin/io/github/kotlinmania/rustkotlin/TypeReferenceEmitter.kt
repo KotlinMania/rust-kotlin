@@ -24,29 +24,33 @@ import io.github.kotlinmania.syn.WhereClause
 import io.github.kotlinmania.syn.WherePredicate
 
 private val CORE_OPS_BINARY_TRAITS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.coreOpsBinaryTraits
+    get() = activeRules().words("coreOpsBinaryTraits")
 private val CORE_OPS_UNARY_OUTPUT_TRAITS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.coreOpsUnaryOutputTraits
-private val CORE_OPS_ASSIGN_TRAITS: Set<String> =
-    CORE_OPS_BINARY_TRAITS.mapTo(linkedSetOf()) { "${it}Assign" }
+    get() = activeRules().words("coreOpsUnaryOutputTraits")
+
+private val CORE_OPS_ASSIGN_TRAITS_MEMO =
+    RegistryMemo { reg -> reg.words("coreOpsBinaryTraits").mapTo(linkedSetOf()) { "${it}Assign" } }
+
+private val CORE_OPS_ASSIGN_TRAITS: Set<String>
+    get() = CORE_OPS_ASSIGN_TRAITS_MEMO.get()
 
 private val NUMERIC_SUFFIX_BY_KIND: Map<NumericKind, String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.numericSuffixByKind
+    get() = activeRules().numericKindKeyMap("numericSuffixByKind")
 
 private val BOXED_INT_FROM_SUFFIX_BY_KIND: Map<NumericKind, String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.boxedIntFromSuffixByKind
+    get() = activeRules().numericKindKeyMap("boxedIntFromSuffixByKind")
 
 private val ZERO_OR_NULL_POINTER_LITERALS: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.zeroOrNullPointerLiterals
+    get() = activeRules().words("zeroOrNullPointerLiterals")
 
 private val KOTLIN_BUILTIN_VALUE_TYPE_NAMES: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.kotlinBuiltinValueTypeNames
+    get() = activeRules().words("kotlinBuiltinValueTypeNames")
 
 private val C_POINTER_WIDTH_UNSIGNED_TYPE_NAMES: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.cPointerWidthUnsignedTypeNames
+    get() = activeRules().words("cPointerWidthUnsignedTypeNames")
 
 private val C_POINTER_WIDTH_SIGNED_TYPE_NAMES: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.cPointerWidthSignedTypeNames
+    get() = activeRules().words("cPointerWidthSignedTypeNames")
 
 internal fun isDecimalOrHexLiteralDigits(text: String): Boolean {
     if (text.isEmpty()) return false
@@ -1102,15 +1106,16 @@ private object StdlibFmtAndFfiTypePathRule : TypePathLoweringRule() {
                 )
         val isAllocFfiCString = rawSegNames.size == 3 && rawSegNames[0] == "alloc" && rawSegNames[1] == "ffi" && symLeaf == "CString"
         if (isSelfContainedLibcFfi && symLeaf !in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS) {
+            val rules = activeRules()
             val ptr64 = emitter.activeCfgProfile.pointerWidth != 32
             val ptrMap =
                 if (ptr64) {
-                    YamlRuleCatalogs.TypeAndMethodPatterns.libcSelfContainedPtrWidth64Types
+                    rules.groupedMap("libcSelfContainedPtrWidth64Types")
                 } else {
-                    YamlRuleCatalogs.TypeAndMethodPatterns.libcSelfContainedPtrWidth32Types
+                    rules.groupedMap("libcSelfContainedPtrWidth32Types")
                 }
             ptrMap[symLeaf]?.let { return it }
-            YamlRuleCatalogs.TypeAndMethodPatterns.libcSelfContainedFixedScalarTypes[symLeaf]?.let { return it }
+            rules.groupedMap("libcSelfContainedFixedScalarTypes")[symLeaf]?.let { return it }
         }
         val resolvedFfiImport =
             when {
@@ -1224,7 +1229,7 @@ private object StdlibResultTypePathRule : TypePathLoweringRule() {
 
 private object StdlibContainerAndPrimitiveTypePathRule : TypePathLoweringRule() {
     private val builtinScalarMap: Map<String, String>
-        get() = YamlRuleCatalogs.TypeAndMethodPatterns.builtinScalarTypes
+        get() = activeRules().map("builtinScalarTypes")
 
     override fun tryRender(ctx: TypePathLoweringContext): String? {
         val emitter = ctx.emitter
@@ -1300,7 +1305,7 @@ private object StdlibContainerAndPrimitiveTypePathRule : TypePathLoweringRule() 
         }
         val segmentIdents = rawSegments.map { it.ident.toString() }
         val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
-        for (rule in YamlRuleCatalogs.TypeAndMethodPatterns.stdlibGenericTypeRules) {
+        for (rule in activeRules().typeRulesByName[rawName].orEmpty()) {
             val rendered =
                 rule.tryMatchAndRender(
                     rawName = rawName,

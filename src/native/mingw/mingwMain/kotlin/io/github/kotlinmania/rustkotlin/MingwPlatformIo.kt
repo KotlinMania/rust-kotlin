@@ -2,6 +2,7 @@
 
 package io.github.kotlinmania.rustkotlin
 
+import io.github.kotlinmania.io.Source
 import io.github.kotlinmania.io.files.Path
 import io.github.kotlinmania.io.files.SystemFileSystem
 import io.github.kotlinmania.io.files.resolve
@@ -20,18 +21,24 @@ import io.github.kotlinmania.windowssys.windows.win32.storage.filesystem.FILE_GE
 import io.github.kotlinmania.windowssys.windows.win32.storage.filesystem.FILE_SHARE_READ
 import io.github.kotlinmania.windowssys.windows.win32.storage.filesystem.FILE_SHARE_WRITE
 import io.github.kotlinmania.windowssys.windows.win32.storage.filesystem.GetFileAttributesW
+import kotlinx.cinterop.UShortVar
 import kotlinx.cinterop.UIntVar
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.alloc
+import kotlinx.cinterop.allocArray
 import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.ptr
 import kotlinx.cinterop.toCPointer
+import kotlinx.cinterop.toKString
 import kotlinx.cinterop.toLong
 import kotlinx.cinterop.usePinned
 import kotlinx.cinterop.value
 import kotlinx.cinterop.wcstr
+import platform.posix.getenv
 import platform.windows.FILE_ATTRIBUTE_REPARSE_POINT
+import platform.windows.GetModuleFileNameW
 import platform.windows.INVALID_FILE_ATTRIBUTES
+import platform.windows.MAX_PATH
 import platform.windows.WriteFile
 
 private object MingwWindowsFileProbe : WindowsTargetFileProbe(
@@ -126,3 +133,20 @@ public actual fun describeVirtualKotlinFile(
 
 public actual fun writeNew(path: String, text: String): Unit =
     MingwWindowsFileProbe.writeNew(path, text)
+
+internal actual fun readPlatformEnvironmentVariable(name: String): String? {
+    val text = getenv(name)?.toKString()?.trim() ?: return null
+    return text.ifEmpty { null }
+}
+
+internal actual fun resolvePlatformExecutablePath(): String? =
+    memScoped {
+        val cap = MAX_PATH * 8
+        val buf = allocArray<UShortVar>(cap)
+        val len = GetModuleFileNameW(null, buf, cap.toUInt())
+        if (len == 0u || len >= cap.toUInt()) null else buf.toKString()
+    }
+
+internal actual fun listPlatformPackagedRuleFiles(resourceDirPath: String): List<String> = emptyList()
+
+internal actual fun openPlatformPackagedRuleSource(resourcePath: String): Source? = null

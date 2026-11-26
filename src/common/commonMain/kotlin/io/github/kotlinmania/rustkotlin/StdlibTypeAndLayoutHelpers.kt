@@ -5,23 +5,23 @@ import io.github.kotlinmania.syn.Member
 import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.SynType
 
-internal val SIZED_TYPE_PROPERTY_NAMES: Set<String> =
-    YamlRuleCatalogs.StdlibSynAndFfi.sizedTypePropertyNames
+internal val SIZED_TYPE_PROPERTY_NAMES: Set<String>
+    get() = activeRules().words("sizedTypePropertyNames")
 
-private val ALLOC_SINGLE_DEFAULT_GLOBAL_TYPES: Set<String> =
-    YamlRuleCatalogs.StdlibSynAndFfi.allocSingleDefaultGlobalTypes
+private val ALLOC_SINGLE_DEFAULT_GLOBAL_TYPES: Set<String>
+    get() = activeRules().words("allocSingleDefaultGlobalTypes")
 
-private val ALLOC_INTO_ITER_MODULE_HINTS: Set<String> =
-    YamlRuleCatalogs.StdlibSynAndFfi.allocIntoIterModuleHints
+private val ALLOC_INTO_ITER_MODULE_HINTS: Set<String>
+    get() = activeRules().words("allocIntoIterModuleHints")
 
-private val STDLIB_CONST_PTR_FIRST_ARG_CALLS: Set<String> =
-    YamlRuleCatalogs.StdlibSynAndFfi.stdlibConstPtrFirstArgCalls
+private val STDLIB_CONST_PTR_FIRST_ARG_CALLS: Set<String>
+    get() = activeRules().words("stdlibConstPtrFirstArgCalls")
 
-private val STDLIB_CONST_PTR_TWO_ARG_CALLS: Set<String> =
-    YamlRuleCatalogs.StdlibSynAndFfi.stdlibConstPtrTwoArgCalls
+private val STDLIB_CONST_PTR_TWO_ARG_CALLS: Set<String>
+    get() = activeRules().words("stdlibConstPtrTwoArgCalls")
 
-private val STDLIB_CONST_PTR_FIRST_ARG_METHODS: Set<String> =
-    YamlRuleCatalogs.StdlibSynAndFfi.stdlibConstPtrFirstArgMethods
+private val STDLIB_CONST_PTR_FIRST_ARG_METHODS: Set<String>
+    get() = activeRules().words("stdlibConstPtrFirstArgMethods")
 
 private object StdlibSpecialTypeCatalog {
     data class AtomicSpec(
@@ -32,45 +32,71 @@ private object StdlibSpecialTypeCatalog {
         val storage: Pair<String, String>? = null,
     )
 
-    val nonZeroByRawPrim: Map<String, String> = YamlRuleCatalogs.StdlibSynAndFfi.nonZeroByRawPrim
-    val nonZeroByKtType: Map<String, String> = YamlRuleCatalogs.StdlibSynAndFfi.nonZeroByKtType
+    private class AtomicTables(
+        val byOwner: Map<String, AtomicSpec>,
+        val byRawPrim: Map<String, AtomicSpec>,
+        val storageByKtType: Map<String, Pair<String, String>>,
+        val ownerByNonIntKtType: Map<String, String>,
+    )
 
-    private val atomicSpecs: List<AtomicSpec> =
-        YamlRuleCatalogs.StdlibSynAndFfi.atomicSpecNodes.map { node ->
-            val alignType = node.optionalString("alignType")
-            val storageType = node.optionalString("storageType")
-            AtomicSpec(
-                ownerSimple = node.string("owner"),
-                rawPrim = node.optionalString("rawPrim"),
-                ktValueType = node.string("ktValueType"),
-                numericKind = node.optionalString("numericKind")?.let(NumericKind::valueOf),
-                storage = if (alignType != null && storageType != null) alignType to storageType else null,
+    val nonZeroByRawPrim: Map<String, String>
+        get() = activeRules().map("nonZeroByRawPrim")
+
+    val nonZeroByKtType: Map<String, String>
+        get() = activeRules().map("nonZeroByKtType")
+
+    private val atomicTablesMemo =
+        RegistryMemo { reg ->
+            val specs =
+                reg.mappings("atomicSpecs").map { node ->
+                    val alignType = node.optionalString("alignType")
+                    val storageType = node.optionalString("storageType")
+                    AtomicSpec(
+                        ownerSimple = node.string("owner"),
+                        rawPrim = node.optionalString("rawPrim"),
+                        ktValueType = node.string("ktValueType"),
+                        numericKind = node.optionalString("numericKind")?.let(NumericKind::valueOf),
+                        storage = if (alignType != null && storageType != null) alignType to storageType else null,
+                    )
+                }
+            AtomicTables(
+                byOwner = specs.associateBy { it.ownerSimple },
+                byRawPrim =
+                    buildMap {
+                        for (spec in specs) {
+                            spec.rawPrim?.let { put(it, spec) }
+                        }
+                    },
+                storageByKtType =
+                    buildMap {
+                        for (spec in specs) {
+                            if (spec.storage != null && spec.ktValueType !in this) {
+                                put(spec.ktValueType, spec.storage)
+                            }
+                        }
+                        put("ConstPtr", "Align8" to "ConstPtr")
+                    },
+                ownerByNonIntKtType =
+                    buildMap {
+                        for (spec in specs) {
+                            if (spec.ktValueType != "Int") put(spec.ktValueType, spec.ownerSimple)
+                        }
+                        put("ConstPtr", "AtomicPtr")
+                    },
             )
         }
 
-    val atomicByOwner: Map<String, AtomicSpec> = atomicSpecs.associateBy { it.ownerSimple }
-    val atomicByRawPrim: Map<String, AtomicSpec> =
-        buildMap {
-            for (spec in atomicSpecs) {
-                spec.rawPrim?.let { put(it, spec) }
-            }
-        }
-    val atomicStorageByKtType: Map<String, Pair<String, String>> =
-        buildMap {
-            for (spec in atomicSpecs) {
-                if (spec.storage != null && spec.ktValueType !in this) {
-                    put(spec.ktValueType, spec.storage)
-                }
-            }
-            put("ConstPtr", "Align8" to "ConstPtr")
-        }
-    val atomicOwnerByNonIntKtType: Map<String, String> =
-        buildMap {
-            for (spec in atomicSpecs) {
-                if (spec.ktValueType != "Int") put(spec.ktValueType, spec.ownerSimple)
-            }
-            put("ConstPtr", "AtomicPtr")
-        }
+    val atomicByOwner: Map<String, AtomicSpec>
+        get() = atomicTablesMemo.get().byOwner
+
+    val atomicByRawPrim: Map<String, AtomicSpec>
+        get() = atomicTablesMemo.get().byRawPrim
+
+    val atomicStorageByKtType: Map<String, Pair<String, String>>
+        get() = atomicTablesMemo.get().storageByKtType
+
+    val atomicOwnerByNonIntKtType: Map<String, String>
+        get() = atomicTablesMemo.get().ownerByNonIntKtType
 
     fun lookupNonZeroInner(rawPrim: String?, ktType: String?): String? =
         rawPrim?.let(nonZeroByRawPrim::get) ?: ktType?.let(nonZeroByKtType::get)
@@ -282,7 +308,7 @@ internal fun KotlinJ2KEmitter.resolveStdlibUnitStructValueExpr(rawSegNames: List
     val leaf = rawSegNames.lastOrNull()?.removePrefix("r#") ?: return null
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
     val fq =
-        YamlRuleCatalogs.PathsConstsAndCAbi.stdlibCoreUnitStructs[leaf]?.let { "$coreNs.$it" }
+        activeRules().map("stdlibCoreUnitStructs")[leaf]?.let { "$coreNs.$it" }
             ?: when (leaf) {
                 "Global" -> headerContext.crateNamespaces["alloc"]?.let { "$it.alloc.Global" }
                 "System" -> headerContext.crateNamespaces["std"]?.let { "$it.alloc.System" }

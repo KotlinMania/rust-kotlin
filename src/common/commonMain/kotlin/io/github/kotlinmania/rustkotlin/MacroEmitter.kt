@@ -29,22 +29,22 @@ import kotlin.io.encoding.Base64
 import io.github.kotlinmania.io.files.Path as KmPath
 
 private val RUST_FLOAT_MATH_CONSTANTS: Map<String, Pair<String, String>>
-    get() = YamlRuleCatalogs.PathsConstsAndCAbi.rustFloatMathConstants
+    get() = activeRules().rustFloatMathConstants
 
 private val INT_BITS_BY_PRIM: Map<String, String>
-    get() = YamlRuleCatalogs.PathsConstsAndCAbi.intBitsByPrim
+    get() = activeRules().map("intBitsByPrim")
 
 private val F16_F128_ASSOC_CONSTS: Set<String>
-    get() = YamlRuleCatalogs.PathsConstsAndCAbi.f16F128AssocConsts
+    get() = activeRules().words("f16F128AssocConsts")
 
 private val BOOLEAN_CAST_SOURCE_METHODS: Set<String>
-    get() = YamlRuleCatalogs.PathsConstsAndCAbi.booleanCastSourceMethods
+    get() = activeRules().words("booleanCastSourceMethods")
 
 private val VALUE_POS_INSTANCE_CONV_METHODS: Set<String>
-    get() = YamlRuleCatalogs.PathsConstsAndCAbi.valuePosInstanceConvMethods
+    get() = activeRules().words("valuePosInstanceConvMethods")
 
 private val SELF_TYPE_TO_RUST_PRIM: Map<String, String>
-    get() = YamlRuleCatalogs.PathsConstsAndCAbi.selfTypeToRustPrim
+    get() = activeRules().map("selfTypeToRustPrim")
 
 internal inline fun <T> KotlinJ2KEmitter.withExpectedTargetAndKind(
     targetType: String?,
@@ -1975,10 +1975,10 @@ private class ExprPathResolutionEmitter(
             val c = norm[1]
             if (prim == "f32") {
                 val f32Name = emitter.kotlinF32TypeName()
-                return YamlRuleCatalogs.PathsConstsAndCAbi.f32AssocConstTemplates[c]?.render { if (it == "typeName") f32Name else null }
+                return activeRules().templates("f32AssocConstTemplates")[c]?.render { if (it == "typeName") f32Name else null }
             }
             if (prim == "f64") {
-                return YamlRuleCatalogs.PathsConstsAndCAbi.f64AssocConstTemplates[c]?.render { if (it == "typeName") "Double" else null }
+                return activeRules().templates("f64AssocConstTemplates")[c]?.render { if (it == "typeName") "Double" else null }
             }
             if (prim == "f16" || prim == "f128") {
                 if (c !in F16_F128_ASSOC_CONSTS) return null
@@ -2139,14 +2139,14 @@ private class ExprPathResolutionEmitter(
 
     companion object {
         private val SIZED_DIRECT_OWNER_CONSTS: Set<String>
-            get() = YamlRuleCatalogs.TypeAndMethodPatterns.sizedCoreConstNames
+            get() = activeRules().words("sizedCoreConstNames")
         private val STDLIB_ROOT_CRATES: Set<String>
             get() = STDLIB_CRATE_ROOTS
         private val FLOAT_PRIMS: Set<String>
-            get() = YamlRuleCatalogs.TypeAndMethodPatterns.floatSuffixNumericKinds.keys
+            get() = activeRules().numericKindValMap("floatSuffixNumericKinds").keys
 
         private fun resolvedPrimOwnerAndBits(kind: NumericKind?): Pair<String, String>? =
-            kind?.let(YamlRuleCatalogs.PathsConstsAndCAbi.primOwnerAndBitsByKind::get)
+            kind?.let(activeRules().primOwnerAndBitsByKind::get)
 
         private fun renderTupleVariantConstructorLambda(ctorRef: String, arity: Int): String {
             if (arity == 1) return "{ $ctorRef(it) }"

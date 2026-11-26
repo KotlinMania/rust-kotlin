@@ -1876,7 +1876,7 @@ private class AddressableLocalUsageScanner(
 /** Address-taken scalar locals have one allocation for direct accesses and escaping borrows. */
 private object AddressableLocalLowering : LocalBindingLowering() {
     private val LITERAL_CODEC_TYPES: Map<String, String>
-        get() = YamlRuleCatalogs.TypeAndMethodPatterns.literalCodecTypes
+        get() = activeRules().map("literalCodecTypes")
 
     override fun tryRender(
         emitter: KotlinJ2KEmitter,

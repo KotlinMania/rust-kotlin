@@ -36,31 +36,31 @@ private enum class DocFenceKind {
 }
 
 private val VERBATIM_FENCE_LANGS: Set<String>
-    get() = YamlRuleCatalogs.NamingAndComments.verbatimFenceLangs
+    get() = activeRules().words("verbatimFenceLangs")
 
 private val NON_COMPILING_RUSTDOC_FENCE_TAGS: Set<String>
-    get() = YamlRuleCatalogs.NamingAndComments.nonCompilingRustdocFenceTags
+    get() = activeRules().words("nonCompilingRustdocFenceTags")
 
 private val COMPILER_ONLY_DOC_EXAMPLE_ATTRS: Set<String>
-    get() = YamlRuleCatalogs.NamingAndComments.compilerOnlyDocExampleAttrs
+    get() = activeRules().words("compilerOnlyDocExampleAttrs")
 
 private val RUSTDOC_REF_TARGET_ROOTS: Set<String>
-    get() = YamlRuleCatalogs.NamingAndComments.rustdocRefTargetRoots
+    get() = activeRules().words("rustdocRefTargetRoots")
 
 private val COMMENT_FORBIDDEN_STUB_WORDS: Set<String>
-    get() = YamlRuleCatalogs.NamingAndComments.commentForbiddenStubWords
+    get() = activeRules().words("commentForbiddenStubWords")
 
 private val COMMENT_COMMON_VOCAB_MAP: Map<String, String>
-    get() = YamlRuleCatalogs.NamingAndComments.commentCommonVocab
+    get() = activeRules().map("commentCommonVocab")
 
 private val COMMENT_CODE_IDENT_MAP: Map<String, String>
-    get() = YamlRuleCatalogs.NamingAndComments.commentCodeIdents
+    get() = activeRules().unionMaps("commentCommonVocab", "commentCodeOnlyIdents")
 
 private val KNOWN_RUST_PROSE_MACROS: Set<String>
-    get() = YamlRuleCatalogs.NamingAndComments.knownRustProseMacros
+    get() = activeRules().words("knownRustProseMacros")
 
 private val TOP_LEVEL_ITEM_KEYWORDS: Set<String>
-    get() = YamlRuleCatalogs.NamingAndComments.topLevelItemKeywords
+    get() = activeRules().words("topLevelItemKeywords")
 
 internal fun sanitizeDocLines(
     rawLines: List<String>,
@@ -1214,7 +1214,7 @@ private fun mapRustIdentInCommentCode(raw: String): String =
 
 private fun mapCommentVocabularyWord(word: String, convertCamelIdentifiersOnly: Boolean): String {
     if (word.lowercase() in COMMENT_FORBIDDEN_STUB_WORDS) return "Note"
-    YamlRuleCatalogs.NamingAndComments.commentProseLifetimeWords[word]?.let { return it }
+    activeRules().map("commentProseLifetimeWords")[word]?.let { return it }
     COMMENT_COMMON_VOCAB_MAP[word]?.let { return it }
     if (!convertCamelIdentifiersOnly && word == "macro_rules") return "macroRules"
     return mapSnakeOrForbiddenCommentWord(word)

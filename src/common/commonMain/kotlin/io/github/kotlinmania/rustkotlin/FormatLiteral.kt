@@ -134,7 +134,7 @@ internal fun escapeKotlinStringContent(text: String): String =
     }
 
 private val KOTLIN_HARD_KEYWORDS: Set<String>
-    get() = YamlRuleCatalogs.NamingAndComments.kotlinHardKeywordEscapes.keys
+    get() = activeRules().map("kotlinHardKeywordEscapes").keys
 
 private fun isSimpleKotlinIdentifier(expr: String): Boolean {
     if (expr.isEmpty()) return false

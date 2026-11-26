@@ -191,26 +191,32 @@ internal data class ScannerScalarDescriptor(
     val sizeAlign: Pair<Int, Int>?,
 )
 
-internal val SCANNER_SCALAR_DESCRIPTORS_BY_KIND: Map<String, ScannerScalarDescriptor> =
-    YamlRuleCatalogs.StdlibSynAndFfi.scannerScalarDescriptorNodes
-        .map { node ->
-            val size = node.optionalInt("size")
-            val align = node.optionalInt("align")
-            ScannerScalarDescriptor(
-                kind = node.string("kind"),
-                kotlinType = node.string("kotlinType"),
-                defaultExpr = node.string("defaultExpr"),
-                arrayType = node.optionalString("arrayType"),
-                arrayFactory = node.optionalString("arrayFactory"),
-                sizeAlign = if (size != null && align != null) size to align else null,
-            )
-        }.associateBy { it.kind }
+private val SCANNER_SCALAR_DESCRIPTORS_BY_KIND_MEMO =
+    RegistryMemo { reg ->
+        reg
+            .mappings("scannerScalarDescriptors")
+            .map { node ->
+                val size = node.optionalInt("size")
+                val align = node.optionalInt("align")
+                ScannerScalarDescriptor(
+                    kind = node.string("kind"),
+                    kotlinType = node.string("kotlinType"),
+                    defaultExpr = node.string("defaultExpr"),
+                    arrayType = node.optionalString("arrayType"),
+                    arrayFactory = node.optionalString("arrayFactory"),
+                    sizeAlign = if (size != null && align != null) size to align else null,
+                )
+            }.associateBy { it.kind }
+    }
 
-internal val SCANNER_RUST_TO_SCALAR_KIND: Map<String, String> =
-    YamlRuleCatalogs.StdlibSynAndFfi.scannerRustToScalarKind
+internal val SCANNER_SCALAR_DESCRIPTORS_BY_KIND: Map<String, ScannerScalarDescriptor>
+    get() = SCANNER_SCALAR_DESCRIPTORS_BY_KIND_MEMO.get()
 
-internal val SCANNER_C_ALIAS_TO_SCALAR_KIND: Map<String, String> =
-    YamlRuleCatalogs.StdlibSynAndFfi.scannerCAliasToScalarKind
+internal val SCANNER_RUST_TO_SCALAR_KIND: Map<String, String>
+    get() = activeRules().map("scannerRustToScalarKind")
+
+internal val SCANNER_C_ALIAS_TO_SCALAR_KIND: Map<String, String>
+    get() = activeRules().map("scannerCAliasToScalarKind")
 
 internal fun <K, V> MutableMap<K, V>.putIfMissing(
     key: K,

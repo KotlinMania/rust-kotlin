@@ -192,7 +192,7 @@ private fun KotlinJ2KEmitter.collectLocalTraitAndSupertraitFnRawNames(traitDecl:
 }
 
 private val CORE_OPS_OUTPUT_TRAIT_NAMES: Set<String>
-    get() = YamlRuleCatalogs.TypeAndMethodPatterns.coreOpsOutputAssocTraits
+    get() = activeRules().words("coreOpsOutputAssocTraits")
 
 internal fun KotlinJ2KEmitter.renderDistinctSuperTraits(
     attachedImpls: List<Item.Impl>,
