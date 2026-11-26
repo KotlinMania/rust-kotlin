@@ -3,59 +3,18 @@ package io.github.kotlinmania.rustkotlin
 import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.procmacro2.Group
 import io.github.kotlinmania.procmacro2.TokenTree
-import io.github.kotlinmania.syn.Attribute
-import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.Item
-import io.github.kotlinmania.syn.Lit
-import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.ModContent
 import io.github.kotlinmania.syn.UseTree
 
-private fun extractScannerPathAttrValue(attrs: List<Attribute>): String? {
-    for (attr in attrs) {
-        val meta = attr.meta
-        if (meta is Meta.NameValue && meta.path.isIdent("path")) {
-            val expr = meta.value
-            if (expr is Expr.Lit && expr.lit is Lit.Str) {
-                return (expr.lit as Lit.Str).value.value()
-            }
-        }
-    }
-    return null
-}
-
-private fun collectScannerUseLeaves(
+private fun collectCleanScannerUseLeaves(
     tree: UseTree,
-    prefix: List<String>,
     out: MutableList<Pair<List<String>, String?>>,
 ) {
-    when (tree) {
-        is UseTree.Path -> {
-            val seg = tree.ident.toString().removePrefix("r#")
-            tree.tree?.let { collectScannerUseLeaves(it, prefix + seg, out) }
-        }
-        is UseTree.Name -> {
-            val seg = tree.ident.toString().removePrefix("r#")
-            val alias =
-                tree.rename
-                    ?.ident
-                    ?.toString()
-                    ?.removePrefix("r#")
-                    ?.takeIf { it != "_" }
-            if (seg == "self") {
-                if (prefix.isNotEmpty()) {
-                    out += prefix to alias
-                }
-            } else {
-                out += (prefix + seg) to alias
-            }
-        }
-        is UseTree.Glob -> out += (prefix + "*") to null
-        is UseTree.Group -> {
-            for (sub in tree.items.toList()) {
-                collectScannerUseLeaves(sub, prefix, out)
-            }
-        }
+    val leaves = mutableListOf<UseLeaf>()
+    collectUseLeaves(tree, emptyList(), leaves)
+    for (leaf in leaves) {
+        out += leaf.segments.map { it.removePrefix("r#") } to leaf.alias
     }
 }
 
@@ -82,7 +41,7 @@ private fun collectInlineScannerModUseLeaves(
     for (sub in content.items) {
         if (itemHasDocOnlyCfg(sub)) continue
         when (sub) {
-            is Item.Use -> collectScannerUseLeaves(sub.tree, emptyList(), out)
+            is Item.Use -> collectCleanScannerUseLeaves(sub.tree, out)
             is Item.Mod -> if (!hasCfgTestModAttribute(sub.attrs)) collectInlineScannerModUseLeaves(sub, out)
             else -> {}
         }
@@ -134,9 +93,9 @@ internal fun scanRootAliasesAndExternalReexports(
                 }
             }
             is Item.Mod -> {
-                val modIdent = item.ident.toString().removePrefix("r#")
+                val modIdent = item.ident.cleanIdent()
                 if (item.content !is ModContent.Inline) {
-                    val pathVal = extractScannerPathAttrValue(item.attrs)?.replace('\\', '/')?.removePrefix("./")
+                    val pathVal = extractStringMetaAttribute(item.attrs, "path")?.replace('\\', '/')?.removePrefix("./")
                     if (pathVal == "mod.rs") {
                         rootSelfDirModuleAliasesOut += modIdent
                         pointsToRootModRs = true
@@ -166,7 +125,7 @@ internal fun scanRootAliasesAndExternalReexports(
     for (item in activeRootItems) {
         if (item is Item.Use) {
             val leaves = mutableListOf<Pair<List<String>, String?>>()
-            collectScannerUseLeaves(item.tree, emptyList(), leaves)
+            collectCleanScannerUseLeaves(item.tree, leaves)
             for ((rawSegs, alias) in leaves) {
                 val firstRaw = rawSegs.firstOrNull() ?: continue
                 val resolvedExt = externCrateAliases[firstRaw] ?: firstRaw
@@ -551,97 +510,13 @@ internal fun collectFfiTokenTypeIdents(
     }
 }
 
-internal fun scanModuleTokenTrees(
-    trees: List<TokenTree>,
-    subpkg: String,
-    rawAbiMode: Boolean,
-    finalStructs: Boolean,
-    splitModuleRoots: Boolean = false,
-    topLevelSplitInlineMods: Set<String> = emptySet(),
-    registerSymbol: (String, String) -> Unit,
-    registerFnSig: (String, String, List<List<TokenTree>>?, String?, Boolean) -> Unit,
-    subpkgToRawLeaf: MutableMap<String, String>,
-    putScopedDefault: (String, String, String) -> Unit,
-    putScopedNumericKind: (String, String, String) -> Unit,
-    addScopedOptionFnType: (String, String) -> Unit,
-    putScopedPointerAlias: (String, String, Pair<Boolean, String>) -> Unit,
-    aliasLeafTargets: MutableMap<String, String>,
-    qualifiedAliasLeafTargets: MutableMap<String, Pair<String, String>>,
-    fnTypeSpecs: MutableMap<String, RawFnTypeTokenSpec>,
-    structFieldTypes: MutableMap<String, String>,
-    recordDecls: MutableMap<String, RawRecordTokenDecl>,
-    recordDeclsBySimple: MutableMap<String, RawRecordTokenDecl>,
-    simpleEnumReprs: MutableMap<String, String>,
-    ffiReferencedIdents: MutableSet<String> = linkedSetOf(),
-    constLeafTargets: MutableList<Triple<String, String, String>> = mutableListOf(),
-    insideCEnumMacro: Boolean = false,
-    insideExternBlock: Boolean = false,
-    traitDefaultlessAssocTypes: MutableMap<String, List<String>> = linkedMapOf(),
-    traitResultMethods: MutableMap<String, List<String>> = linkedMapOf(),
-    registerFnConstParams: (String, String, Int, List<String>) -> Unit = { _, _, _, _ -> },
-    enumVariantTypeArity: MutableMap<String, Int> = linkedMapOf(),
-    unitEnumVariants: MutableSet<String> = linkedSetOf(),
+internal class ModuleTokenTreeScanner(
+    private val sink: CrateTokenScanSink,
 ) {
-    ModuleTokenTreeScanner(
-        rawAbiMode = rawAbiMode,
-        finalStructs = finalStructs,
-        splitModuleRoots = splitModuleRoots,
-        registerSymbol = registerSymbol,
-        registerFnSig = registerFnSig,
-        subpkgToRawLeaf = subpkgToRawLeaf,
-        putScopedDefault = putScopedDefault,
-        putScopedNumericKind = putScopedNumericKind,
-        addScopedOptionFnType = addScopedOptionFnType,
-        putScopedPointerAlias = putScopedPointerAlias,
-        aliasLeafTargets = aliasLeafTargets,
-        qualifiedAliasLeafTargets = qualifiedAliasLeafTargets,
-        fnTypeSpecs = fnTypeSpecs,
-        structFieldTypes = structFieldTypes,
-        recordDecls = recordDecls,
-        recordDeclsBySimple = recordDeclsBySimple,
-        simpleEnumReprs = simpleEnumReprs,
-        ffiReferencedIdents = ffiReferencedIdents,
-        constLeafTargets = constLeafTargets,
-        traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
-        traitResultMethods = traitResultMethods,
-        registerFnConstParams = registerFnConstParams,
-        enumVariantTypeArity = enumVariantTypeArity,
-        unitEnumVariants = unitEnumVariants,
-    ).scan(
-        trees = trees,
-        subpkg = subpkg,
-        topLevelSplitInlineMods = topLevelSplitInlineMods,
-        insideCEnumMacro = insideCEnumMacro,
-        insideExternBlock = insideExternBlock,
-    )
-}
+    private val rawAbiMode: Boolean get() = sink.rawAbiMode
+    private val finalStructs: Boolean get() = sink.finalStructs
+    private val splitModuleRoots: Boolean get() = sink.splitModuleRoots
 
-internal open class ModuleTokenTreeScanner(
-    private val rawAbiMode: Boolean,
-    private val finalStructs: Boolean,
-    private val splitModuleRoots: Boolean,
-    private val registerSymbol: (String, String) -> Unit,
-    private val registerFnSig: (String, String, List<List<TokenTree>>?, String?, Boolean) -> Unit,
-    private val subpkgToRawLeaf: MutableMap<String, String>,
-    private val putScopedDefault: (String, String, String) -> Unit,
-    private val putScopedNumericKind: (String, String, String) -> Unit,
-    private val addScopedOptionFnType: (String, String) -> Unit,
-    private val putScopedPointerAlias: (String, String, Pair<Boolean, String>) -> Unit,
-    private val aliasLeafTargets: MutableMap<String, String>,
-    private val qualifiedAliasLeafTargets: MutableMap<String, Pair<String, String>>,
-    private val fnTypeSpecs: MutableMap<String, RawFnTypeTokenSpec>,
-    private val structFieldTypes: MutableMap<String, String>,
-    private val recordDecls: MutableMap<String, RawRecordTokenDecl>,
-    private val recordDeclsBySimple: MutableMap<String, RawRecordTokenDecl>,
-    private val simpleEnumReprs: MutableMap<String, String>,
-    private val ffiReferencedIdents: MutableSet<String>,
-    private val constLeafTargets: MutableList<Triple<String, String, String>>,
-    private val traitDefaultlessAssocTypes: MutableMap<String, List<String>>,
-    private val traitResultMethods: MutableMap<String, List<String>>,
-    private val registerFnConstParams: (String, String, Int, List<String>) -> Unit,
-    private val enumVariantTypeArity: MutableMap<String, Int>,
-    private val unitEnumVariants: MutableSet<String>,
-) {
     fun scan(
         trees: List<TokenTree>,
         subpkg: String,
@@ -666,7 +541,7 @@ internal open class ModuleTokenTreeScanner(
             ) {
                 if (!skippedByCfg) {
                     val rawMacroName = cursor.cleanIdentAt(i + 2).orEmpty()
-                    registerSymbol(rustFunctionIdentToKotlin(rawMacroName), subpkg)
+                    sink.registerSymbol(rustFunctionIdentToKotlin(rawMacroName), subpkg)
                 }
                 i += 4
                 if (cursor.punctCharAt(i) == ';') i++
@@ -678,7 +553,7 @@ internal open class ModuleTokenTreeScanner(
             if (externBraceIdx != null) {
                 if (!skippedByCfg) {
                     val externInnerTrees = cursor.groupAt(externBraceIdx)!!.stream().toList()
-                    collectFfiTokenTypeIdents(externInnerTrees, rawAbiMode, ffiReferencedIdents)
+                    collectFfiTokenTypeIdents(externInnerTrees, rawAbiMode, sink.ffiReferencedIdents)
                     scan(trees = externInnerTrees, subpkg = subpkg, insideExternBlock = true)
                 }
                 i = externBraceIdx + 1
@@ -694,13 +569,13 @@ internal open class ModuleTokenTreeScanner(
                     val innerScanner = RustItemHeaderTokenScanner(innerTrees)
                     val linkFnIdent = innerScanner.extractLinkMacroFnIdent()
                     if (linkFnIdent != null) {
-                        collectFfiTokenTypeIdents(innerTrees, rawAbiMode, ffiReferencedIdents)
+                        collectFfiTokenTypeIdents(innerTrees, rawAbiMode, sink.ffiReferencedIdents)
                         val ktLinkFn = rustFunctionIdentToKotlin(linkFnIdent)
-                        registerSymbol(ktLinkFn, subpkg)
+                        sink.registerSymbol(ktLinkFn, subpkg)
                         val linkParams = innerScanner.extractLinkMacroFnParamTokenLists()
                         val linkRet = innerScanner.extractLinkMacroFnReturnType(rawAbiMode)
                         if (linkParams != null || linkRet != null) {
-                            registerFnSig(subpkg, ktLinkFn, linkParams, linkRet, true)
+                            sink.registerFnSig(subpkg, ktLinkFn, linkParams, linkRet, true)
                         }
                     } else if (grp.delimiter() == Delimiter.Brace || grp.delimiter() == Delimiter.Parenthesis) {
                         val cfgIfBodies = selectActiveCfgIfBodies(innerTrees) ?: selectActiveCfgSelectBodies(innerTrees)
@@ -720,138 +595,19 @@ internal open class ModuleTokenTreeScanner(
                 continue
             }
 
-            if (cursor.identAt(i) == "pub") {
-                var kwIdx = cursor.copyOptionalPubVisibility(i)
-                val traitLookIdx = cursor.skipQualifiers(kwIdx, TRAIT_QUALIFIERS)
-                if (cursor.identAt(traitLookIdx) == "trait") {
-                    kwIdx = traitLookIdx
-                }
-                when (val kw = cursor.identAt(kwIdx)) {
-                    "mod" -> {
-                        i = scanModItem(cursor, kwIdx, subpkg, topLevelSplitInlineMods, skippedByCfg, insideCEnumMacro, insideExternBlock)
-                        pendingAttrs.clear()
-                        continue
-                    }
-                    "struct", "union" -> {
-                        i = scanStructOrUnionItem(cursor, kwIdx, kw == "union", isPublic = true, subpkg, pendingAttrs, skippedByCfg)
-                        pendingAttrs.clear()
-                        continue
-                    }
-                    "enum" -> {
-                        i = scanEnumItem(cursor, kwIdx, isPublic = true, subpkg, pendingAttrs, skippedByCfg, insideCEnumMacro)
-                        pendingAttrs.clear()
-                        continue
-                    }
-                    "trait" -> {
-                        i = scanTraitItem(cursor, kwIdx, subpkg, skippedByCfg)
-                        pendingAttrs.clear()
-                        continue
-                    }
-                    "type" -> {
-                        i =
-                            cursor.scanPubTypeDeclaration(
-                                typeKwIdx = kwIdx,
-                                subpkg = subpkg,
-                                skippedByCfg = skippedByCfg,
-                                rawAbiMode = rawAbiMode,
-                                registerSymbol = registerSymbol,
-                                putScopedDefault = putScopedDefault,
-                                putScopedNumericKind = putScopedNumericKind,
-                                addScopedOptionFnType = addScopedOptionFnType,
-                                putScopedPointerAlias = putScopedPointerAlias,
-                                aliasLeafTargets = aliasLeafTargets,
-                                qualifiedAliasLeafTargets = qualifiedAliasLeafTargets,
-                                fnTypeSpecs = fnTypeSpecs,
-                            )
-                        pendingAttrs.clear()
-                        continue
-                    }
-                    "const" -> {
-                        val afterConstText = cursor.identAt(kwIdx + 1)
-                        val isConstFn = afterConstText == "fn" || afterConstText == "unsafe" || afterConstText == "extern"
-                        i =
-                            if (isConstFn) {
-                                scanFnItem(cursor, kwIdx + 1, subpkg, skippedByCfg, insideExternBlock)
-                            } else {
-                                scanConstOrStaticValueItem(cursor, kwIdx + 1, subpkg, skippedByCfg)
-                            }
-                        pendingAttrs.clear()
-                        continue
-                    }
-                    "static" -> {
-                        var idIdx = kwIdx + 1
-                        if (cursor.identAt(idIdx) == "mut") idIdx++
-                        i = scanConstOrStaticValueItem(cursor, idIdx, subpkg, skippedByCfg)
-                        pendingAttrs.clear()
-                        continue
-                    }
-                    "fn", "unsafe", "async", "extern" -> {
-                        i = scanFnItem(cursor, kwIdx, subpkg, skippedByCfg, insideExternBlock)
-                        pendingAttrs.clear()
-                        continue
-                    }
-                }
-            }
-
-            val nonPubKw = cursor.identAt(i)
-            if (nonPubKw == "mod" && cursor.identAt(i + 1) != null) {
-                i = scanModItem(cursor, i, subpkg, topLevelSplitInlineMods, skippedByCfg, insideCEnumMacro, insideExternBlock)
-                pendingAttrs.clear()
-                continue
-            }
-            val nonPubTraitQualIdx = cursor.skipQualifiers(i, TRAIT_QUALIFIERS)
-            if (cursor.identAt(nonPubTraitQualIdx) == "trait") {
-                i = scanTraitItem(cursor, nonPubTraitQualIdx, subpkg, skippedByCfg)
-                pendingAttrs.clear()
-                continue
-            }
-            val nonPubImplQualIdx = cursor.skipQualifiers(i, IMPL_QUALIFIERS)
-            if (cursor.identAt(nonPubImplQualIdx) == "impl") {
-                val endImplIdx = cursor.skipAfterItemHeader(nonPubImplQualIdx + 1)
-                if (!skippedByCfg) {
-                    cursor.scanInherentImplAssociatedFunctions(
-                        implKwIdx = nonPubImplQualIdx,
-                        endImplIdx = endImplIdx,
-                        subpkg = subpkg,
-                        rawAbiMode = rawAbiMode,
-                        registerFnSig = registerFnSig,
-                        registerFnConstParams = registerFnConstParams,
-                    )
-                }
-                i = endImplIdx
-                pendingAttrs.clear()
-                continue
-            }
-            if (nonPubKw == "struct" || nonPubKw == "union") {
-                i = scanStructOrUnionItem(cursor, i, nonPubKw == "union", isPublic = false, subpkg, pendingAttrs, skippedByCfg)
-                pendingAttrs.clear()
-                continue
-            }
-            if (nonPubKw == "enum") {
-                i = scanEnumItem(cursor, i, isPublic = false, subpkg, pendingAttrs, skippedByCfg, insideCEnumMacro)
-                pendingAttrs.clear()
-                continue
-            }
-            if (nonPubKw == "type") {
-                val rawIdent = cursor.identAt(i + 1)
-                if (rawIdent != null && !skippedByCfg) {
-                    registerSymbol(KotlinNamingPolicy.Default.toTypeIdentifier(rawIdent, allowRawAbi = rawAbiMode), subpkg)
-                }
-                i = cursor.skipAfterItemHeader(i + 1, semicolonOnly = true)
-                pendingAttrs.clear()
-                continue
-            }
-            if (nonPubKw == "fn" || nonPubKw == "const" || nonPubKw == "unsafe" || nonPubKw == "async" || nonPubKw == "extern") {
-                if (cursor.findFnIdentAfterQualifiers(i) != null) {
-                    i = scanFnItem(cursor, i, subpkg, skippedByCfg, insideExternBlock)
-                    pendingAttrs.clear()
-                    continue
-                }
-            }
-            if (nonPubKw == "const" || nonPubKw == "static") {
-                var idIdx = i + 1
-                if (nonPubKw == "static" && cursor.identAt(idIdx) == "mut") idIdx++
-                i = scanConstOrStaticValueItem(cursor, idIdx, subpkg, skippedByCfg)
+            val nextItemIdx =
+                tryScanDeclarationItem(
+                    cursor = cursor,
+                    startIdx = i,
+                    subpkg = subpkg,
+                    topLevelSplitInlineMods = topLevelSplitInlineMods,
+                    pendingAttrs = pendingAttrs,
+                    skippedByCfg = skippedByCfg,
+                    insideCEnumMacro = insideCEnumMacro,
+                    insideExternBlock = insideExternBlock,
+                )
+            if (nextItemIdx != null) {
+                i = nextItemIdx
                 pendingAttrs.clear()
                 continue
             }
@@ -860,6 +616,82 @@ internal open class ModuleTokenTreeScanner(
                 pendingAttrs.clear()
             }
             i++
+        }
+    }
+
+    private fun tryScanDeclarationItem(
+        cursor: RustItemHeaderTokenScanner,
+        startIdx: Int,
+        subpkg: String,
+        topLevelSplitInlineMods: Set<String>,
+        pendingAttrs: List<List<TokenTree>>,
+        skippedByCfg: Boolean,
+        insideCEnumMacro: Boolean,
+        insideExternBlock: Boolean,
+    ): Int? {
+        val isPublic = cursor.identAt(startIdx) == "pub"
+        val baseIdx = if (isPublic) cursor.copyOptionalPubVisibility(startIdx) else startIdx
+        val traitQualIdx = cursor.skipQualifiers(baseIdx, TRAIT_QUALIFIERS)
+        if (cursor.identAt(traitQualIdx) == "trait") {
+            return scanTraitItem(cursor, traitQualIdx, subpkg, skippedByCfg)
+        }
+        if (!isPublic) {
+            val implQualIdx = cursor.skipQualifiers(startIdx, IMPL_QUALIFIERS)
+            if (cursor.identAt(implQualIdx) == "impl") {
+                val endImplIdx = cursor.skipAfterItemHeader(implQualIdx + 1)
+                if (!skippedByCfg) {
+                    cursor.scanInherentImplAssociatedFunctions(implQualIdx, endImplIdx, subpkg, sink)
+                }
+                return endImplIdx
+            }
+        }
+        return when (val kw = cursor.identAt(baseIdx)) {
+            "mod" ->
+                if (isPublic || cursor.identAt(baseIdx + 1) != null) {
+                    scanModItem(cursor, baseIdx, subpkg, topLevelSplitInlineMods, skippedByCfg, insideCEnumMacro, insideExternBlock)
+                } else {
+                    null
+                }
+            "struct", "union" ->
+                scanStructOrUnionItem(cursor, baseIdx, kw == "union", isPublic = isPublic, subpkg, pendingAttrs, skippedByCfg)
+            "enum" ->
+                scanEnumItem(cursor, baseIdx, isPublic = isPublic, subpkg, pendingAttrs, skippedByCfg, insideCEnumMacro)
+            "type" ->
+                if (isPublic) {
+                    cursor.scanPubTypeDeclaration(baseIdx, subpkg, skippedByCfg, sink)
+                } else {
+                    val rawIdent = cursor.identAt(baseIdx + 1)
+                    if (rawIdent != null && !skippedByCfg) {
+                        sink.registerSymbol(KotlinNamingPolicy.Default.toTypeIdentifier(rawIdent, allowRawAbi = rawAbiMode), subpkg)
+                    }
+                    cursor.skipAfterItemHeader(baseIdx + 1, semicolonOnly = true)
+                }
+            "const" -> {
+                val afterConstText = cursor.identAt(baseIdx + 1)
+                val isConstFn =
+                    if (isPublic) {
+                        afterConstText == "fn" || afterConstText == "unsafe" || afterConstText == "extern"
+                    } else {
+                        cursor.findFnIdentAfterQualifiers(baseIdx) != null
+                    }
+                if (isConstFn) {
+                    scanFnItem(cursor, if (isPublic) baseIdx + 1 else baseIdx, subpkg, skippedByCfg, insideExternBlock)
+                } else {
+                    scanConstOrStaticValueItem(cursor, baseIdx + 1, subpkg, skippedByCfg)
+                }
+            }
+            "static" -> {
+                var idIdx = baseIdx + 1
+                if (cursor.identAt(idIdx) == "mut") idIdx++
+                scanConstOrStaticValueItem(cursor, idIdx, subpkg, skippedByCfg)
+            }
+            "fn", "unsafe", "async", "extern" ->
+                if (isPublic || cursor.findFnIdentAfterQualifiers(baseIdx) != null) {
+                    scanFnItem(cursor, baseIdx, subpkg, skippedByCfg, insideExternBlock)
+                } else {
+                    null
+                }
+            else -> null
         }
     }
 
@@ -883,7 +715,7 @@ internal open class ModuleTokenTreeScanner(
                     inlineGrp.delimiter() == Delimiter.Brace &&
                     rawMod in topLevelSplitInlineMods
             if ((inlineGrp == null || isSplitInlineMod) && modKt.isNotEmpty()) {
-                subpkgToRawLeaf.putIfMissing(childSub, rawMod)
+                sink.subpkgToRawLeaf.putIfMissing(childSub, rawMod)
             }
             if (inlineGrp != null && inlineGrp.delimiter() == Delimiter.Brace) {
                 scan(
@@ -909,21 +741,21 @@ internal open class ModuleTokenTreeScanner(
         val rawIdent = cursor.identAt(kwIdx + 1)
         if (rawIdent != null && !skippedByCfg) {
             val ktType = KotlinNamingPolicy.Default.toTypeIdentifier(rawIdent, allowRawAbi = rawAbiMode)
-            registerSymbol(ktType, subpkg)
+            sink.registerSymbol(ktType, subpkg)
             val afterIdent = kwIdx + 2
             val (genTypeParams, _, afterGenericsIdx) = cursor.extractHeaderGenericTypeParams(afterIdent, rawAbiMode)
             val hasAnyGenerics = afterGenericsIdx > afterIdent
             val bodyGroup = cursor.findStructOrUnionBodyGroup(afterGenericsIdx)
             if (isPublic && !hasAnyGenerics) {
                 if (rawIdent.removePrefix("r#") != "c_void") {
-                    putScopedDefault(subpkg, ktType, "$ktType()")
+                    sink.putScopedDefault(subpkg, ktType, "$ktType()")
                 }
                 if (bodyGroup != null) {
                     val parsedFields =
                         RustItemHeaderTokenScanner.parseRecordFieldsFromGroup(
                             bodyGroup = bodyGroup,
                             rawAbiMode = rawAbiMode,
-                            structFieldTypesOut = structFieldTypes,
+                            structFieldTypesOut = sink.structFieldTypes,
                             ownerKtType = ktType,
                             subpkg = subpkg,
                             isUnion = isUnion,
@@ -938,15 +770,15 @@ internal open class ModuleTokenTreeScanner(
                                 fields = parsedFields,
                             )
                         val scopedKey = if (subpkg.isEmpty()) ktType else "$subpkg.$ktType"
-                        recordDecls.putIfMissing(scopedKey, decl)
-                        recordDeclsBySimple.putIfMissing(ktType, decl)
+                        sink.recordDecls.putIfMissing(scopedKey, decl)
+                        sink.recordDeclsBySimple.putIfMissing(ktType, decl)
                     }
                 }
             } else if (bodyGroup != null) {
                 RustItemHeaderTokenScanner.parseRecordFieldsFromGroup(
                     bodyGroup = bodyGroup,
                     rawAbiMode = rawAbiMode,
-                    structFieldTypesOut = structFieldTypes,
+                    structFieldTypesOut = sink.structFieldTypes,
                     ownerKtType = ktType,
                     subpkg = subpkg,
                     isUnion = isUnion,
@@ -969,25 +801,17 @@ internal open class ModuleTokenTreeScanner(
         val rawIdent = cursor.identAt(kwIdx + 1)
         if (rawIdent != null && !skippedByCfg) {
             val ktType = KotlinNamingPolicy.Default.toTypeIdentifier(rawIdent, allowRawAbi = rawAbiMode)
-            registerSymbol(ktType, subpkg)
+            sink.registerSymbol(ktType, subpkg)
             val afterIdent = kwIdx + 2
-            cursor.scanEnumVariantTypeArities(
-                afterIdentIdx = afterIdent,
-                subpkg = subpkg,
-                ktEnum = ktType,
-                rawAbiMode = rawAbiMode,
-                out = enumVariantTypeArity,
-                unitEnumVariants = unitEnumVariants,
-                traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
-            )
+            cursor.scanEnumVariantTypeArities(afterIdent, subpkg, ktType, sink)
             if (isPublic) {
                 val hasGenerics = cursor.punctCharAt(afterIdent) == '<'
                 val braceGrp = cursor.groupAt(afterIdent, Delimiter.Brace)
                 val attrInspector = ScannerAttrGroupInspector(pendingAttrs)
                 if (insideCEnumMacro) {
                     val reprKind = attrInspector.extractEnumReprKind(rawAbiMode, defaultKind = "I32")
-                    putScopedNumericKind(subpkg, ktType, reprKind)
-                    putScopedDefault(subpkg, ktType, if (reprKind.startsWith("U")) "0u" else "0")
+                    sink.putScopedNumericKind(subpkg, ktType, reprKind)
+                    sink.putScopedDefault(subpkg, ktType, if (reprKind.startsWith("U")) "0u" else "0")
                     if (braceGrp != null) {
                         val bodyCursor = RustTokenCursor(braceGrp.stream().toList())
                         for (bIdx in 0 until bodyCursor.size - 1) {
@@ -995,8 +819,8 @@ internal open class ModuleTokenTreeScanner(
                                 val vIdent = bodyCursor.identAt(bIdx + 1)
                                 if (vIdent != null) {
                                     val ktVar = KotlinNamingPolicy.Default.toConstIdentifier(vIdent)
-                                    registerSymbol(ktVar, subpkg)
-                                    putScopedNumericKind(subpkg, ktVar, reprKind)
+                                    sink.registerSymbol(ktVar, subpkg)
+                                    sink.putScopedNumericKind(subpkg, ktVar, reprKind)
                                 }
                             }
                         }
@@ -1008,8 +832,8 @@ internal open class ModuleTokenTreeScanner(
                 ) {
                     val reprKind = attrInspector.extractEnumReprKind(rawAbiMode)
                     val scopedKey = if (subpkg.isEmpty()) ktType else "$subpkg.$ktType"
-                    simpleEnumReprs.putIfMissing(scopedKey, reprKind)
-                    putScopedDefault(subpkg, ktType, "$ktType.entries.first()")
+                    sink.simpleEnumReprs.putIfMissing(scopedKey, reprKind)
+                    sink.putScopedDefault(subpkg, ktType, "$ktType.entries.first()")
                 }
             }
         }
@@ -1025,14 +849,8 @@ internal open class ModuleTokenTreeScanner(
         val rawIdent = cursor.identAt(traitKwIdx + 1)
         if (rawIdent != null && !skippedByCfg) {
             val ktTrait = KotlinNamingPolicy.Default.toTypeIdentifier(rawIdent, allowRawAbi = rawAbiMode)
-            registerSymbol(ktTrait, subpkg)
-            cursor.scanTraitTokenMetadata(
-                startAfterIdent = traitKwIdx + 2,
-                subpkg = subpkg,
-                ktTrait = ktTrait,
-                traitDefaultlessAssocTypes = traitDefaultlessAssocTypes,
-                traitResultMethods = traitResultMethods,
-            )
+            sink.registerSymbol(ktTrait, subpkg)
+            cursor.scanTraitTokenMetadata(traitKwIdx + 2, subpkg, ktTrait, sink)
         }
         return cursor.skipAfterItemHeader(traitKwIdx + 1)
     }
@@ -1048,15 +866,15 @@ internal open class ModuleTokenTreeScanner(
         val endFnIdx = cursor.skipAfterItemHeader(qualStartIdx)
         if (fnIdent != null && !skippedByCfg) {
             val ktFn = rustFunctionIdentToKotlin(fnIdent)
-            registerSymbol(ktFn, subpkg)
+            sink.registerSymbol(ktFn, subpkg)
             val pLists = cursor.extractNonMethodFnParamTokenLists(qualStartIdx)
             val retTy = cursor.extractFnReturnTypeFromHeader(qualStartIdx, endFnIdx, rawAbiMode, insideExternBlock = insideExternBlock)
             if (pLists != null || retTy != null) {
-                registerFnSig(subpkg, ktFn, pLists, retTy, insideExternBlock)
+                sink.registerFnSig(subpkg, ktFn, pLists, retTy, insideExternBlock)
             }
             val constParams = cursor.extractFnConstParamNamesFromHeader(qualStartIdx)
             if (pLists != null && constParams.isNotEmpty()) {
-                registerFnConstParams(subpkg, ktFn, pLists.size, constParams)
+                sink.registerFnConstParams(subpkg, ktFn, pLists.size, constParams)
             }
         }
         return endFnIdx
@@ -1072,9 +890,9 @@ internal open class ModuleTokenTreeScanner(
         val endIdx = cursor.skipAfterItemHeader(idIdx, semicolonOnly = true)
         if (rawIdent != null && rawIdent != "_" && rawIdent !in RustItemHeaderTokenScanner.SCANNER_ITEM_KEYWORDS && !skippedByCfg) {
             val ktConst = KotlinNamingPolicy.Default.toConstIdentifier(rawIdent)
-            registerSymbol(ktConst, subpkg)
+            sink.registerSymbol(ktConst, subpkg)
             cursor.extractConstOrStaticTypeLeaf(idIdx, endIdx)?.let { leaf ->
-                constLeafTargets += Triple(subpkg, ktConst, leaf)
+                sink.constLeafTargets += Triple(subpkg, ktConst, leaf)
             }
         }
         return endIdx
@@ -1505,16 +1323,17 @@ internal class RustItemHeaderTokenScanner(
         afterIdentIdx: Int,
         subpkg: String,
         ktEnum: String,
-        rawAbiMode: Boolean,
-        out: MutableMap<String, Int>,
-        unitEnumVariants: MutableSet<String> = linkedSetOf(),
-        traitDefaultlessAssocTypes: Map<String, List<String>> = emptyMap(),
+        sink: CrateTokenScanSink,
     ) {
+        val rawAbiMode = sink.rawAbiMode
+        val out = sink.enumVariantTypeArity
+        val unitEnumVariants = sink.unitEnumVariants
         val headerParams = extractHeaderGenericTypeParams(afterIdentIdx, rawAbiMode)
         val braceIdx = findEnumBodyBraceIndex(headerParams.nextIdx) ?: return
         val braceGrp = groupAt(braceIdx, Delimiter.Brace) ?: return
         val headerSlice = if (braceIdx > afterIdentIdx) trees.subList(afterIdentIdx, braceIdx) else emptyList()
-        val extraLiftedAssocs = RustItemHeaderTokenScanner(headerSlice).countEnumLiftedAssocs(headerParams.paramNames, traitDefaultlessAssocTypes)
+        val extraLiftedAssocs =
+            RustItemHeaderTokenScanner(headerSlice).countEnumLiftedAssocs(headerParams.paramNames, sink.traitDefaultlessAssocTypes)
         val typeArity = headerParams.typeArity + extraLiftedAssocs
         for (clause in RustTokenCursor(braceGrp.stream().toList()).splitByTopLevelPunct(',')) {
             val stripped = RustTypeSliceInspector(clause).stripLeadingScannerAttrs()
@@ -1538,18 +1357,9 @@ internal class RustItemHeaderTokenScanner(
                 unitEnumVariants += ktVar
             }
             val prevSimple = out[ktVar]
-            if (typeArity > 0) {
-                if (prevSimple == null) {
-                    out[ktVar] = typeArity
-                } else if (prevSimple != typeArity) {
-                    out[ktVar] = -1
-                }
-            } else {
-                if (prevSimple == null) {
-                    out[ktVar] = 0
-                } else if (prevSimple > 0) {
-                    out[ktVar] = -1
-                }
+            when {
+                prevSimple == null -> out[ktVar] = typeArity
+                (typeArity > 0 && prevSimple != typeArity) || (typeArity == 0 && prevSimple > 0) -> out[ktVar] = -1
             }
         }
     }
@@ -1558,8 +1368,7 @@ internal class RustItemHeaderTokenScanner(
         startAfterIdent: Int,
         subpkg: String,
         ktTrait: String,
-        traitDefaultlessAssocTypes: MutableMap<String, List<String>>,
-        traitResultMethods: MutableMap<String, List<String>>,
+        sink: CrateTokenScanSink,
     ) {
         val braceIdx = findEnumBodyBraceIndex(startAfterIdent) ?: return
         val bodyScanner = RustItemHeaderTokenScanner(groupAt(braceIdx, Delimiter.Brace)!!.stream().toList())
@@ -1576,23 +1385,13 @@ internal class RustItemHeaderTokenScanner(
             when (bodyScanner.identAt(j)) {
                 "type" -> {
                     val assocRaw = bodyScanner.identAt(j + 1)
-                    var k = j + 2
-                    var angleDepth = 0
-                    var hasDefault = false
-                    while (k < bodyScanner.size) {
-                        when (bodyScanner.punctCharAt(k)) {
-                            '<' -> angleDepth++
-                            '>' -> angleDepth = maxOf(0, angleDepth - 1)
-                            '=' -> if (angleDepth == 0) hasDefault = true
-                            ';' -> break
-                        }
-                        k++
-                    }
+                    val endSemi = ((j + 2) until bodyScanner.size).firstOrNull { bodyScanner.punctCharAt(it) == ';' } ?: bodyScanner.size
+                    val hasDefault = bodyScanner.anyTopLevelOutsideAngles(j + 2, endSemi) { bodyScanner.punctCharAt(it) == '=' }
                     if (!skipped && assocRaw != null && !hasDefault) {
                         val assocKt = KotlinNamingPolicy.Default.toTypeIdentifier(assocRaw, allowRawAbi = false)
                         if (assocKt !in assocNames) assocNames += assocKt
                     }
-                    j = k + 1
+                    j = endSemi + 1
                     itemAttrs.clear()
                     continue
                 }
@@ -1627,12 +1426,14 @@ internal class RustItemHeaderTokenScanner(
             j++
         }
         if (assocNames.isNotEmpty()) {
-            if (subpkg.isNotEmpty()) traitDefaultlessAssocTypes["$subpkg.$ktTrait"] = assocNames.toList()
-            if (ktTrait !in traitDefaultlessAssocTypes) traitDefaultlessAssocTypes[ktTrait] = assocNames.toList()
+            val list = assocNames.toList()
+            if (subpkg.isNotEmpty()) sink.traitDefaultlessAssocTypes["$subpkg.$ktTrait"] = list
+            sink.traitDefaultlessAssocTypes.putIfMissing(ktTrait, list)
         }
         if (resultMethods.isNotEmpty()) {
-            if (subpkg.isNotEmpty()) traitResultMethods["$subpkg.$ktTrait"] = resultMethods.toList()
-            if (ktTrait !in traitResultMethods) traitResultMethods[ktTrait] = resultMethods.toList()
+            val list = resultMethods.toList()
+            if (subpkg.isNotEmpty()) sink.traitResultMethods["$subpkg.$ktTrait"] = list
+            sink.traitResultMethods.putIfMissing(ktTrait, list)
         }
     }
 
@@ -1640,22 +1441,15 @@ internal class RustItemHeaderTokenScanner(
         typeKwIdx: Int,
         subpkg: String,
         skippedByCfg: Boolean,
-        rawAbiMode: Boolean,
-        registerSymbol: (String, String) -> Unit,
-        putScopedDefault: (String, String, String) -> Unit,
-        putScopedNumericKind: (String, String, String) -> Unit,
-        addScopedOptionFnType: (String, String) -> Unit,
-        putScopedPointerAlias: (String, String, Pair<Boolean, String>) -> Unit,
-        aliasLeafTargets: MutableMap<String, String>,
-        qualifiedAliasLeafTargets: MutableMap<String, Pair<String, String>>,
-        fnTypeSpecs: MutableMap<String, RawFnTypeTokenSpec>,
+        sink: CrateTokenScanSink,
     ): Int {
+        val rawAbiMode = sink.rawAbiMode
         val rawIdent = identAt(typeKwIdx + 1)
         val endIdx = skipAfterItemHeader(typeKwIdx + 1, semicolonOnly = true)
         if (rawIdent == null || skippedByCfg) return endIdx
 
         val ktName = KotlinNamingPolicy.Default.toTypeIdentifier(rawIdent, allowRawAbi = rawAbiMode)
-        registerSymbol(ktName, subpkg)
+        sink.registerSymbol(ktName, subpkg)
 
         val afterIdent = typeKwIdx + 2
         if (punctCharAt(afterIdent) != '=') return endIdx
@@ -1667,12 +1461,12 @@ internal class RustItemHeaderTokenScanner(
 
         val optionFnParsed = rhsSlice.extractOptionAngleInnerTokens()?.let { RustTypeSliceInspector(it).tryParseBareFnTokens() }
         if (optionFnParsed != null) {
-            addScopedOptionFnType(subpkg, ktName)
-            putScopedDefault(subpkg, ktName, "null")
+            sink.addScopedOptionFnType(subpkg, ktName)
+            sink.putScopedDefault(subpkg, ktName, "null")
             val samFnName = "${ktName}Fn"
-            registerSymbol(samFnName, subpkg)
+            sink.registerSymbol(samFnName, subpkg)
             val scopedKey = if (subpkg.isEmpty()) samFnName else "$subpkg.$samFnName"
-            fnTypeSpecs.putIfMissing(
+            sink.fnTypeSpecs.putIfMissing(
                 scopedKey,
                 RawFnTypeTokenSpec(
                     subpkg = subpkg,
@@ -1689,7 +1483,7 @@ internal class RustItemHeaderTokenScanner(
         val bareFnParsed = rhsSlice.tryParseBareFnTokens()
         if (bareFnParsed != null) {
             val scopedKey = if (subpkg.isEmpty()) ktName else "$subpkg.$ktName"
-            fnTypeSpecs.putIfMissing(
+            sink.fnTypeSpecs.putIfMissing(
                 scopedKey,
                 RawFnTypeTokenSpec(
                     subpkg = subpkg,
@@ -1708,40 +1502,35 @@ internal class RustItemHeaderTokenScanner(
             val isMut = qual == "mut"
             val elemStart = if (qual == "mut" || qual == "const") 2 else 1
             val elemSlice = RustTokenCursor(if (elemStart < rhsSlice.size) rhsTokens.subList(elemStart, rhsSlice.size) else emptyList())
-            val pointeeIdent =
-                if (elemSlice.punctCharAt(0) == '*') {
-                    "*"
-                } else {
-                    elemSlice.simplePathLeafIdent() ?: "*"
-                }
-            putScopedPointerAlias(subpkg, ktName, isMut to pointeeIdent)
+            val pointeeIdent = if (elemSlice.punctCharAt(0) == '*') "*" else elemSlice.simplePathLeafIdent() ?: "*"
+            sink.putScopedPointerAlias(subpkg, ktName, isMut to pointeeIdent)
             if (rawAbiMode) {
-                putScopedDefault(subpkg, ktName, "0L")
-                putScopedNumericKind(subpkg, ktName, "I64")
+                sink.putScopedDefault(subpkg, ktName, "0L")
+                sink.putScopedNumericKind(subpkg, ktName, "I64")
             } else {
-                putScopedDefault(subpkg, ktName, if (isMut) "MutPtr(0L)" else "ConstPtr(0L)")
+                sink.putScopedDefault(subpkg, ktName, if (isMut) "MutPtr(0L)" else "ConstPtr(0L)")
             }
             return endIdx
         }
 
         if (rhsSlice.isUnitParens()) {
-            putScopedDefault(subpkg, ktName, "Unit")
+            sink.putScopedDefault(subpkg, ktName, "Unit")
             return endIdx
         }
 
         if (rhsSlice.size == 1 && rhsSlice.groupAt(0, Delimiter.Bracket) != null) {
             val mapped = rhsSlice.mapFieldTypeQuick(rawAbiMode)
             val defaultExpr = if (mapped != null && mapped.endsWith("Array")) "$mapped(0)" else "emptyList()"
-            putScopedDefault(subpkg, ktName, defaultExpr)
+            sink.putScopedDefault(subpkg, ktName, defaultExpr)
             return endIdx
         }
 
         if (rhsSlice.groupAt(0) == null) {
             val leaf = rhsSlice.simplePathLeafIdent()
             if (leaf != null && (0 until rhsSlice.size).none { rhsSlice.punctCharAt(it) == '<' }) {
-                aliasLeafTargets.putIfMissing(ktName, leaf)
+                sink.aliasLeafTargets.putIfMissing(ktName, leaf)
                 if (subpkg.isNotEmpty()) {
-                    qualifiedAliasLeafTargets.putIfMissing("$subpkg.$ktName", subpkg to leaf)
+                    sink.qualifiedAliasLeafTargets.putIfMissing("$subpkg.$ktName", subpkg to leaf)
                 }
             }
         }
@@ -1798,10 +1587,9 @@ internal class RustItemHeaderTokenScanner(
         implKwIdx: Int,
         endImplIdx: Int,
         subpkg: String,
-        rawAbiMode: Boolean,
-        registerFnSig: (String, String, List<List<TokenTree>>?, String?, Boolean) -> Unit,
-        registerFnConstParams: (String, String, Int, List<String>) -> Unit = { _, _, _, _ -> },
+        sink: CrateTokenScanSink,
     ) {
+        val rawAbiMode = sink.rawAbiMode
         val headerSlice = trees.subList(implKwIdx + 1, endImplIdx)
         val braceTree = headerSlice.lastOrNull { (it as? TokenTree.Group)?.value?.delimiter() == Delimiter.Brace } as? TokenTree.Group ?: return
         val beforeBrace = headerSlice.subList(0, headerSlice.indexOf(braceTree))
@@ -1820,18 +1608,10 @@ internal class RustItemHeaderTokenScanner(
             } else {
                 emptyList()
             }
-        if (scanIdx < beforeCursor.size) {
-            var angleDepth = 0
-            for (idx in scanIdx until beforeCursor.size) {
-                val ch = beforeCursor.punctCharAt(idx)
-                if (ch == '<') {
-                    angleDepth++
-                } else if (ch == '>' && angleDepth > 0) {
-                    angleDepth--
-                } else if (angleDepth == 0 && beforeCursor.identAt(idx) == "for") {
-                    return
-                }
-            }
+        if (scanIdx < beforeCursor.size &&
+            beforeCursor.anyTopLevelOutsideAngles(scanIdx) { beforeCursor.identAt(it) == "for" }
+        ) {
+            return
         }
         val typeHeadTokens =
             beforeBrace
@@ -1864,12 +1644,12 @@ internal class RustItemHeaderTokenScanner(
                     if (!hasGenericsOrFor) {
                         val retTy = bodyScanner.extractFnReturnTypeFromHeader(kwIdx, endFnIdx, rawAbiMode, ownerKt)
                         if (pLists != null || retTy != null) {
-                            registerFnSig(subpkg, "$ownerKt.$ktMethod", pLists, retTy, false)
+                            sink.registerFnSig(subpkg, "$ownerKt.$ktMethod", pLists, retTy, false)
                         }
                     }
                     val combinedConsts = (implConsts + bodyScanner.extractFnConstParamNamesFromHeader(kwIdx)).distinct()
                     if (pLists != null && combinedConsts.isNotEmpty()) {
-                        registerFnConstParams(subpkg, "$ownerKt.$ktMethod", pLists.size, combinedConsts)
+                        sink.registerFnConstParams(subpkg, "$ownerKt.$ktMethod", pLists.size, combinedConsts)
                     }
                 }
                 i = endFnIdx
@@ -1885,7 +1665,7 @@ internal class RustItemHeaderTokenScanner(
 
     companion object {
         val SCANNER_ITEM_KEYWORDS =
-            setOf("pub", "mod", "struct", "union", "enum", "trait", "type", "const", "static", "fn", "unsafe", "async", "auto", "extern", "use", "impl")
+            wordSet("pub mod struct union enum trait type const static fn unsafe async auto extern use impl")
 
         fun parseRecordFieldsFromGroup(
             bodyGroup: Group,

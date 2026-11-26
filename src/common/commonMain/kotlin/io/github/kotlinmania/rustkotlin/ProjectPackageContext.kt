@@ -262,7 +262,7 @@ public abstract class CrateFileTreeNavigator<Node : Any> {
             val resolvedKey = pathKey(resolvedCandidate)
             if (!visitedPaths.add(resolvedKey)) return
             val text = readText(resolvedCandidate)
-            if (text.contains("macro_rules")) {
+            if (text.contains("macro_rules") || text.contains("macro ")) {
                 entries.add(resolvedKey to text)
             }
             if (followMacroUse && text.contains("macro_use")) {
@@ -457,16 +457,20 @@ public data class FileHeaderContext(
     )
 }
 
-private class BoundedDiskCache<V : Any>(
+internal class BoundedDiskCache<V : Any>(
     private val maxEntries: Int = 128,
 ) {
     private var entries: Map<String, V> = emptyMap()
 
+    operator fun get(key: String): V? = entries[key]
+
+    fun put(key: String, value: V) {
+        entries = if (entries.size >= maxEntries) mapOf(key to value) else entries + (key to value)
+    }
+
     fun getOrPut(key: String, compute: () -> V): V {
         entries[key]?.let { return it }
-        val computed = compute()
-        entries = if (entries.size >= maxEntries) mapOf(key to computed) else entries + (key to computed)
-        return computed
+        return compute().also { put(key, it) }
     }
 }
 
@@ -895,4 +899,37 @@ public fun ensureRustLangInLibsVersionsToml(
         )
     }
     return editor.render()
+}
+
+public fun isManualProtectedContent(content: String): Boolean =
+    content
+        .lineSequence()
+        .take(10)
+        .any { line ->
+            val trimmed = line.trimStart()
+            trimmed.startsWith("// rust-kotlin: manual") || trimmed.startsWith("# rust-kotlin: manual")
+        }
+
+public fun synchronizeRustLangProjectCatalog(
+    projectNamespace: String?,
+    existingToml: String,
+    existingProps: String?,
+    canUpdateProps: Boolean = true,
+    writeProps: (String) -> Unit,
+    writeToml: (String) -> Unit,
+): Boolean {
+    if (isRustLangSelfProject(projectNamespace, existingProps)) return false
+    var targetBundle: String? = null
+    if (canUpdateProps && existingProps != null && !isManualProtectedContent(existingProps)) {
+        val (updatedProps, bundleName) = ensureRustLangInGradleProperties(existingProps)
+        targetBundle = bundleName
+        if (updatedProps != existingProps) {
+            writeProps(updatedProps)
+        }
+    }
+    if (isManualProtectedContent(existingToml)) return false
+    val updatedToml = ensureRustLangInLibsVersionsToml(existingToml, commonMainBundleName = targetBundle)
+    if (updatedToml == existingToml) return false
+    writeToml(updatedToml)
+    return true
 }

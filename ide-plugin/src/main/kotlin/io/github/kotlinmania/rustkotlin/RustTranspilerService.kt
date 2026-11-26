@@ -414,32 +414,24 @@ class RustTranspilerService(
 
     private fun ensureProjectVersionCatalogHasRustLang(projectNamespace: String?) {
         val projectRoot = project.guessProjectDir() ?: return
+        val gradleDir = projectRoot.findChild("gradle")?.takeIf { it.isDirectory } ?: return
         val catalogFile =
-            projectRoot
-                .findChild("gradle")
-                ?.takeIf { it.isDirectory }
-                ?.findChild("libs.versions.toml")
+            gradleDir
+                .findChild("libs.versions.toml")
                 ?.takeIf { it.isValid && !it.isDirectory && it.isWritable }
                 ?: return
         val propsFile =
             projectRoot
                 .findChild("gradle.properties")
                 ?.takeIf { it.isValid && !it.isDirectory }
-        val existingProps = propsFile?.let(VfsUtilCore::loadText)
-        if (isRustLangSelfProject(projectNamespace, existingProps)) return
-        var targetBundle: String? = null
-        if (propsFile != null && propsFile.isWritable && existingProps != null) {
-            val (updatedProps, bundleName) = ensureRustLangInGradleProperties(existingProps)
-            targetBundle = bundleName
-            if (updatedProps != existingProps) {
-                VfsUtil.saveText(propsFile, updatedProps)
-            }
-        }
-        val existingToml = VfsUtilCore.loadText(catalogFile)
-        val updatedToml = ensureRustLangInLibsVersionsToml(existingToml, commonMainBundleName = targetBundle)
-        if (updatedToml != existingToml) {
-            VfsUtil.saveText(catalogFile, updatedToml)
-        }
+        synchronizeRustLangProjectCatalog(
+            projectNamespace = projectNamespace,
+            existingToml = VfsUtilCore.loadText(catalogFile),
+            existingProps = propsFile?.let(VfsUtilCore::loadText),
+            canUpdateProps = propsFile?.isWritable == true,
+            writeProps = { updated -> VfsUtil.saveText(propsFile!!, updated) },
+            writeToml = { updated -> VfsUtil.saveText(catalogFile, updated) },
+        )
     }
 
     fun resolvePackagePropertiesForVirtualFile(startFile: VirtualFile?): FolderPackageProperties? =

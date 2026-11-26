@@ -3,8 +3,6 @@ package io.github.kotlinmania.rustkotlin
 import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.syn.Attribute
-import io.github.kotlinmania.syn.Expr
-import io.github.kotlinmania.syn.Lit
 import io.github.kotlinmania.syn.Macro
 import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.PathArguments
@@ -353,43 +351,45 @@ internal fun buildNodeNapiLoaderJsBody(
 ): String {
     val relsJs = napiRelativeCandidatesJsArray(ffiModName)
     val globalProp = "globalThis.__km_napi_$ffiModName"
-    val sb = StringBuilder()
-    if (returnBooleanStatus) {
-        sb.append("if (typeof $globalProp !== 'undefined') return $globalProp !== null; ")
-        sb.append("if (typeof process === 'undefined' || !process.versions || !process.versions.node) { $globalProp = null; return false; } ")
-    } else {
-        sb.append("if (typeof globalThis !== 'undefined' && typeof $globalProp !== 'undefined') return $globalProp; ")
-        sb.append("if (typeof process === 'undefined' || !process.versions || !process.versions.node) return null; ")
-    }
-    sb.append(
-        "var mod = process.getBuiltinModule ? process.getBuiltinModule('module') : (process.mainModule && process.mainModule.constructor); " +
-            "var req = (mod && mod.createRequire) ? mod.createRequire((process.cwd ? process.cwd() : '.') + '/package.json') : (process.mainModule ? process.mainModule.require : null); ",
-    )
-    if (returnBooleanStatus) {
-        sb.append("if (!req) { $globalProp = null; return false; } ")
-        sb.append("try { $globalProp = req('@kotlinmania/$ffiModName-native-bindings'); return true; } catch (_) {} ")
-    } else {
-        sb.append("if (!req) return null; ")
-        sb.append("try { var pkg = req('@kotlinmania/$ffiModName-native-bindings'); if (typeof globalThis !== 'undefined') $globalProp = pkg; return pkg; } catch (_) {} ")
-    }
-    sb.append(
-        "var fs = req('fs'); var path = req('path'); var dir = process.cwd ? process.cwd() : '.'; var rels = $relsJs; " +
-            "for (var d = 0; d < 8; d++) { for (var i = 0; i < rels.length; i++) { var c = path.resolve(dir, rels[i]); ",
-    )
-    if (returnBooleanStatus) {
-        sb.append("if (fs.existsSync(c)) { $globalProp = req(c); return true; } ")
-    } else {
-        sb.append("if (fs.existsSync(c)) { var loaded = req(c); if (typeof globalThis !== 'undefined') $globalProp = loaded; return loaded; } ")
-    }
-    sb.append("} var parent = path.dirname(dir); if (parent === dir) break; dir = parent; } ")
-    sb.append(
+    val pkgSpec = "@kotlinmania/$ffiModName-native-bindings"
+    val cachedGuard =
+        if (returnBooleanStatus) {
+            "if (typeof $globalProp !== 'undefined') return $globalProp !== null; "
+        } else {
+            "if (typeof globalThis !== 'undefined' && typeof $globalProp !== 'undefined') return $globalProp; "
+        }
+    val failAndCache = if (returnBooleanStatus) "{ $globalProp = null; return false; }" else "return null;"
+    val finalFail =
         if (returnBooleanStatus) {
             "$globalProp = null; return false; "
         } else {
             "if (typeof globalThis !== 'undefined') $globalProp = null; return null; "
-        },
-    )
-    return sb.toString()
+        }
+
+    fun storeLoaded(localName: String, loadExpr: String): String =
+        if (returnBooleanStatus) {
+            "$globalProp = $loadExpr; return true;"
+        } else {
+            "var $localName = $loadExpr; if (typeof globalThis !== 'undefined') $globalProp = $localName; return $localName;"
+        }
+
+    return buildString {
+        append(cachedGuard)
+        append("if (typeof process === 'undefined' || !process.versions || !process.versions.node) $failAndCache ")
+        append(
+            "var mod = process.getBuiltinModule ? process.getBuiltinModule('module') : (process.mainModule && process.mainModule.constructor); " +
+                "var req = (mod && mod.createRequire) ? mod.createRequire((process.cwd ? process.cwd() : '.') + '/package.json') : (process.mainModule ? process.mainModule.require : null); ",
+        )
+        append("if (!req) $failAndCache ")
+        append("try { ${storeLoaded("pkg", "req('$pkgSpec')")} } catch (_) {} ")
+        append(
+            "var fs = req('fs'); var path = req('path'); var dir = process.cwd ? process.cwd() : '.'; var rels = $relsJs; " +
+                "for (var d = 0; d < 8; d++) { for (var i = 0; i < rels.length; i++) { var c = path.resolve(dir, rels[i]); ",
+        )
+        append("if (fs.existsSync(c)) { ${storeLoaded("loaded", "req(c)")} } ")
+        append("} var parent = path.dirname(dir); if (parent === dir) break; dir = parent; } ")
+        append(finalFail)
+    }
 }
 
 internal class FfiInteropCollector(
@@ -814,7 +814,7 @@ internal class FfiInteropCollector(
         if (fn.returnBridgeKind == CAbiBridgeKind.CALLBACK_PTR || fn.params.any { it.bridgeKind == CAbiBridgeKind.CALLBACK_PTR }) {
             return false
         }
-        return preambles.any { containsCIdentifier(it, fn.cSymbolName) } || isDirectCallSafeSymbol(fn)
+        return preambles.any { containsWholeIdentifier(it, fn.cSymbolName) } || isDirectCallSafeSymbol(fn)
     }
 
     internal fun finalizeActualsKotlinFile(
@@ -894,15 +894,7 @@ internal class FfiInteropCollector(
             CAbiBridgeKind.CALLBACK_PTR ->
                 if (isRawPointerReturn) {
                     profile.pointerImport?.let { importsOut += it }
-                    if (!profile.callbackConvertsNonLongNumeric ||
-                        retNonNullNumeric == NumericKind.I64 ||
-                        kotlinReturnType == "Long" ||
-                        retNonNullNumeric == null
-                    ) {
-                        profile.ptrLongExpr
-                    } else {
-                        "${profile.ptrLongReceiverExpr}.${conversionMethodForNumericKind(retNonNullNumeric)}()"
-                    }
+                    renderRawPointerNumericReturn(profile, kotlinReturnType, retNonNullNumeric, profile.callbackConvertsNonLongNumeric)
                 } else {
                     returnDefaultExpr
                 }
@@ -914,11 +906,7 @@ internal class FfiInteropCollector(
             -> {
                 profile.pointerImport?.let { importsOut += it }
                 if (isRawPointerReturn) {
-                    if (retNonNullNumeric == NumericKind.I64 || kotlinReturnType == "Long" || retNonNullNumeric == null) {
-                        profile.ptrLongExpr
-                    } else {
-                        "${profile.ptrLongReceiverExpr}.${conversionMethodForNumericKind(retNonNullNumeric)}()"
-                    }
+                    renderRawPointerNumericReturn(profile, kotlinReturnType, retNonNullNumeric, allowNonLongConversion = true)
                 } else {
                     wrapLongAddressForPointerReturn(
                         addrExpr = profile.ptrLongExpr,
@@ -933,6 +921,22 @@ internal class FfiInteropCollector(
             else -> profile.fallbackNonScalar
         }
     }
+
+    private fun renderRawPointerNumericReturn(
+        profile: BridgeReturnConversionProfile,
+        kotlinReturnType: String,
+        retNonNullNumeric: NumericKind?,
+        allowNonLongConversion: Boolean,
+    ): String =
+        if (!allowNonLongConversion ||
+            retNonNullNumeric == NumericKind.I64 ||
+            kotlinReturnType == "Long" ||
+            retNonNullNumeric == null
+        ) {
+            profile.ptrLongExpr
+        } else {
+            "${profile.ptrLongReceiverExpr}.${conversionMethodForNumericKind(retNonNullNumeric)}()"
+        }
 
     internal fun addRecordedImportsForBody(
         bodyText: String,
@@ -1225,35 +1229,48 @@ internal class FfiInteropCollector(
             }
         }
 
+        private val IGNORED_C_TYPE_QUALIFIERS = setOf("const", "volatile", "restrict", "__restrict", "struct", "enum")
+
         private fun classifyExplicitCTypeBridge(
             cType: String,
             cfgProfile: CfgTargetProfile = TranslationSession.cfgTargetProfile,
         ): CAbiBridgeKind {
-            val norm = cType.replace(" ", "")
+            val cursor = RustTokenCursor(lexRustTokenTrees(cType))
+            val hasPointer = (0 until cursor.size).any { cursor.punctCharAt(it) == '*' }
+            val allIdents = (0 until cursor.size).mapNotNull(cursor::identAt)
+            val hasConst = "const" in allIdents
+            val coreIdents = allIdents.filter { it !in IGNORED_C_TYPE_QUALIFIERS }
+            if (hasPointer) {
+                return when (coreIdents) {
+                    listOf("char") -> if (hasConst) CAbiBridgeKind.CONST_CSTR else CAbiBridgeKind.MUT_CSTR
+                    listOf("FILE") -> CAbiBridgeKind.FILE_PTR
+                    listOf("DIR") -> CAbiBridgeKind.DIR_PTR
+                    else -> CAbiBridgeKind.OPAQUE_PTR
+                }
+            }
             val widths = TargetCWidthProfile.from(cfgProfile)
             val ptrSigned32Or64 = if (cfgProfile.pointerWidth == 64) CAbiBridgeKind.I64 else CAbiBridgeKind.I32
             val ptrUnsigned32Or64 = if (cfgProfile.pointerWidth == 64) CAbiBridgeKind.U64 else CAbiBridgeKind.U32
+            val isUnsigned = "unsigned" in coreIdents
+            val longCount = coreIdents.count { it == "long" }
             return when {
-                norm == "void" -> CAbiBridgeKind.VOID
-                norm == "bool" || norm == "_Bool" -> CAbiBridgeKind.BOOL
-                norm == "constchar*" -> CAbiBridgeKind.CONST_CSTR
-                norm == "char*" -> CAbiBridgeKind.MUT_CSTR
-                norm == "FILE*" || norm == "constFILE*" -> CAbiBridgeKind.FILE_PTR
-                norm == "DIR*" || norm == "constDIR*" -> CAbiBridgeKind.DIR_PTR
-                norm.endsWith("*") -> CAbiBridgeKind.OPAQUE_PTR
-                norm == "int8_t" || norm == "signedchar" || norm == "char" -> CAbiBridgeKind.I8
-                norm == "uint8_t" || norm == "unsignedchar" -> CAbiBridgeKind.U8
-                norm == "int16_t" || norm == "short" -> CAbiBridgeKind.I16
-                norm == "uint16_t" || norm == "unsignedshort" -> CAbiBridgeKind.U16
-                norm == "uint32_t" || norm == "unsignedint" || norm == "unsigned" -> CAbiBridgeKind.U32
-                norm == "long" -> widths.cLongSigned
-                norm == "unsignedlong" -> widths.cLongUnsigned
-                norm == "ssize_t" || norm == "intptr_t" || norm == "ptrdiff_t" -> ptrSigned32Or64
-                norm == "size_t" || norm == "uintptr_t" -> ptrUnsigned32Or64
-                norm == "int64_t" || norm == "longlong" -> CAbiBridgeKind.I64
-                norm == "uint64_t" || norm == "unsignedlonglong" -> CAbiBridgeKind.U64
-                norm == "float" -> CAbiBridgeKind.F32
-                norm == "double" -> CAbiBridgeKind.F64
+                coreIdents == listOf("void") -> CAbiBridgeKind.VOID
+                coreIdents == listOf("bool") || coreIdents == listOf("_Bool") -> CAbiBridgeKind.BOOL
+                coreIdents == listOf("int8_t") || coreIdents == listOf("signed", "char") || coreIdents == listOf("char") ->
+                    CAbiBridgeKind.I8
+                coreIdents == listOf("uint8_t") || coreIdents == listOf("unsigned", "char") -> CAbiBridgeKind.U8
+                coreIdents == listOf("int16_t") || (!isUnsigned && "short" in coreIdents) -> CAbiBridgeKind.I16
+                coreIdents == listOf("uint16_t") || (isUnsigned && "short" in coreIdents) -> CAbiBridgeKind.U16
+                coreIdents == listOf("uint32_t") || (isUnsigned && longCount == 0) -> CAbiBridgeKind.U32
+                longCount == 1 -> if (isUnsigned) widths.cLongUnsigned else widths.cLongSigned
+                longCount >= 2 -> if (isUnsigned) CAbiBridgeKind.U64 else CAbiBridgeKind.I64
+                coreIdents == listOf("ssize_t") || coreIdents == listOf("intptr_t") || coreIdents == listOf("ptrdiff_t") ->
+                    ptrSigned32Or64
+                coreIdents == listOf("size_t") || coreIdents == listOf("uintptr_t") -> ptrUnsigned32Or64
+                coreIdents == listOf("int64_t") -> CAbiBridgeKind.I64
+                coreIdents == listOf("uint64_t") -> CAbiBridgeKind.U64
+                coreIdents == listOf("float") -> CAbiBridgeKind.F32
+                coreIdents == listOf("double") -> CAbiBridgeKind.F64
                 else -> CAbiBridgeKind.I32
             }
         }
@@ -1269,7 +1286,7 @@ internal class FfiInteropCollector(
             return when {
                 kind == CAbiBridgeKind.CONST_CSTR -> "ConstPtr"
                 kind == CAbiBridgeKind.MUT_CSTR -> "MutPtr"
-                cType.replace(" ", "").startsWith("const") -> "ConstPtr"
+                RustTokenCursor(lexRustTokenTrees(cType)).identAt(0) == "const" -> "ConstPtr"
                 else -> "MutPtr"
             }
         }
@@ -1284,18 +1301,8 @@ internal class FfiInteropCollector(
             return null
         }
 
-        internal fun extractLinkNameAttribute(attrs: List<Attribute>): String? {
-            for (attr in attrs) {
-                val meta = attr.meta
-                if (meta is Meta.NameValue && meta.path.isIdent("link_name")) {
-                    val expr = meta.value
-                    if (expr is Expr.Lit && expr.lit is Lit.Str) {
-                        return (expr.lit as Lit.Str).value.value()
-                    }
-                }
-            }
-            return null
-        }
+        internal fun extractLinkNameAttribute(attrs: List<Attribute>): String? =
+            extractStringMetaAttribute(attrs, "link_name")
     }
 }
 
@@ -1305,9 +1312,7 @@ private fun extractImportLocalName(imp: String): String {
 }
 
 internal val UMBRELLA_LINK_LIBRARIES =
-    "c m dl pthread rt System gcc gcc_s stdc++ c++ msvcrt ucrtbase libcmt legacy_stdio_definitions"
-        .split(' ')
-        .toSet()
+    wordSet("c m dl pthread rt System gcc gcc_s stdc++ c++ msvcrt ucrtbase libcmt legacy_stdio_definitions")
 
 internal fun extractLinkLibraryNamesFromLinkArgs(
     tokens: TokenStream,
@@ -1416,25 +1421,65 @@ internal fun extractHeaderCommentsFromSource(source: String, out: MutableSet<Str
     }
 }
 
+private val CPP_STDLIB_INCLUDE_HEADERS = setOf("iostream", "vector", "string")
+private val CPP_CAST_KEYWORDS = setOf("reinterpret_cast", "static_cast")
+
+private class CHostPreambleTokenScanner(
+    source: String,
+) : KotlinTokenWalker(source) {
+    fun collectIncludedHeaders(out: MutableSet<String>) {
+        var idx = 0
+        while (idx < tokens.size) {
+            if (punctAt(idx) == '#' && identTextAt(skipHorizontalWhitespace(idx + 1)) == "include") {
+                val targetIdx = skipHorizontalWhitespace(skipHorizontalWhitespace(idx + 1) + 1)
+                when {
+                    punctAt(targetIdx) == '<' -> {
+                        var closeIdx = targetIdx + 1
+                        while (closeIdx < tokens.size && tokens[closeIdx] !is KotlinLexToken.Newline && punctAt(closeIdx) != '>') {
+                            closeIdx++
+                        }
+                        if (punctAt(closeIdx) == '>' && closeIdx > targetIdx + 1) {
+                            val hdr = source.substring(tokens[targetIdx].end, tokens[closeIdx].start).trim()
+                            if (hdr.isNotEmpty()) out += hdr
+                            idx = closeIdx + 1
+                            continue
+                        }
+                    }
+                    tokens.getOrNull(targetIdx) is KotlinLexToken.StringOpen -> {
+                        var closeIdx = targetIdx + 1
+                        while (closeIdx < tokens.size && tokens[closeIdx] !is KotlinLexToken.StringClose) closeIdx++
+                        if (closeIdx < tokens.size && closeIdx > targetIdx) {
+                            val hdr = source.substring(tokens[targetIdx].end, tokens[closeIdx].start).trim()
+                            if (hdr.isNotEmpty()) out += hdr
+                            idx = closeIdx + 1
+                            continue
+                        }
+                    }
+                }
+            }
+            idx++
+        }
+    }
+
+    fun hasCppConstructs(): Boolean {
+        val headers = linkedSetOf<String>()
+        collectIncludedHeaders(headers)
+        if (headers.any { it in CPP_STDLIB_INCLUDE_HEADERS }) return true
+        for (idx in tokens.indices) {
+            when (identTextAt(idx)) {
+                "std" -> if (punctAt(idx + 1) == ':' && punctAt(idx + 2) == ':') return true
+                "namespace" -> if (identTextAt(nextNonTriviaIndex(idx + 1)) != null) return true
+                in CPP_CAST_KEYWORDS -> if (punctAt(nextNonTriviaIndex(idx + 1)) == '<') return true
+            }
+        }
+        return false
+    }
+}
+
 internal fun extractIncludedHeadersFromPreambles(preambles: List<String>): Set<String> {
     val found = linkedSetOf<String>()
     for (chunk in preambles) {
-        for (line in chunk.lineSequence()) {
-            val trimmed = line.trimStart()
-            if (!trimmed.startsWith('#')) continue
-            val afterHash = trimmed.substring(1).trimStart()
-            if (!afterHash.startsWith("include")) continue
-            val afterInclude = afterHash.substring(7).trimStart()
-            if (afterInclude.isEmpty()) continue
-            val close =
-                when (afterInclude[0]) {
-                    '<' -> '>'
-                    '"' -> '"'
-                    else -> continue
-                }
-            val closeIdx = afterInclude.indexOf(close, startIndex = 1)
-            if (closeIdx > 1) found += afterInclude.substring(1, closeIdx)
-        }
+        CHostPreambleTokenScanner(chunk).collectIncludedHeaders(found)
     }
     return found
 }
@@ -1443,13 +1488,7 @@ internal fun formatIncludeTarget(hdr: String): String =
     if (hdr.startsWith('<') || hdr.startsWith('"')) hdr else "<$hdr>"
 
 internal fun looksLikeCppCode(code: String): Boolean =
-    code.contains("std::") ||
-        code.contains("#include <iostream>") ||
-        code.contains("#include <vector>") ||
-        code.contains("#include <string>") ||
-        code.contains("namespace ") ||
-        code.contains("reinterpret_cast<") ||
-        code.contains("static_cast<")
+    CHostPreambleTokenScanner(code).hasCppConstructs()
 
 internal fun computeStemSnake(headerContext: FileHeaderContext): String {
     val rawRel = headerContext.portLintSourcePath
@@ -1551,19 +1590,19 @@ internal fun sanitizeCParamIdentifier(raw: String, index: Int): String {
 }
 
 private val C_RESERVED_PARAM_NAMES: Set<String> =
-    (
-        "auto break case char const continue default do double else enum extern float for goto if " +
-            "inline int long register restrict return short signed sizeof static struct switch typedef union " +
-            "unsigned void volatile while class namespace template typename public private protected virtual operator " +
-            "new delete this friend using try catch throw bool true false alignas alignof constexpr decltype " +
-            "noexcept nullptr static_assert thread_local typeid dynamic_cast static_cast reinterpret_cast const_cast " +
-            "explicit mutable export wchar_t char8_t char16_t char32_t concept requires co_await co_return co_yield " +
-            "and or not xor bitand bitor compl and_eq or_eq xor_eq not_eq near far huge pascal cdecl stdcall fastcall " +
-            "interface small hyper environ errno stdin stdout stderr stat time read write open close accept bind " +
-            "connect listen recv send socket select poll fork pipe dup dup2 link unlink chmod chown " +
-            "lseek mkdir rmdir rename remove system abort exit free malloc calloc realloc div abs labs llabs " +
-            "sin cos tan exp log pow sqrt ceil floor index rindex bcopy bzero bcmp"
-    ).split(' ').toSet()
+    wordSet(
+        "auto break case char const continue default do double else enum extern float for goto if",
+        "inline int long register restrict return short signed sizeof static struct switch typedef union",
+        "unsigned void volatile while class namespace template typename public private protected virtual operator",
+        "new delete this friend using try catch throw bool true false alignas alignof constexpr decltype",
+        "noexcept nullptr static_assert thread_local typeid dynamic_cast static_cast reinterpret_cast const_cast",
+        "explicit mutable export wchar_t char8_t char16_t char32_t concept requires co_await co_return co_yield",
+        "and or not xor bitand bitor compl and_eq or_eq xor_eq not_eq near far huge pascal cdecl stdcall fastcall",
+        "interface small hyper environ errno stdin stdout stderr stat time read write open close accept bind",
+        "connect listen recv send socket select poll fork pipe dup dup2 link unlink chmod chown",
+        "lseek mkdir rmdir rename remove system abort exit free malloc calloc realloc div abs labs llabs",
+        "sin cos tan exp log pow sqrt ceil floor index rindex bcopy bzero bcmp",
+    )
 
 internal fun jniMangleSegment(segment: String): String =
     buildString(segment.length + 4) {
@@ -1729,26 +1768,12 @@ internal fun extractIdentifierTokens(
 }
 
 internal val BUILTIN_KOTLIN_IDENTS: Set<String> =
-    (
-        "null true false Unit Nothing Boolean Byte UByte Short UShort Int UInt Long ULong Float Double " +
-            "String ZERO toByte toUByte toShort toUShort toInt toUInt toLong " +
-            "toULong toFloat toDouble error emptyArray intArrayOf longArrayOf byteArrayOf shortArrayOf " +
-            "floatArrayOf doubleArrayOf ubyteArrayOf ushortArrayOf uintArrayOf ulongArrayOf booleanArrayOf"
-    ).split(' ').toSet()
-
-internal fun containsCIdentifier(code: String, ident: String): Boolean {
-    if (ident.isEmpty()) return false
-    var idx = 0
-    while (true) {
-        val pos = code.indexOf(ident, idx)
-        if (pos < 0) return false
-        val beforeOk = pos == 0 || (!code[pos - 1].isLetterOrDigit() && code[pos - 1] != '_')
-        val afterPos = pos + ident.length
-        val afterOk = afterPos >= code.length || (!code[afterPos].isLetterOrDigit() && code[afterPos] != '_')
-        if (beforeOk && afterOk) return true
-        idx = pos + 1
-    }
-}
+    wordSet(
+        "null true false Unit Nothing Boolean Byte UByte Short UShort Int UInt Long ULong Float Double",
+        "String ZERO toByte toUByte toShort toUShort toInt toUInt toLong toULong toFloat toDouble",
+        "error emptyArray intArrayOf longArrayOf byteArrayOf shortArrayOf floatArrayOf doubleArrayOf",
+        "ubyteArrayOf ushortArrayOf uintArrayOf ulongArrayOf booleanArrayOf",
+    )
 
 /**
  * Token-cursor parser for `c!` / `cpp!` inline FFI blocks (`[mut x: T as "CType", ...] -> Ret as "CRet" { ... }`).

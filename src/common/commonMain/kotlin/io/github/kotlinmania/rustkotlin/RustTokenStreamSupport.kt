@@ -2,7 +2,11 @@ package io.github.kotlinmania.rustkotlin
 
 import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.procmacro2.Group
+import io.github.kotlinmania.procmacro2.Ident
+import io.github.kotlinmania.procmacro2.Literal
+import io.github.kotlinmania.procmacro2.Punct
 import io.github.kotlinmania.procmacro2.Spacing
+import io.github.kotlinmania.procmacro2.Span
 import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.Lit
@@ -46,6 +50,40 @@ internal open class RustTokenCursor(
     fun stringLiteralAt(idx: Int): String? {
         val litTree = trees.getOrNull(idx) as? TokenTree.Literal ?: return null
         return (Lit.new(litTree.value) as? Lit.Str)?.value?.value()
+    }
+
+    fun longLiteralAt(idx: Int): Long? =
+        trees.getOrNull(idx)?.let(::parseIntegerLiteral)
+
+    fun intLiteralAt(idx: Int): Int? =
+        longLiteralAt(idx)?.takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }?.toInt()
+
+    fun hasOuterAttributeIdent(attrIdent: String): Boolean {
+        var idx = 0
+        val attrGroups = mutableListOf<List<TokenTree>>()
+        while (true) {
+            val next = consumeAttribute(idx, attrGroups, allowInnerAttr = false) ?: break
+            idx = next
+        }
+        return attrGroups.any { RustTokenCursor(it).cleanIdentAt(0) == attrIdent }
+    }
+
+    fun consumeJointOperator(idx: Int): Pair<String, Int>? {
+        val c0 = punctCharAt(idx) ?: return null
+        if (punctSpacingAt(idx) != Spacing.Joint) return null
+        val c1 = punctCharAt(idx + 1) ?: return null
+        return when (val pair = "$c0$c1") {
+            "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<", ">>" ->
+                pair to 2
+            ".." -> {
+                if (punctSpacingAt(idx + 1) == Spacing.Joint) {
+                    val c2 = punctCharAt(idx + 2)
+                    if (c2 == '=' || c2 == '.') return "..$c2" to 3
+                }
+                ".." to 2
+            }
+            else -> null
+        }
     }
 
     fun extractGroupInnerSource(source: String, idx: Int, delimiter: Delimiter? = null): String? {
@@ -165,6 +203,34 @@ internal open class RustTokenCursor(
     fun simplePathLeafIdent(startIdx: Int = 0): String? =
         findPathTailIdentIndex(startIdx)?.let(::cleanIdentAt)
 
+    fun extractPureColonPathSegments(
+        allowTrailingBang: Boolean = false,
+        allowTrailingEmptyParens: Boolean = false,
+    ): Pair<List<String>, Boolean>? {
+        if (size == 0) return null
+        var idx = if (isDoubleColonAt(0)) 2 else 0
+        val first = cleanIdentAt(idx) ?: return null
+        val segments = mutableListOf(first)
+        idx++
+        while (idx < size && isDoubleColonAt(idx)) {
+            val nextSeg = cleanIdentAt(idx + 2) ?: return null
+            segments += nextSeg
+            idx += 3
+        }
+        var hadBang = false
+        if (allowTrailingBang && idx < size && punctCharAt(idx) == '!') {
+            hadBang = true
+            idx++
+        }
+        if (allowTrailingEmptyParens && idx < size) {
+            val parenGrp = groupAt(idx, Delimiter.Parenthesis)
+            if (parenGrp != null && parenGrp.stream().isEmpty()) {
+                idx++
+            }
+        }
+        return if (idx == size) segments to hadBang else null
+    }
+
     fun skipFnQualifiersToFnKeyword(
         startIdx: Int,
         endIdx: Int = trees.size,
@@ -208,15 +274,28 @@ internal open class RustTokenCursor(
 
     fun collectTopLevelIdentsOutsideAngles(): List<String> {
         val out = mutableListOf<String>()
+        anyTopLevelOutsideAngles { idx ->
+            cleanIdentAt(idx)?.let { out += it }
+            false
+        }
+        return out
+    }
+
+    inline fun anyTopLevelOutsideAngles(
+        startIdx: Int = 0,
+        endIdx: Int = trees.size,
+        predicate: (idx: Int) -> Boolean,
+    ): Boolean {
         var angleDepth = 0
-        for (idx in 0 until trees.size) {
+        val limit = minOf(endIdx, trees.size)
+        for (idx in startIdx until limit) {
             when (punctCharAt(idx)) {
                 '<' -> angleDepth++
                 '>' -> if (angleDepth > 0 && !isRArrowEndAt(idx)) angleDepth--
-                null -> if (angleDepth == 0) cleanIdentAt(idx)?.let { out += it }
+                else -> if (angleDepth == 0 && predicate(idx)) return true
             }
         }
-        return out
+        return false
     }
 
     fun skipBalancedAngles(openIdx: Int): Int? {
@@ -335,6 +414,84 @@ internal open class RustTokenCursor(
     }
 
     companion object {
+        fun identTree(name: String, span: Span = Span.callSite()): TokenTree =
+            TokenTree.Ident(Ident.new(name, span))
+
+        fun punctTree(
+            ch: Char,
+            spacing: Spacing = Spacing.Alone,
+            span: Span = Span.callSite(),
+        ): TokenTree = TokenTree.Punct(Punct(ch, spacing).also { it.setSpan(span) })
+
+        fun stringLiteralTree(value: String): TokenTree =
+            TokenTree.Literal(Literal.string(value))
+
+        fun groupStreamTree(
+            delimiter: Delimiter,
+            stream: TokenStream,
+            span: Span? = null,
+        ): TokenTree =
+            TokenTree.Group(
+                Group(delimiter, stream).also { grp ->
+                    if (span != null) grp.setSpan(span)
+                },
+            )
+
+        fun groupTree(
+            delimiter: Delimiter,
+            trees: List<TokenTree> = emptyList(),
+            span: Span? = null,
+        ): TokenTree = groupStreamTree(delimiter, TokenStream.fromTokenTrees(trees), span)
+
+        fun parseIntegerLiteral(litTree: TokenTree): Long? {
+            val rawLit = (litTree as? TokenTree.Literal)?.value?.toString() ?: return null
+            val withoutUnderscore = rawLit.replace("_", "")
+            if (withoutUnderscore.isEmpty()) return null
+            return when {
+                withoutUnderscore.startsWith("0x") || withoutUnderscore.startsWith("0X") ->
+                    stripHexOrRadixSuffix(withoutUnderscore.drop(2), allowHexDigits = true).toLongOrNull(16)
+                withoutUnderscore.startsWith("0b") || withoutUnderscore.startsWith("0B") ->
+                    stripHexOrRadixSuffix(withoutUnderscore.drop(2), allowHexDigits = false).toLongOrNull(2)
+                withoutUnderscore.startsWith("0o") || withoutUnderscore.startsWith("0O") ->
+                    stripHexOrRadixSuffix(withoutUnderscore.drop(2), allowHexDigits = false).toLongOrNull(8)
+                else -> withoutUnderscore.trimEnd { it.isLetter() }.toLongOrNull()
+            }
+        }
+
+        private fun stripHexOrRadixSuffix(body: String, allowHexDigits: Boolean): String {
+            for (suffix in INT_LITERAL_SUFFIXES) {
+                if (body.endsWith(suffix) && body.length > suffix.length) {
+                    return body.dropLast(suffix.length)
+                }
+            }
+            return if (allowHexDigits) body else body.trimEnd { it.isLetter() }
+        }
+
+        private val INT_LITERAL_SUFFIXES =
+            listOf("u128", "i128", "usize", "isize", "u64", "i64", "u32", "i32", "u16", "i16", "u8", "i8")
+
+        fun canonicalTokenKey(trees: List<TokenTree>): String =
+            trees.joinToString(" ") { tt ->
+                when (tt) {
+                    is TokenTree.Ident -> "I:${tt.value}"
+                    is TokenTree.Punct -> "P:${tt.value.asChar()}:${tt.value.spacing()}"
+                    is TokenTree.Literal -> "L:${tt.value}"
+                    is TokenTree.Group -> "G:${tt.value.delimiter()}(${canonicalTokenKey(tt.value.stream().toList())})"
+                }
+            }
+
+        fun extractCfgComplementSignature(predTrees: List<TokenTree>): Pair<String, Boolean>? {
+            if (predTrees.isEmpty()) return null
+            val cursor = RustTokenCursor(predTrees)
+            val innerGroup = cursor.groupAt(1, Delimiter.Parenthesis)
+            if (cursor.size == 2 && cursor.identAt(0) == "not" && innerGroup != null) {
+                val inner = canonicalTokenKey(innerGroup.stream().toList())
+                if (inner.isNotEmpty()) return inner to true
+            }
+            val raw = canonicalTokenKey(predTrees)
+            return if (raw.isNotEmpty()) raw to false else null
+        }
+
         fun tokenTreeStartOffset(tt: TokenTree): Int =
             when (tt) {
                 is TokenTree.Group -> tt.value.spanOpen().startOffset()
@@ -427,19 +584,273 @@ internal open class RustTokenCursor(
             return null
         }
 
-        fun containsAnyIdentRecursive(
+        fun anyIdentRecursive(
             stream: TokenStream,
-            idents: Set<String>,
+            predicate: (String) -> Boolean,
         ): Boolean {
-            if (idents.isEmpty()) return false
             for (tt in stream.clone().toList()) {
                 when (tt) {
-                    is TokenTree.Ident -> if (tt.value.toString().removePrefix("r#") in idents) return true
-                    is TokenTree.Group -> if (containsAnyIdentRecursive(tt.value.stream(), idents)) return true
+                    is TokenTree.Ident -> if (predicate(tt.value.toString().removePrefix("r#"))) return true
+                    is TokenTree.Group -> if (anyIdentRecursive(tt.value.stream(), predicate)) return true
                     else -> {}
                 }
             }
             return false
+        }
+
+        fun containsAnyIdentRecursive(
+            stream: TokenStream,
+            idents: Set<String>,
+        ): Boolean = idents.isNotEmpty() && anyIdentRecursive(stream) { it in idents }
+    }
+}
+
+/**
+ * Shared `proc_macro2` [TokenTree] -> Kotlin text emitter.
+ *
+ * Consolidates Rust attribute elision/rendering, `'a` lifetime elision, `&` / `&mut` borrow
+ * stripping, `Token![...]` resolution, `macro!(...)` invocations, `::` -> `.` path emission,
+ * `=>` -> `->` and joint multi-character operators, delimited groups, and Kotlin token-boundary
+ * spacing for comment/KDoc code blocks, `macro_rules!` body templates, and `Verbatim` AST nodes.
+ */
+internal open class RustTokenStreamKotlinEmitter(
+    trees: List<TokenTree>,
+) : RustTokenCursor(trees) {
+    protected open val stripModuleRootPrefixes: Boolean = true
+    protected open val omitTurbofishDot: Boolean = true
+    protected open val bracketMacroAsListOf: Boolean = true
+    protected open val emptyParensAfterAngleAsUnit: Boolean = true
+    protected open val stripPostfixQuestion: Boolean = true
+
+    protected open fun spawnChild(childTrees: List<TokenTree>): RustTokenStreamKotlinEmitter =
+        RustTokenStreamKotlinEmitter(childTrees)
+
+    protected open fun tryConsumeSpecialAt(idx: Int, outTokens: MutableList<String>): Int? = null
+
+    protected open fun renderAttributeInteriorStream(stream: TokenStream, isInner: Boolean): String? = null
+
+    protected open fun consumeLifetimeAt(idx: Int, outTokens: MutableList<String>): Int {
+        var next = idx + 2
+        if (punctCharAt(next) == '+' || (punctCharAt(next) == ',' && outTokens.lastOrNull() == "<")) {
+            next++
+        }
+        return next
+    }
+
+    protected open fun mapMacroName(rawMacro: String): String =
+        if (rawMacro == "macro_rules") "macroRules" else rustFunctionIdentToKotlin(rawMacro)
+
+    protected open fun mapIdent(rawIdent: String): String =
+        if (rawIdent.firstOrNull()?.isUpperCase() == true) {
+            rustTypeIdentToKotlin(rawIdent)
+        } else {
+            rustValueIdentToKotlin(rawIdent)
+        }
+
+    protected open fun mapSynTokenMacro(grp: Group): String {
+        resolveSynTokenStreamTypeName(grp.stream())?.let { return it }
+        val fallback =
+            grp
+                .stream()
+                .toList()
+                .mapNotNull { (it as? TokenTree.Ident)?.value?.toString() }
+                .joinToString("_")
+                .ifEmpty { "Token" }
+        return rustTypeIdentToKotlin(fallback)
+    }
+
+    open fun render(): String {
+        if (trees.isEmpty()) return ""
+        val outTokens = mutableListOf<String>()
+        var i = 0
+        while (i < size) {
+            val specialNext = tryConsumeSpecialAt(i, outTokens)
+            if (specialNext != null) {
+                i = specialNext
+                continue
+            }
+            val current = trees[i]
+            if (punctCharAt(i) == '#') {
+                var nextIdx = i + 1
+                var isInner = false
+                if (punctCharAt(nextIdx) == '!') {
+                    isInner = true
+                    nextIdx++
+                }
+                val grp = groupAt(nextIdx, Delimiter.Bracket)
+                if (grp != null) {
+                    val renderedAttr = renderAttributeInteriorStream(grp.stream(), isInner)
+                    if (!renderedAttr.isNullOrEmpty()) outTokens += renderedAttr
+                    i = nextIdx + 1
+                    continue
+                }
+            }
+
+            if (isLifetimeAt(i)) {
+                i = consumeLifetimeAt(i, outTokens)
+                continue
+            }
+
+            if (punctCharAt(i) == '&') {
+                val prev = outTokens.lastOrNull()
+                if (punctSpacingAt(i) == Spacing.Joint && punctCharAt(i + 1) == '&') {
+                    outTokens += "&&"
+                    i += 2
+                    continue
+                }
+                if (prev == null || prev in BORROW_DROP_PREDECESSORS) {
+                    i++
+                    if (isLifetimeAt(i)) i += 2
+                    if (identAt(i) == "mut") i++
+                    continue
+                }
+            }
+
+            val bangMacroGrp = if (current is TokenTree.Ident && punctCharAt(i + 1) == '!') groupAt(i + 2) else null
+            if (bangMacroGrp != null) {
+                val rawMacro = cleanIdentAt(i).orEmpty()
+                if (identAt(i) == "Token" && bangMacroGrp.delimiter() == Delimiter.Bracket) {
+                    outTokens += mapSynTokenMacro(bangMacroGrp)
+                    i += 3
+                    continue
+                }
+                val ktMacro = mapMacroName(rawMacro)
+                val inner = spawnChild(bangMacroGrp.stream().toList()).render()
+                outTokens +=
+                    when (bangMacroGrp.delimiter()) {
+                        Delimiter.Brace -> if (inner.isEmpty()) "$ktMacro {}" else "$ktMacro { $inner }"
+                        Delimiter.Bracket -> if (bracketMacroAsListOf) "listOf($inner)" else "$ktMacro[$inner]"
+                        else -> "$ktMacro($inner)"
+                    }
+                i += 3
+                continue
+            }
+
+            if (current is TokenTree.Ident && punctCharAt(i + 1) == '!' && punctCharAt(i + 2) != '=') {
+                outTokens += mapMacroName(cleanIdentAt(i).orEmpty())
+                i += 2
+                continue
+            }
+
+            if (isDoubleColonAt(i)) {
+                if (stripModuleRootPrefixes && outTokens.lastOrNull() in MODULE_ROOT_PREFIXES) {
+                    outTokens.removeAt(outTokens.lastIndex)
+                } else if (!omitTurbofishDot || punctCharAt(i + 2) != '<') {
+                    outTokens += "."
+                }
+                i += 2
+                continue
+            }
+
+            when (current) {
+                is TokenTree.Ident -> {
+                    val mapped = mapIdent(cleanIdentAt(i).orEmpty())
+                    if (mapped.isNotEmpty()) outTokens += mapped
+                    i++
+                }
+                is TokenTree.Literal -> {
+                    outTokens += current.value.toString()
+                    i++
+                }
+                is TokenTree.Group -> {
+                    val grp = current.value
+                    val inner = spawnChild(grp.stream().toList()).render()
+                    outTokens +=
+                        when (grp.delimiter()) {
+                            Delimiter.Parenthesis ->
+                                if (emptyParensAfterAngleAsUnit && inner.isEmpty() && outTokens.lastOrNull() == "<") {
+                                    "Unit"
+                                } else {
+                                    "($inner)"
+                                }
+                            Delimiter.Bracket -> "[$inner]"
+                            Delimiter.Brace -> if (inner.isEmpty()) "{}" else "{ $inner }"
+                            Delimiter.None -> inner
+                        }
+                    i++
+                }
+                is TokenTree.Punct -> {
+                    val (punctOut, step) = consumePunctOrOperator(i, outTokens.lastOrNull())
+                    if (punctOut.isNotEmpty()) outTokens += punctOut
+                    i += step
+                }
+            }
+        }
+        return joinKotlinEmittedTokens(outTokens)
+    }
+
+    private fun consumePunctOrOperator(idx: Int, prevRendered: String?): Pair<String, Int> {
+        val jointOp = consumeJointOperator(idx)
+        if (jointOp != null) {
+            val (op, step) = jointOp
+            return (if (op == "=>") "->" else op) to step
+        }
+        val c0 = punctCharAt(idx) ?: return "" to 1
+        if (stripPostfixQuestion &&
+            c0 == '?' &&
+            prevRendered != null &&
+            (prevRendered.endsWith(")") || prevRendered.last().isLetterOrDigit() || prevRendered.endsWith("]"))
+        ) {
+            return "" to 1
+        }
+        return c0.toString() to 1
+    }
+
+    companion object {
+        private val MODULE_ROOT_PREFIXES = setOf("crate", "self", "super")
+        private val BORROW_DROP_PREDECESSORS = setOf("(", ",", ":", "=", "<", "->")
+        private val KEYWORD_SPACE_BEFORE_PAREN = setOf("if", "while", "for", "when", "return", "val", "var", "in")
+        private val KEYWORD_SPACE_BEFORE_ANGLE = setOf("val", "var", "return", "in")
+        private val BINARY_SPACED_OPS =
+            setOf(
+                "=",
+                "->",
+                "==",
+                "!=",
+                "<=",
+                ">=",
+                "&&",
+                "||",
+                "+",
+                "-",
+                "*",
+                "/",
+                "+=",
+                "-=",
+                "*=",
+                "/=",
+                "%=",
+                "&=",
+                "|=",
+                "^=",
+            )
+
+        fun joinKotlinEmittedTokens(tokens: List<String>): String {
+            if (tokens.isEmpty()) return ""
+            val sb = StringBuilder()
+            for (idx in tokens.indices) {
+                val tok = tokens[idx]
+                if (tok.isEmpty()) continue
+                val prev = if (idx > 0) tokens[idx - 1] else null
+                val needSpace =
+                    when {
+                        prev == null -> false
+                        tok == "." || prev == "." -> false
+                        tok == "," || tok == ";" || tok == ":" -> false
+                        prev == "," || prev == ":" || prev == ";" -> true
+                        tok in BINARY_SPACED_OPS || prev in BINARY_SPACED_OPS -> true
+                        tok.startsWith("(") || tok.startsWith("[") -> prev in KEYWORD_SPACE_BEFORE_PAREN
+                        prev == "<" || tok == ">" -> false
+                        tok == "<" -> prev in KEYWORD_SPACE_BEFORE_ANGLE
+                        prev.endsWith("(") || prev.endsWith("[") -> false
+                        tok.startsWith(")") || tok.startsWith("]") -> false
+                        prev == "!" || prev == "@" -> false
+                        else -> true
+                    }
+                if (needSpace && sb.isNotEmpty() && sb.last() != ' ') sb.append(' ')
+                sb.append(tok)
+            }
+            return sb.toString()
         }
     }
 }

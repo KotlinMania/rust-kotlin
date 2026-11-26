@@ -3,8 +3,6 @@ package io.github.kotlinmania.rustkotlin
 import io.github.kotlinmania.procmacro2.Span
 import io.github.kotlinmania.syn.Attribute
 import io.github.kotlinmania.syn.File
-import io.github.kotlinmania.syn.GenericParam
-import io.github.kotlinmania.syn.Generics
 import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.ModContent
 import io.github.kotlinmania.syn.PathArguments
@@ -335,7 +333,7 @@ private fun mergeDuplicateSplitInlineMods(
                     }
                 }
                 is Item.Impl -> {
-                    val owner = extractChunkOwnerTypeName(item.selfType, item.generics)
+                    val owner = extractSimpleSelfOwnerTypeName(item.selfType, item.generics)
                     if (owner == null || owner !in skippedTypeNamesInCurrentMod) {
                         mergedItems += item
                     }
@@ -509,29 +507,12 @@ private fun isNonEmittingModuleRootMacro(item: Item.Macro): Boolean {
     if (item.mac.path.isIdent("macro_rules")) {
         return item.attrs.none { it.path().isIdent("macro_export") }
     }
-    val segs = item.mac.path.segments
-    val pathText = segs.toList().joinToString("::") { it.ident.toString() }
-    return pathText == "include"
+    return item.mac.path.identStrings() == listOf("include")
 }
 
-private fun extractChunkOwnerTypeName(selfTy: SynType, generics: Generics): String? {
-    val typeParams =
-        generics.params
-            .toList()
-            .mapNotNull { (it as? GenericParam.TypeParam)?.ident?.toString()?.let(::rustTypeIdentToKotlin) }
-            .toSet()
-    return when (val u = unwrapSynType(selfTy)) {
-        is SynType.Reference -> extractChunkOwnerTypeName(u.elem, generics)
-        is SynType.Path -> {
-            if (u.qself != null) return null
-            val segs = u.path.segments.toList()
-            if (segs.size != 1) return null
-            val name = rustTypeIdentToKotlin(segs[0].ident.toString())
-            if (name in typeParams) null else name
-        }
-        else -> null
-    }
-}
+private fun Item?.isPublicConstOrStatic(): Boolean =
+    (this as? Item.Const)?.vis is Visibility.Public ||
+        (this as? Item.Static)?.vis is Visibility.Public
 
 internal fun translateModuleRootIntoFocusedChunks(
     source: String,
@@ -541,8 +522,7 @@ internal fun translateModuleRootIntoFocusedChunks(
     TranslationSessionGuard.withHeaderContext(headerContext, preserveSharedModuleFile = true) { sessionAllowStdlibDestructors ->
         val recognized = recognizeRust(source)
         if (isDocOnlyCfgAttribute(recognized.file.attrs)) return@withHeaderContext emptyList()
-        val allowStdlibDestructors = sessionAllowStdlibDestructors
-        validateSupportedRustSemantics(recognized.file, allowStdlibDestructors = allowStdlibDestructors)
+        validateSupportedRustSemantics(recognized.file, allowStdlibDestructors = sessionAllowStdlibDestructors)
         val trivia = SourceTrivia.collect(recognized.source, recognized.tokens)
         val macroExpansion = expandFileMacroRules(recognized.file, headerContext.crateMacroSources)
         val expandedFile = flattenPrivateDefinitionInlineMods(macroExpansion.file)
@@ -567,7 +547,7 @@ internal fun translateModuleRootIntoFocusedChunks(
         val standaloneImpls = mutableListOf<Item.Impl>()
         for (item in substantiveItems) {
             if (item is Item.Impl) {
-                val owner = extractChunkOwnerTypeName(item.selfType, item.generics)
+                val owner = extractSimpleSelfOwnerTypeName(item.selfType, item.generics)
                 if (owner != null && owner in fullInspector.attachableTypeNames) {
                     implsByOwner.getOrPut(owner) { mutableListOf() }.add(item)
                 } else {
@@ -582,12 +562,19 @@ internal fun translateModuleRootIntoFocusedChunks(
         val fnBucket = mutableListOf<Item>()
         val consumedImplOwners = hashSetOf<String>()
 
+        fun appendOwnerGroup(ownerItem: Item, rawIdent: String) {
+            val ktName = rustTypeIdentToKotlin(rawIdent)
+            val group = mutableListOf<Item>(ownerItem)
+            if (consumedImplOwners.add(ktName)) {
+                implsByOwner[ktName]?.let { group.addAll(it) }
+            }
+            structOwnerGroups += group
+        }
+
         for (item in substantiveItems) {
             when (item) {
                 is Item.Impl -> {}
-                is Item.ItemType, is Item.Trait, is Item.TraitAlias, is Item.Mod -> {
-                    typeBucket += item
-                }
+                is Item.ItemType, is Item.Trait, is Item.TraitAlias, is Item.Mod -> typeBucket += item
                 is Item.Enum -> {
                     val ktName = rustTypeIdentToKotlin(item.ident.toString())
                     typeBucket += item
@@ -595,28 +582,10 @@ internal fun translateModuleRootIntoFocusedChunks(
                         implsByOwner[ktName]?.let { typeBucket.addAll(it) }
                     }
                 }
-                is Item.Struct -> {
-                    val ktName = rustTypeIdentToKotlin(item.ident.toString())
-                    val group = mutableListOf<Item>(item)
-                    if (consumedImplOwners.add(ktName)) {
-                        implsByOwner[ktName]?.let { group.addAll(it) }
-                    }
-                    structOwnerGroups += group
-                }
-                is Item.Union -> {
-                    val ktName = rustTypeIdentToKotlin(item.ident.toString())
-                    val group = mutableListOf<Item>(item)
-                    if (consumedImplOwners.add(ktName)) {
-                        implsByOwner[ktName]?.let { group.addAll(it) }
-                    }
-                    structOwnerGroups += group
-                }
-                is Item.Const, is Item.Static -> {
-                    constBucket += item
-                }
-                else -> {
-                    fnBucket += item
-                }
+                is Item.Struct -> appendOwnerGroup(item, item.ident.toString())
+                is Item.Union -> appendOwnerGroup(item, item.ident.toString())
+                is Item.Const, is Item.Static -> constBucket += item
+                else -> fnBucket += item
             }
         }
         fnBucket.addAll(standaloneImpls)
@@ -629,23 +598,17 @@ internal fun translateModuleRootIntoFocusedChunks(
         if (constBucket.isNotEmpty()) {
             val dedupedConstsByKtName = linkedMapOf<String, Item>()
             for (cItem in constBucket) {
-                val (rawId, isPub) =
+                val rawId =
                     when (cItem) {
-                        is Item.Const -> cItem.ident.toString() to (cItem.vis is io.github.kotlinmania.syn.Visibility.Public)
-                        is Item.Static -> cItem.ident.toString() to (cItem.vis is io.github.kotlinmania.syn.Visibility.Public)
-                        else -> null to false
+                        is Item.Const -> cItem.ident.toString()
+                        is Item.Static -> cItem.ident.toString()
+                        else -> null
                     }
                 if (rawId != null) {
                     val cleanRaw = rawId.removePrefix("r#")
                     val ktId = fullInspector.declaredConstNames[cleanRaw] ?: KotlinNamingPolicy.Default.toConstIdentifier(rawId)
                     val existing = dedupedConstsByKtName[ktId]
-                    val existingPub =
-                        when (existing) {
-                            is Item.Const -> existing.vis is io.github.kotlinmania.syn.Visibility.Public
-                            is Item.Static -> existing.vis is io.github.kotlinmania.syn.Visibility.Public
-                            else -> false
-                        }
-                    if (existing == null || (isPub && !existingPub)) {
+                    if (existing == null || (cItem.isPublicConstOrStatic() && !existing.isPublicConstOrStatic())) {
                         dedupedConstsByKtName[ktId] = cItem
                     }
                 }
@@ -686,23 +649,31 @@ internal fun translateModuleRootIntoFocusedChunks(
             } else {
                 chunkHeader
             }
+
+        fun buildChunkEmitter(
+            chunkFileName: String,
+            chunkItems: List<Item>,
+            includeSharedState: Boolean,
+        ): KotlinJ2KEmitter {
+            val chunkAst = File(shebang = null, attrs = emptyList(), items = chunkItems)
+            return KotlinJ2KEmitter(
+                source = recognized.source,
+                originalFile = chunkAst,
+                file = chunkAst,
+                trivia = trivia,
+                macroDefs = macroExpansion.definitions,
+                macroWrapperSpansByTargetOffset = macroExpansion.macroWrapperSpansByTargetOffset,
+                headerContext = headerForChunk(chunkFileName),
+                sharedFfiCollector = if (includeSharedState) sharedFfiCollector else null,
+                sharedDeclaredTypeNames = if (includeSharedState) sharedDeclaredTypeNames else null,
+                sharedSamNamesByShape = if (includeSharedState) sharedSamNamesByShape else null,
+                sharedSamDefaultsByName = if (includeSharedState) sharedSamDefaultsByName else null,
+            )
+        }
+
         val emittedChunks = mutableListOf<ModuleRootChunkTranslation>()
         for ((chunkFileName, chunkItems) in plannedChunks) {
-            val chunkAst = File(shebang = null, attrs = emptyList(), items = chunkItems)
-            val emitter =
-                KotlinJ2KEmitter(
-                    source = recognized.source,
-                    originalFile = chunkAst,
-                    file = chunkAst,
-                    trivia = trivia,
-                    macroDefs = macroExpansion.definitions,
-                    macroWrapperSpansByTargetOffset = macroExpansion.macroWrapperSpansByTargetOffset,
-                    headerContext = headerForChunk(chunkFileName),
-                    sharedFfiCollector = sharedFfiCollector,
-                    sharedDeclaredTypeNames = sharedDeclaredTypeNames,
-                    sharedSamNamesByShape = sharedSamNamesByShape,
-                    sharedSamDefaultsByName = sharedSamDefaultsByName,
-                )
+            val emitter = buildChunkEmitter(chunkFileName, chunkItems, includeSharedState = true)
             latestEmitter = emitter
             val text = emitter.emitFile()
             if (hasEmittedKotlinDeclarations(text)) {
@@ -722,17 +693,7 @@ internal fun translateModuleRootIntoFocusedChunks(
                 emittedChunks[lastIdx] = emittedChunks[lastIdx].copy(companionFiles = companions)
             } else if (plannedChunks.isNotEmpty()) {
                 val (firstChunkName, firstChunkItems) = plannedChunks.first()
-                val chunkAst = File(shebang = null, attrs = emptyList(), items = firstChunkItems)
-                val emitter =
-                    KotlinJ2KEmitter(
-                        source = recognized.source,
-                        originalFile = chunkAst,
-                        file = chunkAst,
-                        trivia = trivia,
-                        macroDefs = macroExpansion.definitions,
-                        macroWrapperSpansByTargetOffset = macroExpansion.macroWrapperSpansByTargetOffset,
-                        headerContext = headerForChunk(firstChunkName),
-                    )
+                val emitter = buildChunkEmitter(firstChunkName, firstChunkItems, includeSharedState = false)
                 emittedChunks +=
                     ModuleRootChunkTranslation(
                         fileName = firstChunkName,

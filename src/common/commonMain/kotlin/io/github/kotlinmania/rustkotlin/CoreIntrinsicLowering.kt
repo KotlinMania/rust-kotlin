@@ -1,6 +1,7 @@
 package io.github.kotlinmania.rustkotlin
 
 import io.github.kotlinmania.procmacro2.Delimiter
+import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
@@ -49,20 +50,10 @@ internal data class CoreIntrinsicCallSpec(
     }
 }
 
-internal class IntrinsicCallContext(
-    val spec: CoreIntrinsicCallSpec,
-    val renderedArgs: List<String>,
-    val indent: String,
-    val selfTypeName: String?,
+internal open class CoreIntrinsicPackageScope(
     val coreNs: String,
-    val isCoreSimdCall: Boolean,
     val emitter: KotlinJ2KEmitter,
 ) {
-    val rawName: String get() = spec.rawName
-    val canonicalName: String get() = spec.canonicalName
-    val explicitTypes: List<SynType> get() = spec.explicitTypes
-    val explicitConsts: List<Expr> get() = spec.explicitConsts
-    val callArgsList: List<Expr> get() = spec.callArgsList
     val intrPkg: String = "$coreNs.intrinsics"
     val memPkg: String = "$coreNs.mem"
     val ptrPkg: String = "$coreNs.ptr"
@@ -92,6 +83,25 @@ internal class IntrinsicCallContext(
 
     fun callMem(fnName: String, vararg args: String): String =
         "${importMem(fnName)}(${args.joinToString(", ")})"
+
+    fun callMemArgs(fnName: String, args: List<String>): String =
+        "${importMem(fnName)}(${args.joinToString(", ")})"
+}
+
+internal class IntrinsicCallContext(
+    val spec: CoreIntrinsicCallSpec,
+    val renderedArgs: List<String>,
+    val indent: String,
+    val selfTypeName: String?,
+    coreNs: String,
+    val isCoreSimdCall: Boolean,
+    emitter: KotlinJ2KEmitter,
+) : CoreIntrinsicPackageScope(coreNs, emitter) {
+    val rawName: String get() = spec.rawName
+    val canonicalName: String get() = spec.canonicalName
+    val explicitTypes: List<SynType> get() = spec.explicitTypes
+    val explicitConsts: List<Expr> get() = spec.explicitConsts
+    val callArgsList: List<Expr> get() = spec.callArgsList
 
     fun pointeeAt(argIdx: Int = 0): SynType? =
         explicitTypes.firstOrNull()
@@ -493,30 +503,8 @@ private object NumericAndFloatIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
 
     override fun renderCall(ctx: IntrinsicCallContext): String? =
         when (ctx.canonicalName) {
-            in INT_INTRINSIC_RULES_BY_NAME ->
-                renderIntOrBitIntrinsicCall(
-                    canonicalName = ctx.canonicalName,
-                    renderedArgs = ctx.renderedArgs,
-                    callArgsList = ctx.callArgsList,
-                    explicitTypes = ctx.explicitTypes,
-                    selfTypeName = ctx.selfTypeName,
-                    coreNs = ctx.coreNs,
-                    intrPkg = ctx.intrPkg,
-                    memPkg = ctx.memPkg,
-                    emitter = ctx.emitter,
-                )
-            in FLOAT_INTRINSIC_RULES_BY_NAME ->
-                renderFloatIntrinsicCall(
-                    canonicalName = ctx.canonicalName,
-                    renderedArgs = ctx.renderedArgs,
-                    callArgsList = ctx.callArgsList,
-                    explicitTypes = ctx.explicitTypes,
-                    selfTypeName = ctx.selfTypeName,
-                    coreNs = ctx.coreNs,
-                    intrPkg = ctx.intrPkg,
-                    memPkg = ctx.memPkg,
-                    emitter = ctx.emitter,
-                )
+            in INT_INTRINSIC_RULES_BY_NAME -> renderIntOrBitIntrinsicCall(ctx)
+            in FLOAT_INTRINSIC_RULES_BY_NAME -> renderFloatIntrinsicCall(ctx)
             else -> null
         }
 }
@@ -1186,24 +1174,10 @@ public object CoreIntrinsicLowering {
         renderedType: String,
         emitter: KotlinJ2KEmitter,
     ): String {
-        val coreNs = resolveCoreNamespace(emitter.headerContext)
-        val memPkg = "$coreNs.mem"
+        val memPkg = "${resolveCoreNamespace(emitter.headerContext)}.mem"
         val clean = renderedType.trim()
-        val expectedLayoutType = "$memPkg.TypeLayout<$clean>"
-        val matchedLocal = emitter.currentTypedLocals.filterValues { it == expectedLayoutType }.keys
-        matchedLocal.singleOrNull()?.let { return it }
-        val candidateParam = StructLayoutComputer.typeLayoutParamName(clean)
-        if (candidateParam in emitter.currentTypedLocals) return candidateParam
-        val structSimple = clean.substringBefore('<').substringAfterLast('.')
-        val structDecl = emitter.sameFileUniqueSimpleStruct(structSimple)
-        if (structDecl != null) {
-            val computed = StructLayoutComputer.computeStructLayout(structDecl, emitter)
-            if (computed != null && computed.requiredTypeLayoutParams.isEmpty()) {
-                return "$structSimple.typeLayout()"
-            }
-        }
-        registerCoreImport(emitter, "$memPkg.UnresolvedTypeLayout")
-        return "UnresolvedTypeLayout<$clean>()"
+        emitter.lookupInScopeTypeLayoutLocal(clean, memPkg)?.let { return it }
+        return emitter.resolveStructOrUnresolvedTypeLayoutExpr(clean, memPkg)
     }
 
     internal fun renderConstEvalSelectMacro(
@@ -1221,8 +1195,8 @@ public object CoreIntrinsicLowering {
             if (cursor.identAt(idx) == "else") {
                 val elseGroup = ((idx + 1) until cursor.size).firstNotNullOfOrNull { cursor.groupAt(it, Delimiter.Brace) }
                 if (elseGroup != null) {
-                    val blockSrc = "{ ${elseGroup.stream()} }"
-                    val parsedExpr = lexTokenStreamOrNull(blockSrc)?.let { parse2(ExprParse::parse, it).getOrNull() }
+                    val blockStream = TokenStream.fromTokenTrees(listOf(TokenTree.Group(elseGroup)))
+                    val parsedExpr = parse2(ExprParse::parse, blockStream).getOrNull()
                     if (parsedExpr != null) return emitter.renderExpr(parsedExpr, indent, selfTypeName)
                 }
             }
@@ -1231,10 +1205,13 @@ public object CoreIntrinsicLowering {
         val topArgs = cursor.splitByTopLevelPunct(',')
         if (topArgs.size >= 3) {
             val tupleTree = topArgs[0].singleOrNull() as? TokenTree.Group
-            val runtimeFnSrc = topArgs[2].joinToString("") { it.toString() }.trim()
-            val tupleStream = tupleTree?.value?.stream()?.toString()
-            val argTupleSrc = tupleStream?.trim().orEmpty()
-            val parsedCall = lexTokenStreamOrNull("$runtimeFnSrc($argTupleSrc)")?.let { parse2(ExprParse::parse, it).getOrNull() }
+            val callArgsGroup =
+                RustTokenCursor.groupStreamTree(
+                    Delimiter.Parenthesis,
+                    tupleTree?.value?.stream() ?: TokenStream.new(),
+                )
+            val callStream = TokenStream.fromTokenTrees(topArgs[2] + callArgsGroup)
+            val parsedCall = parse2(ExprParse::parse, callStream).getOrNull()
             if (parsedCall != null) return emitter.renderExpr(parsedCall, indent, selfTypeName)
         }
         return null
@@ -1245,9 +1222,14 @@ public object CoreIntrinsicLowering {
         emitter: KotlinJ2KEmitter,
         indent: String,
     ): String? {
-        val rawSrc = item.tokens.toString().trim()
-        if (!rawSrc.contains("rustc_intrinsic") || !rawSrc.endsWith(";")) return null
-        val parsedFn = (lexTokenStreamOrNull(rawSrc.dropLast(1) + " {}")?.let { parse2(ItemParse::parse, it).getOrNull() } as? Item.Fn) ?: return null
+        val cursor = RustTokenCursor(item.tokens.clone().toList())
+        if (cursor.size < 4 || cursor.punctCharAt(cursor.size - 1) != ';' || !cursor.hasOuterAttributeIdent("rustc_intrinsic")) {
+            return null
+        }
+        val fnTokens = ArrayList<TokenTree>(cursor.size)
+        fnTokens.addAll(cursor.trees.subList(0, cursor.size - 1))
+        fnTokens += RustTokenCursor.groupTree(Delimiter.Brace)
+        val parsedFn = (parse2(ItemParse::parse, TokenStream.fromTokenTrees(fnTokens)).getOrNull() as? Item.Fn) ?: return null
         val rawFnName = parsedFn.sig.cleanFnName()
         val synthesizedBody = renderSynthesizedIntrinsicFnBody(parsedFn, rawFnName, emitter) ?: return null
         val prevIntrinsicDecl = activeRustcIntrinsicDeclarationName
@@ -1515,6 +1497,47 @@ public object CoreIntrinsicLowering {
         return SimdIntrinsicFamilyRule.inferReturnRenderedType(spec, selfTypeName, emitter)
     }
 
+    internal val RUST_GLOBAL_ALLOC_FN_NAMES: Set<String> =
+        wordSet("__rust_alloc __rust_alloc_zeroed __rust_dealloc __rust_realloc")
+
+    internal fun renderRustGlobalAllocExpr(
+        rawFnName: String,
+        emitter: KotlinJ2KEmitter,
+        rawAbiMode: Boolean,
+        ptrRawAddressAt: (Int) -> String,
+        sizeToLongAt: (Int) -> String,
+        alignToLongAt: (Int) -> String,
+    ): String? {
+        if (rawFnName !in RUST_GLOBAL_ALLOC_FN_NAMES) return null
+        val coreNs = resolveCoreNamespace(emitter.headerContext)
+        val intrPkg = "$coreNs.intrinsics"
+
+        fun wrapRet(callExpr: String): String {
+            if (rawAbiMode) return callExpr
+            registerCoreImport(emitter, "$coreNs.ptr.MutPtr")
+            return "MutPtr($callExpr)"
+        }
+        return when (rawFnName) {
+            "__rust_alloc" -> {
+                registerCoreImport(emitter, "$intrPkg.kmAlloc")
+                wrapRet("kmAlloc(${sizeToLongAt(0)}, ${alignToLongAt(1)})")
+            }
+            "__rust_alloc_zeroed" -> {
+                registerCoreImport(emitter, "$intrPkg.kmAllocZeroed")
+                wrapRet("kmAllocZeroed(${sizeToLongAt(0)}, ${alignToLongAt(1)})")
+            }
+            "__rust_dealloc" -> {
+                registerCoreImport(emitter, "$intrPkg.kmDealloc")
+                "kmDealloc(${ptrRawAddressAt(0)}, ${sizeToLongAt(1)}, ${alignToLongAt(2)})"
+            }
+            "__rust_realloc" -> {
+                registerCoreImport(emitter, "$intrPkg.kmRealloc")
+                wrapRet("kmRealloc(${ptrRawAddressAt(0)}, ${sizeToLongAt(1)}, ${alignToLongAt(2)}, ${sizeToLongAt(3)})")
+            }
+            else -> null
+        }
+    }
+
     private fun renderGlobalAllocOrHintCall(
         spec: CoreIntrinsicCallSpec,
         emitter: KotlinJ2KEmitter,
@@ -1522,43 +1545,26 @@ public object CoreIntrinsicLowering {
         selfTypeName: String?,
     ): String? {
         val rawName = spec.rawName
-        if (rawName in setOf("__rust_alloc", "__rust_dealloc", "__rust_realloc", "__rust_alloc_zeroed")) {
-            val coreNs = resolveCoreNamespace(emitter.headerContext)
-            val intrPkg = "$coreNs.intrinsics"
+        if (rawName in RUST_GLOBAL_ALLOC_FN_NAMES) {
             val args = spec.callArgsList.map { emitter.renderExpr(it, indent, selfTypeName) }
-            registerCoreImport(emitter, "$coreNs.ptr.MutPtr")
-
-            fun alignArgExpr(argIdx: Int): String {
-                val alignSyn = spec.callArgsList.getOrNull(argIdx)
-                val alignTy = alignSyn?.let { emitter.inferExprRenderedType(it, selfTypeName) }?.removeSuffix("?")?.trim()
-                val methodCall = alignSyn?.let { emitter.unwrapParenOrGroupExpr(it) } as? Expr.MethodCall
-                val isAlignmentMethodCall = methodCall?.method?.toString()?.removePrefix("r#") == "alignment"
-                val rawArg = args[argIdx]
-                return if (alignTy == "Alignment" || alignTy?.endsWith(".Alignment") == true || (alignTy == null && isAlignmentMethodCall)) {
-                    "($rawArg).asUsize().toLong()"
-                } else {
-                    "($rawArg).toLong()"
-                }
-            }
-            return when (rawName) {
-                "__rust_alloc" -> {
-                    registerCoreImport(emitter, "$intrPkg.kmAlloc")
-                    "MutPtr(kmAlloc((${args[0]}).toLong(), ${alignArgExpr(1)}))"
-                }
-                "__rust_alloc_zeroed" -> {
-                    registerCoreImport(emitter, "$intrPkg.kmAllocZeroed")
-                    "MutPtr(kmAllocZeroed((${args[0]}).toLong(), ${alignArgExpr(1)}))"
-                }
-                "__rust_realloc" -> {
-                    registerCoreImport(emitter, "$intrPkg.kmRealloc")
-                    "MutPtr(kmRealloc((${args[0]}).rawAddress, (${args[1]}).toLong(), ${alignArgExpr(2)}, (${args[3]}).toLong()))"
-                }
-                "__rust_dealloc" -> {
-                    registerCoreImport(emitter, "$intrPkg.kmDealloc")
-                    "kmDealloc((${args[0]}).rawAddress, (${args[1]}).toLong(), ${alignArgExpr(2)})"
-                }
-                else -> null
-            }
+            return renderRustGlobalAllocExpr(
+                rawFnName = rawName,
+                emitter = emitter,
+                rawAbiMode = false,
+                ptrRawAddressAt = { idx -> "(${args[idx]}).rawAddress" },
+                sizeToLongAt = { idx -> "(${args[idx]}).toLong()" },
+                alignToLongAt = { idx ->
+                    val alignSyn = spec.callArgsList.getOrNull(idx)
+                    val alignTy = alignSyn?.let { emitter.inferExprRenderedType(it, selfTypeName) }?.removeSuffix("?")?.trim()
+                    val methodCall = alignSyn?.let { emitter.unwrapParenOrGroupExpr(it) } as? Expr.MethodCall
+                    val isAlignmentMethodCall = methodCall?.method?.toString()?.removePrefix("r#") == "alignment"
+                    if (alignTy == "Alignment" || alignTy?.endsWith(".Alignment") == true || (alignTy == null && isAlignmentMethodCall)) {
+                        "(${args[idx]}).asUsize().toLong()"
+                    } else {
+                        "(${args[idx]}).toLong()"
+                    }
+                },
+            )
         }
         if (spec.penultName == "hint" && rawName == "spin_loop" && spec.callArgsList.isEmpty()) {
             registerCoreImport(emitter, "${resolveCoreNamespace(emitter.headerContext)}.intrinsics.kmSpinLoopHint")

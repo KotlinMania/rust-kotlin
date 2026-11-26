@@ -3,7 +3,6 @@ package io.github.kotlinmania.rustkotlin
 import io.github.kotlinmania.io.files.SystemFileSystem
 import io.github.kotlinmania.io.files.readBytes
 import io.github.kotlinmania.procmacro2.Delimiter
-import io.github.kotlinmania.procmacro2.Group
 import io.github.kotlinmania.procmacro2.Punct
 import io.github.kotlinmania.procmacro2.Spacing
 import io.github.kotlinmania.procmacro2.TokenStream
@@ -520,19 +519,29 @@ private object IncludeFileMacroRule : BuiltinMacroCallRule("include_bytes", "inc
 }
 
 private object MatchesMacroRule : BuiltinMacroCallRule("matches") {
+    private val matchArmTail: List<TokenTree> =
+        listOf(
+            RustTokenCursor.punctTree('=', Spacing.Joint),
+            RustTokenCursor.punctTree('>'),
+            RustTokenCursor.identTree("true"),
+            RustTokenCursor.punctTree(','),
+            RustTokenCursor.identTree("_"),
+            RustTokenCursor.punctTree('=', Spacing.Joint),
+            RustTokenCursor.punctTree('>'),
+            RustTokenCursor.identTree("false"),
+        )
+
     override fun render(ctx: MacroInvocationContext): String {
         val parts = ctx.splitArgs().filter { it.isNotEmpty() }
         if (parts.size < 2) return "false"
-        val matchHead = TokenStream.fromString("match").getOrThrow().toList()
-        val matchTail = TokenStream.fromString("=> true, _ => false").getOrThrow().toList()
         val scrutineeTokens =
             if (parts[0].any { it is TokenTree.Group && it.value.delimiter() == Delimiter.Brace }) {
-                listOf(TokenTree.Group(Group(Delimiter.Parenthesis, TokenStream.fromTokenTrees(parts[0]))))
+                listOf(RustTokenCursor.groupTree(Delimiter.Parenthesis, parts[0]))
             } else {
                 parts[0]
             }
-        val armTokens = parts[1] + matchTail
-        val fullTokens = matchHead + scrutineeTokens + TokenTree.Group(Group(Delimiter.Brace, TokenStream.fromTokenTrees(armTokens)))
+        val armTokens = parts[1] + matchArmTail
+        val fullTokens = listOf(RustTokenCursor.identTree("match")) + scrutineeTokens + RustTokenCursor.groupTree(Delimiter.Brace, armTokens)
         return ctx.renderTreesAsExpr(fullTokens)
     }
 }
@@ -2113,7 +2122,7 @@ private class ExprPathResolutionEmitter(
         val globPrims = linkedSetOf<String>()
         val leaves = mutableListOf<UseLeaf>()
         for (u in inspector.allUseItems) {
-            emitter.collectUseLeaves(u.tree, emptyList(), leaves)
+            collectUseLeaves(u.tree, emptyList(), leaves)
         }
         for (leaf in leaves) {
             val segs = leaf.segments.map { it.removePrefix("r#") }

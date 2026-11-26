@@ -538,15 +538,43 @@ internal fun KotlinJ2KEmitter.resolveRawPointerPointeeLayout(ptrExpr: Expr, self
     return resolveRenderedTypeLayoutExpr(pointeeKt)
 }
 
+internal fun KotlinJ2KEmitter.lookupInScopeTypeLayoutLocal(
+    pointeeKt: String,
+    memPkg: String,
+    allowUnqualified: Boolean = false,
+): String? {
+    val expectedLayoutTypes =
+        if (allowUnqualified) {
+            setOf("TypeLayout<$pointeeKt>", "$memPkg.TypeLayout<$pointeeKt>")
+        } else {
+            setOf("$memPkg.TypeLayout<$pointeeKt>")
+        }
+    currentTypedLocals.entries.singleOrNull { it.value in expectedLayoutTypes }?.let { return it.key }
+    val candidateParam = StructLayoutComputer.typeLayoutParamName(pointeeKt)
+    return candidateParam.takeIf { it in currentTypedLocals }
+}
+
+internal fun KotlinJ2KEmitter.resolveStructOrUnresolvedTypeLayoutExpr(
+    pointeeKt: String,
+    memPkg: String,
+): String {
+    val structSimple = pointeeKt.substringBefore('<').substringAfterLast('.')
+    val structDecl = sameFileUniqueSimpleStruct(structSimple)
+    if (structDecl != null) {
+        val computed = StructLayoutComputer.computeStructLayout(structDecl, this)
+        if (computed != null && computed.requiredTypeLayoutParams.isEmpty()) {
+            return "$structSimple.typeLayout()"
+        }
+    }
+    CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.UnresolvedTypeLayout")
+    return "UnresolvedTypeLayout<$pointeeKt>()"
+}
+
 internal fun KotlinJ2KEmitter.resolveRenderedTypeLayoutExpr(targetKtRaw: String): String {
     val pointeeKt = targetKtRaw.trim().ifEmpty { "UByte" }
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
     val memPkg = "$coreNs.mem"
-    val expectedLayoutTypes = setOf("TypeLayout<$pointeeKt>", "$memPkg.TypeLayout<$pointeeKt>")
-    val matchingLocals = currentTypedLocals.filterValues { it in expectedLayoutTypes }.keys
-    matchingLocals.singleOrNull()?.let { return it }
-    val candidateParam = StructLayoutComputer.typeLayoutParamName(pointeeKt)
-    if (candidateParam in currentTypedLocals) return candidateParam
+    lookupInScopeTypeLayoutLocal(pointeeKt, memPkg, allowUnqualified = true)?.let { return it }
     PRIMITIVE_LAYOUT_NAME_BY_KT_TYPE[pointeeKt]?.let { layoutConst ->
         CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.PrimitiveLayouts")
         return "PrimitiveLayouts.$layoutConst"
@@ -556,19 +584,7 @@ internal fun KotlinJ2KEmitter.resolveRenderedTypeLayoutExpr(targetKtRaw: String)
         val factory = if (isMutRawPointerRenderedType(pointeeKt)) "mutPtrLayout" else "constPtrLayout"
         return "PrimitiveLayouts.$factory<$innerPointee>(${activeCfgProfile.pointerWidth}L)"
     }
-    val structSimple = pointeeKt.substringBefore('<').substringAfterLast('.')
-    val structDecl =
-        sameFileLayoutItems()
-            .filterIsInstance<Item.Struct>()
-            .singleOrNull { rustTypeIdentToKotlin(it.ident.toString()) == structSimple }
-    if (structDecl != null) {
-        val computed = StructLayoutComputer.computeStructLayout(structDecl, this)
-        if (computed != null && computed.requiredTypeLayoutParams.isEmpty()) {
-            return "$structSimple.typeLayout()"
-        }
-    }
-    CoreIntrinsicLowering.registerCoreImport(this, "$memPkg.UnresolvedTypeLayout")
-    return "UnresolvedTypeLayout<$pointeeKt>()"
+    return resolveStructOrUnresolvedTypeLayoutExpr(pointeeKt, memPkg)
 }
 
 internal fun renderPrimitiveByteSwapExpr(renderedOperand: String, kind: NumericKind): String {

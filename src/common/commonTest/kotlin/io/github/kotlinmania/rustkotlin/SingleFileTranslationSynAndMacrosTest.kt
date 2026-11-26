@@ -1354,4 +1354,103 @@ class SingleFileTranslationSynAndMacrosTest {
         assertFalse(kt.contains("'ptr'"))
         assertFalse(kt.contains("t_19971811"))
     }
+
+    @Test
+    fun verbatimAstNormalizationShebangTokenizationAndTokenIndexInvariants() {
+        val externalMacroRs =
+            """
+            #!/usr/bin/env rustc
+            macro_rules! crab_code {
+                () => { '🦀' as u32 };
+            }
+            """.trimIndent()
+        val rustSource =
+            """
+            #!/usr/bin/env rustc
+            // Shebang trivia stays aligned.
+            pub struct Holder {
+                pub inner: i32,
+            }
+
+            pub trait Worker {
+                default fn compute(&self) -> i32 {
+                    1
+                }
+            }
+
+            pub trait AssocBound {
+                type Output: Clone;
+                fn get_out(&self) -> Self::Output;
+            }
+
+            impl AssocBound for Holder {
+                type Output: Clone = i32;
+                fn get_out(&self) -> Self::Output {
+                    self.inner
+                }
+            }
+
+            #[repr(u8)]
+            pub enum TagByte {
+                Alpha = 1,
+                Beta = 2,
+            }
+
+            impl TagByte {
+                pub fn to_int(&self) -> i32 {
+                    99
+                }
+            }
+
+            pub fn run_verbatim(
+                w: &dyn* Worker,
+                pinned: &pin mut i32,
+                h: Holder,
+                n: i32,
+            ) -> u32 {
+                let Holder { box inner } = h;
+                let off = builtin # offset_of(Holder, inner);
+                let ascribed = builtin # type_ascribe(inner + *pinned + w.compute(), i32);
+                if n > 0 {
+                    become run_verbatim(w, pinned, Holder { inner: ascribed + (off as i32) }, n - 1)
+                }
+                crab_code!()
+            }
+            """.trimIndent()
+
+        val kt =
+            renderSingleKotlinFile(
+                rustSource,
+                FileHeaderContext(crateMacroSources = listOf(externalMacroRs)),
+            ).text
+        assertContains(kt, "// Shebang trivia stays aligned.")
+        assertContains(kt, "public fun compute(): Int")
+        assertContains(kt, "override fun getOut(): Int")
+        assertContains(kt, "val off = 0")
+        assertContains(kt, "val ascribed = inner + (pinned).read() + w.compute()")
+        assertContains(kt, "return runVerbatim(")
+        assertContains(kt, "0x1f980")
+        val ktWalker = KotlinTokenWalker(kt)
+        val toIntDeclCount =
+            ktWalker.tokens.indices.count { idx ->
+                ktWalker.identTextAt(idx) == "fun" && ktWalker.identTextAt(ktWalker.nextNonTriviaIndex(idx + 1)) == "toInt"
+            }
+        assertEquals(1, toIntDeclCount)
+
+        assertFalse(looksLikeCppCode("/* std::vector<int> fake; */\nconst char* s = \"namespace demo\";"))
+        assertTrue(looksLikeCppCode("#include <vector>\nint x = 0;"))
+        assertTrue(looksLikeCppCode("void* p = reinterpret_cast<void*>(0);"))
+        assertEquals(
+            setOf("stdio.h", "local.h"),
+            extractIncludedHeadersFromPreambles(
+                listOf("/* #include <ignored.h> */\n#include <stdio.h>\n# include \"local.h\""),
+            ),
+        )
+
+        val idx = KotlinCodeTokenIndex("val (a, b, c, d, e, f) = foo.bar()\nval bits = mask.inv() /* skip.fake() */")
+        assertEquals(6, idx.maxTupleDestructuringArity)
+        assertTrue(idx.hasMemberCall("bar"))
+        assertFalse(idx.hasMemberCall("fake"))
+        assertTrue(idx.hasZeroArgDotInvCall)
+    }
 }

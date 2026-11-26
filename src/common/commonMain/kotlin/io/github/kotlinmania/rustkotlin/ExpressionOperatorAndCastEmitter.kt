@@ -7,6 +7,26 @@ import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.RangeLimits
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.UnOp
+
+private fun compoundBitwiseKotlinOp(op: BinOp): String? =
+    when (op) {
+        is BinOp.BitAndAssign -> "and"
+        is BinOp.BitOrAssign -> "or"
+        is BinOp.BitXorAssign -> "xor"
+        is BinOp.ShlAssign -> "shl"
+        is BinOp.ShrAssign -> "shr"
+        else -> null
+    }
+
+private fun narrowWidenAndNarrowMethods(kind: NumericKind?, allowUnsigned: Boolean): Pair<String, String>? =
+    when (kind) {
+        NumericKind.I8 -> "toInt()" to "toByte()"
+        NumericKind.I16 -> "toInt()" to "toShort()"
+        NumericKind.U8 -> if (allowUnsigned) "toUInt()" to "toUByte()" else null
+        NumericKind.U16 -> if (allowUnsigned) "toUInt()" to "toUShort()" else null
+        else -> null
+    }
+
 private enum class DerefPlaceKind {
     RAW_POINTER,
     MUTABLE_REFERENCE,
@@ -111,15 +131,7 @@ internal fun KotlinJ2KEmitter.renderExprBinary(expr: Expr.Binary, indent: String
         val derefInner = (rawLeftOperand as Expr.Unary).expr
         val place = renderExpr(derefInner, indent, selfTypeName)
         val rhs = renderExpr(expr.right, indent, selfTypeName)
-        val bitOp =
-            when (expr.op) {
-                is BinOp.BitAndAssign -> "and"
-                is BinOp.BitOrAssign -> "or"
-                is BinOp.BitXorAssign -> "xor"
-                is BinOp.ShlAssign -> "shl"
-                is BinOp.ShrAssign -> "shr"
-                else -> null
-            }
+        val bitOp = compoundBitwiseKotlinOp(expr.op)
         val update =
             if (bitOp == null) {
                 "currentValue ${renderBinOp(expr.op)} ($rhs)"
@@ -232,30 +244,28 @@ internal fun KotlinJ2KEmitter.renderExprBinary(expr: Expr.Binary, indent: String
         } else {
             rawRight
         }
-    val compoundBitOp =
-        when (expr.op) {
-            is BinOp.BitXorAssign -> "xor"
-            is BinOp.BitAndAssign -> "and"
-            is BinOp.BitOrAssign -> "or"
-            is BinOp.ShlAssign -> "shl"
-            is BinOp.ShrAssign -> "shr"
-            else -> null
-        }
+    val compoundBitOp = compoundBitwiseKotlinOp(expr.op)
     val effLeftKind =
         leftInferredKind
             ?: if (left == "this") selfTypeName?.let(this::resolveNumericKind) else null
+    val narrowShiftOrBitwise =
+        when {
+            isShiftOp -> narrowWidenAndNarrowMethods(binarySharedKind, allowUnsigned = true)
+            isBitwiseOp -> narrowWidenAndNarrowMethods(binarySharedKind, allowUnsigned = false)
+            else -> null
+        }
     return if (compoundBitOp != null) {
         val safeRight = if (expr.right is Expr.Binary || expr.right is Expr.Cast) "($right)" else right
         val rhsLeft = left.replace("!!.", ".")
-        val rhsBitExpr =
+        val narrowAssign =
             if (expr.op is BinOp.ShlAssign || expr.op is BinOp.ShrAssign) {
-                when (effLeftKind) {
-                    NumericKind.I8 -> "(($rhsLeft).toInt() $compoundBitOp $safeRight).toByte()"
-                    NumericKind.I16 -> "(($rhsLeft).toInt() $compoundBitOp $safeRight).toShort()"
-                    NumericKind.U8 -> "(($rhsLeft).toUInt() $compoundBitOp $safeRight).toUByte()"
-                    NumericKind.U16 -> "(($rhsLeft).toUInt() $compoundBitOp $safeRight).toUShort()"
-                    else -> "$rhsLeft $compoundBitOp $safeRight"
-                }
+                narrowWidenAndNarrowMethods(effLeftKind, allowUnsigned = true)
+            } else {
+                null
+            }
+        val rhsBitExpr =
+            if (narrowAssign != null) {
+                "(($rhsLeft).${narrowAssign.first} $compoundBitOp $safeRight).${narrowAssign.second}"
             } else {
                 "$rhsLeft $compoundBitOp $safeRight"
             }
@@ -272,24 +282,12 @@ internal fun KotlinJ2KEmitter.renderExprBinary(expr: Expr.Binary, indent: String
         } else {
             "$left = $rhsBitExpr"
         }
-    } else if (isBitwiseOp && (binarySharedKind == NumericKind.I8 || binarySharedKind == NumericKind.I16)) {
+    } else if (narrowShiftOrBitwise != null) {
         val op = renderBinOp(expr.op)
-        val lAtom = if (isAtomicPostfixReceiver(leftOperand, left)) left else "($left)"
-        val rAtom = if (isAtomicPostfixReceiver(rightOperand, right)) right else "($right)"
-        val conv = if (binarySharedKind == NumericKind.I8) "toByte()" else "toShort()"
-        "($lAtom.toInt() $op $rAtom.toInt()).$conv"
-    } else if (isShiftOp && (binarySharedKind == NumericKind.U8 || binarySharedKind == NumericKind.U16)) {
-        val op = renderBinOp(expr.op)
-        val lAtom = if (isAtomicPostfixReceiver(leftOperand, left)) left else "($left)"
-        val rAtom = if (isAtomicPostfixReceiver(rightOperand, right)) right else "($right)"
-        val conv = if (binarySharedKind == NumericKind.U8) "toUByte()" else "toUShort()"
-        "($lAtom.toUInt() $op $rAtom).$conv"
-    } else if (isShiftOp && (binarySharedKind == NumericKind.I8 || binarySharedKind == NumericKind.I16)) {
-        val op = renderBinOp(expr.op)
-        val lAtom = if (isAtomicPostfixReceiver(leftOperand, left)) left else "($left)"
-        val rAtom = if (isAtomicPostfixReceiver(rightOperand, right)) right else "($right)"
-        val conv = if (binarySharedKind == NumericKind.I8) "toByte()" else "toShort()"
-        "($lAtom.toInt() $op $rAtom).$conv"
+        val lAtom = atomicRecvExpr(leftOperand, left)
+        val rAtom = atomicRecvExpr(rightOperand, right)
+        val rExpr = if (isShiftOp) rAtom else "$rAtom.toInt()"
+        "($lAtom.${narrowShiftOrBitwise.first} $op $rExpr).${narrowShiftOrBitwise.second}"
     } else if (isEqOp &&
         (
             inferExprRenderedType(leftOperand, selfTypeName)?.let { isPrimitiveArrayRenderedType(it) } == true ||

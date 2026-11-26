@@ -92,7 +92,16 @@ private data class DiscoveredRustInput(
     val inputPath: String,
     val relativeDir: String,
     val discoveryRoot: String?,
-)
+) {
+    fun relativePathFromDiscoveryRoot(): String {
+        val normEnt = inputPath.replace('\\', '/')
+        if (discoveryRoot != null && normEnt.startsWith("$discoveryRoot/")) {
+            return normEnt.removePrefix("$discoveryRoot/")
+        }
+        val fileName = normEnt.substringAfterLast('/')
+        return if (discoveryRoot == null && relativeDir.isNotEmpty()) "$relativeDir/$fileName" else fileName
+    }
+}
 
 internal fun readExistingFileOrNull(path: String): String? {
     val kmPath = KmPath(path)
@@ -101,15 +110,6 @@ internal fun readExistingFileOrNull(path: String): String? {
     }
     return readInput(path)
 }
-
-internal fun isManualProtectedContent(content: String): Boolean =
-    content
-        .lineSequence()
-        .take(10)
-        .any { line ->
-            val trimmed = line.trimStart()
-            trimmed.startsWith("// rust-kotlin: manual") || trimmed.startsWith("# rust-kotlin: manual")
-        }
 
 /** IO is injected for focused invariant tests; renderers receive source text, never a writer. */
 internal fun runSingleFileCommand(
@@ -201,354 +201,128 @@ internal fun runSingleFileCommand(
     }
 }
 
-private fun parseCliOptions(args: Array<String>): ParsedCliOptions {
-    require(args.isNotEmpty()) {
-        "usage: rust-kotlin inspect input.rs | translate [options] input.rs [output.kt]; try --help"
+private fun parseCliOptions(args: Array<String>): ParsedCliOptions = CliOptionBuilder(args).parse()
+
+private class CliOptionBuilder(
+    private val args: Array<String>,
+) {
+    private var showHelp = false
+    private var showVersion = false
+    private var recursive = false
+    private var outputTarget: String? = null
+    private var inPlace = false
+    private var toStdout = false
+    private var dryRun = false
+    private var forceOverwrite = false
+    private var skipExisting = false
+    private var rustKotlinPropertiesPath: String? = null
+    private var packagePropertiesPath: String? = null
+    private var packageOverride: String? = null
+    private var namespaceOverride: String? = null
+    private var groupOverride: String? = null
+    private val crateNamespaces = linkedMapOf<String, String>()
+    private var sourceRoot: String? = null
+    private var portLintDirective = "source"
+    private var testOutputTarget: String? = null
+    private var rawAbiMode = false
+    private var finalStructs = false
+    private var splitModuleRoots = false
+    private var targetPointerWidth = 64
+    private var targetEndian = "little"
+    private var targetArch: String? = null
+    private var targetOs: String? = null
+    private var targetEnv: String? = null
+    private var targetVendor: String? = null
+    private val targetFamilies = linkedSetOf<String>()
+    private val enabledFeatures = linkedSetOf<String>()
+    private val enabledCfgFlags = linkedSetOf<String>()
+    private var cfgClosedWorld = false
+    private var scalarChar = false
+    private var explicitTargetSelection = false
+    private var timings = false
+    private var quiet = false
+    private val positionals = mutableListOf<String>()
+
+    private fun flagOnly(optName: String, inlineVal: String?): Boolean {
+        require(inlineVal == null) { "$optName does not take a value" }
+        return true
     }
 
-    var showHelp = false
-    var showVersion = false
-    var recursive = false
-    var outputTarget: String? = null
-    var inPlace = false
-    var toStdout = false
-    var dryRun = false
-    var forceOverwrite = false
-    var skipExisting = false
-    var rustKotlinPropertiesPath: String? = null
-    var packagePropertiesPath: String? = null
-    var packageOverride: String? = null
-    var namespaceOverride: String? = null
-    var groupOverride: String? = null
-    val crateNamespaces = linkedMapOf<String, String>()
-    var sourceRoot: String? = null
-    var portLintDirective = "source"
-    var testOutputTarget: String? = null
-    var rawAbiMode = false
-    var finalStructs = false
-    var splitModuleRoots = false
-    var targetPointerWidth = 64
-    var targetEndian = "little"
-    var targetArch: String? = null
-    var targetOs: String? = null
-    var targetEnv: String? = null
-    var targetVendor: String? = null
-    val targetFamilies = linkedSetOf<String>()
-    val enabledFeatures = linkedSetOf<String>()
-    val enabledCfgFlags = linkedSetOf<String>()
-    var cfgClosedWorld = false
-    var scalarChar = false
-    var explicitTargetSelection = false
-    var timings = false
-    var quiet = false
-    val positionals = mutableListOf<String>()
-
-    var idx = 0
-    var onlyPositionals = false
-    while (idx < args.size) {
-        val raw = args[idx]
-        if (onlyPositionals || !raw.startsWith("-") || raw == "-") {
-            positionals += raw
-            idx++
-            continue
-        }
-        if (raw == "--") {
-            onlyPositionals = true
-            idx++
-            continue
-        }
-
-        fun nextValue(flagName: String): String {
-            idx++
-            require(idx < args.size) { "option $flagName requires a value" }
-            return args[idx]
-        }
-
-        val eqIdx = raw.indexOf('=')
-        val optName = if (eqIdx > 0 && raw.startsWith("--")) raw.substring(0, eqIdx) else raw
-        val inlineVal = if (eqIdx > 0 && raw.startsWith("--")) raw.substring(eqIdx + 1) else null
-
-        fun optValue(): String = inlineVal ?: nextValue(optName)
-
-        when (optName) {
-            "--test-output" -> {
-                testOutputTarget = optValue()
-                require(testOutputTarget.isNotBlank()) { "--test-output requires a non-empty directory" }
-            }
-            "-h", "--help" -> showHelp = true
-            "-v", "--version" -> showVersion = true
-            "-r", "--recursive" -> {
-                require(inlineVal == null) { "$optName does not take a value" }
-                recursive = true
-            }
-            "-o", "--output" -> outputTarget = optValue()
-            "--in-place" -> {
-                require(inlineVal == null) { "$optName does not take a value" }
-                inPlace = true
-            }
-            "--stdout" -> {
-                require(inlineVal == null) { "$optName does not take a value" }
-                toStdout = true
-            }
-            "--dry-run" -> {
-                require(inlineVal == null) { "$optName does not take a value" }
-                dryRun = true
-            }
-            "-f", "--force", "--overwrite" -> {
-                require(inlineVal == null) { "$optName does not take a value" }
-                forceOverwrite = true
-            }
-            "--skip-existing" -> {
-                require(inlineVal == null) { "$optName does not take a value" }
-                skipExisting = true
-            }
-            "--rustkotlin-properties" -> rustKotlinPropertiesPath = optValue()
-            "--package-properties" -> packagePropertiesPath = optValue()
-            "-p", "--package" -> packageOverride = optValue()
-            "-n", "--namespace" -> namespaceOverride = optValue()
-            "--group" -> groupOverride = optValue()
-            "-c", "--crate-namespace" -> {
-                val spec = optValue()
-                val sep = spec.indexOf('=')
-                require(sep > 0 && sep < spec.lastIndex) {
-                    "invalid --crate-namespace '$spec'; expected <crate>=<kotlin.package>"
-                }
-                val crateKey = rustModuleIdentToKotlin(spec.substring(0, sep).trim())
-                val cratePkg = spec.substring(sep + 1).trim()
-                require(crateKey.isNotEmpty() && cratePkg.isNotEmpty()) {
-                    "invalid --crate-namespace '$spec'; expected <crate>=<kotlin.package>"
-                }
-                crateNamespaces[crateKey] = cratePkg
-            }
-            "--source-root" -> sourceRoot = optValue()
-            "--port-lint" -> {
-                val mode = optValue().trim().lowercase()
-                require(mode == "source" || mode == "tests" || mode == "none") {
-                    "invalid --port-lint '$mode'; expected source, tests, or none"
-                }
-                portLintDirective = mode
-            }
-            "--raw-abi" -> {
-                require(inlineVal == null) { "$optName does not take a value" }
-                rawAbiMode = true
-            }
-            "--final-structs" -> {
-                require(inlineVal == null) { "$optName does not take a value" }
-                finalStructs = true
-            }
-            "--split-module-roots" -> {
-                require(inlineVal == null) { "$optName does not take a value" }
-                splitModuleRoots = true
-            }
-            "--target-pointer-width" -> {
-                val width = optValue().trim().toIntOrNull()
+    private fun applyTargetOrFeatureSetting(
+        key: String,
+        rawVal: String,
+        fromCfg: Boolean,
+    ): Boolean {
+        when (key) {
+            "target_pointer_width" -> {
+                val width = rawVal.trim().toIntOrNull()
                 require(width == 16 || width == 32 || width == 64) {
-                    "invalid --target-pointer-width; expected 16, 32, or 64"
+                    if (fromCfg) {
+                        "invalid --cfg target_pointer_width='$rawVal'"
+                    } else {
+                        "invalid --target-pointer-width; expected 16, 32, or 64"
+                    }
                 }
                 targetPointerWidth = width
                 explicitTargetSelection = true
             }
-            "--target-endian" -> {
-                val endian = optValue().trim().lowercase()
+            "target_endian" -> {
+                val endian = if (fromCfg) rawVal else rawVal.trim().lowercase()
                 require(endian == "little" || endian == "big") {
-                    "invalid --target-endian '$endian'; expected little or big"
+                    if (fromCfg) {
+                        "invalid --cfg target_endian='$endian'"
+                    } else {
+                        "invalid --target-endian '$endian'; expected little or big"
+                    }
                 }
                 targetEndian = endian
                 explicitTargetSelection = true
             }
-            "--target-arch" -> {
-                targetArch = optValue().trim().takeIf { it.isNotEmpty() }
+            "target_arch" -> {
+                targetArch = if (fromCfg) rawVal else rawVal.trim().takeIf { it.isNotEmpty() }
                 explicitTargetSelection = true
             }
-            "--target-os" -> {
-                targetOs = optValue().trim().takeIf { it.isNotEmpty() }
+            "target_os" -> {
+                targetOs = if (fromCfg) rawVal else rawVal.trim().takeIf { it.isNotEmpty() }
                 explicitTargetSelection = true
             }
-            "--target-env" -> {
-                targetEnv = optValue().trim().takeIf { it.isNotEmpty() }
+            "target_env" -> {
+                targetEnv = if (fromCfg) rawVal else rawVal.trim().takeIf { it.isNotEmpty() }
                 explicitTargetSelection = true
             }
-            "--target-vendor" -> {
-                targetVendor = optValue().trim().takeIf { it.isNotEmpty() }
+            "target_vendor" -> {
+                targetVendor = if (fromCfg) rawVal else rawVal.trim().takeIf { it.isNotEmpty() }
                 explicitTargetSelection = true
             }
-            "--target-family" -> {
-                val fam = optValue().trim()
+            "target_family" -> {
+                val fam = rawVal.trim()
                 if (fam.isNotEmpty()) targetFamilies += fam
                 explicitTargetSelection = true
             }
-            "--feature" -> {
-                val feat = optValue().trim()
+            "feature" -> {
+                val feat = rawVal.trim()
                 if (feat.isNotEmpty()) enabledFeatures += feat
             }
-            "--cfg" -> {
-                val spec = optValue().trim()
-                require(spec.isNotEmpty()) { "--cfg requires a non-empty predicate" }
-                val kvSep = spec.indexOf('=')
-                if (kvSep > 0) {
-                    val cfgKey = normalizeCliCfgKey(spec.substring(0, kvSep))
-                    require(cfgKey.isNotEmpty()) { "--cfg requires a non-empty key before '='" }
-                    val cfgVal = unquoteCliCfgValue(spec.substring(kvSep + 1))
-                    when (cfgKey) {
-                        "target_pointer_width" -> {
-                            val w = cfgVal.toIntOrNull()
-                            require(w == 16 || w == 32 || w == 64) {
-                                "invalid --cfg target_pointer_width='$cfgVal'"
-                            }
-                            targetPointerWidth = w
-                            explicitTargetSelection = true
-                        }
-                        "target_endian" -> {
-                            require(cfgVal == "little" || cfgVal == "big") {
-                                "invalid --cfg target_endian='$cfgVal'"
-                            }
-                            targetEndian = cfgVal
-                            explicitTargetSelection = true
-                        }
-                        "target_arch" -> {
-                            targetArch = cfgVal
-                            explicitTargetSelection = true
-                        }
-                        "target_os" -> {
-                            targetOs = cfgVal
-                            explicitTargetSelection = true
-                        }
-                        "target_env" -> {
-                            targetEnv = cfgVal
-                            explicitTargetSelection = true
-                        }
-                        "target_vendor" -> {
-                            targetVendor = cfgVal
-                            explicitTargetSelection = true
-                        }
-                        "target_family" -> {
-                            if (cfgVal.isNotEmpty()) targetFamilies += cfgVal
-                            explicitTargetSelection = true
-                        }
-                        "feature" -> {
-                            if (cfgVal.isNotEmpty()) enabledFeatures += cfgVal
-                        }
-                        else -> enabledCfgFlags += "$cfgKey=$cfgVal"
-                    }
-                } else {
-                    val normFlag = normalizeCliCfgKey(spec)
-                    if (normFlag.isNotEmpty()) enabledCfgFlags += normFlag
-                }
-            }
-            "--cfg-closed-world" -> {
-                require(inlineVal == null) { "$optName does not take a value" }
-                cfgClosedWorld = true
-            }
-            "--scalar-char" -> {
-                require(inlineVal == null) { "$optName does not take a value" }
-                scalarChar = true
-            }
-            "--timings" -> {
-                require(inlineVal == null) { "$optName does not take a value" }
-                timings = true
-            }
-            "-q", "--quiet" -> {
-                require(inlineVal == null) { "$optName does not take a value" }
-                quiet = true
-            }
-            else -> throw IllegalArgumentException("unknown option: $raw")
+            else -> return false
         }
-        idx++
+        return true
     }
 
-    if (showHelp) {
-        return ParsedCliOptions(action = CliActionKind.HELP)
-    }
-    if (showVersion) {
-        return ParsedCliOptions(action = CliActionKind.VERSION)
-    }
-
-    val outputModesCount = listOf(outputTarget != null, inPlace, toStdout).count { it }
-    require(outputModesCount <= 1) {
-        "--output, --in-place, and --stdout are mutually exclusive"
-    }
-    require(!(forceOverwrite && skipExisting)) {
-        "--force and --skip-existing are mutually exclusive"
-    }
-    require(positionals.isNotEmpty()) {
-        "usage: rust-kotlin inspect input.rs | translate [options] input.rs [output.kt]; try --help"
-    }
-
-    val builtCfgProfile =
-        CfgTargetProfile(
-            pointerWidth = targetPointerWidth,
-            targetEndian = targetEndian,
-            targetArch = targetArch,
-            targetOs = targetOs,
-            targetEnv = targetEnv,
-            targetVendor = targetVendor,
-            targetFamilies =
-                when {
-                    targetFamilies.isNotEmpty() -> targetFamilies
-                    cfgClosedWorld -> emptySet()
-                    else -> null
-                },
-            enabledFeatures =
-                when {
-                    enabledFeatures.isNotEmpty() -> enabledFeatures
-                    cfgClosedWorld -> emptySet()
-                    else -> null
-                },
-            enabledCfgFlags = enabledCfgFlags,
-            unknownPolicy = if (cfgClosedWorld) UnknownCfgPolicy.CLOSED_WORLD_FALSE else UnknownCfgPolicy.OPEN_WORLD_NULL,
-            useRelativeDirPlatformHints = recursive && !explicitTargetSelection && !cfgClosedWorld,
-        )
-
-    val first = positionals[0]
-    if (first == "inspect") {
-        val inputs = positionals.drop(1)
-        require(inputs.isNotEmpty()) {
-            "inspect requires an input .rs file (or directory with -r)"
-        }
-        require(outputModesCount == 0 && !dryRun && !forceOverwrite && !skipExisting && testOutputTarget == null) {
-            "inspect does not accept output write options"
-        }
-        if (!recursive) {
-            require(inputs.size == 1 && inputs[0].endsWith(".rs", ignoreCase = true)) {
-                "inspect requires a single .rs file (pass -r for directories)"
-            }
-        }
-        return ParsedCliOptions(
-            action = CliActionKind.INSPECT,
-            inputs = inputs,
-            recursive = recursive,
-            rawAbiMode = rawAbiMode,
-            finalStructs = finalStructs,
-            splitModuleRoots = splitModuleRoots,
-            scalarChar = scalarChar,
-            cfgTargetProfile = builtCfgProfile,
-            timings = timings,
-            quiet = quiet,
-        )
-    }
-
-    val translatePositionals =
-        if (first == "translate") {
-            positionals.drop(1)
-        } else {
-            require(outputModesCount > 0 || dryRun) {
-                "unknown command '$first'; expected 'inspect' or 'translate' (or pass -o / --in-place / --stdout / --dry-run)"
-            }
-            positionals
-        }
-
-    if (outputModesCount == 0 && !dryRun) {
-        require(!recursive && translatePositionals.size == 2) {
-            "usage: rust-kotlin inspect input.rs | translate input.rs output.kt; one input, one output (or pass -o / --in-place / --stdout / --dry-run)"
-        }
-        val inputPath = translatePositionals[0]
-        val outputPath = translatePositionals[1]
-        validateSingleRustInputPath(inputPath)
-        validateExplicitKotlinOutputPath(inputPath, outputPath)
-        return ParsedCliOptions(
+    private fun buildTranslateOptions(
+        inputs: List<String>,
+        builtCfgProfile: CfgTargetProfile,
+        classicOutputPath: String? = null,
+        effectiveOutputTarget: String? = null,
+    ): ParsedCliOptions =
+        ParsedCliOptions(
             action = CliActionKind.TRANSLATE,
-            inputs = listOf(inputPath),
-            classicOutputPath = outputPath,
+            inputs = inputs,
+            classicOutputPath = classicOutputPath,
+            outputTarget = effectiveOutputTarget,
+            recursive = if (classicOutputPath != null) false else recursive,
+            inPlace = if (classicOutputPath != null) false else inPlace,
+            toStdout = if (classicOutputPath != null) false else toStdout,
+            dryRun = if (classicOutputPath != null) false else dryRun,
             forceOverwrite = forceOverwrite,
             skipExisting = skipExisting,
             rustKotlinPropertiesPath = rustKotlinPropertiesPath,
@@ -568,57 +342,224 @@ private fun parseCliOptions(args: Array<String>): ParsedCliOptions {
             timings = timings,
             quiet = quiet,
         )
-    }
 
-    require(translatePositionals.isNotEmpty()) {
-        "translate requires at least one input .rs file (or directory with -r)"
-    }
-    if (!recursive) {
-        for (inp in translatePositionals) {
-            if (splitModuleRoots && outputTarget?.endsWith(".kt", ignoreCase = true) != true) {
-                require(inp.endsWith(".rs", ignoreCase = true)) {
-                    "input must be a Rust .rs file: $inp (pass -r for directories)"
+    fun parse(): ParsedCliOptions {
+        require(args.isNotEmpty()) {
+            "usage: rust-kotlin inspect input.rs | translate [options] input.rs [output.kt]; try --help"
+        }
+
+        var idx = 0
+        var onlyPositionals = false
+        while (idx < args.size) {
+            val raw = args[idx]
+            if (onlyPositionals || !raw.startsWith("-") || raw == "-") {
+                positionals += raw
+                idx++
+                continue
+            }
+            if (raw == "--") {
+                onlyPositionals = true
+                idx++
+                continue
+            }
+
+            fun nextValue(flagName: String): String {
+                idx++
+                require(idx < args.size) { "option $flagName requires a value" }
+                return args[idx]
+            }
+
+            val eqIdx = raw.indexOf('=')
+            val optName = if (eqIdx > 0 && raw.startsWith("--")) raw.substring(0, eqIdx) else raw
+            val inlineVal = if (eqIdx > 0 && raw.startsWith("--")) raw.substring(eqIdx + 1) else null
+
+            fun optValue(): String = inlineVal ?: nextValue(optName)
+
+            when (optName) {
+                "--test-output" -> {
+                    val dir = optValue()
+                    require(dir.isNotBlank()) { "--test-output requires a non-empty directory" }
+                    testOutputTarget = dir
                 }
+                "-h", "--help" -> showHelp = true
+                "-v", "--version" -> showVersion = true
+                "-r", "--recursive" -> recursive = flagOnly(optName, inlineVal)
+                "-o", "--output" -> outputTarget = optValue()
+                "--in-place" -> inPlace = flagOnly(optName, inlineVal)
+                "--stdout" -> toStdout = flagOnly(optName, inlineVal)
+                "--dry-run" -> dryRun = flagOnly(optName, inlineVal)
+                "-f", "--force", "--overwrite" -> forceOverwrite = flagOnly(optName, inlineVal)
+                "--skip-existing" -> skipExisting = flagOnly(optName, inlineVal)
+                "--rustkotlin-properties" -> rustKotlinPropertiesPath = optValue()
+                "--package-properties" -> packagePropertiesPath = optValue()
+                "-p", "--package" -> packageOverride = optValue()
+                "-n", "--namespace" -> namespaceOverride = optValue()
+                "--group" -> groupOverride = optValue()
+                "-c", "--crate-namespace" -> {
+                    val spec = optValue()
+                    val sep = spec.indexOf('=')
+                    require(sep > 0 && sep < spec.lastIndex) {
+                        "invalid --crate-namespace '$spec'; expected <crate>=<kotlin.package>"
+                    }
+                    val crateKey = rustModuleIdentToKotlin(spec.substring(0, sep).trim())
+                    val cratePkg = spec.substring(sep + 1).trim()
+                    require(crateKey.isNotEmpty() && cratePkg.isNotEmpty()) {
+                        "invalid --crate-namespace '$spec'; expected <crate>=<kotlin.package>"
+                    }
+                    crateNamespaces[crateKey] = cratePkg
+                }
+                "--source-root" -> sourceRoot = optValue()
+                "--port-lint" -> {
+                    val mode = optValue().trim().lowercase()
+                    require(mode == "source" || mode == "tests" || mode == "none") {
+                        "invalid --port-lint '$mode'; expected source, tests, or none"
+                    }
+                    portLintDirective = mode
+                }
+                "--raw-abi" -> rawAbiMode = flagOnly(optName, inlineVal)
+                "--final-structs" -> finalStructs = flagOnly(optName, inlineVal)
+                "--split-module-roots" -> splitModuleRoots = flagOnly(optName, inlineVal)
+                "--target-pointer-width",
+                "--target-endian",
+                "--target-arch",
+                "--target-os",
+                "--target-env",
+                "--target-vendor",
+                "--target-family",
+                "--feature",
+                -> applyTargetOrFeatureSetting(optName.removePrefix("--").replace('-', '_'), optValue(), fromCfg = false)
+                "--cfg" -> {
+                    val spec = optValue().trim()
+                    require(spec.isNotEmpty()) { "--cfg requires a non-empty predicate" }
+                    val kvSep = spec.indexOf('=')
+                    if (kvSep > 0) {
+                        val cfgKey = normalizeCliCfgKey(spec.substring(0, kvSep))
+                        require(cfgKey.isNotEmpty()) { "--cfg requires a non-empty key before '='" }
+                        val cfgVal = unquoteCliCfgValue(spec.substring(kvSep + 1))
+                        if (!applyTargetOrFeatureSetting(cfgKey, cfgVal, fromCfg = true)) {
+                            enabledCfgFlags += "$cfgKey=$cfgVal"
+                        }
+                    } else {
+                        val normFlag = normalizeCliCfgKey(spec)
+                        if (normFlag.isNotEmpty()) enabledCfgFlags += normFlag
+                    }
+                }
+                "--cfg-closed-world" -> cfgClosedWorld = flagOnly(optName, inlineVal)
+                "--scalar-char" -> scalarChar = flagOnly(optName, inlineVal)
+                "--timings" -> timings = flagOnly(optName, inlineVal)
+                "-q", "--quiet" -> quiet = flagOnly(optName, inlineVal)
+                else -> throw IllegalArgumentException("unknown option: $raw")
+            }
+            idx++
+        }
+
+        if (showHelp) return ParsedCliOptions(action = CliActionKind.HELP)
+        if (showVersion) return ParsedCliOptions(action = CliActionKind.VERSION)
+
+        val outputModesCount = listOf(outputTarget != null, inPlace, toStdout).count { it }
+        require(outputModesCount <= 1) { "--output, --in-place, and --stdout are mutually exclusive" }
+        require(!(forceOverwrite && skipExisting)) { "--force and --skip-existing are mutually exclusive" }
+        require(positionals.isNotEmpty()) {
+            "usage: rust-kotlin inspect input.rs | translate [options] input.rs [output.kt]; try --help"
+        }
+
+        val builtCfgProfile =
+            CfgTargetProfile(
+                pointerWidth = targetPointerWidth,
+                targetEndian = targetEndian,
+                targetArch = targetArch,
+                targetOs = targetOs,
+                targetEnv = targetEnv,
+                targetVendor = targetVendor,
+                targetFamilies =
+                    when {
+                        targetFamilies.isNotEmpty() -> targetFamilies
+                        cfgClosedWorld -> emptySet()
+                        else -> null
+                    },
+                enabledFeatures =
+                    when {
+                        enabledFeatures.isNotEmpty() -> enabledFeatures
+                        cfgClosedWorld -> emptySet()
+                        else -> null
+                    },
+                enabledCfgFlags = enabledCfgFlags,
+                unknownPolicy = if (cfgClosedWorld) UnknownCfgPolicy.CLOSED_WORLD_FALSE else UnknownCfgPolicy.OPEN_WORLD_NULL,
+                useRelativeDirPlatformHints = recursive && !explicitTargetSelection && !cfgClosedWorld,
+            )
+
+        val first = positionals[0]
+        if (first == "inspect") {
+            val inputs = positionals.drop(1)
+            require(inputs.isNotEmpty()) { "inspect requires an input .rs file (or directory with -r)" }
+            require(outputModesCount == 0 && !dryRun && !forceOverwrite && !skipExisting && testOutputTarget == null) {
+                "inspect does not accept output write options"
+            }
+            if (!recursive) {
+                require(inputs.size == 1 && inputs[0].endsWith(".rs", ignoreCase = true)) {
+                    "inspect requires a single .rs file (pass -r for directories)"
+                }
+            }
+            return ParsedCliOptions(
+                action = CliActionKind.INSPECT,
+                inputs = inputs,
+                recursive = recursive,
+                rawAbiMode = rawAbiMode,
+                finalStructs = finalStructs,
+                splitModuleRoots = splitModuleRoots,
+                scalarChar = scalarChar,
+                cfgTargetProfile = builtCfgProfile,
+                timings = timings,
+                quiet = quiet,
+            )
+        }
+
+        val translatePositionals =
+            if (first == "translate") {
+                positionals.drop(1)
             } else {
-                validateSingleRustInputPath(inp)
+                require(outputModesCount > 0 || dryRun) {
+                    "unknown command '$first'; expected 'inspect' or 'translate' (or pass -o / --in-place / --stdout / --dry-run)"
+                }
+                positionals
+            }
+
+        if (outputModesCount == 0 && !dryRun) {
+            require(!recursive && translatePositionals.size == 2) {
+                "usage: rust-kotlin inspect input.rs | translate input.rs output.kt; one input, one output (or pass -o / --in-place / --stdout / --dry-run)"
+            }
+            val inputPath = translatePositionals[0]
+            val outputPath = translatePositionals[1]
+            validateSingleRustInputPath(inputPath)
+            validateExplicitKotlinOutputPath(inputPath, outputPath)
+            return buildTranslateOptions(listOf(inputPath), builtCfgProfile, classicOutputPath = outputPath)
+        }
+
+        require(translatePositionals.isNotEmpty()) {
+            "translate requires at least one input .rs file (or directory with -r)"
+        }
+        if (!recursive) {
+            for (inp in translatePositionals) {
+                if (splitModuleRoots && outputTarget?.endsWith(".kt", ignoreCase = true) != true) {
+                    require(inp.endsWith(".rs", ignoreCase = true)) {
+                        "input must be a Rust .rs file: $inp (pass -r for directories)"
+                    }
+                } else {
+                    validateSingleRustInputPath(inp)
+                }
             }
         }
-    }
-    if (outputTarget != null && outputTarget.endsWith(".kt", ignoreCase = true)) {
-        require(!recursive && translatePositionals.size == 1) {
-            "-o <file.kt> requires a single .rs input file; pass an output directory for batch/recursive translation"
+        val curOutTarget = outputTarget
+        if (curOutTarget != null && curOutTarget.endsWith(".kt", ignoreCase = true)) {
+            require(!recursive && translatePositionals.size == 1) {
+                "-o <file.kt> requires a single .rs input file; pass an output directory for batch/recursive translation"
+            }
+            validateSingleRustInputPath(translatePositionals[0])
+            validateExplicitKotlinOutputPath(translatePositionals[0], curOutTarget)
         }
-        validateSingleRustInputPath(translatePositionals[0])
-        validateExplicitKotlinOutputPath(translatePositionals[0], outputTarget)
-    }
 
-    return ParsedCliOptions(
-        action = CliActionKind.TRANSLATE,
-        inputs = translatePositionals,
-        outputTarget = outputTarget,
-        recursive = recursive,
-        inPlace = inPlace,
-        toStdout = toStdout,
-        dryRun = dryRun,
-        forceOverwrite = forceOverwrite,
-        skipExisting = skipExisting,
-        rustKotlinPropertiesPath = rustKotlinPropertiesPath,
-        packagePropertiesPath = packagePropertiesPath,
-        packageOverride = packageOverride,
-        namespaceOverride = namespaceOverride,
-        groupOverride = groupOverride,
-        crateNamespaces = crateNamespaces,
-        sourceRoot = sourceRoot,
-        portLintDirective = portLintDirective,
-        testOutputTarget = testOutputTarget,
-        rawAbiMode = rawAbiMode,
-        finalStructs = finalStructs,
-        splitModuleRoots = splitModuleRoots,
-        scalarChar = scalarChar,
-        cfgTargetProfile = builtCfgProfile,
-        timings = timings,
-        quiet = quiet,
-    )
+        return buildTranslateOptions(translatePositionals, builtCfgProfile, effectiveOutputTarget = curOutTarget)
+    }
 }
 
 private fun validateSingleRustInputPath(inputPath: String) {
@@ -775,9 +716,7 @@ private fun computeModuleRootOutputDirectory(
     val outTarget = requireNotNull(parsed.outputTarget)
     val normOutRoot = outTarget.replace('\\', '/').trimEnd('/')
     val outRelDir =
-        if (entry.relativeDir.isEmpty()) {
-            ""
-        } else if (normOutRoot.contains("/kotlin/") || parsed.splitModuleRoots) {
+        if (normOutRoot.contains("/kotlin/") || parsed.splitModuleRoots) {
             computeEffectiveRelativePackageSegments(entry, parsed, sharedInlineModuleRelFiles).joinToString("/")
         } else {
             entry.relativeDir
@@ -792,32 +731,105 @@ private fun computeBatchOutputPath(
 ): String? {
     if (parsed.toStdout) return null
     if (parsed.classicOutputPath != null) return parsed.classicOutputPath
-
-    val normInput = entry.inputPath.replace('\\', '/')
-    val rustFileName = normInput.substringAfterLast('/')
-    val kotlinFileName = computeTargetKotlinFileName(rustFileName)
-
-    if (parsed.inPlace || (parsed.outputTarget == null && parsed.dryRun)) {
-        val parentDir = normInput.substringBeforeLast('/', missingDelimiterValue = "")
-        return if (parentDir.isEmpty()) kotlinFileName else "$parentDir/$kotlinFileName"
-    }
-
-    val outTarget = requireNotNull(parsed.outputTarget)
-    if (outTarget.endsWith(".kt", ignoreCase = true) && !parsed.recursive && parsed.inputs.size == 1) {
+    val outTarget = parsed.outputTarget
+    if (outTarget != null && outTarget.endsWith(".kt", ignoreCase = true) && !parsed.recursive && parsed.inputs.size == 1) {
         return outTarget
     }
+    val rustFileName = entry.inputPath.replace('\\', '/').substringAfterLast('/')
+    val kotlinFileName = computeTargetKotlinFileName(rustFileName)
+    val outDir = computeModuleRootOutputDirectory(entry, parsed, sharedInlineModuleRelFiles) ?: return null
+    return if (outDir.isEmpty()) kotlinFileName else "$outDir/$kotlinFileName"
+}
 
-    val normOutRoot = outTarget.replace('\\', '/').trimEnd('/')
-    val outRelDir =
-        if (normOutRoot.contains("/kotlin/") || parsed.splitModuleRoots) {
-            computeEffectiveRelativePackageSegments(entry, parsed, sharedInlineModuleRelFiles).joinToString("/")
-        } else {
-            entry.relativeDir
+private class CliArtifactWriter(
+    private val parsed: ParsedCliOptions,
+    private val readExistingOrNull: (String) -> String?,
+    private val write: (String, String) -> Unit,
+    private val writeForce: (String, String) -> Unit,
+    private val exists: (String) -> Boolean,
+    private val report: (String) -> Unit,
+) {
+    private val rustLangImportingProjectRoots = linkedSetOf<String>()
+
+    fun isManualProtected(path: String): Boolean {
+        val existing = readExistingOrNull(path) ?: return false
+        return isManualProtectedContent(existing)
+    }
+
+    private fun writeOutputFile(
+        path: String,
+        content: String,
+        quietSkipExisting: Boolean = false,
+    ): Boolean {
+        if (isManualProtected(path)) {
+            if (!parsed.quiet) report("skip manual $path")
+            return false
         }
-    return if (outRelDir.isEmpty()) {
-        "$normOutRoot/$kotlinFileName"
-    } else {
-        "$normOutRoot/$outRelDir/$kotlinFileName"
+        if (parsed.skipExisting && exists(path)) {
+            if (!quietSkipExisting && !parsed.quiet) report("skip existing $path")
+            return false
+        }
+        if (parsed.forceOverwrite) writeForce(path, content) else write(path, content)
+        return true
+    }
+
+    fun emitRenderedUnit(
+        targetPath: String?,
+        text: String,
+        companionFiles: List<CompanionInteropFile>,
+        dryRunSummary: String,
+        writeSummary: String = dryRunSummary,
+        stdoutHeader: String? = null,
+    ) {
+        when {
+            parsed.toStdout -> {
+                if (stdoutHeader != null) report(stdoutHeader)
+                report(text.trimEnd('\n'))
+            }
+            parsed.dryRun -> {
+                if (!parsed.quiet) {
+                    if (targetPath != null && isManualProtected(targetPath)) {
+                        report("dry-run: skip manual $targetPath")
+                    } else {
+                        report("dry-run: $dryRunSummary")
+                    }
+                }
+            }
+            else -> {
+                val targetOut = requireNotNull(targetPath)
+                val wrote = writeOutputFile(targetOut, text)
+                if (wrote && emittedKotlinImportsRustLang(text)) {
+                    extractProjectRootPrefixFromKotlinPath(targetOut)?.let { rustLangImportingProjectRoots += it }
+                }
+                for (companion in companionFiles) {
+                    val companionOutPath = resolveCompanionOutputPath(targetOut, companion)
+                    writeOutputFile(companionOutPath, companion.content, quietSkipExisting = true)
+                }
+                if (wrote && !parsed.quiet) {
+                    report(writeSummary)
+                }
+            }
+        }
+    }
+
+    fun syncRustLangCatalogs(projectNamespace: String?) {
+        if (parsed.dryRun || parsed.toStdout) return
+        for (projRootPrefix in rustLangImportingProjectRoots) {
+            val catalogPath = "${projRootPrefix}gradle/libs.versions.toml"
+            val existingToml = readExistingOrNull(catalogPath) ?: continue
+            val propsPath = "${projRootPrefix}gradle.properties"
+            val updated =
+                synchronizeRustLangProjectCatalog(
+                    projectNamespace = projectNamespace,
+                    existingToml = existingToml,
+                    existingProps = readExistingOrNull(propsPath),
+                    writeProps = { writeForce(propsPath, it) },
+                    writeToml = { writeForce(catalogPath, it) },
+                )
+            if (updated && !parsed.quiet) {
+                report("rust-lang-kotlin -> $catalogPath")
+            }
+        }
     }
 }
 
@@ -873,18 +885,7 @@ private fun executeTranslate(
         }
     val supportedDiscovered =
         if (parsed.recursive && discovered.size > 1) {
-            discovered.filterNot { ent ->
-                val discRoot = ent.discoveryRoot
-                val normEnt = ent.inputPath.replace('\\', '/')
-                val relPath =
-                    if (discRoot != null && normEnt.startsWith("$discRoot/")) {
-                        normEnt.removePrefix("$discRoot/")
-                    } else {
-                        ent.relativeDir.takeIf { it.isNotEmpty() }?.let { "$it/${normEnt.substringAfterLast('/')}" }
-                            ?: normEnt.substringAfterLast('/')
-                    }
-                isUnsupportedTargetRustRelPath(relPath, effectiveCfgProfile)
-            }
+            discovered.filterNot { isUnsupportedTargetRustRelPath(it.relativePathFromDiscoveryRoot(), effectiveCfgProfile) }
         } else {
             discovered
         }
@@ -895,14 +896,7 @@ private fun executeTranslate(
                 if (discRoot == null) continue
                 val relTextMap = linkedMapOf<String, String>()
                 for (ent in entriesInRoot) {
-                    val normEnt = ent.inputPath.replace('\\', '/')
-                    val relPath =
-                        if (normEnt.startsWith("$discRoot/")) {
-                            normEnt.removePrefix("$discRoot/")
-                        } else {
-                            normEnt.substringAfterLast('/')
-                        }
-                    relTextMap[relPath] = read(ent.inputPath)
+                    relTextMap[ent.relativePathFromDiscoveryRoot()] = read(ent.inputPath)
                 }
                 disabledByRoot[discRoot] =
                     collectCfgDisabledChildModuleRelPrefixes(
@@ -914,15 +908,7 @@ private fun executeTranslate(
             supportedDiscovered.filterNot { ent ->
                 val discRoot = ent.discoveryRoot ?: return@filterNot false
                 val disabledSet = disabledByRoot[discRoot].orEmpty()
-                if (disabledSet.isEmpty()) return@filterNot false
-                val normEnt = ent.inputPath.replace('\\', '/')
-                val relPath =
-                    if (normEnt.startsWith("$discRoot/")) {
-                        normEnt.removePrefix("$discRoot/")
-                    } else {
-                        normEnt.substringAfterLast('/')
-                    }
-                isRelPathUnderDisabledModulePrefix(relPath, disabledSet)
+                disabledSet.isNotEmpty() && isRelPathUnderDisabledModulePrefix(ent.relativePathFromDiscoveryRoot(), disabledSet)
             }
         } else {
             supportedDiscovered
@@ -938,78 +924,30 @@ private fun executeTranslate(
         parsed.rawAbiMode || parsed.splitModuleRoots || parsed.finalStructs || parsed.sourceRoot != null
     var cachedMetadataKey: String? = null
     var cachedMetadata = CrateRawAbiMetadata()
-    val rustLangImportingProjectRoots = linkedSetOf<String>()
+    val artifactWriter = CliArtifactWriter(parsed, readExistingOrNull, write, writeForce, exists, report)
     val batchFailures = mutableListOf<String>()
 
-    fun recordRustLangImportForWrittenPath(
-        path: String,
-        content: String,
-    ) {
-        if (emittedKotlinImportsRustLang(content)) {
-            extractProjectRootPrefixFromKotlinPath(path)?.let { rustLangImportingProjectRoots += it }
-        }
-    }
-
-    fun isManualProtected(path: String): Boolean {
-        val existing = readExistingOrNull(path) ?: return false
-        return isManualProtectedContent(existing)
-    }
-
-    fun writeOutputFile(
-        path: String,
-        content: String,
-        quietSkipExisting: Boolean = false,
-    ): Boolean {
-        if (isManualProtected(path)) {
-            if (!parsed.quiet) {
-                report("skip manual $path")
+    fun obtainCrateMetadata(entry: DiscoveredRustInput, metadataRoot: String?): CrateRawAbiMetadata {
+        val metaKey = "${metadataRoot ?: entry.inputPath}|${parsed.rawAbiMode}|${parsed.splitModuleRoots}|$effectiveCfgProfile"
+        if (metaKey == cachedMetadataKey) return cachedMetadata
+        val prevCfg = TranslationSession.cfgTargetProfile
+        TranslationSession.cfgTargetProfile = effectiveCfgProfile
+        val resolved =
+            try {
+                resolveCrateRawAbiMetadata(entry.inputPath, metadataRoot, parsed.rawAbiMode, parsed.splitModuleRoots)
+            } finally {
+                TranslationSession.cfgTargetProfile = prevCfg
             }
-            return false
+        if (metadataRoot != null) {
+            cachedMetadataKey = metaKey
+            cachedMetadata = resolved
         }
-        if (parsed.skipExisting && exists(path)) {
-            if (!quietSkipExisting && !parsed.quiet) {
-                report("skip existing $path")
-            }
-            return false
-        }
-        if (parsed.forceOverwrite) {
-            writeForce(path, content)
-        } else {
-            write(path, content)
-        }
-        return true
+        return resolved
     }
 
     fun translateDiscoveredEntry(entry: DiscoveredRustInput) {
         val metadataRoot = entry.discoveryRoot ?: parsed.sourceRoot
-        val metaKey = "${metadataRoot ?: entry.inputPath}|${parsed.rawAbiMode}|${parsed.splitModuleRoots}|$effectiveCfgProfile"
-        val crateMetadata =
-            if (shouldScanCrateMetadata) {
-                if (metaKey == cachedMetadataKey) {
-                    cachedMetadata
-                } else {
-                    val prevCfg = TranslationSession.cfgTargetProfile
-                    TranslationSession.cfgTargetProfile = effectiveCfgProfile
-                    val resolved =
-                        try {
-                            resolveCrateRawAbiMetadata(
-                                entry.inputPath,
-                                metadataRoot,
-                                parsed.rawAbiMode,
-                                parsed.splitModuleRoots,
-                            )
-                        } finally {
-                            TranslationSession.cfgTargetProfile = prevCfg
-                        }
-                    if (metadataRoot != null) {
-                        cachedMetadataKey = metaKey
-                        cachedMetadata = resolved
-                    }
-                    resolved
-                }
-            } else {
-                CrateRawAbiMetadata()
-            }
+        val crateMetadata = if (shouldScanCrateMetadata) obtainCrateMetadata(entry, metadataRoot) else CrateRawAbiMetadata()
         val sharedInlineFiles = crateMetadata.sharedInlineModuleRelFiles
         val rustFileName = entry.inputPath.replace('\\', '/').substringAfterLast('/')
         val isModRoot = isRustModuleRootFileName(rustFileName)
@@ -1101,25 +1039,11 @@ private fun executeTranslate(
             }
 
         val effectiveFfiMeta =
-            if (shouldScanCrateMetadata) {
-                crateMetadata
-            } else if (metadataRoot != null && ("extern " in source || "c!" in source || "cpp!" in source)) {
-                if (metaKey == cachedMetadataKey) {
-                    cachedMetadata
-                } else {
-                    val resolved =
-                        resolveCrateRawAbiMetadata(
-                            entry.inputPath,
-                            metadataRoot,
-                            parsed.rawAbiMode,
-                            parsed.splitModuleRoots,
-                        )
-                    cachedMetadataKey = metaKey
-                    cachedMetadata = resolved
-                    resolved
-                }
-            } else {
-                null
+            when {
+                shouldScanCrateMetadata -> crateMetadata
+                metadataRoot != null && ("extern " in source || "c!" in source || "cpp!" in source) ->
+                    obtainCrateMetadata(entry, metadataRoot)
+                else -> null
             }
 
         val externalCrateMeta =
@@ -1174,15 +1098,7 @@ private fun executeTranslate(
                 externalCrateTupleStructArity = externalCrateMeta.tupleStructArity,
                 externalEnumVariantTypeArity = externalCrateMeta.enumVariantTypeArity,
                 externalUnitEnumVariants = externalCrateMeta.unitEnumVariants,
-                cfgTargetProfile =
-                    if (parsed.portLintDirective != "tests") {
-                        parsed.cfgTargetProfile.copy(
-                            enabledCfgFlags = parsed.cfgTargetProfile.enabledCfgFlags - "test",
-                            disabledCfgFlags = parsed.cfgTargetProfile.disabledCfgFlags + "test",
-                        )
-                    } else {
-                        parsed.cfgTargetProfile
-                    },
+                cfgTargetProfile = effectiveCfgProfile,
                 isBatchCrateOutput = isBatchOutput,
                 currentRelativeSourceDir = entry.relativeDir.ifEmpty { null },
                 testClassName =
@@ -1235,27 +1151,13 @@ private fun executeTranslate(
                 }
             val testPath = listOf(testRoot, testRelDir, testName).filter { it.isNotEmpty() }.joinToString("/")
             require(testPath != outputPath) { "inline tests and product output must have distinct paths" }
-            if (parsed.dryRun) {
-                if (!parsed.quiet) {
-                    if (isManualProtected(testPath)) {
-                        report("dry-run: skip manual $testPath")
-                    } else {
-                        report("dry-run: ${entry.inputPath} inline tests -> $testPath")
-                    }
-                }
-            } else {
-                val wroteInline = writeOutputFile(testPath, inlineTests.text)
-                if (wroteInline) {
-                    recordRustLangImportForWrittenPath(testPath, inlineTests.text)
-                }
-                for (companion in inlineTests.companionFiles) {
-                    val companionPath = resolveCompanionOutputPath(testPath, companion)
-                    writeOutputFile(companionPath, companion.content, quietSkipExisting = true)
-                }
-                if (wroteInline && !parsed.quiet) {
-                    report("${entry.inputPath} inline tests -> $testPath; ${inlineTests.summary}")
-                }
-            }
+            artifactWriter.emitRenderedUnit(
+                targetPath = testPath,
+                text = inlineTests.text,
+                companionFiles = inlineTests.companionFiles,
+                dryRunSummary = "${entry.inputPath} inline tests -> $testPath",
+                writeSummary = "${entry.inputPath} inline tests -> $testPath; ${inlineTests.summary}",
+            )
         }
 
         if (isModRoot && parsed.splitModuleRoots) {
@@ -1275,36 +1177,13 @@ private fun executeTranslate(
                     modRootOutDir?.let { dir ->
                         if (dir.isEmpty()) chunk.fileName else "$dir/${chunk.fileName}"
                     }
-                when {
-                    parsed.toStdout -> {
-                        report("// --- ${chunk.fileName} ---")
-                        report(chunk.text.trimEnd('\n'))
-                    }
-                    parsed.dryRun -> {
-                        if (!parsed.quiet) {
-                            val targetOut = chunkPath
-                            if (targetOut != null && isManualProtected(targetOut)) {
-                                report("dry-run: skip manual $targetOut")
-                            } else {
-                                report("dry-run: ${entry.inputPath} -> $chunkPath; ${chunk.itemCount} items translated")
-                            }
-                        }
-                    }
-                    else -> {
-                        val targetOut = requireNotNull(chunkPath)
-                        val wroteChunk = writeOutputFile(targetOut, chunk.text)
-                        if (wroteChunk) {
-                            recordRustLangImportForWrittenPath(targetOut, chunk.text)
-                        }
-                        for (companion in chunk.companionFiles) {
-                            val companionOutPath = resolveCompanionOutputPath(targetOut, companion)
-                            writeOutputFile(companionOutPath, companion.content, quietSkipExisting = true)
-                        }
-                        if (wroteChunk && !parsed.quiet) {
-                            report("${entry.inputPath} -> $targetOut; ${chunk.itemCount} items translated")
-                        }
-                    }
-                }
+                artifactWriter.emitRenderedUnit(
+                    targetPath = chunkPath,
+                    text = chunk.text,
+                    companionFiles = chunk.companionFiles,
+                    dryRunSummary = "${entry.inputPath} -> $chunkPath; ${chunk.itemCount} items translated",
+                    stdoutHeader = "// --- ${chunk.fileName} ---",
+                )
             }
             return
         }
@@ -1318,35 +1197,12 @@ private fun executeTranslate(
         ) {
             return
         }
-        when {
-            parsed.toStdout -> {
-                report(result.text.trimEnd('\n'))
-            }
-            parsed.dryRun -> {
-                if (!parsed.quiet) {
-                    val targetOut = outputPath
-                    if (targetOut != null && isManualProtected(targetOut)) {
-                        report("dry-run: skip manual $targetOut")
-                    } else {
-                        report("dry-run: ${entry.inputPath} -> $outputPath; ${result.summary}")
-                    }
-                }
-            }
-            else -> {
-                val targetOut = requireNotNull(outputPath)
-                val wroteTarget = writeOutputFile(targetOut, result.text)
-                if (wroteTarget) {
-                    recordRustLangImportForWrittenPath(targetOut, result.text)
-                }
-                for (companion in result.companionFiles) {
-                    val companionOutPath = resolveCompanionOutputPath(targetOut, companion)
-                    writeOutputFile(companionOutPath, companion.content, quietSkipExisting = true)
-                }
-                if (wroteTarget && !parsed.quiet) {
-                    report("${entry.inputPath} -> $targetOut; ${result.summary}")
-                }
-            }
-        }
+        artifactWriter.emitRenderedUnit(
+            targetPath = outputPath,
+            text = result.text,
+            companionFiles = result.companionFiles,
+            dryRunSummary = "${entry.inputPath} -> $outputPath; ${result.summary}",
+        )
         result.diagnostics.forEach(report)
     }
 
@@ -1364,34 +1220,7 @@ private fun executeTranslate(
         }
     }
 
-    if (!parsed.dryRun && !parsed.toStdout) {
-        for (projRootPrefix in rustLangImportingProjectRoots) {
-            val catalogPath = "${projRootPrefix}gradle/libs.versions.toml"
-            val existingToml = readExistingOrNull(catalogPath) ?: continue
-            val propsPath = "${projRootPrefix}gradle.properties"
-            val existingProps = readExistingOrNull(propsPath)
-            if (isRustLangSelfProject(resolvedProjectNamespaceForCatalog, existingProps)) {
-                continue
-            }
-            var targetBundle: String? = null
-            if (existingProps != null && !isManualProtectedContent(existingProps)) {
-                val (updatedProps, bundleName) = ensureRustLangInGradleProperties(existingProps)
-                targetBundle = bundleName
-                if (updatedProps != existingProps) {
-                    writeForce(propsPath, updatedProps)
-                }
-            }
-            if (!isManualProtectedContent(existingToml)) {
-                val updatedToml = ensureRustLangInLibsVersionsToml(existingToml, commonMainBundleName = targetBundle)
-                if (updatedToml != existingToml) {
-                    writeForce(catalogPath, updatedToml)
-                    if (!parsed.quiet) {
-                        report("rust-lang-kotlin -> $catalogPath")
-                    }
-                }
-            }
-        }
-    }
+    artifactWriter.syncRustLangCatalogs(resolvedProjectNamespaceForCatalog)
     if (batchFailures.isNotEmpty()) {
         throw IllegalStateException(
             "Batch translation failed on ${batchFailures.size} file(s):\n${batchFailures.joinToString("\n")}",

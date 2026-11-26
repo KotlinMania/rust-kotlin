@@ -239,7 +239,7 @@ internal fun renderInlineWrapperCFunction(fn: InlineCFunctionSpec): String {
     val sb = StringBuilder()
     sb.append("${cHeaderTypeForInlineReturn(fn)} ${fn.wrapperSymbolName}(${formatCParamsDecl(fn.params)}) {\n")
     for (param in fn.params) {
-        if (!containsCIdentifier(fn.rawBody, param.cName)) {
+        if (!containsWholeIdentifier(fn.rawBody, param.cName)) {
             sb.append("    (void)${param.cName};\n")
         }
     }
@@ -588,37 +588,29 @@ internal fun FfiInteropCollector.renderNativeParamConversion(
     param: InteropParamSpec,
     noStringConvEnabled: Boolean,
     importsOut: MutableSet<String>,
-): String =
-    when (param.bridgeKind) {
-        CAbiBridgeKind.CONST_CSTR ->
-            when {
-                !noStringConvEnabled -> param.kotlinName
-                param.kotlinType == "String?" -> {
-                    importsOut += "kotlinx.cinterop.cstr"
-                    "${param.kotlinName}?.cstr"
-                }
-                param.kotlinType == "String" -> {
-                    importsOut += "kotlinx.cinterop.cstr"
-                    "${param.kotlinName}.cstr"
-                }
-                else -> renderPointerParamToCPointer(param, importsOut)
+): String {
+    val desc = bridgeDescriptorFor(param.bridgeKind)
+    if (param.bridgeKind == CAbiBridgeKind.CONST_CSTR) {
+        return when {
+            !noStringConvEnabled -> param.kotlinName
+            param.kotlinType == "String?" -> {
+                importsOut += "kotlinx.cinterop.cstr"
+                "${param.kotlinName}?.cstr"
             }
-        CAbiBridgeKind.MUT_CSTR,
-        CAbiBridgeKind.OPAQUE_PTR,
-        CAbiBridgeKind.FILE_PTR,
-        CAbiBridgeKind.DIR_PTR,
-        CAbiBridgeKind.CALLBACK_PTR,
-        -> renderPointerParamToCPointer(param, importsOut)
-        CAbiBridgeKind.I8 -> renderScalarParamArg(param, NumericKind.I8, "toByte")
-        CAbiBridgeKind.U8 -> renderScalarParamArg(param, NumericKind.U8, "toUByte")
-        CAbiBridgeKind.I16 -> renderScalarParamArg(param, NumericKind.I16, "toShort")
-        CAbiBridgeKind.U16 -> renderScalarParamArg(param, NumericKind.U16, "toUShort")
-        CAbiBridgeKind.I32 -> renderScalarParamArg(param, NumericKind.I32, "toInt")
-        CAbiBridgeKind.U32 -> renderScalarParamArg(param, NumericKind.U32, "toUInt")
-        CAbiBridgeKind.I64 -> renderScalarParamArg(param, NumericKind.I64, "toLong")
-        CAbiBridgeKind.U64 -> renderScalarParamArg(param, NumericKind.U64, "toULong")
-        else -> param.kotlinName
+            param.kotlinType == "String" -> {
+                importsOut += "kotlinx.cinterop.cstr"
+                "${param.kotlinName}.cstr"
+            }
+            else -> renderPointerParamToCPointer(param, importsOut)
+        }
     }
+    if (desc.isPointerAddress) return renderPointerParamToCPointer(param, importsOut)
+    val nk = desc.numericKind
+    if (nk != null && nk.isIntegerNumericKind()) {
+        return renderScalarParamArg(param, nk, conversionMethodForNumericKind(nk))
+    }
+    return param.kotlinName
+}
 
 internal fun FfiInteropCollector.renderNativeReturnConversion(
     rawCall: String,
@@ -673,7 +665,7 @@ internal fun inferRequiredHeaders(
     }
     for (fn in inlineFunctions) {
         for ((sym, hdrList) in C_SYMBOL_HEADERS) {
-            if (containsCIdentifier(fn.rawBody, sym)) specs.addAll(hdrList)
+            if (containsWholeIdentifier(fn.rawBody, sym)) specs.addAll(hdrList)
         }
     }
     return specs.filter { it.header !in preambleIncludes }.distinct()
@@ -711,35 +703,33 @@ private fun headersForCSymbol(symbol: String): List<PlatformHeaderSpec> =
     C_SYMBOL_HEADERS[symbol].orEmpty()
 
 private val PORTABLE_STD_HEADERS: Set<String> =
-    (
-        "assert.h ctype.h errno.h float.h inttypes.h limits.h locale.h math.h setjmp.h signal.h " +
-            "stdarg.h stdbool.h stddef.h stdint.h stdio.h stdlib.h string.h time.h wchar.h wctype.h " +
-            "fcntl.h sys/types.h sys/stat.h"
-    ).split(' ').toSet()
+    wordSet(
+        "assert.h ctype.h errno.h float.h inttypes.h limits.h locale.h math.h setjmp.h signal.h",
+        "stdarg.h stdbool.h stddef.h stdint.h stdio.h stdlib.h string.h time.h wchar.h wctype.h",
+        "fcntl.h sys/types.h sys/stat.h",
+    )
 
 private val COMMON_POSIX_HEADERS: Set<String> =
-    (
-        "unistd.h sys/mman.h sys/socket.h netinet/in.h arpa/inet.h netdb.h dlfcn.h pthread.h " +
-            "semaphore.h poll.h sys/ioctl.h sys/wait.h dirent.h sched.h strings.h utime.h sys/time.h " +
-            "sys/resource.h sys/uio.h sys/un.h sys/utsname.h termios.h pwd.h grp.h syslog.h fnmatch.h glob.h"
-    ).split(' ').toSet()
+    wordSet(
+        "unistd.h sys/mman.h sys/socket.h netinet/in.h arpa/inet.h netdb.h dlfcn.h pthread.h",
+        "semaphore.h poll.h sys/ioctl.h sys/wait.h dirent.h sched.h strings.h utime.h sys/time.h",
+        "sys/resource.h sys/uio.h sys/un.h sys/utsname.h termios.h pwd.h grp.h syslog.h fnmatch.h glob.h",
+    )
 
 private val LINUX_ONLY_SYMBOLS: Set<String> =
-    "epoll_create epoll_create1 epoll_ctl epoll_wait eventfd signalfd timerfd_create timerfd_settime timerfd_gettime memfd_create prctl"
-        .split(' ')
-        .toSet()
+    wordSet("epoll_create epoll_create1 epoll_ctl epoll_wait eventfd signalfd timerfd_create timerfd_settime timerfd_gettime memfd_create prctl")
 
-private val BSD_APPLE_ONLY_SYMBOLS: Set<String> = setOf("kqueue", "kevent")
+private val BSD_APPLE_ONLY_SYMBOLS: Set<String> = wordSet("kqueue kevent")
 
 private val POSIX_NON_WIN32_SYMBOLS: Set<String> =
-    (
-        "fork pipe link symlink readlink chown fchown getuid geteuid getgid getegid setenv unsetenv " +
-            "mmap munmap mprotect msync mlock munlock dlopen dlsym dlclose dlerror pthread_self " +
-            "pthread_equal pthread_detach pthread_join pthread_kill sem_init sem_destroy sem_wait " +
-            "sem_trywait sem_post poll ioctl wait waitpid opendir readdir closedir rewinddir chmod " +
-            "fchmod lstat mkfifo mknod sysconf sleep usleep strndup aligned_alloc fcntl openat fsync " +
-            "ftruncate truncate kill socketpair"
-    ).split(' ').toSet()
+    wordSet(
+        "fork pipe link symlink readlink chown fchown getuid geteuid getgid getegid setenv unsetenv",
+        "mmap munmap mprotect msync mlock munlock dlopen dlsym dlclose dlerror pthread_self",
+        "pthread_equal pthread_detach pthread_join pthread_kill sem_init sem_destroy sem_wait",
+        "sem_trywait sem_post poll ioctl wait waitpid opendir readdir closedir rewinddir chmod",
+        "fchmod lstat mkfifo mknod sysconf sleep usleep strndup aligned_alloc fcntl openat fsync",
+        "ftruncate truncate kill socketpair",
+    )
 
 internal fun isDirectCallSafeSymbol(fn: ForeignFnInteropSpec): Boolean =
     fn.dllName == null && DIRECT_C_SYMBOL_ARITY[fn.cSymbolName] == fn.params.size
@@ -813,24 +803,29 @@ private val C_SYMBOL_HEADERS: Map<String, List<PlatformHeaderSpec>> =
             listOf(PlatformHeaderSpec("sys/types.h"), PlatformHeaderSpec("sys/stat.h")),
             "stat fstat lstat mkdir chmod fchmod umask mkfifo mknod",
         )
-        register(
-            listOf(PlatformHeaderSpec("unistd.h", "!defined(_WIN32)", listOf("io.h", "process.h", "direct.h"))),
+        fun registerPosix(header: String, symbols: String, winFallbacks: List<String> = emptyList()) {
+            register(listOf(PlatformHeaderSpec(header, "!defined(_WIN32)", winFallbacks)), symbols)
+        }
+        registerPosix(
+            "unistd.h",
             "read write close lseek dup dup2 pipe chdir getcwd unlink rmdir access isatty getpid " +
                 "sleep usleep fsync ftruncate truncate link symlink readlink chown fchown geteuid getuid getegid getgid fork sysconf",
+            listOf("io.h", "process.h", "direct.h"),
         )
         register(listOf(PlatformHeaderSpec("stdlib.h"), PlatformHeaderSpec("unistd.h", "!defined(_WIN32)")), "setenv unsetenv")
-        register(listOf(PlatformHeaderSpec("sys/mman.h", "!defined(_WIN32)")), "mmap munmap mprotect msync mlock munlock")
-        register(
-            listOf(PlatformHeaderSpec("sys/socket.h", "!defined(_WIN32)", listOf("winsock2.h", "ws2tcpip.h"))),
+        registerPosix("sys/mman.h", "mmap munmap mprotect msync mlock munlock")
+        registerPosix(
+            "sys/socket.h",
             "socket bind listen accept connect send recv sendto recvfrom setsockopt getsockopt shutdown getsockname getpeername socketpair",
+            listOf("winsock2.h", "ws2tcpip.h"),
         )
-        register(listOf(PlatformHeaderSpec("dlfcn.h", "!defined(_WIN32)")), "dlopen dlsym dlclose dlerror")
-        register(listOf(PlatformHeaderSpec("pthread.h", "!defined(_WIN32)")), "pthread_create pthread_join pthread_detach pthread_self pthread_equal pthread_kill")
-        register(listOf(PlatformHeaderSpec("semaphore.h", "!defined(_WIN32)")), "sem_init sem_destroy sem_wait sem_trywait sem_post")
-        register(listOf(PlatformHeaderSpec("poll.h", "!defined(_WIN32)")), "poll")
-        register(listOf(PlatformHeaderSpec("sys/ioctl.h", "!defined(_WIN32)")), "ioctl")
-        register(listOf(PlatformHeaderSpec("sys/wait.h", "!defined(_WIN32)")), "wait waitpid")
-        register(listOf(PlatformHeaderSpec("dirent.h", "!defined(_WIN32)")), "opendir readdir closedir rewinddir")
+        registerPosix("dlfcn.h", "dlopen dlsym dlclose dlerror")
+        registerPosix("pthread.h", "pthread_create pthread_join pthread_detach pthread_self pthread_equal pthread_kill")
+        registerPosix("semaphore.h", "sem_init sem_destroy sem_wait sem_trywait sem_post")
+        registerPosix("poll.h", "poll")
+        registerPosix("sys/ioctl.h", "ioctl")
+        registerPosix("sys/wait.h", "wait waitpid")
+        registerPosix("dirent.h", "opendir readdir closedir rewinddir")
         register(listOf(PlatformHeaderSpec("sys/epoll.h", "defined(__linux__)")), "epoll_create epoll_create1 epoll_ctl epoll_wait")
         register(listOf(PlatformHeaderSpec("sys/event.h", BSD_APPLE_GUARD)), "kqueue kevent")
     }

@@ -1,5 +1,6 @@
 package io.github.kotlinmania.rustkotlin
 
+import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.rustkotlin.reused.starlark.AssignCount
 import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
@@ -12,6 +13,7 @@ import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.TraitItem
 import io.github.kotlinmania.syn.UnOp
 import io.github.kotlinmania.syn.gen.Visit
+
 internal fun KotlinJ2KEmitter.atomicRecvExpr(
     expr: Expr,
     rendered: String,
@@ -57,6 +59,26 @@ internal fun KotlinJ2KEmitter.markNonNullChecked(
 
 private val NARROW_INTEGER_KINDS: Set<NumericKind> =
     setOf(NumericKind.U8, NumericKind.U16, NumericKind.I8, NumericKind.I16)
+
+private fun KotlinJ2KEmitter.renderNarrowCoercedNumericExpr(
+    operand: Expr,
+    elemKind: NumericKind?,
+    indent: String,
+    selfTypeName: String?,
+): String {
+    if (elemKind == null) return renderExpr(operand, indent, selfTypeName)
+    val rendered = renderTypedNumericInitializer(operand, elemKind, indent, selfTypeName)
+    val expectedSuffix = NUMERIC_COERCE_SUFFIX_BY_KIND[elemKind]
+    val alreadyConverted =
+        expectedSuffix == null ||
+            elemKind !in NARROW_INTEGER_KINDS ||
+            rendered.endsWith(".$expectedSuffix")
+    return if (!alreadyConverted && inferExprNumericKind(operand, selfTypeName) != elemKind) {
+        coerceRenderedNumericExpr(operand, rendered, elemKind)
+    } else {
+        rendered
+    }
+}
 
 private fun KotlinJ2KEmitter.isSafeInlineRepeatOperand(expr: Expr): Boolean =
     when (val core = unwrapParenOrGroupExpr(expr)) {
@@ -115,22 +137,11 @@ private fun KotlinJ2KEmitter.renderArrayOrRepeatExpr(
     val elemParseTarget = targetTy?.let { extractIndexedElementRenderedType(it, selfTypeName) }
     val prevParseTarget = currentExpectedParseTargetType
     currentExpectedParseTargetType = elemParseTarget
-    fun renderElement(elem: Expr): String {
-        if (elemKind == null) return renderExpr(elem, indent, selfTypeName)
-        val renderedElem = renderTypedNumericInitializer(elem, elemKind, indent, selfTypeName)
-        val expectedSuffix = NUMERIC_COERCE_SUFFIX_BY_KIND[elemKind]
-        val alreadyConverted = expectedSuffix == null || elemKind !in NARROW_INTEGER_KINDS || renderedElem.endsWith(".$expectedSuffix")
-        return if (!alreadyConverted && inferExprNumericKind(elem, selfTypeName) != elemKind) {
-            coerceRenderedNumericExpr(elem, renderedElem, elemKind)
-        } else {
-            renderedElem
-        }
-    }
     val isMutableList = targetTy?.startsWith("MutableList<") == true
     return if (elems != null) {
         val renderedElems =
             try {
-                elems.joinToString(", ") { renderElement(it) }
+                elems.joinToString(", ") { renderNarrowCoercedNumericExpr(it, elemKind, indent, selfTypeName) }
             } finally {
                 currentExpectedParseTargetType = prevParseTarget
             }
@@ -139,7 +150,7 @@ private fun KotlinJ2KEmitter.renderArrayOrRepeatExpr(
         val (repExpr, lenExpr) = repeatSpec!!
         val renderedElem =
             try {
-                renderElement(repExpr)
+                renderNarrowCoercedNumericExpr(repExpr, elemKind, indent, selfTypeName)
             } finally {
                 currentExpectedParseTargetType = prevParseTarget
             }
@@ -187,27 +198,20 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                         ?.substringAfter('<')
                         ?.dropLast(1)
                 val cfComma = cfTypeArgsInner?.let(::findTopLevelGenericCommaIndex) ?: -1
-                val cfBreakFirstTypeArg =
-                    if (cfTypeArgsInner != null && cfComma >= 0) {
-                        cfTypeArgsInner.substring(0, cfComma).trim().takeIf(::isUsableExplicitResultTypeArg)
-                    } else {
-                        null
-                    }
-                val cfBreakTypeArgs =
-                    if (cfTypeArgsInner != null && cfComma >= 0) {
-                        buildExplicitResultTypeArgsSuffix(cfTypeArgsInner.substring(0, cfComma), cfTypeArgsInner.substring(cfComma + 1))
-                    } else {
-                        ""
-                    }
-                val isUntypedCf = exprInferredTy != null && exprBase != "ControlFlow"
-                val elseArm = if (isUntypedCf) "; else -> error(\"Unexpected ControlFlow variant: \$tryResult\")" else ""
-                val cfBreakPayload =
-                    if (isUntypedCf && cfBreakFirstTypeArg != null) {
-                        "(tryResult.cfBreakValue() as $cfBreakFirstTypeArg)"
-                    } else {
-                        "tryResult.cfBreakValue()"
-                    }
-                "when (val tryResult = $inner) { is ControlFlow.Continue<*, *> -> tryResult.cfContinueValue(); is ControlFlow.Break<*, *> -> $retKw ControlFlow.Break$cfBreakTypeArgs($cfBreakPayload)$elseArm }"
+                val cfFirstArg = if (cfTypeArgsInner != null && cfComma >= 0) cfTypeArgsInner.substring(0, cfComma) else null
+                val cfSecondArg = if (cfTypeArgsInner != null && cfComma >= 0) cfTypeArgsInner.substring(cfComma + 1) else null
+                renderTaggedTwoArmTry(
+                    scrutineeExpr = inner,
+                    returnKeyword = retKw,
+                    sumTypeName = "ControlFlow",
+                    continueArmSimple = "Continue",
+                    continueAccessor = "cfContinueValue()",
+                    earlyReturnArmSimple = "Break",
+                    earlyReturnAccessor = "cfBreakValue()",
+                    earlyReturnTypeArgs = buildExplicitResultTypeArgsSuffix(cfFirstArg, cfSecondArg),
+                    castEarlyPayloadTo = cfFirstArg?.trim()?.takeIf(::isUsableExplicitResultTypeArg),
+                    isUntypedScrutinee = exprInferredTy != null && exprBase != "ControlFlow",
+                )
             } else if (enclosingRet != null &&
                 enclosingRet.endsWith("?") &&
                 !enclosingRet.startsWith("Result<") &&
@@ -409,25 +413,12 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                 val elemKind = resolveNumericKind(elemTy)
                 val savedKind = currentExpectedNumericKind
                 val savedParseTarget = currentExpectedParseTargetType
-                fun renderRangeBound(boundExpr: Expr): String {
-                    if (elemKind == null) return renderExpr(boundExpr, indent, selfTypeName)
-                    val renderedBound = renderTypedNumericInitializer(boundExpr, elemKind, indent, selfTypeName)
-                    val expectedSuffix = NUMERIC_COERCE_SUFFIX_BY_KIND[elemKind]
-                    val alreadyConverted =
-                        expectedSuffix == null ||
-                            elemKind !in NARROW_INTEGER_KINDS ||
-                            renderedBound.endsWith(".$expectedSuffix")
-                    return if (!alreadyConverted && inferExprNumericKind(boundExpr, selfTypeName) != elemKind) {
-                        coerceRenderedNumericExpr(boundExpr, renderedBound, elemKind)
-                    } else {
-                        renderedBound
-                    }
-                }
                 val (startRendered, endRendered) =
                     try {
                         currentExpectedNumericKind = elemKind
                         currentExpectedParseTargetType = elemTy
-                        renderRangeBound(exprStart) to renderRangeBound(exprEnd)
+                        renderNarrowCoercedNumericExpr(exprStart, elemKind, indent, selfTypeName) to
+                            renderNarrowCoercedNumericExpr(exprEnd, elemKind, indent, selfTypeName)
                     } finally {
                         currentExpectedNumericKind = savedKind
                         currentExpectedParseTargetType = savedParseTarget
@@ -464,18 +455,10 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
             "while (true) $body"
         }
         is Expr.Match -> renderExprMatch(expr, indent, selfTypeName)
-        is Expr.BlockExpr -> {
-            renderBlockAsExpression(expr.block, indent, selfTypeName)
-        }
-        is Expr.Unsafe -> {
-            renderBlockAsExpression(expr.block, indent, selfTypeName)
-        }
-        is Expr.Async -> {
-            renderBlockAsExpression(expr.block, indent, selfTypeName)
-        }
-        is Expr.Const -> {
-            renderBlockAsExpression(expr.block, indent, selfTypeName)
-        }
+        is Expr.BlockExpr -> renderBlockAsExpression(expr.block, indent, selfTypeName)
+        is Expr.Unsafe -> renderBlockAsExpression(expr.block, indent, selfTypeName)
+        is Expr.Async -> renderBlockAsExpression(expr.block, indent, selfTypeName)
+        is Expr.Const -> renderBlockAsExpression(expr.block, indent, selfTypeName)
         is Expr.Return -> {
             val retNumKind = currentEnclosingReturnRenderedType?.let(this::resolveNumericKind)
             val valExpr =
@@ -499,28 +482,27 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
             if (valExpr != null) "$retKw $valExpr" else retKw
         }
         is Expr.Break -> {
-            val valExpr = expr.expr?.let { renderExpr(it, indent, selfTypeName) }
-            if (valExpr != null) "break" else "break"
+            expr.expr?.let { renderExpr(it, indent, selfTypeName) }
+            "break"
         }
         is Expr.Continue -> "continue"
-        is Expr.Let -> {
-            val patCond = renderIfLetCondition(expr.pat, expr.expr, indent, selfTypeName)
-            patCond
-        }
-        is Expr.Macro -> {
+        is Expr.Let -> renderIfLetCondition(expr.pat, expr.expr, indent, selfTypeName)
+        is Expr.Macro ->
             CoreIntrinsicLowering.renderConstEvalSelectMacro(expr.mac, this, indent, selfTypeName)
                 ?: renderMacroInvocationAsStmtOrExpr(expr.mac, indent, selfTypeName)
-        }
-        is Expr.TryBlock -> {
-            renderBlockAsExpression(expr.block, indent, selfTypeName)
-        }
+        is Expr.TryBlock -> renderBlockAsExpression(expr.block, indent, selfTypeName)
         is Expr.Yield -> {
             val valExpr = expr.expr?.let { renderExpr(it, indent, selfTypeName) }
             if (valExpr != null) "yield($valExpr)" else "yield()"
         }
         is Expr.Infer -> "_"
-        is Expr.Verbatim -> ""
+        is Expr.Verbatim -> renderVerbatimExprTokens(expr.tokens)
     }
+
+private fun renderVerbatimExprTokens(stream: TokenStream): String {
+    if (stream.isEmpty()) return ""
+    return RustTokenStreamKotlinEmitter(stream.clone().toList()).render()
+}
 
 internal fun KotlinJ2KEmitter.renderBlockAsExpression(block: Block, indent: String, selfTypeName: String?): String {
     val stmts = block.stmts
@@ -865,19 +847,10 @@ internal fun KotlinJ2KEmitter.renderStructPrimitiveArrayFieldInit(
     return when (initExpr) {
         is Expr.Array -> {
             val fnName =
-                when (arrayType) {
-                    "ByteArray" -> "byteArrayOf"
-                    "UByteArray" -> "ubyteArrayOf"
-                    "ShortArray" -> "shortArrayOf"
-                    "UShortArray" -> "ushortArrayOf"
-                    "IntArray" -> "intArrayOf"
-                    "UIntArray" -> "uintArrayOf"
-                    "LongArray" -> "longArrayOf"
-                    "ULongArray" -> "ulongArrayOf"
-                    "FloatArray" -> "floatArrayOf"
-                    "DoubleArray" -> "doubleArrayOf"
-                    "BooleanArray" -> "booleanArrayOf"
-                    else -> "listOf"
+                if (arrayType in PRIMITIVE_ARRAY_TYPES) {
+                    "${arrayType.removeSuffix("Array").lowercase()}ArrayOf"
+                } else {
+                    "listOf"
                 }
             val elems =
                 initExpr.elems.toList().joinToString(", ") { elem ->
@@ -1115,36 +1088,28 @@ internal fun KotlinJ2KEmitter.renderClosureParam(
         else -> "param$idx"
     }
 
-internal fun KotlinJ2KEmitter.collectUsedRawIdentsInExpr(expr: Expr): Set<String> {
-    val used = linkedSetOf<String>()
-    val visitor =
-        object : Visit() {
-            override fun visitExprPath(e: Expr.Path) {
-                if (e.qself == null && e.path.segments.len() == 1) {
-                    val firstSeg = e.path.segments.first()
-                    val raw = firstSeg?.ident?.toString()?.removePrefix("r#")
-                    if (raw != null) used += raw
-                }
-                super.visitExprPath(e)
-            }
-        }
-    visitor.visitExpr(expr)
-    return used
+private class SingleSegmentRawIdentCollector : Visit() {
+    private val used = linkedSetOf<String>()
+
+    override fun visitExprPath(e: Expr.Path) {
+        val seg = e.unqualifiedPath()?.singleSegment()
+        if (seg != null) used += seg.cleanIdent()
+        super.visitExprPath(e)
+    }
+
+    fun collectExpr(expr: Expr): Set<String> {
+        visitExpr(expr)
+        return used
+    }
+
+    fun collectBlock(block: Block): Set<String> {
+        visitBlock(block)
+        return used
+    }
 }
 
-internal fun KotlinJ2KEmitter.collectUsedRawIdentsInBlock(block: Block): Set<String> {
-    val used = linkedSetOf<String>()
-    val visitor =
-        object : Visit() {
-            override fun visitExprPath(e: Expr.Path) {
-                if (e.qself == null && e.path.segments.len() == 1) {
-                    val firstSeg = e.path.segments.first()
-                    val raw = firstSeg?.ident?.toString()?.removePrefix("r#")
-                    if (raw != null) used += raw
-                }
-                super.visitExprPath(e)
-            }
-        }
-    visitor.visitBlock(block)
-    return used
-}
+internal fun KotlinJ2KEmitter.collectUsedRawIdentsInExpr(expr: Expr): Set<String> =
+    SingleSegmentRawIdentCollector().collectExpr(expr)
+
+internal fun KotlinJ2KEmitter.collectUsedRawIdentsInBlock(block: Block): Set<String> =
+    SingleSegmentRawIdentCollector().collectBlock(block)

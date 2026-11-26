@@ -1,7 +1,6 @@
 package io.github.kotlinmania.rustkotlin
 
 import io.github.kotlinmania.procmacro2.Ident
-import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.Fields
@@ -26,7 +25,6 @@ import io.github.kotlinmania.syn.UseTree
 import io.github.kotlinmania.syn.WherePredicate
 import io.github.kotlinmania.syn.gen.Fold
 import io.github.kotlinmania.syn.gen.Visit
-import io.github.kotlinmania.syn.parse2
 import io.github.kotlinmania.syn.span
 import io.github.kotlinmania.syn.token.Const
 import io.github.kotlinmania.syn.token.Mut
@@ -1275,8 +1273,7 @@ private class SourceAstTypeInferrer(
         private val POINTER_CONTAINER_WRAPPERS = wordSet("NonNull Vec Box Unique")
         private val INTEGER_LITERAL_SUFFIXES = wordSet("i8 u8 i16 u16 i32 u32 i64 u64 i128 u128 isize usize")
 
-        private fun parseU8SynType(): SynType =
-            parse2(SynType.Companion::parse, TokenStream.fromString("u8").getOrThrow()).getOrThrow()
+        private fun parseU8SynType(): SynType = SynAstFragmentParser.u8SynType()
     }
 }
 

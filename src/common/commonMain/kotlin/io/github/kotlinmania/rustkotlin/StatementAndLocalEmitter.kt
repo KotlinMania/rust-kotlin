@@ -1,9 +1,7 @@
 package io.github.kotlinmania.rustkotlin
 
-import io.github.kotlinmania.procmacro2.Delimiter
 import io.github.kotlinmania.procmacro2.Span
 import io.github.kotlinmania.procmacro2.TokenStream
-import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.syn.Block
 import io.github.kotlinmania.syn.Expr
 import io.github.kotlinmania.syn.FieldValue
@@ -12,6 +10,7 @@ import io.github.kotlinmania.syn.Item
 import io.github.kotlinmania.syn.Lit
 import io.github.kotlinmania.syn.Macro
 import io.github.kotlinmania.syn.Member
+import io.github.kotlinmania.syn.Meta
 import io.github.kotlinmania.syn.ModContent
 import io.github.kotlinmania.syn.Pat
 import io.github.kotlinmania.syn.Path
@@ -20,6 +19,7 @@ import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.UnOp
 import io.github.kotlinmania.syn.gen.Visit
+import io.github.kotlinmania.syn.gen.clone
 import io.github.kotlinmania.syn.span
 
 internal fun KotlinJ2KEmitter.singlePlainPathCleanIdent(expr: Expr?): String? {
@@ -107,53 +107,29 @@ internal object BorrowedPlacePropertyDelegateTemplate {
         }
 }
 
-private class StmtLeadingCfgScanner(
-    stmt: Stmt,
-) : RustTokenCursor(stmt.toTokenStream().toList()) {
-    inline fun forEachLeadingCfgPredicate(visit: (List<TokenTree>) -> Unit) {
-        var idx = 0
-        while (idx + 1 < size) {
-            val bracket = groupAt(idx + 1, Delimiter.Bracket)
-            if (punctCharAt(idx) != '#' || bracket == null) break
-            val attrCursor = RustTokenCursor(bracket.stream().toList())
-            val predGroup = attrCursor.groupAt(1, Delimiter.Parenthesis)
-            if (attrCursor.size == 2 && attrCursor.identAt(0) == "cfg" && predGroup != null) {
-                visit(predGroup.stream().toList())
-            }
-            idx += 2
-        }
+private fun Stmt.nonDrainingSpan(): Span =
+    when (this) {
+        is Stmt.Local -> attrs.firstOrNull()?.poundToken?.span ?: letToken.span
+        is Stmt.MacroStmt -> attrs.firstOrNull()?.poundToken?.span ?: mac.path.span()
+        is Stmt.ItemStmt -> item.clone().span()
+        is Stmt.ExprStmt -> expr.deepCopy().span()
     }
-}
 
-internal fun isLeadingCfgStmtDisabled(stmt: Stmt): Boolean {
-    StmtLeadingCfgScanner(stmt).forEachLeadingCfgPredicate { predTrees ->
-        if (isDocOnlyCfgPredicateTokens(predTrees)) return true
-    }
-    return false
-}
-
-private fun canonicalTokenSequenceKey(trees: List<TokenTree>): String =
-    trees.joinToString(" ") { tt ->
-        when (tt) {
-            is TokenTree.Ident -> "I:${tt.value}"
-            is TokenTree.Punct -> "P:${tt.value.asChar()}:${tt.value.spacing()}"
-            is TokenTree.Literal -> "L:${tt.value}"
-            is TokenTree.Group -> "G:${tt.value.delimiter()}(${canonicalTokenSequenceKey(tt.value.stream().toList())})"
-        }
+internal fun isLeadingCfgStmtDisabled(stmt: Stmt): Boolean =
+    stmt.leadingOuterAttributes().any { attr ->
+        val meta = attr.meta
+        meta is Meta.List && meta.path.isIdent("cfg") && isDocOnlyCfgPredicateTokens(meta.tokens.clone().toList())
     }
 
 private fun extractLeadingCfgSignature(stmt: Stmt): Pair<Boolean, String>? {
     var found: Pair<Boolean, String>? = null
-    StmtLeadingCfgScanner(stmt).forEachLeadingCfgPredicate { predTrees ->
-        if (found != null) return null
-        val predCursor = RustTokenCursor(predTrees)
-        val negGroup = predCursor.groupAt(1, Delimiter.Parenthesis)
-        found =
-            if (predCursor.size == 2 && predCursor.identAt(0) == "not" && negGroup != null) {
-                false to canonicalTokenSequenceKey(negGroup.stream().toList())
-            } else {
-                true to canonicalTokenSequenceKey(predTrees)
-            }
+    for (attr in stmt.leadingOuterAttributes()) {
+        val meta = attr.meta
+        if (meta is Meta.List && meta.path.isIdent("cfg")) {
+            if (found != null) return null
+            val sig = RustTokenCursor.extractCfgComplementSignature(meta.tokens.clone().toList()) ?: continue
+            found = !sig.second to sig.first
+        }
     }
     return found
 }
@@ -365,7 +341,7 @@ private class BlockEmissionScope(
             val renderedI = hoistedItems[i].second
             for (j in 0 until n) {
                 val nameJ = hoistedItems[j].first
-                if (i != j && nameJ != null && emitter.containsWholeIdentifier(renderedI, nameJ)) deps[i] += j
+                if (i != j && nameJ != null && containsWholeIdentifier(renderedI, nameJ)) deps[i] += j
             }
         }
         val emitted = BooleanArray(n)
@@ -532,8 +508,8 @@ private class BlockEmissionScope(
         if (nextMac != null) {
             val delim = emitter.extractDelimitedMacroParts(nextMac, innerIndent, selfTypeName)
             if (delim != null && delim.second == rawVar) {
-                val trivia1 = emitter.renderLeadingTriviaForSpan(stmt.span(), innerIndent)
-                val trivia2 = emitter.renderLeadingTriviaForSpan(nextStmt.span(), innerIndent)
+                val trivia1 = emitter.renderLeadingTriviaForSpan(stmt.nonDrainingSpan(), innerIndent)
+                val trivia2 = emitter.renderLeadingTriviaForSpan(nextStmt.nonDrainingSpan(), innerIndent)
                 val ktVar = emitter.bindScopedValueIdent(rawVar, identPat.ident.span(), identPat.mutability != null)
                 val tryCall = emitter.renderSourceResultTry("${delim.first}(${delim.third})", "return")
                 if (nextStmt is Stmt.MacroStmt) {
@@ -602,7 +578,7 @@ private class BlockEmissionScope(
         val borrowFn = if (isMut) "borrowMut" else "borrow"
         val useFn = if (isStringMut) "useMut" else "use"
         val guardVarTy = if (isStringMut) "RefMut<String>" else innerTy
-        val triviaPrefix = emitter.renderLeadingTriviaForSpan(stmt.span(), innerIndent)
+        val triviaPrefix = emitter.renderLeadingTriviaForSpan(stmt.nonDrainingSpan(), innerIndent)
         val guardCapturesTail = returnsValue && scopeEnd == endIdx && effectiveLastExecIdx in (idx + 1) until scopeEnd
 
         val prevTyped = emitter.currentTypedLocals
@@ -736,28 +712,21 @@ private fun KotlinJ2KEmitter.exprAlwaysDiverges(expr: Expr): Boolean =
     }
 
 internal fun KotlinJ2KEmitter.sanitizeBatchBlockLocals(lines: MutableList<String>) {
-    val singleLineDeclRegex = Regex("^(\\s*)(val|var)\\s+([a-zA-Z_][a-zA-Z0-9_]*)(\\s*:\\s*[^=\\n]+)?\\s*=\\s*([^\\n]+)$")
     for (i in lines.indices.reversed()) {
         val entryLines = lines[i].split('\n')
         val firstCodeIdx = entryLines.indexOfFirst { !it.trimStart().startsWith("//") }
         if (firstCodeIdx < 0 || entryLines.size - firstCodeIdx != 1) continue
         val triviaPart = if (firstCodeIdx > 0) entryLines.subList(0, firstCodeIdx).joinToString("\n") else ""
-        val match = singleLineDeclRegex.matchEntire(entryLines[firstCodeIdx]) ?: continue
-        val groups = match.groupValues
-        val ident = groups[3]
+        val decl = KotlinTokenWalker(entryLines[firstCodeIdx]).parseSingleLineLocalDeclaration() ?: continue
         val afterText = if (i + 1 < lines.size) lines.subList(i + 1, lines.size).joinToString("\n") else ""
-        if (!containsWholeIdentifier(afterText, ident)) {
+        val afterWalker = KotlinTokenWalker(afterText)
+        if (!afterWalker.containsIdentifier(decl.ident)) {
             if (triviaPart.isNotEmpty()) lines[i] = triviaPart else lines.removeAt(i)
             continue
         }
-        if (groups[2] == "var") {
-            val isReassigned =
-                Regex("(?<![.\\w])${Regex.escape(ident)}\\s*(?:[+\\-*/%]?=(?![=>])|\\+\\+|--)").containsMatchIn(afterText) ||
-                    Regex("(?:\\+\\+|--)\\s*${Regex.escape(ident)}\\b").containsMatchIn(afterText)
-            if (!isReassigned) {
-                val updatedCode = "${groups[1]}val $ident${groups[4]} = ${groups[5]}"
-                lines[i] = if (triviaPart.isNotEmpty()) "$triviaPart\n$updatedCode" else updatedCode
-            }
+        if (decl.keyword == "var" && !afterWalker.isIdentifierMutated(decl.ident)) {
+            val updatedCode = "${decl.indent}val ${decl.ident}${decl.typeClause} = ${decl.rhs}"
+            lines[i] = if (triviaPart.isNotEmpty()) "$triviaPart\n$updatedCode" else updatedCode
         }
     }
 }
@@ -813,8 +782,8 @@ internal fun KotlinJ2KEmitter.tryRenderDeferredLocalResultMatchInit(
         }
     if (!assignsTarget) return null
 
-    val trivia1 = renderLeadingTriviaForSpan(localStmt.span(), innerIndent)
-    val trivia2 = renderLeadingTriviaForSpan(matchStmt.span(), innerIndent)
+    val trivia1 = renderLeadingTriviaForSpan(localStmt.nonDrainingSpan(), innerIndent)
+    val trivia2 = renderLeadingTriviaForSpan(matchStmt.nonDrainingSpan(), innerIndent)
     val subjectRendered = renderExpr(matchExpr.expr, innerIndent, selfTypeName)
     val okTuple = unwrapTransparentPat(armPattern(okArm)) as Pat.TupleStruct
     val okSubPat = okTuple.elems.toList().firstOrNull()
@@ -913,7 +882,7 @@ internal fun KotlinJ2KEmitter.renderStmt(
     localSignatures: MutableMap<String, Int> = linkedMapOf(),
     remainingStmts: List<Stmt> = emptyList(),
 ): String {
-    val triviaPrefix = renderLeadingTriviaForSpan(stmt.span(), indent)
+    val triviaPrefix = renderLeadingTriviaForSpan(stmt.nonDrainingSpan(), indent)
     val body =
         when (stmt) {
             is Stmt.Local -> renderStmtLocal(stmt, indent, selfTypeName, remainingStmts)
@@ -1227,10 +1196,10 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
 
     val unwrappedPat = unwrapTransparentPat(pat)
     if (unwrappedPat is Pat.Struct && diverge == null) {
-        return renderStructDestructuringLocal(unwrappedPat, rhs, local.span(), indent, selfTypeName)
+        return renderStructDestructuringLocal(unwrappedPat, rhs, local.nonDrainingSpan(), indent, selfTypeName)
     }
     if (unwrappedPat is Pat.TupleStruct && diverge == null) {
-        renderTupleStructDestructuringLocal(unwrappedPat, initExpr, rhs, local.span(), indent, selfTypeName)?.let { return it }
+        renderTupleStructDestructuringLocal(unwrappedPat, initExpr, rhs, local.nonDrainingSpan(), indent, selfTypeName)?.let { return it }
     }
     val divergeBody =
         diverge?.expr?.let { divergeExpr ->
@@ -1751,7 +1720,7 @@ private object ScopedBorrowedPlaceLocalLowering : LocalBindingLowering() {
                 override fun visitMacro(m: Macro) {
                     // Token-only macro arguments have not been resolved to expressions.
                     // Do not classify a hidden pointer use as a dereference.
-                    if (emitter.containsWholeIdentifier(m.tokens.toString(), raw)) escapes = true
+                    if (RustTokenCursor.containsAnyIdentRecursive(m.tokens, setOf(raw))) escapes = true
                     super.visitMacro(m)
                 }
             }
@@ -1805,13 +1774,7 @@ private class AddressableLocalUsageScanner(
     private fun isSelfIdentPath(expr: Expr?): Boolean = emitter.singlePlainPathCleanIdent(expr) == raw
 
     private fun tokenStreamContainsSelfIdent(stream: TokenStream): Boolean =
-        stream.clone().toList().any { tt ->
-            when (tt) {
-                is TokenTree.Ident -> tt.value.toString().removePrefix("r#") == raw
-                is TokenTree.Group -> tokenStreamContainsSelfIdent(tt.value.stream())
-                else -> false
-            }
-        }
+        RustTokenCursor.containsAnyIdentRecursive(stream, setOf(raw))
 
     override fun visitExprPath(e: Expr.Path) {
         if (e.qself == null && e.path.isIdent(raw)) totalPathMentions++
@@ -2025,7 +1988,7 @@ private object AddressableLocalLowering : LocalBindingLowering() {
                 emitter.currentExpectedParseTargetType = previousTarget
             }
         val (boundName, _) = emitter.renderLocalPattern(local.pat, selfTypeName, includeCtorInTupleStruct = false, bindToScope = true)
-        val startPos = local.span().start()
+        val startPos = local.nonDrainingSpan().start()
         val storage = "localStorageL${startPos.line}C${startPos.column}"
         emitter.currentAddressableLocals = emitter.currentAddressableLocals + (boundName to storage)
         emitter.recordLocalInferredType(boundName, type, init, rhs, selfTypeName, null, pat = local.pat)
@@ -2152,7 +2115,7 @@ internal fun KotlinJ2KEmitter.renderTupleStructDestructuringLocal(
     val isMutBorrow =
         (unwrappedInit is Expr.Reference && unwrappedInit.mutability != null) ||
             (unwrappedInit is Expr.Path && unwrappedInit.qself == null && unwrappedInit.path.isIdent("self") && currentReceiverIsMutBorrow)
-    val isSimpleRhs = rhsTrimmed == "this" || rhsTrimmed.matches(Regex("[A-Za-z_][A-Za-z0-9_]*"))
+    val isSimpleRhs = KotlinTokenWalker(rhsTrimmed).isSingleSimpleIdentifierOrThis()
     val lines = mutableListOf<String>()
     val receiverVar = bindDestructuringReceiverIfNeeded(rhsTrimmed, isSimpleRhs, "_tupleStruct", "tupleStructVal", span, indent, lines)
     val arity = elems.size

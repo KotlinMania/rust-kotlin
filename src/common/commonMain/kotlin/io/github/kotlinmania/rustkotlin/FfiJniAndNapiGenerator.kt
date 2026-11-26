@@ -265,11 +265,20 @@ private class JniHostSourceEmitter(
         if (!collector.usesCppLanguage) appendPreambles(sb)
     }
 
+    private fun beginJniFunction(
+        jniRet: String,
+        wrapperSym: String,
+        paramsSig: String = "JNIEnv* km_env, jclass km_clazz",
+        prefixText: String = "",
+    ): StringBuilder =
+        StringBuilder(prefixText).apply {
+            append("JNIEXPORT $jniRet JNICALL ${jniSymbolFor(wrapperSym)}($paramsSig) {\n")
+            append("    (void)km_env;\n    (void)km_clazz;\n")
+        }
+
     override fun renderStaticGetter(st: ForeignStaticInteropSpec): String {
-        val sb = StringBuilder()
         val jniRet = jniCTypeForReturn(st.bridgeKind)
-        sb.append("JNIEXPORT $jniRet JNICALL ${jniSymbolFor(st.getterWrapperSymbolName)}(JNIEnv* km_env, jclass km_clazz) {\n")
-        sb.append("    (void)km_env;\n    (void)km_clazz;\n")
+        val sb = beginJniFunction(jniRet, st.getterWrapperSymbolName)
         val cRet = appendStaticSymbolPtrLookup(sb, st)
         sb.append("    $cRet km_res = (km_sym_ptr != NULL) ? *km_sym_ptr : ${cDefaultFailureLiteral(st.bridgeKind)};\n")
         sb.append("    return ${jniReturnCastExpr(st.bridgeKind, jniRet)};\n}\n")
@@ -277,23 +286,18 @@ private class JniHostSourceEmitter(
     }
 
     override fun renderStaticSetter(st: ForeignStaticInteropSpec): String {
-        val sb = StringBuilder()
         val jniValType = jniCTypeForParam(st.asSetterParamSpec(), noStringConvEnabled = true)
-        sb.append("JNIEXPORT void JNICALL ${jniSymbolFor(st.setterWrapperSymbolName)}(JNIEnv* km_env, jclass km_clazz, $jniValType value) {\n")
-        sb.append("    (void)km_env;\n    (void)km_clazz;\n")
+        val sb = beginJniFunction("void", st.setterWrapperSymbolName, "JNIEnv* km_env, jclass km_clazz, $jniValType value")
         val cRet = appendStaticSymbolPtrLookup(sb, st)
         sb.append("    if (km_sym_ptr != NULL) {\n        *km_sym_ptr = ${jniPointerOrValueCast(st.bridgeKind, "value", cRet)};\n    }\n}\n")
         return sb.toString()
     }
 
     override fun renderForeignFunction(fn: ForeignFnInteropSpec): String {
-        val sb = StringBuilder()
         val noStrConv = requiresNoStringConversion(fn.params)
         val jniRet = jniCTypeForReturn(fn.returnBridgeKind)
         val hasReturn = hasNonVoidReturn(fn.returnBridgeKind)
-
-        sb.append("JNIEXPORT $jniRet JNICALL ${jniSymbolFor(fn.wrapperSymbolName)}(${formatJniParamsSig(fn.params, noStrConv, fn.isVariadic)}) {\n")
-        sb.append("    (void)km_env;\n    (void)km_clazz;\n")
+        val sb = beginJniFunction(jniRet, fn.wrapperSymbolName, formatJniParamsSig(fn.params, noStrConv, fn.isVariadic))
 
         val (stringParams, callArgs) = appendJniStringParamSetupAndCallArgs(sb, fn.params, noStrConv)
         val isAtexit = isAtexitForeignFn(fn)
@@ -323,15 +327,11 @@ private class JniHostSourceEmitter(
     }
 
     override fun renderInlineFunction(fn: InlineCFunctionSpec): String {
-        val sb = StringBuilder()
         val inlineNoStrConv = requiresNoStringConversion(fn.params)
         val jniRet = jniCTypeForReturn(fn.returnBridgeKind)
         val hasReturn = hasNonVoidReturn(fn.returnBridgeKind)
-        if (!collector.usesCppLanguage && !fn.isCpp) {
-            sb.append("static ").append(renderInlineWrapperCFunction(fn)).append('\n')
-        }
-        sb.append("JNIEXPORT $jniRet JNICALL ${jniSymbolFor(fn.wrapperSymbolName)}(${formatJniParamsSig(fn.params, inlineNoStrConv)}) {\n")
-        sb.append("    (void)km_env;\n    (void)km_clazz;\n")
+        val helperPrefix = if (!collector.usesCppLanguage && !fn.isCpp) "static ${renderInlineWrapperCFunction(fn)}\n" else ""
+        val sb = beginJniFunction(jniRet, fn.wrapperSymbolName, formatJniParamsSig(fn.params, inlineNoStrConv), helperPrefix)
         if (collector.usesCppLanguage || fn.isCpp) {
             for (p in fn.params) sb.append("    (void)${p.cName};\n")
             if (hasReturn) {
@@ -496,10 +496,14 @@ private class NapiCppHostSourceEmitter(
         sb.append(NAPI_ARG_HELPERS_CPP)
     }
 
+    private fun beginNapiFunction(wrapperSym: String, prefixText: String = ""): StringBuilder =
+        StringBuilder(prefixText).apply {
+            append("static Napi::Value ${wrapperSym}_napi(const Napi::CallbackInfo& km_info) {\n")
+            append("    Napi::Env km_env = km_info.Env();\n")
+        }
+
     override fun renderStaticGetter(st: ForeignStaticInteropSpec): String {
-        val sb = StringBuilder()
-        sb.append("static Napi::Value ${st.getterWrapperSymbolName}_napi(const Napi::CallbackInfo& km_info) {\n")
-        sb.append("    Napi::Env km_env = km_info.Env();\n")
+        val sb = beginNapiFunction(st.getterWrapperSymbolName)
         val cRet = appendStaticSymbolPtrLookup(sb, st)
         sb.append("    $cRet km_res = (km_sym_ptr != nullptr) ? *km_sym_ptr : ${cDefaultFailureLiteral(st.bridgeKind)};\n")
         sb.append(renderNapiReturnStatement(st.bridgeKind)).append("}\n")
@@ -507,10 +511,8 @@ private class NapiCppHostSourceEmitter(
     }
 
     override fun renderStaticSetter(st: ForeignStaticInteropSpec): String {
-        val sb = StringBuilder()
         val cRet = cHeaderTypeForBridge(st.bridgeKind)
-        sb.append("static Napi::Value ${st.setterWrapperSymbolName}_napi(const Napi::CallbackInfo& km_info) {\n")
-        sb.append("    Napi::Env km_env = km_info.Env();\n")
+        val sb = beginNapiFunction(st.setterWrapperSymbolName)
         sb.append(renderNapiValueExtraction(st.bridgeKind, "value", 0, cRet))
         appendStaticSymbolPtrLookup(sb, st)
         sb.append("    if (km_sym_ptr != nullptr) {\n        *km_sym_ptr = value;\n    }\n")
@@ -519,12 +521,9 @@ private class NapiCppHostSourceEmitter(
     }
 
     override fun renderForeignFunction(fn: ForeignFnInteropSpec): String {
-        val sb = StringBuilder()
         val noStrConv = requiresNoStringConversion(fn.params)
         val hasReturn = hasNonVoidReturn(fn.returnBridgeKind)
-
-        sb.append("static Napi::Value ${fn.wrapperSymbolName}_napi(const Napi::CallbackInfo& km_info) {\n")
-        sb.append("    Napi::Env km_env = km_info.Env();\n")
+        val sb = beginNapiFunction(fn.wrapperSymbolName)
         appendNapiParamExtractions(sb, fn.params, noStrConv)
         if (fn.isVariadic) {
             val baseLen = fn.params.size
@@ -561,12 +560,9 @@ private class NapiCppHostSourceEmitter(
     }
 
     override fun renderInlineFunction(fn: InlineCFunctionSpec): String {
-        val sb = StringBuilder()
         val inlineNoStrConv = requiresNoStringConversion(fn.params)
         val hasReturn = hasNonVoidReturn(fn.returnBridgeKind)
-        sb.append("static ").append(renderInlineWrapperCFunction(fn)).append('\n')
-        sb.append("static Napi::Value ${fn.wrapperSymbolName}_napi(const Napi::CallbackInfo& km_info) {\n")
-        sb.append("    Napi::Env km_env = km_info.Env();\n")
+        val sb = beginNapiFunction(fn.wrapperSymbolName, "static ${renderInlineWrapperCFunction(fn)}\n")
         appendNapiParamExtractions(sb, fn.params, inlineNoStrConv)
         val callExpr = "${fn.wrapperSymbolName}(${fn.params.joinToString(", ") { it.cName }})"
         sb.append(if (hasReturn) "    ${cHeaderTypeForInlineReturn(fn)} km_res = $callExpr;\n" else "    $callExpr;\n")
@@ -593,14 +589,11 @@ private class NapiCppHostSourceEmitter(
         argIdx: Int,
         cDeclType: String,
     ): String {
+        val desc = bridgeDescriptorFor(bridgeKind)
         val u64Expr = "km_info.Length() > $argIdx ? km_napi_arg_u64(km_info[$argIdx]) : 0"
         return when {
-            bridgeKind == CAbiBridgeKind.CONST_CSTR ->
-                "    const char* $varName = reinterpret_cast<const char*>(static_cast<uintptr_t>($u64Expr));\n"
-            bridgeKind == CAbiBridgeKind.MUT_CSTR ->
-                "    char* $varName = reinterpret_cast<char*>(static_cast<uintptr_t>($u64Expr));\n"
-            bridgeDescriptorFor(bridgeKind).isPointerAddress ->
-                "    void* $varName = reinterpret_cast<void*>(static_cast<uintptr_t>($u64Expr));\n"
+            desc.isPointerAddress ->
+                "    ${desc.cType} $varName = reinterpret_cast<${desc.cType}>(static_cast<uintptr_t>($u64Expr));\n"
             bridgeKind == CAbiBridgeKind.I64 ->
                 "    int64_t $varName = km_info.Length() > $argIdx ? km_napi_arg_i64(km_info[$argIdx]) : 0;\n"
             bridgeKind == CAbiBridgeKind.U64 ->

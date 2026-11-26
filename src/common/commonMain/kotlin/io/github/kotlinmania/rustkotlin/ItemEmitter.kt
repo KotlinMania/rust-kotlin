@@ -1943,8 +1943,9 @@ private fun KotlinJ2KEmitter.appendDiscriminantConversionMethods(
     sourceExpr: String,
     directType: String,
 ) {
+    val memberWalker = KotlinTokenWalker(attachedMembers)
     for ((fnName, retType) in ENUM_SCALAR_CONVERSION_SPECS) {
-        if (!containsWholeIdentifier(attachedMembers, "fun $fnName(")) {
+        if (!memberWalker.declaresFunctionNamed(fnName)) {
             val bodyExpr = if (retType == directType) sourceExpr else "$sourceExpr.$fnName()"
             sb.append("\n$indent    public fun $fnName(): $retType = $bodyExpr\n")
         }

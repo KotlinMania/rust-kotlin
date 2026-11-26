@@ -1,8 +1,5 @@
 package io.github.kotlinmania.rustkotlin
 
-import io.github.kotlinmania.procmacro2.Delimiter
-import io.github.kotlinmania.procmacro2.Group
-import io.github.kotlinmania.procmacro2.TokenStream
 import io.github.kotlinmania.procmacro2.TokenTree
 import io.github.kotlinmania.rustkotlin.reused.starlark.AssignCount
 import io.github.kotlinmania.syn.FnArg
@@ -10,10 +7,8 @@ import io.github.kotlinmania.syn.ForeignItem
 import io.github.kotlinmania.syn.GenericParam
 import io.github.kotlinmania.syn.Generics
 import io.github.kotlinmania.syn.Item
-import io.github.kotlinmania.syn.Lit
 import io.github.kotlinmania.syn.Macro
 import io.github.kotlinmania.syn.ModContent
-import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.Signature
 import io.github.kotlinmania.syn.StaticMutability
 import io.github.kotlinmania.syn.SynType
@@ -374,7 +369,7 @@ internal fun KotlinJ2KEmitter.renderItemMacro(
     if (lastMacroIdent == "include") {
         return ""
     }
-    if (isWindowsLinkMacroPath(item.mac.path)) {
+    if (WindowsLinkMacroParser.isWindowsLinkPath(item.mac.path)) {
         return renderWindowsLinkMacro(item, indent)
     }
     if (!isLocalItem) {
@@ -385,50 +380,12 @@ internal fun KotlinJ2KEmitter.renderItemMacro(
     return if (rendered.isBlank()) "" else "$indent$rendered"
 }
 
-internal fun KotlinJ2KEmitter.isWindowsLinkMacroPath(path: Path): Boolean {
-    val segs = path.segments.toList().map { it.ident.toString() }
-    return (segs.size == 2 && (segs[0] == "windows_link" || segs[0] == "windows_targets") && segs[1] == "link") ||
-        segs.lastOrNull() == "link"
-}
-
 internal fun KotlinJ2KEmitter.renderWindowsLinkMacro(item: Item.Macro, indent: String): String {
-    val macTokens = item.mac.tokens
-    val trees = macTokens.clone().toList()
-    val fnIdx =
-        trees.indexOfFirst { tt ->
-            tt is TokenTree.Ident && tt.value.toString() == "fn"
-        }
-    if (fnIdx < 0) return ""
-    val leadingStrings = mutableListOf<String>()
-    for (i in 0 until fnIdx) {
-        val tt = trees[i]
-        if (tt is TokenTree.Literal) {
-            val lit = Lit.new(tt.value)
-            if (lit is Lit.Str) {
-                leadingStrings += lit.value.value()
-            }
-        }
-    }
-    val dllName = leadingStrings.getOrNull(0).orEmpty()
-    val customSymbol = leadingStrings.getOrNull(2)
-    val fnTokens = trees.subList(fnIdx, trees.size)
-    val pubTokens = TokenStream.fromString("pub").getOrThrow().toList()
-    val hasTrailingSemi = (fnTokens.lastOrNull() as? TokenTree.Punct)?.value?.asChar() == ';'
-    val semiTokens = if (hasTrailingSemi) emptyList() else TokenStream.fromString(";").getOrThrow().toList()
-    val braceBody = TokenTree.Group(Group(Delimiter.Brace, TokenStream.fromTokenTrees(pubTokens + fnTokens + semiTokens)))
-    val externPrefix = TokenStream.fromString("extern \"C\"").getOrThrow().toList()
-    val wrappedStream = TokenStream.fromTokenTrees(externPrefix + braceBody)
-    val parsedFile =
-        io.github.kotlinmania.syn
-            .parse2(io.github.kotlinmania.syn.FileParse::parse, wrappedStream)
-            .getOrNull() ?: return ""
-    val foreignMod = parsedFile.items.firstOrNull() as? Item.ForeignMod ?: return ""
-    val foreignFn = foreignMod.items.firstOrNull() as? ForeignItem.Fn ?: return ""
-
-    val foreignIdent = foreignFn.sig.ident.toString()
-    val rawFnName = foreignIdent.removePrefix("r#")
+    val parsed = WindowsLinkMacroParser.parse(item.mac) ?: return ""
+    val foreignFn = parsed.foreignFn
+    val rawFnName = foreignFn.sig.cleanFnName()
     val fnName = rustFunctionIdentToKotlin(rawFnName)
-    val exportedSymbol = customSymbol ?: rawFnName
+    val exportedSymbol = parsed.customSymbol ?: rawFnName
     val trivia = renderLeadingTrivia(item, indent)
     val doc = renderKDocFromAttributes(item.attrs + foreignFn.attrs, indent)
 
@@ -457,7 +414,7 @@ internal fun KotlinJ2KEmitter.renderWindowsLinkMacro(item: Item.Macro, indent: S
         returnSynType = retSynType,
         isVariadic = foreignFn.sig.variadic != null,
         returnDefaultExpr = if (retRendered == "Unit") "" else renderFallbackDefaultForRenderedType(retRendered),
-        dllName = dllName,
+        dllName = parsed.dllName,
     )
     return "$trivia$doc$indent$sig"
 }
@@ -606,66 +563,33 @@ internal sealed class ForeignFnEmissionStrategy {
     abstract fun tryRender(ctx: ForeignFnRenderContext): String?
 
     object RustAllocShim : ForeignFnEmissionStrategy() {
-        private val SHIM_NAMES =
-            setOf(
-                "__rust_alloc",
-                "__rust_alloc_zeroed",
-                "__rust_dealloc",
-                "__rust_realloc",
-                "__rust_no_alloc_shim_is_unstable",
-                "__rust_no_alloc_shim_is_unstable_v2",
-            )
+        private val NO_ALLOC_SHIM_NAMES =
+            wordSet("__rust_no_alloc_shim_is_unstable __rust_no_alloc_shim_is_unstable_v2")
 
         override fun tryRender(ctx: ForeignFnRenderContext): String? {
-            if (ctx.rawFnName !in SHIM_NAMES) return null
-            val emitter = ctx.emitter
-            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
             val pNames = ctx.interopParams.map { it.kotlinName }
-
-            fun ptrArgToLong(idx: Int): String =
-                if (TranslationSession.rawAbiMode) pNames[idx] else "${pNames[idx]}.rawAddress"
-
-            fun alignArgToLong(idx: Int): String =
-                if (ctx.interopParams
-                        .getOrNull(idx)
-                        ?.kotlinType
-                        ?.substringAfterLast('.') == "Alignment"
-                ) {
-                    "${pNames[idx]}.asUsize().toLong()"
-                } else {
-                    "${pNames[idx]}.toLong()"
-                }
-
-            fun wrapLongToRet(expr: String): String =
-                if (TranslationSession.rawAbiMode) {
-                    expr
-                } else {
-                    CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.ptr.MutPtr")
-                    "MutPtr($expr)"
-                }
-
-            val shimBody =
-                when (ctx.rawFnName) {
-                    "__rust_alloc" -> {
-                        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.intrinsics.kmAlloc")
-                        "= ${wrapLongToRet("kmAlloc(${pNames[0]}.toLong(), ${alignArgToLong(1)})")}"
-                    }
-                    "__rust_alloc_zeroed" -> {
-                        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.intrinsics.kmAllocZeroed")
-                        "= ${wrapLongToRet("kmAllocZeroed(${pNames[0]}.toLong(), ${alignArgToLong(1)})")}"
-                    }
-                    "__rust_dealloc" -> {
-                        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.intrinsics.kmDealloc")
-                        "= kmDealloc(${ptrArgToLong(0)}, ${pNames[1]}.toLong(), ${alignArgToLong(2)})"
-                    }
-                    "__rust_realloc" -> {
-                        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.intrinsics.kmRealloc")
-                        "= ${wrapLongToRet("kmRealloc(${ptrArgToLong(0)}, ${pNames[1]}.toLong(), ${alignArgToLong(2)}, ${pNames[3]}.toLong())")}"
-                    }
-                    else -> "= Unit"
+            val shimExpr =
+                when {
+                    ctx.rawFnName in NO_ALLOC_SHIM_NAMES -> "Unit"
+                    else ->
+                        CoreIntrinsicLowering.renderRustGlobalAllocExpr(
+                            rawFnName = ctx.rawFnName,
+                            emitter = ctx.emitter,
+                            rawAbiMode = TranslationSession.rawAbiMode,
+                            ptrRawAddressAt = { idx -> if (TranslationSession.rawAbiMode) pNames[idx] else "${pNames[idx]}.rawAddress" },
+                            sizeToLongAt = { idx -> "${pNames[idx]}.toLong()" },
+                            alignToLongAt = { idx ->
+                                val fullTy = ctx.interopParams.getOrNull(idx)?.kotlinType
+                                if (fullTy?.substringAfterLast('.') == "Alignment") {
+                                    "${pNames[idx]}.asUsize().toLong()"
+                                } else {
+                                    "${pNames[idx]}.toLong()"
+                                }
+                            },
+                        ) ?: return null
                 }
             val directSig = ctx.sig.replaceFirst("expect fun ", "fun ")
-            return "${ctx.fnTrivia}${ctx.doc}${ctx.indent}$directSig $shimBody"
+            return "${ctx.fnTrivia}${ctx.doc}${ctx.indent}$directSig = $shimExpr"
         }
     }
 

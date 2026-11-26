@@ -627,13 +627,61 @@ private fun KotlinJ2KEmitter.hasInvalidDefaultBodyOnErasedInterface(
     val inspectorVisitor = ErasedDefaultBodyInspector(this, traitName, instanceMethodRawNames).also { it.visitBlock(defaultBlock) }
     if (inspectorVisitor.mutatesDerefSelf) return true
     if (selfParamName == null) return false
-    if (Regex("""\bas\s+${Regex.escape(selfParamName)}\b""").containsMatchIn(body)) return true
-    if (Regex("""\bthis\s*=""").containsMatchIn(body)) return true
-    if (Regex("""[!+\-*/%]\s*this\b|\bthis\s*(?:\+|-|\*|/|%|shl|shr)\b""").containsMatchIn(body)) return true
     if (inspectorVisitor.callsStaticSelfOrTraitFn || inspectorVisitor.returnsBareSelfOrUnaryOnSelf) return true
     val retSyn = extractReturnSynType(sig.output)
-    return retSyn != null && synTypeReferencesDirectSelf(retSyn) &&
-        Regex("""(?m)(?:^|\belse\b|return)\s+this\b(?:\s*[;}]|$)""").containsMatchIn(body)
+    val checkReturnThis = retSyn != null && synTypeReferencesDirectSelf(retSyn)
+    return ErasedDefaultBodyKotlinTokenChecker(body, selfParamName, checkReturnThis).hasInvalidSelfUsage()
+}
+
+private class ErasedDefaultBodyKotlinTokenChecker(
+    body: String,
+    private val selfParamName: String,
+    private val checkReturnThis: Boolean,
+) : KotlinTokenWalker(body) {
+    fun hasInvalidSelfUsage(): Boolean {
+        for (idx in tokens.indices) {
+            val ident = anyIdentAt(idx) ?: continue
+            if (ident == "as" && anyIdentAt(nextNonTriviaIndex(idx + 1)) == selfParamName) {
+                return true
+            }
+            if (ident != "this") continue
+            val prevIdx = previousNonTriviaIndex(idx)
+            if (anyPunctAt(prevIdx) == '.') continue
+            val nextIdx = nextNonTriviaIndex(idx + 1)
+            val nextPunct = anyPunctAt(nextIdx)
+            if (nextPunct == '=' && anyPunctAt(nextIdx + 1) != '=') return true
+            if (anyPunctAt(prevIdx)?.let { it in "!+-*/%" } == true) return true
+            if (nextPunct != null && nextPunct in "+-*/%") return true
+            if (anyIdentAt(nextIdx) in SHIFT_INFIX_OPS) return true
+            if (checkReturnThis && isBareReturnedThisAt(idx)) return true
+        }
+        return false
+    }
+
+    private fun isBareReturnedThisAt(thisIdx: Int): Boolean {
+        val prevIdx = previousNonTriviaIndex(thisIdx)
+        val validPrefix =
+            prevIdx < 0 ||
+                anyIdentAt(prevIdx) in RETURN_THIS_KEYWORDS ||
+                hasNewlineBetween(prevIdx, thisIdx)
+        if (!validPrefix) return false
+        var scan = thisIdx + 1
+        while (scan < tokens.size && isTriviaToken(tokens[scan]) && tokens[scan] !is KotlinLexToken.Newline) {
+            scan++
+        }
+        return scan >= tokens.size ||
+            tokens[scan] is KotlinLexToken.Newline ||
+            anyPunctAt(scan) == ';' ||
+            anyPunctAt(scan) == '}'
+    }
+
+    private fun hasNewlineBetween(fromExclusive: Int, toExclusive: Int): Boolean =
+        ((fromExclusive + 1) until toExclusive).any { tokens[it] is KotlinLexToken.Newline }
+
+    private companion object {
+        val SHIFT_INFIX_OPS = setOf("shl", "shr")
+        val RETURN_THIS_KEYWORDS = setOf("return", "else")
+    }
 }
 
 internal fun KotlinJ2KEmitter.pickUnusedTraitSelfParamName(
