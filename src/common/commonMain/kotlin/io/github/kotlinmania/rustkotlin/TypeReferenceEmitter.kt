@@ -23,53 +23,30 @@ import io.github.kotlinmania.syn.Visibility
 import io.github.kotlinmania.syn.WhereClause
 import io.github.kotlinmania.syn.WherePredicate
 
-private val CORE_OPS_BINARY_TRAITS =
-    wordSet("Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr")
-private val CORE_OPS_UNARY_OUTPUT_TRAITS =
-    wordSet("Neg Not")
-private val CORE_OPS_ASSIGN_TRAITS =
+private val CORE_OPS_BINARY_TRAITS: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.coreOpsBinaryTraits
+private val CORE_OPS_UNARY_OUTPUT_TRAITS: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.coreOpsUnaryOutputTraits
+private val CORE_OPS_ASSIGN_TRAITS: Set<String> =
     CORE_OPS_BINARY_TRAITS.mapTo(linkedSetOf()) { "${it}Assign" }
 
-private val NUMERIC_SUFFIX_BY_KIND: Map<NumericKind, String> =
-    mapOf(
-        NumericKind.I8 to ".toByte()",
-        NumericKind.U8 to ".toUByte()",
-        NumericKind.I16 to ".toShort()",
-        NumericKind.U16 to ".toUShort()",
-        NumericKind.I32 to ".toInt()",
-        NumericKind.U32 to ".toUInt()",
-        NumericKind.I64 to ".toLong()",
-        NumericKind.U64 to ".toULong()",
-        NumericKind.F16 to ".toF16()",
-        NumericKind.F32 to ".toFloat()",
-        NumericKind.F64 to ".toDouble()",
-        NumericKind.F128 to ".toF128()",
-        NumericKind.I128 to ".toI128()",
-        NumericKind.U128 to ".toU128()",
-    )
+private val NUMERIC_SUFFIX_BY_KIND: Map<NumericKind, String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.numericSuffixByKind
 
-private val BOXED_INT_FROM_SUFFIX_BY_KIND: Map<NumericKind, String> =
-    mapOf(
-        NumericKind.I8 to "fromByte",
-        NumericKind.I16 to "fromShort",
-        NumericKind.I32 to "fromInt",
-        NumericKind.I64 to "fromLong",
-        NumericKind.U8 to "fromUByte",
-        NumericKind.U16 to "fromUShort",
-        NumericKind.U32 to "fromUInt",
-        NumericKind.U64 to "fromULong",
-    )
+private val BOXED_INT_FROM_SUFFIX_BY_KIND: Map<NumericKind, String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.boxedIntFromSuffixByKind
 
-private val ZERO_OR_NULL_POINTER_LITERALS = wordSet("0 0L 0u 0uL null")
+private val ZERO_OR_NULL_POINTER_LITERALS: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.zeroOrNullPointerLiterals
 
-private val KOTLIN_BUILTIN_VALUE_TYPE_NAMES: Set<String> =
-    wordSet("Byte Short Int Long UByte UShort UInt ULong Float Double Boolean Char String Unit Any")
+private val KOTLIN_BUILTIN_VALUE_TYPE_NAMES: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.kotlinBuiltinValueTypeNames
 
-private val C_POINTER_WIDTH_UNSIGNED_TYPE_NAMES =
-    wordSet("size_t SizeT uintptr_t UintptrT rsize_t RsizeT __size_t")
+private val C_POINTER_WIDTH_UNSIGNED_TYPE_NAMES: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.cPointerWidthUnsignedTypeNames
 
-private val C_POINTER_WIDTH_SIGNED_TYPE_NAMES =
-    wordSet("ssize_t SsizeT ptrdiff_t PtrdiffT intptr_t IntptrT __ssize_t")
+private val C_POINTER_WIDTH_SIGNED_TYPE_NAMES: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.cPointerWidthSignedTypeNames
 
 internal fun isDecimalOrHexLiteralDigits(text: String): Boolean {
     if (text.isEmpty()) return false

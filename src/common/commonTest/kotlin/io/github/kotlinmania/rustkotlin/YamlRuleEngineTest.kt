@@ -167,4 +167,38 @@ class YamlRuleEngineTest {
         assertContains(kt, "opt?.let({ v -> v + 1 }) ?: 0")
         assertContains(kt, "minOf(mapped, items.size)")
     }
+
+    @Test
+    fun drivesCoreImportRoutingCastPointerLayoutAndFfiFallbackYamlCatalogs() {
+        assertTrue(YamlRuleCatalogs.PathsConstsAndCAbi.coreAutoImportRoutes.isNotEmpty())
+        assertTrue(YamlRuleCatalogs.PathsConstsAndCAbi.coreExtensionImportRoutes.isNotEmpty())
+        assertTrue("register" in YamlRuleCatalogs.PathsConstsAndCAbi.cReservedParamNames)
+        assertEquals("(-1).toByte()", YamlRuleCatalogs.PathsConstsAndCAbi.numericDefaultFallbackByKind[NumericKind.I8])
+        assertEquals("Byte" to "8u", YamlRuleCatalogs.PathsConstsAndCAbi.primOwnerAndBitsByKind[NumericKind.I8])
+        assertEquals("I32", YamlRuleCatalogs.TypeAndMethodPatterns.fixedScalarCodecs["i32"])
+        assertEquals("UInt", YamlRuleCatalogs.TypeAndMethodPatterns.literalCodecTypes["U32"])
+
+        val headerCtx =
+            FileHeaderContext(
+                packageName = "sample.wave3",
+                crateNamespaces = mapOf("core" to "io.github.kotlinmania.rustlang.core"),
+            )
+        val rustSource =
+            """
+            pub unsafe fn exercise_wave3_yaml_rules(ptr: *mut i32, raw_len: usize) -> i64 {
+                let mut local_val: i32 = 12;
+                let addr: *mut i32 = &mut local_val;
+                if !ptr.is_null() {
+                    *ptr = *addr;
+                }
+                raw_len as i64
+            }
+            """.trimIndent()
+
+        val kt = renderSingleKotlinFile(rustSource, headerCtx).text
+        assertContains(kt, "import io.github.kotlinmania.rustlang.core.ptr.MutPtr")
+        assertContains(kt, "import io.github.kotlinmania.rustlang.core.mem.PrimitiveLayouts")
+        assertContains(kt, "AddressableLocal(12, PrimitiveLayouts.I32)")
+        assertContains(kt, "return rawLen.toLong()")
+    }
 }

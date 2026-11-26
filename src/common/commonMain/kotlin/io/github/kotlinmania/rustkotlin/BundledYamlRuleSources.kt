@@ -853,6 +853,174 @@ internal object BundledYamlRuleSources {
         |  - { kind: DIR_PTR, cType: "void*", cFailureLiteral: "NULL", jniKotlinType: Long, jniCType: jlong, isPointerAddress: true }
         |  - { kind: CALLBACK_PTR, cType: "void*", cFailureLiteral: "NULL", jniKotlinType: Long, jniCType: jlong, isPointerAddress: true }
         |  - { kind: BY_VALUE_OBJECT, cType: "void*", cFailureLiteral: "NULL", wasmJsType: Unit, jniKotlinType: Long, jniCType: jlong }
+        |
+        |# ==============================================================================
+        |# Synthesized `core` Auto-Import & Extension Routing (`SourceTranslation.kt`)
+        |# ==============================================================================
+        |
+        |unsignedArrayIdents: "UByteArray UShortArray UIntArray ULongArray ubyteArrayOf ushortArrayOf uintArrayOf ulongArrayOf"
+        |
+        |coreAutoImportRoutes:
+        |  # Always-available core pointer, layout, extended-scalar, and debug-builder types
+        |  - { condition: always, subpkg: "ptr", symbols: "ConstPtr MutPtr" }
+        |  - { condition: always, subpkg: "mem", symbols: "TypeLayout PrimitiveLayouts PrimitiveArrayLayouts fixedListTypeLayout" }
+        |  - { condition: always, subpkg: "", symbols: "U128 I128 F16 F128 RustAny RustTypeId" }
+        |  - { condition: always, subpkg: "fmt", symbols: "DebugStruct DebugTuple" }
+        |
+        |  # External `core` crate types and memory/pointer helper functions
+        |  - { condition: externalCore, subpkg: "cmp", symbols: "Ordering" }
+        |  - { condition: externalCore, subpkg: "num.error", symbols: "ParseIntError IntErrorKind TryFromIntError" }
+        |  - { condition: externalCore, subpkg: "num", symbols: "FpCategory" }
+        |  - { condition: externalCore, subpkg: "num.wrapping", symbols: "Wrapping" }
+        |  - { condition: externalCore, subpkg: "pin", symbols: "Pin" }
+        |  - { condition: externalCore, subpkg: "ops.controlflow", symbols: "ControlFlow" }
+        |  - { condition: externalCore, subpkg: "alloc", symbols: "Allocator AllocError" }
+        |  - { condition: externalCore, subpkg: "alloc.layout", symbols: "Layout" }
+        |  - { condition: externalCore, subpkg: "mem", symbols: "transmute transmuteUnchecked sizeOf alignOf" }
+        |  - condition: externalCore
+        |    subpkg: "ptr"
+        |    symbols:
+        |      - "nullMut nullVal withoutProvenance withoutProvenanceMut dangling danglingMut"
+        |      - "fromRef fromMut sliceFromRawParts sliceFromRawPartsMut copyNonoverlapping writeBytes dropInPlace"
+        |
+        |  # Interior mutability (`Cell` / `RefCell` / `OnceCell`) and `RustChar` / ASCII helpers
+        |  - { condition: coreOrScalarChar, subpkg: "cell", symbols: "Cell RefCell Ref RefMut" }
+        |  - { condition: coreOrScalarChar, subpkg: "cell.once", symbols: "OnceCell" }
+        |  - { condition: coreOrScalarChar, subpkg: "char", symbols: "RustChar CharTryFromError RustCharIndex rustChars rustCharIndices" }
+        |  - condition: coreOrScalarChar
+        |    subpkg: "char.methods"
+        |    symbols:
+        |      - "isAscii isAsciiAlphabetic isAsciiUppercase isAsciiLowercase isAsciiAlphanumeric"
+        |      - "isAsciiDigit isAsciiHexdigit isAsciiPunctuation isAsciiGraphic isAsciiWhitespace"
+        |      - "isAsciiControl toAsciiLowercase toAsciiUppercase"
+        |
+        |  # Managed-ABI `core` hint, layout, unaligned pointer, and `cmp` free functions
+        |  - { condition: coreManagedAbi, subpkg: "hint", symbols: "unreachableUnchecked assertUnchecked" }
+        |  - { condition: coreManagedAbi, subpkg: "mem", symbols: "sizeOf alignOf sizeOfVal alignOfVal" }
+        |  - { condition: coreManagedAbi, subpkg: "ptr", symbols: "readUnaligned writeUnaligned" }
+        |  - { condition: coreManagedAbi, subpkg: "cmp", symbols: "min max clamp" }
+        |
+        |coreEnumVariantImports:
+        |  - { ownerSubpkg: "ops.controlflow.ControlFlow", variants: "Break Continue" }
+        |  - { ownerSubpkg: "cmp.Ordering", variants: "Less Equal Greater" }
+        |
+        |coreExtensionImportRoutes:
+        |  - { condition: always, subpkg: "clone", symbols: "clone" }
+        |  - condition: always
+        |    subpkg: "slice"
+        |    symbols:
+        |      - "len iter iterMut splitAt splitFirst splitFirstMut splitLast splitLastMut"
+        |      - "splitAtMut chunksExact chunksExactMut"
+        |  - { condition: always, subpkg: "str", symbols: "len isCharBoundary splitAt" }
+        |  - condition: atomicIdent
+        |    subpkg: "sync.atomic"
+        |    symbols:
+        |      - "load store swap compareExchange compareExchangeWeak fetchAdd fetchSub fetchAnd fetchOr"
+        |      - "fetchXor fetchNand fetchMax fetchMin fetchUpdate intoInner getMut asPtr"
+        |  - condition: always
+        |    subpkg: "num"
+        |    symbols:
+        |      - "uncheckedAdd uncheckedSub uncheckedMul checkedAdd checkedSub checkedMul checkedDiv checkedRem"
+        |      - "checkedAddUnsigned checkedSubUnsigned checkedAddSigned checkedSubSigned"
+        |      - "overflowingAdd overflowingSub overflowingMul overflowingAddUnsigned overflowingSubUnsigned"
+        |      - "overflowingAddSigned overflowingSubSigned wrappingAddUnsigned wrappingSubUnsigned"
+        |      - "wrappingAddSigned wrappingSubSigned saturatingAdd saturatingSub saturatingMul"
+        |      - "saturatingAddUnsigned saturatingSubUnsigned carryingAdd borrowingSub carryingMul carryingMulAdd"
+        |      - "wideningMul absDiff divCeil nextMultipleOf checkedNextMultipleOf isMultipleOf midpoint"
+        |      - "castSigned castUnsigned isPowerOfTwo nextPowerOfTwo checkedNextPowerOfTwo wrappingNextPowerOfTwo"
+        |      - "ilog ilog2 ilog10 checkedIlog checkedIlog2 checkedIlog10 isqrt checkedIsqrt"
+        |  - condition: mutPtrIdent
+        |    subpkg: "ptr.mutptr"
+        |    symbols:
+        |      - "isNull cast add sub offset byteAdd byteSub byteOffset"
+        |      - "wrappingAdd wrappingSub wrappingOffset wrappingByteAdd wrappingByteSub wrappingByteOffset"
+        |      - "read readUnaligned readVolatile copyTo copyToNonoverlapping"
+        |      - "asRef asUninitRef asUninitSlice addr withAddr mapAddr exposeProvenance"
+        |      - "castUninit castInit castSlice offsetFrom offsetFromUnsigned byteOffsetFrom byteOffsetFromUnsigned"
+        |      - "isAligned isAlignedTo alignOffset withMetadataOf toRawParts mask len"
+        |      - "write writeUnaligned writeVolatile writeBytes copyFrom copyFromNonoverlapping"
+        |      - "asMut asUninitMut asUninitSliceMut castConst dropInPlace replace swap splitAtMut"
+        |  - condition: constPtrIdent
+        |    subpkg: "ptr.constptr"
+        |    symbols:
+        |      - "isNull cast add sub offset byteAdd byteSub byteOffset"
+        |      - "wrappingAdd wrappingSub wrappingOffset wrappingByteAdd wrappingByteSub wrappingByteOffset"
+        |      - "read readUnaligned readVolatile copyTo copyToNonoverlapping"
+        |      - "asRef asUninitRef asUninitSlice addr withAddr mapAddr exposeProvenance"
+        |      - "castUninit castInit castSlice offsetFrom offsetFromUnsigned byteOffsetFrom byteOffsetFromUnsigned"
+        |      - "isAligned isAlignedTo alignOffset withMetadataOf toRawParts mask len"
+        |      - "castMut"
+        |
+        |# ==============================================================================
+        |# Primitive Bit-Widths, C Reserved Identifiers & Numeric Bridge Fallbacks
+        |# ==============================================================================
+        |
+        |primOwnerAndBitsByKind:
+        |  - { kind: I8, owner: Byte, bits: "8u" }
+        |  - { kind: U8, owner: UByte, bits: "8u" }
+        |  - { kind: I16, owner: Short, bits: "16u" }
+        |  - { kind: U16, owner: UShort, bits: "16u" }
+        |  - { kind: I32, owner: Int, bits: "32u" }
+        |  - { kind: U32, owner: UInt, bits: "32u" }
+        |  - { kind: I64, owner: Long, bits: "64u" }
+        |  - { kind: U64, owner: ULong, bits: "64u" }
+        |  - { kind: I128, owner: I128, bits: "128u" }
+        |  - { kind: U128, owner: U128, bits: "128u" }
+        |  - { kind: F32, owner: Float, bits: "32u" }
+        |  - { kind: F64, owner: Double, bits: "64u" }
+        |
+        |umbrellaLinkLibraries: "c m dl pthread rt System gcc gcc_s stdc++ c++ msvcrt ucrtbase libcmt legacy_stdio_definitions"
+        |
+        |cReservedParamNames:
+        |  - "auto break case char const continue default do double else enum extern float for goto if"
+        |  - "inline int long register restrict return short signed sizeof static struct switch typedef union"
+        |  - "unsigned void volatile while class namespace template typename public private protected virtual operator"
+        |  - "new delete this friend using try catch throw bool true false alignas alignof constexpr decltype"
+        |  - "noexcept nullptr static_assert thread_local typeid dynamic_cast static_cast reinterpret_cast const_cast"
+        |  - "explicit mutable export wchar_t char8_t char16_t char32_t concept requires co_await co_return co_yield"
+        |  - "and or not xor bitand bitor compl and_eq or_eq xor_eq not_eq near far huge pascal cdecl stdcall fastcall"
+        |  - "interface small hyper environ errno stdin stdout stderr stat time read write open close accept bind"
+        |  - "connect listen recv send socket select poll fork pipe dup dup2 link unlink chmod chown"
+        |  - "lseek mkdir rmdir rename remove system abort exit free malloc calloc realloc div abs labs llabs"
+        |  - "sin cos tan exp log pow sqrt ceil floor index rindex bcopy bzero bcmp"
+        |
+        |numericConversionMethodByKind:
+        |  I8: toByte
+        |  U8: toUByte
+        |  I16: toShort
+        |  U16: toUShort
+        |  I32: toInt
+        |  U32: toUInt
+        |  I64: toLong
+        |  U64: toULong
+        |  F16: toFloat
+        |  F32: toFloat
+        |  F64: toDouble
+        |  F128: toDouble
+        |  I128: toLong
+        |  U128: toLong
+        |
+        |numericDefaultFallbackByKind:
+        |  I8: "(-1).toByte()"
+        |  U8: "0u.toUByte()"
+        |  I16: "(-1).toShort()"
+        |  U16: "0u.toUShort()"
+        |  I32: "-1"
+        |  U32: "0u"
+        |  I64: "-1L"
+        |  U64: "0uL"
+        |  F16: "F16.ZERO"
+        |  F32: "0.0f"
+        |  F64: "0.0"
+        |  F128: "F128.ZERO"
+        |  I128: "I128.ZERO"
+        |  U128: "U128.ZERO"
+        |
+        |builtinKotlinIdents:
+        |  - "null true false Unit Nothing Boolean Byte UByte Short UShort Int UInt Long ULong Float Double"
+        |  - "String ZERO toByte toUByte toShort toUShort toInt toUInt toLong toULong toFloat toDouble"
+        |  - "error emptyArray intArrayOf longArrayOf byteArrayOf shortArrayOf floatArrayOf doubleArrayOf"
+        |  - "ubyteArrayOf ushortArrayOf uintArrayOf ulongArrayOf booleanArrayOf"
         """.trimMargin() + "\n"
 
     val STDLIB_SYN_AND_FFI: String =
@@ -2022,5 +2190,116 @@ internal object BundledYamlRuleSources {
         |  ExactSizeIterator: [Item]
         |  FusedIterator: [Item]
         |  AsyncIterator: [Item]
+        |
+        |# ==============================================================================
+        |# Cast, Operator, Witness, Pointer & Layout Lowering Catalogs
+        |# ==============================================================================
+        |
+        |coreOpsBinaryTraits: "Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr"
+        |coreOpsUnaryOutputTraits: "Neg Not"
+        |
+        |numericSuffixByKind:
+        |  I8: ".toByte()"
+        |  U8: ".toUByte()"
+        |  I16: ".toShort()"
+        |  U16: ".toUShort()"
+        |  I32: ".toInt()"
+        |  U32: ".toUInt()"
+        |  I64: ".toLong()"
+        |  U64: ".toULong()"
+        |  F16: ".toF16()"
+        |  F32: ".toFloat()"
+        |  F64: ".toDouble()"
+        |  F128: ".toF128()"
+        |  I128: ".toI128()"
+        |  U128: ".toU128()"
+        |
+        |boxedIntFromSuffixByKind:
+        |  I8: fromByte
+        |  I16: fromShort
+        |  I32: fromInt
+        |  I64: fromLong
+        |  U8: fromUByte
+        |  U16: fromUShort
+        |  U32: fromUInt
+        |  U64: fromULong
+        |
+        |zeroOrNullPointerLiterals: "0 0L 0u 0uL null"
+        |kotlinBuiltinValueTypeNames: "Byte Short Int Long UByte UShort UInt ULong Float Double Boolean Char String Unit Any"
+        |cPointerWidthUnsignedTypeNames: "size_t SizeT uintptr_t UintptrT rsize_t RsizeT __size_t"
+        |cPointerWidthSignedTypeNames: "ssize_t SsizeT ptrdiff_t PtrdiffT intptr_t IntptrT __ssize_t"
+        |
+        |companionCapableValueTypes:
+        |  - "Byte Short Int Long UByte UShort UInt ULong Float Double Boolean Char String"
+        |  - "kotlin.Byte kotlin.Short kotlin.Int kotlin.Long kotlin.UByte kotlin.UShort kotlin.UInt kotlin.ULong"
+        |  - "kotlin.Float kotlin.Double kotlin.Boolean kotlin.Char kotlin.String I128 U128 F16 F128 RustChar"
+        |
+        |iteratorAssocTraits: "Iterator DoubleEndedIterator ExactSizeIterator FusedIterator AsyncIterator"
+        |
+        |witnessMutRefScalars:
+        |  - "Byte UByte Short UShort Int UInt Long ULong I128 U128"
+        |  - "Float kotlin.Float Double Char RustChar ConstPtr MutPtr"
+        |
+        |zeroArgSelfProducerMethods:
+        |  - "zero one min_value max_value nan infinity neg_infinity neg_zero"
+        |  - "epsilon min_positive_value max_finite min_finite"
+        |
+        |externalOverridableStdlibTraits:
+        |  - "Read Write BufRead Seek Clone Iterator DoubleEndedIterator ExactSizeIterator"
+        |  - "BitOr BitAnd BitXor Not Add Sub Mul Div Rem Neg Shl Shr PanicPayload"
+        |
+        |coreOpsForwardRefTraits:
+        |  - "Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr Neg Not"
+        |  - "AddAssign SubAssign MulAssign DivAssign RemAssign BitAndAssign BitOrAssign BitXorAssign ShlAssign ShrAssign"
+        |
+        |kotlinBuiltinArithTypes: "Byte Short Int Long UByte UShort UInt ULong Float Double"
+        |
+        |fixedScalarCodecs:
+        |  i8: I8
+        |  u8: U8
+        |  i16: I16
+        |  u16: U16
+        |  i32: I32
+        |  u32: U32
+        |  i64: I64
+        |  u64: U64
+        |  bool: BOOL
+        |
+        |literalCodecTypes:
+        |  BOOL: Boolean
+        |  I8: Byte
+        |  U8: UByte
+        |  I16: Short
+        |  U16: UShort
+        |  I32: Int
+        |  U32: UInt
+        |  I64: Long
+        |  U64: ULong
+        |
+        |extendedScalarPointedPrimitives: "isize usize i128 u128 f16 f32 f64 f128 char"
+        |addressBackedSysRoots: "libc wasip1 windows_sys wasi"
+        |
+        |rawMemoryAndLayoutIdents:
+        |  - "size_of size_of_val align_of align_of_val offset_of transmute transmute_copy transmute_unchecked"
+        |  - "zeroed MaybeUninit ManuallyDrop UnsafeCell SyncUnsafeCell from_raw_parts from_raw_parts_mut"
+        |  - "read_unaligned write_unaligned read_volatile write_volatile addr_of addr_of_mut"
+        |  - "copy_nonoverlapping NonNull TypeLayout PrimitiveLayouts"
+        |
+        |managedSliceBases: "List MutableList ArrayList String CharSequence LinearSliceView LinearMutSliceView ByteSlice MutByteSlice"
+        |viewOffsetSliceBases: "LinearSliceView LinearMutSliceView ByteSlice MutByteSlice"
+        |pointerCastMethods: "cast cast_mut cast_const"
+        |pointerContainerWrappers: "NonNull Vec Box Unique"
+        |integerLiteralSuffixes: "i8 u8 i16 u16 i32 u32 i64 u64 i128 u128 isize usize"
+        |
+        |knownStdlibFirstTypeLayoutFunctions:
+        |  - "size_of align_of min_align_of pref_align_of zeroed read read_unaligned read_volatile"
+        |  - "write write_unaligned write_volatile write_bytes copy copy_nonoverlapping dangling dangling_mut"
+        |
+        |pointerStrideOrAccessMethods:
+        |  - "offset add sub wrapping_offset wrapping_add wrapping_sub offset_from offset_from_unsigned sub_ptr"
+        |  - "read read_volatile read_unaligned write write_volatile write_unaligned write_bytes"
+        |  - "copy_to copy_to_nonoverlapping copy_from copy_from_nonoverlapping as_ref as_mut"
+        |
+        |sizedCoreConstNames: "IS_ZST LAYOUT MAX_SLICE_LEN ALIGNMENT"
         """.trimMargin() + "\n"
 }

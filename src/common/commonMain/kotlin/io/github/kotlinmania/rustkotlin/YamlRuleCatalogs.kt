@@ -217,6 +217,39 @@ internal object YamlRuleCatalogs {
             root.mapping("stdlibDefaultlessAssocTypes").entries.keys.associateWith { k ->
                 root.mapping("stdlibDefaultlessAssocTypes").explicitStringList(k)
             }
+
+        val coreOpsBinaryTraits: Set<String> = root.wordSet("coreOpsBinaryTraits")
+        val coreOpsUnaryOutputTraits: Set<String> = root.wordSet("coreOpsUnaryOutputTraits")
+        val numericSuffixByKind: Map<NumericKind, String> =
+            root.stringMap("numericSuffixByKind").entries.associate { (k, v) -> NumericKind.valueOf(k) to v }
+        val boxedIntFromSuffixByKind: Map<NumericKind, String> =
+            root.stringMap("boxedIntFromSuffixByKind").entries.associate { (k, v) -> NumericKind.valueOf(k) to v }
+        val zeroOrNullPointerLiterals: Set<String> = root.wordSet("zeroOrNullPointerLiterals")
+        val kotlinBuiltinValueTypeNames: Set<String> = root.wordSet("kotlinBuiltinValueTypeNames")
+        val cPointerWidthUnsignedTypeNames: Set<String> = root.wordSet("cPointerWidthUnsignedTypeNames")
+        val cPointerWidthSignedTypeNames: Set<String> = root.wordSet("cPointerWidthSignedTypeNames")
+
+        val companionCapableValueTypes: Set<String> = root.wordSet("companionCapableValueTypes")
+        val iteratorAssocTraits: Set<String> = root.wordSet("iteratorAssocTraits")
+        val witnessMutRefScalars: Set<String> = root.wordSet("witnessMutRefScalars")
+        val zeroArgSelfProducerMethods: Set<String> = root.wordSet("zeroArgSelfProducerMethods")
+        val externalOverridableStdlibTraits: Set<String> = root.wordSet("externalOverridableStdlibTraits")
+        val coreOpsForwardRefTraits: Set<String> = root.wordSet("coreOpsForwardRefTraits")
+        val kotlinBuiltinArithTypes: Set<String> = root.wordSet("kotlinBuiltinArithTypes")
+
+        val fixedScalarCodecs: Map<String, String> = root.stringMap("fixedScalarCodecs")
+        val literalCodecTypes: Map<String, String> = root.stringMap("literalCodecTypes")
+        val extendedScalarPointedPrimitives: Set<String> = root.wordSet("extendedScalarPointedPrimitives")
+        val addressBackedSysRoots: Set<String> = root.wordSet("addressBackedSysRoots")
+        val rawMemoryAndLayoutIdents: Set<String> = root.wordSet("rawMemoryAndLayoutIdents")
+        val managedSliceBases: Set<String> = root.wordSet("managedSliceBases")
+        val viewOffsetSliceBases: Set<String> = root.wordSet("viewOffsetSliceBases")
+        val pointerCastMethods: Set<String> = root.wordSet("pointerCastMethods")
+        val pointerContainerWrappers: Set<String> = root.wordSet("pointerContainerWrappers")
+        val integerLiteralSuffixes: Set<String> = root.wordSet("integerLiteralSuffixes")
+        val knownStdlibFirstTypeLayoutFunctions: Set<String> = root.wordSet("knownStdlibFirstTypeLayoutFunctions")
+        val pointerStrideOrAccessMethods: Set<String> = root.wordSet("pointerStrideOrAccessMethods")
+        val sizedCoreConstNames: Set<String> = root.wordSet("sizedCoreConstNames")
     }
 
     object CoreIntrinsics {
@@ -333,5 +366,26 @@ internal object YamlRuleCatalogs {
         val constPanicOrErrorSuffixes: List<String> = root.explicitStringList("constPanicOrErrorSuffixes")
 
         val cAbiBridgeDescriptorNodes: List<YamlNode.Mapping> = root.mappingList("cAbiBridgeDescriptors")
+
+        val unsignedArrayIdents: Set<String> = root.wordSet("unsignedArrayIdents")
+        val coreAutoImportRoutes: List<DeclarativeCoreImportRouteRule> =
+            root.mappingList("coreAutoImportRoutes").map(DeclarativeCoreImportRouteRule::fromYaml)
+        val coreEnumVariantImports: List<Pair<String, List<String>>> =
+            root.mappingList("coreEnumVariantImports").map { node ->
+                node.string("ownerSubpkg") to node.wordSet("variants").toList()
+            }
+        val coreExtensionImportRoutes: List<DeclarativeCoreImportRouteRule> =
+            root.mappingList("coreExtensionImportRoutes").map(DeclarativeCoreImportRouteRule::fromYaml)
+        val primOwnerAndBitsByKind: Map<NumericKind, Pair<String, String>> =
+            root.mappingList("primOwnerAndBitsByKind").associate { node ->
+                NumericKind.valueOf(node.string("kind")) to (node.string("owner") to node.string("bits"))
+            }
+        val umbrellaLinkLibraries: Set<String> = root.wordSet("umbrellaLinkLibraries")
+        val cReservedParamNames: Set<String> = root.wordSet("cReservedParamNames")
+        val numericConversionMethodByKind: Map<NumericKind, String> =
+            root.stringMap("numericConversionMethodByKind").entries.associate { (k, v) -> NumericKind.valueOf(k) to v }
+        val numericDefaultFallbackByKind: Map<NumericKind, String> =
+            root.stringMap("numericDefaultFallbackByKind").entries.associate { (k, v) -> NumericKind.valueOf(k) to v }
+        val builtinKotlinIdents: Set<String> = root.wordSet("builtinKotlinIdents")
     }
 }

@@ -66,8 +66,8 @@ internal fun translateRustSourceToKotlinArtifacts(
         parentText to (emitter.emitCompanionFiles() + splitModCompanions)
     }
 
-private val UNSIGNED_ARRAY_IDENTS: Set<String> =
-    wordSet("UByteArray UShortArray UIntArray ULongArray ubyteArrayOf ushortArrayOf uintArrayOf ulongArrayOf")
+private val UNSIGNED_ARRAY_IDENTS: Set<String>
+    get() = YamlRuleCatalogs.PathsConstsAndCAbi.unsignedArrayIdents
 
 internal class IndexedFnEntry(
     val order: Int,
@@ -955,49 +955,32 @@ private class KotlinFileImportSynthesizer(
     ): List<Pair<String, String>> {
         if (headerContext.isDocExample) return emptyList()
         val activeAllocNs = CoreIntrinsicLowering.resolveAllocNamespace(headerContext)
+        val hasCoreCrate = "core" in headerContext.crateNamespaces
         return buildList {
-            add("ConstPtr" to "$activeCoreNs.ptr")
-            add("MutPtr" to "$activeCoreNs.ptr")
-            for (memSym in CORE_MEM_LAYOUT_IMPORTS) add(memSym to "$activeCoreNs.mem")
-            for (rootSym in CORE_ROOT_SCALAR_IMPORTS) add(rootSym to activeCoreNs)
-            add("DebugStruct" to "$activeCoreNs.fmt")
-            add("DebugTuple" to "$activeCoreNs.fmt")
-            if (!headerContext.rawAbiMode) {
-                for (ffiSym in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS.values.distinct() + "CString") {
-                    if (emitter.resolveBestSubpackageForSymbol(ffiSym) == null) {
-                        add(ffiSym to CoreIntrinsicLowering.defaultStdlibFfiSymbolPackage(ffiSym, activeCoreNs, activeAllocNs))
+            var emittedAlwaysFfi = false
+            for (route in YamlRuleCatalogs.PathsConstsAndCAbi.coreAutoImportRoutes) {
+                if (route.condition != "always" && !emittedAlwaysFfi) {
+                    emittedAlwaysFfi = true
+                    if (!headerContext.rawAbiMode) {
+                        for (ffiSym in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS.values.distinct() + "CString") {
+                            if (emitter.resolveBestSubpackageForSymbol(ffiSym) == null) {
+                                add(ffiSym to CoreIntrinsicLowering.defaultStdlibFfiSymbolPackage(ffiSym, activeCoreNs, activeAllocNs))
+                            }
+                        }
                     }
                 }
-            }
-            if (usesExternalCore) {
-                add("Ordering" to "$activeCoreNs.cmp")
-                for (errSym in CORE_NUM_ERROR_IMPORTS) add(errSym to "$activeCoreNs.num.error")
-                add("FpCategory" to "$activeCoreNs.num")
-                add("Wrapping" to "$activeCoreNs.num.wrapping")
-                add("Pin" to "$activeCoreNs.pin")
-                add("ControlFlow" to "$activeCoreNs.ops.controlflow")
-                add("Allocator" to "$activeCoreNs.alloc")
-                add("AllocError" to "$activeCoreNs.alloc")
-                add("Layout" to "$activeCoreNs.alloc.layout")
-                for (memFn in CORE_MEM_FN_IMPORTS) add(memFn to "$activeCoreNs.mem")
-                for (ptrFn in CORE_PTR_FN_IMPORTS) add(ptrFn to "$activeCoreNs.ptr")
-            }
-            if ("core" in headerContext.crateNamespaces || headerContext.scalarChar) {
-                for (cellSym in CORE_CELL_IMPORTS) add(cellSym to "$activeCoreNs.cell")
-                add("OnceCell" to "$activeCoreNs.cell.once")
-                for (charSym in CORE_CHAR_IMPORTS) add(charSym to "$activeCoreNs.char")
-                for (asciiHelper in CORE_ASCII_HELPER_IMPORTS) add(asciiHelper to "$activeCoreNs.char.methods")
-            }
-            if ("core" in headerContext.crateNamespaces && !headerContext.rawAbiMode) {
-                add("unreachableUnchecked" to "$activeCoreNs.hint")
-                add("assertUnchecked" to "$activeCoreNs.hint")
-                add("sizeOf" to "$activeCoreNs.mem")
-                add("alignOf" to "$activeCoreNs.mem")
-                add("sizeOfVal" to "$activeCoreNs.mem")
-                add("alignOfVal" to "$activeCoreNs.mem")
-                add("readUnaligned" to "$activeCoreNs.ptr")
-                add("writeUnaligned" to "$activeCoreNs.ptr")
-                for (cmpFn in CORE_CMP_FN_IMPORTS) add(cmpFn to "$activeCoreNs.cmp")
+                val active =
+                    when (route.condition) {
+                        "always" -> true
+                        "externalCore" -> usesExternalCore
+                        "coreOrScalarChar" -> hasCoreCrate || headerContext.scalarChar
+                        "coreManagedAbi" -> hasCoreCrate && !headerContext.rawAbiMode
+                        else -> false
+                    }
+                if (active) {
+                    val pkg = route.targetPackage(activeCoreNs)
+                    for (sym in route.symbols) add(sym to pkg)
+                }
             }
         }
     }
@@ -1007,22 +990,17 @@ private class KotlinFileImportSynthesizer(
         bodyTokens: KotlinCodeTokenIndex,
         combinedExtraTypeImports: MutableSet<String>,
     ) {
-        val variants =
-            listOf(
-                "Break" to "$activeCoreNs.ops.controlflow.ControlFlow",
-                "Continue" to "$activeCoreNs.ops.controlflow.ControlFlow",
-                "Less" to "$activeCoreNs.cmp.Ordering",
-                "Equal" to "$activeCoreNs.cmp.Ordering",
-                "Greater" to "$activeCoreNs.cmp.Ordering",
-            )
-        for ((variantName, variantOwner) in variants) {
+        for ((ownerSubpkg, variants) in YamlRuleCatalogs.PathsConstsAndCAbi.coreEnumVariantImports) {
+            val variantOwner = "$activeCoreNs.$ownerSubpkg"
             val ownerPkg = variantOwner.substringBeforeLast('.')
-            if (canSynthesizeSymbolImport(variantName, ownerPkg) &&
-                variantName !in inspector.enumVariantSimpleNames &&
-                variantName !in inspector.importedEnumVariantSimpleNames &&
-                bodyTokens.hasIdent(variantName)
-            ) {
-                combinedExtraTypeImports += "import $variantOwner.$variantName"
+            for (variantName in variants) {
+                if (canSynthesizeSymbolImport(variantName, ownerPkg) &&
+                    variantName !in inspector.enumVariantSimpleNames &&
+                    variantName !in inspector.importedEnumVariantSimpleNames &&
+                    bodyTokens.hasIdent(variantName)
+                ) {
+                    combinedExtraTypeImports += "import $variantOwner.$variantName"
+                }
             }
         }
     }
@@ -1032,20 +1010,22 @@ private class KotlinFileImportSynthesizer(
         bodyTokens: KotlinCodeTokenIndex,
     ): List<Pair<String, String>> =
         buildList {
-            add("clone" to "$activeCoreNs.clone")
-            for (sliceExt in CORE_SLICE_EXT_IMPORTS) add(sliceExt to "$activeCoreNs.slice")
-            for (strExt in CORE_STR_EXT_IMPORTS) add(strExt to "$activeCoreNs.str")
-            if (bodyTokens.hasAtomicTypeIdent) {
-                for (atomicExt in CORE_ATOMIC_EXT_IMPORTS) add(atomicExt to "$activeCoreNs.sync.atomic")
-            }
-            for (ext in CORE_NUM_EXT_IMPORTS) add(ext to "$activeCoreNs.num")
-            if (bodyTokens.hasIdent("MutPtr") || bodyTokens.hasIdent("asMutPtr") || bodyTokens.hasIdent("nullMut")) {
-                for (ext in SHARED_RAW_PTR_EXT_IMPORTS) add(ext to "$activeCoreNs.ptr.mutptr")
-                for (ext in MUT_ONLY_RAW_PTR_EXT_IMPORTS) add(ext to "$activeCoreNs.ptr.mutptr")
-            }
-            if (bodyTokens.hasIdent("ConstPtr") || bodyTokens.hasIdent("asPtr")) {
-                for (ext in SHARED_RAW_PTR_EXT_IMPORTS) add(ext to "$activeCoreNs.ptr.constptr")
-                add("castMut" to "$activeCoreNs.ptr.constptr")
+            for (route in YamlRuleCatalogs.PathsConstsAndCAbi.coreExtensionImportRoutes) {
+                val active =
+                    when (route.condition) {
+                        "always" -> true
+                        "atomicIdent" -> bodyTokens.hasAtomicTypeIdent
+                        "mutPtrIdent" ->
+                            bodyTokens.hasIdent("MutPtr") ||
+                                bodyTokens.hasIdent("asMutPtr") ||
+                                bodyTokens.hasIdent("nullMut")
+                        "constPtrIdent" -> bodyTokens.hasIdent("ConstPtr") || bodyTokens.hasIdent("asPtr")
+                        else -> false
+                    }
+                if (active) {
+                    val pkg = route.targetPackage(activeCoreNs)
+                    for (sym in route.symbols) add(sym to pkg)
+                }
             }
         }
 
@@ -1163,63 +1143,6 @@ private class KotlinFileImportSynthesizer(
 
     private companion object {
         val EXPERIMENTAL_INFIX_BITWISE_OPS = listOf("and", "or", "xor")
-
-        val CORE_MEM_LAYOUT_IMPORTS =
-            wordSet("TypeLayout PrimitiveLayouts PrimitiveArrayLayouts fixedListTypeLayout")
-        val CORE_ROOT_SCALAR_IMPORTS = wordSet("U128 I128 F16 F128 RustAny RustTypeId")
-        val CORE_NUM_ERROR_IMPORTS = wordSet("ParseIntError IntErrorKind TryFromIntError")
-        val CORE_MEM_FN_IMPORTS = wordSet("transmute transmuteUnchecked sizeOf alignOf")
-        val CORE_CMP_FN_IMPORTS = wordSet("min max clamp")
-        val CORE_CELL_IMPORTS = wordSet("Cell RefCell Ref RefMut")
-        val CORE_CHAR_IMPORTS = wordSet("RustChar CharTryFromError RustCharIndex rustChars rustCharIndices")
-        val CORE_SLICE_EXT_IMPORTS =
-            wordSet(
-                "len iter iterMut splitAt splitFirst splitFirstMut splitLast splitLastMut",
-                "splitAtMut chunksExact chunksExactMut",
-            )
-        val CORE_STR_EXT_IMPORTS = wordSet("len isCharBoundary splitAt")
-        val CORE_PTR_FN_IMPORTS =
-            wordSet(
-                "nullMut nullVal withoutProvenance withoutProvenanceMut dangling danglingMut",
-                "fromRef fromMut sliceFromRawParts sliceFromRawPartsMut copyNonoverlapping writeBytes dropInPlace",
-            )
-        val CORE_ASCII_HELPER_IMPORTS =
-            wordSet(
-                "isAscii isAsciiAlphabetic isAsciiUppercase isAsciiLowercase isAsciiAlphanumeric",
-                "isAsciiDigit isAsciiHexdigit isAsciiPunctuation isAsciiGraphic isAsciiWhitespace",
-                "isAsciiControl toAsciiLowercase toAsciiUppercase",
-            )
-        val SHARED_RAW_PTR_EXT_IMPORTS =
-            wordSet(
-                "isNull cast add sub offset byteAdd byteSub byteOffset",
-                "wrappingAdd wrappingSub wrappingOffset wrappingByteAdd wrappingByteSub wrappingByteOffset",
-                "read readUnaligned readVolatile copyTo copyToNonoverlapping",
-                "asRef asUninitRef asUninitSlice addr withAddr mapAddr exposeProvenance",
-                "castUninit castInit castSlice offsetFrom offsetFromUnsigned byteOffsetFrom byteOffsetFromUnsigned",
-                "isAligned isAlignedTo alignOffset withMetadataOf toRawParts mask len",
-            )
-        val MUT_ONLY_RAW_PTR_EXT_IMPORTS =
-            wordSet(
-                "write writeUnaligned writeVolatile writeBytes copyFrom copyFromNonoverlapping",
-                "asMut asUninitMut asUninitSliceMut castConst dropInPlace replace swap splitAtMut",
-            )
-        val CORE_NUM_EXT_IMPORTS =
-            wordSet(
-                "uncheckedAdd uncheckedSub uncheckedMul checkedAdd checkedSub checkedMul checkedDiv checkedRem",
-                "checkedAddUnsigned checkedSubUnsigned checkedAddSigned checkedSubSigned",
-                "overflowingAdd overflowingSub overflowingMul overflowingAddUnsigned overflowingSubUnsigned",
-                "overflowingAddSigned overflowingSubSigned wrappingAddUnsigned wrappingSubUnsigned",
-                "wrappingAddSigned wrappingSubSigned saturatingAdd saturatingSub saturatingMul",
-                "saturatingAddUnsigned saturatingSubUnsigned carryingAdd borrowingSub carryingMul carryingMulAdd",
-                "wideningMul absDiff divCeil nextMultipleOf checkedNextMultipleOf isMultipleOf midpoint",
-                "castSigned castUnsigned isPowerOfTwo nextPowerOfTwo checkedNextPowerOfTwo wrappingNextPowerOfTwo",
-                "ilog ilog2 ilog10 checkedIlog checkedIlog2 checkedIlog10 isqrt checkedIsqrt",
-            )
-        val CORE_ATOMIC_EXT_IMPORTS =
-            wordSet(
-                "load store swap compareExchange compareExchangeWeak fetchAdd fetchSub fetchAnd fetchOr",
-                "fetchXor fetchNand fetchMax fetchMin fetchUpdate intoInner getMut asPtr",
-            )
     }
 }
 

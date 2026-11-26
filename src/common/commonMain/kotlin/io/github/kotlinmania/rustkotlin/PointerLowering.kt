@@ -47,23 +47,14 @@ private fun singleUnqualifiedPathIdent(type: SynType?): String? =
         ?.path
         ?.lastIdentText()
 
-private val FIXED_SCALAR_CODECS: Map<String, String> =
-    mapOf(
-        "i8" to "I8",
-        "u8" to "U8",
-        "i16" to "I16",
-        "u16" to "U16",
-        "i32" to "I32",
-        "u32" to "U32",
-        "i64" to "I64",
-        "u64" to "U64",
-        "bool" to "BOOL",
-    )
+private val FIXED_SCALAR_CODECS: Map<String, String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.fixedScalarCodecs
 
-private val EXTENDED_SCALAR_POINTED_PRIMITIVES: Set<String> =
-    wordSet("isize usize i128 u128 f16 f32 f64 f128 char")
+private val EXTENDED_SCALAR_POINTED_PRIMITIVES: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.extendedScalarPointedPrimitives
 
-private val ADDRESS_BACKED_SYS_ROOTS: Set<String> = wordSet("libc wasip1 windows_sys wasi")
+private val ADDRESS_BACKED_SYS_ROOTS: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.addressBackedSysRoots
 
 /** Keep pointer identity distinct from Kotlin's nullable pointee/value types. */
 internal fun rawPointerPointeeType(type: String?): String? {
@@ -175,19 +166,14 @@ internal fun KotlinJ2KEmitter.sourceTransparentField(
     return name to renderType(fieldType, selfType)
 }
 
-private val RAW_MEMORY_AND_LAYOUT_IDENTS: Set<String> =
-    wordSet(
-        "size_of size_of_val align_of align_of_val offset_of transmute transmute_copy transmute_unchecked",
-        "zeroed MaybeUninit ManuallyDrop UnsafeCell SyncUnsafeCell from_raw_parts from_raw_parts_mut",
-        "read_unaligned write_unaligned read_volatile write_volatile addr_of addr_of_mut",
-        "copy_nonoverlapping NonNull TypeLayout PrimitiveLayouts",
-    )
+private val RAW_MEMORY_AND_LAYOUT_IDENTS: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.rawMemoryAndLayoutIdents
 
-private val MANAGED_SLICE_BASES: Set<String> =
-    wordSet("List MutableList ArrayList String CharSequence LinearSliceView LinearMutSliceView ByteSlice MutByteSlice")
+private val MANAGED_SLICE_BASES: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.managedSliceBases
 
-private val VIEW_OFFSET_SLICE_BASES: Set<String> =
-    wordSet("LinearSliceView LinearMutSliceView ByteSlice MutByteSlice")
+private val VIEW_OFFSET_SLICE_BASES: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.viewOffsetSliceBases
 
 private fun KotlinJ2KEmitter.extractManagedSliceAsPtrTarget(
     expr: Expr,
@@ -1254,9 +1240,12 @@ private class SourceAstTypeInferrer(
     }
 
     companion object {
-        private val POINTER_CAST_METHODS = wordSet("cast cast_mut cast_const")
-        private val POINTER_CONTAINER_WRAPPERS = wordSet("NonNull Vec Box Unique")
-        private val INTEGER_LITERAL_SUFFIXES = wordSet("i8 u8 i16 u16 i32 u32 i64 u64 i128 u128 isize usize")
+        private val POINTER_CAST_METHODS: Set<String>
+            get() = YamlRuleCatalogs.TypeAndMethodPatterns.pointerCastMethods
+        private val POINTER_CONTAINER_WRAPPERS: Set<String>
+            get() = YamlRuleCatalogs.TypeAndMethodPatterns.pointerContainerWrappers
+        private val INTEGER_LITERAL_SUFFIXES: Set<String>
+            get() = YamlRuleCatalogs.TypeAndMethodPatterns.integerLiteralSuffixes
 
         private fun parseU8SynType(): SynType = SynAstFragmentParser.u8SynType()
     }

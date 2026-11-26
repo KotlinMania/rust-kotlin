@@ -1305,8 +1305,8 @@ private fun extractImportLocalName(imp: String): String {
     return if (aliasSep > 0) imp.substring(aliasSep + 4).trim() else imp.substringAfterLast('.')
 }
 
-internal val UMBRELLA_LINK_LIBRARIES =
-    wordSet("c m dl pthread rt System gcc gcc_s stdc++ c++ msvcrt ucrtbase libcmt legacy_stdio_definitions")
+internal val UMBRELLA_LINK_LIBRARIES: Set<String>
+    get() = YamlRuleCatalogs.PathsConstsAndCAbi.umbrellaLinkLibraries
 
 internal fun extractLinkLibraryNamesFromLinkArgs(
     tokens: TokenStream,
@@ -1576,20 +1576,8 @@ internal fun sanitizeCParamIdentifier(raw: String, index: Int): String {
     return if (clean in C_RESERVED_PARAM_NAMES) "arg${index}${toPascalCaseIdentifierPart(clean)}" else clean
 }
 
-private val C_RESERVED_PARAM_NAMES: Set<String> =
-    wordSet(
-        "auto break case char const continue default do double else enum extern float for goto if",
-        "inline int long register restrict return short signed sizeof static struct switch typedef union",
-        "unsigned void volatile while class namespace template typename public private protected virtual operator",
-        "new delete this friend using try catch throw bool true false alignas alignof constexpr decltype",
-        "noexcept nullptr static_assert thread_local typeid dynamic_cast static_cast reinterpret_cast const_cast",
-        "explicit mutable export wchar_t char8_t char16_t char32_t concept requires co_await co_return co_yield",
-        "and or not xor bitand bitor compl and_eq or_eq xor_eq not_eq near far huge pascal cdecl stdcall fastcall",
-        "interface small hyper environ errno stdin stdout stderr stat time read write open close accept bind",
-        "connect listen recv send socket select poll fork pipe dup dup2 link unlink chmod chown",
-        "lseek mkdir rmdir rename remove system abort exit free malloc calloc realloc div abs labs llabs",
-        "sin cos tan exp log pow sqrt ceil floor index rindex bcopy bzero bcmp",
-    )
+private val C_RESERVED_PARAM_NAMES: Set<String>
+    get() = YamlRuleCatalogs.PathsConstsAndCAbi.cReservedParamNames
 
 internal fun jniMangleSegment(segment: String): String =
     buildString(segment.length + 4) {
@@ -1674,37 +1662,10 @@ internal fun escapeCString(raw: String): String =
     }
 
 internal fun conversionMethodForNumericKind(kind: NumericKind): String =
-    when (kind) {
-        NumericKind.I8 -> "toByte"
-        NumericKind.U8 -> "toUByte"
-        NumericKind.I16 -> "toShort"
-        NumericKind.U16 -> "toUShort"
-        NumericKind.I32 -> "toInt"
-        NumericKind.U32 -> "toUInt"
-        NumericKind.I64 -> "toLong"
-        NumericKind.U64 -> "toULong"
-        NumericKind.F16, NumericKind.F32 -> "toFloat"
-        NumericKind.F64, NumericKind.F128 -> "toDouble"
-        NumericKind.I128, NumericKind.U128 -> "toLong"
-    }
+    YamlRuleCatalogs.PathsConstsAndCAbi.numericConversionMethodByKind.getValue(kind)
 
 private fun defaultKotlinFallbackForNumericKind(numKind: NumericKind): String =
-    when (numKind) {
-        NumericKind.I8 -> "(-1).toByte()"
-        NumericKind.U8 -> "0u.toUByte()"
-        NumericKind.I16 -> "(-1).toShort()"
-        NumericKind.U16 -> "0u.toUShort()"
-        NumericKind.I32 -> "-1"
-        NumericKind.U32 -> "0u"
-        NumericKind.I64 -> "-1L"
-        NumericKind.U64 -> "0uL"
-        NumericKind.F16 -> "F16.ZERO"
-        NumericKind.F32 -> "0.0f"
-        NumericKind.F64 -> "0.0"
-        NumericKind.F128 -> "F128.ZERO"
-        NumericKind.I128 -> "I128.ZERO"
-        NumericKind.U128 -> "U128.ZERO"
-    }
+    YamlRuleCatalogs.PathsConstsAndCAbi.numericDefaultFallbackByKind.getValue(numKind)
 
 internal fun defaultKotlinFallbackForBridge(
     kind: CAbiBridgeKind,
@@ -1740,13 +1701,8 @@ internal fun extractIdentifierTokens(
 ): Set<String> =
     KotlinTokenWalker(expr).collectFilteredIdentifiers(if (includeBuiltins) emptySet() else BUILTIN_KOTLIN_IDENTS)
 
-internal val BUILTIN_KOTLIN_IDENTS: Set<String> =
-    wordSet(
-        "null true false Unit Nothing Boolean Byte UByte Short UShort Int UInt Long ULong Float Double",
-        "String ZERO toByte toUByte toShort toUShort toInt toUInt toLong toULong toFloat toDouble",
-        "error emptyArray intArrayOf longArrayOf byteArrayOf shortArrayOf floatArrayOf doubleArrayOf",
-        "ubyteArrayOf ushortArrayOf uintArrayOf ulongArrayOf booleanArrayOf",
-    )
+internal val BUILTIN_KOTLIN_IDENTS: Set<String>
+    get() = YamlRuleCatalogs.PathsConstsAndCAbi.builtinKotlinIdents
 
 /**
  * Token-cursor parser for `c!` / `cpp!` inline FFI blocks (`[mut x: T as "CType", ...] -> Ret as "CRet" { ... }`).

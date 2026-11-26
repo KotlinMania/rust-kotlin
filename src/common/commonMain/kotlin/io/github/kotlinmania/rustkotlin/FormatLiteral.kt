@@ -133,11 +133,8 @@ internal fun escapeKotlinStringContent(text: String): String =
         }
     }
 
-private val KOTLIN_HARD_KEYWORDS: Set<String> =
-    wordSet(
-        "as break class continue do else false for fun if in interface is null",
-        "object package return super this throw true try typealias typeof val var when while",
-    )
+private val KOTLIN_HARD_KEYWORDS: Set<String>
+    get() = YamlRuleCatalogs.NamingAndComments.kotlinHardKeywordEscapes.keys
 
 private fun isSimpleKotlinIdentifier(expr: String): Boolean {
     if (expr.isEmpty()) return false

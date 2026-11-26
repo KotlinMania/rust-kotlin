@@ -743,3 +743,114 @@ stdlibDefaultlessAssocTypes:
   ExactSizeIterator: [Item]
   FusedIterator: [Item]
   AsyncIterator: [Item]
+
+# ==============================================================================
+# Cast, Operator, Witness, Pointer & Layout Lowering Catalogs
+# ==============================================================================
+
+coreOpsBinaryTraits: "Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr"
+coreOpsUnaryOutputTraits: "Neg Not"
+
+numericSuffixByKind:
+  I8: ".toByte()"
+  U8: ".toUByte()"
+  I16: ".toShort()"
+  U16: ".toUShort()"
+  I32: ".toInt()"
+  U32: ".toUInt()"
+  I64: ".toLong()"
+  U64: ".toULong()"
+  F16: ".toF16()"
+  F32: ".toFloat()"
+  F64: ".toDouble()"
+  F128: ".toF128()"
+  I128: ".toI128()"
+  U128: ".toU128()"
+
+boxedIntFromSuffixByKind:
+  I8: fromByte
+  I16: fromShort
+  I32: fromInt
+  I64: fromLong
+  U8: fromUByte
+  U16: fromUShort
+  U32: fromUInt
+  U64: fromULong
+
+zeroOrNullPointerLiterals: "0 0L 0u 0uL null"
+kotlinBuiltinValueTypeNames: "Byte Short Int Long UByte UShort UInt ULong Float Double Boolean Char String Unit Any"
+cPointerWidthUnsignedTypeNames: "size_t SizeT uintptr_t UintptrT rsize_t RsizeT __size_t"
+cPointerWidthSignedTypeNames: "ssize_t SsizeT ptrdiff_t PtrdiffT intptr_t IntptrT __ssize_t"
+
+companionCapableValueTypes:
+  - "Byte Short Int Long UByte UShort UInt ULong Float Double Boolean Char String"
+  - "kotlin.Byte kotlin.Short kotlin.Int kotlin.Long kotlin.UByte kotlin.UShort kotlin.UInt kotlin.ULong"
+  - "kotlin.Float kotlin.Double kotlin.Boolean kotlin.Char kotlin.String I128 U128 F16 F128 RustChar"
+
+iteratorAssocTraits: "Iterator DoubleEndedIterator ExactSizeIterator FusedIterator AsyncIterator"
+
+witnessMutRefScalars:
+  - "Byte UByte Short UShort Int UInt Long ULong I128 U128"
+  - "Float kotlin.Float Double Char RustChar ConstPtr MutPtr"
+
+zeroArgSelfProducerMethods:
+  - "zero one min_value max_value nan infinity neg_infinity neg_zero"
+  - "epsilon min_positive_value max_finite min_finite"
+
+externalOverridableStdlibTraits:
+  - "Read Write BufRead Seek Clone Iterator DoubleEndedIterator ExactSizeIterator"
+  - "BitOr BitAnd BitXor Not Add Sub Mul Div Rem Neg Shl Shr PanicPayload"
+
+coreOpsForwardRefTraits:
+  - "Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr Neg Not"
+  - "AddAssign SubAssign MulAssign DivAssign RemAssign BitAndAssign BitOrAssign BitXorAssign ShlAssign ShrAssign"
+
+kotlinBuiltinArithTypes: "Byte Short Int Long UByte UShort UInt ULong Float Double"
+
+fixedScalarCodecs:
+  i8: I8
+  u8: U8
+  i16: I16
+  u16: U16
+  i32: I32
+  u32: U32
+  i64: I64
+  u64: U64
+  bool: BOOL
+
+literalCodecTypes:
+  BOOL: Boolean
+  I8: Byte
+  U8: UByte
+  I16: Short
+  U16: UShort
+  I32: Int
+  U32: UInt
+  I64: Long
+  U64: ULong
+
+extendedScalarPointedPrimitives: "isize usize i128 u128 f16 f32 f64 f128 char"
+addressBackedSysRoots: "libc wasip1 windows_sys wasi"
+
+rawMemoryAndLayoutIdents:
+  - "size_of size_of_val align_of align_of_val offset_of transmute transmute_copy transmute_unchecked"
+  - "zeroed MaybeUninit ManuallyDrop UnsafeCell SyncUnsafeCell from_raw_parts from_raw_parts_mut"
+  - "read_unaligned write_unaligned read_volatile write_volatile addr_of addr_of_mut"
+  - "copy_nonoverlapping NonNull TypeLayout PrimitiveLayouts"
+
+managedSliceBases: "List MutableList ArrayList String CharSequence LinearSliceView LinearMutSliceView ByteSlice MutByteSlice"
+viewOffsetSliceBases: "LinearSliceView LinearMutSliceView ByteSlice MutByteSlice"
+pointerCastMethods: "cast cast_mut cast_const"
+pointerContainerWrappers: "NonNull Vec Box Unique"
+integerLiteralSuffixes: "i8 u8 i16 u16 i32 u32 i64 u64 i128 u128 isize usize"
+
+knownStdlibFirstTypeLayoutFunctions:
+  - "size_of align_of min_align_of pref_align_of zeroed read read_unaligned read_volatile"
+  - "write write_unaligned write_volatile write_bytes copy copy_nonoverlapping dangling dangling_mut"
+
+pointerStrideOrAccessMethods:
+  - "offset add sub wrapping_offset wrapping_add wrapping_sub offset_from offset_from_unsigned sub_ptr"
+  - "read read_volatile read_unaligned write write_volatile write_unaligned write_bytes"
+  - "copy_to copy_to_nonoverlapping copy_from copy_from_nonoverlapping as_ref as_mut"
+
+sizedCoreConstNames: "IS_ZST LAYOUT MAX_SLICE_LEN ALIGNMENT"

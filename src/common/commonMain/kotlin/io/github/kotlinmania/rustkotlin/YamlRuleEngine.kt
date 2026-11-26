@@ -968,3 +968,27 @@ internal class DeclarativeIntrinsicPatternRule(
             )
     }
 }
+
+/**
+ * Declarative routing rule mapping a group of synthesized `core` type, function, or extension
+ * symbols to their canonical subpackage (`""`, `"ptr"`, `"mem"`, `"num.error"`, `"ptr.mutptr"`, etc.)
+ * under an explicit activation condition (`always`, `externalCore`, `coreOrScalarChar`,
+ * `coreManagedAbi`, `atomicIdent`, `mutPtrIdent`, `constPtrIdent`).
+ */
+internal class DeclarativeCoreImportRouteRule(
+    val condition: String,
+    val subpkg: String,
+    val symbols: List<String>,
+) {
+    fun targetPackage(coreNs: String): String =
+        if (subpkg.isEmpty()) coreNs else "$coreNs.$subpkg"
+
+    companion object {
+        fun fromYaml(node: YamlNode.Mapping): DeclarativeCoreImportRouteRule =
+            DeclarativeCoreImportRouteRule(
+                condition = node.optionalString("condition") ?: "always",
+                subpkg = node.string("subpkg"),
+                symbols = node.wordSet("symbols").toList(),
+            )
+    }
+}

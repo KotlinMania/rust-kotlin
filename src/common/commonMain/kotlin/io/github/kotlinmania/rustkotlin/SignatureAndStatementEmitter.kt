@@ -35,42 +35,26 @@ internal data class TypeParamWitnessSpec(
     val defaultExpr: String? = null,
 )
 
-internal val COMPANION_CAPABLE_VALUE_TYPES: Set<String> =
-    wordSet(
-        "Byte Short Int Long UByte UShort UInt ULong Float Double Boolean Char String",
-        "kotlin.Byte kotlin.Short kotlin.Int kotlin.Long kotlin.UByte kotlin.UShort kotlin.UInt kotlin.ULong",
-        "kotlin.Float kotlin.Double kotlin.Boolean kotlin.Char kotlin.String I128 U128 F16 F128 RustChar",
-    )
+internal val COMPANION_CAPABLE_VALUE_TYPES: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.companionCapableValueTypes
 
-private val ITERATOR_ASSOC_TRAITS: Set<String> =
-    wordSet("Iterator DoubleEndedIterator ExactSizeIterator FusedIterator AsyncIterator")
+private val ITERATOR_ASSOC_TRAITS: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.iteratorAssocTraits
 
-private val WITNESS_MUT_REF_SCALARS: Set<String> =
-    wordSet(
-        "Byte UByte Short UShort Int UInt Long ULong I128 U128",
-        "Float kotlin.Float Double Char RustChar ConstPtr MutPtr",
-    )
+private val WITNESS_MUT_REF_SCALARS: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.witnessMutRefScalars
 
-private val ZERO_ARG_SELF_PRODUCER_METHODS: Set<String> =
-    wordSet(
-        "zero one min_value max_value nan infinity neg_infinity neg_zero",
-        "epsilon min_positive_value max_finite min_finite",
-    )
+private val ZERO_ARG_SELF_PRODUCER_METHODS: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.zeroArgSelfProducerMethods
 
-private val EXTERNAL_OVERRIDABLE_STDLIB_TRAITS: Set<String> =
-    wordSet(
-        "Read Write BufRead Seek Clone Iterator DoubleEndedIterator ExactSizeIterator",
-        "BitOr BitAnd BitXor Not Add Sub Mul Div Rem Neg Shl Shr PanicPayload",
-    )
+private val EXTERNAL_OVERRIDABLE_STDLIB_TRAITS: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.externalOverridableStdlibTraits
 
-private val CORE_OPS_FORWARD_REF_TRAITS: Set<String> =
-    wordSet(
-        "Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr Neg Not",
-        "AddAssign SubAssign MulAssign DivAssign RemAssign BitAndAssign BitOrAssign BitXorAssign ShlAssign ShrAssign",
-    )
+private val CORE_OPS_FORWARD_REF_TRAITS: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.coreOpsForwardRefTraits
 
-private val KOTLIN_BUILTIN_ARITH_TYPES: Set<String> =
-    wordSet("Byte Short Int Long UByte UShort UInt ULong Float Double")
+private val KOTLIN_BUILTIN_ARITH_TYPES: Set<String>
+    get() = YamlRuleCatalogs.TypeAndMethodPatterns.kotlinBuiltinArithTypes
 
 private fun collectCombinedWherePredicates(
     ownerWhere: WhereClause?,

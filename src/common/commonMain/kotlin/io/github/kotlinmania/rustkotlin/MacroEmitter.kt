@@ -2138,26 +2138,15 @@ private class ExprPathResolutionEmitter(
     }
 
     companion object {
-        private val SIZED_DIRECT_OWNER_CONSTS: Set<String> = wordSet("IS_ZST LAYOUT MAX_SLICE_LEN ALIGNMENT")
-        private val STDLIB_ROOT_CRATES: Set<String> = wordSet("core std alloc")
-        private val FLOAT_PRIMS: Set<String> = wordSet("f16 f32 f64 f128")
+        private val SIZED_DIRECT_OWNER_CONSTS: Set<String>
+            get() = YamlRuleCatalogs.TypeAndMethodPatterns.sizedCoreConstNames
+        private val STDLIB_ROOT_CRATES: Set<String>
+            get() = STDLIB_CRATE_ROOTS
+        private val FLOAT_PRIMS: Set<String>
+            get() = YamlRuleCatalogs.TypeAndMethodPatterns.floatSuffixNumericKinds.keys
 
         private fun resolvedPrimOwnerAndBits(kind: NumericKind?): Pair<String, String>? =
-            when (kind) {
-                NumericKind.I8 -> "Byte" to "8u"
-                NumericKind.U8 -> "UByte" to "8u"
-                NumericKind.I16 -> "Short" to "16u"
-                NumericKind.U16 -> "UShort" to "16u"
-                NumericKind.I32 -> "Int" to "32u"
-                NumericKind.U32 -> "UInt" to "32u"
-                NumericKind.I64 -> "Long" to "64u"
-                NumericKind.U64 -> "ULong" to "64u"
-                NumericKind.I128 -> "I128" to "128u"
-                NumericKind.U128 -> "U128" to "128u"
-                NumericKind.F32 -> "Float" to "32u"
-                NumericKind.F64 -> "Double" to "64u"
-                else -> null
-            }
+            kind?.let(YamlRuleCatalogs.PathsConstsAndCAbi.primOwnerAndBitsByKind::get)
 
         private fun renderTupleVariantConstructorLambda(ctorRef: String, arity: Int): String {
             if (arity == 1) return "{ $ctorRef(it) }"
