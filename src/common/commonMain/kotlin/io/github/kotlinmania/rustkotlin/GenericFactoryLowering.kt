@@ -30,7 +30,7 @@ private fun KotlinJ2KEmitter.sourceFactories(): List<SourceFactory> {
                 is Item.Fn -> listOf(SourceFactory(null, item.sig, item.block, null))
                 is Item.Impl ->
                     item.items.filterIsInstance<ImplItem.Fn>().filter { it.sig.inputs.firstOrNull() !is FnArg.Receiver }.map {
-                        SourceFactory(renderType(item.selfType, null).substringBefore('<'), it.sig, it.block, item.generics)
+                        SourceFactory(renderType(item.selfType, null).asKotlinRenderedType()?.headPath.orEmpty(), it.sig, it.block, item.generics)
                     }
                 else -> emptyList()
             }

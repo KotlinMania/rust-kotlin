@@ -368,17 +368,7 @@ internal fun KotlinJ2KEmitter.renderCastExpression(
     CastExpressionLowering(this, inner, targetType, sourceExpr, selfTypeName).render()
 
 private fun hasTopLevelOperatorOutsidePostfix(s: String): Boolean =
-    !KotlinTokenWalker.scanTopLevelTokens(s, trackAllBrackets = true) { tok, depth ->
-        if (depth != 0) {
-            true
-        } else {
-            when (tok) {
-                is KotlinLexToken.Whitespace, is KotlinLexToken.Newline, is KotlinLexToken.Arrow -> false
-                is KotlinLexToken.Punct -> tok.start == 0 || tok.ch !in "+-*/%&|^=<>"
-                else -> true
-            }
-        }
-    }
+    KotlinTokenWalker.hasTopLevelBinaryOperator(s)
 
 internal fun KotlinJ2KEmitter.isAlreadyRenderedAsNumericKind(rendered: String, kind: NumericKind?): Boolean {
     if (kind == null) return false
@@ -541,24 +531,11 @@ internal fun KotlinJ2KEmitter.isAtomicPostfixReceiver(sourceExpr: Expr, rendered
     }
 }
 
-internal fun KotlinJ2KEmitter.hasOuterBalancedParens(text: String): Boolean {
-    if (text.length < 2 || text.first() != '(' || text.last() != ')') return false
-    return KotlinTokenWalker.scanTopLevelTokens(text, trackAllBrackets = false) { tok, depth ->
-        !(tok is KotlinLexToken.Punct && tok.ch == ')' && depth == 0 && tok.end < text.length)
-    }
-}
+internal fun KotlinJ2KEmitter.hasOuterBalancedParens(text: String): Boolean =
+    KotlinTokenWalker.hasOuterBalancedParens(text)
 
 internal fun KotlinJ2KEmitter.hasNoTopLevelSpacesOrColons(text: String): Boolean =
-    KotlinTokenWalker.scanTopLevelTokens(text, trackAllBrackets = true) { tok, depth ->
-        !(
-            depth == 0 &&
-                (
-                    tok is KotlinLexToken.Whitespace ||
-                        tok is KotlinLexToken.Newline ||
-                        (tok is KotlinLexToken.Punct && tok.ch == ':')
-                )
-        )
-    }
+    KotlinTokenWalker.hasNoTopLevelSpacesOrColons(text)
 
 internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): String =
     when (ty) {

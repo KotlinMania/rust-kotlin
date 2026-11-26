@@ -1217,18 +1217,8 @@ private class CommentRustTokenEmitter(
     fun renderAttributeInterior(isInner: Boolean): String {
         if (trees.isEmpty()) return ""
         val prefix = if (isInner) "@file:" else "@"
-        var idx = 0
-        var lastPathIdent = ""
-        while (idx < size) {
-            val seg = cleanIdentAt(idx) ?: break
-            lastPathIdent = seg
-            idx++
-            if (idx < size && isDoubleColonAt(idx)) {
-                idx += 2
-                continue
-            }
-            break
-        }
+        val (pathSegs, idx) = extractLeadingPathIdents(0)
+        val lastPathIdent = pathSegs.lastOrNull().orEmpty()
         if (lastPathIdent.isEmpty()) {
             val fallbackBody = render()
             return if (fallbackBody.isEmpty()) "" else "$prefix$fallbackBody"
@@ -1273,13 +1263,12 @@ private fun mapCommentVocabularyWord(word: String, convertCamelIdentifiersOnly: 
 }
 
 private fun rewriteLeadingKotlinColonPrefix(text: String): String {
-    var ws = 0
-    while (ws < text.length && text[ws].isWhitespace()) ws++
-    if (!text.regionMatches(ws, "Kotlin", 0, 6, ignoreCase = true)) return text
-    var colonIdx = ws + 6
-    while (colonIdx < text.length && text[colonIdx].isWhitespace()) colonIdx++
-    if (colonIdx >= text.length || text[colonIdx] != ':') return text
-    return text.substring(0, ws) + "Note:" + text.substring(colonIdx + 1)
+    val walker = KotlinTokenWalker(text)
+    val kwIdx = walker.nextNonTriviaIndex(0)
+    if (!walker.identTextAt(kwIdx).equals("Kotlin", ignoreCase = true)) return text
+    val colonIdx = walker.nextNonTriviaIndex(kwIdx + 1)
+    if (walker.punctAt(colonIdx) != ':') return text
+    return text.substring(0, walker.tokens[kwIdx].start) + "Note:" + text.substring(walker.tokens[colonIdx].end)
 }
 
 private fun isLowerSnakeIdentifier(token: String): Boolean {

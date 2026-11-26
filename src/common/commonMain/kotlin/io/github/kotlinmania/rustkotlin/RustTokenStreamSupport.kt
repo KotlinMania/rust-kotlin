@@ -272,6 +272,70 @@ internal open class RustTokenCursor(
         return trees.size
     }
 
+    fun skipQualifiers(startIdx: Int, qualifiers: Set<String>): Int {
+        var idx = startIdx
+        while (identAt(idx) in qualifiers) idx++
+        return idx
+    }
+
+    fun extractLeadingPathIdents(startIdx: Int = 0): Pair<List<String>, Int> {
+        var idx = if (isDoubleColonAt(startIdx)) startIdx + 2 else startIdx
+        val first = cleanIdentAt(idx) ?: return emptyList<String>() to startIdx
+        val segments = mutableListOf(first)
+        idx++
+        while (idx < size && isDoubleColonAt(idx)) {
+            val nextSeg = cleanIdentAt(idx + 2) ?: break
+            segments += nextSeg
+            idx += 3
+        }
+        return segments to idx
+    }
+
+    fun matchModDeclAt(startIdx: Int): Triple<Boolean, String, Int>? {
+        val isPub = identAt(startIdx) == "pub"
+        val kwIdx = if (isPub) copyOptionalPubVisibility(startIdx) else startIdx
+        if (identAt(kwIdx) != "mod") return null
+        val modName = cleanIdentAt(kwIdx + 1) ?: return null
+        if (punctCharAt(kwIdx + 2) != ';') return null
+        return Triple(isPub, modName, kwIdx + 3)
+    }
+
+    fun matchMacroRulesDefAt(startIdx: Int): Pair<String, Int>? {
+        if (identAt(startIdx) != "macro_rules" || punctCharAt(startIdx + 1) != '!') return null
+        var k = startIdx + 2
+        val macroName = cleanIdentAt(k).orEmpty()
+        if (identAt(k) != null) k++
+        if (groupAt(k) == null) return null
+        k++
+        if (punctCharAt(k) == ';') k++
+        return macroName to k
+    }
+
+    fun matchExternBlockBraceIndex(startIdx: Int): Int? {
+        var j = startIdx
+        if (identAt(j) == "unsafe") j++
+        if (identAt(j) != "extern") return null
+        j++
+        if (trees.getOrNull(j) is TokenTree.Literal) j++
+        return if (groupAt(j, Delimiter.Brace) != null) j else null
+    }
+
+    fun extractAngleInnerSlice(openAngleIdx: Int): Pair<List<TokenTree>, Int>? {
+        val afterCloseIdx = skipBalancedAngles(openAngleIdx) ?: return null
+        return trees.subList(openAngleIdx + 1, afterCloseIdx - 1) to afterCloseIdx
+    }
+
+    fun extractBracketArrayTypeAndLen(idx: Int = 0): Pair<List<TokenTree>, List<TokenTree>>? {
+        val bracketGrp = groupAt(idx, Delimiter.Bracket) ?: return null
+        val inner = bracketGrp.stream().toList()
+        val semiParts = RustTokenCursor(inner).splitByTopLevelPunct(';')
+        return if (semiParts.size == 2 && semiParts[0].isNotEmpty() && semiParts[1].isNotEmpty()) {
+            semiParts[0] to semiParts[1]
+        } else {
+            null
+        }
+    }
+
     fun collectTopLevelIdentsOutsideAngles(): List<String> {
         val out = mutableListOf<String>()
         anyTopLevelOutsideAngles { idx ->
@@ -1023,4 +1087,40 @@ internal fun partitionCfgBranchArms(arms: List<CfgBranchArm>): List<Pair<List<To
         }
     }
     return result
+}
+
+/**
+ * Reusable item-level token stream scanner base class that accumulates outer/inner attributes
+ * into [pendingAttrs] and resets them automatically across `;` and `{...}` item boundaries.
+ */
+internal abstract class RustItemStreamScanner(
+    trees: List<TokenTree>,
+) : RustTokenCursor(trees) {
+    protected val pendingAttrs: MutableList<List<TokenTree>> = mutableListOf()
+
+    protected fun hasPendingAttrIdent(ident: String): Boolean =
+        pendingAttrs.any { RustTokenCursor(it).cleanIdentAt(0) == ident }
+
+    protected inline fun walkItemStream(
+        onItemToken: (idx: Int, attrs: List<List<TokenTree>>) -> Int?,
+    ) {
+        pendingAttrs.clear()
+        var idx = 0
+        while (idx < size) {
+            consumeAttribute(idx, pendingAttrs)?.let {
+                idx = it
+                continue
+            }
+            val nextIdx = onItemToken(idx, pendingAttrs)
+            if (nextIdx != null) {
+                pendingAttrs.clear()
+                idx = nextIdx
+                continue
+            }
+            if (punctCharAt(idx) == ';' || groupAt(idx, Delimiter.Brace) != null) {
+                pendingAttrs.clear()
+            }
+            idx++
+        }
+    }
 }

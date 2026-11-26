@@ -652,42 +652,25 @@ internal fun KotlinJ2KEmitter.renderFallbackDefaultForRenderedType(renderedType:
         NumericKind.F128 -> return "F128()"
         null -> {}
     }
-    if ((clean.startsWith("Pair<") || clean.startsWith("kotlin.Pair<")) && clean.endsWith(">")) {
-        val inner = clean.substringAfter('<').removeSuffix(">")
-        val commaIdx = findTopLevelGenericCommaIndex(inner)
-        if (commaIdx > 0) {
-            val a = renderFallbackDefaultForRenderedType(inner.substring(0, commaIdx).trim())
-            val b = renderFallbackDefaultForRenderedType(inner.substring(commaIdx + 1).trim())
+    val parsed = clean.asKotlinRenderedType()
+    if (parsed != null && !parsed.isNullable) {
+        if ((parsed.headPath == "Pair" || parsed.headPath == "kotlin.Pair") && parsed.arity == 2) {
+            val (a, b) = parsed.typeArgs.map(::renderFallbackDefaultForRenderedType)
             return "$clean($a, $b)"
         }
-    }
-    if ((clean.startsWith("Triple<") || clean.startsWith("kotlin.Triple<")) && clean.endsWith(">")) {
-        val inner = clean.substringAfter('<').removeSuffix(">")
-        val firstComma = findTopLevelGenericCommaIndex(inner)
-        if (firstComma > 0) {
-            val rest = inner.substring(firstComma + 1)
-            val secondCommaRel = findTopLevelGenericCommaIndex(rest)
-            if (secondCommaRel > 0) {
-                val a = renderFallbackDefaultForRenderedType(inner.substring(0, firstComma).trim())
-                val b = renderFallbackDefaultForRenderedType(rest.substring(0, secondCommaRel).trim())
-                val c = renderFallbackDefaultForRenderedType(rest.substring(secondCommaRel + 1).trim())
-                return "$clean($a, $b, $c)"
-            }
+        if ((parsed.headPath == "Triple" || parsed.headPath == "kotlin.Triple") && parsed.arity == 3) {
+            val (a, b, c) = parsed.typeArgs.map(::renderFallbackDefaultForRenderedType)
+            return "$clean($a, $b, $c)"
         }
-    }
-    if ((clean.startsWith("MaybeUninit<") || ".MaybeUninit<" in clean) && clean.endsWith(">")) {
-        val innerTy = clean.substringAfter("MaybeUninit<").removeSuffix(">").trim()
-        if (innerTy.isNotEmpty()) {
+        val maybeInner = parsed.singleArgOf("MaybeUninit")
+        if (maybeInner != null) {
             val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
             CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.maybeuninit.MaybeUninit")
-            return "MaybeUninit.uninit(${resolveRenderedTypeLayoutExpr(innerTy)})"
+            return "MaybeUninit.uninit(${resolveRenderedTypeLayoutExpr(maybeInner)})"
         }
     }
     return registerPtrDefaultImportIfNeeded(defaultInitializerForType(clean))
 }
-
-internal fun findTopLevelGenericCommaIndex(text: String): Int =
-    KotlinTokenWalker.findTopLevelCommaIndex(text, trackParens = false)
 
 internal fun KotlinJ2KEmitter.normalizeArrayLengthToIntExpr(
     rawLen: String,

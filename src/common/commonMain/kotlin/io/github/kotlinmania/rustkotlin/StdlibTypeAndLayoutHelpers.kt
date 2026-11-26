@@ -286,14 +286,15 @@ internal fun KotlinJ2KEmitter.resolveNonZeroNewExplicitTypeArgs(
         return hintParsed
     }
     if ("NonZeroInner" in currentTraitAssocParamNames) {
-        val tArg = inferExprRenderedType(args[0], selfTypeName)?.removeSuffix("?")?.trim() ?: "T"
+        val tArg = inferExprRenderedType(args[0], selfTypeName).asKotlinRenderedType()?.nonNullText ?: "T"
         return "NonZeroInner" to tArg
     }
     val argExpr = unwrapParenOrGroupExpr(args[0])
     val fieldPrim =
         (argExpr as? Expr.Field)?.let { f ->
-            val recvRendered = inferExprRenderedType(f.base, selfTypeName)?.substringBefore('<')?.removeSuffix("?")?.trim()
-            val ownerSimple = recvRendered?.substringAfterLast('.') ?: selfTypeName?.substringBefore('<')?.trim()
+            val ownerSimple =
+                inferExprRenderedType(f.base, selfTypeName).asKotlinRenderedType()?.simpleName
+                    ?: selfTypeName.asKotlinRenderedType()?.simpleName
             val fieldsByName = ownerSimple?.let { inspector.structFieldSynTypesByType[it] }
             val candidateNames =
                 when (val mem = f.member) {

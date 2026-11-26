@@ -270,7 +270,7 @@ internal fun collectCfgDisabledChildModuleRelPrefixes(
 
 private class ExternalModDeclTokenScanner(
     trees: List<TokenTree>,
-) : RustTokenCursor(trees) {
+) : RustItemStreamScanner(trees) {
     fun scanRootLibDirectives(
         selfAliasesOut: MutableSet<String>,
         includedSubdirsOut: MutableList<String>,
@@ -291,8 +291,7 @@ private class ExternalModDeclTokenScanner(
             }
             val incGrp = if (identAt(i) == "include" && punctCharAt(i + 1) == '!') groupAt(i + 2) else null
             if (incGrp != null) {
-                val grpTokens = incGrp.stream().toList()
-                val litVal = (grpTokens.singleOrNull() as? TokenTree.Literal)?.value?.strValue()?.value
+                val litVal = RustTokenCursor(incGrp.stream().toList()).takeIf { it.size == 1 }?.stringLiteralAt(0)
                 if (litVal != null && litVal.endsWith("/mod.rs")) {
                     val sub = litVal.removeSuffix("/mod.rs")
                     if (sub.isNotEmpty() && '/' !in sub && '\\' !in sub) {
@@ -310,16 +309,13 @@ private class ExternalModDeclTokenScanner(
         val result = mutableListOf<String>()
         var i = 0
         while (i < size) {
-            if (identAt(i) == "pub") {
-                val j = copyOptionalPubVisibility(i)
-                val modName = cleanIdentAt(j + 1)
-                if (identAt(j) == "mod" && modName != null && punctCharAt(j + 2) == ';') {
-                    result += modName
-                    i = j + 3
-                    continue
-                }
+            val modDecl = matchModDeclAt(i)
+            if (modDecl != null && modDecl.first) {
+                result += modDecl.second
+                i = modDecl.third
+            } else {
+                i++
             }
-            i++
         }
         return result
     }
@@ -332,18 +328,12 @@ private class ExternalModDeclTokenScanner(
         totalModDeclsOut: MutableMap<String, Int>,
         enabledModDeclsOut: MutableMap<String, Int>,
     ) {
-        val pendingAttrs = mutableListOf<List<TokenTree>>()
-        var idx = 0
-        while (idx < size) {
-            consumeAttribute(idx, pendingAttrs)?.let {
-                idx = it
-                continue
-            }
-            val attrInspector = ScannerAttrGroupInspector(pendingAttrs)
+        walkItemStream { idx, attrs ->
+            val attrInspector = ScannerAttrGroupInspector(attrs)
             val selfDisabled = inheritedDisabled || attrInspector.hasSkippedAttrs(skipCfgTest = skipCfgTest)
-            val kwIdx = copyOptionalPubVisibility(idx)
-            val rawMod = cleanIdentAt(kwIdx + 1)
-            if (identAt(kwIdx) == "mod" && rawMod != null && punctCharAt(kwIdx + 2) == ';') {
+            val modDecl = matchModDeclAt(idx)
+            if (modDecl != null) {
+                val rawMod = modDecl.second
                 val pathOverride = attrInspector.extractPathAttrOverride()
                 val targetPrefix =
                     when {
@@ -358,9 +348,7 @@ private class ExternalModDeclTokenScanner(
                 if (!selfDisabled) {
                     enabledModDeclsOut[targetPrefix] = (enabledModDeclsOut[targetPrefix] ?: 0) + 1
                 }
-                idx = kwIdx + 3
-                pendingAttrs.clear()
-                continue
+                return@walkItemStream modDecl.third
             }
             val curIdent = identAt(idx)
             val nextGrp = groupAt(idx + 2)
@@ -386,15 +374,10 @@ private class ExternalModDeclTokenScanner(
                             enabledModDeclsOut = enabledModDeclsOut,
                         )
                     }
-                    idx += 3
-                    pendingAttrs.clear()
-                    continue
+                    return@walkItemStream idx + 3
                 }
             }
-            if (punctCharAt(idx) == ';' || groupAt(idx, Delimiter.Brace) != null) {
-                pendingAttrs.clear()
-            }
-            idx++
+            null
         }
     }
 }
@@ -425,8 +408,8 @@ private class ScannerAttrGroupInspector(
     fun extractPathAttrOverride(): String? {
         for (attrTokens in attrGroups) {
             val c = RustTokenCursor(attrTokens)
-            if (c.size == 3 && c.identAt(0) == "path" && c.punctCharAt(1) == '=' && attrTokens[2] is TokenTree.Literal) {
-                val strVal = (attrTokens[2] as TokenTree.Literal).value.strValue().value
+            if (c.size == 3 && c.identAt(0) == "path" && c.punctCharAt(1) == '=') {
+                val strVal = c.stringLiteralAt(2)
                 if (!strVal.isNullOrBlank()) return strVal.replace('\\', '/').trimStart('/')
             }
         }
@@ -534,17 +517,12 @@ internal class ModuleTokenTreeScanner(
             }
             val skippedByCfg = ScannerAttrGroupInspector(pendingAttrs).hasSkippedAttrs()
 
-            if (cursor.identAt(i) == "macro_rules" &&
-                cursor.punctCharAt(i + 1) == '!' &&
-                cursor.identAt(i + 2) != null &&
-                cursor.groupAt(i + 3) != null
-            ) {
+            val macroRulesDef = cursor.matchMacroRulesDefAt(i)
+            if (macroRulesDef != null && macroRulesDef.first.isNotEmpty()) {
                 if (!skippedByCfg) {
-                    val rawMacroName = cursor.cleanIdentAt(i + 2).orEmpty()
-                    sink.registerSymbol(rustFunctionIdentToKotlin(rawMacroName), subpkg)
+                    sink.registerSymbol(rustFunctionIdentToKotlin(macroRulesDef.first), subpkg)
                 }
-                i += 4
-                if (cursor.punctCharAt(i) == ';') i++
+                i = macroRulesDef.second
                 pendingAttrs.clear()
                 continue
             }
@@ -990,15 +968,7 @@ internal open class RustTypeSliceInspector(
     }
 
     fun isResultReturnSlice(): Boolean {
-        val pathIdents = mutableListOf<String>()
-        for (i in 0 until size) {
-            val id = cleanIdentAt(i)
-            when {
-                id != null -> pathIdents += id
-                punctCharAt(i) == ':' -> Unit
-                else -> break
-            }
-        }
+        val (pathIdents, _) = extractLeadingPathIdents(0)
         if (pathIdents.lastOrNull() != "Result") return false
         return pathIdents.getOrNull(pathIdents.lastIndex - 1) != "fmt"
     }
@@ -1021,18 +991,11 @@ internal open class RustTypeSliceInspector(
 
     fun containsExcludedTypeParam(excludedTypeParamNames: Set<String>): Boolean {
         if (excludedTypeParamNames.isEmpty()) return false
-        for (tt in trees) {
-            when (tt) {
+        for (idx in trees.indices) {
+            when (val tt = trees[idx]) {
                 is TokenTree.Ident -> if (tt.value.toString().removePrefix("r#") in excludedTypeParamNames) return true
                 is TokenTree.Group -> {
-                    val inner = tt.value.stream().toList()
-                    val subTokens =
-                        if (tt.value.delimiter() == Delimiter.Bracket) {
-                            val semiIdx = inner.indexOfFirst { (it as? TokenTree.Punct)?.value?.asChar() == ';' }
-                            if (semiIdx > 0) inner.subList(0, semiIdx) else inner
-                        } else {
-                            inner
-                        }
+                    val subTokens = extractBracketArrayTypeAndLen(idx)?.first ?: tt.value.stream().toList()
                     if (RustTypeSliceInspector(subTokens).containsExcludedTypeParam(excludedTypeParamNames)) return true
                 }
                 else -> Unit
@@ -1091,30 +1054,26 @@ internal open class RustTypeSliceInspector(
                 }
             return "$ptrWrapper<$pointeeKt>"
         }
-        val bracketGrp = if (size == 1) groupAt(0, Delimiter.Bracket) else null
-        if (bracketGrp != null) {
-            val inner = bracketGrp.stream().toList()
-            val semiIdx = inner.indexOfFirst { (it as? TokenTree.Punct)?.value?.asChar() == ';' }
-            if (semiIdx > 0) {
-                val elemLeaf = RustTokenCursor(inner.subList(0, semiIdx)).simplePathLeafIdent()
-                val elemKt = elemLeaf?.let { KotlinNamingPolicy.Default.toTypeIdentifier(it, allowRawAbi = rawAbiMode) }
-                val resolvedElemKind =
-                    if (elemKt != null && numericKinds != null) {
-                        (if (subpkg.isNotEmpty()) numericKinds["$subpkg.$elemKt"] else null) ?: numericKinds[elemKt]
-                    } else {
-                        null
-                    }
-                if (resolvedElemKind != null && resolvedElemKind != "BOOL") {
-                    return SCANNER_SCALAR_DESCRIPTORS_BY_KIND[resolvedElemKind]?.arrayType
+        val arraySpec = if (size == 1) extractBracketArrayTypeAndLen(0) else null
+        if (arraySpec != null) {
+            val elemLeaf = RustTokenCursor(arraySpec.first).simplePathLeafIdent()
+            val elemKt = elemLeaf?.let { KotlinNamingPolicy.Default.toTypeIdentifier(it, allowRawAbi = rawAbiMode) }
+            val resolvedElemKind =
+                if (elemKt != null && numericKinds != null) {
+                    (if (subpkg.isNotEmpty()) numericKinds["$subpkg.$elemKt"] else null) ?: numericKinds[elemKt]
+                } else {
+                    null
                 }
-                return when (elemLeaf) {
-                    "c_char" -> if (rawAbiMode) "ByteArray" else "UByteArray"
-                    "usize" -> if (rawAbiMode) "ULongArray" else "IntArray"
-                    "isize" -> if (rawAbiMode) "LongArray" else "IntArray"
-                    else -> {
-                        val kind = elemLeaf?.let { SCANNER_RUST_TO_SCALAR_KIND[it] ?: SCANNER_C_ALIAS_TO_SCALAR_KIND[it] }
-                        kind?.let { SCANNER_SCALAR_DESCRIPTORS_BY_KIND[it]?.arrayType }
-                    }
+            if (resolvedElemKind != null && resolvedElemKind != "BOOL") {
+                return SCANNER_SCALAR_DESCRIPTORS_BY_KIND[resolvedElemKind]?.arrayType
+            }
+            return when (elemLeaf) {
+                "c_char" -> if (rawAbiMode) "ByteArray" else "UByteArray"
+                "usize" -> if (rawAbiMode) "ULongArray" else "IntArray"
+                "isize" -> if (rawAbiMode) "LongArray" else "IntArray"
+                else -> {
+                    val kind = elemLeaf?.let { SCANNER_RUST_TO_SCALAR_KIND[it] ?: SCANNER_C_ALIAS_TO_SCALAR_KIND[it] }
+                    kind?.let { SCANNER_SCALAR_DESCRIPTORS_BY_KIND[it]?.arrayType }
                 }
             }
         }
@@ -1135,12 +1094,6 @@ internal open class RustTypeSliceInspector(
 internal class RustItemHeaderTokenScanner(
     trees: List<TokenTree>,
 ) : RustTypeSliceInspector(trees) {
-    fun skipQualifiers(startIdx: Int, qualifiers: Set<String>): Int {
-        var idx = startIdx
-        while (identAt(idx) in qualifiers) idx++
-        return idx
-    }
-
     fun extractConstOrStaticTypeLeaf(identIdx: Int, endIdx: Int): String? {
         if (!isSingleColonAt(identIdx + 1)) return null
         val typeTokens = mutableListOf<TokenTree>()
@@ -1153,15 +1106,6 @@ internal class RustItemHeaderTokenScanner(
             k++
         }
         return RustTokenCursor(typeTokens).simplePathLeafIdent()
-    }
-
-    fun matchExternBlockBraceIndex(startIdx: Int): Int? {
-        var j = startIdx
-        if (identAt(j) == "unsafe") j++
-        if (identAt(j) != "extern") return null
-        j++
-        if (trees.getOrNull(j) is TokenTree.Literal) j++
-        return if (groupAt(j, Delimiter.Brace) != null) j else null
     }
 
     fun matchPathMacroGroupIndex(startIdx: Int): Int? {
@@ -1244,8 +1188,7 @@ internal class RustItemHeaderTokenScanner(
         startIdx: Int,
         rawAbiMode: Boolean,
     ): HeaderGenericTypeParams {
-        val afterCloseIdx = skipBalancedAngles(startIdx) ?: return HeaderGenericTypeParams(emptySet(), 0, startIdx)
-        val inner = trees.subList(startIdx + 1, afterCloseIdx - 1)
+        val (inner, afterCloseIdx) = extractAngleInnerSlice(startIdx) ?: return HeaderGenericTypeParams(emptySet(), 0, startIdx)
         val clauses = RustTokenCursor(inner).splitByTopLevelPunct(',', unconditionalAngles = true)
         val typeParams = linkedSetOf<String>()
         var typeArity = 0
@@ -1808,7 +1751,7 @@ internal fun discoverSharedInlineModuleRelFiles(byRelPath: Map<String, String>):
 
 private class InlineModulePatternTokenScanner(
     trees: List<TokenTree>,
-) : RustTokenCursor(trees) {
+) : RustItemStreamScanner(trees) {
     fun containsTopLevelTypeDeclTokens(): Boolean {
         var i = 0
         while (i < size) {
@@ -1818,15 +1761,12 @@ private class InlineModulePatternTokenScanner(
                 i++
                 continue
             }
-            val id = identAt(i)
-            if (id == "macro_rules" && punctCharAt(i + 1) == '!') {
-                var k = i + 2
-                if (identAt(k) != null) k++
-                if (groupAt(k) != null) k++
-                if (punctCharAt(k) == ';') k++
-                i = k
+            val macroRules = matchMacroRulesDefAt(i)
+            if (macroRules != null) {
+                i = macroRules.second
                 continue
             }
+            val id = identAt(i)
             if (id in setOf("struct", "enum", "union", "trait")) return true
             if (id == "features" && punctCharAt(i + 1) == '!') return true
             i++
@@ -1842,13 +1782,7 @@ private class InlineModulePatternTokenScanner(
         nestedPrivateModCountsOut: MutableMap<String, Int>,
         pubUseGlobStemsOut: MutableSet<String>,
     ) {
-        val pendingAttrs = mutableListOf<List<TokenTree>>()
-        var i = 0
-        while (i < size) {
-            consumeAttribute(i, pendingAttrs)?.let {
-                i = it
-                continue
-            }
+        walkItemStream { i, _ ->
             val grp = groupAt(i)
             if (grp != null) {
                 InlineModulePatternTokenScanner(grp.stream().toList()).scanPatterns(
@@ -1859,31 +1793,24 @@ private class InlineModulePatternTokenScanner(
                     nestedPrivateModCountsOut = nestedPrivateModCountsOut,
                     pubUseGlobStemsOut = pubUseGlobStemsOut,
                 )
-                pendingAttrs.clear()
-                i++
-                continue
+                return@walkItemStream i + 1
             }
-            val curId = identAt(i)
-            if (curId == "mod") {
-                val prevIsPub =
-                    identAt(i - 1) == "pub" ||
-                        (i >= 2 && identAt(i - 2) == "pub" && groupAt(i - 1, Delimiter.Parenthesis) != null)
-                val modIdent = cleanIdentAt(i + 1)
-                if (!prevIsPub && modIdent != null && punctCharAt(i + 2) == ';') {
-                    val hasCfg = pendingAttrs.any { (it.firstOrNull() as? TokenTree.Ident)?.value?.toString() == "cfg" }
-                    val hasMacroUse = pendingAttrs.any { (it.firstOrNull() as? TokenTree.Ident)?.value?.toString() == "macro_use" }
+            val modDecl = matchModDeclAt(i)
+            if (modDecl != null) {
+                val (isPub, modIdent, nextIdx) = modDecl
+                if (!isPub) {
+                    val hasCfg = hasPendingAttrIdent("cfg")
+                    val hasMacroUse = hasPendingAttrIdent("macro_use")
                     if (isTopLevel && !hasCfg) {
                         if (hasMacroUse) macroUseStemsOut += modIdent
                         topLevelPrivateModsOut += modIdent
                     } else {
                         nestedPrivateModCountsOut[modIdent] = (nestedPrivateModCountsOut[modIdent] ?: 0) + multiplier
                     }
-                    pendingAttrs.clear()
-                    i += 3
-                    continue
                 }
+                return@walkItemStream nextIdx
             }
-            if (curId == "pub") {
+            if (identAt(i) == "pub") {
                 val uIdx = copyOptionalPubVisibility(i)
                 if (identAt(uIdx) == "use") {
                     var endUse = uIdx + 1
@@ -1897,15 +1824,10 @@ private class InlineModulePatternTokenScanner(
                     ) {
                         cleanIdentAt(endUse - 4)?.let { pubUseGlobStemsOut += it }
                     }
-                    pendingAttrs.clear()
-                    i = if (endUse < size) endUse + 1 else endUse
-                    continue
+                    return@walkItemStream if (endUse < size) endUse + 1 else endUse
                 }
             }
-            if (punctCharAt(i) == ';') {
-                pendingAttrs.clear()
-            }
-            i++
+            null
         }
     }
 

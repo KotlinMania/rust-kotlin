@@ -1537,7 +1537,7 @@ private class ExternalKotlinSymbolWalker(
     private val tupleStructArity: MutableMap<String, Int>,
     private val enumVariantTypeArity: MutableMap<String, Int>,
     private val unitEnumVariants: MutableSet<String>,
-) : KotlinTokenWalker(sourceText) {
+) : KotlinDeclarationScopeWalker(sourceText) {
     private val twoFieldClasses = linkedSetOf<String>()
     private val candidateTwoFieldFns = mutableListOf<Pair<String, String>>()
 
@@ -1556,20 +1556,6 @@ private class ExternalKotlinSymbolWalker(
                 twoFieldResultFns += "$packageName.$fnName"
             }
         }
-    }
-
-    private fun parsePackageHeader(): String? {
-        val idx = skipLeadingAnnotations(nextNonTriviaIndex(0))
-        if (identTextAt(idx) != "package") return null
-        return readDottedIdentifier(nextNonTriviaIndex(idx + 1))?.first
-    }
-
-    private fun skipLeadingAnnotations(startIdx: Int, limit: Int = tokens.size): Int {
-        var idx = startIdx
-        while (punctAt(idx) == '@') {
-            idx = nextNonTriviaIndex(skipAnnotation(idx, limit), limit)
-        }
-        return idx
     }
 
     private fun recordExternalVariantArity(
@@ -1598,57 +1584,8 @@ private class ExternalKotlinSymbolWalker(
         ownerCls: String?,
         inCompanion: Boolean,
     ) {
-        var idx = startIdx
-        var atStatementStart = true
-        var parenDepth = 0
-        var bracketDepth = 0
-
-        while (idx < endExclusive) {
-            val tok = tokens[idx]
-            if (tok is KotlinLexToken.Whitespace || tok is KotlinLexToken.LineComment || tok is KotlinLexToken.BlockComment) {
-                idx++
-                continue
-            }
-            if (tok is KotlinLexToken.Newline) {
-                if (parenDepth == 0 && bracketDepth == 0) atStatementStart = true
-                idx++
-                continue
-            }
-            if (tok.interpolationDepth == 0 && tok is KotlinLexToken.Punct) {
-                when (tok.ch) {
-                    '{' ->
-                        if (parenDepth == 0 && bracketDepth == 0) {
-                            idx = findMatchingBraceEndToken(idx)
-                            atStatementStart = true
-                            continue
-                        }
-                    '(' -> parenDepth++
-                    ')' -> if (parenDepth > 0) parenDepth--
-                    '[' -> bracketDepth++
-                    ']' -> if (bracketDepth > 0) bracketDepth--
-                    ';' ->
-                        if (parenDepth == 0 && bracketDepth == 0) {
-                            atStatementStart = true
-                            idx++
-                            continue
-                        }
-                }
-            }
-
-            if (atStatementStart && parenDepth == 0 && bracketDepth == 0) {
-                atStatementStart = false
-                val prev = previousNonTriviaToken(idx)
-                val afterAssign = prev is KotlinLexToken.Punct && prev.ch == '='
-                if (!afterAssign) {
-                    val jumpTo = tryInspectDeclarationAt(idx, endExclusive, packageName, ownerCls, inCompanion)
-                    if (jumpTo != null) {
-                        idx = jumpTo
-                        atStatementStart = true
-                        continue
-                    }
-                }
-            }
-            idx++
+        walkDeclarationStatements(startIdx, endExclusive) { declStartIdx ->
+            tryInspectDeclarationAt(declStartIdx, endExclusive, packageName, ownerCls, inCompanion)
         }
     }
 

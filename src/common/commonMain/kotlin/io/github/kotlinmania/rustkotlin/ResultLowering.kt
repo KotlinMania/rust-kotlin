@@ -112,12 +112,10 @@ internal fun KotlinJ2KEmitter.isFmtResultSynType(ty: SynType?): Boolean {
 /** Resolve two Result payload types, expanding 1-arg `io::Result<T>` and 0-arg `fmt::Result` aliases when applicable. */
 internal fun KotlinJ2KEmitter.resolveEnclosingResultTypeArguments(rendered: String?): Pair<String, String>? {
     rustResultTypeArguments(rendered)?.let { return it }
-    val type = rendered?.trim()?.removeSuffix("?")?.trim() ?: return null
-    val base = type.substringBefore('<').substringAfterLast('.').trim()
-    if (base != "Result" && base != "RustResult") return null
-    if ('<' in type && type.endsWith('>')) {
-        val singleOk = type.substringAfter('<').dropLast(1).trim()
-        if (singleOk.isEmpty()) return null
+    val parsed = rendered.asKotlinRenderedType() ?: return null
+    if (!parsed.matchesSimple("Result", "RustResult")) return null
+    val singleOk = parsed.singleTypeArg
+    if (singleOk != null) {
         val aliasTarget = inspector.typeAliasTargets["Result"]?.let { renderType(it, null) }
         val aliasPair = rustResultTypeArguments(aliasTarget)
         if (aliasPair != null) {
@@ -146,7 +144,7 @@ internal fun KotlinJ2KEmitter.resolveEnclosingResultTypeArguments(rendered: Stri
             }
         return singleOk to errName
     }
-    if (type == "Result") {
+    if (!parsed.hasTypeArgs && parsed.nonNullText == "Result") {
         val aliasTarget = inspector.typeAliasTargets["Result"]?.let { renderType(it, null) }
         rustResultTypeArguments(aliasTarget)?.let { return it }
         if ("Error" in importedSimpleNameToPkg || "Error" in inspector.declaredTypeNames) return "Unit" to "Error"
@@ -155,25 +153,15 @@ internal fun KotlinJ2KEmitter.resolveEnclosingResultTypeArguments(rendered: Stri
 }
 
 /** Keep both Rust alternatives and their independent payload types when tagged Result is active. */
-internal fun rustResultTypeArguments(rendered: String?): Pair<String, String>? {
-    val type = rendered?.trim() ?: return null
-    val base = type.substringBefore('<').substringAfterLast('.')
-    if ((base != "Result" && base != "RustResult") || !type.endsWith('>')) return null
-    val arguments = type.substringAfter('<').dropLast(1)
-    val comma = findTopLevelGenericCommaIndex(arguments)
-    if (comma < 0) return null
-    return arguments.substring(0, comma).trim() to arguments.substring(comma + 1).trim()
-}
+internal fun rustResultTypeArguments(rendered: String?): Pair<String, String>? =
+    rendered.asKotlinRenderedType()?.takeIf { !it.isNullable }?.pairArgsOf("Result", "RustResult")
 
-internal fun rustResultOkPayloadType(rendered: String?): String? {
-    val type = rendered?.trim() ?: return null
-    val base = type.substringBefore('<').substringAfterLast('.')
-    if ((base != "Result" && base != "RustResult") || !type.endsWith('>')) return null
-    val arguments = type.substringAfter('<').dropLast(1).trim()
-    if (arguments.isEmpty()) return null
-    val comma = findTopLevelGenericCommaIndex(arguments)
-    return if (comma < 0) arguments else arguments.substring(0, comma).trim()
-}
+internal fun rustResultOkPayloadType(rendered: String?): String? =
+    rendered
+        .asKotlinRenderedType()
+        ?.takeIf { !it.isNullable && it.matchesSimple("Result", "RustResult") }
+        ?.typeArgs
+        ?.firstOrNull()
 
 internal fun KotlinJ2KEmitter.usesTaggedCoreResult(): Boolean =
     hasDeclaredResultEnum() || "core" in headerContext.crateNamespaces

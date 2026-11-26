@@ -187,19 +187,15 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
             val retKw = currentClosureLabel?.let { "return@$it" } ?: "return"
             val enclosingRet = currentEnclosingReturnRenderedType
             val exprInferredTy = inferExprRenderedType(expr.expr, selfTypeName)
-            val exprBase = exprInferredTy?.substringBefore('<')?.substringAfterLast('.')?.trim()
-            val enclosingBase = enclosingRet?.substringBefore('<')?.substringAfterLast('.')?.trim()
+            val exprBase = exprInferredTy.asKotlinRenderedType()?.simpleName
+            val enclosingParsed = enclosingRet.asKotlinRenderedType()
+            val enclosingBase = enclosingParsed?.simpleName
             if (enclosingRet == "Unit" || isFmtWriteOrUnitExpr(expr.expr, selfTypeName)) {
                 inner
             } else if (exprBase == "ControlFlow" || (exprBase == null && enclosingBase == "ControlFlow")) {
-                val cfTypeArgsInner =
-                    enclosingRet
-                        ?.takeIf { enclosingBase == "ControlFlow" && '<' in it && it.endsWith(">") }
-                        ?.substringAfter('<')
-                        ?.dropLast(1)
-                val cfComma = cfTypeArgsInner?.let(::findTopLevelGenericCommaIndex) ?: -1
-                val cfFirstArg = if (cfTypeArgsInner != null && cfComma >= 0) cfTypeArgsInner.substring(0, cfComma) else null
-                val cfSecondArg = if (cfTypeArgsInner != null && cfComma >= 0) cfTypeArgsInner.substring(cfComma + 1) else null
+                val cfPair = enclosingParsed?.takeIf { !it.isNullable }?.pairArgsOf("ControlFlow")
+                val cfFirstArg = cfPair?.first
+                val cfSecondArg = cfPair?.second
                 renderTaggedTwoArmTry(
                     scrutineeExpr = inner,
                     returnKeyword = retKw,
@@ -209,13 +205,12 @@ internal fun KotlinJ2KEmitter.renderExpr(expr: Expr, indent: String, selfTypeNam
                     earlyReturnArmSimple = "Break",
                     earlyReturnAccessor = "cfBreakValue()",
                     earlyReturnTypeArgs = buildExplicitResultTypeArgsSuffix(cfFirstArg, cfSecondArg),
-                    castEarlyPayloadTo = cfFirstArg?.trim()?.takeIf(::isUsableExplicitResultTypeArg),
+                    castEarlyPayloadTo = cfFirstArg?.takeIf(::isUsableExplicitResultTypeArg),
                     isUntypedScrutinee = exprInferredTy != null && exprBase != "ControlFlow",
                 )
-            } else if (enclosingRet != null &&
-                enclosingRet.endsWith("?") &&
-                !enclosingRet.startsWith("Result<") &&
-                !enclosingRet.startsWith("RustResult<")
+            } else if (enclosingParsed != null &&
+                enclosingParsed.isNullable &&
+                !enclosingParsed.matchesSimple("Result", "RustResult")
             ) {
                 "($inner ?: $retKw null)"
             } else {

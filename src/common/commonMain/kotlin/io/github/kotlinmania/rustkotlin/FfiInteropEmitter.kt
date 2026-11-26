@@ -1404,19 +1404,12 @@ internal fun cFailureReturnExpr(
 }
 
 internal fun extractHeaderCommentsFromSource(source: String, out: MutableSet<String>) {
-    for (line in source.lineSequence()) {
-        val trimmed = line.trimStart()
-        if (!trimmed.startsWith("//")) continue
-        var idx = 2
-        while (idx < trimmed.length && (trimmed[idx] == '!' || trimmed[idx] == '/' || trimmed[idx] == '*' || trimmed[idx].isWhitespace())) {
-            idx++
-        }
-        if (!trimmed.regionMatches(idx, "Header:", 0, 7)) continue
-        idx += 7
-        while (idx < trimmed.length && (trimmed[idx].isWhitespace() || trimmed[idx] == '`')) idx++
-        val start = idx
-        while (idx < trimmed.length && !trimmed[idx].isWhitespace() && trimmed[idx] != '`' && trimmed[idx] != '*') idx++
-        val hdr = trimmed.substring(start, idx).trim()
+    for (tok in KotlinSourceTokenizer.tokenize(source)) {
+        if (tok !is KotlinLexToken.LineComment) continue
+        val body = tok.rawText.drop(2).trimStart { it == '!' || it == '/' || it == '*' || it.isWhitespace() }
+        if (!body.startsWith("Header:")) continue
+        val rest = body.removePrefix("Header:").trimStart { it.isWhitespace() || it == '`' }
+        val hdr = rest.takeWhile { !it.isWhitespace() && it != '`' && it != '*' }
         if (hdr.endsWith(".h") || hdr.endsWith(".hpp")) out += hdr
     }
 }
@@ -1750,22 +1743,8 @@ internal fun defaultKotlinFallbackForBridge(
 internal fun extractIdentifierTokens(
     expr: String,
     includeBuiltins: Boolean = false,
-): Set<String> {
-    val out = linkedSetOf<String>()
-    for (token in KotlinSourceTokenizer.tokenize(expr)) {
-        val tok =
-            when (token) {
-                is KotlinLexToken.Ident -> token.rawText
-                is KotlinLexToken.BacktickIdent -> token.ident
-                is KotlinLexToken.StringIdentTemplate -> token.ident
-                else -> continue
-            }
-        if (tok.isNotEmpty() && !tok.first().isDigit() && (includeBuiltins || tok !in BUILTIN_KOTLIN_IDENTS)) {
-            out += tok
-        }
-    }
-    return out
-}
+): Set<String> =
+    KotlinTokenWalker(expr).collectFilteredIdentifiers(if (includeBuiltins) emptySet() else BUILTIN_KOTLIN_IDENTS)
 
 internal val BUILTIN_KOTLIN_IDENTS: Set<String> =
     wordSet(
