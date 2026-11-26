@@ -11,178 +11,67 @@ import io.github.kotlinmania.syn.RangeLimits
 import io.github.kotlinmania.syn.SynType
 
 private val PRIMITIVE_LAYOUT_NAME_BY_KT_TYPE: Map<String, String> =
-    mapOf(
-        "Boolean" to "BOOL",
-        "Byte" to "I8",
-        "UByte" to "U8",
-        "CVoid" to "U8",
-        "Short" to "I16",
-        "UShort" to "U16",
-        "Int" to "I32",
-        "UInt" to "U32",
-        "Long" to "I64",
-        "ULong" to "U64",
-        "Float" to "F32",
-        "kotlin.Float" to "F32",
-        "Double" to "F64",
-        "F16" to "F16_LAYOUT",
-        "F128" to "F128_LAYOUT",
-        "Char" to "CHAR",
-        "Unit" to "UNIT",
-    )
+    YamlRuleCatalogs.TypeAndMethodPatterns.primitiveLayoutsByKtType
 
 /**
  * Single authoritative catalog of Rust integer and floating-point primitive operations,
- * their Kotlin / `core` / `libm` target names, extra-argument numeric kinds, and return-type
- * shapes so both expression lowering and return-type inference query one source of truth.
+ * loaded from `type-and-method-patterns.yml` so both expression lowering and return-type
+ * inference query one declarative source of truth.
  */
 internal object PrimitiveNumericOpCatalog {
     val integerBitCountMethods: Map<String, String> =
-        mapOf(
-            "count_ones" to "countOnes",
-            "count_zeros" to "countZeros",
-            "leading_zeros" to "leadingZeros",
-            "trailing_zeros" to "trailingZeros",
-            "leading_ones" to "leadingOnes",
-            "trailing_ones" to "trailingOnes",
-        )
+        YamlRuleCatalogs.TypeAndMethodPatterns.integerBitCountMethods
 
     val integerUnaryOpMethods: Map<String, String> =
-        mapOf(
-            "checked_neg" to "checkedNeg",
-            "checked_abs" to "checkedAbs",
-            "wrapping_neg" to "wrappingNeg",
-            "wrapping_abs" to "wrappingAbs",
-            "saturating_neg" to "saturatingNeg",
-            "saturating_abs" to "saturatingAbs",
-            "overflowing_neg" to "overflowingNeg",
-            "overflowing_abs" to "overflowingAbs",
-            "reverse_bits" to "reverseBits",
-        ) + integerBitCountMethods
+        YamlRuleCatalogs.TypeAndMethodPatterns.integerUnaryOpMethods
 
     val integerShiftOrPowMethods: Map<String, String> =
-        mapOf(
-            "checked_shl" to "checkedShl",
-            "checked_shr" to "checkedShr",
-            "checked_pow" to "checkedPow",
-            "wrapping_shl" to "wrappingShl",
-            "wrapping_shr" to "wrappingShr",
-            "overflowing_shl" to "overflowingShl",
-            "overflowing_shr" to "overflowingShr",
-            "rotate_left" to "rotateLeft",
-            "rotate_right" to "rotateRight",
-            "pow" to "pow",
-        )
+        YamlRuleCatalogs.TypeAndMethodPatterns.integerShiftOrPowMethods
 
     val integerBinaryOpMethods: Map<String, String> =
-        mapOf(
-            "checked_add" to "checkedAdd",
-            "checked_sub" to "checkedSub",
-            "checked_mul" to "checkedMul",
-            "checked_div" to "checkedDiv",
-            "checked_rem" to "checkedRem",
-            "checked_div_euclid" to "checkedDivEuclid",
-            "checked_rem_euclid" to "checkedRemEuclid",
-            "wrapping_add" to "wrappingAdd",
-            "wrapping_sub" to "wrappingSub",
-            "wrapping_mul" to "wrappingMul",
-            "wrapping_div" to "wrappingDiv",
-            "wrapping_rem" to "wrappingRem",
-            "saturating_add" to "saturatingAdd",
-            "saturating_sub" to "saturatingSub",
-            "saturating_mul" to "saturatingMul",
-            "overflowing_add" to "overflowingAdd",
-            "overflowing_sub" to "overflowingSub",
-            "overflowing_mul" to "overflowingMul",
-            "div_euclid" to "divEuclid",
-            "rem_euclid" to "remEuclid",
-        )
+        YamlRuleCatalogs.TypeAndMethodPatterns.integerBinaryOpMethods
 
     private val allIntegerOpNames: Set<String> =
         integerUnaryOpMethods.keys + integerShiftOrPowMethods.keys + integerBinaryOpMethods.keys
 
     val signedOnlyIntegerMethods: Set<String> =
-        setOf("checked_abs", "wrapping_abs", "saturating_abs", "overflowing_abs", "saturating_neg")
+        YamlRuleCatalogs.TypeAndMethodPatterns.signedOnlyIntegerMethods
 
     val endian128Methods: Map<String, String> =
-        mapOf(
-            "to_be" to "toBe",
-            "from_be" to "fromBe",
-            "swap_bytes" to "swapBytes",
-            "to_le" to "toLe",
-            "from_le" to "fromLe",
-        )
+        YamlRuleCatalogs.TypeAndMethodPatterns.endian128Methods
 
     val standaloneCheckedI32Ops: Map<String, String> =
-        mapOf(
-            "checked_add" to "+",
-            "checked_sub" to "-",
-            "checked_mul" to "*",
-        )
+        YamlRuleCatalogs.TypeAndMethodPatterns.standaloneCheckedI32Ops
 
     val floatStdlibBoolPredicates: Map<String, String> =
-        mapOf(
-            "is_nan" to "isNaN",
-            "is_infinite" to "isInfinite",
-            "is_finite" to "isFinite",
-        )
+        YamlRuleCatalogs.TypeAndMethodPatterns.floatStdlibBoolPredicates
 
     val floatCoreBoolPredicates: Map<String, String> =
-        mapOf(
-            "is_sign_positive" to "isSignPositive",
-            "is_sign_negative" to "isSignNegative",
-            "is_normal" to "isNormal",
-            "is_subnormal" to "isSubnormal",
-        )
+        YamlRuleCatalogs.TypeAndMethodPatterns.floatCoreBoolPredicates
 
     val floatCoreSelfMethods: Map<String, String> =
-        mapOf(
-            "signum" to "signum",
-            "to_degrees" to "toDegrees",
-            "to_radians" to "toRadians",
-            "next_up" to "nextUp",
-            "next_down" to "nextDown",
-        )
+        YamlRuleCatalogs.TypeAndMethodPatterns.floatCoreSelfMethods
 
     val floatLibraryMethods: Map<String, String> =
         floatCoreBoolPredicates + mapOf("classify" to "classify") + floatCoreSelfMethods
 
     val floatKmUnaryBases: Map<String, String> =
-        mapOf(
-            "abs" to "kmFabs",
-            "floor" to "kmFloor",
-            "ceil" to "kmCeil",
-            "round" to "kmRound",
-            "round_ties_even" to "kmRoundTiesEven",
-            "trunc" to "kmTrunc",
-            "sqrt" to "kmSqrt",
-            "exp" to "kmExp",
-            "exp2" to "kmExp2",
-            "ln" to "kmLog",
-            "log2" to "kmLog2",
-            "log10" to "kmLog10",
-            "sin" to "kmSin",
-            "cos" to "kmCos",
-        )
+        YamlRuleCatalogs.TypeAndMethodPatterns.floatKmUnaryBases
 
     val floatLibmUnaryOps: Set<String> =
-        setOf("tan", "asin", "acos", "atan", "cbrt", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh")
+        YamlRuleCatalogs.TypeAndMethodPatterns.floatLibmUnaryOps
 
-    val floatLibmBinaryOps: Set<String> = setOf("atan2", "hypot")
+    val floatLibmBinaryOps: Set<String> =
+        YamlRuleCatalogs.TypeAndMethodPatterns.floatLibmBinaryOps
 
     val floatKmBinaryBases: Map<String, String> =
-        mapOf(
-            "powf" to "kmPow",
-            "copysign" to "kmCopysign",
-            "min" to "kmMinnum",
-            "max" to "kmMaxnum",
-        )
+        YamlRuleCatalogs.TypeAndMethodPatterns.floatKmBinaryBases
 
     private val floatSameTypeReturnMethods: Set<String> =
         (floatKmUnaryBases.keys - "round_ties_even") +
             floatLibmUnaryOps +
             floatLibmBinaryOps +
-            setOf("powf", "powi", "min", "max", "fract", "mul_add", "recip", "to_degrees", "to_radians", "signum", "log")
+            YamlRuleCatalogs.TypeAndMethodPatterns.floatAdditionalSameTypeReturnMethods
 
     private val floatBoolReturnMethods: Set<String> =
         floatStdlibBoolPredicates.keys + floatCoreBoolPredicates.keys

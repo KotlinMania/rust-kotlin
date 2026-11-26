@@ -503,9 +503,9 @@ private object RawPointerMethodCallRule : MethodLoweringRule() {
         val receiver = ctx.receiver
         val nonUnitArgs = ctx.nonUnitArgs
         val recvRawPtrRenderedTy = emitter.inferExprRenderedType(expr.receiver, ctx.selfTypeName)
-        if (rawPointerPointeeType(recvRawPtrRenderedTy) != null) {
+        val sourcePointee = rawPointerPointeeType(recvRawPtrRenderedTy)
+        if (sourcePointee != null) {
             val ptrPkg = "${ctx.coreNs}.ptr"
-            val intrPkg = "${ctx.coreNs}.intrinsics"
             val ptrCtor = if (isMutRawPointerRenderedType(recvRawPtrRenderedTy)) "MutPtr" else "ConstPtr"
             if (nonUnitArgs.size == 1 && rawMethod in RAW_POINTER_ARITH_METHODS) {
                 CoreIntrinsicLowering.registerCoreImport(emitter, "$ptrPkg.$ptrCtor")
@@ -519,16 +519,8 @@ private object RawPointerMethodCallRule : MethodLoweringRule() {
                     }
                 return "$ptrCtor(($receiver).rawAddress $deltaSign ($byteDelta))"
             }
-            if (rawMethod == "is_null" && nonUnitArgs.isEmpty()) return "(($receiver).rawAddress == 0L)"
-            if ((rawMethod == "cast_mut" || rawMethod == "cast_const") && nonUnitArgs.isEmpty() && expr.turbofish == null) {
-                val pointee = rawPointerPointeeType(recvRawPtrRenderedTy) ?: "Any"
-                val targetCtor = if (rawMethod == "cast_mut") "MutPtr" else "ConstPtr"
-                CoreIntrinsicLowering.registerCoreImport(emitter, "$ptrPkg.$targetCtor")
-                return "$targetCtor<$pointee>(($receiver).rawAddress)"
-            }
             if (rawMethod == "cast" && nonUnitArgs.isEmpty()) {
                 val destination = expr.firstTurbofishTypeArg()
-                val sourcePointee = rawPointerPointeeType(recvRawPtrRenderedTy)
                 val returnDestination =
                     when (val returnType = emitter.currentEnclosingReturnSynType) {
                         is SynType.Ptr -> returnType.elem
@@ -541,54 +533,30 @@ private object RawPointerMethodCallRule : MethodLoweringRule() {
                         ?: rawPointerPointeeType(emitter.currentEnclosingReturnRenderedType)
                         ?: returnDestination?.let { emitter.renderType(it, ctx.selfTypeName) }
                         ?: sourcePointee
-                        ?: "Any"
                 if (sourcePointee == destinationPointee) return receiver
                 CoreIntrinsicLowering.registerCoreImport(emitter, "$ptrPkg.$ptrCtor")
                 return "$ptrCtor<$destinationPointee>(($receiver).rawAddress)"
             }
-            if (expr.turbofish == null) {
-                when {
-                    (rawMethod == "read" || rawMethod == "read_unaligned" || rawMethod == "read_volatile") && nonUnitArgs.isEmpty() -> {
-                        val pointeeLayout = emitter.resolveRawPointerPointeeLayout(expr.receiver, ctx.selfTypeName)
-                        val readFn = if (rawMethod == "read_volatile") "readVolatileNative" else "readNative"
-                        return "($pointeeLayout).$readFn(($receiver).rawAddress)"
-                    }
-                    (rawMethod == "write" || rawMethod == "write_unaligned" || rawMethod == "write_volatile") && nonUnitArgs.size == 1 -> {
-                        val pointeeLayout = emitter.resolveRawPointerPointeeLayout(expr.receiver, ctx.selfTypeName)
-                        val valExpr = emitter.renderExpr(nonUnitArgs[0], ctx.indent, ctx.selfTypeName)
-                        val writeFn = if (rawMethod == "write_volatile") "writeVolatileNative" else "writeNative"
-                        return "($pointeeLayout).$writeFn(($receiver).rawAddress, $valExpr)"
-                    }
-                    rawMethod in PTR_COPY_METHODS && nonUnitArgs.size == 2 -> {
-                        val pointeeLayout = emitter.resolveRawPointerPointeeLayout(expr.receiver, ctx.selfTypeName)
-                        val argExpr = emitter.renderExpr(nonUnitArgs[0], ctx.indent, ctx.selfTypeName)
-                        val countExpr = emitter.renderExpr(nonUnitArgs[1], ctx.indent, ctx.selfTypeName)
-                        val isFrom = rawMethod.startsWith("copy_from")
-                        val fnName = if (rawMethod.endsWith("_nonoverlapping")) "kmCopyNonoverlapping" else "kmCopy"
-                        CoreIntrinsicLowering.registerCoreImport(emitter, "$intrPkg.$fnName")
-                        val srcAddr = if (isFrom) "($argExpr).rawAddress" else "($receiver).rawAddress"
-                        val dstAddr = if (isFrom) "($receiver).rawAddress" else "($argExpr).rawAddress"
-                        return "$fnName($srcAddr, $dstAddr, ($countExpr).toLong() * ($pointeeLayout).sizeBytes)"
-                    }
-                    rawMethod == "write_bytes" && nonUnitArgs.size == 2 -> {
-                        val pointeeLayout = emitter.resolveRawPointerPointeeLayout(expr.receiver, ctx.selfTypeName)
-                        val byteExpr = emitter.renderExpr(nonUnitArgs[0], ctx.indent, ctx.selfTypeName)
-                        val countExpr = emitter.renderExpr(nonUnitArgs[1], ctx.indent, ctx.selfTypeName)
-                        CoreIntrinsicLowering.registerCoreImport(emitter, "$intrPkg.kmWriteBytes")
-                        return "kmWriteBytes(($receiver).rawAddress, ($byteExpr).toUByte(), ($countExpr).toLong() * ($pointeeLayout).sizeBytes)"
-                    }
-                    rawMethod == "offset_from" && nonUnitArgs.size == 1 -> {
-                        val pointeeLayout = emitter.resolveRawPointerPointeeLayout(expr.receiver, ctx.selfTypeName)
-                        val originExpr = emitter.renderExpr(nonUnitArgs[0], ctx.indent, ctx.selfTypeName)
-                        val diffExpr = "((($receiver).rawAddress - ($originExpr).rawAddress) / ($pointeeLayout).strideBytes)"
-                        return if (emitter.headerContext.rawAbiMode) diffExpr else "$diffExpr.toInt()"
-                    }
-                    rawMethod == "addr" && nonUnitArgs.isEmpty() ->
-                        return if (emitter.headerContext.rawAbiMode) "($receiver).rawAddress.toULong()" else "($receiver).rawAddress.toInt()"
-                    rawMethod == "with_addr" && nonUnitArgs.size == 1 -> {
-                        val addrExpr = emitter.renderExpr(nonUnitArgs[0], ctx.indent, ctx.selfTypeName)
-                        CoreIntrinsicLowering.registerCoreImport(emitter, "$ptrPkg.$ptrCtor")
-                        return "$ptrCtor(($addrExpr).toLong())"
+            val ptrRule = YamlRuleCatalogs.TypeAndMethodPatterns.rawPtrMethodRules[rawMethod]
+            if (ptrRule != null && ptrRule.matchesHeader(rawMethod, "rawPtr", nonUnitArgs.size, expr.turbofish != null)) {
+                var cachedLayout: String? = null
+                val renderedArgs = arrayOfNulls<String>(nonUnitArgs.size)
+                return ptrRule.action.render(
+                    rawAbi = emitter.headerContext.rawAbiMode,
+                    onImport = { CoreIntrinsicLowering.registerCoreImport(emitter, it) },
+                ) { key ->
+                    when (key) {
+                        "recv" -> receiver
+                        "coreNs" -> ctx.coreNs
+                        "ptrCtor" -> ptrCtor
+                        "pointee" -> sourcePointee
+                        "pointeeLayout" ->
+                            cachedLayout ?: emitter.resolveRawPointerPointeeLayout(expr.receiver, ctx.selfTypeName).also { cachedLayout = it }
+                        "arg0" ->
+                            renderedArgs[0] ?: emitter.renderExpr(nonUnitArgs[0], ctx.indent, ctx.selfTypeName).also { renderedArgs[0] = it }
+                        "arg1" ->
+                            renderedArgs[1] ?: emitter.renderExpr(nonUnitArgs[1], ctx.indent, ctx.selfTypeName).also { renderedArgs[1] = it }
+                        else -> null
                     }
                 }
             }
@@ -599,8 +567,6 @@ private object RawPointerMethodCallRule : MethodLoweringRule() {
         }
         return null
     }
-
-    private val PTR_COPY_METHODS = wordSet("copy_to copy_to_nonoverlapping copy_from copy_from_nonoverlapping")
 }
 
 private object EarlyPrimitiveAndBitsMethodRule : MethodLoweringRule() {
@@ -707,14 +673,11 @@ private object EarlyReceiverStateAndCollectionRule : MethodLoweringRule() {
             emitter.usesCurrentThreadToken = true
             return "currentThreadBoundToken()"
         }
-        if (rawMethod == "debug_list" || rawMethod == "debug_set") {
-            val (open, close) = if (rawMethod == "debug_list") "[" to "]" else "{" to "}"
-            return "object { val entries = mutableListOf<Any?>(); fun entry(v: Any?) = apply { entries.add(v) }; fun entries(iter: Iterable<*>) = apply { for (e in iter) entries.add(e) }; fun finish() { $receiver.append(entries.joinToString(\", \", \"$open\", \"$close\")) } }"
+        YamlRuleCatalogs.TypeAndMethodPatterns.fmtOrQueueMethodRules[rawMethod]?.let { rule ->
+            if (rule.matchesHeader(rawMethod, "fmtOrQueue", 0, !noTurbofish)) {
+                return rule.action.render { if (it == "recv") receiver else null }
+            }
         }
-        if (rawMethod == "debug_map") {
-            return "object { val entries = mutableListOf<String>(); fun entry(k: Any?, v: Any?) = apply { entries.add(\"\$k: \$v\") }; fun finish() { $receiver.append(entries.joinToString(\", \", \"{\", \"}\")) } }"
-        }
-        if (rawMethod == "pop_front") return "$receiver.removeFirstOrNull()"
         if (rawMethod in OPTION_BORROW_IDENTITY_METHODS &&
             noTurbofish &&
             emitter.isKnownNullableOptionExpr(expr.receiver, receiver, ctx.selfTypeName)
@@ -722,21 +685,13 @@ private object EarlyReceiverStateAndCollectionRule : MethodLoweringRule() {
             return receiver
         }
         if (ctx.isDequeIterReceiver && noTurbofish) {
-            when (rawMethod) {
-                "next" -> return "$receiver.removeFirstOrNull()"
-                "next_back" -> return "$receiver.removeLastOrNull()"
-                "len" -> return "$receiver.size"
-                "clone" -> return "ArrayDeque($receiver)"
+            YamlRuleCatalogs.TypeAndMethodPatterns.dequeIterMethodRules[rawMethod]?.let { rule ->
+                return rule.action.render { if (it == "recv") receiver else null }
             }
         }
         if (ctx.isVecReceiver && noTurbofish) {
-            when (rawMethod) {
-                "pop" -> return "$receiver.removeLastOrNull()"
-                "len" -> return "$receiver.size"
-                "into_iter", "iter", "iter_mut" -> return "ArrayDeque($receiver)"
-                "clone" -> return "$receiver.toMutableList()"
-                "last_mut" -> return "$receiver.lastOrNull()"
-                "first_mut" -> return "$receiver.firstOrNull()"
+            YamlRuleCatalogs.TypeAndMethodPatterns.vecMethodRules[rawMethod]?.let { rule ->
+                return rule.action.render { if (it == "recv") receiver else null }
             }
         }
         if (rawMethod == "into" && noTurbofish && receiver in emitter.currentIntoSubstitutedParams) return receiver

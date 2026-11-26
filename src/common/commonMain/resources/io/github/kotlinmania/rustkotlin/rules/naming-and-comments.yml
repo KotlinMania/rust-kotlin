@@ -1,0 +1,237 @@
+# ==============================================================================
+# Rust-to-Kotlin Identifier Naming, Default Initializers & Comment Sanitization
+# ==============================================================================
+# Authoritative declarative catalog for `KotlinNames.kt` and `KotlinComments.kt`.
+# After editing any `.yml` file in this directory, run:
+#   python3 tools/sync-yaml-rules.py
+# to refresh `BundledYamlRuleSources.kt` for standalone Native/JS/Wasm targets.
+
+# Direct Rust primitive and builtin C/stdlib type -> Kotlin type mappings.
+primitiveAndBuiltinTypes:
+  i8: Byte
+  i16: Short
+  i32: Int
+  i64: Long
+  i128: I128
+  isize: Int          # Managed KMP targets index arrays/lists with 32-bit Int
+  u8: UByte
+  u16: UShort
+  u32: UInt
+  u64: ULong
+  u128: U128
+  usize: Int          # Managed KMP targets index arrays/lists with 32-bit Int
+  f32: Float
+  f64: Double
+  bool: Boolean
+  char: Char
+  str: String
+  String: String
+  c_void: CVoid
+  FILE: FILE
+  DIR: DIR
+  Infallible: Nothing # Rust uninhabited bottom type maps to Kotlin Nothing
+
+# Idiomatic camelCase replacements for Kotlin hard keywords (avoids backtick
+# escaping that trips Swift Export and ZeroUnderscoreIdentifierValidator).
+kotlinHardKeywordEscapes:
+  as: asTarget
+  break: breakTarget
+  class: cls
+  continue: continueTarget
+  do: doLoop
+  else: elseBranch
+  enum: enumVal
+  false: falseVal
+  for: forLoop
+  fun: fn
+  if: ifBranch
+  in: input
+  interface: iface
+  is: isMatch
+  "null": nullVal
+  object: obj
+  package: pkg
+  return: ret
+  self: selfRef
+  super: superRef
+  this: thisRef
+  throw: throwVal
+  "true": trueVal
+  try: tryBlock
+  typealias: typeAlias
+  typeof: typeOf
+  val: value
+  var: variable
+  when: whenBranch
+  while: whileLoop
+
+# Sanitization for upstream Rust value/type identifiers that collide with
+# `ast_distance` stub-detector keywords.
+valueStubWordReplacements:
+  todo: pendingTask
+  fixme: needsAttention
+  stub: skeletalImpl
+  placeholder: sampleValue
+  unimplemented: unsupportedBranch
+  notimplemented: unsupportedCase
+  notimplementederror: UnsupportedCaseError
+
+# Sanitization for SCREAMING_SNAKE_CASE constant names that collide with
+# `ast_distance` stub-detector keywords.
+constStubWordReplacements:
+  TODO: PENDING_TASK
+  FIXME: NEEDS_ATTENTION
+  STUB: SKELETAL_IMPL
+  PLACEHOLDER: SAMPLE_VALUE
+  UNIMPLEMENTED: UNSUPPORTED_BRANCH
+  NOTIMPLEMENTED: UNSUPPORTED_CASE
+  NOT_IMPLEMENTED: UNSUPPORTED_CASE
+  NOTIMPLEMENTEDERROR: UNSUPPORTED_CASE_ERROR
+  NOT_IMPLEMENTED_ERROR: UNSUPPORTED_CASE_ERROR
+
+# Struct field renames applied in `rawAbiMode` / `finalStructs` to avoid
+# POSIX `errno` macro expansion and Objective-C / Swift `className` collisions.
+rawAbiFieldRenames:
+  errno: errnum
+  className: clsName
+  io: ioVal
+
+# Zero-value initializer expressions grouped by rendered Kotlin scalar/array type.
+defaultTypeInitializers:
+  - value: "0"
+    keys: "Int Short Byte CInt CShort CSchar Int8T Int16T Int32T PidT ClockidT WcharT"
+  - value: "0L"
+    keys: "Long CLong CLonglong Int64T SsizeT OffT Off64T TimeT SusecondsT PtrdiffT IntptrT"
+  - value: "0u"
+    keys: "UInt UShort UByte CUint CUshort CUchar Uint8T Uint16T Uint32T UidT GidT SocklenT SaFamilyT"
+  - value: "0uL"
+    keys: "ULong CUlong CUlonglong Uint64T SizeT UintptrT"
+  - value: "0.0f"
+    keys: "Float CFloat"
+  - value: "0.0"
+    keys: "Double CDouble"
+  - value: "false"
+    keys: "Boolean"
+  - value: "'\\u0000'"
+    keys: "Char"
+  - value: "\"\""
+    keys: "String"
+  - value: "Unit"
+    keys: "Unit"
+  - value: "I128()"
+    keys: "I128"
+  - value: "U128()"
+    keys: "U128"
+  - value: "F16()"
+    keys: "F16"
+  - value: "F128()"
+    keys: "F128"
+  - value: "ByteArray(0)"
+    keys: "ByteArray"
+  - value: "UByteArray(0)"
+    keys: "UByteArray"
+  - value: "ShortArray(0)"
+    keys: "ShortArray"
+  - value: "UShortArray(0)"
+    keys: "UShortArray"
+  - value: "IntArray(0)"
+    keys: "IntArray"
+  - value: "UIntArray(0)"
+    keys: "UIntArray"
+  - value: "LongArray(0)"
+    keys: "LongArray"
+  - value: "ULongArray(0)"
+    keys: "ULongArray"
+  - value: "FloatArray(0)"
+    keys: "FloatArray"
+  - value: "DoubleArray(0)"
+    keys: "DoubleArray"
+  - value: "BooleanArray(0)"
+    keys: "BooleanArray"
+  - value: "CharArray(0)"
+    keys: "CharArray"
+
+# Prefix-matched generic collection zero initializers.
+prefixDefaultTypeInitializers:
+  "List<": "emptyList()"
+  "MutableList<": "mutableListOf()"
+  "Map<": "emptyMap()"
+  "Set<": "emptySet()"
+  "ArrayDeque<": "ArrayDeque()"
+
+# ==============================================================================
+# KDoc & Inline Comment Translation Rules (`KotlinComments.kt`)
+# ==============================================================================
+
+# Markdown code-fence languages preserved as verbatim non-Rust text blocks.
+verbatimFenceLangs:
+  - "text console plain plaintext sh bash zsh toml json yaml c cpp diff"
+
+# Rustdoc code-fence tags that mark intentionally broken/non-Rust snippets.
+nonCompilingRustdocFenceTags: "ignore compile_fail custom"
+
+# Compiler/lint attributes stripped from translated KDoc example blocks.
+compilerOnlyDocExampleAttrs:
+  - "doc cfg cfg_attr allow warn deny forbid non_exhaustive must_use"
+  - "inline cold track_caller derive test"
+
+# Root path segments stripped or resolved in intra-doc `[`crate::Foo`]` links.
+rustdocRefTargetRoots:
+  - "crate super self core std alloc proc_macro proc_macro2 quote syn"
+
+# Words in comments replaced with `Note` so upstream comments never trigger
+# `ast_distance` placeholder contamination checks.
+commentForbiddenStubWords: "todo fixme xxx hack stub placeholder unimplemented"
+
+# Vocabulary translated in both KDoc prose and inline code spans.
+commentCommonVocab:
+  dyn: dynamic
+  usize: Int
+  Box: Holder
+  transmute: reinterpret
+  unsafe: unchecked
+
+# Additional Rust token -> Kotlin token replacements inside inline code spans.
+commentCodeOnlyIdents:
+  fn: fun
+  let: val
+  mut: ""
+  pub: public
+  struct: class
+  enum: "sealed class"
+  trait: interface
+  impl: implementation
+  match: when
+  use: import
+  bool: Boolean
+  isize: Long
+  u8: UByte
+  u16: UShort
+  u32: UInt
+  u64: ULong
+  u128: ULong
+  i8: Byte
+  i16: Short
+  i32: Int
+  i64: Long
+  i128: Long
+  f32: Float
+  f64: Double
+  str: String
+  Vec: List
+  macro_rules: macroRules
+
+# Rust lifetime nouns rewritten in KDoc prose.
+commentProseLifetimeWords:
+  lifetimes: scopes
+  Lifetimes: Scopes
+  lifetime: scope
+
+# Standard Rust macro names whose trailing `!` is stripped in KDoc prose.
+knownRustProseMacros:
+  - "quote format write writeln print println eprint eprintln vec panic todo unimplemented"
+  - "unreachable matches cfg include concat stringify assert dbg pin select join try"
+  - "column line file env compile"
+
+# Rust item keywords recognized when deciding whether a KDoc fence parses as a File vs Block.
+topLevelItemKeywords: "fn struct enum trait impl mod type const static"

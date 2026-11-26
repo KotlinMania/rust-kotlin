@@ -192,55 +192,25 @@ internal data class ScannerScalarDescriptor(
 )
 
 internal val SCANNER_SCALAR_DESCRIPTORS_BY_KIND: Map<String, ScannerScalarDescriptor> =
-    listOf(
-        ScannerScalarDescriptor("I8", "Byte", "0", "ByteArray", "byteArrayOf", 1 to 1),
-        ScannerScalarDescriptor("U8", "UByte", "0u", "UByteArray", "ubyteArrayOf", 1 to 1),
-        ScannerScalarDescriptor("I16", "Short", "0", "ShortArray", "shortArrayOf", 2 to 2),
-        ScannerScalarDescriptor("U16", "UShort", "0u", "UShortArray", "ushortArrayOf", 2 to 2),
-        ScannerScalarDescriptor("I32", "Int", "0", "IntArray", "intArrayOf", 4 to 4),
-        ScannerScalarDescriptor("U32", "UInt", "0u", "UIntArray", "uintArrayOf", 4 to 4),
-        ScannerScalarDescriptor("I64", "Long", "0L", "LongArray", null, 8 to 8),
-        ScannerScalarDescriptor("U64", "ULong", "0uL", "ULongArray", null, 8 to 8),
-        ScannerScalarDescriptor("I128", "I128", "I128()", null, null, 16 to 16),
-        ScannerScalarDescriptor("U128", "U128", "U128()", null, null, 16 to 16),
-        ScannerScalarDescriptor("F32", "Float", "0.0f", "FloatArray", null, 4 to 4),
-        ScannerScalarDescriptor("F64", "Double", "0.0", "DoubleArray", null, 8 to 8),
-        ScannerScalarDescriptor("BOOL", "Boolean", "false", "BooleanArray", "booleanArrayOf", 1 to 1),
-    ).associateBy { it.kind }
+    YamlRuleCatalogs.StdlibSynAndFfi.scannerScalarDescriptorNodes
+        .map { node ->
+            val size = node.optionalInt("size")
+            val align = node.optionalInt("align")
+            ScannerScalarDescriptor(
+                kind = node.string("kind"),
+                kotlinType = node.string("kotlinType"),
+                defaultExpr = node.string("defaultExpr"),
+                arrayType = node.optionalString("arrayType"),
+                arrayFactory = node.optionalString("arrayFactory"),
+                sizeAlign = if (size != null && align != null) size to align else null,
+            )
+        }.associateBy { it.kind }
 
 internal val SCANNER_RUST_TO_SCALAR_KIND: Map<String, String> =
-    mapOf(
-        "i8" to "I8",
-        "u8" to "U8",
-        "i16" to "I16",
-        "u16" to "U16",
-        "i32" to "I32",
-        "u32" to "U32",
-        "i64" to "I64",
-        "u64" to "U64",
-        "i128" to "I128",
-        "u128" to "U128",
-        "f32" to "F32",
-        "f64" to "F64",
-        "bool" to "BOOL",
-    )
+    YamlRuleCatalogs.StdlibSynAndFfi.scannerRustToScalarKind
 
 internal val SCANNER_C_ALIAS_TO_SCALAR_KIND: Map<String, String> =
-    mapOf(
-        "c_char" to "I8",
-        "c_schar" to "I8",
-        "c_uchar" to "U8",
-        "c_short" to "I16",
-        "c_ushort" to "U16",
-        "c_int" to "I32",
-        "c_uint" to "U32",
-        "c_long" to "I64",
-        "c_ulong" to "U64",
-        "c_longlong" to "I64",
-        "c_ulonglong" to "U64",
-        "c_float" to "F32",
-        "c_double" to "F64",
-    )
+    YamlRuleCatalogs.StdlibSynAndFfi.scannerCAliasToScalarKind
 
 internal fun <K, V> MutableMap<K, V>.putIfMissing(
     key: K,

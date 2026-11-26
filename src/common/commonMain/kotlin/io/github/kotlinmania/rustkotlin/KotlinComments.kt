@@ -35,70 +35,32 @@ private enum class DocFenceKind {
     VerbatimText,
 }
 
-private val VERBATIM_FENCE_LANGS =
-    setOf("text", "console", "plain", "plaintext", "sh", "bash", "zsh", "toml", "json", "yaml", "c", "cpp", "diff")
+private val VERBATIM_FENCE_LANGS: Set<String>
+    get() = YamlRuleCatalogs.NamingAndComments.verbatimFenceLangs
 
-private val NON_COMPILING_RUSTDOC_FENCE_TAGS = wordSet("ignore compile_fail custom")
+private val NON_COMPILING_RUSTDOC_FENCE_TAGS: Set<String>
+    get() = YamlRuleCatalogs.NamingAndComments.nonCompilingRustdocFenceTags
 
-private val COMPILER_ONLY_DOC_EXAMPLE_ATTRS =
-    wordSet("doc cfg cfg_attr allow warn deny forbid non_exhaustive must_use inline cold track_caller derive test")
+private val COMPILER_ONLY_DOC_EXAMPLE_ATTRS: Set<String>
+    get() = YamlRuleCatalogs.NamingAndComments.compilerOnlyDocExampleAttrs
 
-private val RUSTDOC_REF_TARGET_ROOTS =
-    wordSet("crate super self core std alloc proc_macro proc_macro2 quote syn")
+private val RUSTDOC_REF_TARGET_ROOTS: Set<String>
+    get() = YamlRuleCatalogs.NamingAndComments.rustdocRefTargetRoots
 
-private val COMMENT_FORBIDDEN_STUB_WORDS =
-    wordSet("todo fixme xxx hack stub placeholder unimplemented")
+private val COMMENT_FORBIDDEN_STUB_WORDS: Set<String>
+    get() = YamlRuleCatalogs.NamingAndComments.commentForbiddenStubWords
 
-private val COMMENT_COMMON_VOCAB_MAP =
-    mapOf(
-        "dyn" to "dynamic",
-        "usize" to "Int",
-        "Box" to "Holder",
-        "transmute" to "reinterpret",
-        "unsafe" to "unchecked",
-    )
+private val COMMENT_COMMON_VOCAB_MAP: Map<String, String>
+    get() = YamlRuleCatalogs.NamingAndComments.commentCommonVocab
 
-private val COMMENT_CODE_IDENT_MAP =
-    COMMENT_COMMON_VOCAB_MAP +
-        mapOf(
-            "fn" to "fun",
-            "let" to "val",
-            "mut" to "",
-            "pub" to "public",
-            "struct" to "class",
-            "enum" to "sealed class",
-            "trait" to "interface",
-            "impl" to "implementation",
-            "match" to "when",
-            "use" to "import",
-            "bool" to "Boolean",
-            "isize" to "Long",
-            "u8" to "UByte",
-            "u16" to "UShort",
-            "u32" to "UInt",
-            "u64" to "ULong",
-            "u128" to "ULong",
-            "i8" to "Byte",
-            "i16" to "Short",
-            "i32" to "Int",
-            "i64" to "Long",
-            "i128" to "Long",
-            "f32" to "Float",
-            "f64" to "Double",
-            "str" to "String",
-            "Vec" to "List",
-            "macro_rules" to "macroRules",
-        )
+private val COMMENT_CODE_IDENT_MAP: Map<String, String>
+    get() = YamlRuleCatalogs.NamingAndComments.commentCodeIdents
 
-private val KNOWN_RUST_PROSE_MACROS: Set<String> =
-    wordSet(
-        "quote format write writeln print println eprint eprintln vec panic todo unimplemented",
-        "unreachable matches cfg include concat stringify assert dbg pin select join try",
-        "column line file env compile",
-    )
+private val KNOWN_RUST_PROSE_MACROS: Set<String>
+    get() = YamlRuleCatalogs.NamingAndComments.knownRustProseMacros
 
-private val TOP_LEVEL_ITEM_KEYWORDS =
-    wordSet("fn struct enum trait impl mod type const static")
+private val TOP_LEVEL_ITEM_KEYWORDS: Set<String>
+    get() = YamlRuleCatalogs.NamingAndComments.topLevelItemKeywords
 
 internal fun sanitizeDocLines(
     rawLines: List<String>,
@@ -1252,11 +1214,7 @@ private fun mapRustIdentInCommentCode(raw: String): String =
 
 private fun mapCommentVocabularyWord(word: String, convertCamelIdentifiersOnly: Boolean): String {
     if (word.lowercase() in COMMENT_FORBIDDEN_STUB_WORDS) return "Note"
-    when (word) {
-        "lifetimes" -> return "scopes"
-        "Lifetimes" -> return "Scopes"
-        "lifetime" -> return "scope"
-    }
+    YamlRuleCatalogs.NamingAndComments.commentProseLifetimeWords[word]?.let { return it }
     COMMENT_COMMON_VOCAB_MAP[word]?.let { return it }
     if (!convertCamelIdentifiersOnly && word == "macro_rules") return "macroRules"
     return mapSnakeOrForbiddenCommentWord(word)

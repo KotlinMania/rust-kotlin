@@ -1126,18 +1126,14 @@ private object StdlibFmtAndFfiTypePathRule : TypePathLoweringRule() {
         val isAllocFfiCString = rawSegNames.size == 3 && rawSegNames[0] == "alloc" && rawSegNames[1] == "ffi" && symLeaf == "CString"
         if (isSelfContainedLibcFfi && symLeaf !in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS) {
             val ptr64 = emitter.activeCfgProfile.pointerWidth != 32
-            when (symLeaf) {
-                "size_t", "usize", "uintptr_t" -> return if (ptr64) "ULong" else "UInt"
-                "ssize_t", "isize", "intptr_t", "ptrdiff_t" -> return if (ptr64) "Long" else "Int"
-                "int8_t" -> return "Byte"
-                "uint8_t" -> return "UByte"
-                "int16_t" -> return "Short"
-                "uint16_t" -> return "UShort"
-                "int32_t", "pid_t", "clockid_t", "wchar_t" -> return "Int"
-                "uint32_t", "uid_t", "gid_t", "socklen_t", "useconds_t", "mode_t" -> return "UInt"
-                "int64_t", "off_t", "time_t", "suseconds_t" -> return "Long"
-                "uint64_t", "dev_t", "ino_t", "rlim_t" -> return "ULong"
-            }
+            val ptrMap =
+                if (ptr64) {
+                    YamlRuleCatalogs.TypeAndMethodPatterns.libcSelfContainedPtrWidth64Types
+                } else {
+                    YamlRuleCatalogs.TypeAndMethodPatterns.libcSelfContainedPtrWidth32Types
+                }
+            ptrMap[symLeaf]?.let { return it }
+            YamlRuleCatalogs.TypeAndMethodPatterns.libcSelfContainedFixedScalarTypes[symLeaf]?.let { return it }
         }
         val resolvedFfiImport =
             when {
@@ -1250,24 +1246,8 @@ private object StdlibResultTypePathRule : TypePathLoweringRule() {
 }
 
 private object StdlibContainerAndPrimitiveTypePathRule : TypePathLoweringRule() {
-    private val erasedSmartPointers = setOf("Box", "Rc", "Arc", "NoDrop", "ManuallyDrop")
-    private val builtinScalarMap =
-        mapOf(
-            "i8" to "Byte",
-            "i16" to "Short",
-            "i32" to "Int",
-            "i64" to "Long",
-            "isize" to "Int",
-            "u8" to "UByte",
-            "u16" to "UShort",
-            "u32" to "UInt",
-            "u64" to "ULong",
-            "usize" to "Int",
-            "f64" to "Double",
-            "bool" to "Boolean",
-            "str" to "String",
-            "char" to "Char",
-        )
+    private val builtinScalarMap: Map<String, String>
+        get() = YamlRuleCatalogs.TypeAndMethodPatterns.builtinScalarTypes
 
     override fun tryRender(ctx: TypePathLoweringContext): String? {
         val emitter = ctx.emitter
@@ -1341,19 +1321,19 @@ private object StdlibContainerAndPrimitiveTypePathRule : TypePathLoweringRule() 
             val inner = typeArgs[0]
             return if (emitter.isAlreadyNullableRenderedType(inner)) inner else "$inner?"
         }
-        if (rawName == "Padding" && "Padding" !in emitter.inspector.declaredTypeNames && typeArgs.size == 1) {
-            return typeArgs[0]
-        }
-        if (rawName == "MaybeUninit" && "MaybeUninit" !in emitter.inspector.declaredTypeNames && typeArgs.size == 1) {
-            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
-            CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.mem.maybeuninit.MaybeUninit")
-            return "MaybeUninit<${typeArgs[0]}>"
-        }
-        if ((rawName == "Iter" || rawName == "IterMut") && rawSegments.any { it.ident.toString() == "slice" } && typeArgs.isNotEmpty()) {
-            return "ArrayDeque<${typeArgs[0]}>"
-        }
-        if (rawName == "IntoIter" && rawSegments.any { it.ident.toString() == "vec" || it.ident.toString() == "option" } && typeArgs.isNotEmpty()) {
-            return "ArrayDeque<${typeArgs[0]}>"
+        val segmentIdents = rawSegments.map { it.ident.toString() }
+        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
+        for (rule in YamlRuleCatalogs.TypeAndMethodPatterns.stdlibGenericTypeRules) {
+            val rendered =
+                rule.tryMatchAndRender(
+                    rawName = rawName,
+                    segmentIdents = segmentIdents,
+                    typeArgs = typeArgs,
+                    declaredTypeNames = emitter.inspector.declaredTypeNames,
+                    coreNs = coreNs,
+                    onImport = { CoreIntrinsicLowering.registerCoreImport(emitter, it) },
+                )
+            if (rendered != null) return rendered
         }
         val isExplicitStdResultPath =
             rawName == "Result" &&
@@ -1363,27 +1343,15 @@ private object StdlibContainerAndPrimitiveTypePathRule : TypePathLoweringRule() 
         if (isExplicitStdResultPath && rawName in emitter.inspector.declaredTypeNames && typeArgs.isNotEmpty()) {
             val crateNsMap = emitter.headerContext.crateNamespaces
             val rawCore = crateNsMap["core"]?.trim()?.removeSuffix(".")
-            val coreNs = rawCore?.takeIf { it.isNotEmpty() }
-            return if (coreNs != null && typeArgs.size == 2) {
-                "$coreNs.result.Result<${typeArgs.joinToString(", ")}>"
+            val explicitCoreNs = rawCore?.takeIf { it.isNotEmpty() }
+            return if (explicitCoreNs != null && typeArgs.size == 2) {
+                "$explicitCoreNs.result.Result<${typeArgs.joinToString(", ")}>"
             } else {
                 "kotlin.Result<${typeArgs[0]}>"
             }
         }
         if (rawName in emitter.inspector.declaredTypeNames) return null
-        if (rawName in setOf("Cell", "RefCell", "OnceCell") && typeArgs.size == 1) {
-            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
-            val subpkg = if (rawName == "OnceCell") "cell.once" else "cell"
-            CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.$subpkg.$rawName")
-            return "$rawName<${typeArgs[0]}>"
-        }
         return when {
-            rawName == "Vec" && typeArgs.isNotEmpty() -> "List<${typeArgs[0]}>"
-            rawName == "Cow" && typeArgs.isNotEmpty() -> typeArgs.last()
-            (rawName == "Range" || rawName == "RangeInclusive") && typeArgs.size == 1 && typeArgs[0] == "Int" -> "IntRange"
-            rawName in erasedSmartPointers && typeArgs.isNotEmpty() -> typeArgs[0]
-            (rawName == "HashMap" || rawName == "BTreeMap") && typeArgs.size >= 2 -> "MutableMap<${typeArgs[0]}, ${typeArgs[1]}>"
-            (rawName == "HashSet" || rawName == "BTreeSet") && typeArgs.isNotEmpty() -> "MutableSet<${typeArgs[0]}>"
             rawName == "Result" && "Ok" !in emitter.inspector.declaredTypeNames && !emitter.hasDeclaredResultEnum() && emitter.usesTaggedCoreResult() && typeArgs.size == 2 ->
                 "${emitter.sourceResultName()}<${typeArgs.joinToString(", ")}>"
             rawName == "Result" && "Ok" !in emitter.inspector.declaredTypeNames && !emitter.hasDeclaredResultEnum() && !emitter.usesTaggedCoreResult() && typeArgs.isNotEmpty() ->

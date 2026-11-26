@@ -682,7 +682,7 @@ private fun classifyHeaderGuard(header: String): PlatformHeaderSpec {
             PlatformHeaderSpec(header, guardCondition = "defined(__linux__)")
         header == "sys/event.h" || header.startsWith("mach/") ->
             PlatformHeaderSpec(header, guardCondition = BSD_APPLE_GUARD)
-        header == "windows.h" || header == "winsock2.h" || header == "ws2tcpip.h" || header == "io.h" || header == "direct.h" ->
+        header in WINDOWS_ONLY_HEADERS ->
             PlatformHeaderSpec(header, guardCondition = "defined(_WIN32)")
         header in COMMON_POSIX_HEADERS ->
             PlatformHeaderSpec(header, guardCondition = "!defined(_WIN32)")
@@ -702,130 +702,31 @@ internal fun symbolPlatformGuard(cSymbol: String): String? =
 private fun headersForCSymbol(symbol: String): List<PlatformHeaderSpec> =
     C_SYMBOL_HEADERS[symbol].orEmpty()
 
-private val PORTABLE_STD_HEADERS: Set<String> =
-    wordSet(
-        "assert.h ctype.h errno.h float.h inttypes.h limits.h locale.h math.h setjmp.h signal.h",
-        "stdarg.h stdbool.h stddef.h stdint.h stdio.h stdlib.h string.h time.h wchar.h wctype.h",
-        "fcntl.h sys/types.h sys/stat.h",
-    )
-
-private val COMMON_POSIX_HEADERS: Set<String> =
-    wordSet(
-        "unistd.h sys/mman.h sys/socket.h netinet/in.h arpa/inet.h netdb.h dlfcn.h pthread.h",
-        "semaphore.h poll.h sys/ioctl.h sys/wait.h dirent.h sched.h strings.h utime.h sys/time.h",
-        "sys/resource.h sys/uio.h sys/un.h sys/utsname.h termios.h pwd.h grp.h syslog.h fnmatch.h glob.h",
-    )
-
-private val LINUX_ONLY_SYMBOLS: Set<String> =
-    wordSet("epoll_create epoll_create1 epoll_ctl epoll_wait eventfd signalfd timerfd_create timerfd_settime timerfd_gettime memfd_create prctl")
-
-private val BSD_APPLE_ONLY_SYMBOLS: Set<String> = wordSet("kqueue kevent")
-
-private val POSIX_NON_WIN32_SYMBOLS: Set<String> =
-    wordSet(
-        "fork pipe link symlink readlink chown fchown getuid geteuid getgid getegid setenv unsetenv",
-        "mmap munmap mprotect msync mlock munlock dlopen dlsym dlclose dlerror pthread_self",
-        "pthread_equal pthread_detach pthread_join pthread_kill sem_init sem_destroy sem_wait",
-        "sem_trywait sem_post poll ioctl wait waitpid opendir readdir closedir rewinddir chmod",
-        "fchmod lstat mkfifo mknod sysconf sleep usleep strndup aligned_alloc fcntl openat fsync",
-        "ftruncate truncate kill socketpair",
-    )
+private val WINDOWS_ONLY_HEADERS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.windowsOnlyHeaders
+private val PORTABLE_STD_HEADERS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.portableStdHeaders
+private val COMMON_POSIX_HEADERS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.commonPosixHeaders
+private val LINUX_ONLY_SYMBOLS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.linuxOnlySymbols
+private val BSD_APPLE_ONLY_SYMBOLS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.bsdAppleOnlySymbols
+private val POSIX_NON_WIN32_SYMBOLS: Set<String> = YamlRuleCatalogs.StdlibSynAndFfi.posixNonWin32Symbols
 
 internal fun isDirectCallSafeSymbol(fn: ForeignFnInteropSpec): Boolean =
     fn.dllName == null && DIRECT_C_SYMBOL_ARITY[fn.cSymbolName] == fn.params.size
 
-private val DIRECT_C_SYMBOL_ARITY: Map<String, Int> =
-    buildMap {
-        fun reg(arity: Int, names: String) {
-            for (name in names.split(' ')) if (name.isNotEmpty()) put(name, arity)
-        }
-        reg(0, "abort rand getchar tmpfile clock localeconv getpid geteuid getuid getegid getgid dlerror kqueue")
-        reg(
-            1,
-            "malloc free exit atexit getenv abs llabs atoi atol atoll atof srand fclose fflush fgetc " +
-                "getc putchar puts ftell rewind clearerr feof ferror perror remove strlen strerror strdup " +
-                "isalnum isalpha isblank iscntrl isdigit isgraph islower isprint ispunct isspace isupper isxdigit " +
-                "tolower toupper sin cos tan asin acos atan exp log log10 sqrt ceil floor fabs round trunc time " +
-                "mktime gmtime localtime asctime ctime raise umask close dup pipe chdir unlink rmdir isatty sleep " +
-                "usleep fsync sysconf unsetenv dlclose wait opendir readdir closedir rewinddir epoll_create epoll_create1",
-        )
-        reg(
-            2,
-            "calloc realloc strtod strtof fopen setbuf fputc fputs ungetc rename strcpy strcat " +
-                "strcmp strcoll strchr strrchr strcspn strspn strpbrk strstr strtok strnlen strndup atan2 pow " +
-                "fmod difftime kill setlocale creat stat fstat lstat chmod fchmod mkfifo dup2 getcwd " +
-                "access ftruncate truncate link symlink munmap mlock munlock listen shutdown dlopen dlsym",
-        )
-        reg(
-            3,
-            "strtol strtoll strtoul strtoull freopen fgets fseek memcpy memmove memset memcmp memchr strncpy " +
-                "strncat strncmp strxfrm mknod read write lseek readlink chown fchown setenv mprotect msync " +
-                "socket bind accept connect getsockname getpeername poll waitpid",
-        )
-        reg(4, "qsort setvbuf fread fwrite strftime send recv socketpair epoll_ctl epoll_wait")
-        reg(5, "bsearch setsockopt getsockopt")
-        reg(6, "mmap sendto recvfrom kevent")
-    }
+private val DIRECT_C_SYMBOL_ARITY: Map<String, Int> = YamlRuleCatalogs.StdlibSynAndFfi.directCSymbolArity
 
 private val C_SYMBOL_HEADERS: Map<String, List<PlatformHeaderSpec>> =
     buildMap {
-        fun register(headers: List<PlatformHeaderSpec>, symbols: String) {
-            for (sym in symbols.split(' ')) if (sym.isNotEmpty()) put(sym, headers)
+        for (ruleNode in YamlRuleCatalogs.StdlibSynAndFfi.cSymbolHeaderRuleNodes) {
+            val specs =
+                ruleNode.mappingList("headers").map { hdrNode ->
+                    PlatformHeaderSpec(
+                        hdrNode.string("name"),
+                        hdrNode.optionalString("guard"),
+                        hdrNode.explicitStringList("windowsFallbacks"),
+                    )
+                }
+            for (sym in ruleNode.wordSet("symbols")) {
+                put(sym, specs)
+            }
         }
-        register(
-            listOf(PlatformHeaderSpec("stdlib.h")),
-            "malloc calloc realloc free aligned_alloc abort exit atexit getenv system bsearch qsort " +
-                "abs labs llabs div ldiv lldiv atoi atol atoll atof strtod strtof strtol strtoll strtoul strtoull rand srand",
-        )
-        register(
-            listOf(PlatformHeaderSpec("stdio.h")),
-            "fopen freopen fclose fflush setbuf setvbuf fread fwrite fgetc fgets fputc fputs " +
-                "getc getchar putchar puts ungetc fseek ftell rewind clearerr feof ferror perror remove rename tmpfile tmpnam snprintf",
-        )
-        register(
-            listOf(PlatformHeaderSpec("string.h")),
-            "memcpy memmove memset memcmp memchr strcpy strncpy strcat strncat strcmp strncmp " +
-                "strcoll strxfrm strchr strrchr strcspn strspn strpbrk strstr strtok strlen strnlen strerror strdup strndup",
-        )
-        register(
-            listOf(PlatformHeaderSpec("ctype.h")),
-            "isalnum isalpha isblank iscntrl isdigit isgraph islower isprint ispunct isspace isupper isxdigit tolower toupper",
-        )
-        register(
-            listOf(PlatformHeaderSpec("math.h")),
-            "sin cos tan asin acos atan atan2 exp log log10 pow sqrt ceil floor fabs fmod round trunc",
-        )
-        register(listOf(PlatformHeaderSpec("time.h")), "clock time difftime mktime strftime gmtime localtime asctime ctime")
-        register(listOf(PlatformHeaderSpec("signal.h")), "signal raise kill")
-        register(listOf(PlatformHeaderSpec("locale.h")), "setlocale localeconv")
-        register(listOf(PlatformHeaderSpec("fcntl.h")), "open creat fcntl openat")
-        register(
-            listOf(PlatformHeaderSpec("sys/types.h"), PlatformHeaderSpec("sys/stat.h")),
-            "stat fstat lstat mkdir chmod fchmod umask mkfifo mknod",
-        )
-        fun registerPosix(header: String, symbols: String, winFallbacks: List<String> = emptyList()) {
-            register(listOf(PlatformHeaderSpec(header, "!defined(_WIN32)", winFallbacks)), symbols)
-        }
-        registerPosix(
-            "unistd.h",
-            "read write close lseek dup dup2 pipe chdir getcwd unlink rmdir access isatty getpid " +
-                "sleep usleep fsync ftruncate truncate link symlink readlink chown fchown geteuid getuid getegid getgid fork sysconf",
-            listOf("io.h", "process.h", "direct.h"),
-        )
-        register(listOf(PlatformHeaderSpec("stdlib.h"), PlatformHeaderSpec("unistd.h", "!defined(_WIN32)")), "setenv unsetenv")
-        registerPosix("sys/mman.h", "mmap munmap mprotect msync mlock munlock")
-        registerPosix(
-            "sys/socket.h",
-            "socket bind listen accept connect send recv sendto recvfrom setsockopt getsockopt shutdown getsockname getpeername socketpair",
-            listOf("winsock2.h", "ws2tcpip.h"),
-        )
-        registerPosix("dlfcn.h", "dlopen dlsym dlclose dlerror")
-        registerPosix("pthread.h", "pthread_create pthread_join pthread_detach pthread_self pthread_equal pthread_kill")
-        registerPosix("semaphore.h", "sem_init sem_destroy sem_wait sem_trywait sem_post")
-        registerPosix("poll.h", "poll")
-        registerPosix("sys/ioctl.h", "ioctl")
-        registerPosix("sys/wait.h", "wait waitpid")
-        registerPosix("dirent.h", "opendir readdir closedir rewinddir")
-        register(listOf(PlatformHeaderSpec("sys/epoll.h", "defined(__linux__)")), "epoll_create epoll_create1 epoll_ctl epoll_wait")
-        register(listOf(PlatformHeaderSpec("sys/event.h", BSD_APPLE_GUARD)), "kqueue kevent")
     }

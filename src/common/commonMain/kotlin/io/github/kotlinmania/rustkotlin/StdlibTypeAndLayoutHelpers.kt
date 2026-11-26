@@ -6,30 +6,22 @@ import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.SynType
 
 internal val SIZED_TYPE_PROPERTY_NAMES: Set<String> =
-    wordSet("SIZE ALIGN ALIGNMENT IS_ZST LAYOUT MAX_SLICE_LEN")
+    YamlRuleCatalogs.StdlibSynAndFfi.sizedTypePropertyNames
 
 private val ALLOC_SINGLE_DEFAULT_GLOBAL_TYPES: Set<String> =
-    wordSet("Box Vec Arc Rc RawVec VecDeque LinkedList BinaryHeap BTreeSet BoxedArrayIntoIter")
+    YamlRuleCatalogs.StdlibSynAndFfi.allocSingleDefaultGlobalTypes
 
 private val ALLOC_INTO_ITER_MODULE_HINTS: Set<String> =
-    wordSet("vec binary_heap linked_list vec_deque btree boxed alloc")
+    YamlRuleCatalogs.StdlibSynAndFfi.allocIntoIterModuleHints
 
 private val STDLIB_CONST_PTR_FIRST_ARG_CALLS: Set<String> =
-    wordSet(
-        "copy_nonoverlapping copy read read_unaligned read_volatile slice_from_raw_parts",
-        "align_offset for_value_raw is_dangling Arc::from_raw Arc::from_raw_in",
-        "Rc::from_raw Rc::from_raw_in Weak::from_raw Weak::from_raw_in",
-        "UniqueArc::from_raw_with_allocator ptr::hash",
-    )
+    YamlRuleCatalogs.StdlibSynAndFfi.stdlibConstPtrFirstArgCalls
 
 private val STDLIB_CONST_PTR_TWO_ARG_CALLS: Set<String> =
-    wordSet("ptr::eq ptr::addr_eq")
+    YamlRuleCatalogs.StdlibSynAndFfi.stdlibConstPtrTwoArgCalls
 
 private val STDLIB_CONST_PTR_FIRST_ARG_METHODS: Set<String> =
-    wordSet(
-        "with_metadata_of offset_from byte_offset_from offset_from_unsigned",
-        "byte_offset_from_unsigned sub_ptr copy_from copy_from_nonoverlapping addr_eq",
-    )
+    YamlRuleCatalogs.StdlibSynAndFfi.stdlibConstPtrFirstArgMethods
 
 private object StdlibSpecialTypeCatalog {
     data class AtomicSpec(
@@ -40,56 +32,21 @@ private object StdlibSpecialTypeCatalog {
         val storage: Pair<String, String>? = null,
     )
 
-    val nonZeroByRawPrim: Map<String, String> =
-        mapOf(
-            "u8" to "NonZeroU8Inner",
-            "u16" to "NonZeroU16Inner",
-            "u32" to "NonZeroU32Inner",
-            "u64" to "NonZeroU64Inner",
-            "u128" to "NonZeroU128Inner",
-            "usize" to "NonZeroUsizeInner",
-            "i8" to "NonZeroI8Inner",
-            "i16" to "NonZeroI16Inner",
-            "i32" to "NonZeroI32Inner",
-            "i64" to "NonZeroI64Inner",
-            "i128" to "NonZeroI128Inner",
-            "isize" to "NonZeroIsizeInner",
-            "char" to "NonZeroCharInner",
-        )
-
-    val nonZeroByKtType: Map<String, String> =
-        mapOf(
-            "UByte" to "NonZeroU8Inner",
-            "UShort" to "NonZeroU16Inner",
-            "UInt" to "NonZeroU32Inner",
-            "ULong" to "NonZeroU64Inner",
-            "U128" to "NonZeroU128Inner",
-            "Byte" to "NonZeroI8Inner",
-            "Short" to "NonZeroI16Inner",
-            "Int" to "NonZeroI32Inner",
-            "Long" to "NonZeroI64Inner",
-            "I128" to "NonZeroI128Inner",
-            "RustChar" to "NonZeroCharInner",
-            "Char" to "NonZeroCharInner",
-        )
+    val nonZeroByRawPrim: Map<String, String> = YamlRuleCatalogs.StdlibSynAndFfi.nonZeroByRawPrim
+    val nonZeroByKtType: Map<String, String> = YamlRuleCatalogs.StdlibSynAndFfi.nonZeroByKtType
 
     private val atomicSpecs: List<AtomicSpec> =
-        listOf(
-            AtomicSpec("AtomicBool", "bool", "Boolean", storage = "Align1" to "UByte"),
-            AtomicSpec("AtomicU8", "u8", "UByte", NumericKind.U8, "Align1" to "UByte"),
-            AtomicSpec("AtomicI8", "i8", "Byte", NumericKind.I8, "Align1" to "Byte"),
-            AtomicSpec("AtomicU16", "u16", "UShort", NumericKind.U16, "Align2" to "UShort"),
-            AtomicSpec("AtomicI16", "i16", "Short", NumericKind.I16, "Align2" to "Short"),
-            AtomicSpec("AtomicU32", "u32", "UInt", NumericKind.U32, "Align4" to "UInt"),
-            AtomicSpec("AtomicI32", "i32", "Int", NumericKind.I32, "Align4" to "Int"),
-            AtomicSpec("AtomicU64", "u64", "ULong", NumericKind.U64, "Align8" to "ULong"),
-            AtomicSpec("AtomicI64", "i64", "Long", NumericKind.I64, "Align8" to "Long"),
-            AtomicSpec("AtomicU128", "u128", "U128", NumericKind.U128),
-            AtomicSpec("AtomicI128", "i128", "I128", NumericKind.I128),
-            AtomicSpec("AtomicUsize", "usize", "Int", NumericKind.I32, "Align8" to "Int"),
-            AtomicSpec("AtomicIsize", "isize", "Int", NumericKind.I32, "Align8" to "Int"),
-            AtomicSpec("AtomicPtr", null, "MutPtr", storage = "Align8" to "MutPtr"),
-        )
+        YamlRuleCatalogs.StdlibSynAndFfi.atomicSpecNodes.map { node ->
+            val alignType = node.optionalString("alignType")
+            val storageType = node.optionalString("storageType")
+            AtomicSpec(
+                ownerSimple = node.string("owner"),
+                rawPrim = node.optionalString("rawPrim"),
+                ktValueType = node.string("ktValueType"),
+                numericKind = node.optionalString("numericKind")?.let(NumericKind::valueOf),
+                storage = if (alignType != null && storageType != null) alignType to storageType else null,
+            )
+        }
 
     val atomicByOwner: Map<String, AtomicSpec> = atomicSpecs.associateBy { it.ownerSimple }
     val atomicByRawPrim: Map<String, AtomicSpec> =

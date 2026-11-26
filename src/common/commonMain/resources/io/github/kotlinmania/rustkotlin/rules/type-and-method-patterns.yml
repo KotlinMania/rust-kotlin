@@ -1,0 +1,453 @@
+# ==============================================================================
+# Declarative Rust Type-Path, Numeric Op & Method-Call Pattern/Replacement Rules
+# ==============================================================================
+# Authoritative declarative rules for:
+# - `TypeReferenceEmitter.kt`
+# - `ExpressionPrimitiveAndPointerOps.kt`
+# - `ExpressionMethodCallEmitter.kt`
+#
+# Template placeholders use `{0}`, `{1}`, `{last}`, `{args}`, `{rawName}`, `{coreNs}`,
+# `{recv}`, `{arg0}`, `{arg1}`, `{pointee}`, `{pointeeLayout}`, `{ptrCtor}`.
+# Literal braces inside Kotlin code templates are escaped as `{{` and `}}`.
+
+# Ordered pattern-match and template-replacement rules for stdlib generic types.
+# Rules are evaluated top-to-bottom; collection return/parameter types always target
+# Kotlin collection interfaces (`List`, `MutableMap`, `MutableSet`) per Swift Export invariant.
+stdlibGenericTypeRules:
+  # Compiler/layout wrapper erased to its inner payload type unless locally declared.
+  - match: "Padding"
+    arity: 1
+    unlessDeclared: true
+    replace: "{0}"
+
+  # Uninitialized slot wrapper backed by `core::mem::MaybeUninit<T>`.
+  - match: "MaybeUninit"
+    arity: 1
+    unlessDeclared: true
+    imports: ["{coreNs}.mem.maybeuninit.MaybeUninit"]
+    replace: "MaybeUninit<{0}>"
+
+  # Slice and Vec/Option iterator adapters lowered to `ArrayDeque<T>`.
+  - match: "Iter IterMut"
+    minArity: 1
+    anySegmentIn: "slice"
+    replace: "ArrayDeque<{0}>"
+
+  - match: "IntoIter"
+    minArity: 1
+    anySegmentIn: "vec option"
+    replace: "ArrayDeque<{0}>"
+
+  # Interior mutability cells backed by `rustlang.core.cell`.
+  - match: "Cell RefCell"
+    arity: 1
+    unlessDeclared: true
+    imports: ["{coreNs}.cell.{rawName}"]
+    replace: "{rawName}<{0}>"
+
+  - match: "OnceCell"
+    arity: 1
+    unlessDeclared: true
+    imports: ["{coreNs}.cell.once.OnceCell"]
+    replace: "OnceCell<{0}>"
+
+  # Stdlib containers, smart pointers, cows, and integer ranges.
+  - match: "Vec"
+    minArity: 1
+    unlessDeclared: true
+    replace: "List<{0}>"
+
+  - match: "Cow"
+    minArity: 1
+    unlessDeclared: true
+    replace: "{last}"
+
+  - match: "Range RangeInclusive"
+    arity: 1
+    arg0Equals: "Int"
+    unlessDeclared: true
+    replace: "IntRange"
+
+  - match: "Box Rc Arc NoDrop ManuallyDrop"
+    minArity: 1
+    unlessDeclared: true
+    replace: "{0}"
+
+  - match: "HashMap BTreeMap"
+    minArity: 2
+    unlessDeclared: true
+    replace: "MutableMap<{0}, {1}>"
+
+  - match: "HashSet BTreeSet"
+    minArity: 1
+    unlessDeclared: true
+    replace: "MutableSet<{0}>"
+
+# Unqualified Rust scalar type names lowered through `emitter.kotlinBuiltinTypeName(...)`.
+builtinScalarTypes:
+  i8: Byte
+  i16: Short
+  i32: Int
+  i64: Long
+  isize: Int
+  u8: UByte
+  u16: UShort
+  u32: UInt
+  u64: ULong
+  usize: Int
+  f64: Double
+  bool: Boolean
+  str: String
+  char: Char
+
+# Self-contained `libc::<ty>` scalar typedefs when no external `libc` crate namespace is bound.
+libcSelfContainedPtrWidth64Types:
+  - value: "ULong"
+    keys: "size_t usize uintptr_t"
+  - value: "Long"
+    keys: "ssize_t isize intptr_t ptrdiff_t"
+
+libcSelfContainedPtrWidth32Types:
+  - value: "UInt"
+    keys: "size_t usize uintptr_t"
+  - value: "Int"
+    keys: "ssize_t isize intptr_t ptrdiff_t"
+
+libcSelfContainedFixedScalarTypes:
+  - value: "Byte"
+    keys: "int8_t"
+  - value: "UByte"
+    keys: "uint8_t"
+  - value: "Short"
+    keys: "int16_t"
+  - value: "UShort"
+    keys: "uint16_t"
+  - value: "Int"
+    keys: "int32_t pid_t clockid_t wchar_t"
+  - value: "UInt"
+    keys: "uint32_t uid_t gid_t socklen_t useconds_t mode_t"
+  - value: "Long"
+    keys: "int64_t off_t time_t suseconds_t"
+  - value: "ULong"
+    keys: "uint64_t dev_t ino_t rlim_t"
+
+# ==============================================================================
+# Primitive Layout Constants & Numeric Operation Catalog (`PrimitiveNumericOpCatalog`)
+# ==============================================================================
+
+primitiveLayoutsByKtType:
+  Boolean: BOOL
+  Byte: I8
+  UByte: U8
+  CVoid: U8
+  Short: I16
+  UShort: U16
+  Int: I32
+  UInt: U32
+  Long: I64
+  ULong: U64
+  Float: F32
+  kotlin.Float: F32
+  Double: F64
+  F16: F16_LAYOUT
+  F128: F128_LAYOUT
+  Char: CHAR
+  Unit: UNIT
+
+integerBitCountMethods:
+  count_ones: countOnes
+  count_zeros: countZeros
+  leading_zeros: leadingZeros
+  trailing_zeros: trailingZeros
+  leading_ones: leadingOnes
+  trailing_ones: trailingOnes
+
+integerUnaryCoreMethods:
+  checked_neg: checkedNeg
+  checked_abs: checkedAbs
+  wrapping_neg: wrappingNeg
+  wrapping_abs: wrappingAbs
+  saturating_neg: saturatingNeg
+  saturating_abs: saturatingAbs
+  overflowing_neg: overflowingNeg
+  overflowing_abs: overflowingAbs
+  reverse_bits: reverseBits
+
+integerShiftOrPowMethods:
+  checked_shl: checkedShl
+  checked_shr: checkedShr
+  checked_pow: checkedPow
+  wrapping_shl: wrappingShl
+  wrapping_shr: wrappingShr
+  overflowing_shl: overflowingShl
+  overflowing_shr: overflowingShr
+  rotate_left: rotateLeft
+  rotate_right: rotateRight
+  pow: pow
+
+integerBinaryOpMethods:
+  checked_add: checkedAdd
+  checked_sub: checkedSub
+  checked_mul: checkedMul
+  checked_div: checkedDiv
+  checked_rem: checkedRem
+  checked_div_euclid: checkedDivEuclid
+  checked_rem_euclid: checkedRemEuclid
+  wrapping_add: wrappingAdd
+  wrapping_sub: wrappingSub
+  wrapping_mul: wrappingMul
+  wrapping_div: wrappingDiv
+  wrapping_rem: wrappingRem
+  saturating_add: saturatingAdd
+  saturating_sub: saturatingSub
+  saturating_mul: saturatingMul
+  overflowing_add: overflowingAdd
+  overflowing_sub: overflowingSub
+  overflowing_mul: overflowingMul
+  div_euclid: divEuclid
+  rem_euclid: remEuclid
+
+signedOnlyIntegerMethods: "checked_abs wrapping_abs saturating_abs overflowing_abs saturating_neg"
+
+endian128Methods:
+  to_be: toBe
+  from_be: fromBe
+  swap_bytes: swapBytes
+  to_le: toLe
+  from_le: fromLe
+
+standaloneCheckedI32Ops:
+  checked_add: "+"
+  checked_sub: "-"
+  checked_mul: "*"
+
+floatStdlibBoolPredicates:
+  is_nan: isNaN
+  is_infinite: isInfinite
+  is_finite: isFinite
+
+floatCoreBoolPredicates:
+  is_sign_positive: isSignPositive
+  is_sign_negative: isSignNegative
+  is_normal: isNormal
+  is_subnormal: isSubnormal
+
+floatCoreSelfMethods:
+  signum: signum
+  to_degrees: toDegrees
+  to_radians: toRadians
+  next_up: nextUp
+  next_down: nextDown
+
+floatKmUnaryBases:
+  abs: kmFabs
+  floor: kmFloor
+  ceil: kmCeil
+  round: kmRound
+  round_ties_even: kmRoundTiesEven
+  trunc: kmTrunc
+  sqrt: kmSqrt
+  exp: kmExp
+  exp2: kmExp2
+  ln: kmLog
+  log2: kmLog2
+  log10: kmLog10
+  sin: kmSin
+  cos: kmCos
+
+floatLibmUnaryOps: "tan asin acos atan cbrt sinh cosh tanh asinh acosh atanh"
+floatLibmBinaryOps: "atan2 hypot"
+
+floatKmBinaryBases:
+  powf: kmPow
+  copysign: kmCopysign
+  min: kmMinnum
+  max: kmMaxnum
+
+floatAdditionalSameTypeReturnMethods: "powf powi min max fract mul_add recip to_degrees to_radians signum log"
+
+# ==============================================================================
+# Declarative Method-Call Pattern-Match & Template-Replacement Rules
+# ==============================================================================
+
+methodCallPatternRules:
+  # --- Raw pointer (`ConstPtr<T>` / `MutPtr<T>`) method replacements ---
+  - receiver: rawPtr
+    match: "is_null"
+    arity: 0
+    replace: "(({recv}).rawAddress == 0L)"
+
+  - receiver: rawPtr
+    match: "cast_mut"
+    arity: 0
+    noTurbofish: true
+    imports: ["{coreNs}.ptr.MutPtr"]
+    replace: "MutPtr<{pointee}>(({recv}).rawAddress)"
+
+  - receiver: rawPtr
+    match: "cast_const"
+    arity: 0
+    noTurbofish: true
+    imports: ["{coreNs}.ptr.ConstPtr"]
+    replace: "ConstPtr<{pointee}>(({recv}).rawAddress)"
+
+  - receiver: rawPtr
+    match: "read read_unaligned"
+    arity: 0
+    noTurbofish: true
+    replace: "({pointeeLayout}).readNative(({recv}).rawAddress)"
+
+  - receiver: rawPtr
+    match: "read_volatile"
+    arity: 0
+    noTurbofish: true
+    replace: "({pointeeLayout}).readVolatileNative(({recv}).rawAddress)"
+
+  - receiver: rawPtr
+    match: "write write_unaligned"
+    arity: 1
+    noTurbofish: true
+    replace: "({pointeeLayout}).writeNative(({recv}).rawAddress, {arg0})"
+
+  - receiver: rawPtr
+    match: "write_volatile"
+    arity: 1
+    noTurbofish: true
+    replace: "({pointeeLayout}).writeVolatileNative(({recv}).rawAddress, {arg0})"
+
+  - receiver: rawPtr
+    match: "copy_to"
+    arity: 2
+    noTurbofish: true
+    imports: ["{coreNs}.intrinsics.kmCopy"]
+    replace: "kmCopy(({recv}).rawAddress, ({arg0}).rawAddress, ({arg1}).toLong() * ({pointeeLayout}).sizeBytes)"
+
+  - receiver: rawPtr
+    match: "copy_to_nonoverlapping"
+    arity: 2
+    noTurbofish: true
+    imports: ["{coreNs}.intrinsics.kmCopyNonoverlapping"]
+    replace: "kmCopyNonoverlapping(({recv}).rawAddress, ({arg0}).rawAddress, ({arg1}).toLong() * ({pointeeLayout}).sizeBytes)"
+
+  - receiver: rawPtr
+    match: "copy_from"
+    arity: 2
+    noTurbofish: true
+    imports: ["{coreNs}.intrinsics.kmCopy"]
+    replace: "kmCopy(({arg0}).rawAddress, ({recv}).rawAddress, ({arg1}).toLong() * ({pointeeLayout}).sizeBytes)"
+
+  - receiver: rawPtr
+    match: "copy_from_nonoverlapping"
+    arity: 2
+    noTurbofish: true
+    imports: ["{coreNs}.intrinsics.kmCopyNonoverlapping"]
+    replace: "kmCopyNonoverlapping(({arg0}).rawAddress, ({recv}).rawAddress, ({arg1}).toLong() * ({pointeeLayout}).sizeBytes)"
+
+  - receiver: rawPtr
+    match: "write_bytes"
+    arity: 2
+    noTurbofish: true
+    imports: ["{coreNs}.intrinsics.kmWriteBytes"]
+    replace: "kmWriteBytes(({recv}).rawAddress, ({arg0}).toUByte(), ({arg1}).toLong() * ({pointeeLayout}).sizeBytes)"
+
+  - receiver: rawPtr
+    match: "offset_from"
+    arity: 1
+    noTurbofish: true
+    replace: "((({recv}).rawAddress - ({arg0}).rawAddress) / ({pointeeLayout}).strideBytes).toInt()"
+    rawAbiReplace: "((({recv}).rawAddress - ({arg0}).rawAddress) / ({pointeeLayout}).strideBytes)"
+
+  - receiver: rawPtr
+    match: "addr"
+    arity: 0
+    noTurbofish: true
+    replace: "({recv}).rawAddress.toInt()"
+    rawAbiReplace: "({recv}).rawAddress.toULong()"
+
+  - receiver: rawPtr
+    match: "with_addr"
+    arity: 1
+    noTurbofish: true
+    imports: ["{coreNs}.ptr.{ptrCtor}"]
+    replace: "{ptrCtor}(({arg0}).toLong())"
+
+  # --- Formatter debug builder & VecDeque / Vec / ArrayDeque adapter methods ---
+  - receiver: fmtOrQueue
+    match: "debug_list"
+    arity: 0
+    replace: "object {{ val entries = mutableListOf<Any?>(); fun entry(v: Any?) = apply {{ entries.add(v) }}; fun entries(iter: Iterable<*>) = apply {{ for (e in iter) entries.add(e) }}; fun finish() {{ {recv}.append(entries.joinToString(\", \", \"[\", \"]\")) }} }}"
+
+  - receiver: fmtOrQueue
+    match: "debug_set"
+    arity: 0
+    replace: "object {{ val entries = mutableListOf<Any?>(); fun entry(v: Any?) = apply {{ entries.add(v) }}; fun entries(iter: Iterable<*>) = apply {{ for (e in iter) entries.add(e) }}; fun finish() {{ {recv}.append(entries.joinToString(\", \", \"{{\", \"}}\")) }} }}"
+
+  - receiver: fmtOrQueue
+    match: "debug_map"
+    arity: 0
+    replace: "object {{ val entries = mutableListOf<String>(); fun entry(k: Any?, v: Any?) = apply {{ entries.add(\"$k: $v\") }}; fun finish() {{ {recv}.append(entries.joinToString(\", \", \"{{\", \"}}\")) }} }}"
+
+  - receiver: fmtOrQueue
+    match: "pop_front"
+    arity: 0
+    replace: "{recv}.removeFirstOrNull()"
+
+  - receiver: dequeIter
+    match: "next"
+    arity: 0
+    noTurbofish: true
+    replace: "{recv}.removeFirstOrNull()"
+
+  - receiver: dequeIter
+    match: "next_back"
+    arity: 0
+    noTurbofish: true
+    replace: "{recv}.removeLastOrNull()"
+
+  - receiver: dequeIter
+    match: "len"
+    arity: 0
+    noTurbofish: true
+    replace: "{recv}.size"
+
+  - receiver: dequeIter
+    match: "clone"
+    arity: 0
+    noTurbofish: true
+    replace: "ArrayDeque({recv})"
+
+  - receiver: vec
+    match: "pop"
+    arity: 0
+    noTurbofish: true
+    replace: "{recv}.removeLastOrNull()"
+
+  - receiver: vec
+    match: "len"
+    arity: 0
+    noTurbofish: true
+    replace: "{recv}.size"
+
+  - receiver: vec
+    match: "into_iter iter iter_mut"
+    arity: 0
+    noTurbofish: true
+    replace: "ArrayDeque({recv})"
+
+  - receiver: vec
+    match: "clone"
+    arity: 0
+    noTurbofish: true
+    replace: "{recv}.toMutableList()"
+
+  - receiver: vec
+    match: "last_mut"
+    arity: 0
+    noTurbofish: true
+    replace: "{recv}.lastOrNull()"
+
+  - receiver: vec
+    match: "first_mut"
+    arity: 0
+    noTurbofish: true
+    replace: "{recv}.firstOrNull()"

@@ -1,0 +1,416 @@
+# ==============================================================================
+# Rust Stdlib, Syn Token, Special Layout/Atomic & Native C/POSIX FFI Catalogs
+# ==============================================================================
+# Authoritative declarative catalog for:
+# - `RustStdlibAndSynCatalog.kt`
+# - `StdlibTypeAndLayoutHelpers.kt`
+# - `CrateTokenAbiScanner.kt`
+# - `FfiNativeCinteropGenerator.kt`
+
+# Kotlin specialized primitive array types that use `.size` and value-array factories.
+primitiveArrayTypes:
+  - "ByteArray UByteArray ShortArray UShortArray IntArray UIntArray"
+  - "LongArray ULongArray FloatArray DoubleArray BooleanArray"
+
+ignoredUseRoots: "super self"
+stdlibCrateRoots: "std core alloc"
+stdlibMacroOrPrimitiveModules: "primitive concat stringify"
+flatKotlinmaniaCrates: "procmacro2 quote"
+stdlibTypePathPrefixes: "std core alloc vec boxed collections rc sync slice option marker mem"
+ignoredPathPrefixes: "crate super self std core alloc"
+stdlibPreludeReexportModules: "__private export prelude v1 rust_2015 rust_2018 rust_2021 rust_2024"
+
+# Marker and auto-traits erased from Kotlin generic parameter bounds.
+ignoredTraitBounds:
+  - "Sized MetaSized PointeeSized Unsize CoerceUnsized DispatchFromDyn"
+  - "Send Sync Unpin UnwindSafe RefUnwindSafe TrivialDrop Destruct Hasher Tuple"
+
+fmtTraitNames: "Debug Display Octal LowerHex UpperHex Binary LowerExp UpperExp Pointer"
+
+# Additional stdlib traits (combined with `fmtTraitNames`) treated as implicit supertraits.
+rustStdImplicitSupertraitsExtra:
+  - "Clone Copy Default PartialEq Eq PartialOrd Ord Hash Drop"
+  - "Send Sync Unpin UnwindSafe RefUnwindSafe"
+  - "Iterator ExactSizeIterator DoubleEndedIterator FusedIterator FromIterator IntoIterator Extend"
+  - "Index IndexMut Deref DerefMut From TryFrom Into TryInto"
+
+stdlibTraitSubmodules: "error fmt cmp hash ops convert iter borrow marker panic any clone default"
+stdlibExplicitSupertraitsExtra: "Error Borrow"
+
+# Stdlib symbols (in addition to `rustStdImplicitSupertraits`) omitted from Kotlin `import` statements.
+stdlibErasedOrBuiltinImportsExtra:
+  - "Hasher Formatter DebugStruct DebugTuple DebugList DebugSet DebugMap"
+  - "ManuallyDrop needs_drop PhantomData ThreadId Rc Arc VecDeque None Some Ok Err TypeId"
+
+knownSelfParameterizedTraits: "Parse ParseQuote Read Write"
+kotlinCollectionInterfaces: "List MutableList Map MutableMap Set MutableSet ArrayDeque"
+mutatingVecMethods: "push pop clear insert remove truncate retain extend extend_from_slice append drain swap_remove"
+
+knownOptionReturningMethods:
+  - "take pop pop_front removeFirstOrNull removeLastOrNull next next_back"
+  - "first first_mut last last_mut get get_mut getOrNull punct punct_mut"
+  - "find position rposition checked_add checked_sub checked_mul checked_div"
+  - "checked_rem checked_shl checked_shr checked_neg strip_prefix strip_suffix"
+  - "split_once rsplit_once get_key_value"
+
+kotlinJvmValueTypes: "Boolean Byte Short Int Long Float Double Char UByte UShort UInt ULong"
+
+kotlinStdlibShadowedImportsExtra:
+  - "String Unit Nothing Any Result Iterator Iterable Comparable"
+  - "List MutableList Map MutableMap Set MutableSet Pair Triple"
+  - "Vec Box HashMap BTreeMap HashSet BTreeSet"
+
+forwardDeserializeKeys:
+  - "bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string"
+  - "bytes byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct"
+  - "map struct enum identifier ignored_any"
+
+primitiveTypeNames: "u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize f16 f32 f64 f128 bool str char"
+
+ignoredQuoteKeywordsExtra:
+  - "use as crate const let mut match fn impl for in where pub return if else"
+  - "struct enum trait type static unsafe ref dyn loop while break continue"
+  - "move async await super default union try yield mod"
+
+# `syn::token::*` keyword tokens (`Token![fn]`, `Token![struct]`, etc.).
+synKeywordTokens:
+  - "abstract as async auto await become box break const continue crate default"
+  - "do dyn else enum extern final fn for if impl in let loop macro match mod"
+  - "move mut override priv pub raw ref return safe static struct super trait"
+  - "try typeof union unsafe unsized use virtual where while yield"
+
+# `syn::token::*` punctuation token spellings -> Kotlin `syn` token class names.
+synPunctTokens:
+  "&": And
+  "&&": AndAnd
+  "&=": AndEq
+  "@": At
+  "^": Caret
+  "^=": CaretEq
+  ":": Colon
+  ",": Comma
+  "$": Dollar
+  ".": Dot
+  "..": DotDot
+  "...": DotDotDot
+  "..=": DotDotEq
+  "=": Eq
+  "==": EqEq
+  "=>": FatArrow
+  ">=": Ge
+  ">": Gt
+  "<-": LArrow
+  "<=": Le
+  "<": Lt
+  "-": Minus
+  "-=": MinusEq
+  "!=": Ne
+  "!": Not
+  "|": Or
+  "|=": OrEq
+  "||": OrOr
+  "::": PathSep
+  "%": Percent
+  "%=": PercentEq
+  "+": Plus
+  "+=": PlusEq
+  "#": Pound
+  "?": Question
+  "->": RArrow
+  ";": Semi
+  "<<": Shl
+  "<<=": ShlEq
+  ">>": Shr
+  ">>=": ShrEq
+  "/": Slash
+  "/=": SlashEq
+  "*": Star
+  "*=": StarEq
+  "~": Tilde
+
+# ==============================================================================
+# Stdlib Special Types: `SizedTypeProperties`, `NonZero<T>`, and `Atomic*`
+# ==============================================================================
+
+sizedTypePropertyNames: "SIZE ALIGN ALIGNMENT IS_ZST LAYOUT MAX_SLICE_LEN"
+allocSingleDefaultGlobalTypes: "Box Vec Arc Rc RawVec VecDeque LinkedList BinaryHeap BTreeSet BoxedArrayIntoIter"
+allocIntoIterModuleHints: "vec binary_heap linked_list vec_deque btree boxed alloc"
+
+stdlibConstPtrFirstArgCalls:
+  - "copy_nonoverlapping copy read read_unaligned read_volatile slice_from_raw_parts"
+  - "align_offset for_value_raw is_dangling Arc::from_raw Arc::from_raw_in"
+  - "Rc::from_raw Rc::from_raw_in Weak::from_raw Weak::from_raw_in"
+  - "UniqueArc::from_raw_with_allocator ptr::hash"
+
+stdlibConstPtrTwoArgCalls: "ptr::eq ptr::addr_eq"
+
+stdlibConstPtrFirstArgMethods:
+  - "with_metadata_of offset_from byte_offset_from offset_from_unsigned"
+  - "byte_offset_from_unsigned sub_ptr copy_from copy_from_nonoverlapping addr_eq"
+
+nonZeroByRawPrim:
+  u8: NonZeroU8Inner
+  u16: NonZeroU16Inner
+  u32: NonZeroU32Inner
+  u64: NonZeroU64Inner
+  u128: NonZeroU128Inner
+  usize: NonZeroUsizeInner
+  i8: NonZeroI8Inner
+  i16: NonZeroI16Inner
+  i32: NonZeroI32Inner
+  i64: NonZeroI64Inner
+  i128: NonZeroI128Inner
+  isize: NonZeroIsizeInner
+  char: NonZeroCharInner
+
+nonZeroByKtType:
+  UByte: NonZeroU8Inner
+  UShort: NonZeroU16Inner
+  UInt: NonZeroU32Inner
+  ULong: NonZeroU64Inner
+  U128: NonZeroU128Inner
+  Byte: NonZeroI8Inner
+  Short: NonZeroI16Inner
+  Int: NonZeroI32Inner
+  Long: NonZeroI64Inner
+  I128: NonZeroI128Inner
+  RustChar: NonZeroCharInner
+  Char: NonZeroCharInner
+
+atomicSpecs:
+  - owner: AtomicBool
+    rawPrim: bool
+    ktValueType: Boolean
+    alignType: Align1
+    storageType: UByte
+  - owner: AtomicU8
+    rawPrim: u8
+    ktValueType: UByte
+    numericKind: U8
+    alignType: Align1
+    storageType: UByte
+  - owner: AtomicI8
+    rawPrim: i8
+    ktValueType: Byte
+    numericKind: I8
+    alignType: Align1
+    storageType: Byte
+  - owner: AtomicU16
+    rawPrim: u16
+    ktValueType: UShort
+    numericKind: U16
+    alignType: Align2
+    storageType: UShort
+  - owner: AtomicI16
+    rawPrim: i16
+    ktValueType: Short
+    numericKind: I16
+    alignType: Align2
+    storageType: Short
+  - owner: AtomicU32
+    rawPrim: u32
+    ktValueType: UInt
+    numericKind: U32
+    alignType: Align4
+    storageType: UInt
+  - owner: AtomicI32
+    rawPrim: i32
+    ktValueType: Int
+    numericKind: I32
+    alignType: Align4
+    storageType: Int
+  - owner: AtomicU64
+    rawPrim: u64
+    ktValueType: ULong
+    numericKind: U64
+    alignType: Align8
+    storageType: ULong
+  - owner: AtomicI64
+    rawPrim: i64
+    ktValueType: Long
+    numericKind: I64
+    alignType: Align8
+    storageType: Long
+  - owner: AtomicU128
+    rawPrim: u128
+    ktValueType: U128
+    numericKind: U128
+  - owner: AtomicI128
+    rawPrim: i128
+    ktValueType: I128
+    numericKind: I128
+  - owner: AtomicUsize
+    rawPrim: usize
+    ktValueType: Int
+    numericKind: I32
+    alignType: Align8
+    storageType: Int
+  - owner: AtomicIsize
+    rawPrim: isize
+    ktValueType: Int
+    numericKind: I32
+    alignType: Align8
+    storageType: Int
+  - owner: AtomicPtr
+    ktValueType: MutPtr
+    alignType: Align8
+    storageType: MutPtr
+
+# ==============================================================================
+# Token-Level Crate ABI Scalar Layout Descriptors (`CrateTokenAbiScanner.kt`)
+# ==============================================================================
+
+scannerScalarDescriptors:
+  - { kind: I8, kotlinType: Byte, defaultExpr: "0", arrayType: ByteArray, arrayFactory: byteArrayOf, size: 1, align: 1 }
+  - { kind: U8, kotlinType: UByte, defaultExpr: "0u", arrayType: UByteArray, arrayFactory: ubyteArrayOf, size: 1, align: 1 }
+  - { kind: I16, kotlinType: Short, defaultExpr: "0", arrayType: ShortArray, arrayFactory: shortArrayOf, size: 2, align: 2 }
+  - { kind: U16, kotlinType: UShort, defaultExpr: "0u", arrayType: UShortArray, arrayFactory: ushortArrayOf, size: 2, align: 2 }
+  - { kind: I32, kotlinType: Int, defaultExpr: "0", arrayType: IntArray, arrayFactory: intArrayOf, size: 4, align: 4 }
+  - { kind: U32, kotlinType: UInt, defaultExpr: "0u", arrayType: UIntArray, arrayFactory: uintArrayOf, size: 4, align: 4 }
+  - { kind: I64, kotlinType: Long, defaultExpr: "0L", arrayType: LongArray, size: 8, align: 8 }
+  - { kind: U64, kotlinType: ULong, defaultExpr: "0uL", arrayType: ULongArray, size: 8, align: 8 }
+  - { kind: I128, kotlinType: I128, defaultExpr: "I128()", size: 16, align: 16 }
+  - { kind: U128, kotlinType: U128, defaultExpr: "U128()", size: 16, align: 16 }
+  - { kind: F32, kotlinType: Float, defaultExpr: "0.0f", arrayType: FloatArray, size: 4, align: 4 }
+  - { kind: F64, kotlinType: Double, defaultExpr: "0.0", arrayType: DoubleArray, size: 8, align: 8 }
+  - { kind: BOOL, kotlinType: Boolean, defaultExpr: "false", arrayType: BooleanArray, arrayFactory: booleanArrayOf, size: 1, align: 1 }
+
+scannerRustToScalarKind:
+  i8: I8
+  u8: U8
+  i16: I16
+  u16: U16
+  i32: I32
+  u32: U32
+  i64: I64
+  u64: U64
+  i128: I128
+  u128: U128
+  f32: F32
+  f64: F64
+  bool: BOOL
+
+scannerCAliasToScalarKind:
+  c_char: I8
+  c_schar: I8
+  c_uchar: U8
+  c_short: I16
+  c_ushort: U16
+  c_int: I32
+  c_uint: U32
+  c_long: I64
+  c_ulong: U64
+  c_longlong: I64
+  c_ulonglong: U64
+  c_float: F32
+  c_double: F64
+
+# ==============================================================================
+# Native Cinterop Header & POSIX/Win32 Symbol Guards (`FfiNativeCinteropGenerator.kt`)
+# ==============================================================================
+
+windowsOnlyHeaders: "windows.h winsock2.h ws2tcpip.h io.h direct.h"
+
+portableStdHeaders:
+  - "assert.h ctype.h errno.h float.h inttypes.h limits.h locale.h math.h setjmp.h signal.h"
+  - "stdarg.h stdbool.h stddef.h stdint.h stdio.h stdlib.h string.h time.h wchar.h wctype.h"
+  - "fcntl.h sys/types.h sys/stat.h"
+
+commonPosixHeaders:
+  - "unistd.h sys/mman.h sys/socket.h netinet/in.h arpa/inet.h netdb.h dlfcn.h pthread.h"
+  - "semaphore.h poll.h sys/ioctl.h sys/wait.h dirent.h sched.h strings.h utime.h sys/time.h"
+  - "sys/resource.h sys/uio.h sys/un.h sys/utsname.h termios.h pwd.h grp.h syslog.h fnmatch.h glob.h"
+
+linuxOnlySymbols:
+  - "epoll_create epoll_create1 epoll_ctl epoll_wait eventfd signalfd"
+  - "timerfd_create timerfd_settime timerfd_gettime memfd_create prctl"
+
+bsdAppleOnlySymbols: "kqueue kevent"
+
+posixNonWin32Symbols:
+  - "fork pipe link symlink readlink chown fchown getuid geteuid getgid getegid setenv unsetenv"
+  - "mmap munmap mprotect msync mlock munlock dlopen dlsym dlclose dlerror pthread_self"
+  - "pthread_equal pthread_detach pthread_join pthread_kill sem_init sem_destroy sem_wait"
+  - "sem_trywait sem_post poll ioctl wait waitpid opendir readdir closedir rewinddir chmod"
+  - "fchmod lstat mkfifo mknod sysconf sleep usleep strndup aligned_alloc fcntl openat fsync"
+  - "ftruncate truncate kill socketpair"
+
+# Known fixed-arity C symbols safe for direct C expression calls without function-pointer casts.
+directCSymbolArity:
+  "0": "abort rand getchar tmpfile clock localeconv getpid geteuid getuid getegid getgid dlerror kqueue"
+  "1":
+    - "malloc free exit atexit getenv abs llabs atoi atol atoll atof srand fclose fflush fgetc"
+    - "getc putchar puts ftell rewind clearerr feof ferror perror remove strlen strerror strdup"
+    - "isalnum isalpha isblank iscntrl isdigit isgraph islower isprint ispunct isspace isupper isxdigit"
+    - "tolower toupper sin cos tan asin acos atan exp log log10 sqrt ceil floor fabs round trunc time"
+    - "mktime gmtime localtime asctime ctime raise umask close dup pipe chdir unlink rmdir isatty sleep"
+    - "usleep fsync sysconf unsetenv dlclose wait opendir readdir closedir rewinddir epoll_create epoll_create1"
+  "2":
+    - "calloc realloc strtod strtof fopen setbuf fputc fputs ungetc rename strcpy strcat"
+    - "strcmp strcoll strchr strrchr strcspn strspn strpbrk strstr strtok strnlen strndup atan2 pow"
+    - "fmod difftime kill setlocale creat stat fstat lstat chmod fchmod mkfifo dup2 getcwd"
+    - "access ftruncate truncate link symlink munmap mlock munlock listen shutdown dlopen dlsym"
+  "3":
+    - "strtol strtoll strtoul strtoull freopen fgets fseek memcpy memmove memset memcmp memchr strncpy"
+    - "strncat strncmp strxfrm mknod read write lseek readlink chown fchown setenv mprotect msync"
+    - "socket bind accept connect getsockname getpeername poll waitpid"
+  "4": "qsort setvbuf fread fwrite strftime send recv socketpair epoll_ctl epoll_wait"
+  "5": "bsearch setsockopt getsockopt"
+  "6": "mmap sendto recvfrom kevent"
+
+# C symbol -> required C header(s) and preprocessor guard / Windows fallback headers.
+cSymbolHeaderRules:
+  - headers: [{ name: "stdlib.h" }]
+    symbols:
+      - "malloc calloc realloc free aligned_alloc abort exit atexit getenv system bsearch qsort"
+      - "abs labs llabs div ldiv lldiv atoi atol atoll atof strtod strtof strtol strtoll strtoul strtoull rand srand"
+  - headers: [{ name: "stdio.h" }]
+    symbols:
+      - "fopen freopen fclose fflush setbuf setvbuf fread fwrite fgetc fgets fputc fputs"
+      - "getc getchar putchar puts ungetc fseek ftell rewind clearerr feof ferror perror remove rename tmpfile tmpnam snprintf"
+  - headers: [{ name: "string.h" }]
+    symbols:
+      - "memcpy memmove memset memcmp memchr strcpy strncpy strcat strncat strcmp strncmp"
+      - "strcoll strxfrm strchr strrchr strcspn strspn strpbrk strstr strtok strlen strnlen strerror strdup strndup"
+  - headers: [{ name: "ctype.h" }]
+    symbols: "isalnum isalpha isblank iscntrl isdigit isgraph islower isprint ispunct isspace isupper isxdigit tolower toupper"
+  - headers: [{ name: "math.h" }]
+    symbols: "sin cos tan asin acos atan atan2 exp log log10 pow sqrt ceil floor fabs fmod round trunc"
+  - headers: [{ name: "time.h" }]
+    symbols: "clock time difftime mktime strftime gmtime localtime asctime ctime"
+  - headers: [{ name: "signal.h" }]
+    symbols: "signal raise kill"
+  - headers: [{ name: "locale.h" }]
+    symbols: "setlocale localeconv"
+  - headers: [{ name: "fcntl.h" }]
+    symbols: "open creat fcntl openat"
+  - headers: [{ name: "sys/types.h" }, { name: "sys/stat.h" }]
+    symbols: "stat fstat lstat mkdir chmod fchmod umask mkfifo mknod"
+  - headers: [{ name: "unistd.h", guard: "!defined(_WIN32)", windowsFallbacks: ["io.h", "process.h", "direct.h"] }]
+    symbols:
+      - "read write close lseek dup dup2 pipe chdir getcwd unlink rmdir access isatty getpid"
+      - "sleep usleep fsync ftruncate truncate link symlink readlink chown fchown geteuid getuid getegid getgid fork sysconf"
+  - headers: [{ name: "stdlib.h" }, { name: "unistd.h", guard: "!defined(_WIN32)" }]
+    symbols: "setenv unsetenv"
+  - headers: [{ name: "sys/mman.h", guard: "!defined(_WIN32)" }]
+    symbols: "mmap munmap mprotect msync mlock munlock"
+  - headers: [{ name: "sys/socket.h", guard: "!defined(_WIN32)", windowsFallbacks: ["winsock2.h", "ws2tcpip.h"] }]
+    symbols: "socket bind listen accept connect send recv sendto recvfrom setsockopt getsockopt shutdown getsockname getpeername socketpair"
+  - headers: [{ name: "dlfcn.h", guard: "!defined(_WIN32)" }]
+    symbols: "dlopen dlsym dlclose dlerror"
+  - headers: [{ name: "pthread.h", guard: "!defined(_WIN32)" }]
+    symbols: "pthread_create pthread_join pthread_detach pthread_self pthread_equal pthread_kill"
+  - headers: [{ name: "semaphore.h", guard: "!defined(_WIN32)" }]
+    symbols: "sem_init sem_destroy sem_wait sem_trywait sem_post"
+  - headers: [{ name: "poll.h", guard: "!defined(_WIN32)" }]
+    symbols: "poll"
+  - headers: [{ name: "sys/ioctl.h", guard: "!defined(_WIN32)" }]
+    symbols: "ioctl"
+  - headers: [{ name: "sys/wait.h", guard: "!defined(_WIN32)" }]
+    symbols: "wait waitpid"
+  - headers: [{ name: "dirent.h", guard: "!defined(_WIN32)" }]
+    symbols: "opendir readdir closedir rewinddir"
+  - headers: [{ name: "sys/epoll.h", guard: "defined(__linux__)" }]
+    symbols: "epoll_create epoll_create1 epoll_ctl epoll_wait"
+  - headers: [{ name: "sys/event.h", guard: "defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)" }]
+    symbols: "kqueue kevent"

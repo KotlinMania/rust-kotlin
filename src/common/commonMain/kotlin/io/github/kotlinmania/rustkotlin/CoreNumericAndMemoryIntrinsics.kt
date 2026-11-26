@@ -339,30 +339,44 @@ private object ThreeWayCompareIntrinsicRule : IntIntrinsicLoweringRule("three_wa
 }
 
 private val INT_INTRINSIC_RULES: List<IntIntrinsicLoweringRule> =
-    listOf(
-        BitwiseUnsignedIntrinsicRule(setOf("ctpop"), "kmCtpop", "ctpopWithLayout", returnsUIntCount = true),
-        BitwiseUnsignedIntrinsicRule(setOf("ctlz", "ctlz_nonzero"), "kmCtlz", "ctlzWithLayout", returnsUIntCount = true),
-        BitwiseUnsignedIntrinsicRule(setOf("cttz", "cttz_nonzero"), "kmCttz", "cttzWithLayout", returnsUIntCount = true),
-        BitwiseUnsignedIntrinsicRule(setOf("bswap"), "kmBswap", "bswapWithLayout", identityOnByte = true),
-        BitwiseUnsignedIntrinsicRule(setOf("bitreverse"), "kmBitreverse", "bitreverseWithLayout"),
-        BitwiseUnsignedIntrinsicRule(setOf("rotate_left"), "kmRotateLeft", "rotateLeftWithLayout", takesUIntShift = true),
-        BitwiseUnsignedIntrinsicRule(setOf("rotate_right"), "kmRotateRight", "rotateRightWithLayout", takesUIntShift = true),
-        BinaryInfixIntIntrinsicRule(setOf("wrapping_add", "unchecked_add"), "+", "wrappingAddWithLayout", u128Fn = "kmU128Add"),
-        BinaryInfixIntIntrinsicRule(setOf("wrapping_sub", "unchecked_sub"), "-", "wrappingSubWithLayout", u128Fn = "kmU128Sub"),
-        BinaryInfixIntIntrinsicRule(setOf("wrapping_mul", "unchecked_mul"), "*", "wrappingMulWithLayout", u128Fn = "kmU128Mul"),
-        WidthTaggedBinaryIntrinsicRule("saturating_add", "kmSaturatingAdd", "saturatingAddWithLayout", wrapPairOverflow = false),
-        WidthTaggedBinaryIntrinsicRule("saturating_sub", "kmSaturatingSub", "saturatingSubWithLayout", wrapPairOverflow = false),
-        WidthTaggedBinaryIntrinsicRule("add_with_overflow", "kmAddWithOverflow", "addWithOverflowWithLayout", wrapPairOverflow = true),
-        WidthTaggedBinaryIntrinsicRule("sub_with_overflow", "kmSubWithOverflow", "subWithOverflowWithLayout", wrapPairOverflow = true),
-        WidthTaggedBinaryIntrinsicRule("mul_with_overflow", "kmMulWithOverflow", "mulWithOverflowWithLayout", wrapPairOverflow = true),
-        BinaryInfixIntIntrinsicRule(setOf("unchecked_div"), "/", "uncheckedDivWithLayout"),
-        BinaryInfixIntIntrinsicRule(setOf("exact_div"), "/", "exactDivWithLayout"),
-        BinaryInfixIntIntrinsicRule(setOf("unchecked_rem"), "%", "uncheckedRemWithLayout"),
-        UncheckedShiftIntrinsicRule("unchecked_shl", isLeft = true, "uncheckedShlWithLayout"),
-        UncheckedShiftIntrinsicRule("unchecked_shr", isLeft = false, "uncheckedShrWithLayout"),
-        DisjointBitorIntrinsicRule,
-        ThreeWayCompareIntrinsicRule,
-    )
+    YamlRuleCatalogs.CoreIntrinsics.intIntrinsicRuleNodes.map { node ->
+        val names = node.wordSet("names")
+        val withLayoutFn = node.string("withLayoutFn")
+        when (val kind = node.string("kind")) {
+            "bitwiseUnsigned" ->
+                BitwiseUnsignedIntrinsicRule(
+                    names = names,
+                    kmStem = node.string("kmStem"),
+                    withLayoutFn = withLayoutFn,
+                    returnsUIntCount = node.bool("returnsUIntCount"),
+                    takesUIntShift = node.bool("takesUIntShift"),
+                    identityOnByte = node.bool("identityOnByte"),
+                )
+            "binaryInfix" ->
+                BinaryInfixIntIntrinsicRule(
+                    names = names,
+                    opSymbol = node.string("opSymbol"),
+                    withLayoutFn = withLayoutFn,
+                    u128Fn = node.optionalString("u128Fn"),
+                )
+            "widthTaggedBinary" ->
+                WidthTaggedBinaryIntrinsicRule(
+                    name = names.single(),
+                    kmPrefix = node.string("kmPrefix"),
+                    withLayoutFn = withLayoutFn,
+                    wrapPairOverflow = node.bool("wrapPairOverflow"),
+                )
+            "uncheckedShift" ->
+                UncheckedShiftIntrinsicRule(
+                    name = names.single(),
+                    isLeft = node.bool("isLeft"),
+                    withLayoutFn = withLayoutFn,
+                )
+            "disjointBitor" -> DisjointBitorIntrinsicRule
+            "threeWayCompare" -> ThreeWayCompareIntrinsicRule
+            else -> throw IllegalArgumentException("Unknown intIntrinsicRules kind: '$kind'")
+        }
+    }
 
 internal val INT_INTRINSIC_RULES_BY_NAME: Map<String, IntIntrinsicLoweringRule> =
     buildMap {
@@ -619,15 +633,7 @@ private val FLOAT_INTRINSIC_RULES: List<FloatIntrinsicLoweringRule> =
     listOf(
         FixedKmFloatIntrinsicRule(CoreIntrinsicLowering.SUFFIXED_FLOAT_UNARY_KM, arity = 1),
         FixedKmFloatIntrinsicRule(CoreIntrinsicLowering.SUFFIXED_FLOAT_BINARY_KM, arity = 2),
-        FixedKmFloatIntrinsicRule(
-            mapOf(
-                "fmaf32" to "kmFmaf32",
-                "fmuladdf32" to "kmFmaf32",
-                "fmaf64" to "kmFmaf64",
-                "fmuladdf64" to "kmFmaf64",
-            ),
-            arity = 3,
-        ),
+        FixedKmFloatIntrinsicRule(YamlRuleCatalogs.CoreIntrinsics.suffixedFloatTernaryKm, arity = 3),
         FixedMinMaxFloatIntrinsicRule,
         GenericUnaryFloatIntrinsicRule(),
         GenericBinaryFloatOpIntrinsicRule(),
