@@ -1613,17 +1613,12 @@ internal fun KotlinJ2KEmitter.hasExplicitOriginalDebugImpl(items: List<Item>, ow
     return false
 }
 
-internal fun KotlinJ2KEmitter.formatEnumOffsetLiteral(offset: Int, reprNumKind: NumericKind?): String =
-    when (reprNumKind) {
-        NumericKind.U8 -> "${offset}u.toUByte()"
-        NumericKind.U16 -> "${offset}u.toUShort()"
-        NumericKind.U32 -> "${offset}u"
-        NumericKind.U64 -> "${offset}uL"
-        NumericKind.I8 -> "$offset.toByte()"
-        NumericKind.I16 -> "$offset.toShort()"
-        NumericKind.I64 -> "${offset}L"
-        else -> "$offset"
-    }
+internal fun KotlinJ2KEmitter.formatEnumOffsetLiteral(offset: Int, reprNumKind: NumericKind?): String {
+    val tmpl =
+        activeRules().numericKindTemplates("enumOffsetLiteralTemplates")[reprNumKind ?: NumericKind.I32]
+            ?: return "$offset"
+    return tmpl.render { if (it == "offset") "$offset" else null }
+}
 
 internal fun KotlinJ2KEmitter.formatEnumSteppedDiscriminant(
     baseExpr: String?,

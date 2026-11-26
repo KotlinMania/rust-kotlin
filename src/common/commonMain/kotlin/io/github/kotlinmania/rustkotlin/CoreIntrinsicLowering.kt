@@ -1501,11 +1501,51 @@ public object CoreIntrinsicLowering {
             return "$ctor(($valueExpr).rawAddress)"
         }
         if (srcPrim == null || dstPrim == null) return null
-        val tmpl = activeRules().templates("fastScalarTransmuteTemplates")["$srcPrim->$dstPrim"] ?: return null
+        return renderScalarBitCast(emitter, srcPrim, dstPrim, valueExpr, "($valueExpr)")
+    }
+
+    internal fun renderScalarBitCast(
+        emitter: KotlinJ2KEmitter,
+        srcPrim: String,
+        dstPrim: String,
+        valueExpr: String,
+        atomExpr: String,
+    ): String? {
+        val tmpl = activeRules().templates("scalarBitCastTemplates")["$srcPrim->$dstPrim"] ?: return null
         return tmpl.render { key ->
             when (key) {
                 "val" -> valueExpr
+                "atom" -> atomExpr
                 "f32Type" -> emitter.kotlinF32TypeName()
+                else -> null
+            }
+        }
+    }
+
+    internal fun renderScalarFloatToIntUnchecked(
+        emitter: KotlinJ2KEmitter,
+        coreNs: String,
+        isF32: Boolean,
+        valueExpr: String,
+        atomExpr: String,
+        dstKind: NumericKind?,
+    ): String? {
+        val action = dstKind?.let { activeRules().floatToIntUncheckedRulesByKind[it] } ?: return null
+        val intrPkg = "$coreNs.intrinsics"
+        val u64Km = if (isF32) "kmFloatToU64Unchecked" else "kmDoubleToU64Unchecked"
+        val u128Km = if (isF32) "kmFloatToU128Unchecked" else "kmDoubleToU128Unchecked"
+        val zeroLit = if (isF32) "0.0f" else "0.0"
+        return action.render(
+            onImport = { imp -> registerCoreImport(emitter, imp) },
+        ) { key ->
+            when (key) {
+                "val" -> valueExpr
+                "atom" -> atomExpr
+                "coreNs" -> coreNs
+                "intrPkg" -> intrPkg
+                "u64Km" -> u64Km
+                "u128Km" -> u128Km
+                "zeroLit" -> zeroLit
                 else -> null
             }
         }
@@ -1536,25 +1576,12 @@ public object CoreIntrinsicLowering {
     }
 
     internal fun rustScalarToNumericKind(prim: String, emitter: KotlinJ2KEmitter): NumericKind? =
-        when (prim) {
-            "i8" -> NumericKind.I8
-            "u8" -> NumericKind.U8
-            "i16" -> NumericKind.I16
-            "u16" -> NumericKind.U16
-            "i32" -> NumericKind.I32
-            "u32" -> NumericKind.U32
-            "i64" -> NumericKind.I64
-            "u64" -> NumericKind.U64
-            "i128" -> NumericKind.I128
-            "u128" -> NumericKind.U128
-            "isize" -> if (emitter.headerContext.rawAbiMode) NumericKind.I64 else NumericKind.I32
-            "usize" -> if (emitter.headerContext.rawAbiMode) NumericKind.U64 else NumericKind.U32
-            "f16" -> NumericKind.F16
-            "f32" -> NumericKind.F32
-            "f64" -> NumericKind.F64
-            "f128" -> NumericKind.F128
-            else -> null
-        }
+        activeRules().numericKindValMap("rustFixedScalarKinds")[prim]
+            ?: when (prim) {
+                "isize" -> if (emitter.headerContext.rawAbiMode) NumericKind.I64 else NumericKind.I32
+                "usize" -> if (emitter.headerContext.rawAbiMode) NumericKind.U64 else NumericKind.U32
+                else -> null
+            }
 
     internal fun resolveIntrinsicNumericKind(
         explicitType: SynType?,

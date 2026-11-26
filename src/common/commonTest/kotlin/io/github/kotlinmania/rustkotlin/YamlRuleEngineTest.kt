@@ -235,10 +235,14 @@ class YamlRuleEngineTest {
                                 "replace: \"CustomVecPool.allocate({arg0})\"",
                             )
                         "paths-consts-and-c-abi.yml" ->
-                            original.replace(
-                                "- { name: TAU, f32: \"6.2831855f\", f64: \"6.283185307179586\" }",
-                                "- { name: TAU, f32: \"6.28f\", f64: \"CustomMath.TAU_CONST\" }",
-                            )
+                            original
+                                .replace(
+                                    "- { name: TAU, f32: \"6.2831855f\", f64: \"6.283185307179586\" }",
+                                    "- { name: TAU, f32: \"6.28f\", f64: \"CustomMath.TAU_CONST\" }",
+                                ).replace(
+                                    "- { match: \"unimplemented todo\", emptyTokens: true, replace: \"error(\\\"unsupported\\\")\" }",
+                                    "- { match: \"unimplemented todo\", emptyTokens: true, replace: \"CustomPanic.todoAbort()\" }",
+                                )
                         else -> original
                     }
                 SystemFileSystem.writeString(KmPath("$customDir/${srcFile.name}"), customized)
@@ -246,7 +250,10 @@ class YamlRuleEngineTest {
 
             val rustSnippet =
                 """
-                pub fn custom_rules_probe() -> f64 {
+                pub fn custom_rules_probe(ready: bool) -> f64 {
+                    if !ready {
+                        todo!();
+                    }
                     let _buf: Vec<i32> = Vec::with_capacity(16);
                     std::f64::consts::TAU
                 }
@@ -256,6 +263,7 @@ class YamlRuleEngineTest {
                 RuntimeRuleRegistry.withRulesFromDirectory(customDir.toString()) {
                     renderSingleKotlinFile(rustSnippet, FileHeaderContext(packageName = "sample.custom")).text
                 }
+            assertContains(customRendered, "CustomPanic.todoAbort()")
             assertContains(customRendered, "CustomVecPool.allocate(16)")
             assertContains(customRendered, "CustomMath.TAU_CONST")
 
@@ -272,14 +280,85 @@ class YamlRuleEngineTest {
                 ),
             )
             val cliKt = SystemFileSystem.readString(outputKt)
+            assertContains(cliKt, "CustomPanic.todoAbort()")
             assertContains(cliKt, "CustomVecPool.allocate(16)")
             assertContains(cliKt, "CustomMath.TAU_CONST")
 
             val restoredDefault = renderSingleKotlinFile(rustSnippet, FileHeaderContext(packageName = "sample.restored")).text
+            assertContains(restoredDefault, "error(\"unsupported\")")
             assertContains(restoredDefault, "ArrayList(16)")
             assertContains(restoredDefault, "6.283185307179586")
         } finally {
             cleanupCustomDir()
         }
+    }
+
+    @Test
+    fun drivesGeneralizedMacroScalarCastCalleeAndMethodYamlRulesEndToEnd() {
+        val reg = activeRules()
+        assertTrue(reg.macroRulesByName.containsKey("println"))
+        assertTrue(reg.preCalleeRules.isNotEmpty())
+        assertTrue(reg.floatToIntUncheckedRulesByKind.containsKey(NumericKind.U32))
+        assertTrue(reg.floatFromBitsSpecsByKind.containsKey(NumericKind.F32))
+        assertEquals(4, reg.synForwardedWitnessRules.size)
+
+        val headerCtx =
+            FileHeaderContext(
+                packageName = "sample.wave5",
+                crateNamespaces = mapOf("core" to "io.github.kotlinmania.rustlang.core"),
+            )
+        val rustSource =
+            """
+            use std::sync::Arc;
+
+            #[repr(u8)]
+            pub enum TagByte {
+                Zero,
+                Two = 2,
+            }
+
+            pub unsafe fn exercise_wave5_yaml_rules(
+                label: &str,
+                flag: bool,
+                val_f32: f32,
+                shared: Arc<String>,
+                mut slot: Option<i32>,
+            ) -> u32 {
+                assert!(flag, "bad {}", label);
+                let _cloned = Arc::clone(&shared);
+                let _owned = String::from("hello");
+                let _null_p: *mut u8 = core::ptr::null_mut();
+                let _parts = label.split_once(':');
+                let _upper = label.to_uppercase();
+                let _taken = slot.take();
+                let _flag_u64 = flag as u64;
+                let _punned: u32 = *(&val_f32 as *const f32 as *const u32);
+                let _unchecked: u32 = val_f32.to_int_unchecked::<u32>();
+                let _swapped = u32::swap_bytes(_punned);
+                _swapped.count_ones()
+            }
+            """.trimIndent()
+
+        val kt = renderSingleKotlinFile(rustSource, headerCtx).text
+        assertContains(kt, "2u.toUByte()")
+        assertContains(kt, "check(flag) { \"bad \$label\" }")
+        assertContains(kt, "val cloned = shared")
+        assertContains(kt, "val owned = \"hello\"")
+        assertContains(kt, "MutPtr(0L)")
+        assertContains(kt, "val idx = s.indexOf(':')")
+        assertContains(kt, "label.uppercase()")
+        assertContains(kt, "slot.also { slot = null }")
+        assertContains(kt, "(if (flag) 1uL else 0uL)")
+        assertContains(kt, "valF32.toRawBits().toUInt()")
+        assertContains(kt, "kmFloatToU64Unchecked(valF32).toUInt()")
+        assertContains(kt, "shl 24")
+        assertContains(kt, "swapped.countOnes()")
+
+        val finalEnumKt =
+            renderSingleKotlinFile(
+                "#[repr(u8)] pub enum TagByte { Zero, Two = 2 }",
+                headerCtx.copy(finalClasses = true),
+            ).text
+        assertContains(finalEnumKt, "Zero(0u.toUByte())")
     }
 }

@@ -754,22 +754,32 @@ internal class YamlTemplate private constructor(
 }
 
 /**
- * Declarative replacement action combining a primary template, an optional `rawAbi` override
- * template, and optional auto-registered Kotlin symbol imports.
+ * Declarative replacement action combining a primary template, optional `rawAbi` / `rawOrFinal`
+ * override templates, optional auto-registered Kotlin symbol imports, and optional emitter side-effect flags.
  */
 internal class DeclarativeReplacementAction(
     private val replaceTemplate: YamlTemplate,
     private val rawAbiTemplate: YamlTemplate?,
+    private val rawOrFinalTemplate: YamlTemplate? = null,
     private val importTemplates: List<YamlTemplate>,
     private val rawAbiImportTemplates: List<YamlTemplate>? = null,
+    val sideEffects: Set<String> = emptySet(),
 ) {
     fun render(
         rawAbi: Boolean = false,
+        finalClasses: Boolean = false,
         onImport: (String) -> Unit = {},
+        onSideEffect: (String) -> Unit = {},
         lookup: (String) -> String?,
     ): String {
-        val activeTemplate = if (rawAbi && rawAbiTemplate != null) rawAbiTemplate else replaceTemplate
+        val activeTemplate =
+            when {
+                rawAbi && rawAbiTemplate != null -> rawAbiTemplate
+                (rawAbi || finalClasses) && rawOrFinalTemplate != null -> rawOrFinalTemplate
+                else -> replaceTemplate
+            }
         val activeImports = if (rawAbi && rawAbiImportTemplates != null) rawAbiImportTemplates else importTemplates
+        for (effect in sideEffects) onSideEffect(effect)
         for (imp in activeImports) {
             val renderedImp = imp.render(lookup)
             if (renderedImp.isNotEmpty()) onImport(renderedImp)
@@ -778,10 +788,16 @@ internal class DeclarativeReplacementAction(
     }
 
     companion object {
-        fun fromYaml(node: YamlNode.Mapping, replaceKey: String = "replace", rawAbiKey: String = "rawAbiReplace"): DeclarativeReplacementAction =
+        fun fromYaml(
+            node: YamlNode.Mapping,
+            replaceKey: String = "replace",
+            rawAbiKey: String = "rawAbiReplace",
+            rawOrFinalKey: String = "rawOrFinalReplace",
+        ): DeclarativeReplacementAction =
             DeclarativeReplacementAction(
                 replaceTemplate = YamlTemplate.compile(node.string(replaceKey)),
                 rawAbiTemplate = node.optionalString(rawAbiKey)?.let(YamlTemplate::compile),
+                rawOrFinalTemplate = node.optionalString(rawOrFinalKey)?.let(YamlTemplate::compile),
                 importTemplates = node.explicitStringList("imports").map(YamlTemplate::compile),
                 rawAbiImportTemplates =
                     if ("rawAbiImports" in node.entries) {
@@ -789,6 +805,7 @@ internal class DeclarativeReplacementAction(
                     } else {
                         null
                     },
+                sideEffects = node.optionalWordSet("sideEffect"),
             )
     }
 }
@@ -853,29 +870,53 @@ internal class DeclarativeMethodPatternRule(
     val phase: String,
     val methods: Set<String>,
     val receiverGuard: String,
+    val argGuard: String?,
     val arity: Int?,
+    val minArity: Int?,
     val maxArity: Int?,
     val noTurbofish: Boolean,
     val requireTypeArgs: Boolean,
+    val requireCore: Boolean,
+    val requireRawAbi: Boolean,
     val unlessDeclaredTypes: Set<String>,
+    val unlessDeclaredTraits: Set<String>,
+    val unlessDeclaredTopFns: Set<String>,
     val unlessAnyInstanceMethod: String?,
+    val unlessSelfRecursive: YamlTemplate?,
     val action: DeclarativeReplacementAction,
 ) {
     fun matches(
         rawMethod: String,
         argCount: Int,
         hasTurbofish: Boolean,
+        hasCoreCrate: Boolean = false,
+        rawAbiMode: Boolean = false,
+        coreNs: String = "",
+        currentPkgAndFn: String? = null,
         declaredTypeNames: Set<String> = emptySet(),
+        declaredTraitsByName: Set<String> = emptySet(),
+        declaredTopLevelFnRawNames: Set<String> = emptySet(),
         instanceMethodSets: Collection<Set<String>> = emptyList(),
+        argPredicate: (String) -> Boolean = { true },
         receiverPredicate: (String) -> Boolean,
     ): Boolean {
         if (rawMethod !in methods) return false
         if (arity != null && argCount != arity) return false
+        if (minArity != null && argCount < minArity) return false
         if (maxArity != null && argCount > maxArity) return false
         if (noTurbofish && hasTurbofish) return false
         if (requireTypeArgs && !hasTurbofish) return false
+        if (requireCore && !hasCoreCrate) return false
+        if (requireRawAbi && !rawAbiMode) return false
         if (unlessDeclaredTypes.isNotEmpty() && unlessDeclaredTypes.any { it in declaredTypeNames }) return false
+        if (unlessDeclaredTraits.isNotEmpty() && unlessDeclaredTraits.any { it in declaredTraitsByName }) return false
+        if (unlessDeclaredTopFns.isNotEmpty() && unlessDeclaredTopFns.any { it in declaredTopLevelFnRawNames }) return false
         if (unlessAnyInstanceMethod != null && instanceMethodSets.any { unlessAnyInstanceMethod in it }) return false
+        if (unlessSelfRecursive != null && currentPkgAndFn != null) {
+            val blocked = unlessSelfRecursive.render { if (it == "coreNs") coreNs else null }
+            if (currentPkgAndFn == blocked) return false
+        }
+        if (argGuard != null && !argPredicate(argGuard)) return false
         return receiverPredicate(receiverGuard)
     }
 
@@ -892,12 +933,19 @@ internal class DeclarativeMethodPatternRule(
                 phase = node.optionalString("phase") ?: defaultPhase,
                 methods = node.wordSet("match"),
                 receiverGuard = recv,
+                argGuard = node.optionalString("argGuard"),
                 arity = node.optionalInt("arity"),
+                minArity = node.optionalInt("minArity"),
                 maxArity = node.optionalInt("maxArity"),
                 noTurbofish = node.bool("noTurbofish", default = false),
                 requireTypeArgs = node.bool("requireTypeArgs", default = false),
+                requireCore = node.bool("requireCore", default = false),
+                requireRawAbi = node.bool("requireRawAbi", default = false),
                 unlessDeclaredTypes = node.optionalWordSet("unlessDeclaredTypes"),
+                unlessDeclaredTraits = node.optionalWordSet("unlessDeclaredTraits"),
+                unlessDeclaredTopFns = node.optionalWordSet("unlessDeclaredTopFns"),
                 unlessAnyInstanceMethod = node.optionalString("unlessAnyInstanceMethod"),
+                unlessSelfRecursive = node.optionalString("unlessSelfRecursive")?.let(YamlTemplate::compile),
                 action = DeclarativeReplacementAction.fromYaml(node),
             )
         }
@@ -905,15 +953,19 @@ internal class DeclarativeMethodPatternRule(
 }
 
 /**
- * Declarative pattern-match and template-replacement rule for free and associated function calls
- * (`Vec.new`, `String.new`, `HashMap.new`, `Box.new`, `Cow.Borrowed`, `mem.drop`, `iter.once`, etc.).
+ * Declarative pattern-match and template-replacement rule for free, UFCS, and associated function
+ * calls across both `preCallee` (raw path segments) and `callee` (rendered callee) phases.
  */
 internal class DeclarativeCalleePatternRule(
+    val phase: String,
     val exactCallees: Set<String>,
     val suffixCallees: Set<String>,
     val matchOnBase: Boolean,
     val arity: Int?,
+    val minArity: Int?,
     val maxArity: Int?,
+    val calleeGuard: String?,
+    val byteSwapKind: NumericKind?,
     val unlessDeclaredTypes: Set<String>,
     val unlessDeclaredTopFns: Set<String>,
     val unlessTopSignatures: Set<String>,
@@ -926,28 +978,36 @@ internal class DeclarativeCalleePatternRule(
         declaredTypeNames: Set<String>,
         declaredTopLevelFnRawNames: Set<String>,
         topLevelSignatureCounts: Map<String, Int>,
+        guardPredicate: (String) -> Boolean = { true },
     ): Boolean {
         if (arity != null && argCount != arity) return false
+        if (minArity != null && argCount < minArity) return false
         if (maxArity != null && argCount > maxArity) return false
         val target = if (matchOnBase) calleeBase else callee
         val nameMatched =
             (exactCallees.isNotEmpty() && target in exactCallees) ||
-                suffixCallees.any { suf -> calleeBase == suf || calleeBase.endsWith(".$suf") }
+                suffixCallees.any { suf -> calleeBase == suf || calleeBase.endsWith(".$suf") } ||
+                (exactCallees.isEmpty() && suffixCallees.isEmpty() && calleeGuard != null)
         if (!nameMatched) return false
         if (unlessDeclaredTypes.any { it in declaredTypeNames }) return false
         if (unlessDeclaredTopFns.any { it in declaredTopLevelFnRawNames }) return false
         if (unlessTopSignatures.any { it in topLevelSignatureCounts }) return false
+        if (calleeGuard != null && !guardPredicate(calleeGuard)) return false
         return true
     }
 
     companion object {
         fun fromYaml(node: YamlNode.Mapping): DeclarativeCalleePatternRule =
             DeclarativeCalleePatternRule(
+                phase = node.optionalString("phase") ?: "callee",
                 exactCallees = node.optionalWordSet("match"),
                 suffixCallees = node.optionalWordSet("matchSuffix"),
                 matchOnBase = node.bool("matchOnBase", default = true),
                 arity = node.optionalInt("arity"),
+                minArity = node.optionalInt("minArity"),
                 maxArity = node.optionalInt("maxArity"),
+                calleeGuard = node.optionalString("calleeGuard"),
+                byteSwapKind = node.optionalString("byteSwapKind")?.let(NumericKind::valueOf),
                 unlessDeclaredTypes = node.optionalWordSet("unlessDeclaredTypes"),
                 unlessDeclaredTopFns = node.optionalWordSet("unlessDeclaredTopFns"),
                 unlessTopSignatures = node.optionalWordSet("unlessTopSignatures"),
@@ -955,6 +1015,63 @@ internal class DeclarativeCalleePatternRule(
             )
     }
 }
+
+/**
+ * Declarative pattern-match and template-replacement rule for builtin Rust `macro!(...)` invocations
+ * (`format!`, `write!`/`writeln!`, `print!`/`println!`, `panic!`/`todo!`/`unreachable!`, `assert!`,
+ * `tri!`, `const_error!`, `line!`/`column!`/`file!`, `quote!`/`parse_quote!`, `addr_of!`, `offset_of!`, `asm!`).
+ */
+internal class DeclarativeMacroPatternRule(
+    val macros: Set<String>,
+    val emptyTokens: Boolean?,
+    val arity: Int?,
+    val minArity: Int?,
+    val maxArity: Int?,
+    val macroGuard: String?,
+    val action: DeclarativeReplacementAction,
+) {
+    fun matches(
+        isTokensEmpty: Boolean,
+        argCountProvider: () -> Int,
+        guardPredicate: (String) -> Boolean,
+    ): Boolean {
+        if (emptyTokens != null && isTokensEmpty != emptyTokens) return false
+        if (arity != null || minArity != null || maxArity != null) {
+            val count = argCountProvider()
+            if (arity != null && count != arity) return false
+            if (minArity != null && count < minArity) return false
+            if (maxArity != null && count > maxArity) return false
+        }
+        if (macroGuard != null && !guardPredicate(macroGuard)) return false
+        return true
+    }
+
+    companion object {
+        fun fromYaml(node: YamlNode.Mapping): DeclarativeMacroPatternRule =
+            DeclarativeMacroPatternRule(
+                macros = node.wordSet("match"),
+                emptyTokens = if ("emptyTokens" in node.entries) node.bool("emptyTokens") else null,
+                arity = node.optionalInt("arity"),
+                minArity = node.optionalInt("minArity"),
+                maxArity = node.optionalInt("maxArity"),
+                macroGuard = node.optionalString("macroGuard"),
+                action = DeclarativeReplacementAction.fromYaml(node),
+            )
+    }
+}
+
+internal data class FloatFromBitsRuleSpec(
+    val renderExpectKind: NumericKind,
+    val castKind: NumericKind,
+    val owner: String,
+)
+
+internal data class SynForwardedWitnessRule(
+    val calleeSuffix: String,
+    val arity: Int,
+    val witnessMethods: List<String>,
+    val forwardAllWitnesses: Boolean,
+)
 
 /**
  * Declarative pattern-match and template-replacement rule for `#[rustc_intrinsic]` declarations
@@ -1063,6 +1180,7 @@ internal class RuntimeRuleRegistry(
     private val templateMapCache = HashMap<String, Map<String, YamlTemplate>>()
     private val numericKindKeyCache = HashMap<String, Map<NumericKind, String>>()
     private val numericKindValCache = HashMap<String, Map<String, NumericKind>>()
+    private val numericKindTemplateCache = HashMap<String, Map<NumericKind, YamlTemplate>>()
     private val intrinsicSectionCache = HashMap<String, Map<String, DeclarativeIntrinsicPatternRule>>()
     private val coreRouteCache = HashMap<String, List<DeclarativeCoreImportRouteRule>>()
 
@@ -1113,6 +1231,11 @@ internal class RuntimeRuleRegistry(
             map(key).mapValues { (_, v) -> NumericKind.valueOf(v) }
         }
 
+    fun numericKindTemplates(key: String): Map<NumericKind, YamlTemplate> =
+        numericKindTemplateCache.getOrPut(key) {
+            map(key).entries.associate { (k, pattern) -> NumericKind.valueOf(k) to YamlTemplate.compile(pattern) }
+        }
+
     fun intrinsicRules(section: String): Map<String, DeclarativeIntrinsicPatternRule> =
         intrinsicSectionCache.getOrPut(section) {
             val out = LinkedHashMap<String, DeclarativeIntrinsicPatternRule>()
@@ -1157,8 +1280,58 @@ internal class RuntimeRuleRegistry(
         indexMultiRulePhase("postArg")
     }
 
-    val calleeRules: List<DeclarativeCalleePatternRule> by lazy {
+    private val allCalleeRules: List<DeclarativeCalleePatternRule> by lazy {
         mappings("calleePatternRules").map(DeclarativeCalleePatternRule::fromYaml)
+    }
+
+    val preCalleeRules: List<DeclarativeCalleePatternRule> by lazy {
+        allCalleeRules.filter { it.phase == "preCallee" }
+    }
+
+    val calleeRules: List<DeclarativeCalleePatternRule> by lazy {
+        allCalleeRules.filter { it.phase == "callee" }
+    }
+
+    val macroRulesByName: Map<String, List<DeclarativeMacroPatternRule>> by lazy {
+        val out = LinkedHashMap<String, MutableList<DeclarativeMacroPatternRule>>()
+        for (node in mappings("macroCallPatternRules")) {
+            val rule = DeclarativeMacroPatternRule.fromYaml(node)
+            for (name in rule.macros) out.getOrPut(name) { ArrayList() }.add(rule)
+        }
+        out
+    }
+
+    val floatToIntUncheckedRulesByKind: Map<NumericKind, DeclarativeReplacementAction> by lazy {
+        val out = LinkedHashMap<NumericKind, DeclarativeReplacementAction>()
+        for (node in mappings("floatToIntUncheckedRules")) {
+            val action = DeclarativeReplacementAction.fromYaml(node)
+            for (kindStr in node.wordSet("kinds")) {
+                out[NumericKind.valueOf(kindStr)] = action
+            }
+        }
+        out
+    }
+
+    val floatFromBitsSpecsByKind: Map<NumericKind, FloatFromBitsRuleSpec> by lazy {
+        mappings("floatFromBitsSpecs").associate { node ->
+            NumericKind.valueOf(node.string("kind")) to
+                FloatFromBitsRuleSpec(
+                    renderExpectKind = NumericKind.valueOf(node.string("renderExpectKind")),
+                    castKind = NumericKind.valueOf(node.string("castKind")),
+                    owner = node.string("owner"),
+                )
+        }
+    }
+
+    val synForwardedWitnessRules: List<SynForwardedWitnessRule> by lazy {
+        mappings("synForwardedWitnessRules").map { node ->
+            SynForwardedWitnessRule(
+                calleeSuffix = node.string("calleeSuffix"),
+                arity = node.int("arity"),
+                witnessMethods = node.optionalWordSet("witnessMethods").toList(),
+                forwardAllWitnesses = node.bool("forwardAll", default = false),
+            )
+        }
     }
 
     val rustGlobalAllocActionsByName: Map<String, DeclarativeReplacementAction> by lazy {

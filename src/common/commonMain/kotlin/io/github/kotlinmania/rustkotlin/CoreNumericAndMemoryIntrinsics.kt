@@ -589,37 +589,15 @@ private object FloatToIntUncheckedIntrinsicRule : FloatIntrinsicLoweringRule(set
             dstScalar?.let { CoreIntrinsicLowering.rustScalarToNumericKind(it, ctx.emitter) }
                 ?: ctx.emitter.currentExpectedNumericKind
         if (srcKind == NumericKind.F32 || srcKind == NumericKind.F64) {
-            val isF32 = srcKind == NumericKind.F32
-            val u64Km = if (isF32) "kmFloatToU64Unchecked" else "kmDoubleToU64Unchecked"
-            val u128Km = if (isF32) "kmFloatToU128Unchecked" else "kmDoubleToU128Unchecked"
-            when (dstKind) {
-                NumericKind.I8 -> return "($arg0).toInt().toByte()"
-                NumericKind.I16 -> return "($arg0).toInt().toShort()"
-                NumericKind.I32 -> return "($arg0).toInt()"
-                NumericKind.I64 -> return "($arg0).toLong()"
-                NumericKind.U8, NumericKind.U16, NumericKind.U32, NumericKind.U64 -> {
-                    CoreIntrinsicLowering.registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$u64Km")
-                    val suffix =
-                        when (dstKind) {
-                            NumericKind.U8 -> ".toUByte()"
-                            NumericKind.U16 -> ".toUShort()"
-                            NumericKind.U32 -> ".toUInt()"
-                            else -> ""
-                        }
-                    return "$u64Km($arg0)$suffix"
-                }
-                NumericKind.U128 -> {
-                    CoreIntrinsicLowering.registerCoreImport(ctx.emitter, "${ctx.intrPkg}.$u128Km")
-                    CoreIntrinsicLowering.registerCoreImport(ctx.emitter, "${ctx.coreNs}.U128")
-                    return "$u128Km($arg0).let { U128(it.hi, it.lo) }"
-                }
-                NumericKind.I128 -> {
-                    val srcLayout = layoutExprForNumericKind(srcKind, ctx.coreNs, ctx.memPkg, ctx.emitter)
-                    val dstLayout = layoutExprForNumericKind(NumericKind.I128, ctx.coreNs, ctx.memPkg, ctx.emitter)
-                    return ctx.emitWithLayouts(this, srcLayout, dstLayout)
-                }
-                else -> Unit
-            }
+            CoreIntrinsicLowering
+                .renderScalarFloatToIntUnchecked(
+                    emitter = ctx.emitter,
+                    coreNs = ctx.coreNs,
+                    isF32 = srcKind == NumericKind.F32,
+                    valueExpr = arg0,
+                    atomExpr = "($arg0)",
+                    dstKind = dstKind,
+                )?.let { return it }
         }
         val srcLayout =
             srcKind?.let { layoutExprForNumericKind(it, ctx.coreNs, ctx.memPkg, ctx.emitter) }

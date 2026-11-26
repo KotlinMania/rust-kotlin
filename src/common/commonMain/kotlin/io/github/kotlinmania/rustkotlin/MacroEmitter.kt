@@ -106,6 +106,7 @@ internal fun KotlinJ2KEmitter.renderMacroInvocationAsStmtOrExpr(
             indent = indent,
             selfTypeName = selfTypeName,
         )
+    ctx.tryRenderDeclarativeMacroRules()?.let { return it }
     val rule = BUILTIN_MACRO_CALL_RULES_BY_NAME[macroName]
     return if (rule != null) rule.render(ctx) else ctx.renderUserOrCrateMacroCall()
 }
@@ -206,6 +207,72 @@ private class MacroInvocationContext(
             }
         return "$callee(${args.joinToString(", ")})"
     }
+
+    fun tryRenderDeclarativeMacroRules(): String? {
+        val candidates = activeRules().macroRulesByName[macroName] ?: return null
+        val isTokensEmpty = tokens.isEmpty()
+        var cachedSplitArgs: List<List<TokenTree>>? = null
+        fun argsList(): List<List<TokenTree>> = cachedSplitArgs ?: splitArgs().also { cachedSplitArgs = it }
+
+        val headerCtx = emitter.headerContext
+        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerCtx)
+        val matched =
+            candidates.firstOrNull { rule ->
+                rule.matches(
+                    isTokensEmpty = isTokensEmpty,
+                    argCountProvider = { argsList().size },
+                ) { guard ->
+                    when (guard) {
+                        "rawAbiUnkinded" -> headerCtx.rawAbiMode && emitter.currentExpectedNumericKind == null
+                        "coreActive" -> "core" in headerCtx.crateNamespaces || headerCtx.packageName?.startsWith(coreNs) == true
+                        else -> false
+                    }
+                }
+            } ?: return null
+
+        val renderedArgs = HashMap<Int, String>()
+        return matched.action.render(
+            rawAbi = headerCtx.rawAbiMode,
+            finalClasses = headerCtx.finalClasses,
+            onImport = { CoreIntrinsicLowering.registerCoreImport(emitter, it) },
+        ) { key ->
+            when (key) {
+                "macroName" -> macroName
+                "macroKtName" -> rustFunctionIdentToKotlin(macroName)
+                "coreNs" -> coreNs
+                "expr" -> renderStreamAsExpr(tokens)
+                "tryExpr" -> emitter.renderSourceResultTry(renderStreamAsExpr(tokens), "return")
+                "format" -> renderFormat()
+                "tailFormat" -> renderFormat(joinCommaSeparatedTail(argsList()))
+                "arg0" -> renderedArgs.getOrPut(0) { renderTreesAsExpr(argsList()[0]) }
+                "arg1" -> renderedArgs.getOrPut(1) { renderTreesAsExpr(argsList()[1]) }
+                "spanLine" -> {
+                    val startPos = mac.path.span().start()
+                    startPos.line.toString()
+                }
+                "spanCol1" -> {
+                    val startPos = mac.path.span().start()
+                    (startPos.column + 1).toString()
+                }
+                "quotedSourcePath" -> renderKotlinDoubleQuotedString(headerCtx.portLintSourcePath.orEmpty())
+                "plainFallbackNamed" -> renderPlainFnCallFallback(macroName)
+                "quoteUnspanned" ->
+                    QuoteMacroTokenEmitter(tokens.clone().toList(), emitter, selfTypeName)
+                        .renderCall("quote", indent, spanned = false)
+                "quoteUnspannedNamed" ->
+                    QuoteMacroTokenEmitter(tokens.clone().toList(), emitter, selfTypeName)
+                        .renderCall(rustFunctionIdentToKotlin(macroName), indent, spanned = false)
+                "quoteSpannedNamed" ->
+                    QuoteMacroTokenEmitter(tokens.clone().toList(), emitter, selfTypeName)
+                        .renderCall(rustFunctionIdentToKotlin(macroName), indent, spanned = true)
+                "ioErrorRef" -> emitter.bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.Error")
+                "ioSimpleMsgRef" -> emitter.bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.SimpleMessage")
+                "ioErrorKindRef" -> emitter.bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.ErrorKind")
+                "zeroIntLit" -> emitter.renderIntLiteral("0", "")
+                else -> null
+            }
+        }
+    }
 }
 
 private abstract class BuiltinMacroCallRule(
@@ -214,72 +281,6 @@ private abstract class BuiltinMacroCallRule(
     constructor(vararg names: String) : this(names.toSet())
 
     abstract fun render(ctx: MacroInvocationContext): String
-}
-
-private object TriMacroRule : BuiltinMacroCallRule("tri") {
-    override fun render(ctx: MacroInvocationContext): String =
-        ctx.emitter.renderSourceResultTry(ctx.renderStreamAsExpr(ctx.tokens), "return")
-}
-
-private object FormatMacroRule : BuiltinMacroCallRule("format", "format_args") {
-    override fun render(ctx: MacroInvocationContext): String =
-        ctx.renderFormat()
-}
-
-private object WriteMacroRule : BuiltinMacroCallRule("write", "writeln") {
-    override fun render(ctx: MacroInvocationContext): String {
-        val parts = ctx.splitArgs()
-        if (parts.isEmpty()) return "${rustFunctionIdentToKotlin(ctx.macroName)}()"
-        val target = ctx.renderTreesAsExpr(parts[0])
-        val isWriteln = ctx.macroName == "writeln"
-        if (parts.size == 1) {
-            return if (isWriteln) "$target.appendLine()" else "$target.append(\"\")"
-        }
-        val appendMethod = if (isWriteln) "appendLine" else "append"
-        return "$target.$appendMethod(${ctx.renderFormat(ctx.joinCommaSeparatedTail(parts))})"
-    }
-}
-
-private object PrintMacroRule : BuiltinMacroCallRule("println", "eprintln", "print", "eprint") {
-    override fun render(ctx: MacroInvocationContext): String {
-        val fn = if (ctx.macroName.endsWith("ln")) "println" else "print"
-        return "$fn(${ctx.renderFormat()})"
-    }
-}
-
-private object PanicMacroRule : BuiltinMacroCallRule("panic", "unreachable", "unimplemented", "todo", "const_panic") {
-    override fun render(ctx: MacroInvocationContext): String {
-        if (ctx.macroName == "const_panic") {
-            val parts = ctx.splitArgs()
-            val firstMsg = if (parts.isEmpty()) "\"const_panic\"" else ctx.renderTreesAsExpr(parts[0])
-            return "error($firstMsg)"
-        }
-        val msg =
-            if (ctx.tokens.isEmpty()) {
-                val safeLabel = if (ctx.macroName == "unimplemented" || ctx.macroName == "todo") "unsupported" else ctx.macroName
-                "\"$safeLabel\""
-            } else {
-                ctx.renderFormat()
-            }
-        return "error($msg)"
-    }
-}
-
-private object ConstErrorMacroRule : BuiltinMacroCallRule("const_error") {
-    override fun render(ctx: MacroInvocationContext): String {
-        val parts = ctx.splitArgs()
-        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(ctx.emitter.headerContext)
-        val errType = ctx.emitter.bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.Error")
-        val msgType = ctx.emitter.bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.SimpleMessage")
-        return if (parts.size >= 2) {
-            val kindExpr = ctx.renderTreesAsExpr(parts[0])
-            val msgExpr = ctx.renderTreesAsExpr(parts[1])
-            "$errType.fromStaticMessage($msgType(kind = $kindExpr, message = $msgExpr))"
-        } else {
-            val kindType = ctx.emitter.bindOrQualifyResolvedCrossSymbol("$coreNs.io.error.ErrorKind")
-            "$errType.fromStaticMessage($msgType(kind = $kindType.Other, message = \"const_error\"))"
-        }
-    }
 }
 
 private object VecMacroRule : BuiltinMacroCallRule("vec") {
@@ -347,22 +348,6 @@ private object VecMacroRule : BuiltinMacroCallRule("vec") {
         if (semiIndex <= 0 || semiIndex >= cursor.size - 1) return null
         return TokenStream.fromTokenTrees(cursor.trees.subList(0, semiIndex)) to
             TokenStream.fromTokenTrees(cursor.trees.subList(semiIndex + 1, cursor.size))
-    }
-}
-
-private object AssertMacroRule : BuiltinMacroCallRule("assert", "debug_assert", "const_assert") {
-    override fun render(ctx: MacroInvocationContext): String {
-        val parts = ctx.splitArgs()
-        if (parts.isEmpty()) return "check(true)"
-        val cond = ctx.renderTreesAsExpr(parts[0])
-        if (parts.size < 2) return "check($cond)"
-        val msg =
-            if (ctx.macroName == "const_assert") {
-                ctx.renderTreesAsExpr(parts[1])
-            } else {
-                ctx.renderFormat(ctx.joinCommaSeparatedTail(parts))
-            }
-        return "check($cond) { $msg }"
     }
 }
 
@@ -460,22 +445,6 @@ private object MatchesMacroRule : BuiltinMacroCallRule("matches") {
     }
 }
 
-private object SourceLocationMacroRule : BuiltinMacroCallRule("line", "column", "file") {
-    override fun render(ctx: MacroInvocationContext): String {
-        if (!ctx.tokens.isEmpty()) {
-            return ctx.renderPlainFnCallFallback(ctx.macroName)
-        }
-        val macSpan = ctx.mac.path.span()
-        val startLoc = macSpan.start()
-        val sourcePath = ctx.emitter.headerContext.portLintSourcePath
-        return when (ctx.macroName) {
-            "line" -> "${startLoc.line}u"
-            "column" -> "${startLoc.column + 1}u"
-            else -> renderKotlinDoubleQuotedString(sourcePath.orEmpty())
-        }
-    }
-}
-
 private object SynDelimiterOrTokenMacroRule : BuiltinMacroCallRule("Token", "parenthesized", "braced", "bracketed") {
     override fun render(ctx: MacroInvocationContext): String {
         if (ctx.macroName == "Token") {
@@ -486,26 +455,6 @@ private object SynDelimiterOrTokenMacroRule : BuiltinMacroCallRule("Token", "par
             ctx.emitter.renderSourceResultTry("${delim.first}(${delim.third})", "return")
         } else {
             ctx.renderPlainFnCallFallback()
-        }
-    }
-}
-
-private object QuoteFamilyMacroRule : BuiltinMacroCallRule(
-    "quote",
-    "parse_quote",
-    "quote_block",
-    "quote_expr",
-    "quote_spanned",
-    "parse_quote_spanned",
-) {
-    override fun render(ctx: MacroInvocationContext): String {
-        val quoteEmitter = QuoteMacroTokenEmitter(ctx.tokens.clone().toList(), ctx.emitter, ctx.selfTypeName)
-        return when (ctx.macroName) {
-            "quote_block" -> "Fragment.Block(${quoteEmitter.renderCall("quote", ctx.indent, spanned = false)})"
-            "quote_expr" -> "Fragment.Expr(${quoteEmitter.renderCall("quote", ctx.indent, spanned = false)})"
-            "quote_spanned", "parse_quote_spanned" ->
-                quoteEmitter.renderCall(rustFunctionIdentToKotlin(ctx.macroName), ctx.indent, spanned = true)
-            else -> quoteEmitter.renderCall(rustFunctionIdentToKotlin(ctx.macroName), ctx.indent, spanned = false)
         }
     }
 }
@@ -535,49 +484,15 @@ private object InlineHostMacroRule : BuiltinMacroCallRule("cpp", "c") {
     }
 }
 
-private object LowLevelMemoryOrAsmMacroRule : BuiltinMacroCallRule("offset_of", "addr_of", "addr_of_mut", "asm", "naked_asm", "global_asm") {
-    override fun render(ctx: MacroInvocationContext): String =
-        when (ctx.macroName) {
-            "offset_of" ->
-                if (ctx.emitter.headerContext.rawAbiMode && ctx.emitter.currentExpectedNumericKind == null) {
-                    "0uL"
-                } else {
-                    ctx.emitter.renderIntLiteral("0", "")
-                }
-            "addr_of", "addr_of_mut" -> {
-                val place = ctx.renderStreamAsExpr(ctx.tokens)
-                val callee = rustFunctionIdentToKotlin(ctx.macroName)
-                val headerCtx = ctx.emitter.headerContext
-                val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerCtx)
-                val pkgName = headerCtx.packageName
-                if (("core" in headerCtx.crateNamespaces || pkgName?.startsWith(coreNs) == true) && pkgName != "$coreNs.mem") {
-                    CoreIntrinsicLowering.registerCoreImport(ctx.emitter, "$coreNs.mem.$callee")
-                }
-                "$callee($place)"
-            }
-            else -> "Unit"
-        }
-}
-
 private val BUILTIN_MACRO_CALL_RULES: List<BuiltinMacroCallRule> =
     listOf(
-        TriMacroRule,
-        FormatMacroRule,
-        WriteMacroRule,
-        PrintMacroRule,
-        PanicMacroRule,
-        ConstErrorMacroRule,
         VecMacroRule,
-        AssertMacroRule,
         EqualityAssertMacroRule,
         CompileTimeTextMacroRule,
         IncludeFileMacroRule,
         MatchesMacroRule,
-        SourceLocationMacroRule,
         SynDelimiterOrTokenMacroRule,
-        QuoteFamilyMacroRule,
         InlineHostMacroRule,
-        LowLevelMemoryOrAsmMacroRule,
     )
 
 private val BUILTIN_MACRO_CALL_RULES_BY_NAME: Map<String, BuiltinMacroCallRule> =

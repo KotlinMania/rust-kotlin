@@ -225,24 +225,49 @@ atomicSynthesizedDeclRules:
     imports: ["{coreNs}.mem.atomicCxchgWithLayout"]
     declReplace: "atomicCxchgWithLayout({p0}.rawAddress, {p1}, {p2}, {ord0}, {ord1}, {layout0})"
 
-# Fast zero-allocation scalar bit-cast templates for `mem::transmute::<Src, Dst>(val)`.
-fastScalarTransmuteTemplates:
-  "f32->u32": "({val}).toRawBits().toUInt()"
-  "f32->i32": "({val}).toRawBits()"
-  "u32->f32": "{f32Type}.fromBits(({val}).toInt())"
+# Unified zero-allocation scalar bit-cast templates shared across
+# `mem::transmute::<Src, Dst>(val)` and `*(&val as *const Src as *const Dst)` pointer punning.
+scalarBitCastTemplates:
+  "f16->u16": "{atom}.toBits()"
+  "f16->i16": "{atom}.toBits().toShort()"
+  "u16->f16": "F16.fromBits({val})"
+  "i16->f16": "F16.fromBits({atom}.toUShort())"
+  "f32->u32": "{atom}.toRawBits().toUInt()"
+  "f32->i32": "{atom}.toRawBits()"
+  "u32->f32": "{f32Type}.fromBits({atom}.toInt())"
   "i32->f32": "{f32Type}.fromBits({val})"
-  "f64->u64": "({val}).toRawBits().toULong()"
-  "f64->i64": "({val}).toRawBits()"
-  "u64->f64": "Double.fromBits(({val}).toLong())"
+  "f64->u64": "{atom}.toRawBits().toULong()"
+  "f64->i64": "{atom}.toRawBits()"
+  "u64->f64": "Double.fromBits({atom}.toLong())"
   "i64->f64": "Double.fromBits({val})"
-  "u8->i8": "({val}).toByte()"
-  "i8->u8": "({val}).toUByte()"
-  "u16->i16": "({val}).toShort()"
-  "i16->u16": "({val}).toUShort()"
-  "u32->i32": "({val}).toInt()"
-  "i32->u32": "({val}).toUInt()"
-  "u64->i64": "({val}).toLong()"
-  "i64->u64": "({val}).toULong()"
+  "f128->u128": "U128({atom}.high, {atom}.low)"
+  "f128->i128": "I128({atom}.high.toLong(), {atom}.low)"
+  "u128->f128": "F128.fromBits({val})"
+  "i128->f128": "F128.fromBits({atom}.high.toULong(), {atom}.low)"
+  "u8->i8": "{atom}.toByte()"
+  "i8->u8": "{atom}.toUByte()"
+  "u16->i16": "{atom}.toShort()"
+  "i16->u16": "{atom}.toUShort()"
+  "u32->i32": "{atom}.toInt()"
+  "i32->u32": "{atom}.toUInt()"
+  "u64->i64": "{atom}.toLong()"
+  "i64->u64": "{atom}.toULong()"
+
+# Unified scalar float-to-integer unchecked conversion rules shared across
+# `core::intrinsics::float_to_int_unchecked` and `f32`/`f64::to_int_unchecked`.
+floatToIntUncheckedRules:
+  - { kinds: "I8", replace: "{atom}.toInt().toByte()" }
+  - { kinds: "I16", replace: "{atom}.toInt().toShort()" }
+  - { kinds: "I32", replace: "{atom}.toInt()" }
+  - { kinds: "I64", replace: "{atom}.toLong()" }
+  - { kinds: "U8", imports: ["{intrPkg}.{u64Km}"], replace: "{u64Km}({val}).toUByte()" }
+  - { kinds: "U16", imports: ["{intrPkg}.{u64Km}"], replace: "{u64Km}({val}).toUShort()" }
+  - { kinds: "U32", imports: ["{intrPkg}.{u64Km}"], replace: "{u64Km}({val}).toUInt()" }
+  - { kinds: "U64", imports: ["{intrPkg}.{u64Km}"], replace: "{u64Km}({val})" }
+  - { kinds: "U128", imports: ["{intrPkg}.{u128Km}", "{coreNs}.U128"], replace: "{u128Km}({val}).let {{ U128(it.hi, it.lo) }}" }
+  - kinds: "I128"
+    imports: ["{intrPkg}.{u128Km}", "{coreNs}.I128"]
+    replace: "({val}).let {{ v -> if (v < {zeroLit}) {u128Km}(-v).let {{ -I128(it.hi.toLong(), it.lo) }} else {u128Km}(v).let {{ I128(it.hi.toLong(), it.lo) }} }}"
 
 # ==============================================================================
 # Integer & Floating-Point Intrinsic Rule Specifications

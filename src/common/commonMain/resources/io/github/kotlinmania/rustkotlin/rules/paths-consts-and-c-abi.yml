@@ -361,3 +361,90 @@ builtinKotlinIdents:
   - "String ZERO toByte toUByte toShort toUShort toInt toUInt toLong toULong toFloat toDouble"
   - "error emptyArray intArrayOf longArrayOf byteArrayOf shortArrayOf floatArrayOf doubleArrayOf"
   - "ubyteArrayOf ushortArrayOf uintArrayOf ulongArrayOf booleanArrayOf"
+
+# ==============================================================================
+# Declarative Builtin `macro!(...)` Invocation Pattern/Replacement Rules
+# ==============================================================================
+# Evaluated top-to-bottom per macro name via `RuntimeRuleRegistry.macroRulesByName`.
+macroCallPatternRules:
+  - { match: "tri", replace: "{tryExpr}" }
+  - { match: "format format_args", replace: "{format}" }
+
+  - { match: "write writeln", arity: 0, replace: "{macroKtName}()" }
+  - { match: "write", arity: 1, replace: "{arg0}.append(\"\")" }
+  - { match: "writeln", arity: 1, replace: "{arg0}.appendLine()" }
+  - { match: "write", minArity: 2, replace: "{arg0}.append({tailFormat})" }
+  - { match: "writeln", minArity: 2, replace: "{arg0}.appendLine({tailFormat})" }
+
+  - { match: "println eprintln", replace: "println({format})" }
+  - { match: "print eprint", replace: "print({format})" }
+
+  - { match: "const_panic", arity: 0, replace: "error(\"const_panic\")" }
+  - { match: "const_panic", minArity: 1, replace: "error({arg0})" }
+  - { match: "unimplemented todo", emptyTokens: true, replace: "error(\"unsupported\")" }
+  - { match: "panic unreachable", emptyTokens: true, replace: "error(\"{macroName}\")" }
+  - { match: "panic unreachable unimplemented todo", emptyTokens: false, replace: "error({format})" }
+
+  - match: "const_error"
+    minArity: 2
+    replace: "{ioErrorRef}.fromStaticMessage({ioSimpleMsgRef}(kind = {arg0}, message = {arg1}))"
+  - match: "const_error"
+    maxArity: 1
+    replace: "{ioErrorRef}.fromStaticMessage({ioSimpleMsgRef}(kind = {ioErrorKindRef}.Other, message = \"const_error\"))"
+
+  - { match: "assert debug_assert const_assert", arity: 0, replace: "check(true)" }
+  - { match: "assert debug_assert const_assert", arity: 1, replace: "check({arg0})" }
+  - { match: "const_assert", minArity: 2, replace: "check({arg0}) {{ {arg1} }}" }
+  - { match: "assert debug_assert", minArity: 2, replace: "check({arg0}) {{ {tailFormat} }}" }
+
+  - { match: "line", emptyTokens: true, replace: "{spanLine}u" }
+  - { match: "column", emptyTokens: true, replace: "{spanCol1}u" }
+  - { match: "file", emptyTokens: true, replace: "{quotedSourcePath}" }
+  - { match: "line column file", emptyTokens: false, replace: "{plainFallbackNamed}" }
+
+  - { match: "quote_block", replace: "Fragment.Block({quoteUnspanned})" }
+  - { match: "quote_expr", replace: "Fragment.Expr({quoteUnspanned})" }
+  - { match: "quote_spanned parse_quote_spanned", replace: "{quoteSpannedNamed}" }
+  - { match: "quote parse_quote", replace: "{quoteUnspannedNamed}" }
+
+  - { match: "offset_of", macroGuard: rawAbiUnkinded, replace: "0uL" }
+  - { match: "offset_of", replace: "{zeroIntLit}" }
+  - { match: "addr_of addr_of_mut", macroGuard: coreActive, imports: ["{coreNs}.mem.{macroKtName}"], replace: "{macroKtName}({expr})" }
+  - { match: "addr_of addr_of_mut", replace: "{macroKtName}({expr})" }
+  - { match: "asm naked_asm global_asm", replace: "Unit" }
+
+# Syn `Punctuated` parser methods that auto-forward implicit `Parse` / `Peek` type-param witnesses.
+synForwardedWitnessRules:
+  - { calleeSuffix: ".parseTerminatedWith", arity: 2, witnessMethods: "parse" }
+  - { calleeSuffix: ".parseSeparatedNonemptyWith", arity: 2, witnessMethods: "peek parse" }
+  - { calleeSuffix: ".parseTerminated", arity: 1, witnessMethods: "parse" }
+  - { calleeSuffix: ".parseSeparatedNonempty", arity: 1, forwardAll: true }
+
+# `bool as Numeric` cast replacement templates (`{cond}` = unwrapped boolean condition).
+booleanToNumericCastTemplates:
+  Byte: "(if ({cond}) 1 else 0).toByte()"
+  Short: "(if ({cond}) 1 else 0).toShort()"
+  Int: "(if ({cond}) 1 else 0)"
+  Long: "(if ({cond}) 1L else 0L)"
+  I128: "(if ({cond}) I128.ONE else I128.ZERO)"
+  UByte: "(if ({cond}) 1u else 0u).toUByte()"
+  UShort: "(if ({cond}) 1u else 0u).toUShort()"
+  UInt: "(if ({cond}) 1u else 0u)"
+  ULong: "(if ({cond}) 1uL else 0uL)"
+  U128: "(if ({cond}) U128.ONE else U128.ZERO)"
+  Float: "(if ({cond}) 1.0f else 0.0f)"
+  "kotlin.Float": "(if ({cond}) 1.0f else 0.0f)"
+  Double: "(if ({cond}) 1.0 else 0.0)"
+  Char: "(if ({cond}) 1 else 0).toChar()"
+  RustChar: "(if ({cond}) RustChar(1u) else RustChar(0u))"
+
+# `#[repr(...)]` enum zero/offset discriminant literal templates (`{offset}` = decimal offset).
+enumOffsetLiteralTemplates:
+  U8: "{offset}u.toUByte()"
+  U16: "{offset}u.toUShort()"
+  U32: "{offset}u"
+  U64: "{offset}uL"
+  I8: "{offset}.toByte()"
+  I16: "{offset}.toShort()"
+  I32: "{offset}"
+  I64: "{offset}L"

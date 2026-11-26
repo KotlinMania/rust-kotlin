@@ -243,28 +243,12 @@ internal class CastExpressionLowering(
     }
 
     private fun renderBooleanToNumericCast(canonicalNumericTarget: String): String {
+        val tmpl =
+            activeRules().templates("booleanToNumericCastTemplates")[canonicalNumericTarget]
+                ?: return "($inner as $targetType)"
+        if (canonicalNumericTarget == "RustChar") emitter.usesRustChar = true
         val cleanCond = if (emitter.hasOuterBalancedParens(inner)) inner.substring(1, inner.length - 1) else inner
-        val intBranch = "(if ($cleanCond) 1 else 0)"
-        return when (canonicalNumericTarget) {
-            "Byte" -> "$intBranch.toByte()"
-            "Short" -> "$intBranch.toShort()"
-            "Int" -> intBranch
-            "Long" -> "(if ($cleanCond) 1L else 0L)"
-            "I128" -> "(if ($cleanCond) I128.ONE else I128.ZERO)"
-            "UByte" -> "(if ($cleanCond) 1u else 0u).toUByte()"
-            "UShort" -> "(if ($cleanCond) 1u else 0u).toUShort()"
-            "UInt" -> "(if ($cleanCond) 1u else 0u)"
-            "ULong" -> "(if ($cleanCond) 1uL else 0uL)"
-            "U128" -> "(if ($cleanCond) U128.ONE else U128.ZERO)"
-            "Float", "kotlin.Float" -> "(if ($cleanCond) 1.0f else 0.0f)"
-            "Double" -> "(if ($cleanCond) 1.0 else 0.0)"
-            "Char" -> "$intBranch.toChar()"
-            "RustChar" -> {
-                emitter.usesRustChar = true
-                "(if ($cleanCond) RustChar(1u) else RustChar(0u))"
-            }
-            else -> "($inner as $targetType)"
-        }
+        return tmpl.render { if (it == "cond") cleanCond else null }
     }
 
     private fun tryRenderEnumDiscriminantCast(unwrappedSource: Expr, canonicalNumericTarget: String): String? {
