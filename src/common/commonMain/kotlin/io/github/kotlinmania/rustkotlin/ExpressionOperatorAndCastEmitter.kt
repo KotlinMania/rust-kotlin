@@ -299,18 +299,8 @@ internal fun KotlinJ2KEmitter.renderExprBinary(expr: Expr.Binary, indent: String
     } else if ("core" in headerContext.crateNamespaces &&
         (expr.op is BinOp.Lt || expr.op is BinOp.Le || expr.op is BinOp.Gt || expr.op is BinOp.Ge) &&
         run {
-            val lBase =
-                inferExprRenderedType(leftOperand, selfTypeName)
-                    ?.removeSuffix("?")
-                    ?.substringAfterLast('.')
-                    ?.substringBefore('<')
-                    ?.trim()
-            val rBase =
-                inferExprRenderedType(rightOperand, selfTypeName)
-                    ?.removeSuffix("?")
-                    ?.substringAfterLast('.')
-                    ?.substringBefore('<')
-                    ?.trim()
+            val lBase = inferExprRenderedType(leftOperand, selfTypeName)?.simpleKotlinTypeName()
+            val rBase = inferExprRenderedType(rightOperand, selfTypeName)?.simpleKotlinTypeName()
             lBase == "Wrapping" ||
                 rBase == "Wrapping" ||
                 (
@@ -397,7 +387,7 @@ internal fun KotlinJ2KEmitter.renderExprUnary(expr: Expr.Unary, indent: String, 
                 inner.path.isIdent("self") &&
                 selfTypeName != null
             ) {
-                val baseSelf = selfTypeName.substringBefore('<').trim()
+                val baseSelf = selfTypeName.headKotlinTypePath()
                 if (currentEnclosingFunctionName == "clone") {
                     val fields = inspector.structFieldNamesByType[baseSelf]
                     if (fields != null) {
@@ -668,14 +658,9 @@ internal fun KotlinJ2KEmitter.renderExprAssign(expr: Expr.Assign, indent: String
         currentSmartCastNonNullLocals = currentSmartCastNonNullLocals - left
     }
     if (left == "this") {
-        val selfBase = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
-        val rightBase =
-            inferExprRenderedType(expr.right, selfTypeName)
-                ?.removeSuffix("?")
-                ?.substringBefore('<')
-                ?.substringAfterLast('.')
-                ?.trim()
-        if (selfBase != null &&
+        val selfBase = selfTypeName?.simpleKotlinTypeName()
+        val rightBase = inferExprRenderedType(expr.right, selfTypeName)?.simpleKotlinTypeName()
+        if (!selfBase.isNullOrEmpty() &&
             inspector.tupleStructArityByType[selfBase] == 1 &&
             "value" in inspector.structFieldNamesByType[selfBase].orEmpty() &&
             rightBase == selfBase
@@ -691,13 +676,7 @@ private fun KotlinJ2KEmitter.resolveSelfCompoundAssignMethodName(
     op: BinOp,
     selfTypeName: String?,
 ): String? {
-    val ownerBase =
-        selfTypeName
-            ?.substringBefore('<')
-            ?.substringAfterLast('.')
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
-            ?: return null
+    val ownerBase = selfTypeName?.simpleKotlinTypeName()?.takeIf { it.isNotEmpty() } ?: return null
     val assignMethod =
         when (op) {
             is BinOp.AddAssign -> "addAssign"

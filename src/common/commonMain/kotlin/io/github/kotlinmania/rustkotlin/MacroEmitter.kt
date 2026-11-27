@@ -504,6 +504,116 @@ private val BUILTIN_MACRO_CALL_RULES_BY_NAME: Map<String, BuiltinMacroCallRule> 
         }
     }
 
+/**
+ * Typed token hierarchy for `quote!` / `quote_spanned!` template emission.
+ */
+internal sealed class QuoteEmitToken {
+    data class Placeholder(
+        val kotlinIdent: String,
+    ) : QuoteEmitToken()
+
+    data class AttrGroup(
+        val inner: List<QuoteEmitToken>,
+    ) : QuoteEmitToken()
+
+    data class Word(
+        val text: String,
+    ) : QuoteEmitToken()
+
+    data class Punct(
+        val ch: Char,
+        val isAlone: Boolean,
+    ) : QuoteEmitToken()
+
+    data class DelimitedGroup(
+        val delimiter: Delimiter,
+        val inner: List<QuoteEmitToken>,
+    ) : QuoteEmitToken()
+}
+
+internal open class QuoteTemplateTokenEmitter {
+    private val emitted = ArrayList<QuoteEmitToken>()
+    private val boundVariables = LinkedHashMap<String, String>()
+
+    fun tokens(): List<QuoteEmitToken> = emitted.toList()
+
+    fun bindings(): Map<String, String> = boundVariables.toMap()
+
+    fun placeholder(kotlinIdent: String) {
+        emitted += QuoteEmitToken.Placeholder(kotlinIdent)
+        if (kotlinIdent != "this") {
+            boundVariables[kotlinIdent] = kotlinIdent
+        }
+    }
+
+    fun attrGroup(buildInner: (QuoteTemplateTokenEmitter) -> Unit) {
+        val child = spawnChild()
+        buildInner(child)
+        boundVariables.putAll(child.boundVariables)
+        emitted += QuoteEmitToken.AttrGroup(child.tokens())
+    }
+
+    fun group(delimiter: Delimiter, buildInner: (QuoteTemplateTokenEmitter) -> Unit) {
+        val child = spawnChild()
+        buildInner(child)
+        boundVariables.putAll(child.boundVariables)
+        emitted += QuoteEmitToken.DelimitedGroup(delimiter, child.tokens())
+    }
+
+    fun inlineRepetition(buildInner: (QuoteTemplateTokenEmitter) -> Unit) {
+        val child = spawnChild()
+        buildInner(child)
+        boundVariables.putAll(child.boundVariables)
+        emitted.addAll(child.tokens())
+    }
+
+    fun word(text: String) {
+        emitted += QuoteEmitToken.Word(text)
+    }
+
+    fun punct(ch: Char, spacing: Spacing) {
+        emitted += QuoteEmitToken.Punct(ch, isAlone = spacing == Spacing.Alone)
+    }
+
+    protected open fun spawnChild(): QuoteTemplateTokenEmitter = QuoteTemplateTokenEmitter()
+
+    open fun renderTemplate(): String {
+        val sb = StringBuilder()
+        renderListInto(emitted, sb)
+        return sb.toString().trim()
+    }
+
+    protected open fun renderListInto(list: List<QuoteEmitToken>, out: StringBuilder) {
+        for (tok in list) {
+            when (tok) {
+                is QuoteEmitToken.Placeholder -> out.append("`#`").append(tok.kotlinIdent).append(' ')
+                is QuoteEmitToken.AttrGroup -> {
+                    out.append("`#`[")
+                    renderListInto(tok.inner, out)
+                    out.append("] ")
+                }
+                is QuoteEmitToken.Word -> out.append(tok.text).append(' ')
+                is QuoteEmitToken.Punct -> {
+                    out.append(tok.ch)
+                    if (tok.isAlone) out.append(' ')
+                }
+                is QuoteEmitToken.DelimitedGroup -> {
+                    val (open, close) =
+                        when (tok.delimiter) {
+                            Delimiter.Brace -> "{ " to " } "
+                            Delimiter.Parenthesis -> "(" to ") "
+                            Delimiter.Bracket -> "[" to "] "
+                            Delimiter.None -> "" to " "
+                        }
+                    out.append(open)
+                    renderListInto(tok.inner, out)
+                    out.append(close)
+                }
+            }
+        }
+    }
+}
+
 private class QuoteMacroTokenEmitter(
     trees: List<TokenTree>,
     private val emitter: KotlinJ2KEmitter,
@@ -532,23 +642,25 @@ private class QuoteMacroTokenEmitter(
             } else {
                 this
             }
-        val templateSb = StringBuilder()
-        val bindings = linkedMapOf<String, String>()
-        bodyEmitter.emitTemplateAndBindings(templateSb, bindings)
-        val templateLit = renderKotlinDoubleQuotedString(templateSb.toString().trim())
+        val templateOut = QuoteTemplateTokenEmitter()
+        bodyEmitter.emitInto(templateOut)
+        val templateLit = renderKotlinDoubleQuotedString(templateOut.renderTemplate())
         val callArgs = mutableListOf<String>()
         if (spanArg != null) callArgs += spanArg
         callArgs += templateLit
-        for ((k, v) in bindings) {
+        for ((k, v) in templateOut.bindings()) {
             callArgs += "\"$k\" to $v"
         }
-        return "$fnName(${callArgs.joinToString(", ")})"
+        return KotlinTokenEmitter()
+            .macroCall(callee = fnName, open = "(", close = ")") { inner ->
+                callArgs.forEachIndexed { idx, arg ->
+                    if (idx > 0) inner.punct(',')
+                    inner.raw(arg)
+                }
+            }.render()
     }
 
-    fun emitTemplateAndBindings(
-        out: StringBuilder,
-        bindings: MutableMap<String, String>,
-    ) {
+    fun emitInto(out: QuoteTemplateTokenEmitter) {
         var i = 0
         while (i < size) {
             if (punctCharAt(i) == '#' && i + 1 < size) {
@@ -564,22 +676,21 @@ private class QuoteMacroTokenEmitter(
                                 nextIdent.first().isUpperCase() -> rustTypeIdentToKotlin(nextIdent)
                                 else -> emitter.scopeBuilder.resolveLocalKotlinName(nextIdent) ?: rustValueIdentToKotlin(nextIdent)
                             }
-                        out.append("`#`").append(ktIdent).append(' ')
-                        if (ktIdent != "this") {
-                            bindings[ktIdent] = ktIdent
-                        }
+                        out.placeholder(ktIdent)
                         i += 2
                         continue
                     }
                     nextBracket != null -> {
-                        out.append("`#`[")
-                        QuoteMacroTokenEmitter(nextBracket.stream().toList(), emitter, selfTypeName).emitTemplateAndBindings(out, bindings)
-                        out.append("] ")
+                        out.attrGroup { child ->
+                            QuoteMacroTokenEmitter(nextBracket.stream().toList(), emitter, selfTypeName).emitInto(child)
+                        }
                         i += 2
                         continue
                     }
                     nextParen != null -> {
-                        QuoteMacroTokenEmitter(nextParen.stream().toList(), emitter, selfTypeName).emitTemplateAndBindings(out, bindings)
+                        out.inlineRepetition { child ->
+                            QuoteMacroTokenEmitter(nextParen.stream().toList(), emitter, selfTypeName).emitInto(child)
+                        }
                         i += 2
                         if (punctCharAt(i) == '*') i++
                         continue
@@ -587,26 +698,13 @@ private class QuoteMacroTokenEmitter(
                 }
             }
             when (val tt = trees[i]) {
-                is TokenTree.Ident -> out.append(tt.value.toString()).append(' ')
-                is TokenTree.Literal -> out.append(tt.value.toString()).append(' ')
-                is TokenTree.Punct -> {
-                    out.append(tt.value.asChar())
-                    if (tt.value.spacing() == Spacing.Alone) {
-                        out.append(' ')
+                is TokenTree.Ident -> out.word(tt.value.toString())
+                is TokenTree.Literal -> out.word(tt.value.toString())
+                is TokenTree.Punct -> out.punct(tt.value.asChar(), tt.value.spacing())
+                is TokenTree.Group ->
+                    out.group(tt.value.delimiter()) { child ->
+                        QuoteMacroTokenEmitter(tt.value.stream().toList(), emitter, selfTypeName).emitInto(child)
                     }
-                }
-                is TokenTree.Group -> {
-                    val (open, close) =
-                        when (tt.value.delimiter()) {
-                            Delimiter.Brace -> "{ " to " } "
-                            Delimiter.Parenthesis -> "(" to ") "
-                            Delimiter.Bracket -> "[" to "] "
-                            Delimiter.None -> "" to " "
-                        }
-                    out.append(open)
-                    QuoteMacroTokenEmitter(tt.value.stream().toList(), emitter, selfTypeName).emitTemplateAndBindings(out, bindings)
-                    out.append(close)
-                }
             }
             i++
         }
@@ -943,181 +1041,266 @@ internal fun KotlinJ2KEmitter.renderBinOp(op: BinOp): String =
         -> "="
     }
 
-internal fun KotlinJ2KEmitter.renderLit(lit: Lit): String =
-    when (lit) {
-        is Lit.Str -> renderKotlinDoubleQuotedString(lit.value.value())
-        is Lit.ByteStr -> {
-            val text =
-                lit.value
-                    .value()
-                    .map { it.toInt().toChar() }
-                    .joinToString("")
-            val encoded = "${renderKotlinDoubleQuotedString(text)}.encodeToByteArray()"
-            when (currentExpectedParseTargetType?.removeSuffix("?")?.trim()) {
-                "List<UByte>", "MutableList<UByte>" -> "$encoded.map { it.toUByte() }"
-                "UByteArray" -> "$encoded.toUByteArray()"
-                else -> encoded
+/**
+ * Extensible OOP rule and emitter hierarchy for lowering `syn.Lit` AST literals into Kotlin literal tokens.
+ */
+internal abstract class RustLiteralEmissionRule {
+    abstract fun tryEmit(lit: Lit, ctx: RustLiteralKotlinEmitter): String?
+}
+
+internal object StrAndCStrLiteralEmissionRule : RustLiteralEmissionRule() {
+    override fun tryEmit(lit: Lit, ctx: RustLiteralKotlinEmitter): String? =
+        when (lit) {
+            is Lit.Str -> renderKotlinDoubleQuotedString(lit.value.value())
+            is Lit.CStr -> renderKotlinDoubleQuotedString(lit.value.value().decodeToString())
+            else -> null
+        }
+}
+
+internal object ByteStrAndByteLiteralEmissionRule : RustLiteralEmissionRule() {
+    override fun tryEmit(lit: Lit, ctx: RustLiteralKotlinEmitter): String? =
+        when (lit) {
+            is Lit.ByteStr -> ctx.emitByteStrLiteral(lit)
+            is Lit.Byte -> ctx.emitByteLiteral(lit)
+            else -> null
+        }
+}
+
+internal object IntLiteralEmissionRule : RustLiteralEmissionRule() {
+    override fun tryEmit(lit: Lit, ctx: RustLiteralKotlinEmitter): String? =
+        (lit as? Lit.Int)?.let(ctx::emitSynIntLiteral)
+}
+
+internal object FloatLiteralEmissionRule : RustLiteralEmissionRule() {
+    override fun tryEmit(lit: Lit, ctx: RustLiteralKotlinEmitter): String? =
+        (lit as? Lit.Float)?.let { ctx.emitFloatLiteral(it.value.base10Digits(), it.value.suffix()) }
+}
+
+internal object ScalarAndVerbatimLiteralEmissionRule : RustLiteralEmissionRule() {
+    override fun tryEmit(lit: Lit, ctx: RustLiteralKotlinEmitter): String? =
+        when (lit) {
+            is Lit.Char -> ctx.emitCharLiteral(lit.value.value())
+            is Lit.Bool -> lit.value.value().toString()
+            is Lit.Verbatim -> lit.value.toString()
+            else -> null
+        }
+}
+
+internal open class RustLiteralKotlinEmitter(
+    val emitter: KotlinJ2KEmitter,
+    protected val rules: List<RustLiteralEmissionRule> = DEFAULT_RULES,
+) {
+    open fun emitLiteral(lit: Lit): String {
+        for (rule in rules) {
+            rule.tryEmit(lit, this)?.let { return it }
+        }
+        return lit.toString()
+    }
+
+    open fun emitByteStrLiteral(lit: Lit.ByteStr): String {
+        val text =
+            lit.value
+                .value()
+                .map { it.toInt().toChar() }
+                .joinToString("")
+        val encoded = "${renderKotlinDoubleQuotedString(text)}.encodeToByteArray()"
+        return when (emitter.currentExpectedParseTargetType?.removeSuffix("?")?.trim()) {
+            "List<UByte>", "MutableList<UByte>" -> "$encoded.map { it.toUByte() }"
+            "UByteArray" -> "$encoded.toUByteArray()"
+            else -> encoded
+        }
+    }
+
+    open fun emitByteLiteral(lit: Lit.Byte): String =
+        when (emitter.currentExpectedNumericKind) {
+            NumericKind.U32 -> "${lit.value.value()}u"
+            NumericKind.U64 -> "${lit.value.value()}uL"
+            NumericKind.I32 -> "${lit.value.value()}"
+            NumericKind.I64 -> "${lit.value.value()}L"
+            else -> "${lit.value.value()}u.toUByte()"
+        }
+
+    open fun emitSynIntLiteral(lit: Lit.Int): String {
+        val suffix = lit.value.suffix()
+        val rawToken = lit.value.token().toString()
+        val rawDigits = if (suffix.isNotEmpty() && rawToken.endsWith(suffix)) rawToken.dropLast(suffix.length) else rawToken
+        val isOctal = rawDigits.startsWith("0o") || rawDigits.startsWith("0O")
+        val expectedKind = emitter.currentExpectedNumericKind
+        val is128Context =
+            suffix == "u128" ||
+                suffix == "i128" ||
+                expectedKind == NumericKind.U128 ||
+                expectedKind == NumericKind.I128 ||
+                parseUnsigned128LiteralDigits(rawDigits)?.exceeds64BitUnsigned == true
+        val digits =
+            when {
+                rawDigits.startsWith("0x") || rawDigits.startsWith("0X") -> rawDigits
+                rawDigits.startsWith("0b") || rawDigits.startsWith("0B") ->
+                    if (is128Context) rawDigits else binaryDigitsToHexLiteral(rawDigits)
+                isOctal && is128Context -> rawDigits
+                else -> lit.value.base10Digits()
+            }
+        return emitIntLiteral(digits, suffix)
+    }
+
+    open fun binaryDigitsToHexLiteral(rawDigits: String): String {
+        val bits = rawDigits.substring(2).replace("_", "")
+        if (bits.isEmpty() || bits.any { it != '0' && it != '1' }) return rawDigits
+        val pad = (4 - bits.length % 4) % 4
+        val padded = "0".repeat(pad) + bits
+        val hexChars = "0123456789ABCDEF"
+        val hex = StringBuilder(padded.length / 4)
+        var idx = 0
+        while (idx < padded.length) {
+            val nibble =
+                ((padded[idx] - '0') shl 3) or
+                    ((padded[idx + 1] - '0') shl 2) or
+                    ((padded[idx + 2] - '0') shl 1) or
+                    (padded[idx + 3] - '0')
+            hex.append(hexChars[nibble])
+            idx += 4
+        }
+        return "0x${hex.toString().trimStart('0').ifEmpty { "0" }}"
+    }
+
+    open fun emitIntLiteral(digits: String, suffix: String): String {
+        val parsed128 = parseUnsigned128LiteralDigits(digits)
+        val expected = emitter.currentExpectedNumericKind
+        if (suffix == "u128" || (suffix.isEmpty() && expected == NumericKind.U128)) {
+            return if (parsed128 != null) formatU128ConstructorCall(parsed128.high, parsed128.low) else "U128()"
+        }
+        if (suffix == "i128" || (suffix.isEmpty() && expected == NumericKind.I128)) {
+            return if (parsed128 != null) formatI128ConstructorCall(parsed128.high, parsed128.low) else "I128()"
+        }
+        if (suffix.isEmpty() && parsed128?.exceeds64BitUnsigned == true) {
+            return formatU128ConstructorCall(parsed128.high, parsed128.low)
+        }
+        val clean = digits.replace("_", "")
+        val low64 = if (parsed128 != null && parsed128.high == 0uL) parsed128.low else null
+        val nonDecAtom =
+            when {
+                low64 != null && low64 >= 0x8000000000000000uL -> "${clean}uL"
+                low64 != null && low64 >= 0x80000000uL -> "${clean}L"
+                else -> clean
+            }
+        if (suffix.isEmpty()) {
+            if (expected != null) {
+                renderIntAsFloatKind(clean, nonDecAtom, expected)?.let { return it }
+            }
+            return when (expected) {
+                NumericKind.U8 -> "${clean}u.toUByte()"
+                NumericKind.U16 -> "${clean}u.toUShort()"
+                NumericKind.U32 -> if (low64 != null && low64 > 0xFFFFFFFFuL) "${clean}uL.toUInt()" else "${clean}u"
+                NumericKind.U64 -> "${clean}uL"
+                NumericKind.I8 -> if (low64 != null && low64 > 0x7FuL) "$clean.toByte()" else clean
+                NumericKind.I16 -> if (low64 != null && low64 > 0x7FFFuL) "$clean.toShort()" else clean
+                NumericKind.I32 ->
+                    when {
+                        low64 != null && low64 > 0xFFFFFFFFuL -> "${clean}L.toInt()"
+                        low64 != null && low64 >= 0x80000000uL -> "$clean.toInt()"
+                        else -> clean
+                    }
+                NumericKind.I64 -> if (low64 != null && low64 >= 0x8000000000000000uL) "${clean}uL.toLong()" else "${clean}L"
+                else -> if (low64 != null && low64 >= 0x8000000000000000uL) "${clean}uL" else clean
             }
         }
-        is Lit.CStr -> renderKotlinDoubleQuotedString(lit.value.value().decodeToString())
-        is Lit.Byte ->
-            when (currentExpectedNumericKind) {
-                NumericKind.U32 -> "${lit.value.value()}u"
-                NumericKind.U64 -> "${lit.value.value()}uL"
-                NumericKind.I32 -> "${lit.value.value()}"
-                NumericKind.I64 -> "${lit.value.value()}L"
-                else -> "${lit.value.value()}u.toUByte()"
-            }
-        is Lit.Char -> renderKotlinCharLiteral(lit.value.value())
-        is Lit.Int -> {
-            val suffix = lit.value.suffix()
-            val rawToken = lit.value.token().toString()
-            val rawDigits = if (suffix.isNotEmpty() && rawToken.endsWith(suffix)) rawToken.dropLast(suffix.length) else rawToken
-            val isOctal = rawDigits.startsWith("0o") || rawDigits.startsWith("0O")
-            val is128Context =
-                suffix == "u128" ||
-                    suffix == "i128" ||
-                    currentExpectedNumericKind == NumericKind.U128 ||
-                    currentExpectedNumericKind == NumericKind.I128 ||
-                    parseUnsigned128LiteralDigits(rawDigits)?.exceeds64BitUnsigned == true
-            val digits =
-                when {
-                    rawDigits.startsWith("0x") || rawDigits.startsWith("0X") -> rawDigits
-                    rawDigits.startsWith("0b") || rawDigits.startsWith("0B") ->
-                        if (is128Context) rawDigits else binaryDigitsToHexLiteral(rawDigits)
-                    isOctal && is128Context -> rawDigits
-                    else -> lit.value.base10Digits()
+        val pointerWidth = emitter.activeCfgProfile.pointerWidth
+        val useRawPointerInt = emitter.headerContext.rawAbiMode || emitter.inExternAbiSignature
+        return when (suffix) {
+            "u8" -> "${clean}u.toUByte()"
+            "u16" -> "${clean}u.toUShort()"
+            "u32" -> "${clean}u"
+            "usize" ->
+                if (useRawPointerInt || expected == NumericKind.U64) {
+                    when (pointerWidth) {
+                        16 -> "${clean}u.toUShort()"
+                        32 -> "${clean}u"
+                        else -> "${clean}uL"
+                    }
+                } else {
+                    clean
                 }
-            renderIntLiteral(digits, suffix)
-        }
-        is Lit.Float -> renderFloatLiteral(lit.value.base10Digits(), lit.value.suffix())
-        is Lit.Bool -> lit.value.value().toString()
-        is Lit.Verbatim -> lit.value.toString()
-    }
-
-internal fun KotlinJ2KEmitter.binaryDigitsToHexLiteral(rawDigits: String): String {
-    val bits = rawDigits.substring(2).replace("_", "")
-    if (bits.isEmpty() || bits.any { it != '0' && it != '1' }) return rawDigits
-    val pad = (4 - bits.length % 4) % 4
-    val padded = "0".repeat(pad) + bits
-    val hexChars = "0123456789ABCDEF"
-    val hex = StringBuilder(padded.length / 4)
-    var idx = 0
-    while (idx < padded.length) {
-        val nibble =
-            ((padded[idx] - '0') shl 3) or
-                ((padded[idx + 1] - '0') shl 2) or
-                ((padded[idx + 2] - '0') shl 1) or
-                (padded[idx + 3] - '0')
-        hex.append(hexChars[nibble])
-        idx += 4
-    }
-    return "0x${hex.toString().trimStart('0').ifEmpty { "0" }}"
-}
-
-private fun renderIntAsFloatKind(
-    clean: String,
-    nonDecAtom: String,
-    kind: NumericKind,
-): String? {
-    val isDec = clean.all { it.isDigit() }
-    return when (kind) {
-        NumericKind.F16 -> if (isDec) "F16.fromFloat($clean.0f)" else "F16.fromDouble(($nonDecAtom).toDouble())"
-        NumericKind.F32 -> if (isDec) "$clean.0f" else "($nonDecAtom).toFloat()"
-        NumericKind.F64 -> if (isDec) "$clean.0" else "($nonDecAtom).toDouble()"
-        NumericKind.F128 -> if (isDec) "F128.fromDouble($clean.0)" else "F128.fromDouble(($nonDecAtom).toDouble())"
-        else -> null
-    }
-}
-
-internal fun KotlinJ2KEmitter.renderIntLiteral(digits: String, suffix: String): String {
-    val parsed128 = parseUnsigned128LiteralDigits(digits)
-    if (suffix == "u128" || (suffix.isEmpty() && currentExpectedNumericKind == NumericKind.U128)) {
-        return if (parsed128 != null) formatU128ConstructorCall(parsed128.high, parsed128.low) else "U128()"
-    }
-    if (suffix == "i128" || (suffix.isEmpty() && currentExpectedNumericKind == NumericKind.I128)) {
-        return if (parsed128 != null) formatI128ConstructorCall(parsed128.high, parsed128.low) else "I128()"
-    }
-    if (suffix.isEmpty() && parsed128?.exceeds64BitUnsigned == true) {
-        return formatU128ConstructorCall(parsed128.high, parsed128.low)
-    }
-    val clean = digits.replace("_", "")
-    val low64 = if (parsed128 != null && parsed128.high == 0uL) parsed128.low else null
-    val nonDecAtom =
-        when {
-            low64 != null && low64 >= 0x8000000000000000uL -> "${clean}uL"
-            low64 != null && low64 >= 0x80000000uL -> "${clean}L"
+            "u64" -> "${clean}uL"
+            "i8" -> if (low64 != null && low64 in 0x80uL..0xFFuL) "$clean.toByte()" else clean
+            "i16" -> if (low64 != null && low64 in 0x8000uL..0xFFFFuL) "$clean.toShort()" else clean
+            "i32" -> if (low64 != null && low64 in 0x80000000uL..0xFFFFFFFFuL) "$clean.toInt()" else clean
+            "isize" ->
+                if (useRawPointerInt || expected == NumericKind.I64) {
+                    when (pointerWidth) {
+                        16 -> "($clean).toShort()"
+                        32 -> clean
+                        else -> "${clean}L"
+                    }
+                } else {
+                    clean
+                }
+            "i64" -> if (low64 != null && low64 >= 0x8000000000000000uL) "${clean}uL.toLong()" else "${clean}L"
+            "f16" -> renderIntAsFloatKind(clean, nonDecAtom, NumericKind.F16)!!
+            "f32" -> renderIntAsFloatKind(clean, nonDecAtom, NumericKind.F32)!!
+            "f64" -> renderIntAsFloatKind(clean, nonDecAtom, NumericKind.F64)!!
+            "f128" -> renderIntAsFloatKind(clean, nonDecAtom, NumericKind.F128)!!
             else -> clean
         }
-    if (suffix.isEmpty()) {
-        val expected = currentExpectedNumericKind
-        if (expected != null) {
-            renderIntAsFloatKind(clean, nonDecAtom, expected)?.let { return it }
-        }
-        return when (expected) {
-            NumericKind.U8 -> "${clean}u.toUByte()"
-            NumericKind.U16 -> "${clean}u.toUShort()"
-            NumericKind.U32 -> if (low64 != null && low64 > 0xFFFFFFFFuL) "${clean}uL.toUInt()" else "${clean}u"
-            NumericKind.U64 -> "${clean}uL"
-            NumericKind.I8 -> if (low64 != null && low64 > 0x7FuL) "$clean.toByte()" else clean
-            NumericKind.I16 -> if (low64 != null && low64 > 0x7FFFuL) "$clean.toShort()" else clean
-            NumericKind.I32 ->
-                when {
-                    low64 != null && low64 > 0xFFFFFFFFuL -> "${clean}L.toInt()"
-                    low64 != null && low64 >= 0x80000000uL -> "$clean.toInt()"
-                    else -> clean
-                }
-            NumericKind.I64 -> if (low64 != null && low64 >= 0x8000000000000000uL) "${clean}uL.toLong()" else "${clean}L"
-            else -> if (low64 != null && low64 >= 0x8000000000000000uL) "${clean}uL" else clean
+    }
+
+    open fun emitFloatLiteral(digits: String, suffix: String): String {
+        val clean = digits.replace("_", "")
+        val normalized = if (clean.endsWith('.')) "${clean}0" else clean
+        val expected = emitter.currentExpectedNumericKind
+        return when {
+            suffix == "f16" || (suffix.isEmpty() && expected == NumericKind.F16) -> "F16.fromFloat(${normalized}f)"
+            suffix == "f128" || (suffix.isEmpty() && expected == NumericKind.F128) -> "F128.fromDouble($normalized)"
+            suffix == "f32" || (suffix.isEmpty() && expected == NumericKind.F32) -> "${normalized}f"
+            else -> normalized
         }
     }
-    return when (suffix) {
-        "u8" -> "${clean}u.toUByte()"
-        "u16" -> "${clean}u.toUShort()"
-        "u32" -> "${clean}u"
-        "usize" ->
-            if (headerContext.rawAbiMode || inExternAbiSignature || currentExpectedNumericKind == NumericKind.U64) {
-                when (activeCfgProfile.pointerWidth) {
-                    16 -> "${clean}u.toUShort()"
-                    32 -> "${clean}u"
-                    else -> "${clean}uL"
-                }
-            } else {
-                clean
+
+    open fun emitCharLiteral(codePoint: Int): String {
+        if (emitter.headerContext.scalarChar) {
+            emitter.usesRustChar = true
+            return "RustChar(0x${codePoint.toString(16)}u)"
+        }
+        if (codePoint > 0xFFFF) return "0x${codePoint.toString(16)}"
+        return formatBmpKotlinCharLiteral(codePoint.toChar())
+    }
+
+    companion object {
+        val DEFAULT_RULES: List<RustLiteralEmissionRule> =
+            listOf(
+                StrAndCStrLiteralEmissionRule,
+                ByteStrAndByteLiteralEmissionRule,
+                IntLiteralEmissionRule,
+                FloatLiteralEmissionRule,
+                ScalarAndVerbatimLiteralEmissionRule,
+            )
+
+        private fun renderIntAsFloatKind(
+            clean: String,
+            nonDecAtom: String,
+            kind: NumericKind,
+        ): String? {
+            val isDec = clean.all { it.isDigit() }
+            return when (kind) {
+                NumericKind.F16 -> if (isDec) "F16.fromFloat($clean.0f)" else "F16.fromDouble(($nonDecAtom).toDouble())"
+                NumericKind.F32 -> if (isDec) "$clean.0f" else "($nonDecAtom).toFloat()"
+                NumericKind.F64 -> if (isDec) "$clean.0" else "($nonDecAtom).toDouble()"
+                NumericKind.F128 -> if (isDec) "F128.fromDouble($clean.0)" else "F128.fromDouble(($nonDecAtom).toDouble())"
+                else -> null
             }
-        "u64" -> "${clean}uL"
-        "i8" -> if (low64 != null && low64 in 0x80uL..0xFFuL) "$clean.toByte()" else clean
-        "i16" -> if (low64 != null && low64 in 0x8000uL..0xFFFFuL) "$clean.toShort()" else clean
-        "i32" -> if (low64 != null && low64 in 0x80000000uL..0xFFFFFFFFuL) "$clean.toInt()" else clean
-        "isize" ->
-            if (headerContext.rawAbiMode || inExternAbiSignature || currentExpectedNumericKind == NumericKind.I64) {
-                when (activeCfgProfile.pointerWidth) {
-                    16 -> "($clean).toShort()"
-                    32 -> clean
-                    else -> "${clean}L"
-                }
-            } else {
-                clean
-            }
-        "i64" -> if (low64 != null && low64 >= 0x8000000000000000uL) "${clean}uL.toLong()" else "${clean}L"
-        "f16" -> renderIntAsFloatKind(clean, nonDecAtom, NumericKind.F16)!!
-        "f32" -> renderIntAsFloatKind(clean, nonDecAtom, NumericKind.F32)!!
-        "f64" -> renderIntAsFloatKind(clean, nonDecAtom, NumericKind.F64)!!
-        "f128" -> renderIntAsFloatKind(clean, nonDecAtom, NumericKind.F128)!!
-        else -> clean
+        }
     }
 }
 
-internal fun KotlinJ2KEmitter.renderFloatLiteral(digits: String, suffix: String): String {
-    val clean = digits.replace("_", "")
-    val normalized = if (clean.endsWith('.')) "${clean}0" else clean
-    return when {
-        suffix == "f16" || (suffix.isEmpty() && currentExpectedNumericKind == NumericKind.F16) -> "F16.fromFloat(${normalized}f)"
-        suffix == "f128" || (suffix.isEmpty() && currentExpectedNumericKind == NumericKind.F128) -> "F128.fromDouble($normalized)"
-        suffix == "f32" || (suffix.isEmpty() && currentExpectedNumericKind == NumericKind.F32) -> "${normalized}f"
-        else -> normalized
-    }
-}
+internal fun KotlinJ2KEmitter.renderLit(lit: Lit): String = literalEmitter.emitLiteral(lit)
+
+internal fun KotlinJ2KEmitter.binaryDigitsToHexLiteral(rawDigits: String): String =
+    literalEmitter.binaryDigitsToHexLiteral(rawDigits)
+
+internal fun KotlinJ2KEmitter.renderIntLiteral(digits: String, suffix: String): String =
+    literalEmitter.emitIntLiteral(digits, suffix)
+
+internal fun KotlinJ2KEmitter.renderFloatLiteral(digits: String, suffix: String): String =
+    literalEmitter.emitFloatLiteral(digits, suffix)
 
 internal fun formatBmpKotlinCharLiteral(
     ch: Char,
@@ -1138,14 +1321,8 @@ internal fun formatBmpKotlinCharLiteral(
             }
     }
 
-internal fun KotlinJ2KEmitter.renderKotlinCharLiteral(codePoint: Int): String {
-    if (headerContext.scalarChar) {
-        usesRustChar = true
-        return "RustChar(0x${codePoint.toString(16)}u)"
-    }
-    if (codePoint > 0xFFFF) return "0x${codePoint.toString(16)}"
-    return formatBmpKotlinCharLiteral(codePoint.toChar())
-}
+internal fun KotlinJ2KEmitter.renderKotlinCharLiteral(codePoint: Int): String =
+    literalEmitter.emitCharLiteral(codePoint)
 
 internal fun KotlinJ2KEmitter.extractFnParamNumericKinds(
     item: Item.Fn,
@@ -1246,8 +1423,8 @@ private class ExprPathResolutionEmitter(
     private val inspector get() = emitter.inspector
     private val headerContext get() = emitter.headerContext
     private val scopeBuilder get() = emitter.scopeBuilder
-    private val selfBase: String? = selfTypeName?.substringBefore('<')?.trim()
-    private val selfSimpleBase: String? = selfBase?.substringAfterLast('.')?.trim()
+    private val selfBase: String? = selfTypeName?.headKotlinTypePath()
+    private val selfSimpleBase: String? = selfTypeName?.simpleKotlinTypeName()
 
     private fun selfBaseOrTypeIdent(raw: String, stripOwnerQualification: Boolean = false): String =
         if (raw.removePrefix("r#") == "Self") {
@@ -1345,7 +1522,7 @@ private class ExprPathResolutionEmitter(
                 hasTrailingArgs = seg.arguments !is PathArguments.None,
             )?.let { return it }
         }
-        val receiverBase = baseTy.substringBefore('<').trim()
+        val receiverBase = baseTy.headKotlinTypePath()
         if (tailRawSegs.size == 1) {
             tryRenderTypeParamWitnessAssocConst(receiverBase, tailRawSegs[0])?.let { return it }
         }
@@ -1978,13 +2155,9 @@ private class ExprPathResolutionEmitter(
         methodKt: String,
     ): String {
         val cleanPrev = prevRaw.removePrefix("r#")
-        val baseMethodKt = methodKt.substringBefore('<').trim()
-        val typeArgContent =
-            if ('<' in methodKt && methodKt.endsWith(">")) {
-                methodKt.substringAfter('<').removeSuffix(">").trim()
-            } else {
-                null
-            }
+        val methodShape = KotlinCalleeShape.parse(methodKt)
+        val baseMethodKt = methodShape.basePath
+        val typeArgContent = methodShape.typeArgs.singleOrNull()
         if ((cleanPrev == "str" || cleanPrev == "String") && baseMethodKt == "parse") {
             val strParseMethod = typeArgContent?.let { STR_PRIMITIVE_PARSE_METHODS[it] }
             if (strParseMethod != null) {

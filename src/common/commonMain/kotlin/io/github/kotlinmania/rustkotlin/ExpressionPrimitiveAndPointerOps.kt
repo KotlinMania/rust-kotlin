@@ -390,7 +390,7 @@ internal fun KotlinJ2KEmitter.unwrapTryIntoUnwrapExpr(expr: Expr): Expr? {
 }
 
 internal fun KotlinJ2KEmitter.transparentPointerField(type: String, selfTypeName: String?): Pair<String, String>? {
-    val owner = type.substringBefore('<').substringAfterLast('.')
+    val owner = type.simpleKotlinTypeName()
     val struct =
         file.items.filterIsInstance<Item.Struct>().singleOrNull {
             rustTypeIdentToKotlin(it.ident.toString()) == owner
@@ -445,7 +445,7 @@ internal fun KotlinJ2KEmitter.resolveStructOrUnresolvedTypeLayoutExpr(
     pointeeKt: String,
     memPkg: String,
 ): String {
-    val structSimple = pointeeKt.substringBefore('<').substringAfterLast('.')
+    val structSimple = pointeeKt.simpleKotlinTypeName()
     val structDecl = sameFileUniqueSimpleStruct(structSimple)
     if (structDecl != null) {
         val computed = StructLayoutComputer.computeStructLayout(structDecl, this)

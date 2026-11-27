@@ -238,8 +238,9 @@ private class CWrapperHostSourceEmitter(
 internal fun renderInlineWrapperCFunction(fn: InlineCFunctionSpec): String {
     val sb = StringBuilder()
     sb.append("${cHeaderTypeForInlineReturn(fn)} ${fn.wrapperSymbolName}(${formatCParamsDecl(fn.params)}) {\n")
+    val bodyIdents = if (fn.params.isEmpty()) emptySet() else CHostPreambleTokenScanner(fn.rawBody).collectCIdentifiers()
     for (param in fn.params) {
-        if (!containsWholeIdentifier(fn.rawBody, param.cName)) {
+        if (param.cName !in bodyIdents) {
             sb.append("    (void)${param.cName};\n")
         }
     }
@@ -664,8 +665,9 @@ internal fun inferRequiredHeaders(
         }
     }
     for (fn in inlineFunctions) {
+        val bodyIdents = CHostPreambleTokenScanner(fn.rawBody).collectCIdentifiers()
         for ((sym, hdrList) in C_SYMBOL_HEADERS) {
-            if (containsWholeIdentifier(fn.rawBody, sym)) specs.addAll(hdrList)
+            if (sym in bodyIdents) specs.addAll(hdrList)
         }
     }
     return specs.filter { it.header !in preambleIncludes }.distinct()

@@ -281,7 +281,7 @@ internal fun Generics.kotlinConstParamNames(): List<String> =
         rustValueIdentToKotlin(raw)
     }
 
-internal fun String.simpleKotlinTypeName(): String = substringBefore('<').substringAfterLast('.').trim()
+internal fun String.simpleKotlinTypeName(): String = asKotlinRenderedType()?.simpleName.orEmpty()
 
 internal fun File.findStructByKotlinName(ownerName: String): Item.Struct? =
     items.filterIsInstance<Item.Struct>().singleOrNull { rustTypeIdentToKotlin(it.ident.toString()) == ownerName }

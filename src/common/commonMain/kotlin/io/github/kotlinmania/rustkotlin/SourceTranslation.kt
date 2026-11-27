@@ -95,6 +95,7 @@ internal class KotlinJ2KEmitter(
     internal val sharedDeclaredTypeNames: MutableSet<String>? = null,
     internal val sharedSamNamesByShape: MutableMap<String, String>? = null,
     internal val sharedSamDefaultsByName: MutableMap<String, String>? = null,
+    internal val itemEmitterRegistry: RustItemEmitterRegistry = RustItemEmitterRegistry.Default,
 ) {
     internal val inspector =
         CrateSymbolInspector(headerContext.selfCrateAliases).also { sym ->
@@ -248,9 +249,9 @@ internal class KotlinJ2KEmitter(
         )
 
     private val ownerMatcher by lazy(LazyThreadSafetyMode.NONE) { BlanketImplAndOwnerMatcher(this) }
+    internal val literalEmitter = RustLiteralKotlinEmitter(this)
 
     internal fun emitFile(): String {
-        val out = StringBuilder()
         closeEnumVariantTypeParamArities()
 
         // Partition impl blocks into those belonging to a local type declared in this file
@@ -345,8 +346,13 @@ internal class KotlinJ2KEmitter(
         if (pendingTopLevelTestFns.isNotEmpty()) {
             val suiteCandidate = headerContext.testClassName ?: "InlineTests"
             val suiteName = allocateTopLevelTestSuiteClassName(suiteCandidate, topLevelSignatureCounts)
-            val suiteBody = pendingTopLevelTestFns.joinToString("\n\n") { indentBlockByFourSpaces(it) }
-            renderedItems += "public class $suiteName {\n$suiteBody\n}"
+            renderedItems +=
+                KotlinDeclarationEmitter()
+                    .emitSuiteClass(
+                        visibility = "public",
+                        className = suiteName,
+                        memberDeclarations = pendingTopLevelTestFns,
+                    ).render()
         }
 
         val activeCoreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
@@ -420,54 +426,30 @@ internal class KotlinJ2KEmitter(
 
         val bodyTokens = KotlinCodeTokenIndex(allBodyItems.joinToString("\n\n"))
         val needsUnsignedArrayOptIn = UNSIGNED_ARRAY_IDENTS.any(bodyTokens::hasIdent)
-
-        if (headerContext.portLintDirective != "none") {
-            headerContext.portLintSourcePath?.let { relPath ->
-                out
-                    .append("// port-lint: ")
-                    .append(headerContext.portLintDirective)
-                    .append(' ')
-                    .append(relPath)
-                    .append('\n')
-            }
-        }
-        if (needsUnsignedArrayOptIn) {
-            out.append("@file:OptIn(ExperimentalUnsignedTypes::class)\n\n")
-        }
-        headerContext.packageName?.let { pkg ->
-            out.append("package ").append(pkg).append("\n\n")
-        }
-
         val importLines =
             KotlinFileImportSynthesizer(this).synthesizeImports(
                 activeCoreNs = activeCoreNs,
                 bodyTokens = bodyTokens,
                 standaloneMacrosExtraImports = standaloneMacros.extraImports,
             )
-        if (importLines.isNotEmpty()) {
-            out.append(importLines.joinToString("\n")).append("\n\n")
-        }
-
-        appendFileHeaderComments(
-            out = out,
-            emittedMacroNames = standaloneMacros.emittedMacroNames,
-            hasBodyItems = allBodyItems.isNotEmpty(),
-        )
-
-        out.append(allBodyItems.joinToString("\n\n"))
-        if (out.isNotEmpty() && !out.endsWith('\n')) {
-            out.append('\n')
-        }
-        if (!headerContext.isModuleRootSource && sharedDeclaredTypeNames == null && trivia.trailingComments.isNotEmpty()) {
-            val renderedTrailing = renderInlineComments(trivia.trailingComments, indent = "")
-            if (renderedTrailing.isNotEmpty()) {
-                if (allBodyItems.isNotEmpty() && !out.endsWith("\n\n")) {
-                    out.append('\n')
-                }
-                out.append(renderedTrailing)
+        val fileDocLines =
+            collectFileHeaderDocLines(
+                emittedMacroNames = standaloneMacros.emittedMacroNames,
+                hasBodyItems = allBodyItems.isNotEmpty(),
+            )
+        val renderedTrailing =
+            if (!headerContext.isModuleRootSource && sharedDeclaredTypeNames == null && trivia.trailingComments.isNotEmpty()) {
+                renderInlineComments(trivia.trailingComments, indent = "")
+            } else {
+                ""
             }
-        }
-        return ensureBlankLineBeforeKDocAfterLineComment(out.toString())
+        return KotlinFileDocumentEmitter(headerContext)
+            .emitPortLintHeaderIfPresent()
+            .emitUnsignedOptInIfNeeded(needsUnsignedArrayOptIn)
+            .emitPackageHeaderIfPresent()
+            .emitImportBlock(importLines)
+            .emitFileDocComments(fileDocLines)
+            .emitBodyItemsAndTrailingComments(allBodyItems, renderedTrailing)
     }
 
     private fun closeEnumVariantTypeParamArities() {
@@ -524,9 +506,17 @@ internal class KotlinJ2KEmitter(
                 val strippedTarget = targetType.trim().removeSuffix("?")
                 if (strippedTarget in candidateParams || strippedTarget in activeTypeParamNames) continue
                 inspector.declaredTypeNames += assocName
-                val usedParams = candidateParams.filter { containsWholeIdentifier(targetType, it) }
+                val targetIds = KotlinTokenWalker(targetType).collectFilteredIdentifiers()
+                val usedParams = candidateParams.filter { it in targetIds }
                 val typeParamSuffix = if (usedParams.isEmpty()) "" else "<${usedParams.joinToString(", ")}>"
-                renderedItems += "public typealias $assocName$typeParamSuffix = $targetType"
+                renderedItems +=
+                    KotlinDeclarationEmitter()
+                        .emitTypeAliasDeclaration(
+                            visibilityPrefix = "public",
+                            name = assocName,
+                            typeParamsSuffix = typeParamSuffix,
+                            rhsType = targetType,
+                        ).render()
             }
         }
     }
@@ -550,11 +540,10 @@ internal class KotlinJ2KEmitter(
                     }
             )
 
-    private fun appendFileHeaderComments(
-        out: StringBuilder,
+    private fun collectFileHeaderDocLines(
         emittedMacroNames: Set<String>,
         hasBodyItems: Boolean,
-    ) {
+    ): List<String> {
         val fileDocLines = mutableListOf<String>()
         fileDocLines.addAll(extractDocLinesFromAttributes(file.attrs))
         val rawInnerDocLines = mutableListOf<String>()
@@ -589,12 +578,7 @@ internal class KotlinJ2KEmitter(
                 }
             }
         }
-        if (fileDocLines.isNotEmpty()) {
-            for (docLine in fileDocLines) {
-                if (docLine.isEmpty()) out.append("//\n") else out.append("// ").append(docLine).append('\n')
-            }
-            out.append('\n')
-        }
+        return fileDocLines
     }
 
     internal fun extractDirectOwnerTypeName(
@@ -638,50 +622,173 @@ internal class KotlinJ2KEmitter(
         scopeSignatures: MutableMap<String, Int> = topLevelSignatureCounts,
     ): String {
         if (itemHasDocOnlyCfg(item)) return ""
-        return when (item) {
-            is Item.Use -> ""
-            is Item.Const -> renderItemConst(item, indent, scopeSignatures, isLocalItem = isLocalItem)
-            is Item.Static -> renderItemStatic(item, indent, scopeSignatures, isLocalItem = isLocalItem)
-            is Item.ItemType -> renderItemType(item, indent, scopeSignatures, isLocalItem = isLocalItem)
-            is Item.Fn -> renderItemFn(item, indent, scopeSignatures, isLocalItem = isLocalItem)
-            is Item.Struct -> {
-                val typeName = rustTypeIdentToKotlin(item.ident.toString())
-                val attachedImpls = localTypeImpls[typeName].orEmpty()
-                renderItemStruct(item, attachedImpls, indent, scopeSignatures, isLocalItem = isLocalItem)
-            }
-            is Item.Enum -> {
-                val typeName = rustTypeIdentToKotlin(item.ident.toString())
-                val attachedImpls = localTypeImpls[typeName].orEmpty()
-                renderItemEnum(item, attachedImpls, indent, scopeSignatures, isLocalItem = isLocalItem)
-            }
-            is Item.Union -> {
-                val typeName = rustTypeIdentToKotlin(item.ident.toString())
-                val attachedImpls = localTypeImpls[typeName].orEmpty()
-                renderItemUnion(item, attachedImpls, indent, scopeSignatures, isLocalItem = isLocalItem)
-            }
-            is Item.Trait -> renderItemTrait(item, indent, scopeSignatures, isLocalItem = isLocalItem)
-            is Item.TraitAlias -> renderItemTraitAlias(item, indent, scopeSignatures, isLocalItem = isLocalItem)
-            is Item.Impl -> renderStandaloneItemImpl(item, indent, scopeSignatures, isLocalItem = isLocalItem)
-            is Item.Mod -> renderItemMod(item, indent, scopeSignatures, isLocalItem = isLocalItem)
-            is Item.Macro -> renderItemMacro(item, indent, isLocalItem = isLocalItem)
-            is Item.ForeignMod -> renderItemForeignMod(item, indent, isLocalItem = isLocalItem)
-            is Item.ExternCrate -> ""
-            is Item.Verbatim -> CoreIntrinsicLowering.renderRustcIntrinsicVerbatimItem(item, this, indent).orEmpty()
-        }
+        return itemEmitterRegistry.emitItem(
+            item = item,
+            ctx =
+                ItemEmissionContext(
+                    emitter = this,
+                    indent = indent,
+                    localTypeImpls = localTypeImpls,
+                    isLocalItem = isLocalItem,
+                    scopeSignatures = scopeSignatures,
+                ),
+        )
     }
 }
 
-internal fun containsWholeIdentifier(text: String, ident: String): Boolean {
-    if (ident.isEmpty()) return false
-    var start = 0
-    while (true) {
-        val idx = text.indexOf(ident, start)
-        if (idx < 0) return false
-        val beforeOk = idx == 0 || (!text[idx - 1].isLetterOrDigit() && text[idx - 1] != '_')
-        val afterIdx = idx + ident.length
-        val afterOk = afterIdx >= text.length || (!text[afterIdx].isLetterOrDigit() && text[afterIdx] != '_')
-        if (beforeOk && afterOk) return true
-        start = idx + 1
+/**
+ * Shared render context passed to [RustItemEmissionRule] instances by [RustItemEmitterRegistry].
+ */
+internal data class ItemEmissionContext(
+    val emitter: KotlinJ2KEmitter,
+    val indent: String,
+    val localTypeImpls: Map<String, List<Item.Impl>>,
+    val isLocalItem: Boolean,
+    val scopeSignatures: MutableMap<String, Int>,
+) {
+    fun attachedImplsFor(rawIdent: String): List<Item.Impl> =
+        localTypeImpls[rustTypeIdentToKotlin(rawIdent)].orEmpty()
+}
+
+/**
+ * Extensible OOP rule contract for lowering top-level and local `syn.Item` AST nodes into Kotlin declarations.
+ */
+internal abstract class RustItemEmissionRule {
+    abstract fun tryEmit(item: Item, ctx: ItemEmissionContext): String?
+}
+
+internal abstract class TypedRustItemEmissionRule<I : Item> : RustItemEmissionRule() {
+    protected abstract fun castOrNull(item: Item): I?
+
+    protected abstract fun emitTyped(item: I, ctx: ItemEmissionContext): String
+
+    final override fun tryEmit(item: Item, ctx: ItemEmissionContext): String? =
+        castOrNull(item)?.let { emitTyped(it, ctx) }
+}
+
+private object UseAndExternCrateSkipItemRule : RustItemEmissionRule() {
+    override fun tryEmit(item: Item, ctx: ItemEmissionContext): String? =
+        when (item) {
+            is Item.Use, is Item.ExternCrate -> ""
+            else -> null
+        }
+}
+
+private object ConstItemEmissionRule : TypedRustItemEmissionRule<Item.Const>() {
+    override fun castOrNull(item: Item): Item.Const? = item as? Item.Const
+
+    override fun emitTyped(item: Item.Const, ctx: ItemEmissionContext): String =
+        ctx.emitter.renderItemConst(item, ctx.indent, ctx.scopeSignatures, isLocalItem = ctx.isLocalItem)
+}
+
+private object StaticItemEmissionRule : TypedRustItemEmissionRule<Item.Static>() {
+    override fun castOrNull(item: Item): Item.Static? = item as? Item.Static
+
+    override fun emitTyped(item: Item.Static, ctx: ItemEmissionContext): String =
+        ctx.emitter.renderItemStatic(item, ctx.indent, ctx.scopeSignatures, isLocalItem = ctx.isLocalItem)
+}
+
+private object TypeAliasItemEmissionRule : TypedRustItemEmissionRule<Item.ItemType>() {
+    override fun castOrNull(item: Item): Item.ItemType? = item as? Item.ItemType
+
+    override fun emitTyped(item: Item.ItemType, ctx: ItemEmissionContext): String =
+        ctx.emitter.renderItemType(item, ctx.indent, ctx.scopeSignatures, isLocalItem = ctx.isLocalItem)
+}
+
+private object FnItemEmissionRule : TypedRustItemEmissionRule<Item.Fn>() {
+    override fun castOrNull(item: Item): Item.Fn? = item as? Item.Fn
+
+    override fun emitTyped(item: Item.Fn, ctx: ItemEmissionContext): String =
+        ctx.emitter.renderItemFn(item, ctx.indent, ctx.scopeSignatures, isLocalItem = ctx.isLocalItem)
+}
+
+private object NominalTypeItemEmissionRule : RustItemEmissionRule() {
+    override fun tryEmit(item: Item, ctx: ItemEmissionContext): String? =
+        when (item) {
+            is Item.Struct ->
+                ctx.emitter.renderItemStruct(
+                    item = item,
+                    attachedImpls = ctx.attachedImplsFor(item.ident.toString()),
+                    indent = ctx.indent,
+                    scopeSignatures = ctx.scopeSignatures,
+                    isLocalItem = ctx.isLocalItem,
+                )
+            is Item.Enum ->
+                ctx.emitter.renderItemEnum(
+                    item = item,
+                    attachedImpls = ctx.attachedImplsFor(item.ident.toString()),
+                    indent = ctx.indent,
+                    scopeSignatures = ctx.scopeSignatures,
+                    isLocalItem = ctx.isLocalItem,
+                )
+            is Item.Union ->
+                ctx.emitter.renderItemUnion(
+                    item = item,
+                    attachedImpls = ctx.attachedImplsFor(item.ident.toString()),
+                    indent = ctx.indent,
+                    scopeSignatures = ctx.scopeSignatures,
+                    isLocalItem = ctx.isLocalItem,
+                )
+            else -> null
+        }
+}
+
+private object TraitAndTraitAliasItemEmissionRule : RustItemEmissionRule() {
+    override fun tryEmit(item: Item, ctx: ItemEmissionContext): String? =
+        when (item) {
+            is Item.Trait -> ctx.emitter.renderItemTrait(item, ctx.indent, ctx.scopeSignatures, isLocalItem = ctx.isLocalItem)
+            is Item.TraitAlias -> ctx.emitter.renderItemTraitAlias(item, ctx.indent, ctx.scopeSignatures, isLocalItem = ctx.isLocalItem)
+            else -> null
+        }
+}
+
+private object ImplAndModItemEmissionRule : RustItemEmissionRule() {
+    override fun tryEmit(item: Item, ctx: ItemEmissionContext): String? =
+        when (item) {
+            is Item.Impl -> ctx.emitter.renderStandaloneItemImpl(item, ctx.indent, ctx.scopeSignatures, isLocalItem = ctx.isLocalItem)
+            is Item.Mod -> ctx.emitter.renderItemMod(item, ctx.indent, ctx.scopeSignatures, isLocalItem = ctx.isLocalItem)
+            else -> null
+        }
+}
+
+private object MacroForeignAndVerbatimItemEmissionRule : RustItemEmissionRule() {
+    override fun tryEmit(item: Item, ctx: ItemEmissionContext): String? =
+        when (item) {
+            is Item.Macro -> ctx.emitter.renderItemMacro(item, ctx.indent, isLocalItem = ctx.isLocalItem)
+            is Item.ForeignMod -> ctx.emitter.renderItemForeignMod(item, ctx.indent, isLocalItem = ctx.isLocalItem)
+            is Item.Verbatim -> CoreIntrinsicLowering.renderRustcIntrinsicVerbatimItem(item, ctx.emitter, ctx.indent).orEmpty()
+            else -> null
+        }
+}
+
+internal open class RustItemEmitterRegistry(
+    protected val rules: List<RustItemEmissionRule> = DEFAULT_RULES,
+) {
+    open fun emitItem(item: Item, ctx: ItemEmissionContext): String {
+        for (rule in rules) {
+            rule.tryEmit(item, ctx)?.let { return it }
+        }
+        return ""
+    }
+
+    fun withPrependedRule(rule: RustItemEmissionRule): RustItemEmitterRegistry =
+        RustItemEmitterRegistry(listOf(rule) + rules)
+
+    companion object {
+        val DEFAULT_RULES: List<RustItemEmissionRule> =
+            listOf(
+                UseAndExternCrateSkipItemRule,
+                ConstItemEmissionRule,
+                StaticItemEmissionRule,
+                TypeAliasItemEmissionRule,
+                FnItemEmissionRule,
+                NominalTypeItemEmissionRule,
+                TraitAndTraitAliasItemEmissionRule,
+                ImplAndModItemEmissionRule,
+                MacroForeignAndVerbatimItemEmissionRule,
+            )
+
+        val Default: RustItemEmitterRegistry = RustItemEmitterRegistry()
     }
 }
 
@@ -1250,7 +1357,7 @@ private class BlanketImplAndOwnerMatcher(
             val wrapsTrait =
                 inspector.structFieldSynTypesByType[structName]
                     ?.values
-                    ?.any { emitter.renderType(it, null).substringBefore('<').trim() == blanketTraitKt } == true
+                    ?.any { emitter.renderType(it, null).headKotlinTypePath() == blanketTraitKt } == true
             if (wrapsTrait) return@filter false
             val candidateImpls = localTypeImpls[structName].orEmpty()
             val implementedTraits =

@@ -219,6 +219,153 @@ internal inline fun <R> KotlinJ2KEmitter.withGenericParamScope(
     }
 }
 
+/**
+ * Reusable OOP state snapshot and scope lifecycle guard for function/method AST rendering on [KotlinJ2KEmitter].
+ */
+internal class FunctionRenderScopeSnapshot private constructor(
+    private val emitter: KotlinJ2KEmitter,
+    private val updateEnclosingFunctionName: Boolean,
+    private val resetHasherState: Boolean,
+) {
+    private val prevClosureLabel = emitter.currentClosureLabel
+    private val prevEnclosingFn = emitter.currentEnclosingFunctionName
+    private val prevEnclosingRet = emitter.currentEnclosingReturnRenderedType
+    private val prevEnclosingSynRet = emitter.currentEnclosingReturnSynType
+    private val prevEnclosingFmtResult = emitter.currentEnclosingReturnsFmtResult
+    private val prevTailExpectsUnitResultOk = emitter.currentTailExpectsUnitResultOk
+    private val prevMutableListLocals = emitter.currentMutableListLocals
+    private val prevDequeLocals = emitter.currentDequeLocals
+    private val prevIterableLocals = emitter.currentIterableLocals
+    private val prevSourceParameterTypes = emitter.currentSourceParameterTypes
+    private val prevTypedLocals = emitter.currentTypedLocals
+    private val prevWitnessedBounds = emitter.currentWitnessedTraitBounds
+    private val prevTypeParamBounds = emitter.currentTypeParamTraitBounds
+    private val prevHasherState = emitter.currentHasherStateParam
+    private val prevNullableLocals = emitter.currentNullableLocals
+    private val prevSmartCastLocals = emitter.currentSmartCastNonNullLocals
+    private val prevTypeParams = emitter.activeTypeParamNames
+    private val prevConstParams = emitter.activeConstParamNames
+    private val prevTraitAssoc = emitter.currentTraitAssocParamNames
+    private val prevSubst = emitter.substitutedTypeParamTypes
+    private val prevIntoSubstTps = emitter.currentIntoSubstitutedTypeParams
+    private val prevIntoSubstParams = emitter.currentIntoSubstitutedParams
+    private val prevWitnesses = emitter.currentTypeParamWitnessCalls
+    private val prevSharedBorrowRecv = emitter.currentReceiverIsSharedBorrow
+    private val prevMutBorrowRecv = emitter.currentReceiverIsMutBorrow
+
+    private fun activate(
+        sig: Signature,
+        selfTypeName: String?,
+        ownerGenerics: Generics?,
+        implGenerics: Generics?,
+    ) {
+        emitter.currentClosureLabel = null
+        if (updateEnclosingFunctionName) {
+            emitter.currentEnclosingFunctionName = rustFunctionIdentToKotlin(sig.ident.toString())
+        }
+        emitter.currentEnclosingReturnRenderedType = null
+        emitter.currentEnclosingReturnSynType = null
+        val firstInput = sig.inputs.toList().firstOrNull()
+        val firstReceiverRef = (firstInput as? FnArg.Receiver)?.kind as? ReceiverKind.Reference
+        emitter.currentReceiverIsSharedBorrow = firstReceiverRef?.let { it.mutability == null } == true
+        emitter.currentReceiverIsMutBorrow = firstReceiverRef?.let { it.mutability != null } == true
+        emitter.currentMutableListLocals = emptySet()
+        emitter.currentDequeLocals = emptySet()
+        emitter.currentIterableLocals = emptySet()
+        emitter.currentSourceParameterTypes = emptyMap()
+        emitter.currentTypedLocals = emptyMap()
+        emitter.currentWitnessedTraitBounds = emptyMap()
+        emitter.currentTypeParamTraitBounds = emptyMap()
+        if (resetHasherState) emitter.currentHasherStateParam = null
+        emitter.currentNullableLocals = emptySet()
+        emitter.currentSmartCastNonNullLocals = emptySet()
+        emitter.currentIntoSubstitutedParams = emptySet()
+        val intoSubstTps = linkedSetOf<String>()
+        val mergedSubsts =
+            buildMap {
+                if (implGenerics != null) {
+                    putAll(
+                        emitter.extractFnTraitSubstitutions(
+                            implGenerics.params.toList(),
+                            implGenerics.whereClause,
+                            selfTypeName,
+                            intoSubstTps,
+                        ),
+                    )
+                }
+                val sigGenerics = sig.generics
+                putAll(
+                    emitter.extractFnTraitSubstitutions(
+                        sigGenerics.params.toList(),
+                        sigGenerics.whereClause,
+                        selfTypeName,
+                        intoSubstTps,
+                    ),
+                )
+            }
+        if (mergedSubsts.isNotEmpty()) {
+            emitter.substitutedTypeParamTypes = prevSubst + mergedSubsts
+        }
+        emitter.currentIntoSubstitutedTypeParams = prevIntoSubstTps + intoSubstTps
+        val combinedTypeParams =
+            prevTypeParams +
+                emitter.collectGenericTypeParamNames(ownerGenerics) +
+                emitter.collectGenericTypeParamNames(implGenerics) +
+                emitter.collectGenericTypeParamNames(sig.generics)
+        emitter.activeTypeParamNames = combinedTypeParams - emitter.substitutedTypeParamTypes.keys
+        emitter.activeConstParamNames =
+            prevConstParams +
+            emitter.collectGenericConstParamNames(ownerGenerics) +
+            emitter.collectGenericConstParamNames(implGenerics) +
+            emitter.collectGenericConstParamNames(sig.generics)
+        emitter.scopeBuilder.enterDef()
+    }
+
+    fun restore() {
+        emitter.scopeBuilder.exitDef()
+        emitter.currentClosureLabel = prevClosureLabel
+        if (updateEnclosingFunctionName) emitter.currentEnclosingFunctionName = prevEnclosingFn
+        emitter.currentEnclosingReturnRenderedType = prevEnclosingRet
+        emitter.currentEnclosingReturnSynType = prevEnclosingSynRet
+        emitter.currentEnclosingReturnsFmtResult = prevEnclosingFmtResult
+        emitter.currentTailExpectsUnitResultOk = prevTailExpectsUnitResultOk
+        emitter.currentMutableListLocals = prevMutableListLocals
+        emitter.currentDequeLocals = prevDequeLocals
+        emitter.currentIterableLocals = prevIterableLocals
+        emitter.currentSourceParameterTypes = prevSourceParameterTypes
+        emitter.currentTypedLocals = prevTypedLocals
+        emitter.currentWitnessedTraitBounds = prevWitnessedBounds
+        emitter.currentTypeParamTraitBounds = prevTypeParamBounds
+        if (resetHasherState) emitter.currentHasherStateParam = prevHasherState
+        emitter.currentNullableLocals = prevNullableLocals
+        emitter.currentSmartCastNonNullLocals = prevSmartCastLocals
+        emitter.activeConstParamNames = prevConstParams
+        emitter.activeTypeParamNames = prevTypeParams
+        emitter.currentTraitAssocParamNames = prevTraitAssoc
+        emitter.substitutedTypeParamTypes = prevSubst
+        emitter.currentIntoSubstitutedTypeParams = prevIntoSubstTps
+        emitter.currentIntoSubstitutedParams = prevIntoSubstParams
+        emitter.currentTypeParamWitnessCalls = prevWitnesses
+        emitter.currentReceiverIsSharedBorrow = prevSharedBorrowRecv
+        emitter.currentReceiverIsMutBorrow = prevMutBorrowRecv
+    }
+
+    companion object {
+        fun enter(
+            emitter: KotlinJ2KEmitter,
+            sig: Signature,
+            selfTypeName: String?,
+            ownerGenerics: Generics?,
+            implGenerics: Generics?,
+            updateEnclosingFunctionName: Boolean,
+            resetHasherState: Boolean,
+        ): FunctionRenderScopeSnapshot =
+            FunctionRenderScopeSnapshot(emitter, updateEnclosingFunctionName, resetHasherState).also {
+                it.activate(sig, selfTypeName, ownerGenerics, implGenerics)
+            }
+    }
+}
+
 internal inline fun <R> KotlinJ2KEmitter.withFunctionRenderScope(
     sig: Signature,
     selfTypeName: String?,
@@ -228,106 +375,20 @@ internal inline fun <R> KotlinJ2KEmitter.withFunctionRenderScope(
     resetHasherState: Boolean = false,
     block: () -> R,
 ): R {
-    val prevClosureLabel = currentClosureLabel
-    val prevEnclosingFn = currentEnclosingFunctionName
-    val prevEnclosingRet = currentEnclosingReturnRenderedType
-    val prevEnclosingSynRet = currentEnclosingReturnSynType
-    val prevEnclosingFmtResult = currentEnclosingReturnsFmtResult
-    val prevTailExpectsUnitResultOk = currentTailExpectsUnitResultOk
-    val prevMutableListLocals = currentMutableListLocals
-    val prevDequeLocals = currentDequeLocals
-    val prevIterableLocals = currentIterableLocals
-    val prevSourceParameterTypes = currentSourceParameterTypes
-    val prevTypedLocals = currentTypedLocals
-    val prevWitnessedBounds = currentWitnessedTraitBounds
-    val prevTypeParamBounds = currentTypeParamTraitBounds
-    val prevHasherState = currentHasherStateParam
-    val prevNullableLocals = currentNullableLocals
-    val prevSmartCastLocals = currentSmartCastNonNullLocals
-    val prevTypeParams = activeTypeParamNames
-    val prevConstParams = activeConstParamNames
-    val prevTraitAssoc = currentTraitAssocParamNames
-    val prevSubst = substitutedTypeParamTypes
-    val prevIntoSubstTps = currentIntoSubstitutedTypeParams
-    val prevIntoSubstParams = currentIntoSubstitutedParams
-    val prevWitnesses = currentTypeParamWitnessCalls
-    val prevSharedBorrowRecv = currentReceiverIsSharedBorrow
-    val prevMutBorrowRecv = currentReceiverIsMutBorrow
-    currentClosureLabel = null
-    if (updateEnclosingFunctionName) {
-        currentEnclosingFunctionName = rustFunctionIdentToKotlin(sig.ident.toString())
-    }
-    currentEnclosingReturnRenderedType = null
-    currentEnclosingReturnSynType = null
-    val firstInput = sig.inputs.toList().firstOrNull()
-    val firstReceiverRef = (firstInput as? FnArg.Receiver)?.kind as? ReceiverKind.Reference
-    currentReceiverIsSharedBorrow = firstReceiverRef?.let { it.mutability == null } == true
-    currentReceiverIsMutBorrow = firstReceiverRef?.let { it.mutability != null } == true
-    currentMutableListLocals = emptySet()
-    currentDequeLocals = emptySet()
-    currentIterableLocals = emptySet()
-    currentSourceParameterTypes = emptyMap()
-    currentTypedLocals = emptyMap()
-    currentWitnessedTraitBounds = emptyMap()
-    currentTypeParamTraitBounds = emptyMap()
-    if (resetHasherState) currentHasherStateParam = null
-    currentNullableLocals = emptySet()
-    currentSmartCastNonNullLocals = emptySet()
-    currentIntoSubstitutedParams = emptySet()
-    val intoSubstTps = linkedSetOf<String>()
-    val mergedSubsts =
-        buildMap {
-            if (implGenerics != null) {
-                putAll(extractFnTraitSubstitutions(implGenerics.params.toList(), implGenerics.whereClause, selfTypeName, intoSubstTps))
-            }
-            val sigGenerics = sig.generics
-            putAll(extractFnTraitSubstitutions(sigGenerics.params.toList(), sigGenerics.whereClause, selfTypeName, intoSubstTps))
-        }
-    if (mergedSubsts.isNotEmpty()) {
-        substitutedTypeParamTypes = prevSubst + mergedSubsts
-    }
-    currentIntoSubstitutedTypeParams = prevIntoSubstTps + intoSubstTps
-    val combinedTypeParams =
-        prevTypeParams +
-            collectGenericTypeParamNames(ownerGenerics) +
-            collectGenericTypeParamNames(implGenerics) +
-            collectGenericTypeParamNames(sig.generics)
-    activeTypeParamNames = combinedTypeParams - substitutedTypeParamTypes.keys
-    activeConstParamNames =
-        prevConstParams +
-        collectGenericConstParamNames(ownerGenerics) +
-        collectGenericConstParamNames(implGenerics) +
-        collectGenericConstParamNames(sig.generics)
-    scopeBuilder.enterDef()
+    val snapshot =
+        FunctionRenderScopeSnapshot.enter(
+            emitter = this,
+            sig = sig,
+            selfTypeName = selfTypeName,
+            ownerGenerics = ownerGenerics,
+            implGenerics = implGenerics,
+            updateEnclosingFunctionName = updateEnclosingFunctionName,
+            resetHasherState = resetHasherState,
+        )
     return try {
         block()
     } finally {
-        scopeBuilder.exitDef()
-        currentClosureLabel = prevClosureLabel
-        if (updateEnclosingFunctionName) currentEnclosingFunctionName = prevEnclosingFn
-        currentEnclosingReturnRenderedType = prevEnclosingRet
-        currentEnclosingReturnSynType = prevEnclosingSynRet
-        currentEnclosingReturnsFmtResult = prevEnclosingFmtResult
-        currentTailExpectsUnitResultOk = prevTailExpectsUnitResultOk
-        currentMutableListLocals = prevMutableListLocals
-        currentDequeLocals = prevDequeLocals
-        currentIterableLocals = prevIterableLocals
-        currentSourceParameterTypes = prevSourceParameterTypes
-        currentTypedLocals = prevTypedLocals
-        currentWitnessedTraitBounds = prevWitnessedBounds
-        currentTypeParamTraitBounds = prevTypeParamBounds
-        if (resetHasherState) currentHasherStateParam = prevHasherState
-        currentNullableLocals = prevNullableLocals
-        currentSmartCastNonNullLocals = prevSmartCastLocals
-        activeConstParamNames = prevConstParams
-        activeTypeParamNames = prevTypeParams
-        currentTraitAssocParamNames = prevTraitAssoc
-        substitutedTypeParamTypes = prevSubst
-        currentIntoSubstitutedTypeParams = prevIntoSubstTps
-        currentIntoSubstitutedParams = prevIntoSubstParams
-        currentTypeParamWitnessCalls = prevWitnesses
-        currentReceiverIsSharedBorrow = prevSharedBorrowRecv
-        currentReceiverIsMutBorrow = prevMutBorrowRecv
+        snapshot.restore()
     }
 }
 
@@ -343,7 +404,7 @@ private fun KotlinJ2KEmitter.renderConstOrStaticItem(
     scopeSignatures: MutableMap<String, Int>,
     isLocalItem: Boolean,
 ): String {
-    val (sb, visStr) = beginItemHeaderAndVisibility(leadingTrivia, attrs, vis, indent, isLocalItem)
+    val (headerSb, visStr) = beginItemHeaderAndVisibility(leadingTrivia, attrs, vis, indent, isLocalItem)
     val cleanRaw = rawIdent.removePrefix("r#")
     val baseName =
         if (!isLocalItem) {
@@ -362,13 +423,16 @@ private fun KotlinJ2KEmitter.renderConstOrStaticItem(
         } finally {
             currentExpectedParseTargetType = prevParseTarget
         }
-    sb.append("$indent$visStr$declKeyword$name: $renderedTy")
-    if (headerContext.isBatchCrateOutput && initExpr.contains('\n')) {
-        sb.append(" =\n$indent    ").append(initExpr.replace("\n", "\n    "))
-    } else {
-        sb.append(" = ").append(initExpr)
-    }
-    return sb.toString()
+    return KotlinDeclarationEmitter(baseIndent = indent)
+        .emitPropertyOrConst(
+            leadingHeader = headerSb.toString(),
+            visibilityPrefix = visStr,
+            declKeyword = declKeyword,
+            name = name,
+            typeText = renderedTy,
+            initializerExpr = initExpr,
+            multilineBatchIndent = headerContext.isBatchCrateOutput,
+        ).render()
 }
 
 internal fun KotlinJ2KEmitter.renderItemConst(
@@ -522,8 +586,14 @@ internal fun KotlinJ2KEmitter.renderItemType(
         inspector.declaredTypeNames.remove(name)
         return ""
     }
-    sb.append("${indent}${vis}typealias $name$typeParams = $rhs")
-    return sb.toString()
+    return KotlinDeclarationEmitter(baseIndent = indent)
+        .emitTypeAliasDeclaration(
+            leadingHeader = sb.toString(),
+            visibilityPrefix = vis,
+            name = name,
+            typeParamsSuffix = typeParams,
+            rhsType = rhs,
+        ).render()
 }
 
 internal fun KotlinJ2KEmitter.renderItemFn(
@@ -770,8 +840,8 @@ internal fun KotlinJ2KEmitter.renderStructFieldDefaultOrNull(
             return null
         }
     }
-    val rawBase = cleanType.substringBefore('<').trim().substringAfterLast('.')
-    val selfBase = selfTypeName?.substringBefore('<')?.trim()?.substringAfterLast('.')
+    val rawBase = cleanType.simpleKotlinTypeName()
+    val selfBase = selfTypeName?.simpleKotlinTypeName()
     if (rawBase.isEmpty() || rawBase == "Self" || rawBase == selfBase) return null
     if (rawBase in inspector.declaredTraitsByName ||
         rawBase in setOf("Iterator", "Iterable", "Sequence", "CharSequence", "Comparable", "AutoCloseable")
@@ -1279,7 +1349,7 @@ private class StructDeclarationEmitter(
                 null
             }
         val iterableElem = iterElemTy ?: intoIterElemTy ?: return
-        if (superTraits.any { it.substringBefore('<').trim() == "Iterable" }) return
+        if (superTraits.any { it.headKotlinTypePath() == "Iterable" }) return
         superTraits += "Iterable<$iterableElem>"
         val mIndent = "$indent    "
         val kotlinIteratorTy = emitter.stdlibIteratorTypeName()

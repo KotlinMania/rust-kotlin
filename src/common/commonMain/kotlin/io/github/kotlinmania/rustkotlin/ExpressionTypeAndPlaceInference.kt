@@ -194,7 +194,7 @@ internal fun KotlinJ2KEmitter.extractOwnerAndFieldName(expr: Expr, selfTypeName:
         if (baseCore is Expr.Path && baseCore.qself == null && baseCore.path.segments.len() == 1) {
             val baseRaw = baseCore.path.firstCleanIdent()
             if (baseRaw == "self") {
-                selfTypeName?.substringBefore('<')?.trim()
+                selfTypeName?.headKotlinTypePath()
             } else {
                 val resolvedLocal = baseRaw?.let { scopeBuilder.resolveLocalKotlinName(it) ?: rustValueIdentToKotlin(it) }
                 normalizeDeclaredOwnerType(resolvedLocal?.let { currentTypedLocals[it] })
@@ -475,7 +475,7 @@ private class ExprTypeInferenceEngine(
             is Expr.Struct ->
                 when (val lastSeg = expr.path.lastIdentText()) {
                     null -> null
-                    "Self" -> selfTypeName?.substringBefore('<')?.trim()
+                    "Self" -> selfTypeName?.headKotlinTypePath()
                     else -> rustTypeIdentToKotlin(lastSeg)
                 }
             is Expr.Path -> inferPathType(expr)
@@ -615,12 +615,8 @@ private class ExprTypeInferenceEngine(
             is Member.Unnamed -> {
                 val idx = member.index.index.toInt()
                 if (ownerKt == "Pair" || ownerKt == "Triple") {
-                    val ltIdx = baseTy.indexOf('<')
-                    val gtIdx = baseTy.lastIndexOf('>')
-                    if (ltIdx >= 0 && gtIdx > ltIdx) {
-                        val typeArgs = PhantomRawPointerTypeStripper.splitTopLevelCommaList(baseTy.substring(ltIdx + 1, gtIdx)).map { it.trim() }
-                        typeArgs.getOrNull(idx)?.let { return it }
-                    }
+                    val tupleArgs = baseTy.asKotlinRenderedType()?.typeArgs
+                    tupleArgs?.getOrNull(idx)?.let { return it }
                 }
                 val arity = inspector.tupleStructArityByType[ownerKt]
                 val primaryField = if (arity != null) tupleFieldPropertyName(idx, arity) else emitter.tupleAccessMemberName(expr.base, idx, selfTypeName)
@@ -754,7 +750,7 @@ private class ExprTypeInferenceEngine(
             segs.size == 1 -> {
                 val raw = segs[0].cleanIdent()
                 when {
-                    raw == "Self" -> selfTypeName?.substringBefore('<')?.trim()
+                    raw == "Self" -> selfTypeName?.headKotlinTypePath()
                     raw.isNotEmpty() && raw.first().isUpperCase() && raw !in inspector.declaredTopLevelFnRawNames -> {
                         val ktType = rustTypeIdentToKotlin(raw)
                         val knownCrateType =
@@ -817,7 +813,7 @@ private class ExprTypeInferenceEngine(
         val methodKt = rustFunctionIdentToKotlin(lastRaw)
         val ownerKt =
             when {
-                penultRaw == "Self" -> selfTypeName?.substringBefore('<')?.trim()
+                penultRaw == "Self" -> selfTypeName?.headKotlinTypePath()
                 penultRaw.isNotEmpty() && penultRaw.first().isUpperCase() -> rustTypeIdentToKotlin(penultRaw)
                 else -> null
             }
@@ -857,7 +853,7 @@ private class ExprTypeInferenceEngine(
                 return registerCorePtrType(isMut = rawMethod == "as_mut_ptr", pointee = emitter.renderType(arrayLocal.second, selfTypeName))
             }
             val recvRendered = lazyRecvType
-            val recvBase = recvRendered?.removeSuffix("?")?.substringBefore('<')?.trim()
+            val recvBase = recvRendered?.headKotlinTypePath()
             if (recvBase != null && (recvBase in MUT_PTR_CONTAINER_BASES || MUT_PTR_CONTAINER_BASES.any { recvBase.endsWith(".$it") })) {
                 return registerCorePtrType(isMut = true)
             }
@@ -1404,7 +1400,7 @@ internal fun KotlinJ2KEmitter.mutableReferenceProjection(
             var takesOwnerAddress = false
             while (cast is Expr.Cast) {
                 val pointer = cast.ty as? SynType.Ptr ?: return null
-                if (renderType(pointer.elem, owner).substringBefore('<') == owner) takesOwnerAddress = true
+                if (renderType(pointer.elem, owner).headKotlinTypePath() == owner) takesOwnerAddress = true
                 cast = unwrapParenOrGroupExpr(cast.expr)
             }
             if (!takesOwnerAddress || cast !is Expr.Path || cast.qself != null || !cast.path.isIdent("self")) return null
@@ -1454,16 +1450,13 @@ internal fun KotlinJ2KEmitter.resolveMaybeUninitElementRenderedType(
             }
         }
     }
-    if ('<' in renderedCallee && renderedCallee.endsWith(">")) {
-        val tf = renderedCallee.substringAfter('<').removeSuffix(">").trim()
-        if (tf.isNotEmpty() && ',' !in tf) {
-            return unwrapMaybeUninitRenderedInner(tf) ?: tf
-        }
+    KotlinCalleeShape.parse(renderedCallee).typeArgs.singleOrNull()?.let { tf ->
+        return unwrapMaybeUninitRenderedInner(tf) ?: tf
     }
     currentExpectedParseTargetType?.trim()?.takeIf { it.isNotEmpty() && it != "Unit" }?.let { expected ->
         return unwrapMaybeUninitRenderedInner(expected) ?: expected
     }
-    val ownerBase = selfTypeName?.substringBefore('<')?.trim()
+    val ownerBase = selfTypeName?.headKotlinTypePath()
     if (!ownerBase.isNullOrEmpty()) {
         val singleFieldSyn = inspector.structFieldSynTypesByType[ownerBase]?.values?.singleOrNull()
         if (singleFieldSyn != null) {
@@ -1472,7 +1465,7 @@ internal fun KotlinJ2KEmitter.resolveMaybeUninitElementRenderedType(
     }
     currentEnclosingReturnRenderedType?.trim()?.takeIf { it.isNotEmpty() && it != "Unit" }?.let { ret ->
         unwrapMaybeUninitRenderedInner(ret)?.let { return it }
-        if (ownerBase.isNullOrEmpty() || ret.substringBefore('<').trim() != ownerBase) return ret
+        if (ownerBase.isNullOrEmpty() || ret.headKotlinTypePath() != ownerBase) return ret
     }
     return "UByte"
 }
@@ -1680,7 +1673,7 @@ internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
     val penultRaw = segs[segs.size - 2].cleanIdent()
     val ownerKt =
         when {
-            penultRaw == "Self" -> selfTypeName?.substringBefore('<')?.trim()
+            penultRaw == "Self" -> selfTypeName?.headKotlinTypePath()
             penultRaw.isNotEmpty() && penultRaw.first().isUpperCase() -> rustTypeIdentToKotlin(penultRaw)
             else -> null
         } ?: return null

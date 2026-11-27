@@ -157,7 +157,7 @@ internal fun renderKDocFromAttributes(
 
 private fun renderDocExampleAnnotationsFromAttributes(attrs: List<Attribute>, indent: String): String {
     if (attrs.isEmpty()) return ""
-    val sb = StringBuilder()
+    val emitter = KotlinTokenEmitter(baseIndent = indent)
     for (attr in attrs) {
         val attrSegs = attr.path().segments.toList()
         val lastIdent = attrSegs.lastOrNull()?.ident?.toString()
@@ -165,48 +165,32 @@ private fun renderDocExampleAnnotationsFromAttributes(attrs: List<Attribute>, in
         if (rawLast in COMPILER_ONLY_DOC_EXAMPLE_ATTRS) continue
         val ktAttrName = if (rawLast.startsWith("proc_macro")) rustTypeIdentToKotlin(rawLast) else rustValueIdentToKotlin(rawLast)
         when (val meta = attr.meta) {
-            is Meta.PathMeta -> sb.append("$indent@$ktAttrName\n")
+            is Meta.PathMeta -> emitter.annotation(name = ktAttrName).newline()
             is Meta.List -> {
                 val renderedArgs = renderCommentTokenStream(meta.tokens.clone())
-                sb.append("$indent@$ktAttrName($renderedArgs)\n")
+                val argTokens = if (renderedArgs.isEmpty()) emptyList() else listOf(KotlinEmitToken.RawFragment(renderedArgs))
+                emitter.annotation(name = ktAttrName, args = argTokens).newline()
             }
             is Meta.NameValue -> {
                 val valueTokens = TokenStream.new()
                 meta.value.toTokens(valueTokens)
                 val renderedValue = renderCommentTokenStream(valueTokens)
-                sb.append("$indent@$ktAttrName($renderedValue)\n")
+                val argTokens = if (renderedValue.isEmpty()) emptyList() else listOf(KotlinEmitToken.RawFragment(renderedValue))
+                emitter.annotation(name = ktAttrName, args = argTokens).newline()
             }
         }
     }
-    return sb.toString()
+    return emitter.render()
 }
 
-internal fun renderKDocLines(lines: List<String>, indent: String): String {
-    if (lines.isEmpty()) return ""
-    val sb = StringBuilder()
-    sb.append(indent).append("/**\n")
-    for (line in lines) {
-        val safeLine = line.replace("*/", "* /")
-        if (safeLine.isBlank()) {
-            sb.append("$indent *\n")
-        } else {
-            sb.append("$indent * $safeLine\n")
-        }
-    }
-    sb.append("$indent */\n")
-    return sb.toString()
-}
+internal fun renderKDocLines(lines: List<String>, indent: String): String =
+    if (lines.isEmpty()) "" else KotlinTokenEmitter(baseIndent = indent).kdoc(lines).render()
 
 internal fun renderInlineComments(pieces: List<TriviaPiece>, indent: String): String {
     if (pieces.isEmpty()) return ""
-    val sb = StringBuilder()
+    val emitter = KotlinTokenEmitter(baseIndent = indent)
     fun appendCommentLine(rawBody: String) {
-        val sanitized = sanitizeCommentTextForKotlin(rawBody)
-        if (sanitized.isNotEmpty()) {
-            sb.append("$indent// $sanitized\n")
-        } else {
-            sb.append("$indent//\n")
-        }
+        emitter.lineComment(sanitizeCommentTextForKotlin(rawBody))
     }
     for (piece in pieces) {
         when (piece.style) {
@@ -223,7 +207,7 @@ internal fun renderInlineComments(pieces: List<TriviaPiece>, indent: String): St
             }
         }
     }
-    return sb.toString()
+    return emitter.render()
 }
 
 private data class UnhiddenRustdocSource(
@@ -684,7 +668,7 @@ private fun cleanEmittedKotlinDoctestLines(lines: List<String>): List<String> =
     lines.map { line ->
         val quoteCleaned = ParseQuoteStringArgRewriter(line).rewriteIfCandidate()
         val safeDelims = quoteCleaned.replace("*/", "* /").replace("/*", "/ *")
-        CommentLexicalScanner(safeDelims).sanitizeProseVocabulary(convertCamelIdentifiersOnly = true)
+        ProseVocabularySanitizer(safeDelims, convertCamelIdentifiersOnly = true).sanitize()
     }
 
 private fun isRustdocReferenceLinkDefinition(trimmed: String): Boolean {
@@ -701,12 +685,8 @@ private fun isRustdocReferenceLinkDefinition(trimmed: String): Boolean {
     return cursor.size == 1 || cursor.isDoubleColonAt(1) || cursor.punctCharAt(1) == '!'
 }
 
-private fun sanitizeVerbatimFenceLine(line: String): String {
-    if (line.isEmpty()) return ""
-    val escaped = line.replace("*/", "* /").replace("/*", "/ *")
-    val attrsRewritten = CommentLexicalScanner(escaped).rewriteInlineRustAttributes()
-    return CommentLexicalScanner(attrsRewritten).sanitizeProseVocabulary(convertCamelIdentifiersOnly = true)
-}
+private fun sanitizeVerbatimFenceLine(line: String): String =
+    CodeFenceCommentEmitter.Default.emitLine(line)
 
 internal fun sanitizeCommentTextForKotlin(line: String, inRustCodeFence: Boolean = false): String {
     if (line.isEmpty()) return ""
@@ -714,10 +694,10 @@ internal fun sanitizeCommentTextForKotlin(line: String, inRustCodeFence: Boolean
         val stream = lexRustTokenStreamOrNull(line)
         if (stream != null) {
             val rendered = renderCommentTokenStream(stream).replace("*/", "* /").replace("/*", "/ *")
-            return CommentLexicalScanner(rendered).sanitizeProseVocabulary(convertCamelIdentifiersOnly = true).trimEnd()
+            return ProseVocabularySanitizer(rendered, convertCamelIdentifiersOnly = true).sanitize().trimEnd()
         }
     }
-    return CommentLexicalScanner(line).sanitizeMarkdownCommentLine()
+    return MarkdownCommentEmitter.Default.emitLine(line)
 }
 
 private fun renderIntraDocLinkTarget(rawCode: String): String {
@@ -726,7 +706,7 @@ private fun renderIntraDocLinkTarget(rawCode: String): String {
     val stream = lexRustTokenStreamOrNull(trimmed)
     val parts = stream?.let { CommentRustTokenEmitter(it.toList()).renderIntraDocLinkParts() }.orEmpty()
     return if (parts.isEmpty()) {
-        CommentLexicalScanner(trimmed).sanitizeProseVocabulary(convertCamelIdentifiersOnly = false)
+        ProseVocabularySanitizer(trimmed, convertCamelIdentifiersOnly = false).sanitize()
     } else {
         parts.joinToString(".")
     }
@@ -737,7 +717,7 @@ private fun translateInlineCodeSpan(spanContent: String): String {
     if (trimmed.isEmpty()) return ""
     if (trimmed.all { it.isLetterOrDigit() || it == '_' }) {
         val mappedSingle = if (trimmed[0].isDigit()) trimmed else mapRustIdentInCommentCode(trimmed)
-        return CommentLexicalScanner(mappedSingle).sanitizeProseVocabulary(convertCamelIdentifiersOnly = false)
+        return ProseVocabularySanitizer(mappedSingle, convertCamelIdentifiersOnly = false).sanitize()
     }
     val trees = lexRustTokenTrees(trimmed)
     val bareModuleParts =
@@ -754,96 +734,127 @@ private fun translateInlineCodeSpan(spanContent: String): String {
         }
     if (bareModuleParts != null) {
         val trimmedParts = if (bareModuleParts[0] in setOf("crate", "self", "super")) bareModuleParts.drop(1) else bareModuleParts
-        return CommentLexicalScanner(trimmedParts.joinToString(".")).sanitizeProseVocabulary(convertCamelIdentifiersOnly = false)
+        return ProseVocabularySanitizer(trimmedParts.joinToString("."), convertCamelIdentifiersOnly = false).sanitize()
     }
     val rendered = if (trees.isNotEmpty()) CommentRustTokenEmitter(trees).render() else trimmed
-    return CommentLexicalScanner(rendered).sanitizeProseVocabulary(convertCamelIdentifiersOnly = false)
+    return ProseVocabularySanitizer(rendered, convertCamelIdentifiersOnly = false).sanitize()
 }
 
 /**
- * Lexical scanner for comment/KDoc prose, inline Rust `#[...]` attributes, `parseQuote("...")`
- * string arguments, intra-doc links, and lifetime/macro vocabulary sanitization,
- * reusing string/escape/identifier primitives from [RustLexicalSourceScanner].
+ * Typed token hierarchy for Rustdoc/comment markdown lines, inline code spans,
+ * intra-doc links, inline block comments, and Rust `#[...]` attributes.
  */
-private class CommentLexicalScanner(
+internal sealed class CommentSegmentToken {
+    data class BacktickLink(
+        val targetCode: String,
+        val isExternalLink: Boolean,
+    ) : CommentSegmentToken()
+
+    data class PlainIntraDocLink(
+        val targetCode: String,
+    ) : CommentSegmentToken()
+
+    data class InlineCode(
+        val code: String,
+    ) : CommentSegmentToken()
+
+    data class InlineBlockComment(
+        val inner: String,
+    ) : CommentSegmentToken()
+
+    data class InlineRustAttr(
+        val rawAttr: String,
+    ) : CommentSegmentToken()
+
+    data class Prose(
+        val text: String,
+    ) : CommentSegmentToken()
+}
+
+/**
+ * Single-pass lexical tokenizer turning a comment line into [CommentSegmentToken]s.
+ */
+internal open class CommentSegmentTokenizer(
     source: String,
 ) : RustLexicalSourceScanner(source) {
-    fun sanitizeMarkdownCommentLine(): String {
-        val safeDelims = convertInlineBlockComments().replace("*/", "* /").replace("/*", "/ *")
-        return CommentLexicalScanner(safeDelims).rewriteMarkdownSpansAndProse().trimEnd()
-    }
-
-    private fun convertInlineBlockComments(): String {
-        if (!source.contains("/*")) return source
-        val sb = StringBuilder(len)
+    open fun tokenize(parseMarkdownSpans: Boolean = true): List<CommentSegmentToken> {
+        if (source.isEmpty()) return emptyList()
+        val out = ArrayList<CommentSegmentToken>()
+        val proseBuf = StringBuilder()
         var i = 0
+
+        fun flushProse() {
+            if (proseBuf.isNotEmpty()) {
+                out += CommentSegmentToken.Prose(proseBuf.toString())
+                proseBuf.setLength(0)
+            }
+        }
+
         while (i < len) {
-            if (source[i] == '/' && i + 1 < len && source[i + 1] == '*') {
+            if (parseMarkdownSpans && source[i] == '/' && i + 1 < len && source[i + 1] == '*') {
                 val closeIdx = source.indexOf("*/", startIndex = i + 2)
                 if (closeIdx >= 0) {
-                    val inner = source.substring(i + 2, closeIdx).trim()
-                    if (inner.isEmpty()) sb.append("//") else sb.append("// ").append(inner)
+                    flushProse()
+                    out += CommentSegmentToken.InlineBlockComment(source.substring(i + 2, closeIdx).trim())
                     i = closeIdx + 2
                     continue
                 }
             }
-            sb.append(source[i])
-            i++
-        }
-        return sb.toString()
-    }
-
-    private fun rewriteMarkdownSpansAndProse(): String {
-        val out = StringBuilder(len)
-        var i = 0
-        while (i < len) {
-            if (source[i] == '[' && i + 1 < len && source[i + 1] == '`') {
+            if (parseMarkdownSpans && source[i] == '[' && i + 1 < len && source[i + 1] == '`') {
                 val closeCodeTick = source.indexOf('`', startIndex = i + 2)
                 if (closeCodeTick > i + 2 && closeCodeTick + 1 < len && source[closeCodeTick + 1] == ']') {
+                    flushProse()
                     val afterLink = closeCodeTick + 2
                     val isExternal = afterLink < len && (source[afterLink] == '(' || source[afterLink] == '[')
-                    val renderedTarget = renderIntraDocLinkTarget(source.substring(i + 2, closeCodeTick))
-                    if (isExternal) {
-                        out.append("[`").append(renderedTarget).append("`]")
-                    } else {
-                        out.append('[').append(renderedTarget).append(']')
-                    }
+                    out += CommentSegmentToken.BacktickLink(source.substring(i + 2, closeCodeTick), isExternal)
                     i = afterLink
                     continue
                 }
-                out.append('[')
-                i++
-                continue
             }
-            if (source[i] == '[' && isPlainIntraDocBracketLinkAt(i)) {
+            if (parseMarkdownSpans && source[i] == '[' && isPlainIntraDocBracketLinkAt(i)) {
                 val closeBracket = source.indexOf(']', startIndex = i + 1)
-                out.append('[').append(renderIntraDocLinkTarget(source.substring(i + 1, closeBracket))).append(']')
+                flushProse()
+                out += CommentSegmentToken.PlainIntraDocLink(source.substring(i + 1, closeBracket))
                 i = closeBracket + 1
                 continue
             }
-            if (source[i] == '`') {
+            if (parseMarkdownSpans && source[i] == '`') {
                 val closeTick = source.indexOf('`', startIndex = i + 1)
                 if (closeTick > i) {
-                    val renderedCode = translateInlineCodeSpan(source.substring(i + 1, closeTick))
-                    if (renderedCode.isNotEmpty()) {
-                        out.append('`').append(renderedCode).append('`')
-                    }
+                    flushProse()
+                    out += CommentSegmentToken.InlineCode(source.substring(i + 1, closeTick))
                     i = closeTick + 1
                     continue
                 }
-                out.append('`')
-                i++
-                continue
             }
-            val nextSpecial = findNextBacktickOrIntraDocLink(i + 1)
-            val attrsRewritten = CommentLexicalScanner(source.substring(i, nextSpecial)).rewriteInlineRustAttributes()
-            out.append(CommentLexicalScanner(attrsRewritten).sanitizeProseVocabulary(convertCamelIdentifiersOnly = false))
-            i = nextSpecial
+            if (source[i] == '#') {
+                val attrEnd = tryScanInlineRustAttributeEnd(i)
+                if (attrEnd > i) {
+                    flushProse()
+                    out += CommentSegmentToken.InlineRustAttr(source.substring(i, attrEnd))
+                    i = attrEnd
+                    continue
+                }
+            }
+            proseBuf.append(source[i])
+            i++
         }
-        return out.toString()
+        flushProse()
+        return out
     }
 
-    private fun isPlainIntraDocBracketLinkAt(idx: Int): Boolean {
+    protected fun tryScanInlineRustAttributeEnd(hashIdx: Int): Int {
+        var j = hashIdx + 1
+        if (j < len && source[j] == '!') j++
+        while (j < len && source[j].isWhitespace()) j++
+        if (j < len && source[j] == '[') {
+            val closeIdx = findBalancedDelimiterEnd(j, '[', ']')
+            if (closeIdx > j) return closeIdx + 1
+        }
+        return -1
+    }
+
+    protected fun isPlainIntraDocBracketLinkAt(idx: Int): Boolean {
         if (idx >= len || source[idx] != '[') return false
         if (idx + 1 < len && (source[idx + 1] == '`' || source[idx + 1] == '[')) return false
         val closeBracket = source.indexOf(']', startIndex = idx + 1)
@@ -856,51 +867,102 @@ private class CommentLexicalScanner(
                 ?: return false
         return parsed.first.size >= 2 || parsed.second
     }
+}
 
-    private fun findNextBacktickOrIntraDocLink(start: Int): Int {
-        var i = start
-        while (i < len) {
-            if (source[i] == '`') return i
-            if (source[i] == '[' && i + 1 < len && source[i + 1] == '`') return i
-            if (source[i] == '[' && isPlainIntraDocBracketLinkAt(i)) return i
-            i++
-        }
-        return len
+/**
+ * Extensible token-driven comment emitter over [CommentSegmentToken] streams.
+ */
+internal abstract class CommentSegmentEmitter(
+    protected val convertCamelIdentifiersOnly: Boolean,
+    protected val parseMarkdownSpans: Boolean,
+) {
+    open fun emitLine(line: String): String {
+        if (line.isEmpty()) return ""
+        val tokens = CommentSegmentTokenizer(line).tokenize(parseMarkdownSpans = parseMarkdownSpans)
+        val emitted = emitTokens(tokens)
+        return if (parseMarkdownSpans) emitted.trimEnd() else emitted
     }
 
-    fun rewriteInlineRustAttributes(): String {
-        if (!source.contains('#')) return source
-        val sb = StringBuilder(len)
-        var i = 0
-        while (i < len) {
-            if (source[i] == '#') {
-                var j = i + 1
-                if (j < len && source[j] == '!') j++
-                while (j < len && source[j].isWhitespace()) j++
-                if (j < len && source[j] == '[') {
-                    val closeIdx = findBalancedDelimiterEnd(j, '[', ']')
-                    if (closeIdx > j) {
-                        val attrStream = lexRustTokenStreamOrNull(source.substring(i, closeIdx + 1))
-                        val renderedAttr = attrStream?.let(::renderCommentTokenStream).orEmpty()
-                        if (renderedAttr.isNotEmpty()) sb.append(renderedAttr)
-                        i = closeIdx + 1
-                        continue
-                    }
+    open fun emitTokens(tokens: List<CommentSegmentToken>): String {
+        if (tokens.isEmpty()) return ""
+        val out = StringBuilder()
+        for (token in tokens) {
+            emitSegment(token, out)
+        }
+        return out.toString()
+    }
+
+    protected open fun emitSegment(token: CommentSegmentToken, out: StringBuilder) {
+        when (token) {
+            is CommentSegmentToken.InlineBlockComment -> {
+                if (token.inner.isEmpty()) {
+                    out.append("//")
+                } else {
+                    out.append("// ").append(emitLine(token.inner))
                 }
             }
-            sb.append(source[i])
-            i++
+            is CommentSegmentToken.BacktickLink -> {
+                val renderedTarget = escapeBlockDelims(renderIntraDocLinkTarget(token.targetCode))
+                if (token.isExternalLink) {
+                    out.append("[`").append(renderedTarget).append("`]")
+                } else {
+                    out.append('[').append(renderedTarget).append(']')
+                }
+            }
+            is CommentSegmentToken.PlainIntraDocLink -> {
+                out.append('[').append(escapeBlockDelims(renderIntraDocLinkTarget(token.targetCode))).append(']')
+            }
+            is CommentSegmentToken.InlineCode -> {
+                val renderedCode = escapeBlockDelims(translateInlineCodeSpan(token.code))
+                if (renderedCode.isNotEmpty()) {
+                    out.append('`').append(renderedCode).append('`')
+                }
+            }
+            is CommentSegmentToken.InlineRustAttr -> {
+                val attrStream = lexRustTokenStreamOrNull(token.rawAttr)
+                val renderedAttr = attrStream?.let(::renderCommentTokenStream).orEmpty()
+                if (renderedAttr.isNotEmpty()) {
+                    out.append(
+                        ProseVocabularySanitizer(
+                            escapeBlockDelims(renderedAttr),
+                            convertCamelIdentifiersOnly = convertCamelIdentifiersOnly,
+                        ).sanitize(),
+                    )
+                }
+            }
+            is CommentSegmentToken.Prose -> {
+                out.append(
+                    ProseVocabularySanitizer(
+                        escapeBlockDelims(token.text),
+                        convertCamelIdentifiersOnly = convertCamelIdentifiersOnly,
+                    ).sanitize(),
+                )
+            }
         }
-        return sb.toString()
     }
 
-    fun sanitizeProseVocabulary(convertCamelIdentifiersOnly: Boolean): String {
+    protected fun escapeBlockDelims(text: String): String =
+        text.replace("*/", "* /").replace("/*", "/ *")
+}
+
+internal open class MarkdownCommentEmitter : CommentSegmentEmitter(false, true) {
+    companion object Default : MarkdownCommentEmitter()
+}
+
+internal open class CodeFenceCommentEmitter : CommentSegmentEmitter(true, false) {
+    companion object Default : CodeFenceCommentEmitter()
+}
+
+/**
+ * Lexical prose vocabulary sanitizer for translating Rust lifetimes, `::` paths, macro `!` suffixes,
+ * `&mut` prefixes, and `snake_case` identifiers inside prose segments.
+ */
+internal class ProseVocabularySanitizer(
+    rawSource: String,
+    private val convertCamelIdentifiersOnly: Boolean,
+) : RustLexicalSourceScanner(rewriteLeadingKotlinColonPrefix(rawSource)) {
+    fun sanitize(): String {
         if (source.isEmpty()) return ""
-        val normalized = rewriteLeadingKotlinColonPrefix(source)
-        return CommentLexicalScanner(normalized).rewriteNormalizedProse(convertCamelIdentifiersOnly)
-    }
-
-    private fun rewriteNormalizedProse(convertCamelIdentifiersOnly: Boolean): String {
         val sb = StringBuilder(len)
         var i = 0
         while (i < len) {
@@ -1141,12 +1203,12 @@ private class CommentRustTokenEmitter(
     override fun renderAttributeInteriorStream(stream: TokenStream, isInner: Boolean): String =
         CommentRustTokenEmitter(stream.toList()).renderAttributeInterior(isInner)
 
-    override fun consumeLifetimeAt(idx: Int, outTokens: MutableList<String>): Int {
+    override fun consumeLifetimeAt(idx: Int, out: KotlinTokenEmitter): Int {
         if (size == 2) {
-            outTokens += mapCommentVocabularyWord(cleanIdentAt(idx + 1).orEmpty(), convertCamelIdentifiersOnly = false)
+            out.wordOrKeywords(mapCommentVocabularyWord(cleanIdentAt(idx + 1).orEmpty(), convertCamelIdentifiersOnly = false))
             return idx + 2
         }
-        return super.consumeLifetimeAt(idx, outTokens)
+        return super.consumeLifetimeAt(idx, out)
     }
 
     override fun mapIdent(rawIdent: String): String = mapRustIdentInCommentCode(rawIdent)
@@ -1191,11 +1253,13 @@ private class CommentRustTokenEmitter(
             } else {
                 rustValueIdentToKotlin(lastPathIdent)
             }
-        if (idx >= size) return "$prefix$ktName"
+        if (idx >= size) return KotlinTokenEmitter().annotation(name = ktName, prefix = prefix).render()
         val rest = trees.subList(idx, size)
         val singleParen = if (rest.size == 1) groupAt(idx, Delimiter.Parenthesis) else null
         if (singleParen != null) {
-            return "$prefix$ktName(${renderCommentTokenStream(singleParen.stream())})"
+            val innerRendered = renderCommentTokenStream(singleParen.stream())
+            val args = if (innerRendered.isEmpty()) emptyList() else listOf(KotlinEmitToken.RawFragment(innerRendered))
+            return KotlinTokenEmitter().annotation(name = ktName, prefix = prefix, args = args).render()
         }
         return "$prefix$ktName${CommentRustTokenEmitter(rest).render()}"
     }

@@ -463,11 +463,7 @@ private fun KotlinJ2KEmitter.isSynthesizedDebugFinishCall(call: Expr.MethodCall,
         recv = unwrapParenOrGroupExpr(recv.receiver)
     }
     val recvTypeBase =
-        inferExprRenderedType(call.receiver, selfTypeName)
-            ?.removeSuffix("?")
-            ?.substringBefore('<')
-            ?.substringAfterLast('.')
-            ?.trim()
+        inferExprRenderedType(call.receiver, selfTypeName)?.simpleKotlinTypeName()
     return recvTypeBase in DEBUG_BUILDER_TYPES
 }
 

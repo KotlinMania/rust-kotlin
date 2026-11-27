@@ -1316,7 +1316,11 @@ private fun buildRegisterUnpackExpr(
     return "$ctorTypePlaceholder(${namedArgs.joinToString(", ")})"
 }
 
-private val TUPLE_CTOR_FIELD_REGEX = Regex("""^field\d+(?:CtorArg)?$""")
+private fun isTupleCtorFieldIdent(name: String): Boolean {
+    if (!name.startsWith("field")) return false
+    val digits = name.removePrefix("field").removeSuffix("CtorArg")
+    return digits.isNotEmpty() && digits.all { it in '0'..'9' }
+}
 
 private val KOTLIN_DECL_MODIFIERS =
     wordSet(
@@ -1666,7 +1670,7 @@ private class ExternalKotlinSymbolWalker(
                 if (ctorNames.size == 1 && ctorNames[0] in setOf("value", "valueCtorArg")) {
                     tupleStructArity.putIfMissing(clsName, 1)
                 } else if (ctorNames.size >= 2 && ctorNames[0] in setOf("field0", "field0CtorArg")) {
-                    val fieldCount = ctorNames.count { TUPLE_CTOR_FIELD_REGEX.matches(it) }
+                    val fieldCount = ctorNames.count(::isTupleCtorFieldIdent)
                     if (fieldCount >= 2) tupleStructArity.putIfMissing(clsName, fieldCount)
                 }
                 if ("data" in modifiers && declKw == "class" && countPrimaryCtorProperties(openParenIdx, closeParenIdx) == 2) {

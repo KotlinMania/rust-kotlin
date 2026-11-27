@@ -2261,12 +2261,9 @@ internal fun KotlinJ2KEmitter.qualifyShadowedPatternVariantType(
     selfTypeName: String?,
 ): String {
     if ('.' in variantType) return variantType
-    val rawScrutinee = resolveScrutineeRenderedType(subjectText, selfTypeName)
-    val scrutineeNoNull = rawScrutinee?.removeSuffix("?")?.substringBefore('<')
     val scrutineeBase =
-        scrutineeNoNull
-            ?.substringAfterLast('.')
-            ?.trim()
+        resolveScrutineeRenderedType(subjectText, selfTypeName)
+            ?.simpleKotlinTypeName()
             ?.takeIf { it.isNotEmpty() && it !in activeTypeParamNames }
     if (variantType in activeTypeParamNames) {
         val ownerEnum =

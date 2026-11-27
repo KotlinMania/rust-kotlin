@@ -128,7 +128,7 @@ internal fun KotlinJ2KEmitter.liftDefaultlessAssocTypesFromBounds(
                         }
                         else -> continue
                     }
-                val ownerSimple = ownerTypeSimpleName ?: currentBoundedTypeName?.substringBefore('<')?.trim()
+                val ownerSimple = ownerTypeSimpleName ?: currentBoundedTypeName?.headKotlinTypePath()
                 for (assoc in lookupTraitDefaultlessAssocTypes(ktTrait, b.path)) {
                     if (assoc !in boundAssocs && assoc != ownerSimple && assoc !in existingParams && assoc !in lifted) {
                         lifted += assoc
@@ -955,7 +955,7 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
                 } else if (standaloneTraitPath != null) {
                     val traitKt = standaloneTraitPath.lastKotlinTypeName()
                     val selfDesc = describeSynTypeForDisambiguation(standaloneSelfSynType)
-                    val selfBase = selfTypeName.substringBefore('<').trim()
+                    val selfBase = selfTypeName.headKotlinTypePath()
                     if (traitKt != null &&
                         selfDesc == "Char" &&
                         ((traitKt to "U16") in standaloneTraitImplKeys || (traitKt to "UShort") in standaloneTraitImplKeys)
@@ -972,7 +972,7 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
                 }
                 "$selfTypeName."
             } else if (standaloneTraitPath != null) {
-                val baseType = selfTypeName.substringBefore('<').trim()
+                val baseType = selfTypeName.headKotlinTypePath()
                 val rawStandaloneTrait = standaloneTraitPath.lastCleanIdent()
                 if (baseType in COMPANION_CAPABLE_VALUE_TYPES &&
                     rawStandaloneTrait in setOf("From", "TryFrom", "Step") &&
@@ -984,7 +984,7 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
                     ""
                 }
             } else {
-                val baseType = selfTypeName.substringBefore('<').trim()
+                val baseType = selfTypeName.headKotlinTypePath()
                 if (baseType.isNotEmpty() &&
                     baseType !in activeTypeParamNames &&
                     baseType !in KOTLIN_COLLECTION_INTERFACES &&
@@ -1055,7 +1055,7 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
         }
     val renderedReturnType =
         try {
-            selfTypeName?.substringBefore('<')?.let { owner ->
+            selfTypeName?.headKotlinTypePath()?.let { owner ->
                 if (fnBlock != null) mutablePlaceReturnType(owner, rawFnName) else null
             } ?: implTraitResultOverride ?: retType?.let { renderType(it, selfTypeName) } ?: "Unit"
         } finally {
@@ -1126,10 +1126,14 @@ internal fun KotlinJ2KEmitter.renderFunctionSignature(
             liftedAssocs.isEmpty() &&
             whereClause.isEmpty()
         ) {
+            val paramTypeIdents =
+                params.flatMapTo(hashSetOf()) { param ->
+                    KotlinTokenWalker(param.substringAfter(": ")).collectFilteredIdentifiers()
+                }
             fnOnlyTypeParamNames
                 .filter { tpKt ->
                     (renderedReturnType == tpKt || renderedReturnType == "$tpKt?") &&
-                        params.none { containsWholeIdentifier(it.substringAfter(": "), tpKt) }
+                        tpKt !in paramTypeIdents
                 }.toSet()
         } else {
             emptySet()
@@ -1496,16 +1500,16 @@ internal fun KotlinJ2KEmitter.computeReceiverSignatureKey(receiverPrefix: String
     when {
         receiverPrefix.isEmpty() -> ""
         receiverPrefix.endsWith(".Companion.") ->
-            receiverPrefix.removeSuffix(".Companion.").substringBefore('<').trim() + ".Companion."
+            receiverPrefix.removeSuffix(".Companion.").headKotlinTypePath() + ".Companion."
         else ->
-            receiverPrefix.removeSuffix(".").substringBefore('<').trim() + "."
+            receiverPrefix.removeSuffix(".").headKotlinTypePath() + "."
     }
 
 internal fun KotlinJ2KEmitter.eraseTypeForSignatureKey(renderedType: String): String {
-    val nonNull = renderedType.removeSuffix("?")
-    val base = nonNull.substringBefore('<').trim()
+    val parsed = renderedType.asKotlinRenderedType() ?: return renderedType
+    val base = parsed.headPath
     if (base in activeTypeParamNames) return "*"
-    return if (base in KOTLIN_JVM_VALUE_TYPES && renderedType.endsWith("?")) "$base?" else base
+    return if (base in KOTLIN_JVM_VALUE_TYPES && parsed.isNullable) "$base?" else base
 }
 
 internal fun KotlinJ2KEmitter.extractRawParamIdent(pat: Pat): String? =

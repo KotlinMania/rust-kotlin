@@ -1275,7 +1275,7 @@ internal data class KotlinRenderedType(
                 )
             }
 
-            val simpleName = walker.anyIdentAt(coreLastIdx) ?: nonNull.substringBefore('<').substringAfterLast('.').trim()
+            val simpleName = walker.anyIdentAt(coreLastIdx).orEmpty()
             return KotlinRenderedType(
                 rawTrimmed = trimmed,
                 nonNullText = nonNull,
@@ -1290,6 +1290,152 @@ internal data class KotlinRenderedType(
 }
 
 internal fun String?.asKotlinRenderedType(): KotlinRenderedType? = KotlinRenderedType.parse(this)
+
+internal fun String.headKotlinTypePath(): String = asKotlinRenderedType()?.headPath ?: trim()
+
+/**
+ * Token-parsed structural decomposition of a rendered Kotlin callee expression
+ * (such as `pkg.Owner<A>.member<B, List<C>>`, `Vec.new<Int>`, or `foo<T>`).
+ */
+internal data class KotlinCalleeShape(
+    val rawCallee: String,
+    val basePath: String,
+    val erasedBasePath: String,
+    val ownerPath: String?,
+    val memberName: String,
+    val typeArgs: List<String>,
+    val typeArgsSuffix: String,
+) {
+    companion object {
+        fun parse(raw: String): KotlinCalleeShape {
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) {
+                return KotlinCalleeShape("", "", "", null, "", emptyList(), "")
+            }
+            if ('<' !in trimmed && '(' !in trimmed && '`' !in trimmed) {
+                val dotIdx = trimmed.lastIndexOf('.')
+                val owner = if (dotIdx >= 0) trimmed.substring(0, dotIdx).trim() else null
+                val member = if (dotIdx >= 0) trimmed.substring(dotIdx + 1).trim() else trimmed
+                return KotlinCalleeShape(
+                    rawCallee = trimmed,
+                    basePath = trimmed,
+                    erasedBasePath = trimmed,
+                    ownerPath = owner,
+                    memberName = member,
+                    typeArgs = emptyList(),
+                    typeArgsSuffix = "",
+                )
+            }
+            val walker = KotlinTokenWalker(trimmed)
+            val firstIdx = walker.nextNonTriviaIndex(0)
+            val lastIdx = walker.previousNonTriviaIndex(walker.tokens.size)
+            if (firstIdx > lastIdx) {
+                return KotlinCalleeShape(trimmed, trimmed, trimmed, null, trimmed, emptyList(), "")
+            }
+
+            var scanIdx = firstIdx
+            var trailingOpenAngle = -1
+            while (scanIdx <= lastIdx) {
+                if (walker.punctAt(scanIdx) == '<') {
+                    val closeAngle = walker.findMatchingTypeAngleToken(scanIdx)
+                    if (closeAngle == lastIdx) {
+                        trailingOpenAngle = scanIdx
+                        break
+                    }
+                    if (closeAngle > scanIdx) {
+                        scanIdx = closeAngle + 1
+                        continue
+                    }
+                }
+                scanIdx++
+            }
+
+            val headEndIdx: Int
+            val basePath: String
+            val typeArgs: List<String>
+            val typeArgsSuffix: String
+            if (trailingOpenAngle > firstIdx) {
+                headEndIdx = walker.previousNonTriviaIndex(trailingOpenAngle)
+                basePath = trimmed.substring(walker.tokens[firstIdx].start, walker.tokens[headEndIdx].end).trim()
+                typeArgsSuffix = trimmed.substring(walker.tokens[trailingOpenAngle].start, walker.tokens[lastIdx].end)
+                typeArgs =
+                    walker
+                        .splitTopLevelCommaTokenRanges(trailingOpenAngle + 1, lastIdx)
+                        .map { range -> trimmed.substring(walker.tokens[range.first].start, walker.tokens[range.last].end).trim() }
+                        .filter { it.isNotEmpty() }
+            } else {
+                headEndIdx = lastIdx
+                basePath = trimmed
+                typeArgs = emptyList()
+                typeArgsSuffix = ""
+            }
+
+            var lastTopDotIdx = -1
+            walker.walkTopLevelTokens(firstIdx, headEndIdx + 1, trackBraces = true) { idx, _, isTop ->
+                if (isTop && walker.punctAt(idx) == '.') {
+                    lastTopDotIdx = idx
+                }
+                true
+            }
+            val ownerPath =
+                if (lastTopDotIdx > firstIdx) {
+                    val ownerEndIdx = walker.previousNonTriviaIndex(lastTopDotIdx)
+                    trimmed.substring(walker.tokens[firstIdx].start, walker.tokens[ownerEndIdx].end).trim()
+                } else {
+                    null
+                }
+            val memberStartIdx =
+                if (lastTopDotIdx >= firstIdx) {
+                    walker.nextNonTriviaIndex(lastTopDotIdx + 1, headEndIdx + 1)
+                } else {
+                    firstIdx
+                }
+            val memberName =
+                if (memberStartIdx <= headEndIdx) {
+                    trimmed.substring(walker.tokens[memberStartIdx].start, walker.tokens[headEndIdx].end).trim()
+                } else {
+                    ""
+                }
+            val erasedBasePath =
+                if ('<' !in basePath) {
+                    basePath
+                } else {
+                    eraseTopLevelAngleBlocks(walker, trimmed, firstIdx, headEndIdx)
+                }
+            return KotlinCalleeShape(
+                rawCallee = trimmed,
+                basePath = basePath,
+                erasedBasePath = erasedBasePath,
+                ownerPath = ownerPath,
+                memberName = memberName,
+                typeArgs = typeArgs,
+                typeArgsSuffix = typeArgsSuffix,
+            )
+        }
+
+        private fun eraseTopLevelAngleBlocks(
+            walker: KotlinTokenWalker,
+            source: String,
+            startIdx: Int,
+            endIdx: Int,
+        ): String {
+            val sb = StringBuilder()
+            var k = startIdx
+            while (k <= endIdx) {
+                if (walker.punctAt(k) == '<') {
+                    val close = walker.findMatchingTypeAngleToken(k)
+                    if (close in (k + 1)..endIdx) {
+                        k = close + 1
+                        continue
+                    }
+                }
+                sb.append(walker.tokens[k].rawText)
+                k++
+            }
+            return source.takeIf { sb.isEmpty() } ?: sb.toString().trim()
+        }
+    }
+}
 
 /**
  * Extensible token-to-source emitter over [KotlinLexToken] streams.

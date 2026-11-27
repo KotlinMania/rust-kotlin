@@ -797,7 +797,7 @@ internal class TypePathLoweringContext(
             prefixQualifier.isNotEmpty() ||
             externalQualifiedOverride != null ||
             rawName == "Self" ||
-            ktBaseIdent == selfTypeName?.substringBefore('<')?.trim() ||
+            ktBaseIdent == selfTypeName?.headKotlinTypePath() ||
             ktBaseIdent !in emitter.activeEnclosingEnumVariantNames ||
             ktBaseIdent in emitter.activeTypeParamNames ||
             rawName in PRIMITIVE_TYPE_NAMES
@@ -1399,7 +1399,7 @@ internal class TypeParameterClauseEmitter(
     private val selfTypeName: String?,
 ) {
     fun renderTypeParameters(generics: Generics, excludeNames: Set<String> = emptySet()): String {
-        val ownerSimple = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
+        val ownerSimple = selfTypeName?.simpleKotlinTypeName()
         val declared = renderTypeParametersFromParams(generics.params.toList(), excludeNames).removePrefix("<").removeSuffix(">")
         val associated =
             emitter
@@ -1587,7 +1587,7 @@ internal fun KotlinJ2KEmitter.renderWhereClause(
     ownerGenerics: Generics? = null,
     extraDeclaredNames: Set<String> = emptySet(),
 ): String {
-    val ownerSimple = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
+    val ownerSimple = selfTypeName?.simpleKotlinTypeName()
     val assocDeclared = ownerGenerics?.let { sourceAssociatedParameters(it, ownerSimple).map { a -> a.associated } }.orEmpty()
     return renderCombinedWhereClause(
         ownerWhere = null,
@@ -1980,10 +1980,16 @@ internal fun KotlinJ2KEmitter.synthesizeOrReuseBareFnSam(ty: SynType.FnPtr, self
             currentSamNameHint = prevHint
             inExternAbiSignature = prevExternAbi
         }
-    val referencesGeneric =
-        activeTypeParamNames.any { tp ->
-            inputTypes.any { containsWholeIdentifier(it, tp) } || containsWholeIdentifier(outType, tp)
+    val referencedIds =
+        if (activeTypeParamNames.isEmpty()) {
+            emptySet()
+        } else {
+            buildSet {
+                for (inTy in inputTypes) addAll(KotlinTokenWalker(inTy).collectFilteredIdentifiers())
+                addAll(KotlinTokenWalker(outType).collectFilteredIdentifiers())
+            }
         }
+    val referencesGeneric = activeTypeParamNames.any { it in referencedIds }
     if (referencesGeneric) {
         return "(${inputTypes.joinToString(", ")}) -> $outType"
     }

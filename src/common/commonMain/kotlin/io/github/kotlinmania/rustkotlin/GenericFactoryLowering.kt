@@ -192,7 +192,7 @@ private fun KotlinJ2KEmitter.factoryRequirements(factory: SourceFactory, visitin
 private fun factoryLayoutName(parameter: String) = "typeLayout${rustTypeIdentToKotlin(parameter)}"
 
 internal fun KotlinJ2KEmitter.genericFactorySignatureParameters(sig: Signature, block: Block?, selfType: String?): List<Pair<String, String>> {
-    val owner = selfType?.substringBefore('<')
+    val owner = selfType?.headKotlinTypePath()
     val factory =
         sourceFactories().singleOrNull { it.owner == owner && it.sig === sig }
             ?: sourceFactories().singleOrNull { it.owner == owner && it.sig.ident == sig.ident && it.block == block }
@@ -206,7 +206,8 @@ internal fun KotlinJ2KEmitter.genericFactorySignatureParameters(sig: Signature, 
 }
 
 internal fun KotlinJ2KEmitter.genericFactoryCallArguments(call: Expr.Call, selfType: String?): List<String> {
-    val factory = calledFactory(call, selfType?.substringBefore('<')) ?: return emptyList()
+    val ownerHead = selfType?.headKotlinTypePath()
+    val factory = calledFactory(call, ownerHead) ?: return emptyList()
     val required = factoryRequirements(factory)
     val existing = transparentConstructorField(factory.owner, factory.block)?.second
     val bindings = factoryBindings(call, factory, ::sourceInitializerType)
@@ -215,7 +216,7 @@ internal fun KotlinJ2KEmitter.genericFactoryCallArguments(call: Expr.Call, selfT
         val actual =
             bindings[parameter] ?: currentStandaloneImplSelfSynType
                 ?.takeIf {
-                    factory.owner == selfType?.substringBefore('<')
+                    factory.owner == ownerHead
                 }?.let { owner ->
                     val arguments =
                         (
@@ -254,7 +255,7 @@ internal fun KotlinJ2KEmitter.genericFactoryCallArguments(call: Expr.Call, selfT
 }
 
 internal fun KotlinJ2KEmitter.sourceFactoryCallLayout(call: Expr.Call, declaration: Item.Struct, selfType: String?): String {
-    val factory = calledFactory(call, selfType?.substringBefore('<'))
+    val factory = calledFactory(call, selfType?.headKotlinTypePath())
     val bindings = factory?.let { factoryBindings(call, it, ::sourceInitializerType) }.orEmpty()
     val (leaf, substitutions) = transparentFactoryLeaf(declaration, selfType)
     sourcePointerLayout(leaf, selfType, substitutions = substitutions + bindings)?.let { return it }

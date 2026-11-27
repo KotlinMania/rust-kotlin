@@ -265,12 +265,7 @@ internal fun KotlinJ2KEmitter.isResolvedCrateSubpackageModule(resolvedImportPath
 }
 
 internal fun KotlinJ2KEmitter.scopedAbiKeysForRenderedType(renderedType: String): List<String> {
-    val clean =
-        renderedType
-            .substringBefore('<')
-            .trim()
-            .removeSuffix("?")
-            .trim()
+    val clean = renderedType.headKotlinTypePath()
     if (clean.isEmpty()) return emptyList()
     val keys = mutableListOf<String>()
     val nsPrefix = currentNamespacePrefix()

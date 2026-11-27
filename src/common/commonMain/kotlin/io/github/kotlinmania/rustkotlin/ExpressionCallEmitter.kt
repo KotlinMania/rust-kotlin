@@ -43,10 +43,17 @@ internal class CallLoweringContext(
             path.segments.toList().map { it.ident.toString().removePrefix("r#") }
         }
     var callee: String = ""
-    var calleeBase: String = ""
+        set(value) {
+            field = value
+            calleeShape = KotlinCalleeShape.parse(value)
+        }
+    var calleeShape: KotlinCalleeShape = KotlinCalleeShape.parse("")
+        private set
+    val calleeBase: String
+        get() = calleeShape.erasedBasePath
 
     val turbofishSuffix: String
-        get() = if ('<' in callee) "<${callee.substringAfter('<')}" else ""
+        get() = calleeShape.typeArgsSuffix
 
     fun renderArg(idx: Int): String = emitter.renderExpr(nonUnitArgs[idx], indent, selfTypeName)
 
@@ -68,7 +75,7 @@ internal class CallLoweringContext(
 
     fun renderStandardCall(): String {
         emitter.renderStaticPrimitiveCall(expr, nonUnitArgs, indent, selfTypeName)?.let { return it }
-        val plainCalleeBase = callee.substringBefore('<')
+        val plainCalleeBase = calleeShape.basePath
         registerPrimitiveConvertImportIfNeeded(plainCalleeBase)
         val calleeParamNumericKinds = resolveCalleeParamNumericKinds(plainCalleeBase)
         val subslicePreStmts = mutableListOf<String>()
@@ -351,8 +358,8 @@ internal class CallLoweringContext(
         }
         if (renderedArgList.isEmpty() || '.' !in plainCalleeBase) return null
         val ownerSimple = plainCalleeBase.substringBeforeLast('.').substringAfterLast('.').trim()
-        val methodPart = callee.substringAfterLast('.')
-        val methodBase = methodPart.substringBefore('<').trim()
+        val methodPart = calleeShape.memberName + calleeShape.typeArgsSuffix
+        val methodBase = calleeShape.memberName
         val traitDecl = emitter.lookupDeclaredTraitAst(ownerSimple)
         val isUfcsTraitReceiverCall =
             when {
@@ -483,7 +490,7 @@ internal class CallLoweringContext(
         val isCtorOrFactory =
             plainCalleeBase == callOwner ||
                 emitter.file.items.filterIsInstance<Item.Impl>().any { implementation ->
-                    emitter.renderType(implementation.selfType, selfTypeName).substringBefore('<') == callOwner &&
+                    emitter.renderType(implementation.selfType, selfTypeName).headKotlinTypePath() == callOwner &&
                         implementation.items.filterIsInstance<ImplItem.Fn>().any { function ->
                             rustFunctionIdentToKotlin(function.sig.ident.toString()) == plainCalleeBase.substringAfterLast('.') &&
                                 function.sig.inputs.firstOrNull() !is FnArg.Receiver &&
@@ -638,7 +645,7 @@ private object DefaultTraitCallRule : CalleeDispatchRule() {
         val targetTy = (emitter.currentExpectedParseTargetType ?: emitter.currentEnclosingReturnRenderedType)?.removeSuffix("?")?.trim()
         if (targetTy.isNullOrEmpty()) return "${ctx.callee}()"
         val init = defaultInitializerForType(targetTy)
-        val targetBase = targetTy.substringBefore('<').substringAfterLast('.').trim()
+        val targetBase = targetTy.simpleKotlinTypeName()
         return when {
             init != "null as $targetTy" &&
                 init != "$targetTy()" &&
@@ -756,7 +763,7 @@ private fun tryRenderDeclarativeCalleeRules(
                                 ?: emitter.resolveMaybeUninitElementRenderedType(ctx.expr, callee, ctx.selfTypeName)
                         emitter.resolveRenderedTypeLayoutExpr(elemTy)
                     }
-                    "quotedSelfType" -> renderKotlinDoubleQuotedString(ctx.selfTypeName?.substringBefore('<')?.trim() ?: "Any")
+                    "quotedSelfType" -> renderKotlinDoubleQuotedString(ctx.selfTypeName?.headKotlinTypePath() ?: "Any")
                     "nullPtrCtor" -> {
                         val wantMut =
                             "Mut" in calleeBase ||
@@ -819,7 +826,7 @@ private object ZeroedAndPaddingCallRule : CalleeDispatchRule() {
         if (!fallback.startsWith("null as ") && fallback != "null" && !fallback.startsWith("error(")) {
             return fallback
         }
-        val baseSimple = targetType.substringBefore('<').substringAfterLast('.').trim()
+        val baseSimple = targetType.simpleKotlinTypeName()
         val impPkg = emitter.importedSimpleNameToPkg[baseSimple]
         val libcNs = FfiInteropCollector.resolveLibcNamespace(emitter.headerContext)
         val structDecl = emitter.sameFileUniqueSimpleStruct(baseSimple)
@@ -989,7 +996,6 @@ internal fun KotlinJ2KEmitter.renderExprCall(expr: Expr.Call, indent: String, se
         rule.tryRender(ctx)?.let { return it }
     }
     ctx.callee = renderCalleeExpr(expr.func, indent, selfTypeName)
-    ctx.calleeBase = ctx.callee.substringBefore('<').trim()
     for (rule in CALLEE_DISPATCH_RULES) {
         rule.tryRender(ctx)?.let { return it }
     }
@@ -1242,7 +1248,30 @@ internal data class SimdLaneVectorSpec(
     val lanes: Int,
 )
 
-private val SIMD_LANE_NAME_REGEX = Regex("^([iufm])(8|16|32|64|128|size)x(\\d+)$", RegexOption.IGNORE_CASE)
+/**
+ * Lexical recognizer for Rust portable-SIMD vector type identifiers (`i32x4`, `u8x16`, `f64x2`, `msizex8`).
+ */
+internal object SimdVectorIdentLexer {
+    private val WIDTH_TOKENS: List<String> = listOf("128", "64", "32", "16", "8", "size")
+
+    data class ParsedSimdIdent(
+        val kindChar: Char,
+        val widthToken: String,
+        val lanes: Int,
+    )
+
+    fun parse(ident: String): ParsedSimdIdent? {
+        if (ident.length < 4) return null
+        val kindCh = ident[0].lowercaseChar()
+        if (kindCh != 'i' && kindCh != 'u' && kindCh != 'f' && kindCh != 'm') return null
+        val lowerRest = ident.substring(1).lowercase()
+        val width = WIDTH_TOKENS.firstOrNull { lowerRest.startsWith("${it}x") } ?: return null
+        val lanesSlice = lowerRest.substring(width.length + 1)
+        if (lanesSlice.isEmpty() || !lanesSlice.all { it in '0'..'9' }) return null
+        val lanes = lanesSlice.toIntOrNull()?.takeIf { it > 0 } ?: return null
+        return ParsedSimdIdent(kindChar = kindCh, widthToken = width, lanes = lanes)
+    }
+}
 
 internal fun parseSimdLaneVectorSpec(
     rawOwner: String,
@@ -1250,11 +1279,11 @@ internal fun parseSimdLaneVectorSpec(
     visited: MutableSet<String> = hashSetOf(),
 ): SimdLaneVectorSpec? {
     val clean = rawOwner.removePrefix("r#").trim()
-    val direct = SIMD_LANE_NAME_REGEX.matchEntire(clean)
+    val direct = SimdVectorIdentLexer.parse(clean)
     if (direct != null) {
-        val kindCh = direct.groupValues[1].lowercase()[0]
-        val bits = direct.groupValues[2].lowercase()
-        val lanes = direct.groupValues[3].toIntOrNull()?.takeIf { it > 0 } ?: return null
+        val kindCh = direct.kindChar
+        val bits = direct.widthToken
+        val lanes = direct.lanes
         val wrapperName = if (kindCh == 'm') "SimdM" else "Simd"
         val elemKind =
             when (kindCh) {

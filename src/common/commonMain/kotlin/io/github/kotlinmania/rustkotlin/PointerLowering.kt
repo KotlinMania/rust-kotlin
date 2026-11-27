@@ -391,7 +391,7 @@ internal fun KotlinJ2KEmitter.sameFileUniqueSimpleStruct(ktName: String): Item.S
     sameFileLayoutIndex().simpleStructsByKtName[ktName]
 
 internal fun KotlinJ2KEmitter.transparentDeclaration(owner: String?): Item.Struct? {
-    val trimmed = owner?.substringBefore('<')?.trim() ?: return null
+    val trimmed = owner?.headKotlinTypePath() ?: return null
     val idx = sameFileLayoutIndex()
     if ('.' in trimmed) {
         val prefix = trimmed.substringBeforeLast('.')
@@ -521,7 +521,7 @@ internal fun KotlinJ2KEmitter.sourceAssociatedParameters(
             list.addAll(tp.bounds.toList())
         }
     }
-    val ownerSimple = ownerTypeSimpleName ?: currentBoundedTypeName?.substringBefore('<')?.trim()
+    val ownerSimple = ownerTypeSimpleName ?: currentBoundedTypeName?.headKotlinTypePath()
     return declaredTypeParams
         .flatMap { rawParamIdent ->
             boundsByParam[rawParamIdent]
@@ -958,7 +958,7 @@ private class SourcePointerLayoutResolver(
                 ?: error("Transparent construction requires a source-proven single field")
         val substitutions = initialOwnerSubstitutions(declaration, selfType)
         resolve(requireNotNull(sourceSingleField(declaration)).ty, selfType, substitutions = substitutions)?.let { return it }
-        if (selfType?.substringBefore('<') == declKt &&
+        if (selfType?.headKotlinTypePath() == declKt &&
             emitter.currentTypedLocals["this"] == selfType &&
             emitter.currentTypedLocals["fieldLayout"] == null
         ) {
@@ -1033,7 +1033,7 @@ private class SourceAstTypeInferrer(
         val ownerRaw = (baseSyn as? SynType.Path)?.path?.lastIdentText() ?: return null
         val ownerKt =
             if (ownerRaw == "Self") {
-                emitter.currentStandaloneImplSelfSynType?.let { emitter.renderType(it, null).substringBefore('<') }
+                emitter.currentStandaloneImplSelfSynType?.let { emitter.renderType(it, null).headKotlinTypePath() }
             } else {
                 rustTypeIdentToKotlin(ownerRaw)
             } ?: return null

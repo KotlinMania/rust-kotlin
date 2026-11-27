@@ -73,7 +73,9 @@ internal fun KotlinJ2KEmitter.extractFnTraitSubstitutions(
             val typeArgs = angleArgs?.filterIsInstance<GenericArgument.TypeArg>().orEmpty()
             if (typeArgs.size != 1) continue
             val targetRendered = renderType(typeArgs[0].type, selfTypeName).trim()
-            if (targetRendered.isNotEmpty() && fnTypeParams.none { containsWholeIdentifier(targetRendered, it) }) {
+            if (targetRendered.isNotEmpty() &&
+                KotlinTokenWalker(targetRendered).collectFilteredIdentifiers().none { it in fnTypeParams }
+            ) {
                 result[tpName] = targetRendered
                 intoSubstitutedOut?.add(tpName)
             }
@@ -167,7 +169,7 @@ internal fun KotlinJ2KEmitter.collectLocalSupertraitMethodNames(
             visitTraitByBaseName(boundBase, boundPath)
         }
     }
-    for (st in superTraits) visitTraitByBaseName(st.substringBefore('<').trim())
+    for (st in superTraits) visitTraitByBaseName(st.headKotlinTypePath())
     return names
 }
 
@@ -201,7 +203,7 @@ internal fun KotlinJ2KEmitter.renderDistinctSuperTraits(
 ): List<String> {
     val seenInterfaces = hashSetOf<String>()
     val result = mutableListOf<String>()
-    val selfBase = selfTypeWithGenerics.substringBefore('<').trim()
+    val selfBase = selfTypeWithGenerics.headKotlinTypePath()
     for (impl in attachedImpls) {
         if (isDocOnlyCfgAttribute(impl.attrs)) continue
         val path = impl.traitPath?.path ?: continue
@@ -211,7 +213,7 @@ internal fun KotlinJ2KEmitter.renderDistinctSuperTraits(
             withBoundedTypeScope(boundedType = selfTypeWithGenerics, suppressAssocs = true) {
                 renderPathAsType(path, selfTypeName = selfTypeWithGenerics)
             }
-        val baseIface = rendered.substringBefore('<').trim()
+        val baseIface = rendered.headKotlinTypePath()
         if (baseIface.isEmpty() || baseIface == selfBase || rendered.contains("->")) continue
         if (ownerIsPublic) {
             val traitDecl = lookupDeclaredTraitAst(baseIface, path)
@@ -394,7 +396,7 @@ internal fun KotlinJ2KEmitter.renderAttachedImplMembers(
                 }
             }
 
-        val ownerBaseName = typeName.substringBefore('<').trim()
+        val ownerBaseName = typeName.headKotlinTypePath()
         for (impl in attachedImpls) {
             if (isDocOnlyCfgAttribute(impl.attrs)) continue
             val implComments = (renderLeadingTrivia(impl, indent) + renderKDocFromAttributes(impl.attrs, indent)).trimEnd()
@@ -1069,7 +1071,7 @@ private fun KotlinJ2KEmitter.appendUniqueReceiverlessTraitCompanion(
                 val targetCall =
                     if (isLocalAttached ||
                         (
-                            concreteSelfType.substringBefore('<').trim() in COMPANION_CAPABLE_VALUE_TYPES &&
+                            concreteSelfType.headKotlinTypePath() in COMPANION_CAPABLE_VALUE_TYPES &&
                                 rawImplTrait in setOf("From", "TryFrom", "Step") &&
                                 !implFn.sig.inputs.isEmpty()
                         )
@@ -1335,7 +1337,7 @@ internal fun KotlinJ2KEmitter.renderImplItemFn(
             val closeSuffix = "\n$indent}"
             val body =
                 when {
-                    containsWholeIdentifier(rawBody, stateKt) ->
+                    KotlinTokenWalker(rawBody).containsIdentifier(stateKt) ->
                         if (rawBody.startsWith("{\n") && rawBody.endsWith(closeSuffix)) {
                             val inner = rawBody.substring(2, rawBody.length - closeSuffix.length)
                             "{\n$indent    var $stateKt = 0\n$inner\n$indent    return $stateKt\n$indent}"
@@ -1375,7 +1377,7 @@ internal fun KotlinJ2KEmitter.renderImplItemFn(
         val shadows = computeReassignedParamShadows(item.sig, item.block, "$bodyIndent    ", selfTypeName = selfTypeName)
         val accessorFields =
             if (retType is SynType.Reference && retType.mutability != null) {
-                selfTypeName?.substringBefore('<')?.let { owner ->
+                selfTypeName?.headKotlinTypePath()?.let { owner ->
                     mutableReferenceProjection(owner, item.sig.ident.toString(), linkedSetOf())
                 }
             } else {
@@ -1383,7 +1385,7 @@ internal fun KotlinJ2KEmitter.renderImplItemFn(
             }
         val rawStorageProjection =
             if (retType is SynType.Ptr && selfTypeName != null) {
-                val owner = selfTypeName.substringBefore('<')
+                val owner = selfTypeName.headKotlinTypePath()
                 val declaration = file.findStructByKotlinName(owner)
                 val field = declaration?.let { sourceTransparentField(it, selfTypeName) }
                 val projection = mutableReferenceProjection(owner, item.sig.ident.toString(), linkedSetOf())
@@ -1436,7 +1438,7 @@ private fun KotlinJ2KEmitter.renderImplMethodBlockWithDropCascade(
             !isCompanionMember &&
             selfTypeName != null
         ) {
-            val ownerName = selfTypeName.substringBefore('<')
+            val ownerName = selfTypeName.headKotlinTypePath()
             val ownerStruct = file.findStructByKotlinName(ownerName)
             val structNamed = (ownerStruct?.fields as? Fields.Named)?.fields?.named
             val namedFields = structNamed?.toList().orEmpty()

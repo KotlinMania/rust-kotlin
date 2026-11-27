@@ -824,7 +824,7 @@ internal class FfiInteropCollector(
         if (fn.returnBridgeKind == CAbiBridgeKind.CALLBACK_PTR || fn.params.any { it.bridgeKind == CAbiBridgeKind.CALLBACK_PTR }) {
             return false
         }
-        return preambles.any { containsWholeIdentifier(it, fn.cSymbolName) } || isDirectCallSafeSymbol(fn)
+        return preambles.any { CHostPreambleTokenScanner(it).containsCIdentifier(fn.cSymbolName) } || isDirectCallSafeSymbol(fn)
     }
 
     internal fun finalizeActualsKotlinFile(
@@ -1427,9 +1427,19 @@ internal fun extractHeaderCommentsFromSource(source: String, out: MutableSet<Str
 private val CPP_STDLIB_INCLUDE_HEADERS = setOf("iostream", "vector", "string")
 private val CPP_CAST_KEYWORDS = setOf("reinterpret_cast", "static_cast")
 
-private class CHostPreambleTokenScanner(
+internal class CHostPreambleTokenScanner(
     source: String,
 ) : KotlinTokenWalker(source) {
+    fun collectCIdentifiers(): Set<String> {
+        val out = HashSet<String>(maxOf(8, tokens.size / 4))
+        collectCodeIdentifiers(0, tokens.size, out)
+        return out
+    }
+
+    fun containsCIdentifier(ident: String): Boolean {
+        if (ident.isEmpty()) return false
+        return tokens.any { it.interpolationDepth == 0 && it is KotlinLexToken.Ident && it.rawText == ident }
+    }
     fun collectIncludedHeaders(out: MutableSet<String>) {
         var idx = 0
         while (idx < tokens.size) {

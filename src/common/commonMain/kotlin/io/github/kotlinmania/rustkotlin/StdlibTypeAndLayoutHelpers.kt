@@ -113,7 +113,7 @@ internal fun isUntypedTaggedSumScrutinee(
     val clean = renderedType?.removeSuffix("?")?.trim() ?: return false
     if (clean == "Any" || clean == "RustAny" || clean == "*" || clean == "Nothing") return true
     if (clean.length == 1 && clean[0] in 'A'..'Z') return true
-    val simpleBase = clean.substringBefore('<').substringAfterLast('.').trim()
+    val simpleBase = clean.simpleKotlinTypeName()
     return if (isControlFlow) simpleBase != "ControlFlow" else simpleBase != "Result" && simpleBase != "RustResult"
 }
 
@@ -342,7 +342,7 @@ internal fun isStdlibConstPtrMethodParam(rawMethod: String, paramSyn: SynType?, 
 
 /** Coerces a rendered `MutPtr` expression to `ConstPtr` using `asConstPtr()`. */
 internal fun coerceMutPtrArgToConstPtr(renderedArg: String, inferredArgType: String?): String {
-    val clean = inferredArgType?.removeSuffix("?")?.substringBefore('<')?.trim() ?: return renderedArg
+    val clean = inferredArgType?.headKotlinTypePath() ?: return renderedArg
     if (clean != "MutPtr" && !clean.endsWith(".MutPtr")) return renderedArg
     val trimmed = renderedArg.trim()
     if (trimmed.endsWith(".asConstPtr()") || trimmed.startsWith("ConstPtr(")) return renderedArg

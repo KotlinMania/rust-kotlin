@@ -42,7 +42,7 @@ private fun KotlinJ2KEmitter.unwrapRepeatSourceArg(
     selfTypeName: String?,
 ): Expr? {
     val call = unwrapParenOrGroupExpr(expr) as? Expr.Call ?: return null
-    val callee = renderCalleeExpr(call.func, indent, selfTypeName).substringBefore('<').trim()
+    val callee = KotlinCalleeShape.parse(renderCalleeExpr(call.func, indent, selfTypeName)).erasedBasePath
     val args = call.args.toList().filterNot { it is Expr.Tuple && it.elems.isEmpty() }
     return if (args.size == 1 &&
         "repeat" !in inspector.declaredTopLevelFnRawNames &&
@@ -102,7 +102,7 @@ internal fun KotlinJ2KEmitter.isFmtStringBuilderReceiver(
     selfTypeName: String?,
 ): Boolean {
     fun isStdFmtReceiverType(ty: String?): Boolean {
-        val clean = ty?.removeSuffix("?")?.substringBefore('<')?.trim() ?: return false
+        val clean = ty?.headKotlinTypePath() ?: return false
         val simple = clean.substringAfterLast('.')
         return clean == "StringBuilder" ||
             simple == "StringBuilder" ||

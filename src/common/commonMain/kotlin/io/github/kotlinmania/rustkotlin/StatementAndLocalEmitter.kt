@@ -336,12 +336,13 @@ private class BlockEmissionScope(
             return
         }
         val n = hoistedItems.size
+        val identsByItem = hoistedItems.map { KotlinTokenWalker(it.second).collectFilteredIdentifiers() }
         val deps = Array(n) { hashSetOf<Int>() }
         for (i in 0 until n) {
-            val renderedI = hoistedItems[i].second
+            val idsI = identsByItem[i]
             for (j in 0 until n) {
                 val nameJ = hoistedItems[j].first
-                if (i != j && nameJ != null && containsWholeIdentifier(renderedI, nameJ)) deps[i] += j
+                if (i != j && nameJ != null && nameJ in idsI) deps[i] += j
             }
         }
         val emitted = BooleanArray(n)
@@ -665,7 +666,8 @@ internal fun KotlinJ2KEmitter.renderBlock(
         val returnPrefix = "${innerIndent}return "
         if (single.startsWith(returnPrefix)) {
             val exprText = single.removePrefix(returnPrefix)
-            if (!containsWholeIdentifier(exprText, "return") && !containsWholeIdentifier(exprText, "throw")) {
+            val exprIds = KotlinTokenWalker(exprText).collectFilteredIdentifiers()
+            if ("return" !in exprIds && "throw" !in exprIds) {
                 return if (exprText.contains('\n')) "=\n$innerIndent$exprText" else "= $exprText"
             }
         }
@@ -1230,7 +1232,7 @@ internal fun KotlinJ2KEmitter.renderStmtLocal(
                 if (ret.startsWith("Result<") && ret.endsWith(">")) rustResultOkPayloadType(ret) ?: ret else ret
             }
         if (unwrappedRet != null && '<' in unwrappedRet) {
-            val baseRet = unwrappedRet.substringBefore('<').trim()
+            val baseRet = unwrappedRet.headKotlinTypePath()
             if (rhs == "$baseRet.new()" || rhs == "$baseRet.default()") typeAnnotation = unwrappedRet
         }
     }
@@ -1387,7 +1389,7 @@ private class EmptyListLocalElemTypeInferrer(
     private fun resolveOwnerKt(rawName: String?): String? =
         when (rawName) {
             null -> null
-            "Self" -> selfTypeName?.substringBefore('<')?.trim()
+            "Self" -> selfTypeName?.headKotlinTypePath()
             else -> rustTypeIdentToKotlin(rawName)
         }
 
@@ -2030,7 +2032,7 @@ internal fun KotlinJ2KEmitter.renderStructDestructuringLocal(
 ): String {
     val structTypeName =
         structPat.path.lastIdentText()?.let {
-            if (it == "Self") selfTypeName?.substringBefore('<')?.trim() else rustTypeIdentToKotlin(it)
+            if (it == "Self") selfTypeName?.headKotlinTypePath() else rustTypeIdentToKotlin(it)
         }
     val isSimpleRhs =
         rhs.all { it.isLetterOrDigit() || it == '_' } ||
@@ -2098,9 +2100,9 @@ internal fun KotlinJ2KEmitter.renderTupleStructDestructuringLocal(
     val rawPathLast = pat.path.lastIdentText()
     val structTypeName =
         if (pat.path.segments.size == 1 && rawPathLast == "Self" && selfTypeName != null) {
-            selfTypeName.substringBefore('<')
+            selfTypeName.headKotlinTypePath()
         } else {
-            renderPathAsType(pat.path, selfTypeName).substringBefore('<')
+            renderPathAsType(pat.path, selfTypeName).headKotlinTypePath()
         }
     val unwrappedInit = initExpr?.let(::unwrapParenOrGroupExpr)
     val isMutBorrow =
@@ -2117,7 +2119,8 @@ internal fun KotlinJ2KEmitter.renderTupleStructDestructuringLocal(
         val ktVar = bindScopedValueIdent(raw, identPat.ident.span(), isMutBorrow || isMutBinding)
         if (fieldTy != null) {
             currentTypedLocals = currentTypedLocals + (ktVar to fieldTy)
-            val fieldHead = fieldTy.substringBefore('<')
+            val parsedFieldTy = fieldTy.asKotlinRenderedType()
+            val fieldHead = if (parsedFieldTy?.isNullable == true) "" else parsedFieldTy?.headPath.orEmpty()
             if (fieldHead in setOf("MutableList", "ArrayList", "Vec", "List")) {
                 currentMutableListLocals = currentMutableListLocals + ktVar
             } else if (fieldHead in setOf("VecDeque", "ArrayDeque")) {

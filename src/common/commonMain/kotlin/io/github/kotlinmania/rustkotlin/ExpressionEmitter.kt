@@ -691,7 +691,7 @@ internal fun KotlinJ2KEmitter.renderExprStruct(expr: Expr.Struct, indent: String
                     } + rawSegments.last()
                 }
             if (typeSegments.isEmpty()) {
-                selfTypeName?.substringBefore('<')?.trim() ?: "Any"
+                selfTypeName?.headKotlinTypePath() ?: "Any"
             } else {
                 val mappedSegs =
                     typeSegments.mapIndexed { idx, seg ->
@@ -699,7 +699,7 @@ internal fun KotlinJ2KEmitter.renderExprStruct(expr: Expr.Struct, indent: String
                         val isLastSeg = (idx == typeSegments.lastIndex)
                         val importedTypeName = resolveImportedUppercaseTypeBinding(raw)
                         when {
-                            raw == "Self" -> selfTypeName?.substringBefore('<')?.trim() ?: "Self"
+                            raw == "Self" -> selfTypeName?.headKotlinTypePath() ?: "Self"
                             importedTypeName != null -> importedTypeName
                             isLastSeg || raw.first().isUpperCase() -> rustTypeIdentToKotlin(raw)
                             scopeBuilder.isImportedModuleInScope(raw) -> scopeBuilder.resolveModuleBinding(raw)?.kotlinName ?: rustModuleIdentToKotlin(raw)
@@ -709,7 +709,7 @@ internal fun KotlinJ2KEmitter.renderExprStruct(expr: Expr.Struct, indent: String
                 mappedSegs.joinToString(".")
             }
         }
-    val ctorBase = ctorPath.substringAfterLast('.').substringBefore('<').trim()
+    val ctorBase = ctorPath.simpleKotlinTypeName()
     if (!ctorPath.contains('.') &&
         ctorBase !in inspector.declaredTypeNames &&
         headerContext.crateSymbolSubpackages.isNotEmpty()
@@ -756,16 +756,12 @@ internal fun KotlinJ2KEmitter.renderExprStruct(expr: Expr.Struct, indent: String
                     currentExpectedParseTargetType = prevFieldParseTarget
                 }
             if (valText == "ArrayDeque()" && fieldSynTy != null && renderedFieldTy != null) {
-                val traitBase = renderedFieldTy.substringBefore('<').trim()
+                val parsedFieldTy = renderedFieldTy.asKotlinRenderedType()
+                val traitBase = parsedFieldTy?.headPath.orEmpty()
                 val traitDecl = lookupDeclaredTraitAst(traitBase)
                 val iterSpec = traitDecl?.let { extractIteratorSupertraitSpec(it.supertraits.toList(), null) }
                 if (traitDecl != null && iterSpec != null) {
-                    val elemTy =
-                        if ('<' in renderedFieldTy && renderedFieldTy.endsWith(">")) {
-                            renderedFieldTy.substringAfter('<').removeSuffix(">").trim()
-                        } else {
-                            iterSpec.itemType
-                        }
+                    val elemTy = parsedFieldTy?.singleTypeArg ?: iterSpec.itemType
                     val methodStubs = mutableListOf<String>()
                     methodStubs += "override fun next(): $elemTy? = null"
                     if (iterSpec.hasDoubleEnded) {
