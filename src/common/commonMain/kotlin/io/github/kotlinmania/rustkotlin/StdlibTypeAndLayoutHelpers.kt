@@ -5,31 +5,23 @@ import io.github.kotlinmania.syn.Member
 import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.SynType
 
-internal val SIZED_TYPE_PROPERTY_NAMES: Set<String> =
-    wordSet("SIZE ALIGN ALIGNMENT IS_ZST LAYOUT MAX_SLICE_LEN")
+internal val SIZED_TYPE_PROPERTY_NAMES: Set<String>
+    get() = activeRules().words("sizedTypePropertyNames")
 
-private val ALLOC_SINGLE_DEFAULT_GLOBAL_TYPES: Set<String> =
-    wordSet("Box Vec Arc Rc RawVec VecDeque LinkedList BinaryHeap BTreeSet BoxedArrayIntoIter")
+private val ALLOC_SINGLE_DEFAULT_GLOBAL_TYPES: Set<String>
+    get() = activeRules().words("allocSingleDefaultGlobalTypes")
 
-private val ALLOC_INTO_ITER_MODULE_HINTS: Set<String> =
-    wordSet("vec binary_heap linked_list vec_deque btree boxed alloc")
+private val ALLOC_INTO_ITER_MODULE_HINTS: Set<String>
+    get() = activeRules().words("allocIntoIterModuleHints")
 
-private val STDLIB_CONST_PTR_FIRST_ARG_CALLS: Set<String> =
-    wordSet(
-        "copy_nonoverlapping copy read read_unaligned read_volatile slice_from_raw_parts",
-        "align_offset for_value_raw is_dangling Arc::from_raw Arc::from_raw_in",
-        "Rc::from_raw Rc::from_raw_in Weak::from_raw Weak::from_raw_in",
-        "UniqueArc::from_raw_with_allocator ptr::hash",
-    )
+private val STDLIB_CONST_PTR_FIRST_ARG_CALLS: Set<String>
+    get() = activeRules().words("stdlibConstPtrFirstArgCalls")
 
-private val STDLIB_CONST_PTR_TWO_ARG_CALLS: Set<String> =
-    wordSet("ptr::eq ptr::addr_eq")
+private val STDLIB_CONST_PTR_TWO_ARG_CALLS: Set<String>
+    get() = activeRules().words("stdlibConstPtrTwoArgCalls")
 
-private val STDLIB_CONST_PTR_FIRST_ARG_METHODS: Set<String> =
-    wordSet(
-        "with_metadata_of offset_from byte_offset_from offset_from_unsigned",
-        "byte_offset_from_unsigned sub_ptr copy_from copy_from_nonoverlapping addr_eq",
-    )
+private val STDLIB_CONST_PTR_FIRST_ARG_METHODS: Set<String>
+    get() = activeRules().words("stdlibConstPtrFirstArgMethods")
 
 private object StdlibSpecialTypeCatalog {
     data class AtomicSpec(
@@ -40,80 +32,71 @@ private object StdlibSpecialTypeCatalog {
         val storage: Pair<String, String>? = null,
     )
 
-    val nonZeroByRawPrim: Map<String, String> =
-        mapOf(
-            "u8" to "NonZeroU8Inner",
-            "u16" to "NonZeroU16Inner",
-            "u32" to "NonZeroU32Inner",
-            "u64" to "NonZeroU64Inner",
-            "u128" to "NonZeroU128Inner",
-            "usize" to "NonZeroUsizeInner",
-            "i8" to "NonZeroI8Inner",
-            "i16" to "NonZeroI16Inner",
-            "i32" to "NonZeroI32Inner",
-            "i64" to "NonZeroI64Inner",
-            "i128" to "NonZeroI128Inner",
-            "isize" to "NonZeroIsizeInner",
-            "char" to "NonZeroCharInner",
-        )
+    private class AtomicTables(
+        val byOwner: Map<String, AtomicSpec>,
+        val byRawPrim: Map<String, AtomicSpec>,
+        val storageByKtType: Map<String, Pair<String, String>>,
+        val ownerByNonIntKtType: Map<String, String>,
+    )
 
-    val nonZeroByKtType: Map<String, String> =
-        mapOf(
-            "UByte" to "NonZeroU8Inner",
-            "UShort" to "NonZeroU16Inner",
-            "UInt" to "NonZeroU32Inner",
-            "ULong" to "NonZeroU64Inner",
-            "U128" to "NonZeroU128Inner",
-            "Byte" to "NonZeroI8Inner",
-            "Short" to "NonZeroI16Inner",
-            "Int" to "NonZeroI32Inner",
-            "Long" to "NonZeroI64Inner",
-            "I128" to "NonZeroI128Inner",
-            "RustChar" to "NonZeroCharInner",
-            "Char" to "NonZeroCharInner",
-        )
+    val nonZeroByRawPrim: Map<String, String>
+        get() = activeRules().map("nonZeroByRawPrim")
 
-    private val atomicSpecs: List<AtomicSpec> =
-        listOf(
-            AtomicSpec("AtomicBool", "bool", "Boolean", storage = "Align1" to "UByte"),
-            AtomicSpec("AtomicU8", "u8", "UByte", NumericKind.U8, "Align1" to "UByte"),
-            AtomicSpec("AtomicI8", "i8", "Byte", NumericKind.I8, "Align1" to "Byte"),
-            AtomicSpec("AtomicU16", "u16", "UShort", NumericKind.U16, "Align2" to "UShort"),
-            AtomicSpec("AtomicI16", "i16", "Short", NumericKind.I16, "Align2" to "Short"),
-            AtomicSpec("AtomicU32", "u32", "UInt", NumericKind.U32, "Align4" to "UInt"),
-            AtomicSpec("AtomicI32", "i32", "Int", NumericKind.I32, "Align4" to "Int"),
-            AtomicSpec("AtomicU64", "u64", "ULong", NumericKind.U64, "Align8" to "ULong"),
-            AtomicSpec("AtomicI64", "i64", "Long", NumericKind.I64, "Align8" to "Long"),
-            AtomicSpec("AtomicU128", "u128", "U128", NumericKind.U128),
-            AtomicSpec("AtomicI128", "i128", "I128", NumericKind.I128),
-            AtomicSpec("AtomicUsize", "usize", "Int", NumericKind.I32, "Align8" to "Int"),
-            AtomicSpec("AtomicIsize", "isize", "Int", NumericKind.I32, "Align8" to "Int"),
-            AtomicSpec("AtomicPtr", null, "MutPtr", storage = "Align8" to "MutPtr"),
-        )
+    val nonZeroByKtType: Map<String, String>
+        get() = activeRules().map("nonZeroByKtType")
 
-    val atomicByOwner: Map<String, AtomicSpec> = atomicSpecs.associateBy { it.ownerSimple }
-    val atomicByRawPrim: Map<String, AtomicSpec> =
-        buildMap {
-            for (spec in atomicSpecs) {
-                spec.rawPrim?.let { put(it, spec) }
-            }
-        }
-    val atomicStorageByKtType: Map<String, Pair<String, String>> =
-        buildMap {
-            for (spec in atomicSpecs) {
-                if (spec.storage != null && spec.ktValueType !in this) {
-                    put(spec.ktValueType, spec.storage)
+    private val atomicTablesMemo =
+        RegistryMemo { reg ->
+            val specs =
+                reg.mappings("atomicSpecs").map { node ->
+                    val alignType = node.optionalString("alignType")
+                    val storageType = node.optionalString("storageType")
+                    AtomicSpec(
+                        ownerSimple = node.string("owner"),
+                        rawPrim = node.optionalString("rawPrim"),
+                        ktValueType = node.string("ktValueType"),
+                        numericKind = node.optionalString("numericKind")?.let(NumericKind::valueOf),
+                        storage = if (alignType != null && storageType != null) alignType to storageType else null,
+                    )
                 }
-            }
-            put("ConstPtr", "Align8" to "ConstPtr")
+            AtomicTables(
+                byOwner = specs.associateBy { it.ownerSimple },
+                byRawPrim =
+                    buildMap {
+                        for (spec in specs) {
+                            spec.rawPrim?.let { put(it, spec) }
+                        }
+                    },
+                storageByKtType =
+                    buildMap {
+                        for (spec in specs) {
+                            if (spec.storage != null && spec.ktValueType !in this) {
+                                put(spec.ktValueType, spec.storage)
+                            }
+                        }
+                        put("ConstPtr", "Align8" to "ConstPtr")
+                    },
+                ownerByNonIntKtType =
+                    buildMap {
+                        for (spec in specs) {
+                            if (spec.ktValueType != "Int") put(spec.ktValueType, spec.ownerSimple)
+                        }
+                        put("ConstPtr", "AtomicPtr")
+                    },
+            )
         }
-    val atomicOwnerByNonIntKtType: Map<String, String> =
-        buildMap {
-            for (spec in atomicSpecs) {
-                if (spec.ktValueType != "Int") put(spec.ktValueType, spec.ownerSimple)
-            }
-            put("ConstPtr", "AtomicPtr")
-        }
+
+    val atomicByOwner: Map<String, AtomicSpec>
+        get() = atomicTablesMemo.get().byOwner
+
+    val atomicByRawPrim: Map<String, AtomicSpec>
+        get() = atomicTablesMemo.get().byRawPrim
+
+    val atomicStorageByKtType: Map<String, Pair<String, String>>
+        get() = atomicTablesMemo.get().storageByKtType
+
+    val atomicOwnerByNonIntKtType: Map<String, String>
+        get() = atomicTablesMemo.get().ownerByNonIntKtType
 
     fun lookupNonZeroInner(rawPrim: String?, ktType: String?): String? =
         rawPrim?.let(nonZeroByRawPrim::get) ?: ktType?.let(nonZeroByKtType::get)
@@ -130,7 +113,7 @@ internal fun isUntypedTaggedSumScrutinee(
     val clean = renderedType?.removeSuffix("?")?.trim() ?: return false
     if (clean == "Any" || clean == "RustAny" || clean == "*" || clean == "Nothing") return true
     if (clean.length == 1 && clean[0] in 'A'..'Z') return true
-    val simpleBase = clean.substringBefore('<').substringAfterLast('.').trim()
+    val simpleBase = clean.simpleKotlinTypeName()
     return if (isControlFlow) simpleBase != "ControlFlow" else simpleBase != "Result" && simpleBase != "RustResult"
 }
 
@@ -286,14 +269,15 @@ internal fun KotlinJ2KEmitter.resolveNonZeroNewExplicitTypeArgs(
         return hintParsed
     }
     if ("NonZeroInner" in currentTraitAssocParamNames) {
-        val tArg = inferExprRenderedType(args[0], selfTypeName)?.removeSuffix("?")?.trim() ?: "T"
+        val tArg = inferExprRenderedType(args[0], selfTypeName).asKotlinRenderedType()?.nonNullText ?: "T"
         return "NonZeroInner" to tArg
     }
     val argExpr = unwrapParenOrGroupExpr(args[0])
     val fieldPrim =
         (argExpr as? Expr.Field)?.let { f ->
-            val recvRendered = inferExprRenderedType(f.base, selfTypeName)?.substringBefore('<')?.removeSuffix("?")?.trim()
-            val ownerSimple = recvRendered?.substringAfterLast('.') ?: selfTypeName?.substringBefore('<')?.trim()
+            val ownerSimple =
+                inferExprRenderedType(f.base, selfTypeName).asKotlinRenderedType()?.simpleName
+                    ?: selfTypeName.asKotlinRenderedType()?.simpleName
             val fieldsByName = ownerSimple?.let { inspector.structFieldSynTypesByType[it] }
             val candidateNames =
                 when (val mem = f.member) {
@@ -324,20 +308,18 @@ internal fun KotlinJ2KEmitter.resolveStdlibUnitStructValueExpr(rawSegNames: List
     val leaf = rawSegNames.lastOrNull()?.removePrefix("r#") ?: return null
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
     val fq =
-        when (leaf) {
-            "AllocError" -> "$coreNs.alloc.AllocError"
-            "LayoutError" -> "$coreNs.alloc.layout.LayoutError"
-            "ParseBoolError" -> "$coreNs.str.error.ParseBoolError"
-            "Global" -> headerContext.crateNamespaces["alloc"]?.let { "$it.alloc.Global" }
-            "System" -> headerContext.crateNamespaces["std"]?.let { "$it.alloc.System" }
-            "Error" ->
-                if (rawSegNames.size >= 2 && rawSegNames[rawSegNames.lastIndex - 1].removePrefix("r#") == "fmt") {
-                    "$coreNs.fmt.Error"
-                } else {
-                    null
-                }
-            else -> null
-        } ?: return null
+        activeRules().map("stdlibCoreUnitStructs")[leaf]?.let { "$coreNs.$it" }
+            ?: when (leaf) {
+                "Global" -> headerContext.crateNamespaces["alloc"]?.let { "$it.alloc.Global" }
+                "System" -> headerContext.crateNamespaces["std"]?.let { "$it.alloc.System" }
+                "Error" ->
+                    if (rawSegNames.size >= 2 && rawSegNames[rawSegNames.lastIndex - 1].removePrefix("r#") == "fmt") {
+                        "$coreNs.fmt.Error"
+                    } else {
+                        null
+                    }
+                else -> null
+            } ?: return null
     return "${bindOrQualifyResolvedCrossSymbol(fq)}()"
 }
 
@@ -360,7 +342,7 @@ internal fun isStdlibConstPtrMethodParam(rawMethod: String, paramSyn: SynType?, 
 
 /** Coerces a rendered `MutPtr` expression to `ConstPtr` using `asConstPtr()`. */
 internal fun coerceMutPtrArgToConstPtr(renderedArg: String, inferredArgType: String?): String {
-    val clean = inferredArgType?.removeSuffix("?")?.substringBefore('<')?.trim() ?: return renderedArg
+    val clean = inferredArgType?.headKotlinTypePath() ?: return renderedArg
     if (clean != "MutPtr" && !clean.endsWith(".MutPtr")) return renderedArg
     val trimmed = renderedArg.trim()
     if (trimmed.endsWith(".asConstPtr()") || trimmed.startsWith("ConstPtr(")) return renderedArg

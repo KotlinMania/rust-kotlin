@@ -27,11 +27,8 @@ import io.github.kotlinmania.syn.TraitItem
 import io.github.kotlinmania.syn.UnOp
 import io.github.kotlinmania.syn.gen.Visit
 
-internal val RAW_POINTER_ARITH_METHODS: Set<String> =
-    wordSet(
-        "offset add sub wrapping_offset wrapping_add wrapping_sub",
-        "byte_offset byte_add byte_sub wrapping_byte_offset wrapping_byte_add wrapping_byte_sub",
-    )
+internal val RAW_POINTER_ARITH_METHODS: Set<String>
+    get() = activeRules().words("rawPointerArithMethods")
 
 internal fun Expr.MethodCall.firstTurbofishTypeArg(): SynType? {
     val argList = turbofish?.args?.toList() ?: return null
@@ -77,47 +74,44 @@ internal object PrimitiveArrayTypeCatalog {
         val layoutFactory: String,
     )
 
-    private val SPECS: List<Spec> =
-        listOf(
-            Spec("BooleanArray", "Boolean", null, "booleanArray"),
-            Spec("ByteArray", "Byte", NumericKind.I8, "byteArray"),
-            Spec("UByteArray", "UByte", NumericKind.U8, "uByteArray"),
-            Spec("ShortArray", "Short", NumericKind.I16, "shortArray"),
-            Spec("UShortArray", "UShort", NumericKind.U16, "uShortArray"),
-            Spec("IntArray", "Int", NumericKind.I32, "intArray"),
-            Spec("UIntArray", "UInt", NumericKind.U32, "uIntArray"),
-            Spec("LongArray", "Long", NumericKind.I64, "longArray"),
-            Spec("ULongArray", "ULong", NumericKind.U64, "uLongArray"),
-            Spec("FloatArray", "Float", NumericKind.F32, "floatArray"),
-            Spec("DoubleArray", "Double", NumericKind.F64, "doubleArray"),
-        )
+    private class Tables(
+        val byArrayType: Map<String, Spec>,
+        val factoryByKind: Map<NumericKind, String>,
+        val arrayByElem: Map<String, String>,
+    )
 
-    private val BY_ARRAY_TYPE: Map<String, Spec> = SPECS.associateBy { it.arrayType }
-    private val FACTORY_BY_KIND: Map<NumericKind, String> =
-        SPECS
-            .mapNotNull { spec -> spec.numericKind?.let { it to spec.layoutFactory } }
-            .toMap()
-    private val ARRAY_BY_ELEM: Map<String, String> =
-        SPECS.associate { it.elemType to it.arrayType } + ("kotlin.Float" to "FloatArray")
+    private val tablesMemo =
+        RegistryMemo { reg ->
+            val specs =
+                reg.mappings("primitiveArraySpecs").map { node ->
+                    Spec(
+                        arrayType = node.string("arrayType"),
+                        elemType = node.string("elemType"),
+                        numericKind = node.optionalString("numericKind")?.let(NumericKind::valueOf),
+                        layoutFactory = node.string("layoutFactory"),
+                    )
+                }
+            Tables(
+                byArrayType = specs.associateBy { it.arrayType },
+                factoryByKind =
+                    specs
+                        .mapNotNull { spec -> spec.numericKind?.let { it to spec.layoutFactory } }
+                        .toMap(),
+                arrayByElem = specs.associate { it.elemType to it.arrayType } + ("kotlin.Float" to "FloatArray"),
+            )
+        }
 
-    private val NUMERIC_KIND_BY_ELEM: Map<String, NumericKind> =
-        mapOf(
-            "Byte" to NumericKind.I8,
-            "UByte" to NumericKind.U8,
-            "Short" to NumericKind.I16,
-            "UShort" to NumericKind.U16,
-            "Int" to NumericKind.I32,
-            "UInt" to NumericKind.U32,
-            "Long" to NumericKind.I64,
-            "ULong" to NumericKind.U64,
-            "I128" to NumericKind.I128,
-            "U128" to NumericKind.U128,
-            "F16" to NumericKind.F16,
-            "Float" to NumericKind.F32,
-            "kotlin.Float" to NumericKind.F32,
-            "Double" to NumericKind.F64,
-            "F128" to NumericKind.F128,
-        )
+    private val BY_ARRAY_TYPE: Map<String, Spec>
+        get() = tablesMemo.get().byArrayType
+
+    private val FACTORY_BY_KIND: Map<NumericKind, String>
+        get() = tablesMemo.get().factoryByKind
+
+    private val ARRAY_BY_ELEM: Map<String, String>
+        get() = tablesMemo.get().arrayByElem
+
+    private val NUMERIC_KIND_BY_ELEM: Map<String, NumericKind>
+        get() = activeRules().numericKindValMap("numericKindByElem")
 
     fun elemKind(containerType: String, coreNs: String): NumericKind? {
         BY_ARRAY_TYPE[containerType]?.numericKind?.let { return it }
@@ -200,7 +194,7 @@ internal fun KotlinJ2KEmitter.extractOwnerAndFieldName(expr: Expr, selfTypeName:
         if (baseCore is Expr.Path && baseCore.qself == null && baseCore.path.segments.len() == 1) {
             val baseRaw = baseCore.path.firstCleanIdent()
             if (baseRaw == "self") {
-                selfTypeName?.substringBefore('<')?.trim()
+                selfTypeName?.headKotlinTypePath()
             } else {
                 val resolvedLocal = baseRaw?.let { scopeBuilder.resolveLocalKotlinName(it) ?: rustValueIdentToKotlin(it) }
                 normalizeDeclaredOwnerType(resolvedLocal?.let { currentTypedLocals[it] })
@@ -249,40 +243,43 @@ internal fun KotlinJ2KEmitter.unwrapZeroArgClosureText(renderedClosure: String):
 internal fun KotlinJ2KEmitter.primitiveArrayElementNumericKind(arrayType: String): NumericKind? =
     PrimitiveArrayTypeCatalog.elemKind(arrayType, CoreIntrinsicLowering.resolveCoreNamespace(headerContext))
 
-internal fun KotlinJ2KEmitter.inferArrayElementNumericKind(expr: Expr, selfTypeName: String?): NumericKind? {
-    var containerTy = inferExprRenderedType(expr, selfTypeName)?.removeSuffix("?")?.trim() ?: return null
-    var depth = 0
-    while (depth <= 6) {
-        primitiveArrayElementNumericKind(containerTy)?.let { return it }
-        extractIndexedElementRenderedType(containerTy, selfTypeName)?.let(this::resolveNumericKind)?.let { return it }
-        if (depth == 6) break
-        val aliasSyn = inspector.typeAliasTargets[containerTy] ?: break
-        val rendered = renderType(aliasSyn, selfTypeName = null).removeSuffix("?").trim()
-        if (rendered == containerTy) break
-        containerTy = rendered
-        depth++
+private inline fun <R : Any> KotlinJ2KEmitter.walkLocalAliasChain(
+    initialRendered: String,
+    selfTypeName: String?,
+    maxSteps: Int = 6,
+    useSimpleLookupKey: Boolean = false,
+    includeCrateDefaults: Boolean = false,
+    step: (KotlinRenderedType) -> R?,
+): R? {
+    var cur = initialRendered
+    for (depth in 0..maxSteps) {
+        val parsed = cur.asKotlinRenderedType() ?: return null
+        step(parsed)?.let { return it }
+        if (depth == maxSteps) break
+        val lookupKey = if (useSimpleLookupKey) parsed.simpleName else parsed.nonNullText
+        val next =
+            inspector.typeAliasTargets[lookupKey]?.let { renderType(it, selfTypeName).trim() }
+                ?: (if (includeCrateDefaults) headerContext.crateTypeAliasDefaults[lookupKey]?.trim() else null)
+                ?: break
+        if (next == cur || next == parsed.nonNullText) break
+        cur = next
     }
     return null
 }
 
-internal fun KotlinJ2KEmitter.extractIndexedElementRenderedType(containerTy: String, selfTypeName: String?): String? {
-    var cur = containerTy.removeSuffix("?").trim()
-    var depth = 0
-    while (depth <= 6) {
-        PrimitiveArrayTypeCatalog.elemType(cur, kotlinF32TypeName())?.let { return it }
-        when {
-            cur.startsWith("List<") && cur.endsWith(">") -> return cur.removePrefix("List<").removeSuffix(">").trim()
-            cur.startsWith("MutableList<") && cur.endsWith(">") -> return cur.removePrefix("MutableList<").removeSuffix(">").trim()
-            cur.startsWith("Array<") && cur.endsWith(">") -> return cur.removePrefix("Array<").removeSuffix(">").trim()
-        }
-        val aliasSyn = inspector.typeAliasTargets[cur] ?: break
-        val next = renderType(aliasSyn, selfTypeName).removeSuffix("?").trim()
-        if (next == cur) break
-        cur = next
-        depth++
+internal fun KotlinJ2KEmitter.inferArrayElementNumericKind(expr: Expr, selfTypeName: String?): NumericKind? {
+    val containerTy = inferExprRenderedType(expr, selfTypeName) ?: return null
+    return walkLocalAliasChain(containerTy, selfTypeName = null) { parsed ->
+        primitiveArrayElementNumericKind(parsed.nonNullText)
+            ?: extractIndexedElementRenderedType(parsed.nonNullText, selfTypeName)?.let(this::resolveNumericKind)
     }
-    return null
 }
+
+internal fun KotlinJ2KEmitter.extractIndexedElementRenderedType(containerTy: String, selfTypeName: String?): String? =
+    walkLocalAliasChain(containerTy, selfTypeName) { parsed ->
+        PrimitiveArrayTypeCatalog.elemType(parsed.nonNullText, kotlinF32TypeName())
+            ?: parsed.singleArgOf("List", "MutableList", "Array")
+    }
 
 internal fun KotlinJ2KEmitter.isKnownNonNullableNonOptionReceiver(
     recvExpr: Expr,
@@ -290,25 +287,20 @@ internal fun KotlinJ2KEmitter.isKnownNonNullableNonOptionReceiver(
     selfTypeName: String?,
 ): Boolean {
     if (renderedReceiver in currentNullableLocals) return false
-    fun isNullableOrOptionShape(ty: String): Boolean =
-        ty.isEmpty() || ty.endsWith("?") || ty == "Any" || ty == "Option" || ty.startsWith("Option<")
+    fun isNullableOrOptionShape(parsed: KotlinRenderedType?): Boolean =
+        parsed == null || parsed.isNullable || parsed.simpleName == "Any" || parsed.simpleName == "Option"
     val rawTy = (currentTypedLocals[renderedReceiver] ?: inferExprRenderedType(recvExpr, selfTypeName))?.trim() ?: return false
-    if (isNullableOrOptionShape(rawTy)) return false
-    var cur = rawTy
-    var depth = 0
-    while (depth < 8) {
-        val base = cur.simpleKotlinTypeName()
-        if (base.isEmpty() || base in activeTypeParamNames) return false
-        val next =
-            inspector.typeAliasTargets[base]?.let { renderType(it, selfTypeName).trim() }
-                ?: headerContext.crateTypeAliasDefaults[base]?.trim()
-                ?: break
-        if (isNullableOrOptionShape(next)) return false
-        if (next == cur) break
-        cur = next
-        depth++
-    }
-    return true
+    val rejected =
+        walkLocalAliasChain(
+            initialRendered = rawTy,
+            selfTypeName = selfTypeName,
+            maxSteps = 8,
+            useSimpleLookupKey = true,
+            includeCrateDefaults = true,
+        ) { parsed ->
+            true.takeIf { isNullableOrOptionShape(parsed) || parsed.simpleName.isEmpty() || parsed.simpleName in activeTypeParamNames }
+        }
+    return rejected == null
 }
 
 internal data class InferExprCacheKey(
@@ -483,7 +475,7 @@ private class ExprTypeInferenceEngine(
             is Expr.Struct ->
                 when (val lastSeg = expr.path.lastIdentText()) {
                     null -> null
-                    "Self" -> selfTypeName?.substringBefore('<')?.trim()
+                    "Self" -> selfTypeName?.headKotlinTypePath()
                     else -> rustTypeIdentToKotlin(lastSeg)
                 }
             is Expr.Path -> inferPathType(expr)
@@ -623,12 +615,8 @@ private class ExprTypeInferenceEngine(
             is Member.Unnamed -> {
                 val idx = member.index.index.toInt()
                 if (ownerKt == "Pair" || ownerKt == "Triple") {
-                    val ltIdx = baseTy.indexOf('<')
-                    val gtIdx = baseTy.lastIndexOf('>')
-                    if (ltIdx >= 0 && gtIdx > ltIdx) {
-                        val typeArgs = PhantomRawPointerTypeStripper.splitTopLevelCommaList(baseTy.substring(ltIdx + 1, gtIdx)).map { it.trim() }
-                        typeArgs.getOrNull(idx)?.let { return it }
-                    }
+                    val tupleArgs = baseTy.asKotlinRenderedType()?.typeArgs
+                    tupleArgs?.getOrNull(idx)?.let { return it }
                 }
                 val arity = inspector.tupleStructArityByType[ownerKt]
                 val primaryField = if (arity != null) tupleFieldPropertyName(idx, arity) else emitter.tupleAccessMemberName(expr.base, idx, selfTypeName)
@@ -762,7 +750,7 @@ private class ExprTypeInferenceEngine(
             segs.size == 1 -> {
                 val raw = segs[0].cleanIdent()
                 when {
-                    raw == "Self" -> selfTypeName?.substringBefore('<')?.trim()
+                    raw == "Self" -> selfTypeName?.headKotlinTypePath()
                     raw.isNotEmpty() && raw.first().isUpperCase() && raw !in inspector.declaredTopLevelFnRawNames -> {
                         val ktType = rustTypeIdentToKotlin(raw)
                         val knownCrateType =
@@ -825,7 +813,7 @@ private class ExprTypeInferenceEngine(
         val methodKt = rustFunctionIdentToKotlin(lastRaw)
         val ownerKt =
             when {
-                penultRaw == "Self" -> selfTypeName?.substringBefore('<')?.trim()
+                penultRaw == "Self" -> selfTypeName?.headKotlinTypePath()
                 penultRaw.isNotEmpty() && penultRaw.first().isUpperCase() -> rustTypeIdentToKotlin(penultRaw)
                 else -> null
             }
@@ -865,7 +853,7 @@ private class ExprTypeInferenceEngine(
                 return registerCorePtrType(isMut = rawMethod == "as_mut_ptr", pointee = emitter.renderType(arrayLocal.second, selfTypeName))
             }
             val recvRendered = lazyRecvType
-            val recvBase = recvRendered?.removeSuffix("?")?.substringBefore('<')?.trim()
+            val recvBase = recvRendered?.headKotlinTypePath()
             if (recvBase != null && (recvBase in MUT_PTR_CONTAINER_BASES || MUT_PTR_CONTAINER_BASES.any { recvBase.endsWith(".$it") })) {
                 return registerCorePtrType(isMut = true)
             }
@@ -1006,20 +994,15 @@ private class ExprTypeInferenceEngine(
             (mutableReferencePointeeType(receiverType) ?: refCellGuardPointeeType(receiverType) ?: receiverType)
                 .removeSuffix("?")
                 .trim()
+        val recvParsed = recvTy.asKotlinRenderedType()
         if (isMapRenderedType(recvTy) &&
             (rawMethod == "get" || rawMethod == "get_mut" || rawMethod == "remove") &&
-            expr.args.size == 1 &&
-            '<' in recvTy &&
-            recvTy.endsWith('>')
+            expr.args.size == 1
         ) {
-            val innerArgs = recvTy.substringAfter('<').dropLast(1)
-            val comma = findTopLevelGenericCommaIndex(innerArgs)
-            if (comma >= 0) {
-                val valTy = innerArgs.substring(comma + 1).trim()
-                if (valTy.isNotEmpty() && valTy != "*") return "$valTy?"
-            }
+            val valTy = recvParsed?.pairTypeArgs?.second
+            if (!valTy.isNullOrEmpty() && valTy != "*") return "$valTy?"
         }
-        val ownerKt = recvTy.simpleKotlinTypeName()
+        val ownerKt = recvParsed?.simpleName.orEmpty()
         if (ownerKt.isEmpty()) return null
         val methodKt = rustFunctionIdentToKotlin(rawMethod)
         emitter.mutablePlaceReturnType(ownerKt, rawMethod)?.let { return it }
@@ -1132,62 +1115,30 @@ private class ExprTypeInferenceEngine(
                 listOf("core", "option", "Option", "None"),
                 listOf("std", "option", "Option", "None"),
             )
-        private val NON_OPTION_METHOD_NAMES: Set<String> =
-            wordSet("ok_or ok_or_else is_ok is_err is_some is_none map_err to_lowercase to_uppercase")
-        private val OPTION_CHAIN_PRESERVING_METHODS: Set<String> =
-            wordSet("map and_then flatten or or_else as_ref as_mut cloned copied filter")
-        private val NULLABLE_NEW_WRAPPER_OWNERS: Set<String> = wordSet("NonNull NonZero Alignment")
-        private val LAYOUT_QUERY_FN_IDENTS: Set<String> = wordSet("size_of size_of_val align_of align_of_val")
-        private val MUT_PTR_CONTAINER_BASES: Set<String> = wordSet("NonNull Unique BoxRaw")
-        private val ENDIAN_INT_METHODS: Set<String> = wordSet("to_be from_be swap_bytes to_le from_le")
-        private val OPTION_UNWRAP_SINGLE_ARG_METHODS: Set<String> = wordSet("expect unwrap_or unwrap_or_else")
-        private val OPTION_ZERO_ARG_IDENTITY_METHODS: Set<String> = wordSet("cloned copied as_ref as_mut")
-        private val ATOMIC_VALUE_RETURNING_METHODS: Set<String> =
-            wordSet("load swap into_inner fetch_add fetch_sub fetch_and fetch_or fetch_xor fetch_max fetch_min")
-        private val FMT_DEBUG_BUILDER_RETURNS: Map<String, String> =
-            mapOf(
-                "debug_struct" to "DebugStruct",
-                "debug_tuple" to "DebugTuple",
-                "debug_list" to "DebugList",
-                "debug_set" to "DebugSet",
-                "debug_map" to "DebugMap",
-            )
-        private val FLOAT_SUFFIX_NUMERIC_KINDS: Map<String, NumericKind> =
-            mapOf(
-                "f16" to NumericKind.F16,
-                "f32" to NumericKind.F32,
-                "f64" to NumericKind.F64,
-                "f128" to NumericKind.F128,
-            )
-        private val INT_SUFFIX_NUMERIC_KINDS: Map<String, NumericKind> =
-            mapOf(
-                "i8" to NumericKind.I8,
-                "u8" to NumericKind.U8,
-                "i16" to NumericKind.I16,
-                "u16" to NumericKind.U16,
-                "i32" to NumericKind.I32,
-                "u32" to NumericKind.U32,
-                "i64" to NumericKind.I64,
-                "u64" to NumericKind.U64,
-                "i128" to NumericKind.I128,
-                "u128" to NumericKind.U128,
-            )
+        private val NON_OPTION_METHOD_NAMES: Set<String> get() = activeRules().words("nonOptionMethodNames")
+        private val OPTION_CHAIN_PRESERVING_METHODS: Set<String>
+            get() = activeRules().words("optionChainPreservingMethods")
+        private val NULLABLE_NEW_WRAPPER_OWNERS: Set<String> get() = activeRules().words("nullableNewWrapperOwners")
+        private val LAYOUT_QUERY_FN_IDENTS: Set<String> get() = activeRules().words("layoutQueryFnIdents")
+        private val MUT_PTR_CONTAINER_BASES: Set<String> get() = activeRules().words("mutPtrContainerBases")
+        private val ENDIAN_INT_METHODS: Set<String> get() = activeRules().words("endianIntMethods")
+        private val OPTION_UNWRAP_SINGLE_ARG_METHODS: Set<String>
+            get() = activeRules().words("optionUnwrapSingleArgMethods")
+        private val OPTION_ZERO_ARG_IDENTITY_METHODS: Set<String>
+            get() = activeRules().words("optionZeroArgIdentityMethods")
+        private val ATOMIC_VALUE_RETURNING_METHODS: Set<String>
+            get() = activeRules().words("atomicValueReturningMethods")
+        private val FMT_DEBUG_BUILDER_RETURNS: Map<String, String>
+            get() = activeRules().map("fmtDebugBuilderReturns")
+        private val FLOAT_SUFFIX_NUMERIC_KINDS: Map<String, NumericKind>
+            get() = activeRules().numericKindValMap("floatSuffixNumericKinds")
+        private val INT_SUFFIX_NUMERIC_KINDS: Map<String, NumericKind>
+            get() = activeRules().numericKindValMap("intSuffixNumericKinds")
     }
 }
 
-internal val NUMERIC_COERCE_SUFFIX_BY_KIND: Map<NumericKind, String> =
-    mapOf(
-        NumericKind.U8 to "toUByte()",
-        NumericKind.U16 to "toUShort()",
-        NumericKind.U32 to "toUInt()",
-        NumericKind.U64 to "toULong()",
-        NumericKind.I8 to "toByte()",
-        NumericKind.I16 to "toShort()",
-        NumericKind.I32 to "toInt()",
-        NumericKind.I64 to "toLong()",
-        NumericKind.F32 to "toFloat()",
-        NumericKind.F64 to "toDouble()",
-    )
+internal val NUMERIC_COERCE_SUFFIX_BY_KIND: Map<NumericKind, String>
+    get() = activeRules().numericKindKeyMap("numericCoerceSuffixByKind")
 
 private val NUMERIC_KIND_BY_NAME: Map<String, NumericKind> = NumericKind.entries.associateBy { it.name }
 
@@ -1368,15 +1319,12 @@ internal fun KotlinJ2KEmitter.mutablePlaceReturnType(
         if (tail.semiToken != null) return null
         // A second exit would need its own place proof. Do not change the
         // function contract based on only one of multiple return paths.
-        var hasExplicitReturn = false
         val returnVisitor =
-            object : Visit() {
-                override fun visitExprReturn(e: Expr.Return) {
-                    hasExplicitReturn = true
-                }
+            object : ScopedPredicateAstVisitor(skipNestedClosures = true) {
+                override fun visitExprReturn(e: Expr.Return) = markMatched()
             }
         for (stmt in fn.block.stmts) returnVisitor.visitStmt(stmt)
-        if (hasExplicitReturn) return null
+        if (returnVisitor.matched) return null
         val call = unwrapParenOrGroupExpr(tail.expr) as? Expr.MethodCall ?: return null
         if (!call.args.isEmpty() || call.turbofish != null) return null
         val receiver = unwrapParenOrGroupExpr(call.receiver) as? Expr.Path ?: return null
@@ -1388,55 +1336,36 @@ internal fun KotlinJ2KEmitter.mutablePlaceReturnType(
     }
 }
 
-internal val STR_PRIMITIVE_PARSE_METHODS: Map<String, String> =
-    mapOf(
-        "Boolean" to "toBooleanStrictOrNull()",
-        "Byte" to "toByteOrNull()",
-        "UByte" to "toUByteOrNull()",
-        "Short" to "toShortOrNull()",
-        "UShort" to "toUShortOrNull()",
-        "Int" to "toIntOrNull()",
-        "UInt" to "toUIntOrNull()",
-        "Long" to "toLongOrNull()",
-        "ULong" to "toULongOrNull()",
-        "Float" to "toFloatOrNull()",
-        "kotlin.Float" to "toFloatOrNull()",
-        "Double" to "toDoubleOrNull()",
-    )
+internal val STR_PRIMITIVE_PARSE_METHODS: Map<String, String>
+    get() = activeRules().map("strPrimitiveParseMethods")
 
-internal fun refCellGuardPointeeType(type: String?): String? {
-    val base = type?.trim()?.removeSuffix("?") ?: return null
-    if (!base.endsWith('>')) return null
-    val simple = base.simpleKotlinTypeName()
-    if (simple != "Ref" && simple != "RefMut") return null
-    val inner = base.substringAfter('<').dropLast(1).trim()
-    return inner.ifEmpty { null }
-}
+internal fun refCellGuardPointeeType(type: String?): String? =
+    type.asKotlinRenderedType()?.singleArgOf("Ref", "RefMut")
 
-private val MAP_TYPE_PREFIXES = listOf("MutableMap<", "Map<", "LinkedHashMap<", "HashMap<")
-private val SET_TYPE_PREFIXES = listOf("MutableSet<", "Set<", "LinkedHashSet<", "HashSet<")
-private val INDEXED_SLICE_BASES = wordSet("List MutableList Array ArrayDeque")
+private val MAP_SIMPLE_NAMES: Set<String> get() = activeRules().words("mapSimpleNames")
+private val SET_SIMPLE_NAMES: Set<String> get() = activeRules().words("setSimpleNames")
+private val INDEXED_SLICE_BASES: Set<String> get() = activeRules().words("indexedSliceBases")
 
 internal fun isMapRenderedType(type: String?): Boolean {
-    val clean = type?.removeSuffix("?")?.trim() ?: return false
-    return MAP_TYPE_PREFIXES.any(clean::startsWith)
+    val parsed = type.asKotlinRenderedType() ?: return false
+    return parsed.hasTypeArgs && parsed.simpleName in MAP_SIMPLE_NAMES
 }
 
 internal fun isSetRenderedType(type: String?): Boolean {
-    val clean = type?.removeSuffix("?")?.trim() ?: return false
-    return SET_TYPE_PREFIXES.any(clean::startsWith)
+    val parsed = type.asKotlinRenderedType() ?: return false
+    return parsed.hasTypeArgs && parsed.simpleName in SET_SIMPLE_NAMES
 }
 
 internal fun isIndexedSliceOrArrayRenderedType(type: String?): Boolean {
-    val base = type?.trim()?.removeSuffix("?")?.simpleKotlinTypeName() ?: return false
+    val base = type.asKotlinRenderedType()?.simpleName ?: return false
     return base in PRIMITIVE_ARRAY_TYPES || base in INDEXED_SLICE_BASES
 }
 
 internal fun mutablePlaceValueType(type: String?): String? =
     type
-        ?.takeIf { it.startsWith("kotlin.reflect.KMutableProperty0<") && it.endsWith('>') }
-        ?.removePrefix("kotlin.reflect.KMutableProperty0<")
-        ?.dropLast(1)
+        .asKotlinRenderedType()
+        ?.takeIf { !it.isNullable && it.headPath == "kotlin.reflect.KMutableProperty0" }
+        ?.singleTypeArg
 
 internal fun KotlinJ2KEmitter.mutableReferenceProjection(
     owner: String,
@@ -1471,7 +1400,7 @@ internal fun KotlinJ2KEmitter.mutableReferenceProjection(
             var takesOwnerAddress = false
             while (cast is Expr.Cast) {
                 val pointer = cast.ty as? SynType.Ptr ?: return null
-                if (renderType(pointer.elem, owner).substringBefore('<') == owner) takesOwnerAddress = true
+                if (renderType(pointer.elem, owner).headKotlinTypePath() == owner) takesOwnerAddress = true
                 cast = unwrapParenOrGroupExpr(cast.expr)
             }
             if (!takesOwnerAddress || cast !is Expr.Path || cast.qself != null || !cast.path.isIdent("self")) return null
@@ -1503,14 +1432,8 @@ internal fun KotlinJ2KEmitter.mutableReferenceProjection(
     }
 }
 
-internal fun unwrapMaybeUninitRenderedInner(rendered: String?): String? {
-    val clean = rendered?.trim()?.takeIf { it.isNotEmpty() } ?: return null
-    if ((clean.startsWith("MaybeUninit<") || ".MaybeUninit<" in clean) && clean.endsWith(">")) {
-        val inner = clean.substringAfter("MaybeUninit<").removeSuffix(">").trim()
-        return inner.ifEmpty { null }
-    }
-    return null
-}
+internal fun unwrapMaybeUninitRenderedInner(rendered: String?): String? =
+    rendered.asKotlinRenderedType()?.takeIf { !it.isNullable }?.singleArgOf("MaybeUninit")
 
 internal fun KotlinJ2KEmitter.resolveMaybeUninitElementRenderedType(
     callExpr: Expr.Call,
@@ -1527,16 +1450,13 @@ internal fun KotlinJ2KEmitter.resolveMaybeUninitElementRenderedType(
             }
         }
     }
-    if ('<' in renderedCallee && renderedCallee.endsWith(">")) {
-        val tf = renderedCallee.substringAfter('<').removeSuffix(">").trim()
-        if (tf.isNotEmpty() && ',' !in tf) {
-            return unwrapMaybeUninitRenderedInner(tf) ?: tf
-        }
+    KotlinCalleeShape.parse(renderedCallee).typeArgs.singleOrNull()?.let { tf ->
+        return unwrapMaybeUninitRenderedInner(tf) ?: tf
     }
     currentExpectedParseTargetType?.trim()?.takeIf { it.isNotEmpty() && it != "Unit" }?.let { expected ->
         return unwrapMaybeUninitRenderedInner(expected) ?: expected
     }
-    val ownerBase = selfTypeName?.substringBefore('<')?.trim()
+    val ownerBase = selfTypeName?.headKotlinTypePath()
     if (!ownerBase.isNullOrEmpty()) {
         val singleFieldSyn = inspector.structFieldSynTypesByType[ownerBase]?.values?.singleOrNull()
         if (singleFieldSyn != null) {
@@ -1545,7 +1465,7 @@ internal fun KotlinJ2KEmitter.resolveMaybeUninitElementRenderedType(
     }
     currentEnclosingReturnRenderedType?.trim()?.takeIf { it.isNotEmpty() && it != "Unit" }?.let { ret ->
         unwrapMaybeUninitRenderedInner(ret)?.let { return it }
-        if (ownerBase.isNullOrEmpty() || ret.substringBefore('<').trim() != ownerBase) return ret
+        if (ownerBase.isNullOrEmpty() || ret.headKotlinTypePath() != ownerBase) return ret
     }
     return "UByte"
 }
@@ -1753,7 +1673,7 @@ internal fun KotlinJ2KEmitter.resolveCalleeExprParamSynType(
     val penultRaw = segs[segs.size - 2].cleanIdent()
     val ownerKt =
         when {
-            penultRaw == "Self" -> selfTypeName?.substringBefore('<')?.trim()
+            penultRaw == "Self" -> selfTypeName?.headKotlinTypePath()
             penultRaw.isNotEmpty() && penultRaw.first().isUpperCase() -> rustTypeIdentToKotlin(penultRaw)
             else -> null
         } ?: return null
@@ -1912,43 +1832,8 @@ internal fun KotlinJ2KEmitter.methodExpectsMutableListSliceParam(
 internal fun KotlinJ2KEmitter.primitiveArrayTypeForElementRenderedType(elemTy: String?): String? =
     PrimitiveArrayTypeCatalog.arrayTypeForElem(elemTy)
 
-private fun extractCallableReturnRenderedType(renderedCallableType: String?): String? {
-    val raw = renderedCallableType?.trim()?.takeIf { it.isNotEmpty() } ?: return null
-    return CallableReturnTypeWalker(raw).extractReturnType()
-}
-
-private class CallableReturnTypeWalker(
-    source: String,
-) : KotlinTokenWalker(source) {
-    fun extractReturnType(): String? {
-        if (punctAt(0) == '(') {
-            val closeParenIdx = findMatchingParenToken(0)
-            if (closeParenIdx > 0) {
-                val nextIdx = nextNonTriviaIndex(closeParenIdx + 1)
-                if (tokens.getOrNull(nextIdx) is KotlinLexToken.Arrow) {
-                    val retText = source.substring(tokens[nextIdx].end).trim()
-                    return retText.ifEmpty { null }
-                }
-                if (closeParenIdx == tokens.lastIndex - 1 && punctAt(tokens.lastIndex) == '?') {
-                    val inner = source.substring(tokens[0].end, tokens[closeParenIdx].start).trim()
-                    if ("->" in inner) return CallableReturnTypeWalker(inner).extractReturnType()
-                }
-                return null
-            }
-        }
-        val base = source.simpleKotlinTypeName()
-        if (base in FN_TRAIT_NAMES && '<' in source && source.endsWith('>')) {
-            val argsInner = source.substringAfter('<').dropLast(1)
-            val comma = findTopLevelCommaIndex(argsInner)
-            if (comma >= 0) return argsInner.substring(comma + 1).trim().takeIf { it.isNotEmpty() }
-        }
-        return null
-    }
-
-    companion object {
-        private val FN_TRAIT_NAMES = wordSet("Fn FnMut FnOnce")
-    }
-}
+private fun extractCallableReturnRenderedType(renderedCallableType: String?): String? =
+    renderedCallableType.asKotlinRenderedType()?.callableReturnType
 
 internal fun KotlinJ2KEmitter.inferExplicitArrayElementRenderedType(
     elem: Expr,

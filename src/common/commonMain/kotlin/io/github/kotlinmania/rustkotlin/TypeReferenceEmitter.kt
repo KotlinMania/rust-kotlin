@@ -23,53 +23,34 @@ import io.github.kotlinmania.syn.Visibility
 import io.github.kotlinmania.syn.WhereClause
 import io.github.kotlinmania.syn.WherePredicate
 
-private val CORE_OPS_BINARY_TRAITS =
-    wordSet("Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr")
-private val CORE_OPS_UNARY_OUTPUT_TRAITS =
-    wordSet("Neg Not")
-private val CORE_OPS_ASSIGN_TRAITS =
-    CORE_OPS_BINARY_TRAITS.mapTo(linkedSetOf()) { "${it}Assign" }
+private val CORE_OPS_BINARY_TRAITS: Set<String>
+    get() = activeRules().words("coreOpsBinaryTraits")
+private val CORE_OPS_UNARY_OUTPUT_TRAITS: Set<String>
+    get() = activeRules().words("coreOpsUnaryOutputTraits")
 
-private val NUMERIC_SUFFIX_BY_KIND: Map<NumericKind, String> =
-    mapOf(
-        NumericKind.I8 to ".toByte()",
-        NumericKind.U8 to ".toUByte()",
-        NumericKind.I16 to ".toShort()",
-        NumericKind.U16 to ".toUShort()",
-        NumericKind.I32 to ".toInt()",
-        NumericKind.U32 to ".toUInt()",
-        NumericKind.I64 to ".toLong()",
-        NumericKind.U64 to ".toULong()",
-        NumericKind.F16 to ".toF16()",
-        NumericKind.F32 to ".toFloat()",
-        NumericKind.F64 to ".toDouble()",
-        NumericKind.F128 to ".toF128()",
-        NumericKind.I128 to ".toI128()",
-        NumericKind.U128 to ".toU128()",
-    )
+private val CORE_OPS_ASSIGN_TRAITS_MEMO =
+    RegistryMemo { reg -> reg.words("coreOpsBinaryTraits").mapTo(linkedSetOf()) { "${it}Assign" } }
 
-private val BOXED_INT_FROM_SUFFIX_BY_KIND: Map<NumericKind, String> =
-    mapOf(
-        NumericKind.I8 to "fromByte",
-        NumericKind.I16 to "fromShort",
-        NumericKind.I32 to "fromInt",
-        NumericKind.I64 to "fromLong",
-        NumericKind.U8 to "fromUByte",
-        NumericKind.U16 to "fromUShort",
-        NumericKind.U32 to "fromUInt",
-        NumericKind.U64 to "fromULong",
-    )
+private val CORE_OPS_ASSIGN_TRAITS: Set<String>
+    get() = CORE_OPS_ASSIGN_TRAITS_MEMO.get()
 
-private val ZERO_OR_NULL_POINTER_LITERALS = wordSet("0 0L 0u 0uL null")
+private val NUMERIC_SUFFIX_BY_KIND: Map<NumericKind, String>
+    get() = activeRules().numericKindKeyMap("numericSuffixByKind")
 
-private val KOTLIN_BUILTIN_VALUE_TYPE_NAMES: Set<String> =
-    wordSet("Byte Short Int Long UByte UShort UInt ULong Float Double Boolean Char String Unit Any")
+private val BOXED_INT_FROM_SUFFIX_BY_KIND: Map<NumericKind, String>
+    get() = activeRules().numericKindKeyMap("boxedIntFromSuffixByKind")
 
-private val C_POINTER_WIDTH_UNSIGNED_TYPE_NAMES =
-    wordSet("size_t SizeT uintptr_t UintptrT rsize_t RsizeT __size_t")
+private val ZERO_OR_NULL_POINTER_LITERALS: Set<String>
+    get() = activeRules().words("zeroOrNullPointerLiterals")
 
-private val C_POINTER_WIDTH_SIGNED_TYPE_NAMES =
-    wordSet("ssize_t SsizeT ptrdiff_t PtrdiffT intptr_t IntptrT __ssize_t")
+private val KOTLIN_BUILTIN_VALUE_TYPE_NAMES: Set<String>
+    get() = activeRules().words("kotlinBuiltinValueTypeNames")
+
+private val C_POINTER_WIDTH_UNSIGNED_TYPE_NAMES: Set<String>
+    get() = activeRules().words("cPointerWidthUnsignedTypeNames")
+
+private val C_POINTER_WIDTH_SIGNED_TYPE_NAMES: Set<String>
+    get() = activeRules().words("cPointerWidthSignedTypeNames")
 
 internal fun isDecimalOrHexLiteralDigits(text: String): Boolean {
     if (text.isEmpty()) return false
@@ -262,28 +243,12 @@ internal class CastExpressionLowering(
     }
 
     private fun renderBooleanToNumericCast(canonicalNumericTarget: String): String {
+        val tmpl =
+            activeRules().templates("booleanToNumericCastTemplates")[canonicalNumericTarget]
+                ?: return "($inner as $targetType)"
+        if (canonicalNumericTarget == "RustChar") emitter.usesRustChar = true
         val cleanCond = if (emitter.hasOuterBalancedParens(inner)) inner.substring(1, inner.length - 1) else inner
-        val intBranch = "(if ($cleanCond) 1 else 0)"
-        return when (canonicalNumericTarget) {
-            "Byte" -> "$intBranch.toByte()"
-            "Short" -> "$intBranch.toShort()"
-            "Int" -> intBranch
-            "Long" -> "(if ($cleanCond) 1L else 0L)"
-            "I128" -> "(if ($cleanCond) I128.ONE else I128.ZERO)"
-            "UByte" -> "(if ($cleanCond) 1u else 0u).toUByte()"
-            "UShort" -> "(if ($cleanCond) 1u else 0u).toUShort()"
-            "UInt" -> "(if ($cleanCond) 1u else 0u)"
-            "ULong" -> "(if ($cleanCond) 1uL else 0uL)"
-            "U128" -> "(if ($cleanCond) U128.ONE else U128.ZERO)"
-            "Float", "kotlin.Float" -> "(if ($cleanCond) 1.0f else 0.0f)"
-            "Double" -> "(if ($cleanCond) 1.0 else 0.0)"
-            "Char" -> "$intBranch.toChar()"
-            "RustChar" -> {
-                emitter.usesRustChar = true
-                "(if ($cleanCond) RustChar(1u) else RustChar(0u))"
-            }
-            else -> "($inner as $targetType)"
-        }
+        return tmpl.render { if (it == "cond") cleanCond else null }
     }
 
     private fun tryRenderEnumDiscriminantCast(unwrappedSource: Expr, canonicalNumericTarget: String): String? {
@@ -368,17 +333,7 @@ internal fun KotlinJ2KEmitter.renderCastExpression(
     CastExpressionLowering(this, inner, targetType, sourceExpr, selfTypeName).render()
 
 private fun hasTopLevelOperatorOutsidePostfix(s: String): Boolean =
-    !KotlinTokenWalker.scanTopLevelTokens(s, trackAllBrackets = true) { tok, depth ->
-        if (depth != 0) {
-            true
-        } else {
-            when (tok) {
-                is KotlinLexToken.Whitespace, is KotlinLexToken.Newline, is KotlinLexToken.Arrow -> false
-                is KotlinLexToken.Punct -> tok.start == 0 || tok.ch !in "+-*/%&|^=<>"
-                else -> true
-            }
-        }
-    }
+    KotlinTokenWalker.hasTopLevelBinaryOperator(s)
 
 internal fun KotlinJ2KEmitter.isAlreadyRenderedAsNumericKind(rendered: String, kind: NumericKind?): Boolean {
     if (kind == null) return false
@@ -541,24 +496,11 @@ internal fun KotlinJ2KEmitter.isAtomicPostfixReceiver(sourceExpr: Expr, rendered
     }
 }
 
-internal fun KotlinJ2KEmitter.hasOuterBalancedParens(text: String): Boolean {
-    if (text.length < 2 || text.first() != '(' || text.last() != ')') return false
-    return KotlinTokenWalker.scanTopLevelTokens(text, trackAllBrackets = false) { tok, depth ->
-        !(tok is KotlinLexToken.Punct && tok.ch == ')' && depth == 0 && tok.end < text.length)
-    }
-}
+internal fun KotlinJ2KEmitter.hasOuterBalancedParens(text: String): Boolean =
+    KotlinTokenWalker.hasOuterBalancedParens(text)
 
 internal fun KotlinJ2KEmitter.hasNoTopLevelSpacesOrColons(text: String): Boolean =
-    KotlinTokenWalker.scanTopLevelTokens(text, trackAllBrackets = true) { tok, depth ->
-        !(
-            depth == 0 &&
-                (
-                    tok is KotlinLexToken.Whitespace ||
-                        tok is KotlinLexToken.Newline ||
-                        (tok is KotlinLexToken.Punct && tok.ch == ':')
-                )
-        )
-    }
+    KotlinTokenWalker.hasNoTopLevelSpacesOrColons(text)
 
 internal fun KotlinJ2KEmitter.renderType(ty: SynType, selfTypeName: String?): String =
     when (ty) {
@@ -855,7 +797,7 @@ internal class TypePathLoweringContext(
             prefixQualifier.isNotEmpty() ||
             externalQualifiedOverride != null ||
             rawName == "Self" ||
-            ktBaseIdent == selfTypeName?.substringBefore('<')?.trim() ||
+            ktBaseIdent == selfTypeName?.headKotlinTypePath() ||
             ktBaseIdent !in emitter.activeEnclosingEnumVariantNames ||
             ktBaseIdent in emitter.activeTypeParamNames ||
             rawName in PRIMITIVE_TYPE_NAMES
@@ -1148,19 +1090,16 @@ private object StdlibFmtAndFfiTypePathRule : TypePathLoweringRule() {
                 )
         val isAllocFfiCString = rawSegNames.size == 3 && rawSegNames[0] == "alloc" && rawSegNames[1] == "ffi" && symLeaf == "CString"
         if (isSelfContainedLibcFfi && symLeaf !in CoreIntrinsicLowering.STDLIB_CORE_FFI_SYMBOLS) {
+            val rules = activeRules()
             val ptr64 = emitter.activeCfgProfile.pointerWidth != 32
-            when (symLeaf) {
-                "size_t", "usize", "uintptr_t" -> return if (ptr64) "ULong" else "UInt"
-                "ssize_t", "isize", "intptr_t", "ptrdiff_t" -> return if (ptr64) "Long" else "Int"
-                "int8_t" -> return "Byte"
-                "uint8_t" -> return "UByte"
-                "int16_t" -> return "Short"
-                "uint16_t" -> return "UShort"
-                "int32_t", "pid_t", "clockid_t", "wchar_t" -> return "Int"
-                "uint32_t", "uid_t", "gid_t", "socklen_t", "useconds_t", "mode_t" -> return "UInt"
-                "int64_t", "off_t", "time_t", "suseconds_t" -> return "Long"
-                "uint64_t", "dev_t", "ino_t", "rlim_t" -> return "ULong"
-            }
+            val ptrMap =
+                if (ptr64) {
+                    rules.groupedMap("libcSelfContainedPtrWidth64Types")
+                } else {
+                    rules.groupedMap("libcSelfContainedPtrWidth32Types")
+                }
+            ptrMap[symLeaf]?.let { return it }
+            rules.groupedMap("libcSelfContainedFixedScalarTypes")[symLeaf]?.let { return it }
         }
         val resolvedFfiImport =
             when {
@@ -1273,24 +1212,8 @@ private object StdlibResultTypePathRule : TypePathLoweringRule() {
 }
 
 private object StdlibContainerAndPrimitiveTypePathRule : TypePathLoweringRule() {
-    private val erasedSmartPointers = setOf("Box", "Rc", "Arc", "NoDrop", "ManuallyDrop")
-    private val builtinScalarMap =
-        mapOf(
-            "i8" to "Byte",
-            "i16" to "Short",
-            "i32" to "Int",
-            "i64" to "Long",
-            "isize" to "Int",
-            "u8" to "UByte",
-            "u16" to "UShort",
-            "u32" to "UInt",
-            "u64" to "ULong",
-            "usize" to "Int",
-            "f64" to "Double",
-            "bool" to "Boolean",
-            "str" to "String",
-            "char" to "Char",
-        )
+    private val builtinScalarMap: Map<String, String>
+        get() = activeRules().map("builtinScalarTypes")
 
     override fun tryRender(ctx: TypePathLoweringContext): String? {
         val emitter = ctx.emitter
@@ -1364,19 +1287,19 @@ private object StdlibContainerAndPrimitiveTypePathRule : TypePathLoweringRule() 
             val inner = typeArgs[0]
             return if (emitter.isAlreadyNullableRenderedType(inner)) inner else "$inner?"
         }
-        if (rawName == "Padding" && "Padding" !in emitter.inspector.declaredTypeNames && typeArgs.size == 1) {
-            return typeArgs[0]
-        }
-        if (rawName == "MaybeUninit" && "MaybeUninit" !in emitter.inspector.declaredTypeNames && typeArgs.size == 1) {
-            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
-            CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.mem.maybeuninit.MaybeUninit")
-            return "MaybeUninit<${typeArgs[0]}>"
-        }
-        if ((rawName == "Iter" || rawName == "IterMut") && rawSegments.any { it.ident.toString() == "slice" } && typeArgs.isNotEmpty()) {
-            return "ArrayDeque<${typeArgs[0]}>"
-        }
-        if (rawName == "IntoIter" && rawSegments.any { it.ident.toString() == "vec" || it.ident.toString() == "option" } && typeArgs.isNotEmpty()) {
-            return "ArrayDeque<${typeArgs[0]}>"
+        val segmentIdents = rawSegments.map { it.ident.toString() }
+        val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
+        for (rule in activeRules().typeRulesByName[rawName].orEmpty()) {
+            val rendered =
+                rule.tryMatchAndRender(
+                    rawName = rawName,
+                    segmentIdents = segmentIdents,
+                    typeArgs = typeArgs,
+                    declaredTypeNames = emitter.inspector.declaredTypeNames,
+                    coreNs = coreNs,
+                    onImport = { CoreIntrinsicLowering.registerCoreImport(emitter, it) },
+                )
+            if (rendered != null) return rendered
         }
         val isExplicitStdResultPath =
             rawName == "Result" &&
@@ -1386,27 +1309,15 @@ private object StdlibContainerAndPrimitiveTypePathRule : TypePathLoweringRule() 
         if (isExplicitStdResultPath && rawName in emitter.inspector.declaredTypeNames && typeArgs.isNotEmpty()) {
             val crateNsMap = emitter.headerContext.crateNamespaces
             val rawCore = crateNsMap["core"]?.trim()?.removeSuffix(".")
-            val coreNs = rawCore?.takeIf { it.isNotEmpty() }
-            return if (coreNs != null && typeArgs.size == 2) {
-                "$coreNs.result.Result<${typeArgs.joinToString(", ")}>"
+            val explicitCoreNs = rawCore?.takeIf { it.isNotEmpty() }
+            return if (explicitCoreNs != null && typeArgs.size == 2) {
+                "$explicitCoreNs.result.Result<${typeArgs.joinToString(", ")}>"
             } else {
                 "kotlin.Result<${typeArgs[0]}>"
             }
         }
         if (rawName in emitter.inspector.declaredTypeNames) return null
-        if (rawName in setOf("Cell", "RefCell", "OnceCell") && typeArgs.size == 1) {
-            val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(emitter.headerContext)
-            val subpkg = if (rawName == "OnceCell") "cell.once" else "cell"
-            CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.$subpkg.$rawName")
-            return "$rawName<${typeArgs[0]}>"
-        }
         return when {
-            rawName == "Vec" && typeArgs.isNotEmpty() -> "List<${typeArgs[0]}>"
-            rawName == "Cow" && typeArgs.isNotEmpty() -> typeArgs.last()
-            (rawName == "Range" || rawName == "RangeInclusive") && typeArgs.size == 1 && typeArgs[0] == "Int" -> "IntRange"
-            rawName in erasedSmartPointers && typeArgs.isNotEmpty() -> typeArgs[0]
-            (rawName == "HashMap" || rawName == "BTreeMap") && typeArgs.size >= 2 -> "MutableMap<${typeArgs[0]}, ${typeArgs[1]}>"
-            (rawName == "HashSet" || rawName == "BTreeSet") && typeArgs.isNotEmpty() -> "MutableSet<${typeArgs[0]}>"
             rawName == "Result" && "Ok" !in emitter.inspector.declaredTypeNames && !emitter.hasDeclaredResultEnum() && emitter.usesTaggedCoreResult() && typeArgs.size == 2 ->
                 "${emitter.sourceResultName()}<${typeArgs.joinToString(", ")}>"
             rawName == "Result" && "Ok" !in emitter.inspector.declaredTypeNames && !emitter.hasDeclaredResultEnum() && !emitter.usesTaggedCoreResult() && typeArgs.isNotEmpty() ->
@@ -1488,7 +1399,7 @@ internal class TypeParameterClauseEmitter(
     private val selfTypeName: String?,
 ) {
     fun renderTypeParameters(generics: Generics, excludeNames: Set<String> = emptySet()): String {
-        val ownerSimple = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
+        val ownerSimple = selfTypeName?.simpleKotlinTypeName()
         val declared = renderTypeParametersFromParams(generics.params.toList(), excludeNames).removePrefix("<").removeSuffix(">")
         val associated =
             emitter
@@ -1676,7 +1587,7 @@ internal fun KotlinJ2KEmitter.renderWhereClause(
     ownerGenerics: Generics? = null,
     extraDeclaredNames: Set<String> = emptySet(),
 ): String {
-    val ownerSimple = selfTypeName?.substringBefore('<')?.substringAfterLast('.')?.trim()
+    val ownerSimple = selfTypeName?.simpleKotlinTypeName()
     val assocDeclared = ownerGenerics?.let { sourceAssociatedParameters(it, ownerSimple).map { a -> a.associated } }.orEmpty()
     return renderCombinedWhereClause(
         ownerWhere = null,
@@ -2069,10 +1980,16 @@ internal fun KotlinJ2KEmitter.synthesizeOrReuseBareFnSam(ty: SynType.FnPtr, self
             currentSamNameHint = prevHint
             inExternAbiSignature = prevExternAbi
         }
-    val referencesGeneric =
-        activeTypeParamNames.any { tp ->
-            inputTypes.any { containsWholeIdentifier(it, tp) } || containsWholeIdentifier(outType, tp)
+    val referencedIds =
+        if (activeTypeParamNames.isEmpty()) {
+            emptySet()
+        } else {
+            buildSet {
+                for (inTy in inputTypes) addAll(KotlinTokenWalker(inTy).collectFilteredIdentifiers())
+                addAll(KotlinTokenWalker(outType).collectFilteredIdentifiers())
+            }
         }
+    val referencesGeneric = activeTypeParamNames.any { it in referencedIds }
     if (referencesGeneric) {
         return "(${inputTypes.joinToString(", ")}) -> $outType"
     }

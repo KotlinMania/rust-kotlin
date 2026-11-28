@@ -56,6 +56,8 @@ internal object TranslationSession {
     var rawAbiMode = false
     var finalStructs = false
     var splitModuleRoots = false
+    var rulesDirOverride: String? = null
+    var activeRuleRegistryOverride: RuntimeRuleRegistry? = null
     var currentRelativeSourceDir: String? = null
     var cfgTargetProfile: CfgTargetProfile = CfgTargetProfile()
     var crateTypeAliasDefaults: Map<String, String> = emptyMap()
@@ -71,6 +73,8 @@ internal object TranslationSession {
         rawAbiMode = false
         finalStructs = false
         splitModuleRoots = false
+        rulesDirOverride = null
+        activeRuleRegistryOverride = null
         currentRelativeSourceDir = null
         cfgTargetProfile = CfgTargetProfile()
         crateTypeAliasDefaults = emptyMap()

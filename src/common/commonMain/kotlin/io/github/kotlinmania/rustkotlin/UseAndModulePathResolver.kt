@@ -11,7 +11,8 @@ internal data class UseLeaf(
     val isSelfImport: Boolean,
 )
 
-private val EXTERNAL_REEXPORT_SEARCH_CRATES = listOf("core", "alloc", "libm")
+private val EXTERNAL_REEXPORT_SEARCH_CRATES: List<String>
+    get() = activeRules().stringList("externalReexportSearchCrates")
 
 internal fun KotlinJ2KEmitter.normalizeNetcLibcSegments(segs: List<String>): List<String> =
     if (segs.firstOrNull()?.removePrefix("r#") == "netc" && FfiInteropCollector.resolveLibcNamespace(headerContext) != null) {
@@ -103,9 +104,10 @@ internal fun KotlinJ2KEmitter.resolveExternalDepReexportPkg(
     return null
 }
 
-private val CORE_ROOT_PRIMITIVE_WRAPPER_SYMBOLS = wordSet("U128 I128 F16 F128")
-private val CORE_MEM_SUBPKG_SYMBOLS =
-    wordSet("sizeOf sizeOfVal alignOf alignOfVal transmute transmuteUnchecked needsDrop forget drop")
+private val CORE_ROOT_PRIMITIVE_WRAPPER_SYMBOLS: Set<String>
+    get() = activeRules().words("coreRootPrimitiveWrapperSymbols")
+private val CORE_MEM_SUBPKG_SYMBOLS: Set<String>
+    get() = activeRules().words("coreMemSubpkgSymbols")
 
 internal fun KotlinJ2KEmitter.resolveBestSubpackageForSymbol(ktSymbol: String): String? {
     val nsPrefix = currentNamespacePrefix()
@@ -203,16 +205,15 @@ private class SubpackageAffinityScorer(
     }
 
     companion object {
-        private val HIGH_ARCH_SEGS = wordSet("b64 aarch64 x8664 notx32")
-        private val BSD_FAMILY_SEGS = wordSet("freebsdlike netbsdlike freebsd")
-        private val UNIX_BIAS_SEGS = wordSet("apple bsd linuxlike linux gnu unix")
-        private val BITS32_PENALTY_SEGS = wordSet("b32 x32 x86 arm mips mips32 powerpc sparc riscv32 i386 uclibc")
-        private val UNIX_FAMILY_SEGS = wordSet("unix linux android apple macos ios tvos watchos darwin posix")
-        private val FOREIGN_PLATFORM_SEGS =
-            wordSet("windows wasi wasip1 wasip2 wasip3 unsupported stubs hermit solid uefi xous zkvm motor sgx teeos vexos")
-        private val NON_SIGNIFICANT_SEGS = wordSet("new sys pal mod bsd linuxlike freebsdlike netbsdlike solarish")
-        private val WASI_FOREIGN_PENALTY_SEGS = wordSet("windows hermit solid uefi xous zkvm motor sgx unsupported stubs")
-        private val WASIP_VERSION_SEGS = wordSet("wasip1 wasip2 wasip3")
+        private val HIGH_ARCH_SEGS: Set<String> get() = activeRules().words("highArchSegs")
+        private val BSD_FAMILY_SEGS: Set<String> get() = activeRules().words("bsdFamilySegs")
+        private val UNIX_BIAS_SEGS: Set<String> get() = activeRules().words("unixBiasSegs")
+        private val BITS32_PENALTY_SEGS: Set<String> get() = activeRules().words("bits32PenaltySegs")
+        private val UNIX_FAMILY_SEGS: Set<String> get() = activeRules().words("unixFamilySegs")
+        private val FOREIGN_PLATFORM_SEGS: Set<String> get() = activeRules().words("foreignPlatformSegs")
+        private val NON_SIGNIFICANT_SEGS: Set<String> get() = activeRules().words("nonSignificantSegs")
+        private val WASI_FOREIGN_PENALTY_SEGS: Set<String> get() = activeRules().words("wasiForeignPenaltySegs")
+        private val WASIP_VERSION_SEGS: Set<String> get() = activeRules().words("wasipVersionSegs")
     }
 }
 
@@ -264,12 +265,7 @@ internal fun KotlinJ2KEmitter.isResolvedCrateSubpackageModule(resolvedImportPath
 }
 
 internal fun KotlinJ2KEmitter.scopedAbiKeysForRenderedType(renderedType: String): List<String> {
-    val clean =
-        renderedType
-            .substringBefore('<')
-            .trim()
-            .removeSuffix("?")
-            .trim()
+    val clean = renderedType.headKotlinTypePath()
     if (clean.isEmpty()) return emptyList()
     val keys = mutableListOf<String>()
     val nsPrefix = currentNamespacePrefix()
@@ -313,20 +309,15 @@ internal fun KotlinJ2KEmitter.scopedAbiKeysForRenderedType(renderedType: String)
     return keys.distinct()
 }
 
-private val KOTLIN_BUILTIN_QUALIFY_SIMPLE_TYPE_NAMES =
-    wordSet("String Boolean Char Byte Short Int Long UByte UShort UInt ULong Float Double Unit Nothing Any")
+private val KOTLIN_BUILTIN_QUALIFY_SIMPLE_TYPE_NAMES: Set<String>
+    get() = activeRules().words("kotlinBuiltinQualifySimpleTypeNames")
 
 internal fun KotlinJ2KEmitter.isDeclaredTopLevelFnKotlinName(ktName: String): Boolean =
     ktName == currentEnclosingFunctionName ||
         inspector.declaredTopLevelFnRawNames.any { rustFunctionIdentToKotlin(it) == ktName }
 
-private val STDLIB_UNIMPORTED_SUBMODULES =
-    wordSet(
-        "alloc any arch ascii bool borrow boxed cell char clone cmp collections convert core default",
-        "env error f32 f64 ffi fmt fs hash hint i128 i16 i32 i64 i8 io isize iter marker mem net num",
-        "ops option panic path pin process ptr rc result slice std str string sync task thread time",
-        "u128 u16 u32 u64 u8 usize vec",
-    )
+private val STDLIB_UNIMPORTED_SUBMODULES: Set<String>
+    get() = activeRules().words("stdlibUnimportedSubmodules")
 
 internal fun KotlinJ2KEmitter.bindOrQualifyResolvedCrossSymbol(resolvedFullImport: String): String {
     val rawTarget = resolvedFullImport.substringBefore(" as ").trim()
@@ -655,23 +646,14 @@ internal open class RustModulePathResolver(
             thirdClean == "atomic"
 
     companion object {
-        internal val CORE_MEM_INTRINSICS =
-            wordSet("transmute transmute_unchecked size_of size_of_val align_of align_of_val needs_drop forget")
+        internal val CORE_MEM_INTRINSICS: Set<String> get() = activeRules().words("coreMemIntrinsics")
         private val ALLOC_STD_CRATE_ROOTS = wordSet("alloc std crate")
         private val ARC_WEAK_SYMBOLS = wordSet("Arc Weak")
         private val RC_WEAK_SYMBOLS = wordSet("Rc Weak")
         internal val CORE_STD_CRATE_ROOTS = wordSet("core std crate")
-        internal val STDLIB_CORE_SUBMODULES =
-            wordSet(
-                "ffi mem ptr option result fmt marker cmp ops slice str iter convert default hash clone",
-                "any arch cell hint num panic pin sync task time char borrow error",
-            )
-        internal val CORE_INTRINSIC_OR_PRELUDE_LEAVES =
-            wordSet(
-                "Option Some None Result Ok Err Vec Box Rc Arc Cow PhantomData ManuallyDrop MaybeUninit",
-                "Cell RefCell OnceCell Iter IterMut IntoIter Range RangeInclusive min max once empty drop",
-                "transmute transmute_unchecked size_of size_of_val align_of align_of_val needs_drop forget",
-            )
+        internal val STDLIB_CORE_SUBMODULES: Set<String> get() = activeRules().words("stdlibCoreSubmodules")
+        internal val CORE_INTRINSIC_OR_PRELUDE_LEAVES: Set<String>
+            get() = activeRules().words("coreIntrinsicOrPreludeLeaves")
     }
 }
 
@@ -1753,13 +1735,13 @@ private class KotlinImportPathResolver(
         private val FFI_SEGS = listOf("ffi")
         private val PROC_OR_SERDE_DERIVE_CRATES = wordSet("proc_macro serde_derive serde_derive_internals")
         private val STDLIB_SEARCH_CRATES = listOf("core", "alloc", "std")
-        private val STDLIB_CELL_TYPES = wordSet("Cell RefCell Ref RefMut")
-        private val STDLIB_PRIMITIVE_OR_PRELUDE_SECOND_SEGS =
-            wordSet("f32 f64 f16 f128 i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize consts prelude")
-        private val STDLIB_UNINDEXED_SKIP_SECOND_SEGS =
-            wordSet("convert marker default clone hash borrow iter option hint panic pin task error fmt")
-        private val STDLIB_ALLOWED_WILDCARD_SUBMODULES =
-            wordSet("alloc cell cmp ffi mem num ops ptr result sync atomic")
+        private val STDLIB_CELL_TYPES: Set<String> get() = activeRules().words("stdlibCellTypes")
+        private val STDLIB_PRIMITIVE_OR_PRELUDE_SECOND_SEGS: Set<String>
+            get() = activeRules().words("stdlibPrimitiveOrPreludeSecondSegs")
+        private val STDLIB_UNINDEXED_SKIP_SECOND_SEGS: Set<String>
+            get() = activeRules().words("stdlibUnindexedSkipSecondSegs")
+        private val STDLIB_ALLOWED_WILDCARD_SUBMODULES: Set<String>
+            get() = activeRules().words("stdlibAllowedWildcardSubmodules")
     }
 }
 
@@ -2118,12 +2100,12 @@ private class UseItemImportEmitter(
 
     companion object {
         private val FILE_OR_DIR_NAMES = wordSet("FILE DIR")
-        private val UNLOWERED_STD_MODULES = wordSet("env fs process net path time collections")
-        private val WINDOWS_OS_PRELUDE_SYMS = listOf("OsStrExt", "OsStringExt", "encode_wide")
-        private val UNIX_OS_PRELUDE_SYMS = listOf("OsStrExt", "OsStringExt", "as_bytes", "into_vec", "from_bytes", "from_vec")
-        private val FLOAT_OR_CONSTS_SEGS = wordSet("f16 f32 f64 f128 consts")
-        private val DROP_MARKER_LEAVES = wordSet("NoDrop TrivialDrop")
-        private val CONST_PANIC_OR_ERROR_SUFFIXES =
-            listOf(".panic.constPanic", ".panic.constAssert", ".io.constError", ".error.constError")
+        private val UNLOWERED_STD_MODULES: Set<String> get() = activeRules().words("unloweredStdModules")
+        private val WINDOWS_OS_PRELUDE_SYMS: List<String> get() = activeRules().stringList("windowsOsPreludeSyms")
+        private val UNIX_OS_PRELUDE_SYMS: List<String> get() = activeRules().stringList("unixOsPreludeSyms")
+        private val FLOAT_OR_CONSTS_SEGS: Set<String> get() = activeRules().words("floatOrConstsSegs")
+        private val DROP_MARKER_LEAVES: Set<String> get() = activeRules().words("dropMarkerLeaves")
+        private val CONST_PANIC_OR_ERROR_SUFFIXES: List<String>
+            get() = activeRules().stringList("constPanicOrErrorSuffixes")
     }
 }

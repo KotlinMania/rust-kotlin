@@ -281,7 +281,7 @@ internal fun Generics.kotlinConstParamNames(): List<String> =
         rustValueIdentToKotlin(raw)
     }
 
-internal fun String.simpleKotlinTypeName(): String = substringBefore('<').substringAfterLast('.').trim()
+internal fun String.simpleKotlinTypeName(): String = asKotlinRenderedType()?.simpleName.orEmpty()
 
 internal fun File.findStructByKotlinName(ownerName: String): Item.Struct? =
     items.filterIsInstance<Item.Struct>().singleOrNull { rustTypeIdentToKotlin(it.ident.toString()) == ownerName }
@@ -1172,21 +1172,106 @@ internal class CrateSymbolInspector(
     }
 }
 
-internal fun synTypeReferencesDirectSelf(ty: SynType): Boolean {
-    var found = false
+/**
+ * Reusable block-scoped [Visit] base class that automatically stops at nested `fn` declarations,
+ * optionally stops at nested closures, and skips `#[cfg(doc)]`-disabled statements.
+ */
+internal open class ScopedBlockAstVisitor(
+    private val skipNestedClosures: Boolean = false,
+) : Visit() {
+    override fun visitItemFn(i: Item.Fn) {}
+
+    override fun visitExprClosure(e: Expr.Closure) {
+        if (!skipNestedClosures) super.visitExprClosure(e)
+    }
+
+    final override fun visitStmt(s: Stmt) {
+        if (!isLeadingCfgStmtDisabled(s)) onActiveStmt(s)
+    }
+
+    protected open fun onActiveStmt(s: Stmt) {
+        super.visitStmt(s)
+    }
+}
+
+/**
+ * Short-circuiting block-scoped predicate visitor extending [ScopedBlockAstVisitor].
+ */
+internal abstract class ScopedPredicateAstVisitor(
+    skipNestedClosures: Boolean = false,
+) : ScopedBlockAstVisitor(skipNestedClosures) {
+    var matched: Boolean = false
+        protected set
+
+    protected fun markMatched() {
+        matched = true
+    }
+
+    override fun onActiveStmt(s: Stmt) {
+        if (!matched) super.onActiveStmt(s)
+    }
+
+    override fun visitExpr(e: Expr) {
+        if (!matched) super.visitExpr(e)
+    }
+}
+
+/**
+ * Short-circuiting AST path/type predicate visitor base class.
+ */
+internal abstract class SynPathPredicateVisitor : Visit() {
+    var matched: Boolean = false
+        protected set
+
+    protected fun markMatched() {
+        matched = true
+    }
+
+    override fun visitType(t: SynType) {
+        if (!matched) super.visitType(t)
+    }
+
+    override fun visitExpr(e: Expr) {
+        if (!matched) super.visitExpr(e)
+    }
+
+    override fun visitPath(p: Path) {
+        if (!matched) super.visitPath(p)
+    }
+}
+
+internal fun synNodeMentionsRawIdent(
+    rawIdent: String,
+    drive: (Visit) -> Unit,
+): Boolean {
     val visitor =
-        object : Visit() {
+        object : SynPathPredicateVisitor() {
+            override fun visitPath(p: Path) {
+                if (p.segments.toList().any { it.cleanIdent() == rawIdent }) {
+                    markMatched()
+                    return
+                }
+                super.visitPath(p)
+            }
+        }
+    drive(visitor)
+    return visitor.matched
+}
+
+internal fun synTypeReferencesDirectSelf(ty: SynType): Boolean {
+    val visitor =
+        object : SynPathPredicateVisitor() {
             override fun visitPath(p: Path) {
                 val segs = p.segments.toList()
                 if (segs.size == 1 && segs[0].ident.toString() == "Self") {
-                    found = true
+                    markMatched()
                     return
                 }
                 super.visitPath(p)
             }
         }
     visitor.visitType(ty)
-    return found
+    return visitor.matched
 }
 
 internal fun traitReferencesSelfOutsideReceiver(traitItem: Item.Trait): Boolean {
@@ -1215,23 +1300,8 @@ internal fun traitReferencesSelfOutsideReceiver(traitItem: Item.Trait): Boolean 
     return false
 }
 
-internal fun synTypeReferencesIdent(ty: SynType, target: String): Boolean {
-    var found = false
-    val visitor =
-        object : Visit() {
-            override fun visitPath(p: Path) {
-                for (seg in p.segments.toList()) {
-                    if (seg.ident.toString().removePrefix("r#") == target) {
-                        found = true
-                        return
-                    }
-                }
-                super.visitPath(p)
-            }
-        }
-    visitor.visitType(ty)
-    return found
-}
+internal fun synTypeReferencesIdent(ty: SynType?, target: String): Boolean =
+    ty != null && synNodeMentionsRawIdent(target) { it.visitType(ty) }
 
 internal fun fieldsReferenceIdent(fields: Fields, target: String): Boolean =
     when (fields) {

@@ -25,6 +25,7 @@ internal val CLI_USAGE_TEXT: String =
           --skip-existing              Skip target .kt files that already exist
       --rustkotlin-properties <file>   Explicit rustkotlin.properties file for group/namespace/crate inference
           --package-properties <file>  Explicit package.properties file for package/crate overrides
+          --rules-dir <dir>            Load runtime `.yml` pattern/replacement rules from <dir>
       -p, --package <pkg>              Explicit Kotlin package name (appends relative subpackages in recursive mode)
       -n, --namespace <ns>             Explicit crate root Kotlin namespace (e.g. io.github.kotlinmania.serdejson)
           --group <group>              Explicit project group (e.g. io.github.kotlinmania)
@@ -72,6 +73,7 @@ private data class ParsedCliOptions(
     val skipExisting: Boolean = false,
     val rustKotlinPropertiesPath: String? = null,
     val packagePropertiesPath: String? = null,
+    val rulesDirOverride: String? = null,
     val packageOverride: String? = null,
     val namespaceOverride: String? = null,
     val groupOverride: String? = null,
@@ -157,6 +159,8 @@ internal fun runSingleFileCommand(
     val prevRawAbi = TranslationSession.rawAbiMode
     val prevFinalStructs = TranslationSession.finalStructs
     val prevSplitModRoots = TranslationSession.splitModuleRoots
+    val prevRulesDir = TranslationSession.rulesDirOverride
+    val prevRuleRegOverride = TranslationSession.activeRuleRegistryOverride
     val prevCfgProfile = TranslationSession.cfgTargetProfile
     if (parsed.timings) {
         TranslationSession.timings = true
@@ -164,6 +168,9 @@ internal fun runSingleFileCommand(
     TranslationSession.rawAbiMode = parsed.rawAbiMode
     TranslationSession.finalStructs = parsed.finalStructs
     TranslationSession.splitModuleRoots = parsed.splitModuleRoots
+    TranslationSession.rulesDirOverride = parsed.rulesDirOverride
+    TranslationSession.activeRuleRegistryOverride =
+        parsed.rulesDirOverride?.let(RuntimeRuleRegistry::loadFromDirectory)
     TranslationSession.cfgTargetProfile = parsed.cfgTargetProfile
     try {
         if (parsed.action == CliActionKind.INSPECT) {
@@ -197,6 +204,8 @@ internal fun runSingleFileCommand(
         TranslationSession.rawAbiMode = prevRawAbi
         TranslationSession.finalStructs = prevFinalStructs
         TranslationSession.splitModuleRoots = prevSplitModRoots
+        TranslationSession.rulesDirOverride = prevRulesDir
+        TranslationSession.activeRuleRegistryOverride = prevRuleRegOverride
         TranslationSession.cfgTargetProfile = prevCfgProfile
     }
 }
@@ -217,6 +226,7 @@ private class CliOptionBuilder(
     private var skipExisting = false
     private var rustKotlinPropertiesPath: String? = null
     private var packagePropertiesPath: String? = null
+    private var rulesDirOverride: String? = null
     private var packageOverride: String? = null
     private var namespaceOverride: String? = null
     private var groupOverride: String? = null
@@ -327,6 +337,7 @@ private class CliOptionBuilder(
             skipExisting = skipExisting,
             rustKotlinPropertiesPath = rustKotlinPropertiesPath,
             packagePropertiesPath = packagePropertiesPath,
+            rulesDirOverride = rulesDirOverride,
             packageOverride = packageOverride,
             namespaceOverride = namespaceOverride,
             groupOverride = groupOverride,
@@ -392,6 +403,11 @@ private class CliOptionBuilder(
                 "--skip-existing" -> skipExisting = flagOnly(optName, inlineVal)
                 "--rustkotlin-properties" -> rustKotlinPropertiesPath = optValue()
                 "--package-properties" -> packagePropertiesPath = optValue()
+                "--rules-dir" -> {
+                    val dir = optValue().trim()
+                    require(dir.isNotEmpty()) { "--rules-dir requires a non-empty directory" }
+                    rulesDirOverride = dir
+                }
                 "-p", "--package" -> packageOverride = optValue()
                 "-n", "--namespace" -> namespaceOverride = optValue()
                 "--group" -> groupOverride = optValue()
@@ -504,6 +520,7 @@ private class CliOptionBuilder(
                 action = CliActionKind.INSPECT,
                 inputs = inputs,
                 recursive = recursive,
+                rulesDirOverride = rulesDirOverride,
                 rawAbiMode = rawAbiMode,
                 finalStructs = finalStructs,
                 splitModuleRoots = splitModuleRoots,

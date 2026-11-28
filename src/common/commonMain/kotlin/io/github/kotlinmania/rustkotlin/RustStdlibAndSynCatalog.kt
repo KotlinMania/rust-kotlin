@@ -10,36 +10,32 @@ import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.TypeParamBound
 import io.github.kotlinmania.syn.WherePredicate
 
-internal val PRIMITIVE_ARRAY_TYPES =
-    wordSet("ByteArray UByteArray ShortArray UShortArray IntArray UIntArray LongArray ULongArray FloatArray DoubleArray BooleanArray")
-internal val IGNORED_USE_ROOTS = wordSet("super self")
-internal val STDLIB_CRATE_ROOTS = wordSet("std core alloc")
-internal val STDLIB_MACRO_OR_PRIMITIVE_MODULES = wordSet("primitive concat stringify")
-internal val FLAT_KOTLINMANIA_CRATES = wordSet("procmacro2 quote")
-internal val STDLIB_TYPE_PATH_PREFIXES =
-    wordSet("std core alloc vec boxed collections rc sync slice option marker mem")
-internal val IGNORED_PATH_PREFIXES = wordSet("crate super self std core alloc")
-internal val STDLIB_PRELUDE_REEXPORT_MODULES =
-    wordSet("__private export prelude v1 rust_2015 rust_2018 rust_2021 rust_2024")
-internal val IGNORED_TRAIT_BOUNDS =
-    wordSet(
-        "Sized MetaSized PointeeSized Unsize CoerceUnsized DispatchFromDyn",
-        "Send Sync Unpin UnwindSafe RefUnwindSafe TrivialDrop Destruct Hasher Tuple",
-    )
-internal val FMT_TRAIT_NAMES: Set<String> =
-    wordSet("Debug Display Octal LowerHex UpperHex Binary LowerExp UpperExp Pointer")
-internal val RUST_STD_IMPLICIT_SUPERTRAITS =
-    FMT_TRAIT_NAMES +
-        wordSet(
-            "Clone Copy Default PartialEq Eq PartialOrd Ord Hash Drop",
-            "Send Sync Unpin UnwindSafe RefUnwindSafe",
-            "Iterator ExactSizeIterator DoubleEndedIterator FusedIterator FromIterator IntoIterator Extend",
-            "Index IndexMut Deref DerefMut From TryFrom Into TryInto",
-        )
-internal val STDLIB_TRAIT_SUBMODULES =
-    wordSet("error fmt cmp hash ops convert iter borrow marker panic any clone default")
-internal val STDLIB_EXPLICIT_SUPERTRAITS =
-    RUST_STD_IMPLICIT_SUPERTRAITS + wordSet("Error Borrow")
+internal val PRIMITIVE_ARRAY_TYPES: Set<String>
+    get() = activeRules().words("primitiveArrayTypes")
+internal val IGNORED_USE_ROOTS: Set<String>
+    get() = activeRules().words("ignoredUseRoots")
+internal val STDLIB_CRATE_ROOTS: Set<String>
+    get() = activeRules().words("stdlibCrateRoots")
+internal val STDLIB_MACRO_OR_PRIMITIVE_MODULES: Set<String>
+    get() = activeRules().words("stdlibMacroOrPrimitiveModules")
+internal val FLAT_KOTLINMANIA_CRATES: Set<String>
+    get() = activeRules().words("flatKotlinmaniaCrates")
+internal val STDLIB_TYPE_PATH_PREFIXES: Set<String>
+    get() = activeRules().words("stdlibTypePathPrefixes")
+internal val IGNORED_PATH_PREFIXES: Set<String>
+    get() = activeRules().words("ignoredPathPrefixes")
+internal val STDLIB_PRELUDE_REEXPORT_MODULES: Set<String>
+    get() = activeRules().words("stdlibPreludeReexportModules")
+internal val IGNORED_TRAIT_BOUNDS: Set<String>
+    get() = activeRules().words("ignoredTraitBounds")
+internal val FMT_TRAIT_NAMES: Set<String>
+    get() = activeRules().words("fmtTraitNames")
+internal val RUST_STD_IMPLICIT_SUPERTRAITS: Set<String>
+    get() = activeRules().unionWords("fmtTraitNames", "rustStdImplicitSupertraitsExtra")
+internal val STDLIB_TRAIT_SUBMODULES: Set<String>
+    get() = activeRules().words("stdlibTraitSubmodules")
+internal val STDLIB_EXPLICIT_SUPERTRAITS: Set<String>
+    get() = activeRules().unionWords("fmtTraitNames", "rustStdImplicitSupertraitsExtra", "stdlibExplicitSupertraitsExtra")
 
 private fun SynType.singleUnqualifiedIdent(): String? {
     val seg = unqualifiedPath()?.singleSegment() ?: return null
@@ -183,110 +179,49 @@ private class KDocSpacingRewriter(
     }
 }
 
-internal val STDLIB_ERASED_OR_BUILTIN_IMPORTS =
-    RUST_STD_IMPLICIT_SUPERTRAITS +
-        wordSet(
-            "Hasher Formatter DebugStruct DebugTuple DebugList DebugSet DebugMap",
-            "ManuallyDrop needs_drop PhantomData ThreadId Rc Arc VecDeque None Some Ok Err TypeId",
-        )
-internal val KNOWN_SELF_PARAMETERIZED_TRAITS = wordSet("Parse ParseQuote Read Write")
-internal val KOTLIN_COLLECTION_INTERFACES =
-    wordSet("List MutableList Map MutableMap Set MutableSet ArrayDeque")
-internal val MUTATING_VEC_METHODS =
-    wordSet("push pop clear insert remove truncate retain extend extend_from_slice append drain swap_remove")
-internal val KNOWN_OPTION_RETURNING_METHODS =
-    wordSet(
-        "take pop pop_front removeFirstOrNull removeLastOrNull next next_back",
-        "first first_mut last last_mut get get_mut getOrNull punct punct_mut",
-        "find position rposition checked_add checked_sub checked_mul checked_div",
-        "checked_rem checked_shl checked_shr checked_neg strip_prefix strip_suffix",
-        "split_once rsplit_once get_key_value",
-    )
-internal val KOTLIN_JVM_VALUE_TYPES =
-    wordSet("Boolean Byte Short Int Long Float Double Char UByte UShort UInt ULong")
-internal val NUMERIC_CAST_TARGETS = KOTLIN_JVM_VALUE_TYPES - "Boolean"
-internal val KOTLIN_STDLIB_SHADOWED_IMPORTS =
-    KOTLIN_JVM_VALUE_TYPES +
-        wordSet(
-            "String Unit Nothing Any Result Iterator Iterable Comparable",
-            "List MutableList Map MutableMap Set MutableSet Pair Triple",
-            "Vec Box HashMap BTreeMap HashSet BTreeSet",
-        )
-internal val FORWARD_DESERIALIZE_KEYS =
-    wordSet(
-        "bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string",
-        "bytes byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct",
-        "map struct enum identifier ignored_any",
-    )
-internal val PRIMITIVE_TYPE_NAMES =
-    wordSet("u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize f16 f32 f64 f128 bool str char")
-internal val IGNORED_QUOTE_KEYWORDS =
-    wordSet(
-        "use as crate const let mut match fn impl for in where pub return if else",
-        "struct enum trait type static unsafe ref dyn loop while break continue",
-        "move async await super default union try yield mod",
-    ) + PRIMITIVE_TYPE_NAMES
+internal val STDLIB_ERASED_OR_BUILTIN_IMPORTS: Set<String>
+    get() = activeRules().unionWords("fmtTraitNames", "rustStdImplicitSupertraitsExtra", "stdlibErasedOrBuiltinImportsExtra")
+internal val KNOWN_SELF_PARAMETERIZED_TRAITS: Set<String>
+    get() = activeRules().words("knownSelfParameterizedTraits")
+internal val KOTLIN_COLLECTION_INTERFACES: Set<String>
+    get() = activeRules().words("kotlinCollectionInterfaces")
+internal val MUTATING_VEC_METHODS: Set<String>
+    get() = activeRules().words("mutatingVecMethods")
+internal val KNOWN_OPTION_RETURNING_METHODS: Set<String>
+    get() = activeRules().words("knownOptionReturningMethods")
+internal val KOTLIN_JVM_VALUE_TYPES: Set<String>
+    get() = activeRules().words("kotlinJvmValueTypes")
 
-internal val SYN_KEYWORD_TOKENS =
-    wordSet(
-        "abstract as async auto await become box break const continue crate default",
-        "do dyn else enum extern final fn for if impl in let loop macro match mod",
-        "move mut override priv pub raw ref return safe static struct super trait",
-        "try typeof union unsafe unsized use virtual where while yield",
-    )
+private val NUMERIC_CAST_TARGETS_MEMO =
+    RegistryMemo { reg -> reg.words("kotlinJvmValueTypes") - "Boolean" }
 
-internal val SYN_PUNCT_TOKEN_NAMES =
-    mapOf(
-        "&" to "And",
-        "&&" to "AndAnd",
-        "&=" to "AndEq",
-        "@" to "At",
-        "^" to "Caret",
-        "^=" to "CaretEq",
-        ":" to "Colon",
-        "," to "Comma",
-        "$" to "Dollar",
-        "." to "Dot",
-        ".." to "DotDot",
-        "..." to "DotDotDot",
-        "..=" to "DotDotEq",
-        "=" to "Eq",
-        "==" to "EqEq",
-        "=>" to "FatArrow",
-        ">=" to "Ge",
-        ">" to "Gt",
-        "<-" to "LArrow",
-        "<=" to "Le",
-        "<" to "Lt",
-        "-" to "Minus",
-        "-=" to "MinusEq",
-        "!=" to "Ne",
-        "!" to "Not",
-        "|" to "Or",
-        "|=" to "OrEq",
-        "||" to "OrOr",
-        "::" to "PathSep",
-        "%" to "Percent",
-        "%=" to "PercentEq",
-        "+" to "Plus",
-        "+=" to "PlusEq",
-        "#" to "Pound",
-        "?" to "Question",
-        "->" to "RArrow",
-        ";" to "Semi",
-        "<<" to "Shl",
-        "<<=" to "ShlEq",
-        ">>" to "Shr",
-        ">>=" to "ShrEq",
-        "/" to "Slash",
-        "/=" to "SlashEq",
-        "*" to "Star",
-        "*=" to "StarEq",
-        "~" to "Tilde",
-    )
+internal val NUMERIC_CAST_TARGETS: Set<String>
+    get() = NUMERIC_CAST_TARGETS_MEMO.get()
 
-internal val SYN_KEYWORD_TOKEN_CLASS_NAMES =
-    SYN_KEYWORD_TOKENS.mapTo(linkedSetOf()) { it[0].uppercaseChar() + it.substring(1) }
+internal val KOTLIN_STDLIB_SHADOWED_IMPORTS: Set<String>
+    get() = activeRules().unionWords("kotlinJvmValueTypes", "kotlinStdlibShadowedImportsExtra")
+internal val FORWARD_DESERIALIZE_KEYS: Set<String>
+    get() = activeRules().words("forwardDeserializeKeys")
+internal val PRIMITIVE_TYPE_NAMES: Set<String>
+    get() = activeRules().words("primitiveTypeNames")
+internal val IGNORED_QUOTE_KEYWORDS: Set<String>
+    get() = activeRules().unionWords("ignoredQuoteKeywordsExtra", "primitiveTypeNames")
 
-internal val SYN_PUNCT_TOKEN_CLASS_NAMES =
-    SYN_PUNCT_TOKEN_NAMES.values.toSet()
+internal val SYN_KEYWORD_TOKENS: Set<String>
+    get() = activeRules().words("synKeywordTokens")
+internal val SYN_PUNCT_TOKEN_NAMES: Map<String, String>
+    get() = activeRules().map("synPunctTokens")
+
+private val SYN_KEYWORD_TOKEN_CLASS_NAMES_MEMO =
+    RegistryMemo { reg ->
+        reg.words("synKeywordTokens").mapTo(linkedSetOf()) { it[0].uppercaseChar() + it.substring(1) }
+    }
+
+private val SYN_PUNCT_TOKEN_CLASS_NAMES_MEMO =
+    RegistryMemo { reg -> reg.map("synPunctTokens").values.toSet() }
+
+internal val SYN_KEYWORD_TOKEN_CLASS_NAMES: Set<String>
+    get() = SYN_KEYWORD_TOKEN_CLASS_NAMES_MEMO.get()
+
+internal val SYN_PUNCT_TOKEN_CLASS_NAMES: Set<String>
+    get() = SYN_PUNCT_TOKEN_CLASS_NAMES_MEMO.get()

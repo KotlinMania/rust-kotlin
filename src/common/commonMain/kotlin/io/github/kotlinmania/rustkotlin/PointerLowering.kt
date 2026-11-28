@@ -15,6 +15,7 @@ import io.github.kotlinmania.syn.Member
 import io.github.kotlinmania.syn.ModContent
 import io.github.kotlinmania.syn.Path
 import io.github.kotlinmania.syn.PathArguments
+import io.github.kotlinmania.syn.PathSegment
 import io.github.kotlinmania.syn.PointerMutability
 import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
@@ -23,7 +24,6 @@ import io.github.kotlinmania.syn.TypeParamBound
 import io.github.kotlinmania.syn.UnOp
 import io.github.kotlinmania.syn.UseTree
 import io.github.kotlinmania.syn.WherePredicate
-import io.github.kotlinmania.syn.gen.Fold
 import io.github.kotlinmania.syn.gen.Visit
 import io.github.kotlinmania.syn.span
 import io.github.kotlinmania.syn.token.Const
@@ -47,23 +47,14 @@ private fun singleUnqualifiedPathIdent(type: SynType?): String? =
         ?.path
         ?.lastIdentText()
 
-private val FIXED_SCALAR_CODECS: Map<String, String> =
-    mapOf(
-        "i8" to "I8",
-        "u8" to "U8",
-        "i16" to "I16",
-        "u16" to "U16",
-        "i32" to "I32",
-        "u32" to "U32",
-        "i64" to "I64",
-        "u64" to "U64",
-        "bool" to "BOOL",
-    )
+private val FIXED_SCALAR_CODECS: Map<String, String>
+    get() = activeRules().map("fixedScalarCodecs")
 
-private val EXTENDED_SCALAR_POINTED_PRIMITIVES: Set<String> =
-    wordSet("isize usize i128 u128 f16 f32 f64 f128 char")
+private val EXTENDED_SCALAR_POINTED_PRIMITIVES: Set<String>
+    get() = activeRules().words("extendedScalarPointedPrimitives")
 
-private val ADDRESS_BACKED_SYS_ROOTS: Set<String> = wordSet("libc wasip1 windows_sys wasi")
+private val ADDRESS_BACKED_SYS_ROOTS: Set<String>
+    get() = activeRules().words("addressBackedSysRoots")
 
 /** Keep pointer identity distinct from Kotlin's nullable pointee/value types. */
 internal fun rawPointerPointeeType(type: String?): String? {
@@ -161,38 +152,28 @@ internal fun KotlinJ2KEmitter.sourceTransparentField(
     val name = field.ident?.toString()?.let(::rustFieldIdentToKotlin) ?: tupleFieldPropertyName(0, 1)
     val associated = sourceAssociatedParameters(item.generics)
     val fieldType =
-        object : Fold() {
-            override fun foldType(t: SynType): SynType {
-                val projection = t.unqualifiedPath()?.segments?.toList()
+        object : SynTypeProjectionFolder() {
+            override fun rewriteUnqualifiedTypePath(type: SynType, segments: List<PathSegment>): SynType? {
                 val parameter =
                     associated.singleOrNull {
-                        projection?.size == 2 &&
-                            projection.first().identText() == it.owner &&
-                            projection.last().identText() == it.associated
-                    }
-                if (parameter != null) {
-                    val lastSpan = requireNotNull(projection).last().ident.span()
-                    return SynType.Path(null, Path.from(Ident.new(parameter.associated, lastSpan)))
-                }
-                return super.foldType(t)
+                        segments.size == 2 &&
+                            segments.first().identText() == it.owner &&
+                            segments.last().identText() == it.associated
+                    } ?: return null
+                return SynType.Path(null, Path.from(Ident.new(parameter.associated, segments.last().ident.span())))
             }
         }.foldType(field.ty.deepCopy())
     return name to renderType(fieldType, selfType)
 }
 
-private val RAW_MEMORY_AND_LAYOUT_IDENTS: Set<String> =
-    wordSet(
-        "size_of size_of_val align_of align_of_val offset_of transmute transmute_copy transmute_unchecked",
-        "zeroed MaybeUninit ManuallyDrop UnsafeCell SyncUnsafeCell from_raw_parts from_raw_parts_mut",
-        "read_unaligned write_unaligned read_volatile write_volatile addr_of addr_of_mut",
-        "copy_nonoverlapping NonNull TypeLayout PrimitiveLayouts",
-    )
+private val RAW_MEMORY_AND_LAYOUT_IDENTS: Set<String>
+    get() = activeRules().words("rawMemoryAndLayoutIdents")
 
-private val MANAGED_SLICE_BASES: Set<String> =
-    wordSet("List MutableList ArrayList String CharSequence LinearSliceView LinearMutSliceView ByteSlice MutByteSlice")
+private val MANAGED_SLICE_BASES: Set<String>
+    get() = activeRules().words("managedSliceBases")
 
-private val VIEW_OFFSET_SLICE_BASES: Set<String> =
-    wordSet("LinearSliceView LinearMutSliceView ByteSlice MutByteSlice")
+private val VIEW_OFFSET_SLICE_BASES: Set<String>
+    get() = activeRules().words("viewOffsetSliceBases")
 
 private fun KotlinJ2KEmitter.extractManagedSliceAsPtrTarget(
     expr: Expr,
@@ -410,7 +391,7 @@ internal fun KotlinJ2KEmitter.sameFileUniqueSimpleStruct(ktName: String): Item.S
     sameFileLayoutIndex().simpleStructsByKtName[ktName]
 
 internal fun KotlinJ2KEmitter.transparentDeclaration(owner: String?): Item.Struct? {
-    val trimmed = owner?.substringBefore('<')?.trim() ?: return null
+    val trimmed = owner?.headKotlinTypePath() ?: return null
     val idx = sameFileLayoutIndex()
     if ('.' in trimmed) {
         val prefix = trimmed.substringBeforeLast('.')
@@ -540,7 +521,7 @@ internal fun KotlinJ2KEmitter.sourceAssociatedParameters(
             list.addAll(tp.bounds.toList())
         }
     }
-    val ownerSimple = ownerTypeSimpleName ?: currentBoundedTypeName?.substringBefore('<')?.trim()
+    val ownerSimple = ownerTypeSimpleName ?: currentBoundedTypeName?.headKotlinTypePath()
     return declaredTypeParams
         .flatMap { rawParamIdent ->
             boundsByParam[rawParamIdent]
@@ -607,14 +588,9 @@ internal fun KotlinJ2KEmitter.sourceAssociatedArguments(path: Path, selfType: St
 }
 
 internal fun substituteSourceType(type: SynType, substitutions: Map<String, SynType>): SynType =
-    object : Fold() {
-        override fun foldType(t: SynType): SynType {
-            val singleName = singleUnqualifiedPathIdent(t)
-            if (singleName != null) {
-                substitutions[singleName]?.let { return it.deepCopy() }
-            }
-            return super.foldType(t)
-        }
+    object : SynTypeProjectionFolder() {
+        override fun rewriteUnqualifiedTypePath(type: SynType, segments: List<PathSegment>): SynType? =
+            singleUnqualifiedPathIdent(type)?.let(substitutions::get)?.deepCopy()
     }.foldType(type.deepCopy())
 
 internal fun KotlinJ2KEmitter.sourceAssociatedBinding(
@@ -673,16 +649,11 @@ internal fun KotlinJ2KEmitter.resolveLayoutType(
     }
 
     val substituted =
-        object : Fold() {
-            override fun foldType(t: SynType): SynType {
-                val projection = t.unqualifiedPath()?.segments?.toList()
-                if (projection?.size == 2) {
-                    resolveProjectionBinding(projection.first().identText(), projection.last().identText())?.let {
-                        return super.foldType(it)
-                    }
-                }
-                return super.foldType(t)
-            }
+        object : SynTypeProjectionFolder() {
+            override val foldReplacementResult: Boolean = true
+
+            override fun rewriteUnqualifiedTypePath(type: SynType, segments: List<PathSegment>): SynType? =
+                if (segments.size == 2) resolveProjectionBinding(segments.first().identText(), segments.last().identText()) else null
         }.foldType(substituteSourceType(type, substitutions))
     val path = substituted.unqualifiedPath() ?: return substituted
     val key = substituted.toTokenStream().toString()
@@ -987,7 +958,7 @@ private class SourcePointerLayoutResolver(
                 ?: error("Transparent construction requires a source-proven single field")
         val substitutions = initialOwnerSubstitutions(declaration, selfType)
         resolve(requireNotNull(sourceSingleField(declaration)).ty, selfType, substitutions = substitutions)?.let { return it }
-        if (selfType?.substringBefore('<') == declKt &&
+        if (selfType?.headKotlinTypePath() == declKt &&
             emitter.currentTypedLocals["this"] == selfType &&
             emitter.currentTypedLocals["fieldLayout"] == null
         ) {
@@ -1062,7 +1033,7 @@ private class SourceAstTypeInferrer(
         val ownerRaw = (baseSyn as? SynType.Path)?.path?.lastIdentText() ?: return null
         val ownerKt =
             if (ownerRaw == "Self") {
-                emitter.currentStandaloneImplSelfSynType?.let { emitter.renderType(it, null).substringBefore('<') }
+                emitter.currentStandaloneImplSelfSynType?.let { emitter.renderType(it, null).headKotlinTypePath() }
             } else {
                 rustTypeIdentToKotlin(ownerRaw)
             } ?: return null
@@ -1269,9 +1240,12 @@ private class SourceAstTypeInferrer(
     }
 
     companion object {
-        private val POINTER_CAST_METHODS = wordSet("cast cast_mut cast_const")
-        private val POINTER_CONTAINER_WRAPPERS = wordSet("NonNull Vec Box Unique")
-        private val INTEGER_LITERAL_SUFFIXES = wordSet("i8 u8 i16 u16 i32 u32 i64 u64 i128 u128 isize usize")
+        private val POINTER_CAST_METHODS: Set<String>
+            get() = activeRules().words("pointerCastMethods")
+        private val POINTER_CONTAINER_WRAPPERS: Set<String>
+            get() = activeRules().words("pointerContainerWrappers")
+        private val INTEGER_LITERAL_SUFFIXES: Set<String>
+            get() = activeRules().words("integerLiteralSuffixes")
 
         private fun parseU8SynType(): SynType = SynAstFragmentParser.u8SynType()
     }

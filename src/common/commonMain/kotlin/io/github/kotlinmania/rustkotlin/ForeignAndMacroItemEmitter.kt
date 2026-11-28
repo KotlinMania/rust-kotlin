@@ -213,11 +213,6 @@ internal fun KotlinJ2KEmitter.shouldOmitItemForUnportedQuickcheckOrRand(item: It
         RustTokenCursor.containsAnyIdentRecursive(item.toTokenStream(), currentOmittedTestIdents)
 }
 
-internal fun indentBlockByFourSpaces(text: String): String =
-    text.lines().joinToString("\n") { line ->
-        if (line.isEmpty()) "" else "    $line"
-    }
-
 internal fun KotlinJ2KEmitter.allocateTopLevelTestSuiteClassName(
     candidate: String,
     scopeSignatures: MutableMap<String, Int>,
@@ -327,8 +322,13 @@ internal fun KotlinJ2KEmitter.renderItemMod(
             if (modTestFns.isNotEmpty()) {
                 if (indent.isEmpty()) {
                     val suiteName = allocateTopLevelTestSuiteClassName(resolveModTestSuiteCandidateName(), scopeSignatures)
-                    val suiteBody = modTestFns.joinToString("\n\n") { indentBlockByFourSpaces(it) }
-                    nonTestOutputs += "public class $suiteName {\n$suiteBody\n}"
+                    nonTestOutputs +=
+                        KotlinDeclarationEmitter()
+                            .emitSuiteClass(
+                                visibility = "public",
+                                className = suiteName,
+                                memberDeclarations = modTestFns,
+                            ).render()
                 } else {
                     nonTestOutputs += modTestFns
                 }
@@ -599,11 +599,7 @@ internal sealed class ForeignFnEmissionStrategy {
             val emitter = ctx.emitter
             val localSig = ctx.sig.replaceFirst("expect fun ", "fun ")
             val retSynTy = extractReturnSynType(ctx.foreign.sig.output)
-            val retBaseSimple =
-                ctx.retRendered
-                    .substringBefore('<')
-                    .substringAfterLast('.')
-                    .trim()
+            val retBaseSimple = ctx.retRendered.simpleKotlinTypeName()
             val isReturnStructWithFields =
                 ctx.retDefault.endsWith("()") &&
                     (

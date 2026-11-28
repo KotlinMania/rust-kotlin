@@ -10,182 +10,93 @@ import io.github.kotlinmania.syn.QSelf
 import io.github.kotlinmania.syn.RangeLimits
 import io.github.kotlinmania.syn.SynType
 
-private val PRIMITIVE_LAYOUT_NAME_BY_KT_TYPE: Map<String, String> =
-    mapOf(
-        "Boolean" to "BOOL",
-        "Byte" to "I8",
-        "UByte" to "U8",
-        "CVoid" to "U8",
-        "Short" to "I16",
-        "UShort" to "U16",
-        "Int" to "I32",
-        "UInt" to "U32",
-        "Long" to "I64",
-        "ULong" to "U64",
-        "Float" to "F32",
-        "kotlin.Float" to "F32",
-        "Double" to "F64",
-        "F16" to "F16_LAYOUT",
-        "F128" to "F128_LAYOUT",
-        "Char" to "CHAR",
-        "Unit" to "UNIT",
-    )
+private val PRIMITIVE_LAYOUT_NAME_BY_KT_TYPE: Map<String, String>
+    get() = activeRules().map("primitiveLayoutsByKtType")
 
 /**
  * Single authoritative catalog of Rust integer and floating-point primitive operations,
- * their Kotlin / `core` / `libm` target names, extra-argument numeric kinds, and return-type
- * shapes so both expression lowering and return-type inference query one source of truth.
+ * loaded from `type-and-method-patterns.yml` so both expression lowering and return-type
+ * inference query one declarative source of truth.
  */
 internal object PrimitiveNumericOpCatalog {
-    val integerBitCountMethods: Map<String, String> =
-        mapOf(
-            "count_ones" to "countOnes",
-            "count_zeros" to "countZeros",
-            "leading_zeros" to "leadingZeros",
-            "trailing_zeros" to "trailingZeros",
-            "leading_ones" to "leadingOnes",
-            "trailing_ones" to "trailingOnes",
-        )
+    val integerBitCountMethods: Map<String, String>
+        get() = activeRules().map("integerBitCountMethods")
 
-    val integerUnaryOpMethods: Map<String, String> =
-        mapOf(
-            "checked_neg" to "checkedNeg",
-            "checked_abs" to "checkedAbs",
-            "wrapping_neg" to "wrappingNeg",
-            "wrapping_abs" to "wrappingAbs",
-            "saturating_neg" to "saturatingNeg",
-            "saturating_abs" to "saturatingAbs",
-            "overflowing_neg" to "overflowingNeg",
-            "overflowing_abs" to "overflowingAbs",
-            "reverse_bits" to "reverseBits",
-        ) + integerBitCountMethods
+    val integerUnaryOpMethods: Map<String, String>
+        get() = activeRules().unionMaps("integerUnaryCoreMethods", "integerBitCountMethods")
 
-    val integerShiftOrPowMethods: Map<String, String> =
-        mapOf(
-            "checked_shl" to "checkedShl",
-            "checked_shr" to "checkedShr",
-            "checked_pow" to "checkedPow",
-            "wrapping_shl" to "wrappingShl",
-            "wrapping_shr" to "wrappingShr",
-            "overflowing_shl" to "overflowingShl",
-            "overflowing_shr" to "overflowingShr",
-            "rotate_left" to "rotateLeft",
-            "rotate_right" to "rotateRight",
-            "pow" to "pow",
-        )
+    val integerShiftOrPowMethods: Map<String, String>
+        get() = activeRules().map("integerShiftOrPowMethods")
 
-    val integerBinaryOpMethods: Map<String, String> =
-        mapOf(
-            "checked_add" to "checkedAdd",
-            "checked_sub" to "checkedSub",
-            "checked_mul" to "checkedMul",
-            "checked_div" to "checkedDiv",
-            "checked_rem" to "checkedRem",
-            "checked_div_euclid" to "checkedDivEuclid",
-            "checked_rem_euclid" to "checkedRemEuclid",
-            "wrapping_add" to "wrappingAdd",
-            "wrapping_sub" to "wrappingSub",
-            "wrapping_mul" to "wrappingMul",
-            "wrapping_div" to "wrappingDiv",
-            "wrapping_rem" to "wrappingRem",
-            "saturating_add" to "saturatingAdd",
-            "saturating_sub" to "saturatingSub",
-            "saturating_mul" to "saturatingMul",
-            "overflowing_add" to "overflowingAdd",
-            "overflowing_sub" to "overflowingSub",
-            "overflowing_mul" to "overflowingMul",
-            "div_euclid" to "divEuclid",
-            "rem_euclid" to "remEuclid",
-        )
+    val integerBinaryOpMethods: Map<String, String>
+        get() = activeRules().map("integerBinaryOpMethods")
 
-    private val allIntegerOpNames: Set<String> =
-        integerUnaryOpMethods.keys + integerShiftOrPowMethods.keys + integerBinaryOpMethods.keys
+    private val allIntegerOpNamesMemo =
+        RegistryMemo { reg ->
+            reg.unionMaps("integerUnaryCoreMethods", "integerBitCountMethods").keys +
+                reg.map("integerShiftOrPowMethods").keys +
+                reg.map("integerBinaryOpMethods").keys
+        }
 
-    val signedOnlyIntegerMethods: Set<String> =
-        setOf("checked_abs", "wrapping_abs", "saturating_abs", "overflowing_abs", "saturating_neg")
+    private val allIntegerOpNames: Set<String>
+        get() = allIntegerOpNamesMemo.get()
 
-    val endian128Methods: Map<String, String> =
-        mapOf(
-            "to_be" to "toBe",
-            "from_be" to "fromBe",
-            "swap_bytes" to "swapBytes",
-            "to_le" to "toLe",
-            "from_le" to "fromLe",
-        )
+    val signedOnlyIntegerMethods: Set<String>
+        get() = activeRules().words("signedOnlyIntegerMethods")
 
-    val standaloneCheckedI32Ops: Map<String, String> =
-        mapOf(
-            "checked_add" to "+",
-            "checked_sub" to "-",
-            "checked_mul" to "*",
-        )
+    val endian128Methods: Map<String, String>
+        get() = activeRules().map("endian128Methods")
 
-    val floatStdlibBoolPredicates: Map<String, String> =
-        mapOf(
-            "is_nan" to "isNaN",
-            "is_infinite" to "isInfinite",
-            "is_finite" to "isFinite",
-        )
+    val standaloneCheckedI32Ops: Map<String, String>
+        get() = activeRules().map("standaloneCheckedI32Ops")
 
-    val floatCoreBoolPredicates: Map<String, String> =
-        mapOf(
-            "is_sign_positive" to "isSignPositive",
-            "is_sign_negative" to "isSignNegative",
-            "is_normal" to "isNormal",
-            "is_subnormal" to "isSubnormal",
-        )
+    val floatStdlibBoolPredicates: Map<String, String>
+        get() = activeRules().map("floatStdlibBoolPredicates")
 
-    val floatCoreSelfMethods: Map<String, String> =
-        mapOf(
-            "signum" to "signum",
-            "to_degrees" to "toDegrees",
-            "to_radians" to "toRadians",
-            "next_up" to "nextUp",
-            "next_down" to "nextDown",
-        )
+    val floatCoreBoolPredicates: Map<String, String>
+        get() = activeRules().map("floatCoreBoolPredicates")
 
-    val floatLibraryMethods: Map<String, String> =
-        floatCoreBoolPredicates + mapOf("classify" to "classify") + floatCoreSelfMethods
+    val floatCoreSelfMethods: Map<String, String>
+        get() = activeRules().map("floatCoreSelfMethods")
 
-    val floatKmUnaryBases: Map<String, String> =
-        mapOf(
-            "abs" to "kmFabs",
-            "floor" to "kmFloor",
-            "ceil" to "kmCeil",
-            "round" to "kmRound",
-            "round_ties_even" to "kmRoundTiesEven",
-            "trunc" to "kmTrunc",
-            "sqrt" to "kmSqrt",
-            "exp" to "kmExp",
-            "exp2" to "kmExp2",
-            "ln" to "kmLog",
-            "log2" to "kmLog2",
-            "log10" to "kmLog10",
-            "sin" to "kmSin",
-            "cos" to "kmCos",
-        )
+    private val floatLibraryMethodsMemo =
+        RegistryMemo { reg ->
+            reg.map("floatCoreBoolPredicates") + mapOf("classify" to "classify") + reg.map("floatCoreSelfMethods")
+        }
 
-    val floatLibmUnaryOps: Set<String> =
-        setOf("tan", "asin", "acos", "atan", "cbrt", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh")
+    val floatLibraryMethods: Map<String, String>
+        get() = floatLibraryMethodsMemo.get()
 
-    val floatLibmBinaryOps: Set<String> = setOf("atan2", "hypot")
+    val floatKmUnaryBases: Map<String, String>
+        get() = activeRules().map("floatKmUnaryBases")
 
-    val floatKmBinaryBases: Map<String, String> =
-        mapOf(
-            "powf" to "kmPow",
-            "copysign" to "kmCopysign",
-            "min" to "kmMinnum",
-            "max" to "kmMaxnum",
-        )
+    val floatLibmUnaryOps: Set<String>
+        get() = activeRules().words("floatLibmUnaryOps")
 
-    private val floatSameTypeReturnMethods: Set<String> =
-        (floatKmUnaryBases.keys - "round_ties_even") +
-            floatLibmUnaryOps +
-            floatLibmBinaryOps +
-            setOf("powf", "powi", "min", "max", "fract", "mul_add", "recip", "to_degrees", "to_radians", "signum", "log")
+    val floatLibmBinaryOps: Set<String>
+        get() = activeRules().words("floatLibmBinaryOps")
 
-    private val floatBoolReturnMethods: Set<String> =
-        floatStdlibBoolPredicates.keys + floatCoreBoolPredicates.keys
+    val floatKmBinaryBases: Map<String, String>
+        get() = activeRules().map("floatKmBinaryBases")
+
+    private val floatSameTypeReturnMethodsMemo =
+        RegistryMemo { reg ->
+            (reg.map("floatKmUnaryBases").keys - "round_ties_even") +
+                reg.words("floatLibmUnaryOps") +
+                reg.words("floatLibmBinaryOps") +
+                reg.words("floatAdditionalSameTypeReturnMethods")
+        }
+
+    private val floatSameTypeReturnMethods: Set<String>
+        get() = floatSameTypeReturnMethodsMemo.get()
+
+    private val floatBoolReturnMethodsMemo =
+        RegistryMemo { reg ->
+            reg.map("floatStdlibBoolPredicates").keys + reg.map("floatCoreBoolPredicates").keys
+        }
+
+    private val floatBoolReturnMethods: Set<String>
+        get() = floatBoolReturnMethodsMemo.get()
 
     fun isFloatKind(kind: NumericKind): Boolean =
         kind == NumericKind.F16 || kind == NumericKind.F32 || kind == NumericKind.F64 || kind == NumericKind.F128
@@ -397,38 +308,14 @@ private class ConcretePrimitiveOpEmitter(
                     ?: emitter.currentExpectedParseTargetType
                     ?: emitter.currentEnclosingReturnRenderedType
             val dstKind = dstType?.let(emitter::resolveNumericKind) ?: return null
-            return when (dstKind) {
-                NumericKind.I8 -> "$scalarAtom.toInt().toByte()"
-                NumericKind.I16 -> "$scalarAtom.toInt().toShort()"
-                NumericKind.I32 -> "$scalarAtom.toInt()"
-                NumericKind.I64 -> "$scalarAtom.toLong()"
-                NumericKind.U8 -> "$scalarAtom.toInt().toUByte()"
-                NumericKind.U16 -> "$scalarAtom.toInt().toUShort()"
-                NumericKind.U32 -> "$scalarAtom.toUInt()"
-                NumericKind.U64 -> {
-                    val fn = if (useF32) "kmFloatToU64Unchecked" else "kmDoubleToU64Unchecked"
-                    registerIntrinsic(fn)
-                    "$fn($scalarExpr)"
-                }
-                NumericKind.U128 -> {
-                    val fn = if (useF32) "kmFloatToU128Unchecked" else "kmDoubleToU128Unchecked"
-                    registerIntrinsic(fn)
-                    if (emitter.headerContext.packageName != coreNs) {
-                        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.U128")
-                    }
-                    "$fn($scalarExpr).let { U128(it.hi, it.lo) }"
-                }
-                NumericKind.I128 -> {
-                    val fn = if (useF32) "kmFloatToU128Unchecked" else "kmDoubleToU128Unchecked"
-                    registerIntrinsic(fn)
-                    if (emitter.headerContext.packageName != coreNs) {
-                        CoreIntrinsicLowering.registerCoreImport(emitter, "$coreNs.I128")
-                    }
-                    val zeroLit = if (useF32) "0.0f" else "0.0"
-                    "($scalarExpr).let { v -> if (v < $zeroLit) $fn(-v).let { -I128(it.hi.toLong(), it.lo) } else $fn(v).let { I128(it.hi.toLong(), it.lo) } }"
-                }
-                else -> null
-            }
+            return CoreIntrinsicLowering.renderScalarFloatToIntUnchecked(
+                emitter = emitter,
+                coreNs = coreNs,
+                isF32 = useF32,
+                valueExpr = scalarExpr,
+                atomExpr = scalarAtom,
+                dstKind = dstKind,
+            )
         }
 
         private fun renderUnaryFloatOp(rawMethod: String): String? {
@@ -503,7 +390,7 @@ internal fun KotlinJ2KEmitter.unwrapTryIntoUnwrapExpr(expr: Expr): Expr? {
 }
 
 internal fun KotlinJ2KEmitter.transparentPointerField(type: String, selfTypeName: String?): Pair<String, String>? {
-    val owner = type.substringBefore('<').substringAfterLast('.')
+    val owner = type.simpleKotlinTypeName()
     val struct =
         file.items.filterIsInstance<Item.Struct>().singleOrNull {
             rustTypeIdentToKotlin(it.ident.toString()) == owner
@@ -558,7 +445,7 @@ internal fun KotlinJ2KEmitter.resolveStructOrUnresolvedTypeLayoutExpr(
     pointeeKt: String,
     memPkg: String,
 ): String {
-    val structSimple = pointeeKt.substringBefore('<').substringAfterLast('.')
+    val structSimple = pointeeKt.simpleKotlinTypeName()
     val structDecl = sameFileUniqueSimpleStruct(structSimple)
     if (structDecl != null) {
         val computed = StructLayoutComputer.computeStructLayout(structDecl, this)
@@ -597,22 +484,7 @@ internal fun renderPrimitiveByteSwapExpr(renderedOperand: String, kind: NumericK
 }
 
 private fun renderPrimitiveByteSwapBody(v: String, kind: NumericKind): String =
-    when (kind) {
-        NumericKind.I8, NumericKind.U8 -> v
-        NumericKind.U16 ->
-            "((((($v).toUInt() and 0xFFu) shl 8) or ((($v).toUInt() shr 8) and 0xFFu)).toUShort())"
-        NumericKind.I16 ->
-            "((((($v).toInt() and 0xFF) shl 8) or ((($v).toInt() ushr 8) and 0xFF)).toShort())"
-        NumericKind.U32 ->
-            "(((($v) shl 24)) or ((($v) and 0x0000FF00u) shl 8) or ((($v) shr 8) and 0x0000FF00u) or (($v) shr 24))"
-        NumericKind.I32 ->
-            "(((($v) shl 24)) or ((($v) and 0x0000FF00) shl 8) or ((($v) ushr 8) and 0x0000FF00) or (($v) ushr 24))"
-        NumericKind.U64 ->
-            "(((($v) shl 56)) or ((($v) and 0x000000000000FF00uL) shl 40) or ((($v) and 0x0000000000FF0000uL) shl 24) or ((($v) and 0x00000000FF000000uL) shl 8) or (((($v) shr 8) and 0x00000000FF000000uL)) or (((($v) shr 24) and 0x0000000000FF0000uL)) or (((($v) shr 40) and 0x000000000000FF00uL)) or (($v) shr 56))"
-        NumericKind.I64 ->
-            "((((($v).toULong() shl 56)) or ((($v).toULong() and 0x000000000000FF00uL) shl 40) or ((($v).toULong() and 0x0000000000FF0000uL) shl 24) or ((($v).toULong() and 0x00000000FF000000uL) shl 8) or (((($v).toULong() shr 8) and 0x00000000FF000000uL)) or (((($v).toULong() shr 24) and 0x0000000000FF0000uL)) or (((($v).toULong() shr 40) and 0x000000000000FF00uL)) or (($v).toULong() shr 56)).toLong())"
-        else -> v
-    }
+    activeRules().numericKindTemplates("primitiveByteSwapTemplates")[kind]?.render { if (it == "v") v else null } ?: v
 
 internal fun KotlinJ2KEmitter.tryExtractMutableArraySubsliceArg(
     argExpr: Expr,
@@ -733,27 +605,9 @@ internal fun KotlinJ2KEmitter.renderUnOpDerefPointerPunning(
     val dstKind = resolveNumericKind(renderType(dstPointee, selfTypeName)) ?: return null
     val srcKind = inferExprNumericKind(srcInner, selfTypeName) ?: return null
     val rval = renderExpr(srcInner, indent, selfTypeName)
+    if (srcKind == dstKind) return rval
     val atom = if (isAtomicPostfixReceiver(srcInner, rval)) rval else "($rval)"
-    return when {
-        srcKind == dstKind -> rval
-        srcKind == NumericKind.F16 && dstKind == NumericKind.U16 -> "$atom.toBits()"
-        srcKind == NumericKind.F16 && dstKind == NumericKind.I16 -> "$atom.toBits().toShort()"
-        srcKind == NumericKind.U16 && dstKind == NumericKind.F16 -> "F16.fromBits($rval)"
-        srcKind == NumericKind.I16 && dstKind == NumericKind.F16 -> "F16.fromBits($atom.toUShort())"
-        srcKind == NumericKind.F32 && dstKind == NumericKind.U32 -> "$atom.toRawBits().toUInt()"
-        srcKind == NumericKind.F32 && dstKind == NumericKind.I32 -> "$atom.toRawBits()"
-        srcKind == NumericKind.F64 && dstKind == NumericKind.U64 -> "$atom.toRawBits().toULong()"
-        srcKind == NumericKind.F64 && dstKind == NumericKind.I64 -> "$atom.toRawBits()"
-        srcKind == NumericKind.F128 && dstKind == NumericKind.U128 -> "U128($atom.high, $atom.low)"
-        srcKind == NumericKind.F128 && dstKind == NumericKind.I128 -> "I128($atom.high.toLong(), $atom.low)"
-        srcKind == NumericKind.U128 && dstKind == NumericKind.F128 -> "F128.fromBits($rval)"
-        srcKind == NumericKind.I128 && dstKind == NumericKind.F128 -> "F128.fromBits($atom.high.toULong(), $atom.low)"
-        srcKind == NumericKind.U32 && dstKind == NumericKind.F32 -> "${kotlinF32TypeName()}.fromBits($atom.toInt())"
-        srcKind == NumericKind.I32 && dstKind == NumericKind.F32 -> "${kotlinF32TypeName()}.fromBits($rval)"
-        srcKind == NumericKind.U64 && dstKind == NumericKind.F64 -> "Double.fromBits($atom.toLong())"
-        srcKind == NumericKind.I64 && dstKind == NumericKind.F64 -> "Double.fromBits($rval)"
-        else -> null
-    }
+    return CoreIntrinsicLowering.renderScalarBitCast(this, srcKind.name.lowercase(), dstKind.name.lowercase(), rval, atom)
 }
 
 internal fun KotlinJ2KEmitter.renderFloatToBitsExpr(
@@ -761,13 +615,9 @@ internal fun KotlinJ2KEmitter.renderFloatToBitsExpr(
     renderedRecv: String,
     recvKind: NumericKind,
 ): String? {
+    val tmpl = activeRules().numericKindTemplates("floatToBitsTemplates")[recvKind] ?: return null
     val recvAtom = atomicRecvExpr(recvExpr, renderedRecv)
-    return when (recvKind) {
-        NumericKind.F16, NumericKind.F128 -> "$recvAtom.toBits()"
-        NumericKind.F32 -> "$recvAtom.toRawBits().toUInt()"
-        NumericKind.F64 -> "$recvAtom.toRawBits().toULong()"
-        else -> null
-    }
+    return tmpl.render { if (it == "recv") recvAtom else null }
 }
 
 internal fun KotlinJ2KEmitter.tryRender128BitEndianMethodCall(
@@ -829,22 +679,10 @@ internal data class StaticPrimitiveCallSpec(
 internal fun KotlinJ2KEmitter.rustPrimitivePathNameToKind(raw: String): NumericKind? {
     var cur = raw.removePrefix("r#")
     val visited = hashSetOf<String>()
+    val fixedKinds = activeRules().numericKindValMap("rustFixedScalarKinds")
     repeat(5) {
+        fixedKinds[cur]?.let { kind -> return kind }
         when (cur) {
-            "i8" -> return NumericKind.I8
-            "u8" -> return NumericKind.U8
-            "i16" -> return NumericKind.I16
-            "u16" -> return NumericKind.U16
-            "i32" -> return NumericKind.I32
-            "u32" -> return NumericKind.U32
-            "i64" -> return NumericKind.I64
-            "u64" -> return NumericKind.U64
-            "i128" -> return NumericKind.I128
-            "u128" -> return NumericKind.U128
-            "f16" -> return NumericKind.F16
-            "f32" -> return NumericKind.F32
-            "f64" -> return NumericKind.F64
-            "f128" -> return NumericKind.F128
             "isize" -> return resolvePointerSizedNumericKind(signed = true)
             "usize" -> return resolvePointerSizedNumericKind(signed = false)
         }
@@ -913,16 +751,9 @@ internal fun KotlinJ2KEmitter.renderStaticPrimitiveCall(
     val spec = parseStaticPrimitiveCallSpec(expr) ?: return null
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
     if (spec.methodName == "from_bits" && spec.turbofishType == null && nonUnitArgs.size == 1) {
-        when (spec.primKind) {
-            NumericKind.F16 ->
-                return renderFloatFromBitsArg(nonUnitArgs[0], NumericKind.U16, NumericKind.U16, "F16", indent, selfTypeName)
-            NumericKind.F32 ->
-                return renderFloatFromBitsArg(nonUnitArgs[0], NumericKind.U32, NumericKind.I32, kotlinF32TypeName(), indent, selfTypeName)
-            NumericKind.F64 ->
-                return renderFloatFromBitsArg(nonUnitArgs[0], NumericKind.U64, NumericKind.I64, "Double", indent, selfTypeName)
-            NumericKind.F128 ->
-                return renderFloatFromBitsArg(nonUnitArgs[0], NumericKind.U128, NumericKind.U128, "F128", indent, selfTypeName)
-            else -> Unit
+        activeRules().floatFromBitsSpecsByKind[spec.primKind]?.let { fb ->
+            val owner = if (fb.owner == "{f32Type}") kotlinF32TypeName() else fb.owner
+            return renderFloatFromBitsArg(nonUnitArgs[0], fb.renderExpectKind, fb.castKind, owner, indent, selfTypeName)
         }
     }
     if (spec.methodName == "from_str_radix" &&

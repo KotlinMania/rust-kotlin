@@ -24,6 +24,12 @@ assert 'Usage:' in execute('help',[BINARY,'--help']).stdout
 assert 'items=1' in execute('inspect',[BINARY,'inspect',source]).stdout
 output=OUT/'Sum.kt';execute('translate',[BINARY,'translate',source,output])
 code=output.read_text();assert 'fun sum' in code and 'import java.' not in code and 'import javax.' not in code
+yaml_src=OUT/'yaml_probe.rs';yaml_src.write_text('pub fn yaml_probe() -> Vec<u8> { Vec::with_capacity(8) }\n')
+yaml_out=OUT/'YamlProbe.kt'
+r_cwd=subprocess.run([str(BINARY),'translate',str(yaml_src),str(yaml_out)],capture_output=True,text=True,timeout=120,cwd=OUT)
+if r_cwd.returncode!=0:raise RuntimeError('translate-outside-root: '+r_cwd.stdout[-1500:]+r_cwd.stderr[-1500:])
+yaml_code=yaml_out.read_text();assert 'List<UByte>' in yaml_code and 'ArrayList(8)' in yaml_code
+results.append({'name':'translate-outside-root','command':[str(BINARY),'translate',str(yaml_src),str(yaml_out)],'exit':r_cwd.returncode})
 before=hashlib.sha256(output.read_bytes()).hexdigest()
 execute('refuse-existing',[BINARY,'translate',source,output],2)
 assert before==hashlib.sha256(output.read_bytes()).hexdigest()

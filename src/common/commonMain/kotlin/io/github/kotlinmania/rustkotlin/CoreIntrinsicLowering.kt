@@ -153,79 +153,79 @@ private abstract class CoreIntrinsicFamilyRule {
     abstract fun renderCall(ctx: IntrinsicCallContext): String?
 }
 
+private fun SynthesizedIntrinsicDeclContext.renderDeclarativeBody(
+    rulesByName: Map<String, DeclarativeIntrinsicPatternRule>,
+): String? {
+    val action = rulesByName[canonicalName]?.declAction ?: return null
+    return action.render(
+        rawAbi = rawAbi,
+        onImport = { CoreIntrinsicLowering.registerCoreImport(emitter, it) },
+    ) { key ->
+        when (key) {
+            "coreNs" -> coreNs
+            "p0" -> p0
+            "p1" -> p1
+            "p2" -> p2
+            "t0" -> t0
+            "t1" -> t1
+            "layout0" -> layout0
+            "layout1" -> layout1
+            "ord0" -> ord0
+            "ord1" -> ord1
+            else -> null
+        }
+    }
+}
+
 private object ControlAndHintIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
-    private val DECL_NOOP_NAMES =
-        "assume breakpoint forget cold_path assert_inhabited assert_zero_valid assert_mem_uninitialized_valid"
-            .split(' ')
-            .toSet()
-    private val CALL_NOOP_NAMES =
-        DECL_NOOP_NAMES +
-            "prefetch_read_data prefetch_write_data prefetch_read_instruction prefetch_write_instruction".split(' ')
-    private val IDENTITY_NAMES = setOf("likely", "unlikely", "rustc_peek")
-    private val FALSE_CHECK_NAMES = setOf("ub_checks", "overflow_checks", "is_val_statically_known")
-    private val OTHER_NAMES = setOf("abort", "abort_immediate", "unreachable", "select_unpredictable", "black_box")
+    private val rulesByName: Map<String, DeclarativeIntrinsicPatternRule>
+        get() = activeRules().intrinsicRules("controlAndHintIntrinsicRules")
 
     override fun matches(canonicalName: String, isCoreSimdCall: Boolean): Boolean =
-        canonicalName in CALL_NOOP_NAMES ||
-            canonicalName in IDENTITY_NAMES ||
-            canonicalName in FALSE_CHECK_NAMES ||
-            canonicalName in OTHER_NAMES
+        canonicalName == "black_box" || canonicalName in rulesByName
 
-    override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? =
-        when (decl.canonicalName) {
-            "abort", "abort_immediate" -> decl.callIntr("kmAbort")
-            "unreachable" -> "error(\"Entered Rust intrinsics::unreachable\")"
-            in DECL_NOOP_NAMES -> "Unit"
-            in IDENTITY_NAMES, "black_box" -> decl.p0
-            "select_unpredictable" -> "if (${decl.p0}) ${decl.p1} else ${decl.p2}"
-            else -> null
+    override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? {
+        if (decl.canonicalName == "black_box") return decl.p0
+        return decl.renderDeclarativeBody(rulesByName)
+    }
+
+    override fun renderCall(ctx: IntrinsicCallContext): String? {
+        if (ctx.canonicalName == "black_box") {
+            val arg0 = ctx.renderedArgs.firstOrNull() ?: return "Unit"
+            val kind = ctx.callArgsList.firstOrNull()?.let { ctx.emitter.inferExprNumericKind(it, ctx.selfTypeName) }
+            return if (kind == NumericKind.U64) ctx.callIntr("kmBlackBoxU64", arg0) else arg0
         }
-
-    override fun renderCall(ctx: IntrinsicCallContext): String? =
-        when (ctx.canonicalName) {
-            "abort", "abort_immediate" -> ctx.callIntr("kmAbort")
-            "unreachable" -> "error(\"Entered Rust intrinsics::unreachable\")"
-            in CALL_NOOP_NAMES -> "Unit"
-            in IDENTITY_NAMES -> ctx.renderedArgs.firstOrNull() ?: "Unit"
-            "select_unpredictable" ->
-                if (ctx.renderedArgs.size >= 3) "if (${ctx.renderedArgs[0]}) ${ctx.renderedArgs[1]} else ${ctx.renderedArgs[2]}" else null
-            in FALSE_CHECK_NAMES -> "false"
-            "black_box" -> {
-                val arg0 = ctx.renderedArgs.firstOrNull() ?: return "Unit"
-                val kind = ctx.callArgsList.firstOrNull()?.let { ctx.emitter.inferExprNumericKind(it, ctx.selfTypeName) }
-                if (kind == NumericKind.U64) ctx.callIntr("kmBlackBoxU64", arg0) else arg0
+        val rule = rulesByName[ctx.canonicalName] ?: return null
+        val callAction = rule.callAction ?: return null
+        if (ctx.renderedArgs.size < rule.minCallArgs) return null
+        return callAction.render(
+            rawAbi = ctx.rawAbi,
+            onImport = { CoreIntrinsicLowering.registerCoreImport(ctx.emitter, it) },
+        ) { key ->
+            when (key) {
+                "coreNs" -> ctx.coreNs
+                "arg0OrUnit" -> ctx.renderedArgs.firstOrNull() ?: "Unit"
+                "arg0" -> ctx.renderedArgs.getOrNull(0)
+                "arg1" -> ctx.renderedArgs.getOrNull(1)
+                "arg2" -> ctx.renderedArgs.getOrNull(2)
+                else -> null
             }
-            else -> null
         }
+    }
 }
 
 private object LayoutAndReflectionIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
     private val ALIGN_NAMES = setOf("align_of", "align_of_val", "min_align_of", "min_align_of_val", "pref_align_of")
-    private val ALL_NAMES =
-        ALIGN_NAMES +
-            setOf("size_of", "size_of_val", "vtable_size", "vtable_align", "variant_count", "raw_eq", "needs_drop", "type_name")
-    private val TRIVIAL_SCALARS =
-        "bool char i8 u8 i16 u16 i32 u32 i64 u64 i128 u128 isize usize f16 f32 f64 f128".split(' ').toSet()
+    private val TRIVIAL_SCALARS: Set<String>
+        get() = activeRules().words("trivialDropScalars")
+    private val declRulesByName: Map<String, DeclarativeIntrinsicPatternRule>
+        get() = activeRules().intrinsicRules("layoutSynthesizedDeclRules")
 
-    override fun matches(canonicalName: String, isCoreSimdCall: Boolean): Boolean = canonicalName in ALL_NAMES
+    override fun matches(canonicalName: String, isCoreSimdCall: Boolean): Boolean =
+        canonicalName in declRulesByName
 
     override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? =
-        when (decl.canonicalName) {
-            "size_of" -> decl.asUsizeExpr("${decl.layout0}.sizeBytes")
-            "size_of_val" ->
-                if (decl.rawAbi) {
-                    "${decl.layout0}.sizeBytes.toULong()"
-                } else {
-                    "(if (${decl.p0}.rawMeta > 0L) (${decl.p0}.rawMeta * ${decl.layout0}.sizeBytes).toInt() else ${decl.layout0}.sizeBytes.toInt())"
-                }
-            in ALIGN_NAMES -> decl.asUsizeExpr("${decl.layout0}.alignBytes")
-            "vtable_size", "vtable_align" -> decl.usizeLiteral(8)
-            "variant_count" -> decl.usizeLiteral(1)
-            "raw_eq" -> decl.callMem("rawEqWithLayout", decl.p0, decl.p1, decl.layout0)
-            "needs_drop" -> "true"
-            "type_name" -> "\"${decl.t0}\""
-            else -> null
-        }
+        decl.renderDeclarativeBody(declRulesByName)
 
     override fun renderCall(ctx: IntrinsicCallContext): String? =
         when (ctx.canonicalName) {
@@ -294,31 +294,7 @@ private object PointerAndMemoryIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
         canonicalName in PTR_OPS || canonicalName in LOAD_NAMES || canonicalName in STORE_NAMES || canonicalName in COPY_NAMES || canonicalName in SET_NAMES
 
     override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? =
-        when (decl.canonicalName) {
-            "arith_offset" -> "${decl.importPtr("ConstPtr")}(${decl.p0}.rawAddress + (${decl.p1}).toLong() * ${decl.layout0}.strideBytes)"
-            "ptr_offset_from" -> {
-                val diff = "((${decl.p0}.rawAddress - ${decl.p1}.rawAddress) / maxOf(1L, ${decl.layout0}.sizeBytes))"
-                if (decl.rawAbi) diff else "$diff.toInt()"
-            }
-            "ptr_offset_from_unsigned" -> {
-                val diff = "((${decl.p0}.rawAddress - ${decl.p1}.rawAddress) / maxOf(1L, ${decl.layout0}.sizeBytes))"
-                if (decl.rawAbi) "($diff.toULong())" else "$diff.toInt()"
-            }
-            "ptr_mask" -> "${decl.importPtr("ConstPtr")}(${decl.p0}.rawAddress and (${decl.p1}).toLong())"
-            "read_via_copy" -> "${decl.layout0}.readNative(${decl.p0}.rawAddress)"
-            "write_via_move", "nontemporal_store" -> "${decl.layout0}.writeNative(${decl.p0}.rawAddress, ${decl.p1})"
-            "volatile_load", "unaligned_volatile_load" -> "${decl.layout0}.readVolatileNative(${decl.p0}.rawAddress)"
-            "volatile_store", "unaligned_volatile_store" -> "${decl.layout0}.writeVolatileNative(${decl.p0}.rawAddress, ${decl.p1})"
-            "copy_nonoverlapping", "volatile_copy_nonoverlapping_memory" ->
-                decl.callIntr("kmCopyNonoverlapping", "${decl.p1}.rawAddress", "${decl.p0}.rawAddress", "(${decl.p2}).toLong() * ${decl.layout0}.sizeBytes")
-            "copy", "volatile_copy_memory" ->
-                decl.callIntr("kmCopy", "${decl.p1}.rawAddress", "${decl.p0}.rawAddress", "(${decl.p2}).toLong() * ${decl.layout0}.sizeBytes")
-            "write_bytes", "volatile_set_memory" ->
-                decl.callIntr("kmWriteBytes", "${decl.p0}.rawAddress", decl.p1, "(${decl.p2}).toLong() * ${decl.layout0}.sizeBytes")
-            "compare_bytes" ->
-                decl.callIntr("kmCompareBytes", "${decl.p0}.rawAddress", "${decl.p1}.rawAddress", "(${decl.p2}).toLong()")
-            else -> null
-        }
+        decl.renderDeclarativeBody(activeRules().intrinsicRules("pointerSynthesizedDeclRules"))
 
     override fun renderCall(ctx: IntrinsicCallContext): String? =
         when (ctx.canonicalName) {
@@ -406,46 +382,37 @@ private object PointerAndMemoryIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
 }
 
 private object AtomicMemoryIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
-    val RMW_OP_CODES: Map<String, Int> =
-        mapOf(
-            "atomic_xadd" to 1,
-            "atomic_xsub" to 2,
-            "atomic_and" to 3,
-            "atomic_nand" to 4,
-            "atomic_or" to 5,
-            "atomic_xor" to 6,
-            "atomic_max" to 7,
-            "atomic_min" to 8,
-            "atomic_umax" to 9,
-            "atomic_umin" to 10,
-        )
-    val NON_RMW_NAMES: Set<String> =
-        setOf("atomic_load", "atomic_store", "atomic_xchg", "atomic_fence", "atomic_singlethreadfence", "atomic_cxchg", "atomic_cxchgweak")
+    val RMW_OP_CODES: Map<String, Int>
+        get() = activeRules().atomicRmwOpCodes
+    val NON_RMW_NAMES: Set<String>
+        get() = activeRules().words("atomicNonRmwNames")
+    private val atomicRulesByName: Map<String, DeclarativeIntrinsicPatternRule>
+        get() = activeRules().intrinsicRules("atomicSynthesizedDeclRules")
 
     override fun matches(canonicalName: String, isCoreSimdCall: Boolean): Boolean =
         canonicalName in NON_RMW_NAMES || canonicalName in RMW_OP_CODES
 
-    override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? =
-        when (decl.canonicalName) {
-            "atomic_fence" -> decl.callIntr("kmAtomicFence", decl.ord0)
-            "atomic_singlethreadfence" -> decl.callIntr("kmAtomicSignalFence", decl.ord0)
-            "atomic_load" -> decl.callMem("atomicLoadWithLayout", "${decl.p0}.rawAddress", decl.ord0, decl.layout0)
-            "atomic_store" -> decl.callMem("atomicStoreWithLayout", "${decl.p0}.rawAddress", decl.p1, decl.ord0, decl.layout0)
-            "atomic_xchg" -> decl.callMem("atomicXchgWithLayout", "${decl.p0}.rawAddress", decl.p1, decl.ord0, decl.layout0)
-            "atomic_cxchg", "atomic_cxchgweak" ->
-                decl.callMem("atomicCxchgWithLayout", "${decl.p0}.rawAddress", decl.p1, decl.p2, decl.ord0, decl.ord1, decl.layout0)
-            in RMW_OP_CODES -> {
-                val opCode = RMW_OP_CODES.getValue(decl.canonicalName).toString()
-                val opLayout = if (decl.typeParams.size >= 2) decl.layout1 else decl.layout0
-                decl.callMem("atomicRmwWithLayout", "${decl.p0}.rawAddress", decl.p1, opCode, decl.ord0, decl.layout0, opLayout)
-            }
-            else -> null
-        }
+    override fun renderSynthesizedDecl(decl: SynthesizedIntrinsicDeclContext): String? {
+        decl.renderDeclarativeBody(atomicRulesByName)?.let { return it }
+        val rmwCode = RMW_OP_CODES[decl.canonicalName]?.toString() ?: return null
+        val opLayout = if (decl.typeParams.size >= 2) decl.layout1 else decl.layout0
+        return decl.callMem("atomicRmwWithLayout", "${decl.p0}.rawAddress", decl.p1, rmwCode, decl.ord0, decl.layout0, opLayout)
+    }
 
-    override fun renderCall(ctx: IntrinsicCallContext): String? =
-        when (ctx.canonicalName) {
-            "atomic_fence" -> ctx.callIntr("kmAtomicFence", ctx.orderingCode(0))
-            "atomic_singlethreadfence" -> ctx.callIntr("kmAtomicSignalFence", ctx.orderingCode(0))
+    override fun renderCall(ctx: IntrinsicCallContext): String? {
+        atomicRulesByName[ctx.canonicalName]?.callAction?.let { action ->
+            return action.render(
+                rawAbi = ctx.rawAbi,
+                onImport = { CoreIntrinsicLowering.registerCoreImport(ctx.emitter, it) },
+            ) { key ->
+                when (key) {
+                    "coreNs" -> ctx.coreNs
+                    "ord0" -> ctx.orderingCode(0)
+                    else -> null
+                }
+            }
+        }
+        return when (ctx.canonicalName) {
             "atomic_load" -> {
                 val pointee = ctx.pointeeAt(0) ?: return null
                 val ord0 = ctx.orderingCode(0)
@@ -491,6 +458,7 @@ private object AtomicMemoryIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
             }
             else -> null
         }
+    }
 }
 
 private object NumericAndFloatIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
@@ -530,39 +498,16 @@ private object TransmuteIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
 }
 
 private object SimdIntrinsicFamilyRule : CoreIntrinsicFamilyRule() {
-    val NAMES: Set<String> =
-        wordSet(
-            "simd_insert simd_extract simd_insert_dyn simd_extract_dyn simd_splat simd_add simd_sub simd_mul simd_div",
-            "simd_rem simd_shl simd_shr simd_funnel_shl simd_funnel_shr simd_carryless_mul simd_and simd_or simd_xor",
-            "simd_cast simd_as simd_neg simd_fabs simd_minimum_number_nsz simd_maximum_number_nsz simd_eq simd_ne",
-            "simd_lt simd_le simd_gt simd_ge simd_shuffle simd_gather simd_scatter simd_masked_load simd_masked_store",
-            "simd_saturating_add simd_saturating_sub simd_reduce_add_ordered simd_reduce_add_unordered",
-            "simd_reduce_mul_ordered simd_reduce_mul_unordered simd_reduce_all simd_reduce_any simd_reduce_max",
-            "simd_reduce_min simd_reduce_and simd_reduce_or simd_reduce_xor simd_bitmask simd_select simd_select_bitmask",
-            "simd_arith_offset simd_cast_ptr simd_expose_provenance simd_with_exposed_provenance simd_bswap",
-            "simd_bitreverse simd_ctlz simd_ctpop simd_cttz simd_ceil simd_floor simd_round simd_round_ties_even",
-            "simd_trunc simd_fsqrt simd_fma simd_relaxed_fma simd_fsin simd_fcos simd_fexp simd_fexp2 simd_flog10",
-            "simd_flog2 simd_flog",
-        )
-    val BOOL_RETURN_NAMES: Set<String> = setOf("simd_reduce_all", "simd_reduce_any")
-    val UNIT_RETURN_NAMES: Set<String> = setOf("simd_scatter", "simd_masked_store")
-    val SAME_ARG0_NAMES: Set<String> =
-        wordSet(
-            "simd_insert simd_insert_dyn simd_add simd_sub simd_mul simd_div simd_rem simd_shl simd_shr",
-            "simd_funnel_shl simd_funnel_shr simd_carryless_mul simd_and simd_or simd_xor simd_neg simd_fabs",
-            "simd_minimum_number_nsz simd_maximum_number_nsz simd_gather simd_saturating_add simd_saturating_sub",
-            "simd_arith_offset simd_bswap simd_bitreverse simd_ctlz simd_ctpop simd_cttz simd_ceil simd_floor",
-            "simd_round simd_round_ties_even simd_trunc simd_fsqrt simd_fma simd_relaxed_fma simd_fsin simd_fcos",
-            "simd_fexp simd_fexp2 simd_flog10 simd_flog2 simd_flog",
-        )
-    private val SAME_ARG1_NAMES: Set<String> =
-        setOf("simd_reduce_add_ordered", "simd_reduce_mul_ordered", "simd_select", "simd_select_bitmask")
-    private val SAME_ARG2_NAMES: Set<String> = setOf("simd_masked_load")
-    private val NO_PEER_INFER_EXPECTED =
-        setOf("simd_select_bitmask", "simd_gather", "simd_scatter", "simd_masked_load", "simd_masked_store")
-    private val NO_EXPECTED_TARGET_PROPAGATION =
-        setOf("simd_insert", "simd_insert_dyn", "simd_gather", "simd_arith_offset")
-    private val NO_PEER_INFER_RETURN = NO_PEER_INFER_EXPECTED + NO_EXPECTED_TARGET_PROPAGATION
+    val NAMES: Set<String> get() = activeRules().words("simdIntrinsicNames")
+    val BOOL_RETURN_NAMES: Set<String> get() = activeRules().words("simdBoolReturnNames")
+    val UNIT_RETURN_NAMES: Set<String> get() = activeRules().words("simdUnitReturnNames")
+    val SAME_ARG0_NAMES: Set<String> get() = activeRules().words("simdSameArg0Names")
+    private val SAME_ARG1_NAMES: Set<String> get() = activeRules().words("simdSameArg1Names")
+    private val SAME_ARG2_NAMES: Set<String> get() = activeRules().words("simdSameArg2Names")
+    private val NO_PEER_INFER_EXPECTED: Set<String> get() = activeRules().words("simdNoPeerInferExpected")
+    private val NO_EXPECTED_TARGET_PROPAGATION: Set<String> get() = activeRules().words("simdNoExpectedTargetPropagation")
+    private val NO_PEER_INFER_RETURN: Set<String>
+        get() = activeRules().unionWords("simdNoPeerInferExpected", "simdNoExpectedTargetPropagation")
 
     fun isSimdIntrinsicName(name: String): Boolean = name in NAMES || name.startsWith("sve_tuple_")
 
@@ -759,27 +704,8 @@ public object CoreIntrinsicLowering {
     public const val DEFAULT_CORE_NAMESPACE: String = "io.github.kotlinmania.rustlang.core"
     public const val DEFAULT_ALLOC_NAMESPACE: String = "io.github.kotlinmania.rustlang.alloc"
 
-    public val STDLIB_CORE_FFI_SYMBOLS: Map<String, String> =
-        mapOf(
-            "c_void" to "CVoid",
-            "c_char" to "CChar",
-            "c_schar" to "CSchar",
-            "c_uchar" to "CUchar",
-            "c_short" to "CShort",
-            "c_ushort" to "CUshort",
-            "c_int" to "CInt",
-            "c_uint" to "CUint",
-            "c_long" to "CLong",
-            "c_ulong" to "CUlong",
-            "c_longlong" to "CLonglong",
-            "c_ulonglong" to "CUlonglong",
-            "c_float" to "CFloat",
-            "c_double" to "CDouble",
-            "c_size_t" to "CSizeT",
-            "c_ptrdiff_t" to "CPtrdiffT",
-            "c_ssize_t" to "CSsizeT",
-            "CStr" to "CStr",
-        )
+    public val STDLIB_CORE_FFI_SYMBOLS: Map<String, String>
+        get() = activeRules().map("stdlibCoreFfiSymbols")
 
     public fun defaultStdlibFfiSymbolPackage(
         ktSym: String,
@@ -793,124 +719,35 @@ public object CoreIntrinsicLowering {
             else -> "$coreNs.ffi.primitives"
         }
 
-    private val FIRST_TYPE_ARG_LAYOUT_INTRINSICS: Set<String> =
-        wordSet(
-            "size_of size_of_val align_of align_of_val min_align_of min_align_of_val pref_align_of offset arith_offset",
-            "ptr_offset_from ptr_offset_from_unsigned read_via_copy write_via_move volatile_load volatile_store",
-            "unaligned_volatile_load unaligned_volatile_store nontemporal_store copy copy_nonoverlapping",
-            "volatile_copy_memory volatile_copy_nonoverlapping_memory write_bytes volatile_set_memory",
-            "typed_swap_nonoverlapping raw_eq atomic_load atomic_store atomic_xchg atomic_cxchg atomic_cxchgweak",
-            "atomic_max atomic_min atomic_umax atomic_umin ctpop ctlz ctlz_nonzero cttz cttz_nonzero bswap bitreverse",
-            "rotate_left rotate_right wrapping_add wrapping_sub wrapping_mul unchecked_add unchecked_sub unchecked_mul",
-            "saturating_add saturating_sub add_with_overflow sub_with_overflow mul_with_overflow unchecked_div",
-            "unchecked_rem exact_div disjoint_bitor three_way_compare sqrt sin cos exp exp2 log log2 log10 trunc round",
-            "round_ties_even ceil floor fabs powf powi fma fmuladd copysign minnum maxnum fadd_fast fsub_fast fmul_fast",
-            "fdiv_fast frem_fast fadd_algebraic fsub_algebraic fmul_algebraic fdiv_algebraic frem_algebraic",
-        )
+    private val FIRST_TYPE_ARG_LAYOUT_INTRINSICS: Set<String>
+        get() = activeRules().words("firstTypeArgLayoutIntrinsics")
 
-    private val TWO_TYPE_ARG_LAYOUT_INTRINSICS: Set<String> =
-        wordSet(
-            "transmute transmute_unchecked unchecked_shl unchecked_shr float_to_int_unchecked",
-            "atomic_xadd atomic_xsub atomic_and atomic_nand atomic_or atomic_xor",
-        )
+    private val TWO_TYPE_ARG_LAYOUT_INTRINSICS: Set<String>
+        get() = activeRules().words("twoTypeArgLayoutIntrinsics")
 
-    internal val GENERIC_FLOAT_UNARY_KM: Map<String, Pair<String, String>> =
-        mapOf(
-            "sqrt" to ("kmSqrtf32" to "kmSqrtf64"),
-            "sin" to ("kmSinf32" to "kmSinf64"),
-            "cos" to ("kmCosf32" to "kmCosf64"),
-            "exp" to ("kmExpf32" to "kmExpf64"),
-            "exp2" to ("kmExp2f32" to "kmExp2f64"),
-            "log" to ("kmLogf32" to "kmLogf64"),
-            "log2" to ("kmLog2f32" to "kmLog2f64"),
-            "log10" to ("kmLog10f32" to "kmLog10f64"),
-            "trunc" to ("kmTruncf32" to "kmTruncf64"),
-            "round" to ("kmRoundf32" to "kmRoundf64"),
-            "round_ties_even" to ("kmRoundTiesEvenf32" to "kmRoundTiesEvenf64"),
-            "ceil" to ("kmCeilf32" to "kmCeilf64"),
-            "floor" to ("kmFloorf32" to "kmFloorf64"),
-            "fabs" to ("kmFabsf32" to "kmFabsf64"),
-        )
+    internal val GENERIC_FLOAT_UNARY_KM: Map<String, Pair<String, String>>
+        get() = activeRules().genericFloatUnaryKm
 
-    internal val SUFFIXED_FLOAT_UNARY_KM: Map<String, String> =
-        buildMap {
-            for ((op, fns) in GENERIC_FLOAT_UNARY_KM) {
-                if (op != "round_ties_even") {
-                    put("${op}f32", fns.first)
-                    put("${op}f64", fns.second)
-                }
-            }
-            put("round_ties_even_f32", "kmRoundTiesEvenf32")
-            put("round_ties_even_f64", "kmRoundTiesEvenf64")
-            put("rintf32", "kmRoundTiesEvenf32")
-            put("rintf64", "kmRoundTiesEvenf64")
-        }
+    internal val SUFFIXED_FLOAT_UNARY_KM: Map<String, String>
+        get() = activeRules().suffixedFloatUnaryKm
 
-    internal val SUFFIXED_FLOAT_BINARY_KM: Map<String, String> =
-        mapOf(
-            "powf32" to "kmPowf32",
-            "powf64" to "kmPowf64",
-            "powif32" to "kmPowif32",
-            "powif64" to "kmPowif64",
-            "copysignf32" to "kmCopysignf32",
-            "copysignf64" to "kmCopysignf64",
-            "minnumf32" to "kmMinnumf32",
-            "minnumf64" to "kmMinnumf64",
-            "minimum_number_nsz_f32" to "kmMinnumf32",
-            "minimum_number_nsz_f64" to "kmMinnumf64",
-            "maxnumf32" to "kmMaxnumf32",
-            "maxnumf64" to "kmMaxnumf64",
-            "maximum_number_nsz_f32" to "kmMaxnumf32",
-            "maximum_number_nsz_f64" to "kmMaxnumf64",
-        )
+    internal val SUFFIXED_FLOAT_BINARY_KM: Map<String, String>
+        get() = activeRules().map("suffixedFloatBinaryKm")
 
-    internal val GENERIC_FLOAT_BINARY_OP_NAMES: Map<String, String> =
-        mapOf(
-            "powf" to "powf",
-            "copysign" to "copysign",
-            "minnum" to "minnum",
-            "maxnum" to "maxnum",
-            "minimum" to "minimum",
-            "maximum" to "maximum",
-            "fadd_fast" to "fadd",
-            "fadd_algebraic" to "fadd",
-            "fsub_fast" to "fsub",
-            "fsub_algebraic" to "fsub",
-            "fmul_fast" to "fmul",
-            "fmul_algebraic" to "fmul",
-            "fdiv_fast" to "fdiv",
-            "fdiv_algebraic" to "fdiv",
-            "frem_fast" to "frem",
-            "frem_algebraic" to "frem",
-        )
+    internal val GENERIC_FLOAT_BINARY_OP_NAMES: Map<String, String>
+        get() = activeRules().map("genericFloatBinaryOpNames")
 
-    private val KNOWN_STDLIB_LAYOUT_FUNCTIONS: Set<String> =
-        wordSet(
-            "size_of size_of_val align_of align_of_val min_align_of pref_align_of zeroed",
-            "read read_unaligned read_volatile write write_unaligned write_volatile write_bytes",
-            "copy copy_nonoverlapping dangling dangling_mut",
-        )
+    private val KNOWN_STDLIB_LAYOUT_FUNCTIONS: Set<String>
+        get() = activeRules().words("knownStdlibLayoutFunctions")
 
-    private val POINTED_LOAD_RETURN_INTRINSICS: Set<String> =
-        wordSet(
-            "volatile_load unaligned_volatile_load read_via_copy atomic_load atomic_xchg",
-            "atomic_xadd atomic_xsub atomic_and atomic_nand atomic_or atomic_xor",
-            "atomic_max atomic_min atomic_umax atomic_umin",
-        )
+    private val POINTED_LOAD_RETURN_INTRINSICS: Set<String>
+        get() = activeRules().words("pointedLoadReturnIntrinsics")
 
-    private val FIRST_ARG_RETURN_INTRINSICS: Set<String> =
-        wordSet(
-            "bswap bitreverse rotate_left rotate_right wrapping_add wrapping_sub wrapping_mul",
-            "unchecked_add unchecked_sub unchecked_mul saturating_add saturating_sub unchecked_div",
-            "unchecked_rem exact_div unchecked_shl unchecked_shr disjoint_bitor select_unpredictable",
-            "powi fma fmuladd",
-        )
+    private val FIRST_ARG_RETURN_INTRINSICS: Set<String>
+        get() = activeRules().words("firstArgReturnIntrinsics")
 
-    private val USIZE_RETURN_INTRINSICS: Set<String> =
-        wordSet(
-            "ptr_offset_from ptr_offset_from_unsigned size_of size_of_val align_of",
-            "align_of_val min_align_of_val vtable_size vtable_align variant_count",
-        )
+    private val USIZE_RETURN_INTRINSICS: Set<String>
+        get() = activeRules().words("usizeReturnIntrinsics")
 
     private val FAMILY_RULES: List<CoreIntrinsicFamilyRule> =
         listOf(
@@ -957,15 +794,8 @@ public object CoreIntrinsicLowering {
         val ord1: String? = null,
     )
 
-    private val LEGACY_ORDERING_CODES: Map<String, String> =
-        mapOf(
-            "relaxed" to "0",
-            "release" to "1",
-            "acquire" to "2",
-            "acqrel" to "3",
-            "seqcst" to "4",
-            "ord" to "4",
-        )
+    private val LEGACY_ORDERING_CODES: Map<String, String>
+        get() = activeRules().map("legacyOrderingCodes")
 
     private fun parseLegacyAtomicOrderingSuffix(rawName: String): ParsedIntrinsicName {
         if (!rawName.startsWith("atomic_")) return ParsedIntrinsicName(rawName)
@@ -1497,8 +1327,8 @@ public object CoreIntrinsicLowering {
         return SimdIntrinsicFamilyRule.inferReturnRenderedType(spec, selfTypeName, emitter)
     }
 
-    internal val RUST_GLOBAL_ALLOC_FN_NAMES: Set<String> =
-        wordSet("__rust_alloc __rust_alloc_zeroed __rust_dealloc __rust_realloc")
+    internal val RUST_GLOBAL_ALLOC_FN_NAMES: Set<String>
+        get() = activeRules().rustGlobalAllocActionsByName.keys
 
     internal fun renderRustGlobalAllocExpr(
         rawFnName: String,
@@ -1508,33 +1338,22 @@ public object CoreIntrinsicLowering {
         sizeToLongAt: (Int) -> String,
         alignToLongAt: (Int) -> String,
     ): String? {
-        if (rawFnName !in RUST_GLOBAL_ALLOC_FN_NAMES) return null
+        val action = activeRules().rustGlobalAllocActionsByName[rawFnName] ?: return null
         val coreNs = resolveCoreNamespace(emitter.headerContext)
-        val intrPkg = "$coreNs.intrinsics"
-
-        fun wrapRet(callExpr: String): String {
-            if (rawAbiMode) return callExpr
-            registerCoreImport(emitter, "$coreNs.ptr.MutPtr")
-            return "MutPtr($callExpr)"
-        }
-        return when (rawFnName) {
-            "__rust_alloc" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAlloc")
-                wrapRet("kmAlloc(${sizeToLongAt(0)}, ${alignToLongAt(1)})")
+        return action.render(
+            rawAbi = rawAbiMode,
+            onImport = { registerCoreImport(emitter, it) },
+        ) { key ->
+            when (key) {
+                "coreNs" -> coreNs
+                "ptr0" -> ptrRawAddressAt(0)
+                "size0" -> sizeToLongAt(0)
+                "size1" -> sizeToLongAt(1)
+                "size3" -> sizeToLongAt(3)
+                "align1" -> alignToLongAt(1)
+                "align2" -> alignToLongAt(2)
+                else -> null
             }
-            "__rust_alloc_zeroed" -> {
-                registerCoreImport(emitter, "$intrPkg.kmAllocZeroed")
-                wrapRet("kmAllocZeroed(${sizeToLongAt(0)}, ${alignToLongAt(1)})")
-            }
-            "__rust_dealloc" -> {
-                registerCoreImport(emitter, "$intrPkg.kmDealloc")
-                "kmDealloc(${ptrRawAddressAt(0)}, ${sizeToLongAt(1)}, ${alignToLongAt(2)})"
-            }
-            "__rust_realloc" -> {
-                registerCoreImport(emitter, "$intrPkg.kmRealloc")
-                wrapRet("kmRealloc(${ptrRawAddressAt(0)}, ${sizeToLongAt(1)}, ${alignToLongAt(2)}, ${sizeToLongAt(3)})")
-            }
-            else -> null
         }
     }
 
@@ -1681,24 +1500,54 @@ public object CoreIntrinsicLowering {
             registerCoreImport(emitter, "$ptrPkg.$ctor")
             return "$ctor(($valueExpr).rawAddress)"
         }
-        return when (srcPrim to dstPrim) {
-            "f32" to "u32" -> "($valueExpr).toRawBits().toUInt()"
-            "f32" to "i32" -> "($valueExpr).toRawBits()"
-            "u32" to "f32" -> "${emitter.kotlinF32TypeName()}.fromBits(($valueExpr).toInt())"
-            "i32" to "f32" -> "${emitter.kotlinF32TypeName()}.fromBits($valueExpr)"
-            "f64" to "u64" -> "($valueExpr).toRawBits().toULong()"
-            "f64" to "i64" -> "($valueExpr).toRawBits()"
-            "u64" to "f64" -> "Double.fromBits(($valueExpr).toLong())"
-            "i64" to "f64" -> "Double.fromBits($valueExpr)"
-            "u8" to "i8" -> "($valueExpr).toByte()"
-            "i8" to "u8" -> "($valueExpr).toUByte()"
-            "u16" to "i16" -> "($valueExpr).toShort()"
-            "i16" to "u16" -> "($valueExpr).toUShort()"
-            "u32" to "i32" -> "($valueExpr).toInt()"
-            "i32" to "u32" -> "($valueExpr).toUInt()"
-            "u64" to "i64" -> "($valueExpr).toLong()"
-            "i64" to "u64" -> "($valueExpr).toULong()"
-            else -> null
+        if (srcPrim == null || dstPrim == null) return null
+        return renderScalarBitCast(emitter, srcPrim, dstPrim, valueExpr, "($valueExpr)")
+    }
+
+    internal fun renderScalarBitCast(
+        emitter: KotlinJ2KEmitter,
+        srcPrim: String,
+        dstPrim: String,
+        valueExpr: String,
+        atomExpr: String,
+    ): String? {
+        val tmpl = activeRules().templates("scalarBitCastTemplates")["$srcPrim->$dstPrim"] ?: return null
+        return tmpl.render { key ->
+            when (key) {
+                "val" -> valueExpr
+                "atom" -> atomExpr
+                "f32Type" -> emitter.kotlinF32TypeName()
+                else -> null
+            }
+        }
+    }
+
+    internal fun renderScalarFloatToIntUnchecked(
+        emitter: KotlinJ2KEmitter,
+        coreNs: String,
+        isF32: Boolean,
+        valueExpr: String,
+        atomExpr: String,
+        dstKind: NumericKind?,
+    ): String? {
+        val action = dstKind?.let { activeRules().floatToIntUncheckedRulesByKind[it] } ?: return null
+        val intrPkg = "$coreNs.intrinsics"
+        val u64Km = if (isF32) "kmFloatToU64Unchecked" else "kmDoubleToU64Unchecked"
+        val u128Km = if (isF32) "kmFloatToU128Unchecked" else "kmDoubleToU128Unchecked"
+        val zeroLit = if (isF32) "0.0f" else "0.0"
+        return action.render(
+            onImport = { imp -> registerCoreImport(emitter, imp) },
+        ) { key ->
+            when (key) {
+                "val" -> valueExpr
+                "atom" -> atomExpr
+                "coreNs" -> coreNs
+                "intrPkg" -> intrPkg
+                "u64Km" -> u64Km
+                "u128Km" -> u128Km
+                "zeroLit" -> zeroLit
+                else -> null
+            }
         }
     }
 
@@ -1727,25 +1576,12 @@ public object CoreIntrinsicLowering {
     }
 
     internal fun rustScalarToNumericKind(prim: String, emitter: KotlinJ2KEmitter): NumericKind? =
-        when (prim) {
-            "i8" -> NumericKind.I8
-            "u8" -> NumericKind.U8
-            "i16" -> NumericKind.I16
-            "u16" -> NumericKind.U16
-            "i32" -> NumericKind.I32
-            "u32" -> NumericKind.U32
-            "i64" -> NumericKind.I64
-            "u64" -> NumericKind.U64
-            "i128" -> NumericKind.I128
-            "u128" -> NumericKind.U128
-            "isize" -> if (emitter.headerContext.rawAbiMode) NumericKind.I64 else NumericKind.I32
-            "usize" -> if (emitter.headerContext.rawAbiMode) NumericKind.U64 else NumericKind.U32
-            "f16" -> NumericKind.F16
-            "f32" -> NumericKind.F32
-            "f64" -> NumericKind.F64
-            "f128" -> NumericKind.F128
-            else -> null
-        }
+        activeRules().numericKindValMap("rustFixedScalarKinds")[prim]
+            ?: when (prim) {
+                "isize" -> if (emitter.headerContext.rawAbiMode) NumericKind.I64 else NumericKind.I32
+                "usize" -> if (emitter.headerContext.rawAbiMode) NumericKind.U64 else NumericKind.U32
+                else -> null
+            }
 
     internal fun resolveIntrinsicNumericKind(
         explicitType: SynType?,

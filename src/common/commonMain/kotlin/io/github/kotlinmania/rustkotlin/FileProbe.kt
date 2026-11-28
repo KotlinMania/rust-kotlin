@@ -1,5 +1,7 @@
 package io.github.kotlinmania.rustkotlin
 
+import io.github.kotlinmania.io.Source
+import io.github.kotlinmania.io.buffered
 import io.github.kotlinmania.io.files.FileMetadata
 import io.github.kotlinmania.io.files.SystemFileSystem
 import io.github.kotlinmania.io.files.readBytes
@@ -38,6 +40,14 @@ public expect fun describeVirtualKotlinFile(
 ): TargetKotlinFileDetails
 
 public expect fun writeNew(path: String, text: String)
+
+internal expect fun readPlatformEnvironmentVariable(name: String): String?
+
+internal expect fun resolvePlatformExecutablePath(): String?
+
+internal expect fun listPlatformPackagedRuleFiles(resourceDirPath: String): List<String>
+
+internal expect fun openPlatformPackagedRuleSource(resourcePath: String): Source?
 
 internal abstract class TargetFileProbe {
     abstract fun probe(path: String): TargetKotlinFileDetails
@@ -358,4 +368,76 @@ internal fun distinctCaseVariant(actualFileName: String, requestedFileName: Stri
         }
     }
     return null
+}
+
+internal const val DEFAULT_RULES_RESOURCE_DIR: String = "io/github/kotlinmania/rustkotlin/rules"
+internal const val RULES_DIR_ENV_VAR: String = "RUST_KOTLIN_RULES_DIR"
+
+internal fun resolveFilesystemRulesDirectory(explicitDir: String? = TranslationSession.rulesDirOverride): KmPath? {
+    val configuredDir = explicitDir?.trim()?.takeIf { it.isNotEmpty() } ?: readPlatformEnvironmentVariable(RULES_DIR_ENV_VAR)
+    if (configuredDir != null) {
+        val dirPath = KmPath(configuredDir)
+        require(SystemFileSystem.metadataOrNull(dirPath)?.isDirectory == true) {
+            "YAML rules directory does not exist or is not a directory: $configuredDir"
+        }
+        return dirPath
+    }
+    val cwdCandidates =
+        listOf(
+            KmPath("src/common/commonMain/resources/$DEFAULT_RULES_RESOURCE_DIR"),
+            KmPath("rules"),
+        )
+    for (candidate in cwdCandidates) {
+        if (SystemFileSystem.metadataOrNull(candidate)?.isDirectory == true) {
+            return candidate
+        }
+    }
+    val exePath = resolvePlatformExecutablePath()?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    var dirCursor: KmPath? = KmPath(exePath).parent
+    var hops = 0
+    while (dirCursor != null && hops < 8) {
+        val base = dirCursor.toString().trimEnd('/', '\\')
+        if (base.isEmpty()) break
+        val relativeCandidates =
+            listOf(
+                KmPath("$base/rules"),
+                KmPath("$base/share/rust-kotlin/rules"),
+                KmPath("$base/src/common/commonMain/resources/$DEFAULT_RULES_RESOURCE_DIR"),
+            )
+        for (cand in relativeCandidates) {
+            if (SystemFileSystem.metadataOrNull(cand)?.isDirectory == true) {
+                return cand
+            }
+        }
+        dirCursor = dirCursor.parent
+        hops++
+    }
+    return null
+}
+
+internal fun openRuntimeRuleStreams(explicitDir: String? = TranslationSession.rulesDirOverride): List<Pair<String, () -> Source>> {
+    val fsDir = resolveFilesystemRulesDirectory(explicitDir)
+    if (fsDir != null) {
+        val ymlNames =
+            SystemFileSystem
+                .list(fsDir)
+                .map { it.name }
+                .filter { it.endsWith(".yml") }
+                .sorted()
+        require(ymlNames.isNotEmpty()) { "No `.yml` rule files found in directory: $fsDir" }
+        val baseDir = fsDir.toString().trimEnd('/', '\\')
+        return ymlNames.map { name -> name to { SystemFileSystem.source(KmPath("$baseDir/$name")).buffered() } }
+    }
+    val packagedNames = listPlatformPackagedRuleFiles(DEFAULT_RULES_RESOURCE_DIR)
+    require(packagedNames.isNotEmpty()) {
+        "Unable to locate runtime `.yml` rules directory on filesystem or packaged resources ($DEFAULT_RULES_RESOURCE_DIR); " +
+            "pass --rules-dir <dir> or set $RULES_DIR_ENV_VAR"
+    }
+    return packagedNames.map { name ->
+        val resPath = "$DEFAULT_RULES_RESOURCE_DIR/$name"
+        name to {
+            openPlatformPackagedRuleSource(resPath)
+                ?: throw IllegalStateException("Missing packaged YAML rule resource: $resPath")
+        }
+    }
 }

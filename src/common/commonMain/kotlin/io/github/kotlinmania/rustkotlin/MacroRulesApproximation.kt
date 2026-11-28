@@ -770,7 +770,7 @@ private class MacroBodyTokenFormatter(
 
     override fun mapIdent(rawIdent: String): String = translateMacroTemplateIdent(rawIdent)
 
-    override fun tryConsumeSpecialAt(idx: Int, outTokens: MutableList<String>): Int? {
+    override fun tryConsumeSpecialAt(idx: Int, out: KotlinTokenEmitter): Int? {
         if (punctCharAt(idx) == '&') {
             if (punctCharAt(idx + 1) == '$') return idx + 1
             if (identAt(idx + 1) == "mut" && punctCharAt(idx + 2) == '$') return idx + 2
@@ -792,7 +792,7 @@ private class MacroBodyTokenFormatter(
             if (nextIdent != null) {
                 val raw = nextIdent.removePrefix("r#")
                 val ktParam = allMetavars[raw] ?: sanitizeMacroParamName(rustValueIdentToKotlin(raw))
-                outTokens += "\$$ktParam"
+                out.templateRef(ktParam)
                 return idx + 2
             }
         }

@@ -1,0 +1,423 @@
+# ==============================================================================
+# Core Intrinsics, Memory/Atomic Synthesized Bodies & Numeric Intrinsic Rules
+# ==============================================================================
+# Authoritative declarative rules for:
+# - `CoreIntrinsicLowering.kt`
+# - `CoreNumericAndMemoryIntrinsics.kt`
+
+# `core::ffi` / `std::os::raw` C scalar & string types exported by `rustlang.core.ffi`.
+stdlibCoreFfiSymbols:
+  c_void: CVoid
+  c_char: CChar
+  c_schar: CSchar
+  c_uchar: CUchar
+  c_short: CShort
+  c_ushort: CUshort
+  c_int: CInt
+  c_uint: CUint
+  c_long: CLong
+  c_ulong: CUlong
+  c_longlong: CLonglong
+  c_ulonglong: CUlonglong
+  c_float: CFloat
+  c_double: CDouble
+  c_size_t: CSizeT
+  c_ptrdiff_t: CPtrdiffT
+  c_ssize_t: CSsizeT
+  CStr: CStr
+
+# Intrinsics requiring a `TypeLayout<T>` witness for their first generic type parameter.
+firstTypeArgLayoutIntrinsics:
+  - "size_of size_of_val align_of align_of_val min_align_of min_align_of_val pref_align_of offset arith_offset"
+  - "ptr_offset_from ptr_offset_from_unsigned read_via_copy write_via_move volatile_load volatile_store"
+  - "unaligned_volatile_load unaligned_volatile_store nontemporal_store copy copy_nonoverlapping"
+  - "volatile_copy_memory volatile_copy_nonoverlapping_memory write_bytes volatile_set_memory"
+  - "typed_swap_nonoverlapping raw_eq atomic_load atomic_store atomic_xchg atomic_cxchg atomic_cxchgweak"
+  - "atomic_max atomic_min atomic_umax atomic_umin ctpop ctlz ctlz_nonzero cttz cttz_nonzero bswap bitreverse"
+  - "rotate_left rotate_right wrapping_add wrapping_sub wrapping_mul unchecked_add unchecked_sub unchecked_mul"
+  - "saturating_add saturating_sub add_with_overflow sub_with_overflow mul_with_overflow unchecked_div"
+  - "unchecked_rem exact_div disjoint_bitor three_way_compare sqrt sin cos exp exp2 log log2 log10 trunc round"
+  - "round_ties_even ceil floor fabs powf powi fma fmuladd copysign minnum maxnum fadd_fast fsub_fast fmul_fast"
+  - "fdiv_fast frem_fast fadd_algebraic fsub_algebraic fmul_algebraic fdiv_algebraic frem_algebraic"
+
+# Intrinsics requiring `TypeLayout` witnesses for both `T` and `U` generic type parameters.
+twoTypeArgLayoutIntrinsics:
+  - "transmute transmute_unchecked unchecked_shl unchecked_shr float_to_int_unchecked"
+  - "atomic_xadd atomic_xsub atomic_and atomic_nand atomic_or atomic_xor"
+
+knownStdlibLayoutFunctions:
+  - "size_of size_of_val align_of align_of_val min_align_of pref_align_of zeroed"
+  - "read read_unaligned read_volatile write write_unaligned write_volatile write_bytes"
+  - "copy copy_nonoverlapping dangling dangling_mut"
+
+pointedLoadReturnIntrinsics:
+  - "volatile_load unaligned_volatile_load read_via_copy atomic_load atomic_xchg"
+  - "atomic_xadd atomic_xsub atomic_and atomic_nand atomic_or atomic_xor"
+  - "atomic_max atomic_min atomic_umax atomic_umin"
+
+firstArgReturnIntrinsics:
+  - "bswap bitreverse rotate_left rotate_right wrapping_add wrapping_sub wrapping_mul"
+  - "unchecked_add unchecked_sub unchecked_mul saturating_add saturating_sub unchecked_div"
+  - "unchecked_rem exact_div unchecked_shl unchecked_shr disjoint_bitor select_unpredictable"
+  - "powi fma fmuladd"
+
+usizeReturnIntrinsics:
+  - "ptr_offset_from ptr_offset_from_unsigned size_of size_of_val align_of"
+  - "align_of_val min_align_of_val vtable_size vtable_align variant_count"
+
+trivialDropScalars: "bool char i8 u8 i16 u16 i32 u32 i64 u64 i128 u128 isize usize f16 f32 f64 f128"
+
+# ==============================================================================
+# Control, Hint, Layout, Pointer & Atomic Declarative Template Rules
+# ==============================================================================
+
+controlAndHintIntrinsicRules:
+  - match: "abort abort_immediate"
+    imports: ["{coreNs}.intrinsics.kmAbort"]
+    declReplace: "kmAbort()"
+    callReplace: "kmAbort()"
+
+  - match: "unreachable"
+    declReplace: "error(\"Entered Rust intrinsics::unreachable\")"
+    callReplace: "error(\"Entered Rust intrinsics::unreachable\")"
+
+  - match: "assume breakpoint forget cold_path assert_inhabited assert_zero_valid assert_mem_uninitialized_valid"
+    declReplace: "Unit"
+    callReplace: "Unit"
+
+  - match: "prefetch_read_data prefetch_write_data prefetch_read_instruction prefetch_write_instruction"
+    callReplace: "Unit"
+
+  - match: "likely unlikely rustc_peek"
+    declReplace: "{p0}"
+    callReplace: "{arg0OrUnit}"
+
+  - match: "ub_checks overflow_checks is_val_statically_known"
+    callReplace: "false"
+
+  - match: "select_unpredictable"
+    minCallArgs: 3
+    declReplace: "if ({p0}) {p1} else {p2}"
+    callReplace: "if ({arg0}) {arg1} else {arg2}"
+
+layoutSynthesizedDeclRules:
+  - match: "size_of"
+    declReplace: "{layout0}.sizeBytes.toInt()"
+    declRawAbiReplace: "{layout0}.sizeBytes.toULong()"
+
+  - match: "size_of_val"
+    declReplace: "(if ({p0}.rawMeta > 0L) ({p0}.rawMeta * {layout0}.sizeBytes).toInt() else {layout0}.sizeBytes.toInt())"
+    declRawAbiReplace: "{layout0}.sizeBytes.toULong()"
+
+  - match: "align_of align_of_val min_align_of min_align_of_val pref_align_of"
+    declReplace: "{layout0}.alignBytes.toInt()"
+    declRawAbiReplace: "{layout0}.alignBytes.toULong()"
+
+  - match: "vtable_size vtable_align"
+    declReplace: "8"
+    declRawAbiReplace: "8uL"
+
+  - match: "variant_count"
+    declReplace: "1"
+    declRawAbiReplace: "1uL"
+
+  - match: "raw_eq"
+    imports: ["{coreNs}.mem.rawEqWithLayout"]
+    declReplace: "rawEqWithLayout({p0}, {p1}, {layout0})"
+
+  - match: "needs_drop"
+    declReplace: "true"
+
+  - match: "type_name"
+    declReplace: "\"{t0}\""
+
+pointerSynthesizedDeclRules:
+  - match: "arith_offset"
+    imports: ["{coreNs}.ptr.ConstPtr"]
+    declReplace: "ConstPtr({p0}.rawAddress + ({p1}).toLong() * {layout0}.strideBytes)"
+
+  - match: "ptr_offset_from"
+    declReplace: "(({p0}.rawAddress - {p1}.rawAddress) / maxOf(1L, {layout0}.sizeBytes)).toInt()"
+    declRawAbiReplace: "(({p0}.rawAddress - {p1}.rawAddress) / maxOf(1L, {layout0}.sizeBytes))"
+
+  - match: "ptr_offset_from_unsigned"
+    declReplace: "(({p0}.rawAddress - {p1}.rawAddress) / maxOf(1L, {layout0}.sizeBytes)).toInt()"
+    declRawAbiReplace: "((({p0}.rawAddress - {p1}.rawAddress) / maxOf(1L, {layout0}.sizeBytes)).toULong())"
+
+  - match: "ptr_mask"
+    imports: ["{coreNs}.ptr.ConstPtr"]
+    declReplace: "ConstPtr({p0}.rawAddress and ({p1}).toLong())"
+
+  - match: "read_via_copy"
+    declReplace: "{layout0}.readNative({p0}.rawAddress)"
+
+  - match: "write_via_move nontemporal_store"
+    declReplace: "{layout0}.writeNative({p0}.rawAddress, {p1})"
+
+  - match: "volatile_load unaligned_volatile_load"
+    declReplace: "{layout0}.readVolatileNative({p0}.rawAddress)"
+
+  - match: "volatile_store unaligned_volatile_store"
+    declReplace: "{layout0}.writeVolatileNative({p0}.rawAddress, {p1})"
+
+  - match: "copy_nonoverlapping volatile_copy_nonoverlapping_memory"
+    imports: ["{coreNs}.intrinsics.kmCopyNonoverlapping"]
+    declReplace: "kmCopyNonoverlapping({p1}.rawAddress, {p0}.rawAddress, ({p2}).toLong() * {layout0}.sizeBytes)"
+
+  - match: "copy volatile_copy_memory"
+    imports: ["{coreNs}.intrinsics.kmCopy"]
+    declReplace: "kmCopy({p1}.rawAddress, {p0}.rawAddress, ({p2}).toLong() * {layout0}.sizeBytes)"
+
+  - match: "write_bytes volatile_set_memory"
+    imports: ["{coreNs}.intrinsics.kmWriteBytes"]
+    declReplace: "kmWriteBytes({p0}.rawAddress, {p1}, ({p2}).toLong() * {layout0}.sizeBytes)"
+
+  - match: "compare_bytes"
+    imports: ["{coreNs}.intrinsics.kmCompareBytes"]
+    declReplace: "kmCompareBytes({p0}.rawAddress, {p1}.rawAddress, ({p2}).toLong())"
+
+legacyOrderingCodes:
+  relaxed: "0"
+  release: "1"
+  acquire: "2"
+  acqrel: "3"
+  seqcst: "4"
+  ord: "4"
+
+atomicRmwOpCodes:
+  atomic_xadd: "1"
+  atomic_xsub: "2"
+  atomic_and: "3"
+  atomic_nand: "4"
+  atomic_or: "5"
+  atomic_xor: "6"
+  atomic_max: "7"
+  atomic_min: "8"
+  atomic_umax: "9"
+  atomic_umin: "10"
+
+atomicNonRmwNames: "atomic_load atomic_store atomic_xchg atomic_fence atomic_singlethreadfence atomic_cxchg atomic_cxchgweak"
+
+atomicSynthesizedDeclRules:
+  - match: "atomic_fence"
+    imports: ["{coreNs}.intrinsics.kmAtomicFence"]
+    declReplace: "kmAtomicFence({ord0})"
+    callReplace: "kmAtomicFence({ord0})"
+
+  - match: "atomic_singlethreadfence"
+    imports: ["{coreNs}.intrinsics.kmAtomicSignalFence"]
+    declReplace: "kmAtomicSignalFence({ord0})"
+    callReplace: "kmAtomicSignalFence({ord0})"
+
+  - match: "atomic_load"
+    imports: ["{coreNs}.mem.atomicLoadWithLayout"]
+    declReplace: "atomicLoadWithLayout({p0}.rawAddress, {ord0}, {layout0})"
+
+  - match: "atomic_store"
+    imports: ["{coreNs}.mem.atomicStoreWithLayout"]
+    declReplace: "atomicStoreWithLayout({p0}.rawAddress, {p1}, {ord0}, {layout0})"
+
+  - match: "atomic_xchg"
+    imports: ["{coreNs}.mem.atomicXchgWithLayout"]
+    declReplace: "atomicXchgWithLayout({p0}.rawAddress, {p1}, {ord0}, {layout0})"
+
+  - match: "atomic_cxchg atomic_cxchgweak"
+    imports: ["{coreNs}.mem.atomicCxchgWithLayout"]
+    declReplace: "atomicCxchgWithLayout({p0}.rawAddress, {p1}, {p2}, {ord0}, {ord1}, {layout0})"
+
+# Unified zero-allocation scalar bit-cast templates shared across
+# `mem::transmute::<Src, Dst>(val)` and `*(&val as *const Src as *const Dst)` pointer punning.
+scalarBitCastTemplates:
+  "f16->u16": "{atom}.toBits()"
+  "f16->i16": "{atom}.toBits().toShort()"
+  "u16->f16": "F16.fromBits({val})"
+  "i16->f16": "F16.fromBits({atom}.toUShort())"
+  "f32->u32": "{atom}.toRawBits().toUInt()"
+  "f32->i32": "{atom}.toRawBits()"
+  "u32->f32": "{f32Type}.fromBits({atom}.toInt())"
+  "i32->f32": "{f32Type}.fromBits({val})"
+  "f64->u64": "{atom}.toRawBits().toULong()"
+  "f64->i64": "{atom}.toRawBits()"
+  "u64->f64": "Double.fromBits({atom}.toLong())"
+  "i64->f64": "Double.fromBits({val})"
+  "f128->u128": "U128({atom}.high, {atom}.low)"
+  "f128->i128": "I128({atom}.high.toLong(), {atom}.low)"
+  "u128->f128": "F128.fromBits({val})"
+  "i128->f128": "F128.fromBits({atom}.high.toULong(), {atom}.low)"
+  "u8->i8": "{atom}.toByte()"
+  "i8->u8": "{atom}.toUByte()"
+  "u16->i16": "{atom}.toShort()"
+  "i16->u16": "{atom}.toUShort()"
+  "u32->i32": "{atom}.toInt()"
+  "i32->u32": "{atom}.toUInt()"
+  "u64->i64": "{atom}.toLong()"
+  "i64->u64": "{atom}.toULong()"
+
+# Unified scalar float-to-integer unchecked conversion rules shared across
+# `core::intrinsics::float_to_int_unchecked` and `f32`/`f64::to_int_unchecked`.
+floatToIntUncheckedRules:
+  - { kinds: "I8", replace: "{atom}.toInt().toByte()" }
+  - { kinds: "I16", replace: "{atom}.toInt().toShort()" }
+  - { kinds: "I32", replace: "{atom}.toInt()" }
+  - { kinds: "I64", replace: "{atom}.toLong()" }
+  - { kinds: "U8", imports: ["{intrPkg}.{u64Km}"], replace: "{u64Km}({val}).toUByte()" }
+  - { kinds: "U16", imports: ["{intrPkg}.{u64Km}"], replace: "{u64Km}({val}).toUShort()" }
+  - { kinds: "U32", imports: ["{intrPkg}.{u64Km}"], replace: "{u64Km}({val}).toUInt()" }
+  - { kinds: "U64", imports: ["{intrPkg}.{u64Km}"], replace: "{u64Km}({val})" }
+  - { kinds: "U128", imports: ["{intrPkg}.{u128Km}", "{coreNs}.U128"], replace: "{u128Km}({val}).let {{ U128(it.hi, it.lo) }}" }
+  - kinds: "I128"
+    imports: ["{intrPkg}.{u128Km}", "{coreNs}.I128"]
+    replace: "({val}).let {{ v -> if (v < {zeroLit}) {u128Km}(-v).let {{ -I128(it.hi.toLong(), it.lo) }} else {u128Km}(v).let {{ I128(it.hi.toLong(), it.lo) }} }}"
+
+# ==============================================================================
+# Integer & Floating-Point Intrinsic Rule Specifications
+# ==============================================================================
+
+intIntrinsicRules:
+  - { kind: bitwiseUnsigned, names: "ctpop", kmStem: kmCtpop, withLayoutFn: ctpopWithLayout, returnsUIntCount: true }
+  - { kind: bitwiseUnsigned, names: "ctlz ctlz_nonzero", kmStem: kmCtlz, withLayoutFn: ctlzWithLayout, returnsUIntCount: true }
+  - { kind: bitwiseUnsigned, names: "cttz cttz_nonzero", kmStem: kmCttz, withLayoutFn: cttzWithLayout, returnsUIntCount: true }
+  - { kind: bitwiseUnsigned, names: "bswap", kmStem: kmBswap, withLayoutFn: bswapWithLayout, identityOnByte: true }
+  - { kind: bitwiseUnsigned, names: "bitreverse", kmStem: kmBitreverse, withLayoutFn: bitreverseWithLayout }
+  - { kind: bitwiseUnsigned, names: "rotate_left", kmStem: kmRotateLeft, withLayoutFn: rotateLeftWithLayout, takesUIntShift: true }
+  - { kind: bitwiseUnsigned, names: "rotate_right", kmStem: kmRotateRight, withLayoutFn: rotateRightWithLayout, takesUIntShift: true }
+  - { kind: binaryInfix, names: "wrapping_add unchecked_add", opSymbol: "+", withLayoutFn: wrappingAddWithLayout, u128Fn: kmU128Add }
+  - { kind: binaryInfix, names: "wrapping_sub unchecked_sub", opSymbol: "-", withLayoutFn: wrappingSubWithLayout, u128Fn: kmU128Sub }
+  - { kind: binaryInfix, names: "wrapping_mul unchecked_mul", opSymbol: "*", withLayoutFn: wrappingMulWithLayout, u128Fn: kmU128Mul }
+  - { kind: widthTaggedBinary, names: "saturating_add", kmPrefix: kmSaturatingAdd, withLayoutFn: saturatingAddWithLayout, wrapPairOverflow: false }
+  - { kind: widthTaggedBinary, names: "saturating_sub", kmPrefix: kmSaturatingSub, withLayoutFn: saturatingSubWithLayout, wrapPairOverflow: false }
+  - { kind: widthTaggedBinary, names: "add_with_overflow", kmPrefix: kmAddWithOverflow, withLayoutFn: addWithOverflowWithLayout, wrapPairOverflow: true }
+  - { kind: widthTaggedBinary, names: "sub_with_overflow", kmPrefix: kmSubWithOverflow, withLayoutFn: subWithOverflowWithLayout, wrapPairOverflow: true }
+  - { kind: widthTaggedBinary, names: "mul_with_overflow", kmPrefix: kmMulWithOverflow, withLayoutFn: mulWithOverflowWithLayout, wrapPairOverflow: true }
+  - { kind: binaryInfix, names: "unchecked_div", opSymbol: "/", withLayoutFn: uncheckedDivWithLayout }
+  - { kind: binaryInfix, names: "exact_div", opSymbol: "/", withLayoutFn: exactDivWithLayout }
+  - { kind: binaryInfix, names: "unchecked_rem", opSymbol: "%", withLayoutFn: uncheckedRemWithLayout }
+  - { kind: uncheckedShift, names: "unchecked_shl", isLeft: true, withLayoutFn: uncheckedShlWithLayout }
+  - { kind: uncheckedShift, names: "unchecked_shr", isLeft: false, withLayoutFn: uncheckedShrWithLayout }
+  - { kind: disjointBitor, names: "disjoint_bitor", withLayoutFn: disjointBitorWithLayout }
+  - { kind: threeWayCompare, names: "three_way_compare", withLayoutFn: threeWayCompareWithLayout }
+
+# Generic float unary intrinsic name -> C/libm stem (`{stem}f32`, `{stem}f64`).
+genericFloatUnaryKmStems:
+  sqrt: kmSqrt
+  sin: kmSin
+  cos: kmCos
+  exp: kmExp
+  exp2: kmExp2
+  log: kmLog
+  log2: kmLog2
+  log10: kmLog10
+  trunc: kmTrunc
+  round: kmRound
+  round_ties_even: kmRoundTiesEven
+  ceil: kmCeil
+  floor: kmFloor
+  fabs: kmFabs
+
+suffixedFloatUnaryExtras:
+  round_ties_even_f32: kmRoundTiesEvenf32
+  round_ties_even_f64: kmRoundTiesEvenf64
+  rintf32: kmRoundTiesEvenf32
+  rintf64: kmRoundTiesEvenf64
+
+suffixedFloatBinaryKm:
+  powf32: kmPowf32
+  powf64: kmPowf64
+  powif32: kmPowif32
+  powif64: kmPowif64
+  copysignf32: kmCopysignf32
+  copysignf64: kmCopysignf64
+  minnumf32: kmMinnumf32
+  minnumf64: kmMinnumf64
+  minimum_number_nsz_f32: kmMinnumf32
+  minimum_number_nsz_f64: kmMinnumf64
+  maxnumf32: kmMaxnumf32
+  maxnumf64: kmMaxnumf64
+  maximum_number_nsz_f32: kmMaxnumf32
+  maximum_number_nsz_f64: kmMaxnumf64
+
+suffixedFloatTernaryKm:
+  fmaf32: kmFmaf32
+  fmuladdf32: kmFmaf32
+  fmaf64: kmFmaf64
+  fmuladdf64: kmFmaf64
+
+genericFloatBinaryOpNames:
+  powf: powf
+  copysign: copysign
+  minnum: minnum
+  maxnum: maxnum
+  minimum: minimum
+  maximum: maximum
+  fadd_fast: fadd
+  fadd_algebraic: fadd
+  fsub_fast: fsub
+  fsub_algebraic: fsub
+  fmul_fast: fmul
+  fmul_algebraic: fmul
+  fdiv_fast: fdiv
+  fdiv_algebraic: fdiv
+  frem_fast: frem
+  frem_algebraic: frem
+
+# ==============================================================================
+# SIMD Intrinsics & Rust Global Allocator Lowering Rules
+# ==============================================================================
+
+homogeneousBinarySimdIntrinsics:
+  - "simd_add simd_sub simd_mul simd_div simd_rem simd_and simd_or simd_xor simd_shl simd_shr"
+  - "simd_eq simd_ne simd_lt simd_le simd_gt simd_ge simd_fmin simd_fmax"
+
+simdIntrinsicNames:
+  - "simd_insert simd_extract simd_insert_dyn simd_extract_dyn simd_splat simd_add simd_sub simd_mul simd_div"
+  - "simd_rem simd_shl simd_shr simd_funnel_shl simd_funnel_shr simd_carryless_mul simd_and simd_or simd_xor"
+  - "simd_cast simd_as simd_neg simd_fabs simd_minimum_number_nsz simd_maximum_number_nsz simd_eq simd_ne"
+  - "simd_lt simd_le simd_gt simd_ge simd_shuffle simd_gather simd_scatter simd_masked_load simd_masked_store"
+  - "simd_saturating_add simd_saturating_sub simd_reduce_add_ordered simd_reduce_add_unordered"
+  - "simd_reduce_mul_ordered simd_reduce_mul_unordered simd_reduce_all simd_reduce_any simd_reduce_max"
+  - "simd_reduce_min simd_reduce_and simd_reduce_or simd_reduce_xor simd_bitmask simd_select simd_select_bitmask"
+  - "simd_arith_offset simd_cast_ptr simd_expose_provenance simd_with_exposed_provenance simd_bswap"
+  - "simd_bitreverse simd_ctlz simd_ctpop simd_cttz simd_ceil simd_floor simd_round simd_round_ties_even"
+  - "simd_trunc simd_fsqrt simd_fma simd_relaxed_fma simd_fsin simd_fcos simd_fexp simd_fexp2 simd_flog10"
+  - "simd_flog2 simd_flog"
+
+simdBoolReturnNames: "simd_reduce_all simd_reduce_any"
+simdUnitReturnNames: "simd_scatter simd_masked_store"
+
+simdSameArg0Names:
+  - "simd_insert simd_insert_dyn simd_add simd_sub simd_mul simd_div simd_rem simd_shl simd_shr"
+  - "simd_funnel_shl simd_funnel_shr simd_carryless_mul simd_and simd_or simd_xor simd_neg simd_fabs"
+  - "simd_minimum_number_nsz simd_maximum_number_nsz simd_gather simd_saturating_add simd_saturating_sub"
+  - "simd_arith_offset simd_bswap simd_bitreverse simd_ctlz simd_ctpop simd_cttz simd_ceil simd_floor"
+  - "simd_round simd_round_ties_even simd_trunc simd_fsqrt simd_fma simd_relaxed_fma simd_fsin simd_fcos"
+  - "simd_fexp simd_fexp2 simd_flog10 simd_flog2 simd_flog"
+
+simdSameArg1Names: "simd_reduce_add_ordered simd_reduce_mul_ordered simd_select simd_select_bitmask"
+simdSameArg2Names: "simd_masked_load"
+simdNoPeerInferExpected: "simd_select_bitmask simd_gather simd_scatter simd_masked_load simd_masked_store"
+simdNoExpectedTargetPropagation: "simd_insert simd_insert_dyn simd_gather simd_arith_offset"
+
+rustGlobalAllocRules:
+  - name: "__rust_alloc"
+    imports: ["{coreNs}.intrinsics.kmAlloc", "{coreNs}.ptr.MutPtr"]
+    rawAbiImports: ["{coreNs}.intrinsics.kmAlloc"]
+    replace: "MutPtr(kmAlloc({size0}, {align1}))"
+    rawAbiReplace: "kmAlloc({size0}, {align1})"
+
+  - name: "__rust_alloc_zeroed"
+    imports: ["{coreNs}.intrinsics.kmAllocZeroed", "{coreNs}.ptr.MutPtr"]
+    rawAbiImports: ["{coreNs}.intrinsics.kmAllocZeroed"]
+    replace: "MutPtr(kmAllocZeroed({size0}, {align1}))"
+    rawAbiReplace: "kmAllocZeroed({size0}, {align1})"
+
+  - name: "__rust_dealloc"
+    imports: ["{coreNs}.intrinsics.kmDealloc"]
+    rawAbiImports: ["{coreNs}.intrinsics.kmDealloc"]
+    replace: "kmDealloc({ptr0}, {size1}, {align2})"
+    rawAbiReplace: "kmDealloc({ptr0}, {size1}, {align2})"
+
+  - name: "__rust_realloc"
+    imports: ["{coreNs}.intrinsics.kmRealloc", "{coreNs}.ptr.MutPtr"]
+    rawAbiImports: ["{coreNs}.intrinsics.kmRealloc"]
+    replace: "MutPtr(kmRealloc({ptr0}, {size1}, {align2}, {size3}))"
+    rawAbiReplace: "kmRealloc({ptr0}, {size1}, {align2}, {size3})"

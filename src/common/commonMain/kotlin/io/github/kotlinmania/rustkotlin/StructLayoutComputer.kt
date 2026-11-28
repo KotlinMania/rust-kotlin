@@ -783,20 +783,14 @@ public object StructLayoutComputer {
     }
 }
 
-private val KNOWN_STDLIB_FIRST_TYPE_LAYOUT_FUNCTIONS: Set<String> =
-    wordSet(
-        "size_of align_of min_align_of pref_align_of zeroed read read_unaligned read_volatile",
-        "write write_unaligned write_volatile write_bytes copy copy_nonoverlapping dangling dangling_mut",
-    )
+private val KNOWN_STDLIB_FIRST_TYPE_LAYOUT_FUNCTIONS: Set<String>
+    get() = activeRules().words("knownStdlibFirstTypeLayoutFunctions")
 
-private val POINTER_STRIDE_OR_ACCESS_METHODS: Set<String> =
-    wordSet(
-        "offset add sub wrapping_offset wrapping_add wrapping_sub offset_from offset_from_unsigned sub_ptr",
-        "read read_volatile read_unaligned write write_volatile write_unaligned write_bytes",
-        "copy_to copy_to_nonoverlapping copy_from copy_from_nonoverlapping as_ref as_mut",
-    )
+private val POINTER_STRIDE_OR_ACCESS_METHODS: Set<String>
+    get() = activeRules().words("pointerStrideOrAccessMethods")
 
-private val SIZED_CORE_CONST_NAMES: Set<String> = wordSet("IS_ZST LAYOUT MAX_SLICE_LEN ALIGNMENT")
+private val SIZED_CORE_CONST_NAMES: Set<String>
+    get() = activeRules().words("sizedCoreConstNames")
 private val MEM_OR_PTR_SEGS: Set<String> = wordSet("mem ptr")
 
 /**

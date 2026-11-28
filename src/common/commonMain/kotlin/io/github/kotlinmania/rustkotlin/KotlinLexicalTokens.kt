@@ -554,6 +554,157 @@ internal open class KotlinTokenWalker(
         return k
     }
 
+    fun skipLeadingAnnotations(startIdx: Int = 0, limit: Int = tokens.size): Int {
+        var idx = nextNonTriviaIndex(startIdx, limit)
+        while (punctAt(idx) == '@') {
+            idx = nextNonTriviaIndex(skipAnnotation(idx, limit), limit)
+        }
+        return idx
+    }
+
+    fun parsePackageHeader(): String? {
+        val idx = skipLeadingAnnotations(0)
+        if (identTextAt(idx) != "package") return null
+        return readDottedIdentifier(nextNonTriviaIndex(idx + 1))?.first
+    }
+
+    fun isFollowedByEmptyParens(startTokenIdx: Int): Boolean {
+        val openIdx = skipHorizontalWhitespace(startTokenIdx)
+        val openTok = tokens.getOrNull(openIdx) as? KotlinLexToken.Punct ?: return false
+        if (openTok.ch != '(') return false
+        val closeIdx = skipAllWhitespace(openIdx + 1)
+        val closeTok = tokens.getOrNull(closeIdx) as? KotlinLexToken.Punct ?: return false
+        return closeTok.ch == ')'
+    }
+
+    fun isAdjacentComparisonOrEq(eqIdx: Int): Boolean {
+        val next = tokens.getOrNull(eqIdx + 1)
+        if (next is KotlinLexToken.Punct && next.ch == '=') return true
+        val prev = tokens.getOrNull(eqIdx - 1)
+        return prev != null && prev is KotlinLexToken.Punct && prev.ch in "=!<>?"
+    }
+
+    fun startsTopLevelItemAt(tokenIdx: Int): Boolean {
+        val tok = tokens.getOrNull(tokenIdx) ?: return false
+        return when (tok) {
+            is KotlinLexToken.LineComment -> true
+            is KotlinLexToken.BlockComment -> tok.rawText.startsWith("/**")
+            is KotlinLexToken.Punct -> tok.ch == '@'
+            is KotlinLexToken.Ident ->
+                tok.rawText in TOP_LEVEL_ITEM_STARTERS &&
+                    tokens.getOrNull(tokenIdx + 1) is KotlinLexToken.Whitespace
+            else -> false
+        }
+    }
+
+    fun findExpressionBodyEndToken(startTokenIdx: Int): Int {
+        var k = startTokenIdx
+        var parenDepth = 0
+        var bracketDepth = 0
+        var braceDepth = 0
+        var seenExprToken = false
+        while (k < tokens.size) {
+            val tok = tokens[k]
+            if (tok.interpolationDepth == 0) {
+                when (tok) {
+                    is KotlinLexToken.Whitespace,
+                    is KotlinLexToken.LineComment,
+                    is KotlinLexToken.BlockComment,
+                    -> {}
+                    is KotlinLexToken.Newline ->
+                        if (seenExprToken && parenDepth == 0 && bracketDepth == 0 && braceDepth == 0) {
+                            val peek = skipHorizontalWhitespace(k + 1)
+                            val peekTok = tokens.getOrNull(peek)
+                            if (peekTok == null ||
+                                peekTok is KotlinLexToken.Newline ||
+                                (peekTok is KotlinLexToken.Punct && peekTok.ch == '}') ||
+                                startsTopLevelItemAt(peek)
+                            ) {
+                                return k
+                            }
+                        }
+                    is KotlinLexToken.Punct ->
+                        when (tok.ch) {
+                            '(' -> {
+                                seenExprToken = true
+                                parenDepth++
+                            }
+                            ')' -> if (parenDepth > 0) parenDepth--
+                            '[' -> {
+                                seenExprToken = true
+                                bracketDepth++
+                            }
+                            ']' -> if (bracketDepth > 0) bracketDepth--
+                            '{' -> {
+                                seenExprToken = true
+                                braceDepth++
+                            }
+                            '}' -> {
+                                if (braceDepth == 0) return k
+                                braceDepth--
+                            }
+                            else -> seenExprToken = true
+                        }
+                    else -> seenExprToken = true
+                }
+            }
+            k++
+        }
+        return tokens.size
+    }
+
+    fun findFunctionDeclarationEndToken(startTokenIdx: Int): Int {
+        var k = startTokenIdx
+        var parenDepth = 0
+        var angleDepth = 0
+        while (k < tokens.size) {
+            val tok = tokens[k]
+            if (tok.interpolationDepth == 0) {
+                when (tok) {
+                    is KotlinLexToken.Punct ->
+                        when (tok.ch) {
+                            '(' -> parenDepth++
+                            ')' -> if (parenDepth > 0) parenDepth--
+                            '<' -> if (parenDepth == 0) angleDepth++
+                            '>' -> if (parenDepth == 0 && angleDepth > 0) angleDepth--
+                            '{' -> if (parenDepth == 0 && angleDepth == 0) return findMatchingBraceEndToken(k)
+                            '=' ->
+                                if (parenDepth == 0 && angleDepth == 0 && !isAdjacentComparisonOrEq(k)) {
+                                    return findExpressionBodyEndToken(k + 1)
+                                }
+                        }
+                    is KotlinLexToken.Newline ->
+                        if (parenDepth == 0 && angleDepth == 0) {
+                            val peek = skipHorizontalWhitespace(k + 1)
+                            if (peek >= tokens.size || tokens[peek] is KotlinLexToken.Newline || startsTopLevelItemAt(peek)) {
+                                return k
+                            }
+                        }
+                    else -> {}
+                }
+            }
+            k++
+        }
+        return tokens.size
+    }
+
+    fun collectFilteredIdentifiers(exclude: Set<String> = emptySet()): Set<String> {
+        val out = linkedSetOf<String>()
+        for (token in tokens) {
+            val ident =
+                when (token) {
+                    is KotlinLexToken.Ident -> token.rawText
+                    is KotlinLexToken.BacktickIdent -> token.ident
+                    is KotlinLexToken.StringIdentTemplate -> token.ident
+                    else -> continue
+                }
+            if (ident.isNotEmpty() && !ident.first().isDigit() && ident !in exclude) {
+                out += ident
+            }
+        }
+        return out
+    }
+
     fun containsIdentifier(ident: String): Boolean {
         if (ident.isEmpty()) return false
         for (tok in tokens) {
@@ -883,6 +1034,405 @@ internal open class KotlinTokenWalker(
                 if (!onTopLevelToken(tok, depth)) return false
             }
             return depth == 0 && unclosedQuotes == 0
+        }
+
+        fun hasOuterBalancedParens(text: String): Boolean {
+            if (text.length < 2 || text.first() != '(' || text.last() != ')') return false
+            return scanTopLevelTokens(text, trackAllBrackets = false) { tok, depth ->
+                !(tok is KotlinLexToken.Punct && tok.ch == ')' && depth == 0 && tok.end < text.length)
+            }
+        }
+
+        fun hasNoTopLevelSpacesOrColons(text: String): Boolean =
+            scanTopLevelTokens(text, trackAllBrackets = true) { tok, depth ->
+                !(
+                    depth == 0 &&
+                        (
+                            tok is KotlinLexToken.Whitespace ||
+                                tok is KotlinLexToken.Newline ||
+                                (tok is KotlinLexToken.Punct && tok.ch == ':')
+                        )
+                )
+            }
+
+        fun hasTopLevelBinaryOperator(text: String): Boolean =
+            !scanTopLevelTokens(text, trackAllBrackets = true) { tok, depth ->
+                if (depth != 0) {
+                    true
+                } else {
+                    when (tok) {
+                        is KotlinLexToken.Whitespace, is KotlinLexToken.Newline, is KotlinLexToken.Arrow -> false
+                        is KotlinLexToken.Punct -> tok.start == 0 || tok.ch !in "+-*/%&|^=<>"
+                        else -> true
+                    }
+                }
+            }
+
+        private val TOP_LEVEL_ITEM_STARTERS: Set<String> =
+            wordSet("public internal private protected override fun val var class interface object typealias")
+    }
+}
+
+/**
+ * Reusable declaration-scope walker over [KotlinLexToken] streams that tracks top-level statement
+ * starts across newlines, `;`, `(...)`, `[...]`, and skipped `{...}` bodies.
+ */
+internal abstract class KotlinDeclarationScopeWalker(
+    sourceText: String,
+) : KotlinTokenWalker(sourceText) {
+    protected fun walkDeclarationStatements(
+        startIdx: Int,
+        endExclusive: Int,
+        onStatementStart: (declStartIdx: Int) -> Int?,
+    ) {
+        var idx = startIdx
+        var atStatementStart = true
+        var parenDepth = 0
+        var bracketDepth = 0
+        while (idx < endExclusive) {
+            val tok = tokens[idx]
+            if (tok is KotlinLexToken.Whitespace || tok is KotlinLexToken.LineComment || tok is KotlinLexToken.BlockComment) {
+                idx++
+                continue
+            }
+            if (tok is KotlinLexToken.Newline) {
+                if (parenDepth == 0 && bracketDepth == 0) atStatementStart = true
+                idx++
+                continue
+            }
+            if (tok.interpolationDepth == 0 && tok is KotlinLexToken.Punct) {
+                when (tok.ch) {
+                    '{' ->
+                        if (parenDepth == 0 && bracketDepth == 0) {
+                            idx = findMatchingBraceEndToken(idx)
+                            atStatementStart = true
+                            continue
+                        }
+                    '(' -> parenDepth++
+                    ')' -> if (parenDepth > 0) parenDepth--
+                    '[' -> bracketDepth++
+                    ']' -> if (bracketDepth > 0) bracketDepth--
+                    ';' ->
+                        if (parenDepth == 0 && bracketDepth == 0) {
+                            atStatementStart = true
+                            idx++
+                            continue
+                        }
+                }
+            }
+            if (atStatementStart && parenDepth == 0 && bracketDepth == 0) {
+                atStatementStart = false
+                val prev = previousNonTriviaToken(idx)
+                if (!(prev is KotlinLexToken.Punct && prev.ch == '=')) {
+                    val jumpTo = onStatementStart(idx)
+                    if (jumpTo != null) {
+                        idx = jumpTo
+                        atStatementStart = true
+                        continue
+                    }
+                }
+            }
+            idx++
+        }
+    }
+}
+
+/**
+ * Token-parsed structural view of a rendered Kotlin type expression (`pkg.Owner<A, List<B>>?` or
+ * `((Int) -> String)?`), eliminating fragile `substringBefore('<')` / `substringAfter('<')` slicing.
+ */
+internal data class KotlinRenderedType(
+    val rawTrimmed: String,
+    val nonNullText: String,
+    val headPath: String,
+    val simpleName: String,
+    val isNullable: Boolean,
+    val typeArgs: List<String>,
+    val callableReturnType: String?,
+) {
+    val hasTypeArgs: Boolean
+        get() = typeArgs.isNotEmpty()
+
+    val arity: Int
+        get() = typeArgs.size
+
+    val singleTypeArg: String?
+        get() = typeArgs.singleOrNull()
+
+    val pairTypeArgs: Pair<String, String>?
+        get() = if (typeArgs.size == 2) typeArgs[0] to typeArgs[1] else null
+
+    fun matchesSimple(vararg names: String): Boolean = simpleName in names
+
+    fun singleArgOf(vararg names: String): String? =
+        if (simpleName in names) typeArgs.singleOrNull() else null
+
+    fun pairArgsOf(vararg names: String): Pair<String, String>? =
+        if (simpleName in names && typeArgs.size == 2) typeArgs[0] to typeArgs[1] else null
+
+    fun isStarProjectedOrPlain(): Boolean =
+        typeArgs.isEmpty() || typeArgs.all { it == "*" }
+
+    fun withStarProjection(targetArity: Int = typeArgs.size): String =
+        if (targetArity <= 0) headPath else "$headPath<${List(targetArity) { "*" }.joinToString(", ")}>"
+
+    companion object {
+        private val FN_TRAIT_NAMES: Set<String> = wordSet("Fn FnMut FnOnce")
+
+        fun parse(raw: String?): KotlinRenderedType? {
+            val trimmed = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+            if ('<' !in trimmed && '(' !in trimmed && '`' !in trimmed) {
+                val isNullable = trimmed.endsWith('?')
+                val nonNull = if (isNullable) trimmed.dropLast(1).trimEnd() else trimmed
+                if (nonNull.isEmpty()) return null
+                val simple = nonNull.substringAfterLast('.').trim()
+                return KotlinRenderedType(
+                    rawTrimmed = trimmed,
+                    nonNullText = nonNull,
+                    headPath = nonNull,
+                    simpleName = simple,
+                    isNullable = isNullable,
+                    typeArgs = emptyList(),
+                    callableReturnType = null,
+                )
+            }
+            val walker = KotlinTokenWalker(trimmed)
+            val firstIdx = walker.nextNonTriviaIndex(0)
+            val lastIdx = walker.previousNonTriviaIndex(walker.tokens.size)
+            if (firstIdx > lastIdx) return null
+            val isNullable = walker.punctAt(lastIdx) == '?'
+            val coreLastIdx = if (isNullable) walker.previousNonTriviaIndex(lastIdx) else lastIdx
+            if (coreLastIdx < firstIdx) return null
+            val coreEndExclusive = coreLastIdx + 1
+            val nonNull = trimmed.substring(walker.tokens[firstIdx].start, walker.tokens[coreLastIdx].end).trim()
+
+            if (walker.punctAt(firstIdx) == '(') {
+                val closeParen = walker.findMatchingParenToken(firstIdx)
+                if (closeParen == coreLastIdx) {
+                    val innerText = trimmed.substring(walker.tokens[firstIdx].end, walker.tokens[closeParen].start).trim()
+                    val innerParsed = parse(innerText) ?: return null
+                    return innerParsed.copy(
+                        rawTrimmed = trimmed,
+                        isNullable = isNullable || innerParsed.isNullable,
+                    )
+                }
+                if (closeParen > firstIdx) {
+                    val arrowIdx = walker.nextNonTriviaIndex(closeParen + 1, coreEndExclusive)
+                    if (walker.tokens.getOrNull(arrowIdx) is KotlinLexToken.Arrow) {
+                        val retText = trimmed.substring(walker.tokens[arrowIdx].end, walker.tokens[coreLastIdx].end).trim()
+                        return KotlinRenderedType(
+                            rawTrimmed = trimmed,
+                            nonNullText = nonNull,
+                            headPath = nonNull,
+                            simpleName = "",
+                            isNullable = isNullable,
+                            typeArgs = emptyList(),
+                            callableReturnType = retText.ifEmpty { null },
+                        )
+                    }
+                }
+            }
+
+            var idx = firstIdx
+            var trailingOpenAngle = -1
+            while (idx < coreEndExclusive) {
+                if (walker.punctAt(idx) == '<') {
+                    val closeAngle = walker.findMatchingTypeAngleToken(idx)
+                    if (closeAngle == coreLastIdx) {
+                        trailingOpenAngle = idx
+                        break
+                    }
+                    if (closeAngle > idx) {
+                        idx = closeAngle + 1
+                        continue
+                    }
+                }
+                idx++
+            }
+            if (trailingOpenAngle > firstIdx) {
+                val headEndIdx = walker.previousNonTriviaIndex(trailingOpenAngle)
+                val headPath = trimmed.substring(walker.tokens[firstIdx].start, walker.tokens[headEndIdx].end).trim()
+                val simpleName = walker.anyIdentAt(headEndIdx) ?: headPath.substringAfterLast('.').trim()
+                val typeArgs =
+                    walker
+                        .splitTopLevelCommaTokenRanges(trailingOpenAngle + 1, coreLastIdx)
+                        .map { range -> trimmed.substring(walker.tokens[range.first].start, walker.tokens[range.last].end).trim() }
+                        .filter { it.isNotEmpty() }
+                val callableRet =
+                    if (simpleName in FN_TRAIT_NAMES && typeArgs.size >= 2) {
+                        typeArgs.drop(1).joinToString(", ").takeIf { it.isNotEmpty() }
+                    } else {
+                        null
+                    }
+                return KotlinRenderedType(
+                    rawTrimmed = trimmed,
+                    nonNullText = nonNull,
+                    headPath = headPath,
+                    simpleName = simpleName,
+                    isNullable = isNullable,
+                    typeArgs = typeArgs,
+                    callableReturnType = callableRet,
+                )
+            }
+
+            val simpleName = walker.anyIdentAt(coreLastIdx).orEmpty()
+            return KotlinRenderedType(
+                rawTrimmed = trimmed,
+                nonNullText = nonNull,
+                headPath = nonNull,
+                simpleName = simpleName,
+                isNullable = isNullable,
+                typeArgs = emptyList(),
+                callableReturnType = null,
+            )
+        }
+    }
+}
+
+internal fun String?.asKotlinRenderedType(): KotlinRenderedType? = KotlinRenderedType.parse(this)
+
+internal fun String.headKotlinTypePath(): String = asKotlinRenderedType()?.headPath ?: trim()
+
+/**
+ * Token-parsed structural decomposition of a rendered Kotlin callee expression
+ * (such as `pkg.Owner<A>.member<B, List<C>>`, `Vec.new<Int>`, or `foo<T>`).
+ */
+internal data class KotlinCalleeShape(
+    val rawCallee: String,
+    val basePath: String,
+    val erasedBasePath: String,
+    val ownerPath: String?,
+    val memberName: String,
+    val typeArgs: List<String>,
+    val typeArgsSuffix: String,
+) {
+    companion object {
+        fun parse(raw: String): KotlinCalleeShape {
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) {
+                return KotlinCalleeShape("", "", "", null, "", emptyList(), "")
+            }
+            if ('<' !in trimmed && '(' !in trimmed && '`' !in trimmed) {
+                val dotIdx = trimmed.lastIndexOf('.')
+                val owner = if (dotIdx >= 0) trimmed.substring(0, dotIdx).trim() else null
+                val member = if (dotIdx >= 0) trimmed.substring(dotIdx + 1).trim() else trimmed
+                return KotlinCalleeShape(
+                    rawCallee = trimmed,
+                    basePath = trimmed,
+                    erasedBasePath = trimmed,
+                    ownerPath = owner,
+                    memberName = member,
+                    typeArgs = emptyList(),
+                    typeArgsSuffix = "",
+                )
+            }
+            val walker = KotlinTokenWalker(trimmed)
+            val firstIdx = walker.nextNonTriviaIndex(0)
+            val lastIdx = walker.previousNonTriviaIndex(walker.tokens.size)
+            if (firstIdx > lastIdx) {
+                return KotlinCalleeShape(trimmed, trimmed, trimmed, null, trimmed, emptyList(), "")
+            }
+
+            var scanIdx = firstIdx
+            var trailingOpenAngle = -1
+            while (scanIdx <= lastIdx) {
+                if (walker.punctAt(scanIdx) == '<') {
+                    val closeAngle = walker.findMatchingTypeAngleToken(scanIdx)
+                    if (closeAngle == lastIdx) {
+                        trailingOpenAngle = scanIdx
+                        break
+                    }
+                    if (closeAngle > scanIdx) {
+                        scanIdx = closeAngle + 1
+                        continue
+                    }
+                }
+                scanIdx++
+            }
+
+            val headEndIdx: Int
+            val basePath: String
+            val typeArgs: List<String>
+            val typeArgsSuffix: String
+            if (trailingOpenAngle > firstIdx) {
+                headEndIdx = walker.previousNonTriviaIndex(trailingOpenAngle)
+                basePath = trimmed.substring(walker.tokens[firstIdx].start, walker.tokens[headEndIdx].end).trim()
+                typeArgsSuffix = trimmed.substring(walker.tokens[trailingOpenAngle].start, walker.tokens[lastIdx].end)
+                typeArgs =
+                    walker
+                        .splitTopLevelCommaTokenRanges(trailingOpenAngle + 1, lastIdx)
+                        .map { range -> trimmed.substring(walker.tokens[range.first].start, walker.tokens[range.last].end).trim() }
+                        .filter { it.isNotEmpty() }
+            } else {
+                headEndIdx = lastIdx
+                basePath = trimmed
+                typeArgs = emptyList()
+                typeArgsSuffix = ""
+            }
+
+            var lastTopDotIdx = -1
+            walker.walkTopLevelTokens(firstIdx, headEndIdx + 1, trackBraces = true) { idx, _, isTop ->
+                if (isTop && walker.punctAt(idx) == '.') {
+                    lastTopDotIdx = idx
+                }
+                true
+            }
+            val ownerPath =
+                if (lastTopDotIdx > firstIdx) {
+                    val ownerEndIdx = walker.previousNonTriviaIndex(lastTopDotIdx)
+                    trimmed.substring(walker.tokens[firstIdx].start, walker.tokens[ownerEndIdx].end).trim()
+                } else {
+                    null
+                }
+            val memberStartIdx =
+                if (lastTopDotIdx >= firstIdx) {
+                    walker.nextNonTriviaIndex(lastTopDotIdx + 1, headEndIdx + 1)
+                } else {
+                    firstIdx
+                }
+            val memberName =
+                if (memberStartIdx <= headEndIdx) {
+                    trimmed.substring(walker.tokens[memberStartIdx].start, walker.tokens[headEndIdx].end).trim()
+                } else {
+                    ""
+                }
+            val erasedBasePath =
+                if ('<' !in basePath) {
+                    basePath
+                } else {
+                    eraseTopLevelAngleBlocks(walker, trimmed, firstIdx, headEndIdx)
+                }
+            return KotlinCalleeShape(
+                rawCallee = trimmed,
+                basePath = basePath,
+                erasedBasePath = erasedBasePath,
+                ownerPath = ownerPath,
+                memberName = memberName,
+                typeArgs = typeArgs,
+                typeArgsSuffix = typeArgsSuffix,
+            )
+        }
+
+        private fun eraseTopLevelAngleBlocks(
+            walker: KotlinTokenWalker,
+            source: String,
+            startIdx: Int,
+            endIdx: Int,
+        ): String {
+            val sb = StringBuilder()
+            var k = startIdx
+            while (k <= endIdx) {
+                if (walker.punctAt(k) == '<') {
+                    val close = walker.findMatchingTypeAngleToken(k)
+                    if (close in (k + 1)..endIdx) {
+                        k = close + 1
+                        continue
+                    }
+                }
+                sb.append(walker.tokens[k].rawText)
+                k++
+            }
+            return source.takeIf { sb.isEmpty() } ?: sb.toString().trim()
         }
     }
 }

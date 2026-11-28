@@ -11,29 +11,11 @@ import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.UnOp
 
-private val ITER_RECEIVER_METHODS: Set<String> = wordSet("iter iter_mut into_iter")
-
-private val POINTER_DISTANCE_SUB_METHODS: Set<String> =
-    wordSet("checked_sub wrapping_sub unchecked_sub saturating_sub offset_from offset_from_unsigned sub_ptr byte_offset_from")
-
-private val INDEXED_ITER_UNWRAP_METHODS: Set<String> =
-    wordSet("zip any all map filter filter_map flat_map fold for_each forEach enumerate count sum find position")
-
-private val NUMERIC_RECEIVER_KIND_METHODS: Set<String> =
-    wordSet(
-        "wrapping_add wrapping_sub wrapping_mul wrapping_div wrapping_rem wrapping_shl wrapping_shr",
-        "unchecked_shl unchecked_shr checked_add checked_sub checked_mul checked_div checked_rem",
-        "checked_div_euclid checked_rem_euclid checked_shl checked_shr checked_pow",
-        "saturating_add saturating_sub saturating_mul overflowing_add overflowing_sub overflowing_mul",
-        "overflowing_shl overflowing_shr div_euclid rem_euclid rotate_left rotate_right",
-        "pow powf powi min max atan2 hypot log mul_add to_digit",
-    )
-
-private val U32_SHIFT_OR_EXP_METHODS: Set<String> =
-    wordSet(
-        "wrapping_shl wrapping_shr checked_shl checked_shr overflowing_shl overflowing_shr",
-        "rotate_left rotate_right pow checked_pow",
-    )
+private val ITER_RECEIVER_METHODS: Set<String> get() = activeRules().words("iterReceiverMethods")
+private val POINTER_DISTANCE_SUB_METHODS: Set<String> get() = activeRules().words("pointerDistanceSubMethods")
+private val INDEXED_ITER_UNWRAP_METHODS: Set<String> get() = activeRules().words("indexedIterUnwrapMethods")
+private val NUMERIC_RECEIVER_KIND_METHODS: Set<String> get() = activeRules().words("numericReceiverKindMethods")
+private val U32_SHIFT_OR_EXP_METHODS: Set<String> get() = activeRules().words("u32ShiftOrExpMethods")
 
 private fun unwrapTrailingIterReceiver(expr: Expr): Expr {
     val mc = expr as? Expr.MethodCall ?: return expr
@@ -60,7 +42,7 @@ private fun KotlinJ2KEmitter.unwrapRepeatSourceArg(
     selfTypeName: String?,
 ): Expr? {
     val call = unwrapParenOrGroupExpr(expr) as? Expr.Call ?: return null
-    val callee = renderCalleeExpr(call.func, indent, selfTypeName).substringBefore('<').trim()
+    val callee = KotlinCalleeShape.parse(renderCalleeExpr(call.func, indent, selfTypeName)).erasedBasePath
     val args = call.args.toList().filterNot { it is Expr.Tuple && it.elems.isEmpty() }
     return if (args.size == 1 &&
         "repeat" !in inspector.declaredTopLevelFnRawNames &&
@@ -120,7 +102,7 @@ internal fun KotlinJ2KEmitter.isFmtStringBuilderReceiver(
     selfTypeName: String?,
 ): Boolean {
     fun isStdFmtReceiverType(ty: String?): Boolean {
-        val clean = ty?.removeSuffix("?")?.substringBefore('<')?.trim() ?: return false
+        val clean = ty?.headKotlinTypePath() ?: return false
         val simple = clean.substringAfterLast('.')
         return clean == "StringBuilder" ||
             simple == "StringBuilder" ||
@@ -306,18 +288,6 @@ private class MethodCallLoweringContext(
 
     fun derefRefCellOrAtom(): String = if (refCellInnerType() != null) "$recvAtom.value" else recvAtom
 
-    fun renderIndexedGetOrNull(recvTarget: String): String {
-        val indexExpr = allMethodArgs[0]
-        val idxKind = emitter.inferExprNumericKind(indexExpr, selfTypeName)
-        val idxArg =
-            if (idxKind != null && idxKind != NumericKind.I32) {
-                emitter.normalizeArrayLengthToIntExpr(renderedValueArgs[0], indexExpr, selfTypeName)
-            } else {
-                renderedValueArgs[0]
-            }
-        return "$recvTarget.getOrNull($idxArg)"
-    }
-
     fun renderOptionEagerEvaluation(
         isEager: Boolean,
         argExpr: Expr,
@@ -484,10 +454,271 @@ private class MethodCallLoweringContext(
         return synPath.path.lastCleanIdent() == "NonNull"
     }
 
+    private fun isThreadCurrentCall(): Boolean {
+        val recvCore = emitter.unwrapParenOrGroupExpr(expr.receiver) as? Expr.Call ?: return false
+        if (!recvCore.args.isEmpty()) return false
+        val fnPath = (emitter.unwrapParenOrGroupExpr(recvCore.func) as? Expr.Path)?.takeIf { it.qself == null } ?: return false
+        val segs = fnPath.path.cleanIdentStrings()
+        val scope = emitter.scopeBuilder
+        return segs == listOf("thread", "current") ||
+            segs == listOf("std", "thread", "current") ||
+            (segs == listOf("current") && scope.resolveModuleBinding("current")?.importedPath == "std.thread.current")
+    }
+
+    private fun matchesReceiverGuard(guard: String): Boolean {
+        val headerCtx = emitter.headerContext
+        return when (guard) {
+            "any", "fmtOrQueue" -> true
+            "potentialOption" ->
+                !emitter.hasDeclaredOptionEnum() &&
+                    !emitter.isKnownNonNullableNonOptionReceiver(expr.receiver, receiver, selfTypeName)
+            "nullableOption" ->
+                emitter.isKnownNullableOptionExpr(expr.receiver, receiver, selfTypeName)
+            "erasedOption" ->
+                !emitter.hasDeclaredOptionEnum() &&
+                    emitter.isKnownNullableOptionExpr(expr.receiver, receiver, selfTypeName) &&
+                    !(rawMethod == "map" && allMethodArgs.size == 1 && emitter.isTransparentWrapperOrIdentityMapArg(allMethodArgs[0]))
+            "erasedOptionPlace" ->
+                !emitter.hasDeclaredOptionEnum() &&
+                    emitter.isKnownNullableOptionExpr(expr.receiver, receiver, selfTypeName) &&
+                    receiver.all { it.isLetterOrDigit() || it == '_' || it == '.' } &&
+                    (expr.receiver is Expr.Field || (expr.receiver is Expr.Path && receiver != "cell"))
+            "dequeIter" -> isDequeIterReceiver
+            "dequeOrIter" ->
+                receiver in emitter.currentDequeLocals ||
+                    isDequeIterReceiver ||
+                    inferredRecvTy?.startsWith("ArrayDeque<") == true
+            "vec" -> isVecReceiver
+            "vecOrMutableList" -> isVecReceiver || localOrInferredRecvTy?.startsWith("MutableList<") == true
+            "nonVecFieldOrNullableLocal" ->
+                !isVecReceiver && (expr.receiver is Expr.Field || receiver in emitter.currentNullableLocals)
+            "indexedSliceOrArray" -> {
+                val collTy = emitter.currentTypedLocals[receiver] ?: emitter.inferExprRenderedType(expr.receiver, selfTypeName)
+                isIndexedSliceOrArrayRenderedType(collTy)
+            }
+            "map" -> {
+                val collTy = emitter.currentTypedLocals[receiver] ?: emitter.inferExprRenderedType(expr.receiver, selfTypeName)
+                isMapRenderedType(collTy)
+            }
+            "set" -> {
+                val collTy = emitter.currentTypedLocals[receiver] ?: emitter.inferExprRenderedType(expr.receiver, selfTypeName)
+                isSetRenderedType(collTy)
+            }
+            "charsIter" -> {
+                val recvTy = localOrInferredRecvTy
+                "core" in headerCtx.crateNamespaces &&
+                    (recvTy == "Chars" || recvTy?.endsWith(".Chars") == true) &&
+                    !(headerCtx.packageName == "$coreNs.str.iter" && selfTypeName == "Chars")
+            }
+            "fmtBuilder" -> emitter.isFmtStringBuilderReceiver(expr.receiver, receiver, selfTypeName)
+            "stringOrUninferred" -> inferredRecvTy == null || inferredRecvTy == "String"
+            "stringOrStrLit" ->
+                inferredRecvTy == "String" ||
+                    emitter.unwrapParenOrGroupExpr(expr.receiver).let { it is Expr.Lit && it.lit is Lit.Str }
+            "stringOrCharSeq" -> {
+                val ty = localOrInferredRecvTy
+                ty == "String" || ty == "CharSequence"
+            }
+            "uninferredRecv" -> localOrInferredRecvTy == null
+            "charOrCharLit" ->
+                localOrInferredRecvTy == "Char" ||
+                    (emitter.unwrapParenOrGroupExpr(expr.receiver) as? Expr.Lit)?.lit is Lit.Char
+            "assignableStringPath" ->
+                localOrInferredRecvTy == "String" &&
+                    receiver.all { it.isLetterOrDigit() || it == '_' || it == '.' }
+            "stringSplitRecv" -> {
+                val ty = localOrInferredRecvTy
+                ty == null || ty == "String" || ty == "CharSequence" || refCellInnerType() == "String"
+            }
+            "listOrByteSlice" -> {
+                val unwrappedRecvExpr = emitter.unwrapTransparentCastExpr(expr.receiver)
+                val isRangeSliceExpr = unwrappedRecvExpr is Expr.Index && unwrappedRecvExpr.index is Expr.Range
+                val ty = inferredRecvTy
+                ty?.startsWith("List<") == true ||
+                    ty?.startsWith("MutableList<") == true ||
+                    ty?.startsWith("ArrayList<") == true ||
+                    isRangeSliceExpr ||
+                    receiver.endsWith(".toBytes()") ||
+                    receiver.endsWith(".asBytes()") ||
+                    receiver.endsWith(".asSlice()")
+            }
+            "rustAny" -> inferredRecvTy == "RustAny"
+            "intNumeric" -> emitter.inferExprNumericKind(expr.receiver, selfTypeName)?.isIntegerNumericKind() == true
+            "stringLikeOrRefCell" -> (refCellInnerType() ?: localOrInferredRecvTy)?.let { it in STRING_LIKE_TYPES } == true
+            "sizedCollectionOrRefCell" ->
+                (refCellInnerType() ?: localOrInferredRecvTy)?.let { ty ->
+                    ty in PRIMITIVE_ARRAY_TYPES || SIZED_COLLECTION_PREFIXES.any(ty::startsWith)
+                } == true
+            "arrayElemKind" -> emitter.inferArrayElementNumericKind(expr.receiver, selfTypeName) != null
+            "refCellGuard" -> refCellInnerType() != null
+            "refCellString" -> refCellInnerType() == "String"
+            "stringBytesOrUninferred" -> {
+                val ty = refCellInnerType() ?: localOrInferredRecvTy
+                ty == null || ty in STRING_LIKE_TYPES
+            }
+            "plainStringOrUnboundAsStr" -> {
+                val recvTy = localOrInferredRecvTy
+                val methodSets = emitter.inspector.instanceMethodsByType
+                val crateFns = emitter.headerContext.crateFnReturnTypes
+                recvTy == "String" ||
+                    (recvTy == null && methodSets.values.none { "asStr" in it } && crateFns.keys.none { it.endsWith(".asStr") })
+            }
+            "intoSubstOrStrOrList" -> {
+                val recvTy = localOrInferredRecvTy
+                receiver in emitter.currentIntoSubstitutedParams ||
+                    recvTy == "String" ||
+                    recvTy?.startsWith("List<") == true ||
+                    recvTy?.startsWith("MutableList<") == true
+            }
+            "intoSubstParam" -> receiver in emitter.currentIntoSubstitutedParams
+            "threadCurrent" ->
+                receiver == "thread.current()" || receiver.endsWith(".thread.current()") || isThreadCurrentCall()
+            "sharedBorrowRecv" -> {
+                val unwrappedRecv = emitter.unwrapParenOrGroupExpr(expr.receiver)
+                (unwrappedRecv is Expr.Reference && unwrappedRecv.mutability == null) ||
+                    (
+                        emitter.currentReceiverIsSharedBorrow &&
+                            unwrappedRecv is Expr.Path &&
+                            unwrappedRecv.qself == null &&
+                            unwrappedRecv.path.isIdent("self")
+                    )
+            }
+            else -> throw IllegalArgumentException("Unknown method receiver guard '$guard'")
+        }
+    }
+
+    private fun matchesArgGuard(guard: String): Boolean =
+        when (guard) {
+            "arg0FmtBuilder" ->
+                allMethodArgs.isNotEmpty() &&
+                    renderedValueArgs.isNotEmpty() &&
+                    emitter.isFmtStringBuilderReceiver(allMethodArgs[0], renderedValueArgs[0], selfTypeName)
+            "nonRangeArg0" ->
+                allMethodArgs.isNotEmpty() && emitter.unwrapParenOrGroupExpr(allMethodArgs[0]) !is Expr.Range
+            "setInsertArgs" ->
+                renderedValueArgs.size == 1 || (renderedValueArgs.size == 2 && renderedValueArgs[1] == "Unit")
+            "charPatArg0" -> {
+                val argExpr = allMethodArgs.firstOrNull() ?: return false
+                val argTy = emitter.inferExprRenderedType(argExpr, selfTypeName)?.removeSuffix("?")?.trim()
+                (emitter.unwrapParenOrGroupExpr(argExpr) as? Expr.Lit)?.lit is Lit.Char || argTy == "Char" || argTy == "RustChar"
+            }
+            else -> throw IllegalArgumentException("Unknown method argGuard '$guard'")
+        }
+
+    fun tryRenderDeclarativeMethodRules(
+        rulesByName: Map<String, List<DeclarativeMethodPatternRule>>,
+        preArg: Boolean,
+    ): String? {
+        val candidates = rulesByName[rawMethod] ?: return null
+        val argCount = if (preArg) nonUnitArgs.size else renderedValueArgs.size
+        val hasTurbofish = if (preArg) expr.turbofish != null else typeArgs.isNotEmpty()
+        val currentPkg = emitter.headerContext.packageName
+        val currentFn = emitter.currentEnclosingFunctionName
+        val currentPkgAndFn = if (currentPkg != null && currentFn != null) "$currentPkg#$currentFn" else null
+        val matched =
+            candidates.firstOrNull { rule ->
+                rule.matches(
+                    rawMethod = rawMethod,
+                    argCount = argCount,
+                    hasTurbofish = hasTurbofish,
+                    hasCoreCrate = "core" in emitter.headerContext.crateNamespaces,
+                    rawAbiMode = emitter.headerContext.rawAbiMode,
+                    coreNs = coreNs,
+                    currentPkgAndFn = currentPkgAndFn,
+                    declaredTypeNames = emitter.inspector.declaredTypeNames,
+                    declaredTraitsByName = emitter.inspector.declaredTraitsByName.keys,
+                    declaredTopLevelFnRawNames = emitter.inspector.declaredTopLevelFnRawNames,
+                    instanceMethodSets = emitter.inspector.instanceMethodsByType.values,
+                    argPredicate = ::matchesArgGuard,
+                    receiverPredicate = ::matchesReceiverGuard,
+                )
+            } ?: return null
+        return matched.action.render(
+            rawAbi = emitter.headerContext.rawAbiMode,
+            finalClasses = emitter.headerContext.finalClasses,
+            onImport = { CoreIntrinsicLowering.registerCoreImport(emitter, it) },
+            onSideEffect = { effect ->
+                when (effect) {
+                    "usesCurrentThreadToken" -> emitter.usesCurrentThreadToken = true
+                    else -> throw IllegalArgumentException("Unknown method sideEffect '$effect'")
+                }
+            },
+        ) { key ->
+            when (key) {
+                "recv" -> receiver
+                "recvAtom" -> recvAtom
+                "derefRecv" -> derefRefCellOrAtom()
+                "derefStrRecv" -> if (refCellInnerType() == "String") "$recvAtom.value" else recvAtom
+                "typeArgs" -> if (preArg) "" else typeArgs
+                "coreNs" -> coreNs
+                "arg0" -> if (preArg) null else renderedValueArgs.getOrNull(0)
+                "arg1" -> if (preArg) null else renderedValueArgs.getOrNull(1)
+                "arg0U32" ->
+                    if (preArg) {
+                        null
+                    } else {
+                        allMethodArgs.getOrNull(0)?.let { argExpr ->
+                            renderedValueArgs.getOrNull(0)?.let {
+                                emitter.coerceNumericArgIfNeeded(argExpr, it, NumericKind.U32, selfTypeName)
+                            }
+                        }
+                    }
+                "idx0" ->
+                    if (preArg) {
+                        null
+                    } else {
+                        allMethodArgs.getOrNull(0)?.let { indexExpr ->
+                            renderedValueArgs.getOrNull(0)?.let { renderedIdx ->
+                                val idxKind = emitter.inferExprNumericKind(indexExpr, selfTypeName)
+                                if (idxKind != null && idxKind != NumericKind.I32) {
+                                    emitter.normalizeArrayLengthToIntExpr(renderedIdx, indexExpr, selfTypeName)
+                                } else {
+                                    renderedIdx
+                                }
+                            }
+                        }
+                    }
+                "charArg0" ->
+                    if (preArg) {
+                        null
+                    } else {
+                        allMethodArgs.getOrNull(0)?.let { argExpr ->
+                            renderedValueArgs.getOrNull(0)?.let { renderedArg ->
+                                val argTy = emitter.inferExprRenderedType(argExpr, selfTypeName)?.removeSuffix("?")?.trim()
+                                if (argTy == "RustChar") "($renderedArg).toInt().toChar()" else renderedArg
+                            }
+                        }
+                    }
+                "cb0" ->
+                    if (preArg) {
+                        null
+                    } else {
+                        allMethodArgs.getOrNull(0)?.let { argExpr ->
+                            renderedValueArgs.getOrNull(0)?.let { emitter.wrapMapCallbackArg(argExpr, it) }
+                        }
+                    }
+                "cb1" ->
+                    if (preArg) {
+                        null
+                    } else {
+                        allMethodArgs.getOrNull(1)?.let { argExpr ->
+                            renderedValueArgs.getOrNull(1)?.let { emitter.wrapMapCallbackArg(argExpr, it) }
+                        }
+                    }
+                "zeroClosure0" -> if (preArg) null else renderedValueArgs.getOrNull(0)?.let(emitter::unwrapZeroArgClosureText)
+                else -> null
+            }
+        }
+    }
+
     companion object {
-        private val ATOMIC_SINGLE_VALUE_METHODS =
-            wordSet("store swap fetch_add fetch_sub fetch_and fetch_or fetch_xor fetch_max fetch_min")
+        private val ATOMIC_SINGLE_VALUE_METHODS: Set<String>
+            get() = activeRules().words("atomicSingleValueMethods")
         private val RAW_PTR_OWNER_NAMES = wordSet("MutPtr ConstPtr")
+        private val STRING_LIKE_TYPES: Set<String>
+            get() = activeRules().words("stringLikeTypes")
+        private val SIZED_COLLECTION_PREFIXES: List<String>
+            get() = activeRules().stringList("sizedCollectionPrefixes")
     }
 }
 
@@ -503,9 +734,9 @@ private object RawPointerMethodCallRule : MethodLoweringRule() {
         val receiver = ctx.receiver
         val nonUnitArgs = ctx.nonUnitArgs
         val recvRawPtrRenderedTy = emitter.inferExprRenderedType(expr.receiver, ctx.selfTypeName)
-        if (rawPointerPointeeType(recvRawPtrRenderedTy) != null) {
+        val sourcePointee = rawPointerPointeeType(recvRawPtrRenderedTy)
+        if (sourcePointee != null) {
             val ptrPkg = "${ctx.coreNs}.ptr"
-            val intrPkg = "${ctx.coreNs}.intrinsics"
             val ptrCtor = if (isMutRawPointerRenderedType(recvRawPtrRenderedTy)) "MutPtr" else "ConstPtr"
             if (nonUnitArgs.size == 1 && rawMethod in RAW_POINTER_ARITH_METHODS) {
                 CoreIntrinsicLowering.registerCoreImport(emitter, "$ptrPkg.$ptrCtor")
@@ -519,16 +750,8 @@ private object RawPointerMethodCallRule : MethodLoweringRule() {
                     }
                 return "$ptrCtor(($receiver).rawAddress $deltaSign ($byteDelta))"
             }
-            if (rawMethod == "is_null" && nonUnitArgs.isEmpty()) return "(($receiver).rawAddress == 0L)"
-            if ((rawMethod == "cast_mut" || rawMethod == "cast_const") && nonUnitArgs.isEmpty() && expr.turbofish == null) {
-                val pointee = rawPointerPointeeType(recvRawPtrRenderedTy) ?: "Any"
-                val targetCtor = if (rawMethod == "cast_mut") "MutPtr" else "ConstPtr"
-                CoreIntrinsicLowering.registerCoreImport(emitter, "$ptrPkg.$targetCtor")
-                return "$targetCtor<$pointee>(($receiver).rawAddress)"
-            }
             if (rawMethod == "cast" && nonUnitArgs.isEmpty()) {
                 val destination = expr.firstTurbofishTypeArg()
-                val sourcePointee = rawPointerPointeeType(recvRawPtrRenderedTy)
                 val returnDestination =
                     when (val returnType = emitter.currentEnclosingReturnSynType) {
                         is SynType.Ptr -> returnType.elem
@@ -541,92 +764,53 @@ private object RawPointerMethodCallRule : MethodLoweringRule() {
                         ?: rawPointerPointeeType(emitter.currentEnclosingReturnRenderedType)
                         ?: returnDestination?.let { emitter.renderType(it, ctx.selfTypeName) }
                         ?: sourcePointee
-                        ?: "Any"
                 if (sourcePointee == destinationPointee) return receiver
                 CoreIntrinsicLowering.registerCoreImport(emitter, "$ptrPkg.$ptrCtor")
                 return "$ptrCtor<$destinationPointee>(($receiver).rawAddress)"
             }
-            if (expr.turbofish == null) {
-                when {
-                    (rawMethod == "read" || rawMethod == "read_unaligned" || rawMethod == "read_volatile") && nonUnitArgs.isEmpty() -> {
-                        val pointeeLayout = emitter.resolveRawPointerPointeeLayout(expr.receiver, ctx.selfTypeName)
-                        val readFn = if (rawMethod == "read_volatile") "readVolatileNative" else "readNative"
-                        return "($pointeeLayout).$readFn(($receiver).rawAddress)"
-                    }
-                    (rawMethod == "write" || rawMethod == "write_unaligned" || rawMethod == "write_volatile") && nonUnitArgs.size == 1 -> {
-                        val pointeeLayout = emitter.resolveRawPointerPointeeLayout(expr.receiver, ctx.selfTypeName)
-                        val valExpr = emitter.renderExpr(nonUnitArgs[0], ctx.indent, ctx.selfTypeName)
-                        val writeFn = if (rawMethod == "write_volatile") "writeVolatileNative" else "writeNative"
-                        return "($pointeeLayout).$writeFn(($receiver).rawAddress, $valExpr)"
-                    }
-                    rawMethod in PTR_COPY_METHODS && nonUnitArgs.size == 2 -> {
-                        val pointeeLayout = emitter.resolveRawPointerPointeeLayout(expr.receiver, ctx.selfTypeName)
-                        val argExpr = emitter.renderExpr(nonUnitArgs[0], ctx.indent, ctx.selfTypeName)
-                        val countExpr = emitter.renderExpr(nonUnitArgs[1], ctx.indent, ctx.selfTypeName)
-                        val isFrom = rawMethod.startsWith("copy_from")
-                        val fnName = if (rawMethod.endsWith("_nonoverlapping")) "kmCopyNonoverlapping" else "kmCopy"
-                        CoreIntrinsicLowering.registerCoreImport(emitter, "$intrPkg.$fnName")
-                        val srcAddr = if (isFrom) "($argExpr).rawAddress" else "($receiver).rawAddress"
-                        val dstAddr = if (isFrom) "($receiver).rawAddress" else "($argExpr).rawAddress"
-                        return "$fnName($srcAddr, $dstAddr, ($countExpr).toLong() * ($pointeeLayout).sizeBytes)"
-                    }
-                    rawMethod == "write_bytes" && nonUnitArgs.size == 2 -> {
-                        val pointeeLayout = emitter.resolveRawPointerPointeeLayout(expr.receiver, ctx.selfTypeName)
-                        val byteExpr = emitter.renderExpr(nonUnitArgs[0], ctx.indent, ctx.selfTypeName)
-                        val countExpr = emitter.renderExpr(nonUnitArgs[1], ctx.indent, ctx.selfTypeName)
-                        CoreIntrinsicLowering.registerCoreImport(emitter, "$intrPkg.kmWriteBytes")
-                        return "kmWriteBytes(($receiver).rawAddress, ($byteExpr).toUByte(), ($countExpr).toLong() * ($pointeeLayout).sizeBytes)"
-                    }
-                    rawMethod == "offset_from" && nonUnitArgs.size == 1 -> {
-                        val pointeeLayout = emitter.resolveRawPointerPointeeLayout(expr.receiver, ctx.selfTypeName)
-                        val originExpr = emitter.renderExpr(nonUnitArgs[0], ctx.indent, ctx.selfTypeName)
-                        val diffExpr = "((($receiver).rawAddress - ($originExpr).rawAddress) / ($pointeeLayout).strideBytes)"
-                        return if (emitter.headerContext.rawAbiMode) diffExpr else "$diffExpr.toInt()"
-                    }
-                    rawMethod == "addr" && nonUnitArgs.isEmpty() ->
-                        return if (emitter.headerContext.rawAbiMode) "($receiver).rawAddress.toULong()" else "($receiver).rawAddress.toInt()"
-                    rawMethod == "with_addr" && nonUnitArgs.size == 1 -> {
-                        val addrExpr = emitter.renderExpr(nonUnitArgs[0], ctx.indent, ctx.selfTypeName)
-                        CoreIntrinsicLowering.registerCoreImport(emitter, "$ptrPkg.$ptrCtor")
-                        return "$ptrCtor(($addrExpr).toLong())"
+            val ptrRule = activeRules().rawPtrMethodRulesByName[rawMethod]
+            if (ptrRule != null && ptrRule.matches(rawMethod, nonUnitArgs.size, expr.turbofish != null) { true }) {
+                var cachedLayout: String? = null
+                val renderedArgs = arrayOfNulls<String>(nonUnitArgs.size)
+                return ptrRule.action.render(
+                    rawAbi = emitter.headerContext.rawAbiMode,
+                    onImport = { CoreIntrinsicLowering.registerCoreImport(emitter, it) },
+                ) { key ->
+                    when (key) {
+                        "recv" -> receiver
+                        "coreNs" -> ctx.coreNs
+                        "ptrCtor" -> ptrCtor
+                        "pointee" -> sourcePointee
+                        "pointeeLayout" ->
+                            cachedLayout ?: emitter.resolveRawPointerPointeeLayout(expr.receiver, ctx.selfTypeName).also { cachedLayout = it }
+                        "arg0" ->
+                            renderedArgs[0] ?: emitter.renderExpr(nonUnitArgs[0], ctx.indent, ctx.selfTypeName).also { renderedArgs[0] = it }
+                        "arg1" ->
+                            renderedArgs[1] ?: emitter.renderExpr(nonUnitArgs[1], ctx.indent, ctx.selfTypeName).also { renderedArgs[1] = it }
+                        else -> null
                     }
                 }
             }
         }
-        if (emitter.headerContext.rawAbiMode && nonUnitArgs.isEmpty()) {
-            if (rawMethod == "is_null") return "($receiver == 0L)"
-            if ((rawMethod == "cast_mut" || rawMethod == "cast_const") && expr.turbofish == null) return receiver
-        }
         return null
     }
-
-    private val PTR_COPY_METHODS = wordSet("copy_to copy_to_nonoverlapping copy_from copy_from_nonoverlapping")
 }
 
 private object EarlyPrimitiveAndBitsMethodRule : MethodLoweringRule() {
     override fun tryRender(ctx: MethodCallLoweringContext): String? {
-        if (ctx.nonUnitArgs.isNotEmpty()) return null
+        if (ctx.nonUnitArgs.isNotEmpty() || ctx.expr.turbofish != null) return null
         val emitter = ctx.emitter
         val expr = ctx.expr
         val rawMethod = ctx.rawMethod
         val receiver = ctx.receiver
-        if (rawMethod == "cast" && emitter.headerContext.rawAbiMode) return receiver
-        if (expr.turbofish != null) return null
-        val recvKind = emitter.inferExprNumericKind(expr.receiver, ctx.selfTypeName)
-        if (rawMethod == "count_ones" && recvKind != null && recvKind.isIntegerNumericKind()) {
-            if ("core" in emitter.headerContext.crateNamespaces) {
-                ctx.registerCoreSubpkgImport("num", "countOnes")
-                return "${ctx.recvAtom}.countOnes()"
-            }
-            return "${ctx.recvAtom}.countOneBits().toUInt()"
-        }
-        if (rawMethod == "to_bits" && recvKind != null) {
+        val recvKind = emitter.inferExprNumericKind(expr.receiver, ctx.selfTypeName) ?: return null
+        if (rawMethod == "to_bits") {
             emitter.renderFloatToBitsExpr(expr.receiver, receiver, recvKind)?.let { return it }
         }
-        if ((rawMethod == "to_be_bytes" || rawMethod == "to_le_bytes" || rawMethod == "to_ne_bytes") && recvKind != null) {
+        if (rawMethod == "to_be_bytes" || rawMethod == "to_le_bytes" || rawMethod == "to_ne_bytes") {
             return emitter.renderIntToBytesMethodCall(receiver, expr.receiver, recvKind, rawMethod, ctx.selfTypeName)
         }
-        if (rawMethod in ENDIAN_SWAP_METHODS && recvKind != null && recvKind.isIntegerNumericKind()) {
+        if (rawMethod in ENDIAN_SWAP_METHODS && recvKind.isIntegerNumericKind()) {
             emitter
                 .tryRender128BitEndianMethodCall(rawMethod, recvKind, expr.receiver, receiver, guardSelfRecursion = false)
                 ?.let { return it }
@@ -641,148 +825,37 @@ private object EarlyPrimitiveAndBitsMethodRule : MethodLoweringRule() {
         return null
     }
 
-    private val ENDIAN_SWAP_METHODS = wordSet("to_be from_be swap_bytes to_le from_le")
+    private val ENDIAN_SWAP_METHODS: Set<String> get() = activeRules().words("endianIntMethods")
 }
 
-private object EarlyReceiverStateAndCollectionRule : MethodLoweringRule() {
+private object DeclarativePreArgMethodRule : MethodLoweringRule() {
+    override fun tryRender(ctx: MethodCallLoweringContext): String? =
+        ctx.tryRenderDeclarativeMethodRules(activeRules().preArgMethodRulesByName, preArg = true)
+}
+
+private object SveIntoMethodRule : MethodLoweringRule() {
     override fun tryRender(ctx: MethodCallLoweringContext): String? {
-        if (ctx.nonUnitArgs.isNotEmpty()) return null
+        if (ctx.rawMethod != "sve_into" || ctx.nonUnitArgs.isNotEmpty() || ctx.expr.turbofish != null) return null
         val emitter = ctx.emitter
-        val expr = ctx.expr
-        val rawMethod = ctx.rawMethod
-        val receiver = ctx.receiver
-        val noTurbofish = expr.turbofish == null
-        if (rawMethod == "len" && noTurbofish) {
-            val effectiveLenTy = ctx.refCellInnerType() ?: ctx.localOrInferredRecvTy
-            val recvTarget = ctx.derefRefCellOrAtom()
-            if (effectiveLenTy != null) {
-                if (effectiveLenTy in STRING_LIKE_TYPES) return "$recvTarget.length"
-                if (effectiveLenTy in PRIMITIVE_ARRAY_TYPES || SIZED_COLLECTION_PREFIXES.any(effectiveLenTy::startsWith)) {
-                    return "$recvTarget.size"
-                }
-            }
-            if (emitter.inferArrayElementNumericKind(expr.receiver, ctx.selfTypeName) != null) return "$receiver.size"
-        }
-        if (rawMethod == "is_empty" && noTurbofish && ctx.refCellInnerType() != null) {
-            return "${ctx.recvAtom}.value.isEmpty()"
-        }
-        if ((rawMethod == "is_none" || rawMethod == "is_some") &&
-            !emitter.hasDeclaredOptionEnum() &&
-            !emitter.isKnownNonNullableNonOptionReceiver(expr.receiver, receiver, ctx.selfTypeName)
-        ) {
-            return if (rawMethod == "is_none") "$receiver == null" else "$receiver != null"
-        }
-        if (rawMethod == "as_bytes" && noTurbofish) {
-            val effectiveBytesTy = ctx.refCellInnerType() ?: ctx.localOrInferredRecvTy
-            if (effectiveBytesTy == null || effectiveBytesTy in STRING_LIKE_TYPES) {
-                val strExpr = ctx.derefRefCellOrAtom()
-                return if (emitter.headerContext.rawAbiMode || emitter.headerContext.finalClasses) {
-                    "$strExpr.encodeToByteArray().asUByteArray()"
-                } else {
-                    "$strExpr.encodeToByteArray().map { it.toUByte() }"
-                }
-            }
-        }
-        if (rawMethod == "as_str" && noTurbofish) {
-            val recvTy = ctx.localOrInferredRecvTy
-            if (ctx.refCellInnerType() == "String") return "${ctx.recvAtom}.value"
-            if (recvTy == "String") return receiver
-            val instanceMethodSets = emitter.inspector.instanceMethodsByType.values
-            val crateFnKeys = emitter.headerContext.crateFnReturnTypes.keys
-            if (recvTy == null && instanceMethodSets.none { "asStr" in it } && crateFnKeys.none { it.endsWith(".asStr") }) {
-                return receiver
-            }
-        }
-        if ((rawMethod == "as_ref" || rawMethod == "borrow") && noTurbofish) {
-            val recvTy = ctx.localOrInferredRecvTy
-            if (receiver in emitter.currentIntoSubstitutedParams ||
-                recvTy == "String" ||
-                recvTy?.startsWith("List<") == true ||
-                recvTy?.startsWith("MutableList<") == true
-            ) {
-                return receiver
-            }
-        }
-        if (rawMethod == "id" && (receiver == "thread.current()" || receiver.endsWith(".thread.current()") || isThreadCurrentCall(ctx))) {
-            emitter.usesCurrentThreadToken = true
-            return "currentThreadBoundToken()"
-        }
-        if (rawMethod == "debug_list" || rawMethod == "debug_set") {
-            val (open, close) = if (rawMethod == "debug_list") "[" to "]" else "{" to "}"
-            return "object { val entries = mutableListOf<Any?>(); fun entry(v: Any?) = apply { entries.add(v) }; fun entries(iter: Iterable<*>) = apply { for (e in iter) entries.add(e) }; fun finish() { $receiver.append(entries.joinToString(\", \", \"$open\", \"$close\")) } }"
-        }
-        if (rawMethod == "debug_map") {
-            return "object { val entries = mutableListOf<String>(); fun entry(k: Any?, v: Any?) = apply { entries.add(\"\$k: \$v\") }; fun finish() { $receiver.append(entries.joinToString(\", \", \"{\", \"}\")) } }"
-        }
-        if (rawMethod == "pop_front") return "$receiver.removeFirstOrNull()"
-        if (rawMethod in OPTION_BORROW_IDENTITY_METHODS &&
-            noTurbofish &&
-            emitter.isKnownNullableOptionExpr(expr.receiver, receiver, ctx.selfTypeName)
-        ) {
-            return receiver
-        }
-        if (ctx.isDequeIterReceiver && noTurbofish) {
-            when (rawMethod) {
-                "next" -> return "$receiver.removeFirstOrNull()"
-                "next_back" -> return "$receiver.removeLastOrNull()"
-                "len" -> return "$receiver.size"
-                "clone" -> return "ArrayDeque($receiver)"
-            }
-        }
-        if (ctx.isVecReceiver && noTurbofish) {
-            when (rawMethod) {
-                "pop" -> return "$receiver.removeLastOrNull()"
-                "len" -> return "$receiver.size"
-                "into_iter", "iter", "iter_mut" -> return "ArrayDeque($receiver)"
-                "clone" -> return "$receiver.toMutableList()"
-                "last_mut" -> return "$receiver.lastOrNull()"
-                "first_mut" -> return "$receiver.firstOrNull()"
-            }
-        }
-        if (rawMethod == "into" && noTurbofish && receiver in emitter.currentIntoSubstitutedParams) return receiver
-        if (rawMethod == "sve_into" && noTurbofish) {
-            val recvSimple = ctx.inferredRecvTy?.simpleKotlinTypeName()
-            val targetRaw = ctx.methodEntryParseTarget ?: if (emitter.callArgumentNestingDepth == 0) emitter.currentEnclosingReturnRenderedType else null
-            val targetSimple = targetRaw?.removeSuffix("?")?.simpleKotlinTypeName()
-            if (recvSimple != null && targetSimple != null) {
-                if (recvSimple == targetSimple) return receiver
-                if (recvSimple == "SvboolT" && (targetSimple == "Svbool4T" || targetSimple == "Svbool8T")) {
-                    return "$receiver.sveInto$targetSimple()"
-                }
+        val recvSimple = ctx.inferredRecvTy?.simpleKotlinTypeName()
+        val targetRaw =
+            ctx.methodEntryParseTarget
+                ?: if (emitter.callArgumentNestingDepth == 0) emitter.currentEnclosingReturnRenderedType else null
+        val targetSimple = targetRaw?.removeSuffix("?")?.simpleKotlinTypeName()
+        if (recvSimple != null && targetSimple != null) {
+            if (recvSimple == targetSimple) return ctx.receiver
+            if (recvSimple == "SvboolT" && (targetSimple == "Svbool4T" || targetSimple == "Svbool8T")) {
+                return "${ctx.receiver}.sveInto$targetSimple()"
             }
         }
         return null
     }
-
-    private fun isThreadCurrentCall(ctx: MethodCallLoweringContext): Boolean {
-        val recvCore = ctx.emitter.unwrapParenOrGroupExpr(ctx.expr.receiver) as? Expr.Call ?: return false
-        if (!recvCore.args.isEmpty()) return false
-        val fnPath = (ctx.emitter.unwrapParenOrGroupExpr(recvCore.func) as? Expr.Path)?.takeIf { it.qself == null } ?: return false
-        val segs = fnPath.path.cleanIdentStrings()
-        val scope = ctx.emitter.scopeBuilder
-        return segs == listOf("thread", "current") ||
-            segs == listOf("std", "thread", "current") ||
-            (segs == listOf("current") && scope.resolveModuleBinding("current")?.importedPath == "std.thread.current")
-    }
-
-    private val STRING_LIKE_TYPES = wordSet("String CharSequence StringBuilder")
-    private val OPTION_BORROW_IDENTITY_METHODS = wordSet("as_deref as_deref_mut as_ref as_mut")
-    private val SIZED_COLLECTION_PREFIXES =
-        listOf("List<", "MutableList<", "Set<", "MutableSet<", "Map<", "MutableMap<", "Collection<", "ArrayDeque<")
 }
 
 private object TryIntoStdlibIntegerMethodRule : MethodLoweringRule() {
-    private val STDLIB_INT_TYPES = wordSet("Byte Short Int Long I128 UByte UShort UInt ULong U128")
-    private val FROM_ONLY_TARGETS_BY_SRC: Map<String, Set<String>> =
-        mapOf(
-            "Byte" to wordSet("Short Long I128"),
-            "Short" to wordSet("Long I128"),
-            "Long" to wordSet("I128"),
-            "UByte" to wordSet("Short Int Long I128 UShort UInt ULong U128"),
-            "UShort" to wordSet("Long I128 UInt ULong U128"),
-            "UInt" to wordSet("Long I128 ULong U128"),
-            "ULong" to wordSet("I128 U128"),
-        )
+    private val STDLIB_INT_TYPES: Set<String> get() = activeRules().words("stdlibIntTypes")
+    private val FROM_ONLY_TARGETS_BY_SRC: Map<String, Set<String>>
+        get() = activeRules().tryIntoFromOnlyTargetsBySrc
 
     override fun tryRender(ctx: MethodCallLoweringContext): String? {
         val emitter = ctx.emitter
@@ -864,8 +937,8 @@ private object EarlyIntoIterAndCloneWitnessRule : MethodLoweringRule() {
         return null
     }
 
-    private val INTO_ITER_COLLECTION_PREFIXES =
-        listOf("Iterable<", "Collection<", "List<", "MutableList<", "Set<", "MutableSet<")
+    private val INTO_ITER_COLLECTION_PREFIXES: List<String>
+        get() = activeRules().stringList("intoIterCollectionPrefixes")
 }
 
 private object SynAndStringParseMethodRule : MethodLoweringRule() {
@@ -929,27 +1002,15 @@ private object SynAndStringParseMethodRule : MethodLoweringRule() {
             target.all { it.isLetterOrDigit() || it == '_' || it == '.' }
 }
 
-private object IntoTokenStreamBorrowRule : MethodLoweringRule() {
-    override fun tryRender(ctx: MethodCallLoweringContext): String? {
-        if (ctx.rawMethod != "into_token_stream" || ctx.nonUnitArgs.isNotEmpty() || ctx.expr.turbofish != null) return null
-        val emitter = ctx.emitter
-        val unwrappedRecv = emitter.unwrapParenOrGroupExpr(ctx.expr.receiver)
-        val isSharedBorrowRecv =
-            (unwrappedRecv is Expr.Reference && unwrappedRecv.mutability == null) ||
-                (emitter.currentReceiverIsSharedBorrow && unwrappedRecv is Expr.Path && unwrappedRecv.qself == null && unwrappedRecv.path.isIdent("self"))
-        return if (isSharedBorrowRecv) "TokenStream.new().also { tokens -> ${ctx.recvAtom}.toTokens(tokens) }" else null
-    }
-}
-
 private val RECEIVER_FIRST_METHOD_RULES: List<MethodLoweringRule> =
     listOf(
         RawPointerMethodCallRule,
         EarlyPrimitiveAndBitsMethodRule,
-        EarlyReceiverStateAndCollectionRule,
+        DeclarativePreArgMethodRule,
+        SveIntoMethodRule,
         TryIntoStdlibIntegerMethodRule,
         EarlyIntoIterAndCloneWitnessRule,
         SynAndStringParseMethodRule,
-        IntoTokenStreamBorrowRule,
     )
 
 private object PostArgArithmeticAndHashRule : MethodLoweringRule() {
@@ -987,50 +1048,6 @@ private object PostArgArithmeticAndHashRule : MethodLoweringRule() {
     }
 }
 
-private object CoreStrAndCharMethodRule : MethodLoweringRule() {
-    override fun tryRender(ctx: MethodCallLoweringContext): String? {
-        val emitter = ctx.emitter
-        val headerCtx = emitter.headerContext
-        if ("core" !in headerCtx.crateNamespaces || ctx.typeArgs.isNotEmpty()) return null
-        val coreNs = ctx.coreNs
-        val recvTyForStr = ctx.localOrInferredRecvTy
-        val atomicRecv = ctx.recvAtom
-        val rawMethod = ctx.rawMethod
-        val args = ctx.renderedValueArgs
-        val instanceMethods = emitter.inspector.instanceMethodsByType.values
-        return when {
-            rawMethod == "chars" &&
-                args.isEmpty() &&
-                (recvTyForStr == "String" || recvTyForStr == "CharSequence") &&
-                "chars" !in emitter.inspector.declaredTopLevelFnRawNames &&
-                instanceMethods.none { "chars" in it } &&
-                !(headerCtx.packageName == "$coreNs.str" && emitter.currentEnclosingFunctionName == "chars") -> {
-                ctx.registerCoreSubpkgImport("str", "chars")
-                "$atomicRecv.chars()"
-            }
-            (recvTyForStr == "Chars" || recvTyForStr?.endsWith(".Chars") == true) &&
-                !(headerCtx.packageName == "$coreNs.str.iter" && ctx.selfTypeName == "Chars") &&
-                args.isEmpty() ->
-                when (rawMethod) {
-                    "next" -> "$atomicRecv.next()"
-                    "as_str" -> "$atomicRecv.asStr()"
-                    "clone" -> "$atomicRecv.clone()"
-                    "enumerate" -> "$atomicRecv.enumerate()"
-                    else -> null
-                }
-            rawMethod == "to_digit" &&
-                args.size == 1 &&
-                (recvTyForStr == "Char" || (emitter.unwrapParenOrGroupExpr(ctx.expr.receiver) as? Expr.Lit)?.lit is Lit.Char) &&
-                !(headerCtx.packageName == "$coreNs.char.methods" && emitter.currentEnclosingFunctionName == "toDigit") -> {
-                ctx.registerCoreSubpkgImport("char.methods", "toDigit")
-                val radixArg = emitter.coerceNumericArgIfNeeded(ctx.allMethodArgs[0], args[0], NumericKind.U32, ctx.selfTypeName)
-                "$atomicRecv.toDigit($radixArg)"
-            }
-            else -> null
-        }
-    }
-}
-
 private object ConcreteNumericDispatchMethodRule : MethodLoweringRule() {
     override fun tryRender(ctx: MethodCallLoweringContext): String? =
         ctx.emitter.renderConcreteNumericMethodCall(
@@ -1045,10 +1062,14 @@ private object ConcreteNumericDispatchMethodRule : MethodLoweringRule() {
         )
 }
 
+private object DeclarativePostArgMethodRule : MethodLoweringRule() {
+    override fun tryRender(ctx: MethodCallLoweringContext): String? =
+        ctx.tryRenderDeclarativeMethodRules(activeRules().postArgMethodRulesByName, preArg = false)
+}
+
 private object FmtAndCollectionTransformRule : MethodLoweringRule() {
-    private val RAW_ABI_BYTE_OFFSET_METHODS =
-        wordSet("byte_offset byte_add byte_sub wrapping_byte_offset wrapping_byte_add wrapping_byte_sub")
-    private val FMT_WRITE_METHODS = wordSet("write_str write_char pad write_fmt")
+    private val RAW_ABI_BYTE_OFFSET_METHODS: Set<String>
+        get() = activeRules().words("rawAbiByteOffsetMethods")
 
     override fun tryRender(ctx: MethodCallLoweringContext): String? {
         if (ctx.rawMethod == "collect" && ctx.renderedValueArgs.isEmpty()) return tryRenderCollect(ctx)
@@ -1058,24 +1079,6 @@ private object FmtAndCollectionTransformRule : MethodLoweringRule() {
         val rawMethod = ctx.rawMethod
         val receiver = ctx.receiver
         val args = ctx.renderedValueArgs
-        if (rawMethod == "append_all" && args.size == 1) return "for (item in ${args[0]}) item.toTokens($receiver)"
-        if (rawMethod in FMT_WRITE_METHODS && args.size == 1 && emitter.isFmtStringBuilderReceiver(expr.receiver, receiver, ctx.selfTypeName)) {
-            return "$receiver.append(${args[0]})"
-        }
-        val isStringLitRecv = emitter.unwrapParenOrGroupExpr(expr.receiver).let { it is Expr.Lit && it.lit is Lit.Str }
-        if (rawMethod == "fmt" &&
-            args.size == 1 &&
-            (ctx.inferredRecvTy == "String" || isStringLitRecv) &&
-            emitter.isFmtStringBuilderReceiver(ctx.allMethodArgs[0], args[0], ctx.selfTypeName)
-        ) {
-            return "${args[0]}.append($receiver)"
-        }
-        if (rawMethod == "find" && args.size == 1) return "$receiver.indexOf(${args[0]}).takeIf { it >= 0 }"
-        if ((rawMethod == "position" || rawMethod == "rposition") && args.size == 1) {
-            val idxFn = if (rawMethod == "position") "indexOfFirst" else "indexOfLast"
-            return "${ctx.recvAtom}.$idxFn(${args[0]}).takeIf { it >= 0 }"
-        }
-        if (rawMethod == "enumerate" && args.isEmpty()) return "${ctx.recvAtom}.mapIndexed { index, item -> Pair(index, item) }"
         if (rawMethod == "take" && args.size == 1) {
             emitter.unwrapRepeatSourceArg(expr.receiver, ctx.indent, ctx.selfTypeName)?.let { repArg ->
                 return "List(${args[0]}) { ${emitter.renderExpr(repArg, ctx.indent, ctx.selfTypeName)} }"
@@ -1084,30 +1087,12 @@ private object FmtAndCollectionTransformRule : MethodLoweringRule() {
         if ((rawMethod == "push_str" || (rawMethod == "push" && !ctx.isVecReceiver)) && args.size == 1) {
             emitter.tryRenderStringAppendMethod(expr, receiver, args[0], ctx.selfTypeName)?.let { return it }
         }
-        if (rawMethod == "clear" && args.isEmpty()) {
-            if (ctx.refCellInnerType() == "String") return "${ctx.recvAtom}.value = \"\""
-            if (ctx.localOrInferredRecvTy == "String" && receiver.all { it.isLetterOrDigit() || it == '_' || it == '.' }) {
-                return "$receiver = \"\""
-            }
-        }
-        if (rawMethod == "extend_from_slice" && args.size == 1 &&
-            (ctx.isVecReceiver || ctx.localOrInferredRecvTy?.startsWith("MutableList<") == true)
-        ) {
-            return "$receiver.addAll(${args[0]})"
-        }
         if (rawMethod in RAW_ABI_BYTE_OFFSET_METHODS && args.size == 1 && emitter.headerContext.rawAbiMode) {
             val deltaSign = if (rawMethod.endsWith("sub")) "-" else "+"
             val deltaRecv = emitter.atomicRecvExpr(ctx.allMethodArgs[0], args[0])
             val deltaExpr = emitter.convertNumericReceiver(deltaRecv, "Long", emitter.inferExprNumericKind(ctx.allMethodArgs[0], ctx.selfTypeName))
             return "($receiver $deltaSign $deltaExpr)"
         }
-        if (rawMethod == "debug_struct" && args.size == 1 && "DebugStruct" !in emitter.inspector.declaredTypeNames) {
-            return "DebugStruct($receiver, ${args[0]})"
-        }
-        if (rawMethod == "debug_tuple" && args.size == 1 && "DebugTuple" !in emitter.inspector.declaredTypeNames) {
-            return "DebugTuple($receiver, ${args[0]})"
-        }
-        if (rawMethod == "push_back" && args.size == 1) return "$receiver.addLast(${args[0]})"
         return null
     }
 
@@ -1138,54 +1123,13 @@ private object FmtAndCollectionTransformRule : MethodLoweringRule() {
     }
 }
 
-private object ContainerMutationAndIndexingRule : MethodLoweringRule() {
+private object DefaultWitnessAndDequeMapMethodRule : MethodLoweringRule() {
     override fun tryRender(ctx: MethodCallLoweringContext): String? {
         val emitter = ctx.emitter
         val rawMethod = ctx.rawMethod
         val receiver = ctx.receiver
         val args = ctx.renderedValueArgs
         val noTypeArgs = ctx.typeArgs.isEmpty()
-        if (ctx.isVecReceiver && noTypeArgs) {
-            when {
-                rawMethod == "push" && args.size == 1 -> return "$receiver.add(${args[0]})"
-                rawMethod == "insert" && args.size == 2 -> return "$receiver.add(${args[0]}, ${args[1]})"
-                rawMethod == "clone_from" && args.size == 1 -> return "run { $receiver.clear(); $receiver.addAll(${args[0]}) }"
-                (rawMethod == "get" || rawMethod == "get_mut") &&
-                    args.size == 1 &&
-                    emitter.unwrapParenOrGroupExpr(ctx.allMethodArgs[0]) !is Expr.Range -> return ctx.renderIndexedGetOrNull(receiver)
-            }
-        }
-        val recvCollectionTy = emitter.currentTypedLocals[receiver] ?: emitter.inferExprRenderedType(ctx.expr.receiver, ctx.selfTypeName)
-        if (isMapRenderedType(recvCollectionTy) && noTypeArgs) {
-            val recvAtom = ctx.recvAtom
-            when {
-                rawMethod == "insert" && args.size == 2 -> return "$recvAtom.put(${args[0]}, ${args[1]})"
-                rawMethod == "clone" && args.isEmpty() -> return "$recvAtom.toMutableMap()"
-                (rawMethod == "get" || rawMethod == "get_mut") && args.size == 1 -> return "$recvAtom.get(${args[0]})"
-            }
-        }
-        if ((rawMethod == "get" || rawMethod == "get_mut") &&
-            args.size == 1 &&
-            noTypeArgs &&
-            emitter.unwrapParenOrGroupExpr(ctx.allMethodArgs[0]) !is Expr.Range &&
-            isIndexedSliceOrArrayRenderedType(recvCollectionTy)
-        ) {
-            return ctx.renderIndexedGetOrNull(ctx.recvAtom)
-        }
-        if (isSetRenderedType(recvCollectionTy) && noTypeArgs) {
-            val recvAtom = ctx.recvAtom
-            when {
-                rawMethod == "insert" && (args.size == 1 || (args.size == 2 && args[1] == "Unit")) -> return "$recvAtom.add(${args[0]})"
-                rawMethod == "clone" && args.isEmpty() -> return "$recvAtom.toMutableSet()"
-            }
-        }
-        if (rawMethod == "clone_from" &&
-            args.size == 1 &&
-            noTypeArgs &&
-            (ctx.expr.receiver is Expr.Field || receiver in emitter.currentNullableLocals)
-        ) {
-            return "$receiver = ${args[0]}"
-        }
         if ((rawMethod == "push" || rawMethod == "extend") && !ctx.isVecReceiver && args.size == 1 && noTypeArgs) {
             val defaultWitness =
                 emitter.currentTypeParamWitnessCalls.entries
@@ -1204,102 +1148,15 @@ private object ContainerMutationAndIndexingRule : MethodLoweringRule() {
     }
 }
 
-private object StringCaseAndSplitMethodRule : MethodLoweringRule() {
+private object UncheckedShiftAndUnconstrainedCmpRule : MethodLoweringRule() {
     override fun tryRender(ctx: MethodCallLoweringContext): String? {
-        if (ctx.typeArgs.isNotEmpty()) return null
-        val emitter = ctx.emitter
-        val rawMethod = ctx.rawMethod
-        val receiver = ctx.receiver
-        val args = ctx.renderedValueArgs
-        val atomicRecv = ctx.recvAtom
-        if ((rawMethod == "strip_prefix" || rawMethod == "strip_suffix") && args.size == 1) {
-            val recvTy = ctx.inferredRecvTy
-            if (recvTy == null || recvTy == "String") {
-                val pred = if (rawMethod == "strip_prefix") "startsWith" else "endsWith"
-                val rem = if (rawMethod == "strip_prefix") "removePrefix" else "removeSuffix"
-                return "$atomicRecv.takeIf { it.$pred(${args[0]}) }?.$rem(${args[0]})"
-            }
-        }
-        if ((rawMethod == "split_once" || rawMethod == "rsplit_once") && args.size == 1) {
-            val recvTy = ctx.localOrInferredRecvTy
-            val refInner = ctx.refCellInnerType()
-            if (recvTy == null || recvTy == "String" || recvTy == "CharSequence" || refInner == "String") {
-                val strExpr = if (refInner == "String") "$atomicRecv.value" else atomicRecv
-                val findFn = if (rawMethod == "split_once") "indexOf" else "lastIndexOf"
-                val argExpr = ctx.allMethodArgs[0]
-                val argTy = emitter.inferExprRenderedType(argExpr, ctx.selfTypeName)?.removeSuffix("?")?.trim()
-                val isCharPat = (emitter.unwrapParenOrGroupExpr(argExpr) as? Expr.Lit)?.lit is Lit.Char || argTy == "Char" || argTy == "RustChar"
-                return if (isCharPat) {
-                    val charVal = if (argTy == "RustChar") "(${args[0]}).toInt().toChar()" else args[0]
-                    "$strExpr.let { s -> val idx = s.$findFn($charVal); if (idx < 0) null else Pair(s.substring(0, idx), s.substring(idx + 1)) }"
-                } else {
-                    "$strExpr.let { s -> val d = ${args[0]}; val idx = s.$findFn(d); if (idx < 0) null else Pair(s.substring(0, idx), s.substring(idx + d.length)) }"
-                }
-            }
-        }
-        val instanceMethods = emitter.inspector.instanceMethodsByType.values
-        if ((rawMethod == "to_lowercase" || rawMethod == "to_uppercase") && args.isEmpty()) {
-            val recvTy = ctx.localOrInferredRecvTy
-            val ktFn = if (rawMethod == "to_lowercase") "lowercase" else "uppercase"
-            if (ctx.refCellInnerType() == "String") return "$atomicRecv.value.$ktFn()"
-            val ktMethodIdent = rustFunctionIdentToKotlin(rawMethod)
-            if (recvTy == "String" || recvTy == "CharSequence" || (recvTy == null && instanceMethods.none { ktMethodIdent in it })) {
-                return "$atomicRecv.$ktFn()"
-            }
-        }
-        if (rawMethod == "filter_map" && args.size == 1 && instanceMethods.none { "filterMap" in it }) {
-            return "$atomicRecv.mapNotNull(${emitter.wrapMapCallbackArg(ctx.allMethodArgs[0], args[0])})"
-        }
-        val inferredMethodRecvTy = ctx.inferredRecvTy
-        if (rawMethod == "to_vec" && args.isEmpty()) {
-            val unwrappedRecvExpr = emitter.unwrapTransparentCastExpr(ctx.expr.receiver)
-            val isRangeSliceExpr = unwrappedRecvExpr is Expr.Index && unwrappedRecvExpr.index is Expr.Range
-            val isListOrByteSlice =
-                inferredMethodRecvTy?.startsWith("List<") == true ||
-                    inferredMethodRecvTy?.startsWith("MutableList<") == true ||
-                    inferredMethodRecvTy?.startsWith("ArrayList<") == true ||
-                    isRangeSliceExpr ||
-                    receiver.endsWith(".toBytes()") ||
-                    receiver.endsWith(".asBytes()") ||
-                    receiver.endsWith(".asSlice()")
-            if (isListOrByteSlice) return "$atomicRecv.toMutableList()"
-        }
-        if ((rawMethod == "as_slice" || rawMethod == "size_hint") &&
-            args.isEmpty() &&
-            (receiver in emitter.currentDequeLocals || ctx.isDequeIterReceiver || inferredMethodRecvTy?.startsWith("ArrayDeque<") == true)
-        ) {
-            return if (rawMethod == "as_slice") "$atomicRecv.toList()" else "run { val n = $atomicRecv.size; Pair(n, n) }"
-        }
-        return null
-    }
-}
-
-private object AnyReflectionAndUncheckedShiftRule : MethodLoweringRule() {
-    override fun tryRender(ctx: MethodCallLoweringContext): String? {
+        if (ctx.typeArgs.isNotEmpty() || ctx.renderedValueArgs.size != 1) return null
         val emitter = ctx.emitter
         val rawMethod = ctx.rawMethod
         val args = ctx.renderedValueArgs
-        val inferredMethodRecvTy = ctx.inferredRecvTy
-        if (inferredMethodRecvTy == "RustAny" && args.isEmpty() && ctx.typeArgs.isNotEmpty()) {
-            val atomicRecv = ctx.recvAtom
-            when (rawMethod) {
-                "is" -> return "$atomicRecv.isType${ctx.typeArgs}()"
-                "downcast_ref" -> return "$atomicRecv.downcastRef${ctx.typeArgs}()"
-                "downcast_mut" -> return "$atomicRecv.downcastMut${ctx.typeArgs}()"
-                "downcast" -> return "$atomicRecv.downcast${ctx.typeArgs}()"
-            }
-        }
-        if (ctx.typeArgs.isNotEmpty()) return null
-        if (rawMethod == "type_id" &&
-            args.isEmpty() &&
-            "TypeId" !in emitter.inspector.declaredTypeNames &&
-            "Any" !in emitter.inspector.declaredTraitsByName
-        ) {
-            return if (inferredMethodRecvTy == "RustAny") "${ctx.recvAtom}.typeId" else "RustAny.from(${ctx.receiver}).typeId"
-        }
         val cleanRecvForCmp =
-            inferredMethodRecvTy ?: emitter.inferExprRenderedType(ctx.effectiveReceiverExpr, ctx.selfTypeName)?.removeSuffix("?")?.trim()
-        if ((rawMethod == "unchecked_shl" || rawMethod == "unchecked_shr") && args.size == 1) {
+            ctx.inferredRecvTy ?: emitter.inferExprRenderedType(ctx.effectiveReceiverExpr, ctx.selfTypeName)?.removeSuffix("?")?.trim()
+        if (rawMethod == "unchecked_shl" || rawMethod == "unchecked_shr") {
             val intKind =
                 ctx.recvNumericKindForMethod
                     ?: cleanRecvForCmp?.let(emitter::resolveNumericKind)
@@ -1324,10 +1181,7 @@ private object AnyReflectionAndUncheckedShiftRule : MethodLoweringRule() {
                 }
             }
         }
-        if (args.size == 1) {
-            emitter.tryRenderUnconstrainedCmpLowering(rawMethod, cleanRecvForCmp, ctx.receiver, args[0])?.let { return it }
-        }
-        return null
+        return emitter.tryRenderUnconstrainedCmpLowering(rawMethod, cleanRecvForCmp, ctx.receiver, args[0])
     }
 }
 
@@ -1343,23 +1197,9 @@ private object ErasedOptionCombinatorMethodRule : MethodLoweringRule() {
         }
         val rawMethod = ctx.rawMethod
         val args = ctx.renderedValueArgs
-        if (rawMethod == "take" &&
-            args.isEmpty() &&
-            receiver.all { it.isLetterOrDigit() || it == '_' || it == '.' } &&
-            (ctx.expr.receiver is Expr.Field || (ctx.expr.receiver is Expr.Path && receiver != "cell"))
-        ) {
-            return "$receiver.also { $receiver = null }"
-        }
         val atomicRecv = ctx.recvAtom
         return when {
-            rawMethod == "unwrap" && args.isEmpty() -> "$atomicRecv!!"
-            rawMethod == "expect" && args.size == 1 -> "($receiver ?: error(${args[0]}))"
-            (rawMethod == "clone" || rawMethod == "cloned" || rawMethod == "copied") && args.isEmpty() -> receiver
             (rawMethod == "ok_or" || rawMethod == "ok_or_else") && args.size == 1 -> renderOkOr(ctx)
-            rawMethod == "into_iter" && args.isEmpty() -> "ArrayDeque(listOfNotNull($receiver))"
-            rawMethod == "flatten" && args.isEmpty() -> receiver
-            (rawMethod == "map" || rawMethod == "and_then") && args.size == 1 ->
-                "$atomicRecv?.let(${emitter.wrapMapCallbackArg(ctx.allMethodArgs[0], args[0])})"
             rawMethod == "map_or" && args.size == 2 -> {
                 val callback = emitter.wrapMapCallbackArg(ctx.allMethodArgs[1], args[1])
                 val defaultExpr = ctx.allMethodArgs[0]
@@ -1373,8 +1213,6 @@ private object ErasedOptionCombinatorMethodRule : MethodLoweringRule() {
                     runtimeIfExpr = { recvTmp, defTmp -> "if ($recvTmp != null) $recvTmp.let($callback) else $defTmp" },
                 )
             }
-            rawMethod == "map_or_else" && args.size == 2 ->
-                "($atomicRecv?.let(${emitter.wrapMapCallbackArg(ctx.allMethodArgs[1], args[1])}) ?: ${emitter.unwrapZeroArgClosureText(args[0])})"
             (rawMethod == "or_else" || rawMethod == "unwrap_or_else") && args.size == 1 -> {
                 val renderedClosure = renderWithOptionElemKind(ctx, ctx.allMethodArgs[0], args[0], asTypedInitializer = false)
                 "($receiver ?: ${emitter.unwrapZeroArgClosureText(renderedClosure)})"
@@ -1515,20 +1353,23 @@ private object NullAccumulatorFoldMethodRule : MethodLoweringRule() {
 private val POST_ARG_METHOD_RULES: List<MethodLoweringRule> =
     listOf(
         PostArgArithmeticAndHashRule,
-        CoreStrAndCharMethodRule,
         ConcreteNumericDispatchMethodRule,
         FmtAndCollectionTransformRule,
-        ContainerMutationAndIndexingRule,
-        StringCaseAndSplitMethodRule,
-        AnyReflectionAndUncheckedShiftRule,
+        DeclarativePostArgMethodRule,
+        DefaultWitnessAndDequeMapMethodRule,
+        UncheckedShiftAndUnconstrainedCmpRule,
         ErasedOptionCombinatorMethodRule,
         NullAccumulatorFoldMethodRule,
     )
 
-private val CORE_SLICE_OR_PTR_METHODS = wordSet("asPtr asMutPtr chunksMut chunks")
-private val NON_SLICE_CORE_OWNER_TYPES = wordSet("MaybeUninit ConstPtr MutPtr AddressableLocal AddressableArrayLocal")
-private val PEEK_MACRO_METHODS = wordSet("peek peek2 peek3")
-private val CALLBACK_WRAP_METHODS = wordSet("map map_err and_then or_else")
+private val CORE_SLICE_OR_PTR_METHODS: Set<String>
+    get() = activeRules().words("coreSliceOrPtrMethods")
+private val NON_SLICE_CORE_OWNER_TYPES: Set<String>
+    get() = activeRules().words("nonSliceCoreOwnerTypes")
+private val PEEK_MACRO_METHODS: Set<String>
+    get() = activeRules().words("peekMacroMethods")
+private val CALLBACK_WRAP_METHODS: Set<String>
+    get() = activeRules().words("callbackWrapMethods")
 
 private fun MethodCallLoweringContext.renderStandardMethodCall(): String {
     val adjustedRenderedValueArgs =
@@ -1883,9 +1724,6 @@ private fun KotlinJ2KEmitter.renderCopyFromSliceCall(
     return null
 }
 
-private val UNCONSTRAINED_CMP_METHODS: Set<String> =
-    wordSet("partial_cmp partialCmp cmp lt le gt ge __chaining_less chainingLess __chaining_greater chainingGreater")
-
 internal fun KotlinJ2KEmitter.tryRenderUnconstrainedCmpLowering(
     rawMethod: String,
     cleanRecvTy: String?,
@@ -1893,6 +1731,7 @@ internal fun KotlinJ2KEmitter.tryRenderUnconstrainedCmpLowering(
     argRendered: String,
     allowWhenRecvUninferred: Boolean = false,
 ): String? {
+    val rule = activeRules().unconstrainedCmpRulesByName[rawMethod] ?: return null
     val recvBase = cleanRecvTy?.simpleKotlinTypeName()
     val coreNs = CoreIntrinsicLowering.resolveCoreNamespace(headerContext)
     val isCoreRuntimeActive =
@@ -1900,7 +1739,6 @@ internal fun KotlinJ2KEmitter.tryRenderUnconstrainedCmpLowering(
             headerContext.packageName == coreNs ||
             headerContext.packageName?.startsWith("$coreNs.") == true
     if (!isCoreRuntimeActive ||
-        rawMethod !in UNCONSTRAINED_CMP_METHODS ||
         "PartialOrd" in inspector.declaredTypeNames ||
         "Ord" in inspector.declaredTypeNames
     ) {
@@ -1912,34 +1750,19 @@ internal fun KotlinJ2KEmitter.tryRenderUnconstrainedCmpLowering(
             (allowWhenRecvUninferred && cleanRecvTy == null)
     if (!isEligibleRecv) return null
 
-    return when (rawMethod) {
-        "partial_cmp", "partialCmp" -> {
-            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.kmPartialCompareValues")
-            val ordRef = bindOrQualifyResolvedCrossSymbol("$coreNs.cmp.Ordering")
-            "kmPartialCompareValues($recvRendered, $argRendered)?.let { cmpSign -> when { cmpSign < 0 -> $ordRef.Less; cmpSign > 0 -> $ordRef.Greater; else -> $ordRef.Equal } }"
+    var cachedOrdRef: String? = null
+    var cachedCfRef: String? = null
+    return rule.action.render(
+        rawAbi = headerContext.rawAbiMode,
+        onImport = { CoreIntrinsicLowering.registerCoreImport(this, it) },
+    ) { key ->
+        when (key) {
+            "coreNs" -> coreNs
+            "recv" -> recvRendered
+            "arg0" -> argRendered
+            "ordRef" -> cachedOrdRef ?: bindOrQualifyResolvedCrossSymbol("$coreNs.cmp.Ordering").also { cachedOrdRef = it }
+            "cfRef" -> cachedCfRef ?: bindOrQualifyResolvedCrossSymbol("$coreNs.ops.controlflow.ControlFlow").also { cachedCfRef = it }
+            else -> null
         }
-        "cmp" -> {
-            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.kmCompareValues")
-            val ordRef = bindOrQualifyResolvedCrossSymbol("$coreNs.cmp.Ordering")
-            "kmCompareValues($recvRendered, $argRendered).let { cmpSign -> when { cmpSign < 0 -> $ordRef.Less; cmpSign > 0 -> $ordRef.Greater; else -> $ordRef.Equal } }"
-        }
-        "lt", "le", "gt", "ge" -> {
-            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.kmPartialCompareValues")
-            val cmpOp =
-                when (rawMethod) {
-                    "lt" -> "< 0"
-                    "le" -> "<= 0"
-                    "gt" -> "> 0"
-                    else -> ">= 0"
-                }
-            "(kmPartialCompareValues($recvRendered, $argRendered)?.let { cmpSign -> cmpSign $cmpOp } == true)"
-        }
-        "__chaining_less", "chainingLess", "__chaining_greater", "chainingGreater" -> {
-            CoreIntrinsicLowering.registerCoreImport(this, "$coreNs.mem.kmPartialCompareValues")
-            val cfRef = bindOrQualifyResolvedCrossSymbol("$coreNs.ops.controlflow.ControlFlow")
-            val cmpOp = if (rawMethod == "__chaining_less" || rawMethod == "chainingLess") "< 0" else "> 0"
-            "kmPartialCompareValues($recvRendered, $argRendered).let { cmpSign -> if (cmpSign == 0) $cfRef.Continue<Boolean, Unit>(Unit) else $cfRef.Break<Boolean, Unit>(cmpSign != null && cmpSign $cmpOp) }"
-        }
-        else -> null
     }
 }

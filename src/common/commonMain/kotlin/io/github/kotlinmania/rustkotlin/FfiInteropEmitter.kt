@@ -213,34 +213,44 @@ private data class TargetCWidthProfile(
     }
 }
 
-internal val C_ABI_BRIDGE_DESCRIPTORS: Map<CAbiBridgeKind, CAbiBridgeDescriptor> =
-    mapOf(
-        CAbiBridgeKind.VOID to CAbiBridgeDescriptor("void", "", wasmWasiScalarType = "Unit", wasmJsType = "Unit", jniKotlinType = "Unit", jniCType = "void", kotlinScalarType = "Unit"),
-        CAbiBridgeKind.NEVER to CAbiBridgeDescriptor("void", "", wasmWasiScalarType = "Unit", wasmJsType = "Unit", jniKotlinType = "Unit", jniCType = "void", kotlinScalarType = "Unit"),
-        CAbiBridgeKind.BOOL to CAbiBridgeDescriptor("bool", "false", wasmWasiScalarType = "Int", wasmJsType = "Boolean", jniKotlinType = "Boolean", jniCType = "jboolean", kotlinScalarType = "Boolean"),
-        CAbiBridgeKind.I8 to CAbiBridgeDescriptor("int8_t", "-1", NumericKind.I8, "toByte", "Int", "Int", "Byte", "jbyte", "Byte"),
-        CAbiBridgeKind.U8 to CAbiBridgeDescriptor("uint8_t", "0", NumericKind.U8, "toUByte", "Int", "Int", "Byte", "jbyte", "UByte"),
-        CAbiBridgeKind.I16 to CAbiBridgeDescriptor("int16_t", "-1", NumericKind.I16, "toShort", "Int", "Int", "Short", "jshort", "Short"),
-        CAbiBridgeKind.U16 to CAbiBridgeDescriptor("uint16_t", "0", NumericKind.U16, "toUShort", "Int", "Int", "Short", "jshort", "UShort"),
-        CAbiBridgeKind.I32 to CAbiBridgeDescriptor("int32_t", "-1", NumericKind.I32, null, "Int", "Int", "Int", "jint", "Int"),
-        CAbiBridgeKind.U32 to CAbiBridgeDescriptor("uint32_t", "0", NumericKind.U32, "toUInt", "Int", "Int", "Int", "jint", "UInt"),
-        CAbiBridgeKind.I64 to CAbiBridgeDescriptor("int64_t", "-1", NumericKind.I64, null, "Long", null, "Long", "jlong", "Long"),
-        CAbiBridgeKind.U64 to CAbiBridgeDescriptor("uint64_t", "0", NumericKind.U64, "toULong", "Long", null, "Long", "jlong", "ULong"),
-        CAbiBridgeKind.F32 to CAbiBridgeDescriptor("float", "0.0f", NumericKind.F32, null, "Float", "Double", "Float", "jfloat", "Float"),
-        CAbiBridgeKind.F64 to CAbiBridgeDescriptor("double", "0.0", NumericKind.F64, null, "Double", "Double", "Double", "jdouble", "Double"),
-        CAbiBridgeKind.CONST_CSTR to CAbiBridgeDescriptor("const char*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
-        CAbiBridgeKind.MUT_CSTR to CAbiBridgeDescriptor("char*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
-        CAbiBridgeKind.OPAQUE_PTR to CAbiBridgeDescriptor("void*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
-        CAbiBridgeKind.FILE_PTR to CAbiBridgeDescriptor("void*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
-        CAbiBridgeKind.DIR_PTR to CAbiBridgeDescriptor("void*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
-        CAbiBridgeKind.CALLBACK_PTR to CAbiBridgeDescriptor("void*", "NULL", jniKotlinType = "Long", jniCType = "jlong", isPointerAddress = true),
-        CAbiBridgeKind.BY_VALUE_OBJECT to CAbiBridgeDescriptor("void*", "NULL", wasmJsType = "Unit", jniKotlinType = "Long", jniCType = "jlong"),
-    )
+private class CAbiBridgeTables(
+    val byKind: Map<CAbiBridgeKind, CAbiBridgeDescriptor>,
+    val numericToBridge: Map<NumericKind, CAbiBridgeKind>,
+)
 
-private val NUMERIC_KIND_TO_BRIDGE_KIND: Map<NumericKind, CAbiBridgeKind> =
-    C_ABI_BRIDGE_DESCRIPTORS.entries
-        .mapNotNull { (kind, desc) -> desc.numericKind?.let { it to kind } }
-        .toMap()
+private val C_ABI_BRIDGE_TABLES_MEMO =
+    RegistryMemo { reg ->
+        val byKind =
+            reg.mappings("cAbiBridgeDescriptors").associate { node ->
+                val kind = CAbiBridgeKind.valueOf(node.string("kind"))
+                kind to
+                    CAbiBridgeDescriptor(
+                        cType = node.string("cType"),
+                        cFailureLiteral = node.string("cFailureLiteral"),
+                        numericKind = node.optionalString("numericKind")?.let(NumericKind::valueOf),
+                        defaultReturnConv = node.optionalString("defaultReturnConv"),
+                        wasmWasiScalarType = node.optionalString("wasmWasiScalarType"),
+                        wasmJsType = node.optionalString("wasmJsType"),
+                        jniKotlinType = node.string("jniKotlinType"),
+                        jniCType = node.string("jniCType"),
+                        kotlinScalarType = node.optionalString("kotlinScalarType"),
+                        isPointerAddress = node.bool("isPointerAddress"),
+                    )
+            }
+        CAbiBridgeTables(
+            byKind = byKind,
+            numericToBridge =
+                byKind.entries
+                    .mapNotNull { (kind, desc) -> desc.numericKind?.let { it to kind } }
+                    .toMap(),
+        )
+    }
+
+internal val C_ABI_BRIDGE_DESCRIPTORS: Map<CAbiBridgeKind, CAbiBridgeDescriptor>
+    get() = C_ABI_BRIDGE_TABLES_MEMO.get().byKind
+
+private val NUMERIC_KIND_TO_BRIDGE_KIND: Map<NumericKind, CAbiBridgeKind>
+    get() = C_ABI_BRIDGE_TABLES_MEMO.get().numericToBridge
 
 internal fun bridgeDescriptorFor(kind: CAbiBridgeKind): CAbiBridgeDescriptor =
     C_ABI_BRIDGE_DESCRIPTORS.getValue(kind)
@@ -814,7 +824,7 @@ internal class FfiInteropCollector(
         if (fn.returnBridgeKind == CAbiBridgeKind.CALLBACK_PTR || fn.params.any { it.bridgeKind == CAbiBridgeKind.CALLBACK_PTR }) {
             return false
         }
-        return preambles.any { containsWholeIdentifier(it, fn.cSymbolName) } || isDirectCallSafeSymbol(fn)
+        return preambles.any { CHostPreambleTokenScanner(it).containsCIdentifier(fn.cSymbolName) } || isDirectCallSafeSymbol(fn)
     }
 
     internal fun finalizeActualsKotlinFile(
@@ -1311,8 +1321,8 @@ private fun extractImportLocalName(imp: String): String {
     return if (aliasSep > 0) imp.substring(aliasSep + 4).trim() else imp.substringAfterLast('.')
 }
 
-internal val UMBRELLA_LINK_LIBRARIES =
-    wordSet("c m dl pthread rt System gcc gcc_s stdc++ c++ msvcrt ucrtbase libcmt legacy_stdio_definitions")
+internal val UMBRELLA_LINK_LIBRARIES: Set<String>
+    get() = activeRules().words("umbrellaLinkLibraries")
 
 internal fun extractLinkLibraryNamesFromLinkArgs(
     tokens: TokenStream,
@@ -1404,19 +1414,12 @@ internal fun cFailureReturnExpr(
 }
 
 internal fun extractHeaderCommentsFromSource(source: String, out: MutableSet<String>) {
-    for (line in source.lineSequence()) {
-        val trimmed = line.trimStart()
-        if (!trimmed.startsWith("//")) continue
-        var idx = 2
-        while (idx < trimmed.length && (trimmed[idx] == '!' || trimmed[idx] == '/' || trimmed[idx] == '*' || trimmed[idx].isWhitespace())) {
-            idx++
-        }
-        if (!trimmed.regionMatches(idx, "Header:", 0, 7)) continue
-        idx += 7
-        while (idx < trimmed.length && (trimmed[idx].isWhitespace() || trimmed[idx] == '`')) idx++
-        val start = idx
-        while (idx < trimmed.length && !trimmed[idx].isWhitespace() && trimmed[idx] != '`' && trimmed[idx] != '*') idx++
-        val hdr = trimmed.substring(start, idx).trim()
+    for (tok in KotlinSourceTokenizer.tokenize(source)) {
+        if (tok !is KotlinLexToken.LineComment) continue
+        val body = tok.rawText.drop(2).trimStart { it == '!' || it == '/' || it == '*' || it.isWhitespace() }
+        if (!body.startsWith("Header:")) continue
+        val rest = body.removePrefix("Header:").trimStart { it.isWhitespace() || it == '`' }
+        val hdr = rest.takeWhile { !it.isWhitespace() && it != '`' && it != '*' }
         if (hdr.endsWith(".h") || hdr.endsWith(".hpp")) out += hdr
     }
 }
@@ -1424,9 +1427,19 @@ internal fun extractHeaderCommentsFromSource(source: String, out: MutableSet<Str
 private val CPP_STDLIB_INCLUDE_HEADERS = setOf("iostream", "vector", "string")
 private val CPP_CAST_KEYWORDS = setOf("reinterpret_cast", "static_cast")
 
-private class CHostPreambleTokenScanner(
+internal class CHostPreambleTokenScanner(
     source: String,
 ) : KotlinTokenWalker(source) {
+    fun collectCIdentifiers(): Set<String> {
+        val out = HashSet<String>(maxOf(8, tokens.size / 4))
+        collectCodeIdentifiers(0, tokens.size, out)
+        return out
+    }
+
+    fun containsCIdentifier(ident: String): Boolean {
+        if (ident.isEmpty()) return false
+        return tokens.any { it.interpolationDepth == 0 && it is KotlinLexToken.Ident && it.rawText == ident }
+    }
     fun collectIncludedHeaders(out: MutableSet<String>) {
         var idx = 0
         while (idx < tokens.size) {
@@ -1589,20 +1602,8 @@ internal fun sanitizeCParamIdentifier(raw: String, index: Int): String {
     return if (clean in C_RESERVED_PARAM_NAMES) "arg${index}${toPascalCaseIdentifierPart(clean)}" else clean
 }
 
-private val C_RESERVED_PARAM_NAMES: Set<String> =
-    wordSet(
-        "auto break case char const continue default do double else enum extern float for goto if",
-        "inline int long register restrict return short signed sizeof static struct switch typedef union",
-        "unsigned void volatile while class namespace template typename public private protected virtual operator",
-        "new delete this friend using try catch throw bool true false alignas alignof constexpr decltype",
-        "noexcept nullptr static_assert thread_local typeid dynamic_cast static_cast reinterpret_cast const_cast",
-        "explicit mutable export wchar_t char8_t char16_t char32_t concept requires co_await co_return co_yield",
-        "and or not xor bitand bitor compl and_eq or_eq xor_eq not_eq near far huge pascal cdecl stdcall fastcall",
-        "interface small hyper environ errno stdin stdout stderr stat time read write open close accept bind",
-        "connect listen recv send socket select poll fork pipe dup dup2 link unlink chmod chown",
-        "lseek mkdir rmdir rename remove system abort exit free malloc calloc realloc div abs labs llabs",
-        "sin cos tan exp log pow sqrt ceil floor index rindex bcopy bzero bcmp",
-    )
+private val C_RESERVED_PARAM_NAMES: Set<String>
+    get() = activeRules().words("cReservedParamNames")
 
 internal fun jniMangleSegment(segment: String): String =
     buildString(segment.length + 4) {
@@ -1687,37 +1688,10 @@ internal fun escapeCString(raw: String): String =
     }
 
 internal fun conversionMethodForNumericKind(kind: NumericKind): String =
-    when (kind) {
-        NumericKind.I8 -> "toByte"
-        NumericKind.U8 -> "toUByte"
-        NumericKind.I16 -> "toShort"
-        NumericKind.U16 -> "toUShort"
-        NumericKind.I32 -> "toInt"
-        NumericKind.U32 -> "toUInt"
-        NumericKind.I64 -> "toLong"
-        NumericKind.U64 -> "toULong"
-        NumericKind.F16, NumericKind.F32 -> "toFloat"
-        NumericKind.F64, NumericKind.F128 -> "toDouble"
-        NumericKind.I128, NumericKind.U128 -> "toLong"
-    }
+    activeRules().numericKindKeyMap("numericConversionMethodByKind").getValue(kind)
 
 private fun defaultKotlinFallbackForNumericKind(numKind: NumericKind): String =
-    when (numKind) {
-        NumericKind.I8 -> "(-1).toByte()"
-        NumericKind.U8 -> "0u.toUByte()"
-        NumericKind.I16 -> "(-1).toShort()"
-        NumericKind.U16 -> "0u.toUShort()"
-        NumericKind.I32 -> "-1"
-        NumericKind.U32 -> "0u"
-        NumericKind.I64 -> "-1L"
-        NumericKind.U64 -> "0uL"
-        NumericKind.F16 -> "F16.ZERO"
-        NumericKind.F32 -> "0.0f"
-        NumericKind.F64 -> "0.0"
-        NumericKind.F128 -> "F128.ZERO"
-        NumericKind.I128 -> "I128.ZERO"
-        NumericKind.U128 -> "U128.ZERO"
-    }
+    activeRules().numericKindKeyMap("numericDefaultFallbackByKind").getValue(numKind)
 
 internal fun defaultKotlinFallbackForBridge(
     kind: CAbiBridgeKind,
@@ -1750,30 +1724,11 @@ internal fun defaultKotlinFallbackForBridge(
 internal fun extractIdentifierTokens(
     expr: String,
     includeBuiltins: Boolean = false,
-): Set<String> {
-    val out = linkedSetOf<String>()
-    for (token in KotlinSourceTokenizer.tokenize(expr)) {
-        val tok =
-            when (token) {
-                is KotlinLexToken.Ident -> token.rawText
-                is KotlinLexToken.BacktickIdent -> token.ident
-                is KotlinLexToken.StringIdentTemplate -> token.ident
-                else -> continue
-            }
-        if (tok.isNotEmpty() && !tok.first().isDigit() && (includeBuiltins || tok !in BUILTIN_KOTLIN_IDENTS)) {
-            out += tok
-        }
-    }
-    return out
-}
+): Set<String> =
+    KotlinTokenWalker(expr).collectFilteredIdentifiers(if (includeBuiltins) emptySet() else BUILTIN_KOTLIN_IDENTS)
 
-internal val BUILTIN_KOTLIN_IDENTS: Set<String> =
-    wordSet(
-        "null true false Unit Nothing Boolean Byte UByte Short UShort Int UInt Long ULong Float Double",
-        "String ZERO toByte toUByte toShort toUShort toInt toUInt toLong toULong toFloat toDouble",
-        "error emptyArray intArrayOf longArrayOf byteArrayOf shortArrayOf floatArrayOf doubleArrayOf",
-        "ubyteArrayOf ushortArrayOf uintArrayOf ulongArrayOf booleanArrayOf",
-    )
+internal val BUILTIN_KOTLIN_IDENTS: Set<String>
+    get() = activeRules().words("builtinKotlinIdents")
 
 /**
  * Token-cursor parser for `c!` / `cpp!` inline FFI blocks (`[mut x: T as "CType", ...] -> Ret as "CRet" { ... }`).

@@ -53,31 +53,11 @@ internal fun KotlinJ2KEmitter.isSelfParameterizedTraitName(ktTrait: String): Boo
         ktTrait in KNOWN_SELF_PARAMETERIZED_TRAITS
 }
 
-private val CORE_OPS_OUTPUT_ASSOC_TRAITS =
-    wordSet("Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr Neg Not")
+private val CORE_OPS_OUTPUT_ASSOC_TRAITS: Set<String>
+    get() = activeRules().words("coreOpsOutputAssocTraits")
 
-private val STDLIB_DEFAULTLESS_ASSOC_TYPES: Map<String, List<String>> =
-    mapOf(
-        "Iterator" to listOf("Item"),
-        "IntoIterator" to listOf("Item", "IntoIter"),
-        "Fn" to listOf("Output"),
-        "FnMut" to listOf("Output"),
-        "FnOnce" to listOf("Output"),
-        "Try" to listOf("Output", "Residual"),
-        "Deref" to listOf("Target"),
-        "SliceIndex" to listOf("Output"),
-        "Future" to listOf("Output"),
-        "IntoFuture" to listOf("Output", "IntoFuture"),
-        "FromStr" to listOf("Err"),
-        "TryFrom" to listOf("Error"),
-        "TryInto" to listOf("Error"),
-        "Pattern" to listOf("Searcher"),
-        "BuildHasher" to listOf("Hasher"),
-        "DoubleEndedIterator" to listOf("Item"),
-        "ExactSizeIterator" to listOf("Item"),
-        "FusedIterator" to listOf("Item"),
-        "AsyncIterator" to listOf("Item"),
-    )
+private val STDLIB_DEFAULTLESS_ASSOC_TYPES: Map<String, List<String>>
+    get() = activeRules().stdlibDefaultlessAssocTypes
 
 internal fun KotlinJ2KEmitter.lookupTraitDefaultlessAssocTypes(ktTrait: String, traitPath: Path? = null): List<String> {
     lookupScopedTraitMetadata(
@@ -112,12 +92,10 @@ internal fun KotlinJ2KEmitter.isFmtResultSynType(ty: SynType?): Boolean {
 /** Resolve two Result payload types, expanding 1-arg `io::Result<T>` and 0-arg `fmt::Result` aliases when applicable. */
 internal fun KotlinJ2KEmitter.resolveEnclosingResultTypeArguments(rendered: String?): Pair<String, String>? {
     rustResultTypeArguments(rendered)?.let { return it }
-    val type = rendered?.trim()?.removeSuffix("?")?.trim() ?: return null
-    val base = type.substringBefore('<').substringAfterLast('.').trim()
-    if (base != "Result" && base != "RustResult") return null
-    if ('<' in type && type.endsWith('>')) {
-        val singleOk = type.substringAfter('<').dropLast(1).trim()
-        if (singleOk.isEmpty()) return null
+    val parsed = rendered.asKotlinRenderedType() ?: return null
+    if (!parsed.matchesSimple("Result", "RustResult")) return null
+    val singleOk = parsed.singleTypeArg
+    if (singleOk != null) {
         val aliasTarget = inspector.typeAliasTargets["Result"]?.let { renderType(it, null) }
         val aliasPair = rustResultTypeArguments(aliasTarget)
         if (aliasPair != null) {
@@ -146,7 +124,7 @@ internal fun KotlinJ2KEmitter.resolveEnclosingResultTypeArguments(rendered: Stri
             }
         return singleOk to errName
     }
-    if (type == "Result") {
+    if (!parsed.hasTypeArgs && parsed.nonNullText == "Result") {
         val aliasTarget = inspector.typeAliasTargets["Result"]?.let { renderType(it, null) }
         rustResultTypeArguments(aliasTarget)?.let { return it }
         if ("Error" in importedSimpleNameToPkg || "Error" in inspector.declaredTypeNames) return "Unit" to "Error"
@@ -155,25 +133,15 @@ internal fun KotlinJ2KEmitter.resolveEnclosingResultTypeArguments(rendered: Stri
 }
 
 /** Keep both Rust alternatives and their independent payload types when tagged Result is active. */
-internal fun rustResultTypeArguments(rendered: String?): Pair<String, String>? {
-    val type = rendered?.trim() ?: return null
-    val base = type.substringBefore('<').substringAfterLast('.')
-    if ((base != "Result" && base != "RustResult") || !type.endsWith('>')) return null
-    val arguments = type.substringAfter('<').dropLast(1)
-    val comma = findTopLevelGenericCommaIndex(arguments)
-    if (comma < 0) return null
-    return arguments.substring(0, comma).trim() to arguments.substring(comma + 1).trim()
-}
+internal fun rustResultTypeArguments(rendered: String?): Pair<String, String>? =
+    rendered.asKotlinRenderedType()?.takeIf { !it.isNullable }?.pairArgsOf("Result", "RustResult")
 
-internal fun rustResultOkPayloadType(rendered: String?): String? {
-    val type = rendered?.trim() ?: return null
-    val base = type.substringBefore('<').substringAfterLast('.')
-    if ((base != "Result" && base != "RustResult") || !type.endsWith('>')) return null
-    val arguments = type.substringAfter('<').dropLast(1).trim()
-    if (arguments.isEmpty()) return null
-    val comma = findTopLevelGenericCommaIndex(arguments)
-    return if (comma < 0) arguments else arguments.substring(0, comma).trim()
-}
+internal fun rustResultOkPayloadType(rendered: String?): String? =
+    rendered
+        .asKotlinRenderedType()
+        ?.takeIf { !it.isNullable && it.matchesSimple("Result", "RustResult") }
+        ?.typeArgs
+        ?.firstOrNull()
 
 internal fun KotlinJ2KEmitter.usesTaggedCoreResult(): Boolean =
     hasDeclaredResultEnum() || "core" in headerContext.crateNamespaces
@@ -495,11 +463,7 @@ private fun KotlinJ2KEmitter.isSynthesizedDebugFinishCall(call: Expr.MethodCall,
         recv = unwrapParenOrGroupExpr(recv.receiver)
     }
     val recvTypeBase =
-        inferExprRenderedType(call.receiver, selfTypeName)
-            ?.removeSuffix("?")
-            ?.substringBefore('<')
-            ?.substringAfterLast('.')
-            ?.trim()
+        inferExprRenderedType(call.receiver, selfTypeName)?.simpleKotlinTypeName()
     return recvTypeBase in DEBUG_BUILDER_TYPES
 }
 

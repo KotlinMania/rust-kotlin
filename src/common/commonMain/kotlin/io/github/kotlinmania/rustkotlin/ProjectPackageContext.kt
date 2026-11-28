@@ -753,18 +753,294 @@ public fun ensureRustLangInGradleProperties(propsText: String): Pair<String, Str
     return propsText to null
 }
 
-private class TomlManifestEditor(
+/**
+ * Lossless lexical token hierarchy for TOML version-catalog manifests (`libs.versions.toml`).
+ *
+ * Replaces ad-hoc `Regex` line matching and raw `']' in line` slicing so inline `#` comments,
+ * quoted brackets, dotted keys (`version.ref`), and multiline bundle arrays are tokenized cleanly.
+ */
+internal sealed class TomlLexToken {
+    abstract val rawText: String
+    abstract val start: Int
+    abstract val end: Int
+
+    data class LBracket(
+        override val start: Int,
+        override val end: Int,
+        override val rawText: String = "[",
+    ) : TomlLexToken()
+
+    data class RBracket(
+        override val start: Int,
+        override val end: Int,
+        override val rawText: String = "]",
+    ) : TomlLexToken()
+
+    data class LBrace(
+        override val start: Int,
+        override val end: Int,
+        override val rawText: String = "{",
+    ) : TomlLexToken()
+
+    data class RBrace(
+        override val start: Int,
+        override val end: Int,
+        override val rawText: String = "}",
+    ) : TomlLexToken()
+
+    data class Equals(
+        override val start: Int,
+        override val end: Int,
+        override val rawText: String = "=",
+    ) : TomlLexToken()
+
+    data class Comma(
+        override val start: Int,
+        override val end: Int,
+        override val rawText: String = ",",
+    ) : TomlLexToken()
+
+    data class Dot(
+        override val start: Int,
+        override val end: Int,
+        override val rawText: String = ".",
+    ) : TomlLexToken()
+
+    data class BareKey(
+        override val rawText: String,
+        override val start: Int,
+        override val end: Int,
+    ) : TomlLexToken()
+
+    data class StringLit(
+        override val rawText: String,
+        val value: String,
+        override val start: Int,
+        override val end: Int,
+    ) : TomlLexToken()
+
+    data class Comment(
+        override val rawText: String,
+        override val start: Int,
+        override val end: Int,
+    ) : TomlLexToken()
+
+    data class Whitespace(
+        override val rawText: String,
+        override val start: Int,
+        override val end: Int,
+    ) : TomlLexToken()
+
+    data class Newline(
+        override val rawText: String,
+        override val start: Int,
+        override val end: Int,
+    ) : TomlLexToken()
+
+    data class Other(
+        override val rawText: String,
+        override val start: Int,
+        override val end: Int,
+    ) : TomlLexToken()
+}
+
+internal open class TomlTokenizer {
+    open fun tokenize(source: String): List<TomlLexToken> {
+        if (source.isEmpty()) return emptyList()
+        val out = ArrayList<TomlLexToken>(maxOf(8, source.length / 4))
+        var i = 0
+        val n = source.length
+        while (i < n) {
+            val ch = source[i]
+            when {
+                ch == '\n' -> {
+                    out += TomlLexToken.Newline("\n", i, i + 1)
+                    i++
+                }
+                ch == ' ' || ch == '\t' || ch == '\r' -> {
+                    var j = i + 1
+                    while (j < n && (source[j] == ' ' || source[j] == '\t' || source[j] == '\r')) j++
+                    out += TomlLexToken.Whitespace(source.substring(i, j), i, j)
+                    i = j
+                }
+                ch == '#' -> {
+                    var j = i + 1
+                    while (j < n && source[j] != '\n') j++
+                    out += TomlLexToken.Comment(source.substring(i, j), i, j)
+                    i = j
+                }
+                ch == '[' -> {
+                    out += TomlLexToken.LBracket(i, i + 1)
+                    i++
+                }
+                ch == ']' -> {
+                    out += TomlLexToken.RBracket(i, i + 1)
+                    i++
+                }
+                ch == '{' -> {
+                    out += TomlLexToken.LBrace(i, i + 1)
+                    i++
+                }
+                ch == '}' -> {
+                    out += TomlLexToken.RBrace(i, i + 1)
+                    i++
+                }
+                ch == '=' -> {
+                    out += TomlLexToken.Equals(i, i + 1)
+                    i++
+                }
+                ch == ',' -> {
+                    out += TomlLexToken.Comma(i, i + 1)
+                    i++
+                }
+                ch == '.' -> {
+                    out += TomlLexToken.Dot(i, i + 1)
+                    i++
+                }
+                ch == '"' || ch == '\'' -> {
+                    val quote = ch
+                    val sb = StringBuilder()
+                    var j = i + 1
+                    while (j < n && source[j] != quote && source[j] != '\n') {
+                        if (quote == '"' && source[j] == '\\' && j + 1 < n) {
+                            val esc = source[j + 1]
+                            sb.append(
+                                when (esc) {
+                                    'n' -> '\n'
+                                    't' -> '\t'
+                                    'r' -> '\r'
+                                    '\\' -> '\\'
+                                    '"' -> '"'
+                                    else -> esc
+                                },
+                            )
+                            j += 2
+                        } else {
+                            sb.append(source[j])
+                            j++
+                        }
+                    }
+                    if (j < n && source[j] == quote) j++
+                    out += TomlLexToken.StringLit(source.substring(i, j), sb.toString(), i, j)
+                    i = j
+                }
+                isTomlBareKeyChar(ch) -> {
+                    var j = i + 1
+                    while (j < n && isTomlBareKeyChar(source[j])) j++
+                    out += TomlLexToken.BareKey(source.substring(i, j), i, j)
+                    i = j
+                }
+                else -> {
+                    out += TomlLexToken.Other(ch.toString(), i, i + 1)
+                    i++
+                }
+            }
+        }
+        return out
+    }
+
+    fun analyzeLine(line: String): TomlTokenLineView = TomlTokenLineView(line, tokenize(line))
+
+    companion object Default : TomlTokenizer() {
+        private fun isTomlBareKeyChar(ch: Char): Boolean =
+            ch in 'A'..'Z' || ch in 'a'..'z' || ch in '0'..'9' || ch == '_' || ch == '-'
+    }
+}
+
+internal class TomlTokenLineView(
+    val sourceLine: String,
+    val tokens: List<TomlLexToken>,
+) {
+    private val significant: List<TomlLexToken> =
+        tokens.filterNot { it is TomlLexToken.Whitespace || it is TomlLexToken.Newline || it is TomlLexToken.Comment }
+
+    fun sectionHeaderName(): String? {
+        if (significant.size < 3) return null
+        if (significant.first() !is TomlLexToken.LBracket || significant.last() !is TomlLexToken.RBracket) return null
+        val middle = significant.subList(1, significant.size - 1)
+        val sb = StringBuilder()
+        for ((idx, tok) in middle.withIndex()) {
+            if (idx % 2 == 0) {
+                val key = tok as? TomlLexToken.BareKey ?: return null
+                sb.append(key.rawText)
+            } else {
+                if (tok !is TomlLexToken.Dot) return null
+                sb.append('.')
+            }
+        }
+        return sb.toString().takeIf { it.isNotEmpty() && !it.endsWith('.') }
+    }
+
+    fun assignmentKey(): String? {
+        val eqIdx = significant.indexOfFirst { it is TomlLexToken.Equals }
+        if (eqIdx <= 0) return null
+        val keyTokens = significant.subList(0, eqIdx)
+        val sb = StringBuilder()
+        for ((idx, tok) in keyTokens.withIndex()) {
+            when {
+                idx % 2 == 0 && tok is TomlLexToken.BareKey -> sb.append(tok.rawText)
+                idx % 2 == 0 && tok is TomlLexToken.StringLit -> sb.append(tok.value)
+                idx % 2 == 1 && tok is TomlLexToken.Dot -> sb.append('.')
+                else -> return null
+            }
+        }
+        return sb.toString().takeIf { it.isNotEmpty() }
+    }
+
+    fun hasOpenBracketAfterEquals(): Boolean {
+        val eqIdx = significant.indexOfFirst { it is TomlLexToken.Equals }
+        return eqIdx >= 0 && significant.drop(eqIdx + 1).any { it is TomlLexToken.LBracket }
+    }
+
+    fun lastCloseBracketToken(): TomlLexToken.RBracket? =
+        significant.filterIsInstance<TomlLexToken.RBracket>().lastOrNull()
+
+    fun containsStringValue(target: String): Boolean =
+        significant.any { it is TomlLexToken.StringLit && it.value == target }
+
+    fun inlineStringProperty(dottedProperty: String): String? {
+        val parts = dottedProperty.split('.')
+        if (parts.isEmpty()) return null
+        val expectedCount = parts.size * 2 - 1
+        for (i in 0..(significant.size - expectedCount - 2)) {
+            var matched = true
+            for (pIdx in parts.indices) {
+                val keyTok = significant[i + pIdx * 2]
+                if (keyTok !is TomlLexToken.BareKey || keyTok.rawText != parts[pIdx]) {
+                    matched = false
+                    break
+                }
+                if (pIdx + 1 < parts.size && significant[i + pIdx * 2 + 1] !is TomlLexToken.Dot) {
+                    matched = false
+                    break
+                }
+            }
+            if (!matched) continue
+            val eqTok = significant[i + expectedCount]
+            val valTok = significant[i + expectedCount + 1]
+            if (eqTok is TomlLexToken.Equals && valTok is TomlLexToken.StringLit) {
+                return valTok.value
+            }
+        }
+        return null
+    }
+}
+
+internal class TomlManifestEditor(
     private val rawText: String,
+    private val tokenizer: TomlTokenizer = TomlTokenizer,
 ) {
     private val hadTrailingNewline = rawText.endsWith('\n')
     val lines: MutableList<String> = rawText.trimEnd('\n').split('\n').toMutableList()
 
+    fun analyze(lineIndex: Int): TomlTokenLineView = tokenizer.analyzeLine(lines[lineIndex])
+
     fun findSectionBounds(sectionName: String): IntRange? {
         var start = -1
         for (i in lines.indices) {
-            val match = HEADER_REGEX.matchEntire(lines[i].trim()) ?: continue
+            val header = analyze(i).sectionHeaderName() ?: continue
             if (start < 0) {
-                if (match.groupValues[1] == sectionName) start = i
+                if (header == sectionName) start = i
             } else {
                 return start until i
             }
@@ -801,18 +1077,24 @@ private class TomlManifestEditor(
         val curBounds = findSectionBounds("bundles") ?: return false
         val startLine =
             ((curBounds.first + 1)..curBounds.last).firstOrNull { i ->
-                val trimmed = lines[i].trim()
-                !trimmed.startsWith("#") && '=' in trimmed && trimmed.substringBefore('=').trim() == bundleName
+                val view = analyze(i)
+                view.assignmentKey() == bundleName && view.hasOpenBracketAfterEquals()
             } ?: return false
         var endLine = startLine
-        while (endLine <= curBounds.last && ']' !in lines[endLine]) endLine++
-        if (endLine > curBounds.last) return false
-        val sliceText = (startLine..endLine).joinToString("\n") { lines[it] }
-        if (Regex(""""${Regex.escape(libKey)}"""").containsMatchIn(sliceText)) return true
+        var closeBracket: TomlLexToken.RBracket? = null
+        while (endLine <= curBounds.last) {
+            closeBracket = analyze(endLine).lastCloseBracketToken()
+            if (closeBracket != null) break
+            endLine++
+        }
+        if (endLine > curBounds.last || closeBracket == null) return false
+        if ((startLine..endLine).any { analyze(it).containsStringValue(libKey) }) return true
         if (startLine == endLine) {
-            val beforeClose = lines[startLine].substringBeforeLast(']').trimEnd()
+            val lineText = lines[startLine]
+            val beforeClose = lineText.substring(0, closeBracket.start).trimEnd()
+            val afterClose = lineText.substring(closeBracket.end)
             val sep = if (beforeClose.endsWith('[') || beforeClose.endsWith(',')) " " else ", "
-            lines[startLine] = """$beforeClose$sep"$libKey"]"""
+            lines[startLine] = """$beforeClose$sep"$libKey"]$afterClose"""
         } else {
             lines.add(endLine, """  "$libKey",""")
         }
@@ -822,11 +1104,6 @@ private class TomlManifestEditor(
     fun render(): String {
         val joined = lines.joinToString("\n")
         return if (hadTrailingNewline || rawText.isEmpty()) "$joined\n" else joined
-    }
-
-    companion object {
-        val HEADER_REGEX = Regex("""^\[([A-Za-z0-9_.-]+)]\s*$""")
-        val VERSION_REF_REGEX = Regex("""version\.ref\s*=\s*"([^"]+)"""")
     }
 }
 
@@ -840,11 +1117,19 @@ public fun ensureRustLangInLibsVersionsToml(
     var existingVerRef: String? = null
     editor.findSectionBounds("libraries")?.let { libBounds ->
         for (i in (libBounds.first + 1)..libBounds.last) {
-            val line = editor.lines[i].trim()
-            if (!line.startsWith("#") && "io.github.kotlinmania:rust-lang-kotlin" in line && '=' in line) {
-                existingLibKey = line.substringBefore('=').trim()
-                val verMatch = TomlManifestEditor.VERSION_REF_REGEX.find(line)
-                existingVerRef = verMatch?.groupValues?.get(1)
+            val view = editor.analyze(i)
+            val key = view.assignmentKey() ?: continue
+            val moduleVal = view.inlineStringProperty("module")
+            val containsRustLang =
+                moduleVal == "io.github.kotlinmania:rust-lang-kotlin" ||
+                    view.containsStringValue("io.github.kotlinmania:rust-lang-kotlin") ||
+                    view.tokens.any {
+                        it is TomlLexToken.StringLit &&
+                            it.value.startsWith("io.github.kotlinmania:rust-lang-kotlin:")
+                    }
+            if (containsRustLang) {
+                existingLibKey = key
+                existingVerRef = view.inlineStringProperty("version.ref")
                 break
             }
         }
@@ -854,9 +1139,7 @@ public fun ensureRustLangInLibsVersionsToml(
     val verBounds = if (versionKey == null) editor.findSectionBounds("versions") else null
     if (verBounds != null) {
         for (i in (verBounds.first + 1)..verBounds.last) {
-            val line = editor.lines[i].trim()
-            if (line.startsWith("#") || '=' !in line) continue
-            val k = line.substringBefore('=').trim()
+            val k = editor.analyze(i).assignmentKey() ?: continue
             if (k == "rustLang" || k == "rustLangKotlin") {
                 versionKey = k
                 break
@@ -880,11 +1163,11 @@ public fun ensureRustLangInLibsVersionsToml(
     val preferredBundle =
         commonMainBundleName?.trim()?.takeIf { it.isNotEmpty() }
             ?: ((bundleBounds.first + 1)..bundleBounds.last).firstNotNullOfOrNull { i ->
-                val trimmed = editor.lines[i].trim()
-                if (trimmed.startsWith("#") || '=' !in trimmed || '[' !in trimmed) {
+                val view = editor.analyze(i)
+                if (!view.hasOpenBracketAfterEquals()) {
                     null
                 } else {
-                    trimmed.substringBefore('=').trim().takeIf { it.endsWith("-commonMain") && it != "rust-lang-commonMain" }
+                    view.assignmentKey()?.takeIf { it.endsWith("-commonMain") && it != "rust-lang-commonMain" }
                 }
             }
 

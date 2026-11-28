@@ -1,0 +1,1064 @@
+# ==============================================================================
+# Declarative Rust Type-Path, Numeric Op & Method-Call Pattern/Replacement Rules
+# ==============================================================================
+# Authoritative declarative rules for:
+# - `TypeReferenceEmitter.kt`
+# - `ExpressionPrimitiveAndPointerOps.kt`
+# - `ExpressionMethodCallEmitter.kt`
+#
+# Template placeholders use `{0}`, `{1}`, `{last}`, `{args}`, `{rawName}`, `{coreNs}`,
+# `{recv}`, `{arg0}`, `{arg1}`, `{pointee}`, `{pointeeLayout}`, `{ptrCtor}`.
+# Literal braces inside Kotlin code templates are escaped as `{{` and `}}`.
+
+# Ordered pattern-match and template-replacement rules for stdlib generic types.
+# Rules are evaluated top-to-bottom; collection return/parameter types always target
+# Kotlin collection interfaces (`List`, `MutableMap`, `MutableSet`) per Swift Export invariant.
+stdlibGenericTypeRules:
+  # Compiler/layout wrapper erased to its inner payload type unless locally declared.
+  - match: "Padding"
+    arity: 1
+    unlessDeclared: true
+    replace: "{0}"
+
+  # Uninitialized slot wrapper backed by `core::mem::MaybeUninit<T>`.
+  - match: "MaybeUninit"
+    arity: 1
+    unlessDeclared: true
+    imports: ["{coreNs}.mem.maybeuninit.MaybeUninit"]
+    replace: "MaybeUninit<{0}>"
+
+  # Slice and Vec/Option iterator adapters lowered to `ArrayDeque<T>`.
+  - match: "Iter IterMut"
+    minArity: 1
+    anySegmentIn: "slice"
+    replace: "ArrayDeque<{0}>"
+
+  - match: "IntoIter"
+    minArity: 1
+    anySegmentIn: "vec option"
+    replace: "ArrayDeque<{0}>"
+
+  # Interior mutability cells backed by `rustlang.core.cell`.
+  - match: "Cell RefCell"
+    arity: 1
+    unlessDeclared: true
+    imports: ["{coreNs}.cell.{rawName}"]
+    replace: "{rawName}<{0}>"
+
+  - match: "OnceCell"
+    arity: 1
+    unlessDeclared: true
+    imports: ["{coreNs}.cell.once.OnceCell"]
+    replace: "OnceCell<{0}>"
+
+  # Stdlib containers, smart pointers, cows, and integer ranges.
+  - match: "Vec"
+    minArity: 1
+    unlessDeclared: true
+    replace: "List<{0}>"
+
+  - match: "Cow"
+    minArity: 1
+    unlessDeclared: true
+    replace: "{last}"
+
+  - match: "Range RangeInclusive"
+    arity: 1
+    arg0Equals: "Int"
+    unlessDeclared: true
+    replace: "IntRange"
+
+  - match: "Box Rc Arc NoDrop ManuallyDrop"
+    minArity: 1
+    unlessDeclared: true
+    replace: "{0}"
+
+  - match: "HashMap BTreeMap"
+    minArity: 2
+    unlessDeclared: true
+    replace: "MutableMap<{0}, {1}>"
+
+  - match: "HashSet BTreeSet"
+    minArity: 1
+    unlessDeclared: true
+    replace: "MutableSet<{0}>"
+
+# Unqualified Rust scalar type names lowered through `emitter.kotlinBuiltinTypeName(...)`.
+builtinScalarTypes:
+  i8: Byte
+  i16: Short
+  i32: Int
+  i64: Long
+  isize: Int
+  u8: UByte
+  u16: UShort
+  u32: UInt
+  u64: ULong
+  usize: Int
+  f64: Double
+  bool: Boolean
+  str: String
+  char: Char
+
+# Self-contained `libc::<ty>` scalar typedefs when no external `libc` crate namespace is bound.
+libcSelfContainedPtrWidth64Types:
+  - value: "ULong"
+    keys: "size_t usize uintptr_t"
+  - value: "Long"
+    keys: "ssize_t isize intptr_t ptrdiff_t"
+
+libcSelfContainedPtrWidth32Types:
+  - value: "UInt"
+    keys: "size_t usize uintptr_t"
+  - value: "Int"
+    keys: "ssize_t isize intptr_t ptrdiff_t"
+
+libcSelfContainedFixedScalarTypes:
+  - value: "Byte"
+    keys: "int8_t"
+  - value: "UByte"
+    keys: "uint8_t"
+  - value: "Short"
+    keys: "int16_t"
+  - value: "UShort"
+    keys: "uint16_t"
+  - value: "Int"
+    keys: "int32_t pid_t clockid_t wchar_t"
+  - value: "UInt"
+    keys: "uint32_t uid_t gid_t socklen_t useconds_t mode_t"
+  - value: "Long"
+    keys: "int64_t off_t time_t suseconds_t"
+  - value: "ULong"
+    keys: "uint64_t dev_t ino_t rlim_t"
+
+# ==============================================================================
+# Primitive Layout Constants & Numeric Operation Catalog (`PrimitiveNumericOpCatalog`)
+# ==============================================================================
+
+primitiveLayoutsByKtType:
+  Boolean: BOOL
+  Byte: I8
+  UByte: U8
+  CVoid: U8
+  Short: I16
+  UShort: U16
+  Int: I32
+  UInt: U32
+  Long: I64
+  ULong: U64
+  Float: F32
+  kotlin.Float: F32
+  Double: F64
+  F16: F16_LAYOUT
+  F128: F128_LAYOUT
+  Char: CHAR
+  Unit: UNIT
+
+integerBitCountMethods:
+  count_ones: countOnes
+  count_zeros: countZeros
+  leading_zeros: leadingZeros
+  trailing_zeros: trailingZeros
+  leading_ones: leadingOnes
+  trailing_ones: trailingOnes
+
+integerUnaryCoreMethods:
+  checked_neg: checkedNeg
+  checked_abs: checkedAbs
+  wrapping_neg: wrappingNeg
+  wrapping_abs: wrappingAbs
+  saturating_neg: saturatingNeg
+  saturating_abs: saturatingAbs
+  overflowing_neg: overflowingNeg
+  overflowing_abs: overflowingAbs
+  reverse_bits: reverseBits
+
+integerShiftOrPowMethods:
+  checked_shl: checkedShl
+  checked_shr: checkedShr
+  checked_pow: checkedPow
+  wrapping_shl: wrappingShl
+  wrapping_shr: wrappingShr
+  overflowing_shl: overflowingShl
+  overflowing_shr: overflowingShr
+  rotate_left: rotateLeft
+  rotate_right: rotateRight
+  pow: pow
+
+integerBinaryOpMethods:
+  checked_add: checkedAdd
+  checked_sub: checkedSub
+  checked_mul: checkedMul
+  checked_div: checkedDiv
+  checked_rem: checkedRem
+  checked_div_euclid: checkedDivEuclid
+  checked_rem_euclid: checkedRemEuclid
+  wrapping_add: wrappingAdd
+  wrapping_sub: wrappingSub
+  wrapping_mul: wrappingMul
+  wrapping_div: wrappingDiv
+  wrapping_rem: wrappingRem
+  saturating_add: saturatingAdd
+  saturating_sub: saturatingSub
+  saturating_mul: saturatingMul
+  overflowing_add: overflowingAdd
+  overflowing_sub: overflowingSub
+  overflowing_mul: overflowingMul
+  div_euclid: divEuclid
+  rem_euclid: remEuclid
+
+signedOnlyIntegerMethods: "checked_abs wrapping_abs saturating_abs overflowing_abs saturating_neg"
+
+endian128Methods:
+  to_be: toBe
+  from_be: fromBe
+  swap_bytes: swapBytes
+  to_le: toLe
+  from_le: fromLe
+
+standaloneCheckedI32Ops:
+  checked_add: "+"
+  checked_sub: "-"
+  checked_mul: "*"
+
+floatStdlibBoolPredicates:
+  is_nan: isNaN
+  is_infinite: isInfinite
+  is_finite: isFinite
+
+floatCoreBoolPredicates:
+  is_sign_positive: isSignPositive
+  is_sign_negative: isSignNegative
+  is_normal: isNormal
+  is_subnormal: isSubnormal
+
+floatCoreSelfMethods:
+  signum: signum
+  to_degrees: toDegrees
+  to_radians: toRadians
+  next_up: nextUp
+  next_down: nextDown
+
+floatKmUnaryBases:
+  abs: kmFabs
+  floor: kmFloor
+  ceil: kmCeil
+  round: kmRound
+  round_ties_even: kmRoundTiesEven
+  trunc: kmTrunc
+  sqrt: kmSqrt
+  exp: kmExp
+  exp2: kmExp2
+  ln: kmLog
+  log2: kmLog2
+  log10: kmLog10
+  sin: kmSin
+  cos: kmCos
+
+floatLibmUnaryOps: "tan asin acos atan cbrt sinh cosh tanh asinh acosh atanh"
+floatLibmBinaryOps: "atan2 hypot"
+
+floatKmBinaryBases:
+  powf: kmPow
+  copysign: kmCopysign
+  min: kmMinnum
+  max: kmMaxnum
+
+floatAdditionalSameTypeReturnMethods: "powf powi min max fract mul_add recip to_degrees to_radians signum log"
+
+rustFixedScalarKinds:
+  i8: I8
+  u8: U8
+  i16: I16
+  u16: U16
+  i32: I32
+  u32: U32
+  i64: I64
+  u64: U64
+  i128: I128
+  u128: U128
+  f16: F16
+  f32: F32
+  f64: F64
+  f128: F128
+
+primitiveByteSwapTemplates:
+  I8: "{v}"
+  U8: "{v}"
+  U16: "((((({v}).toUInt() and 0xFFu) shl 8) or ((({v}).toUInt() shr 8) and 0xFFu)).toUShort())"
+  I16: "((((({v}).toInt() and 0xFF) shl 8) or ((({v}).toInt() ushr 8) and 0xFF)).toShort())"
+  U32: "(((({v}) shl 24)) or ((({v}) and 0x0000FF00u) shl 8) or ((({v}) shr 8) and 0x0000FF00u) or (({v}) shr 24))"
+  I32: "(((({v}) shl 24)) or ((({v}) and 0x0000FF00) shl 8) or ((({v}) ushr 8) and 0x0000FF00) or (({v}) ushr 24))"
+  U64: "(((({v}) shl 56)) or ((({v}) and 0x000000000000FF00uL) shl 40) or ((({v}) and 0x0000000000FF0000uL) shl 24) or ((({v}) and 0x00000000FF000000uL) shl 8) or (((({v}) shr 8) and 0x00000000FF000000uL)) or (((({v}) shr 24) and 0x0000000000FF0000uL)) or (((({v}) shr 40) and 0x000000000000FF00uL)) or (({v}) shr 56))"
+  I64: "((((({v}).toULong() shl 56)) or ((({v}).toULong() and 0x000000000000FF00uL) shl 40) or ((({v}).toULong() and 0x0000000000FF0000uL) shl 24) or ((({v}).toULong() and 0x00000000FF000000uL) shl 8) or (((({v}).toULong() shr 8) and 0x00000000FF000000uL)) or (((({v}).toULong() shr 24) and 0x0000000000FF0000uL)) or (((({v}).toULong() shr 40) and 0x000000000000FF00uL)) or (({v}).toULong() shr 56)).toLong())"
+
+floatToBitsTemplates:
+  F16: "{recv}.toBits()"
+  F32: "{recv}.toRawBits().toUInt()"
+  F64: "{recv}.toRawBits().toULong()"
+  F128: "{recv}.toBits()"
+
+floatFromBitsSpecs:
+  - { kind: F16, renderExpectKind: U16, castKind: U16, owner: F16 }
+  - { kind: F32, renderExpectKind: U32, castKind: I32, owner: "{f32Type}" }
+  - { kind: F64, renderExpectKind: U64, castKind: I64, owner: Double }
+  - { kind: F128, renderExpectKind: U128, castKind: U128, owner: F128 }
+
+# ==============================================================================
+# Declarative Method-Call Pattern-Match & Template-Replacement Rules
+# ==============================================================================
+
+methodCallPatternRules:
+  # --- Raw pointer (`ConstPtr<T>` / `MutPtr<T>`) method replacements ---
+  - receiver: rawPtr
+    match: "is_null"
+    arity: 0
+    replace: "(({recv}).rawAddress == 0L)"
+
+  - receiver: rawPtr
+    match: "cast_mut"
+    arity: 0
+    noTurbofish: true
+    imports: ["{coreNs}.ptr.MutPtr"]
+    replace: "MutPtr<{pointee}>(({recv}).rawAddress)"
+
+  - receiver: rawPtr
+    match: "cast_const"
+    arity: 0
+    noTurbofish: true
+    imports: ["{coreNs}.ptr.ConstPtr"]
+    replace: "ConstPtr<{pointee}>(({recv}).rawAddress)"
+
+  - receiver: rawPtr
+    match: "read read_unaligned"
+    arity: 0
+    noTurbofish: true
+    replace: "({pointeeLayout}).readNative(({recv}).rawAddress)"
+
+  - receiver: rawPtr
+    match: "read_volatile"
+    arity: 0
+    noTurbofish: true
+    replace: "({pointeeLayout}).readVolatileNative(({recv}).rawAddress)"
+
+  - receiver: rawPtr
+    match: "write write_unaligned"
+    arity: 1
+    noTurbofish: true
+    replace: "({pointeeLayout}).writeNative(({recv}).rawAddress, {arg0})"
+
+  - receiver: rawPtr
+    match: "write_volatile"
+    arity: 1
+    noTurbofish: true
+    replace: "({pointeeLayout}).writeVolatileNative(({recv}).rawAddress, {arg0})"
+
+  - receiver: rawPtr
+    match: "copy_to"
+    arity: 2
+    noTurbofish: true
+    imports: ["{coreNs}.intrinsics.kmCopy"]
+    replace: "kmCopy(({recv}).rawAddress, ({arg0}).rawAddress, ({arg1}).toLong() * ({pointeeLayout}).sizeBytes)"
+
+  - receiver: rawPtr
+    match: "copy_to_nonoverlapping"
+    arity: 2
+    noTurbofish: true
+    imports: ["{coreNs}.intrinsics.kmCopyNonoverlapping"]
+    replace: "kmCopyNonoverlapping(({recv}).rawAddress, ({arg0}).rawAddress, ({arg1}).toLong() * ({pointeeLayout}).sizeBytes)"
+
+  - receiver: rawPtr
+    match: "copy_from"
+    arity: 2
+    noTurbofish: true
+    imports: ["{coreNs}.intrinsics.kmCopy"]
+    replace: "kmCopy(({arg0}).rawAddress, ({recv}).rawAddress, ({arg1}).toLong() * ({pointeeLayout}).sizeBytes)"
+
+  - receiver: rawPtr
+    match: "copy_from_nonoverlapping"
+    arity: 2
+    noTurbofish: true
+    imports: ["{coreNs}.intrinsics.kmCopyNonoverlapping"]
+    replace: "kmCopyNonoverlapping(({arg0}).rawAddress, ({recv}).rawAddress, ({arg1}).toLong() * ({pointeeLayout}).sizeBytes)"
+
+  - receiver: rawPtr
+    match: "write_bytes"
+    arity: 2
+    noTurbofish: true
+    imports: ["{coreNs}.intrinsics.kmWriteBytes"]
+    replace: "kmWriteBytes(({recv}).rawAddress, ({arg0}).toUByte(), ({arg1}).toLong() * ({pointeeLayout}).sizeBytes)"
+
+  - receiver: rawPtr
+    match: "offset_from"
+    arity: 1
+    noTurbofish: true
+    replace: "((({recv}).rawAddress - ({arg0}).rawAddress) / ({pointeeLayout}).strideBytes).toInt()"
+    rawAbiReplace: "((({recv}).rawAddress - ({arg0}).rawAddress) / ({pointeeLayout}).strideBytes)"
+
+  - receiver: rawPtr
+    match: "addr"
+    arity: 0
+    noTurbofish: true
+    replace: "({recv}).rawAddress.toInt()"
+    rawAbiReplace: "({recv}).rawAddress.toULong()"
+
+  - receiver: rawPtr
+    match: "with_addr"
+    arity: 1
+    noTurbofish: true
+    imports: ["{coreNs}.ptr.{ptrCtor}"]
+    replace: "{ptrCtor}(({arg0}).toLong())"
+
+  # --- Pre-argument phase (`phase: preArg`): rawAbi pointer shorthands, bit-counts, collection state, Option & Vec/Deque adapters ---
+  - { phase: preArg, match: "is_null", arity: 0, requireRawAbi: true, replace: "({recv} == 0L)" }
+  - { phase: preArg, match: "cast_mut cast_const", arity: 0, noTurbofish: true, requireRawAbi: true, replace: "{recv}" }
+  - { phase: preArg, match: "cast", arity: 0, requireRawAbi: true, replace: "{recv}" }
+
+  - phase: preArg
+    receiver: intNumeric
+    match: "count_ones"
+    arity: 0
+    noTurbofish: true
+    requireCore: true
+    imports: ["{coreNs}.num.countOnes"]
+    replace: "{recvAtom}.countOnes()"
+
+  - { phase: preArg, receiver: intNumeric, match: "count_ones", arity: 0, noTurbofish: true, replace: "{recvAtom}.countOneBits().toUInt()" }
+
+  - { phase: preArg, receiver: stringLikeOrRefCell, match: "len", arity: 0, noTurbofish: true, replace: "{derefRecv}.length" }
+  - { phase: preArg, receiver: sizedCollectionOrRefCell, match: "len", arity: 0, noTurbofish: true, replace: "{derefRecv}.size" }
+  - { phase: preArg, receiver: arrayElemKind, match: "len", arity: 0, noTurbofish: true, replace: "{recv}.size" }
+  - { phase: preArg, receiver: refCellGuard, match: "is_empty", arity: 0, noTurbofish: true, replace: "{recvAtom}.value.isEmpty()" }
+
+  - phase: preArg
+    receiver: stringBytesOrUninferred
+    match: "as_bytes"
+    arity: 0
+    noTurbofish: true
+    rawOrFinalReplace: "{derefRecv}.encodeToByteArray().asUByteArray()"
+    replace: "{derefRecv}.encodeToByteArray().map {{ it.toUByte() }}"
+
+  - { phase: preArg, receiver: refCellString, match: "as_str", arity: 0, noTurbofish: true, replace: "{recvAtom}.value" }
+  - { phase: preArg, receiver: plainStringOrUnboundAsStr, match: "as_str", arity: 0, noTurbofish: true, replace: "{recv}" }
+  - { phase: preArg, receiver: intoSubstOrStrOrList, match: "as_ref borrow", arity: 0, noTurbofish: true, replace: "{recv}" }
+  - { phase: preArg, receiver: threadCurrent, match: "id", arity: 0, sideEffect: "usesCurrentThreadToken", replace: "currentThreadBoundToken()" }
+
+  - { phase: preArg, receiver: potentialOption, match: "is_none", arity: 0, replace: "{recv} == null" }
+  - { phase: preArg, receiver: potentialOption, match: "is_some", arity: 0, replace: "{recv} != null" }
+  - { phase: preArg, receiver: nullableOption, match: "as_deref as_deref_mut as_ref as_mut", arity: 0, noTurbofish: true, replace: "{recv}" }
+
+  - phase: preArg
+    receiver: fmtOrQueue
+    match: "debug_list"
+    arity: 0
+    replace: "object {{ val entries = mutableListOf<Any?>(); fun entry(v: Any?) = apply {{ entries.add(v) }}; fun entries(iter: Iterable<*>) = apply {{ for (e in iter) entries.add(e) }}; fun finish() {{ {recv}.append(entries.joinToString(\", \", \"[\", \"]\")) }} }}"
+
+  - phase: preArg
+    receiver: fmtOrQueue
+    match: "debug_set"
+    arity: 0
+    replace: "object {{ val entries = mutableListOf<Any?>(); fun entry(v: Any?) = apply {{ entries.add(v) }}; fun entries(iter: Iterable<*>) = apply {{ for (e in iter) entries.add(e) }}; fun finish() {{ {recv}.append(entries.joinToString(\", \", \"{{\", \"}}\")) }} }}"
+
+  - phase: preArg
+    receiver: fmtOrQueue
+    match: "debug_map"
+    arity: 0
+    replace: "object {{ val entries = mutableListOf<String>(); fun entry(k: Any?, v: Any?) = apply {{ entries.add(\"$k: $v\") }}; fun finish() {{ {recv}.append(entries.joinToString(\", \", \"{{\", \"}}\")) }} }}"
+
+  - { phase: preArg, receiver: fmtOrQueue, match: "pop_front", arity: 0, replace: "{recv}.removeFirstOrNull()" }
+  - { phase: preArg, receiver: dequeIter, match: "next", arity: 0, noTurbofish: true, replace: "{recv}.removeFirstOrNull()" }
+  - { phase: preArg, receiver: dequeIter, match: "next_back", arity: 0, noTurbofish: true, replace: "{recv}.removeLastOrNull()" }
+  - { phase: preArg, receiver: dequeIter, match: "len", arity: 0, noTurbofish: true, replace: "{recv}.size" }
+  - { phase: preArg, receiver: dequeIter, match: "clone", arity: 0, noTurbofish: true, replace: "ArrayDeque({recv})" }
+  - { phase: preArg, receiver: vec, match: "pop", arity: 0, noTurbofish: true, replace: "{recv}.removeLastOrNull()" }
+  - { phase: preArg, receiver: vec, match: "len", arity: 0, noTurbofish: true, replace: "{recv}.size" }
+  - { phase: preArg, receiver: vec, match: "into_iter iter iter_mut", arity: 0, noTurbofish: true, replace: "ArrayDeque({recv})" }
+  - { phase: preArg, receiver: vec, match: "clone", arity: 0, noTurbofish: true, replace: "{recv}.toMutableList()" }
+  - { phase: preArg, receiver: vec, match: "last_mut", arity: 0, noTurbofish: true, replace: "{recv}.lastOrNull()" }
+  - { phase: preArg, receiver: vec, match: "first_mut", arity: 0, noTurbofish: true, replace: "{recv}.firstOrNull()" }
+  - { phase: preArg, receiver: intoSubstParam, match: "into", arity: 0, noTurbofish: true, replace: "{recv}" }
+  - { phase: preArg, receiver: sharedBorrowRecv, match: "into_token_stream", arity: 0, noTurbofish: true, replace: "TokenStream.new().also {{ tokens -> {recvAtom}.toTokens(tokens) }}" }
+
+  # --- Post-argument phase (`phase: postArg`): unified predicate-driven method lowering ---
+  - receiver: stringOrCharSeq
+    match: "chars"
+    arity: 0
+    noTurbofish: true
+    requireCore: true
+    unlessDeclaredTopFns: "chars"
+    unlessAnyInstanceMethod: "chars"
+    unlessSelfRecursive: "{coreNs}.str#chars"
+    imports: ["{coreNs}.str.chars"]
+    replace: "{recvAtom}.chars()"
+
+  - receiver: charOrCharLit
+    match: "to_digit"
+    arity: 1
+    noTurbofish: true
+    requireCore: true
+    unlessSelfRecursive: "{coreNs}.char.methods#toDigit"
+    imports: ["{coreNs}.char.methods.toDigit"]
+    replace: "{recvAtom}.toDigit({arg0U32})"
+
+  - { receiver: stringOrStrLit, match: "fmt", arity: 1, noTurbofish: true, argGuard: arg0FmtBuilder, replace: "{arg0}.append({recv})" }
+  - { receiver: refCellString, match: "clear", arity: 0, noTurbofish: true, replace: "{recvAtom}.value = \"\"" }
+  - { receiver: assignableStringPath, match: "clear", arity: 0, noTurbofish: true, replace: "{recv} = \"\"" }
+
+  - { receiver: charsIter, match: "next", arity: 0, noTurbofish: true, replace: "{recvAtom}.next()" }
+  - { receiver: charsIter, match: "as_str", arity: 0, noTurbofish: true, replace: "{recvAtom}.asStr()" }
+  - { receiver: charsIter, match: "clone", arity: 0, noTurbofish: true, replace: "{recvAtom}.clone()" }
+  - { receiver: charsIter, match: "enumerate", arity: 0, noTurbofish: true, replace: "{recvAtom}.enumerate()" }
+
+  - { receiver: fmtBuilder, match: "write_str write_char pad write_fmt", arity: 1, noTurbofish: true, replace: "{recv}.append({arg0})" }
+
+  - { receiver: any, match: "append_all", arity: 1, noTurbofish: true, replace: "for (item in {arg0}) item.toTokens({recv})" }
+  - { receiver: any, match: "find", arity: 1, noTurbofish: true, replace: "{recv}.indexOf({arg0}).takeIf {{ it >= 0 }}" }
+  - { receiver: any, match: "position", arity: 1, noTurbofish: true, replace: "{recvAtom}.indexOfFirst({arg0}).takeIf {{ it >= 0 }}" }
+  - { receiver: any, match: "rposition", arity: 1, noTurbofish: true, replace: "{recvAtom}.indexOfLast({arg0}).takeIf {{ it >= 0 }}" }
+  - { receiver: any, match: "enumerate", arity: 0, noTurbofish: true, replace: "{recvAtom}.mapIndexed {{ index, item -> Pair(index, item) }}" }
+  - { receiver: any, match: "debug_struct", arity: 1, noTurbofish: true, unlessDeclaredTypes: "DebugStruct", replace: "DebugStruct({recv}, {arg0})" }
+  - { receiver: any, match: "debug_tuple", arity: 1, noTurbofish: true, unlessDeclaredTypes: "DebugTuple", replace: "DebugTuple({recv}, {arg0})" }
+  - { receiver: any, match: "push_back", arity: 1, noTurbofish: true, replace: "{recv}.addLast({arg0})" }
+  - { receiver: vecOrMutableList, match: "extend_from_slice", arity: 1, noTurbofish: true, replace: "{recv}.addAll({arg0})" }
+
+  - { receiver: vec, match: "push", arity: 1, noTurbofish: true, replace: "{recv}.add({arg0})" }
+  - { receiver: vec, match: "insert", arity: 2, noTurbofish: true, replace: "{recv}.add({arg0}, {arg1})" }
+  - { receiver: vec, match: "clone_from", arity: 1, noTurbofish: true, replace: "run {{ {recv}.clear(); {recv}.addAll({arg0}) }}" }
+  - { receiver: map, match: "insert", arity: 2, noTurbofish: true, replace: "{recvAtom}.put({arg0}, {arg1})" }
+  - { receiver: map, match: "clone", arity: 0, noTurbofish: true, replace: "{recvAtom}.toMutableMap()" }
+  - { receiver: map, match: "get get_mut", arity: 1, noTurbofish: true, replace: "{recvAtom}.get({arg0})" }
+  - { receiver: set, match: "clone", arity: 0, noTurbofish: true, replace: "{recvAtom}.toMutableSet()" }
+  - { receiver: vec, match: "get get_mut", arity: 1, noTurbofish: true, argGuard: nonRangeArg0, replace: "{recv}.getOrNull({idx0})" }
+  - { receiver: indexedSliceOrArray, match: "get get_mut", arity: 1, noTurbofish: true, argGuard: nonRangeArg0, replace: "{recvAtom}.getOrNull({idx0})" }
+  - { receiver: set, match: "insert", minArity: 1, maxArity: 2, noTurbofish: true, argGuard: setInsertArgs, replace: "{recvAtom}.add({arg0})" }
+  - { receiver: nonVecFieldOrNullableLocal, match: "clone_from", arity: 1, noTurbofish: true, replace: "{recv} = {arg0}" }
+
+  - { receiver: stringOrUninferred, match: "strip_prefix", arity: 1, noTurbofish: true, replace: "{recvAtom}.takeIf {{ it.startsWith({arg0}) }}?.removePrefix({arg0})" }
+  - { receiver: stringOrUninferred, match: "strip_suffix", arity: 1, noTurbofish: true, replace: "{recvAtom}.takeIf {{ it.endsWith({arg0}) }}?.removeSuffix({arg0})" }
+
+  - receiver: stringSplitRecv
+    match: "split_once"
+    arity: 1
+    noTurbofish: true
+    argGuard: charPatArg0
+    replace: "{derefStrRecv}.let {{ s -> val idx = s.indexOf({charArg0}); if (idx < 0) null else Pair(s.substring(0, idx), s.substring(idx + 1)) }}"
+
+  - receiver: stringSplitRecv
+    match: "rsplit_once"
+    arity: 1
+    noTurbofish: true
+    argGuard: charPatArg0
+    replace: "{derefStrRecv}.let {{ s -> val idx = s.lastIndexOf({charArg0}); if (idx < 0) null else Pair(s.substring(0, idx), s.substring(idx + 1)) }}"
+
+  - receiver: stringSplitRecv
+    match: "split_once"
+    arity: 1
+    noTurbofish: true
+    replace: "{derefStrRecv}.let {{ s -> val d = {arg0}; val idx = s.indexOf(d); if (idx < 0) null else Pair(s.substring(0, idx), s.substring(idx + d.length)) }}"
+
+  - receiver: stringSplitRecv
+    match: "rsplit_once"
+    arity: 1
+    noTurbofish: true
+    replace: "{derefStrRecv}.let {{ s -> val d = {arg0}; val idx = s.lastIndexOf(d); if (idx < 0) null else Pair(s.substring(0, idx), s.substring(idx + d.length)) }}"
+
+  - { receiver: refCellString, match: "to_lowercase", arity: 0, noTurbofish: true, replace: "{recvAtom}.value.lowercase()" }
+  - { receiver: refCellString, match: "to_uppercase", arity: 0, noTurbofish: true, replace: "{recvAtom}.value.uppercase()" }
+  - { receiver: stringOrCharSeq, match: "to_lowercase", arity: 0, noTurbofish: true, replace: "{recvAtom}.lowercase()" }
+  - { receiver: stringOrCharSeq, match: "to_uppercase", arity: 0, noTurbofish: true, replace: "{recvAtom}.uppercase()" }
+  - { receiver: uninferredRecv, match: "to_lowercase", arity: 0, noTurbofish: true, unlessAnyInstanceMethod: "toLowercase", replace: "{recvAtom}.lowercase()" }
+  - { receiver: uninferredRecv, match: "to_uppercase", arity: 0, noTurbofish: true, unlessAnyInstanceMethod: "toUppercase", replace: "{recvAtom}.uppercase()" }
+  - { receiver: listOrByteSlice, match: "to_vec", arity: 0, noTurbofish: true, replace: "{recvAtom}.toMutableList()" }
+
+  - { receiver: any, match: "filter_map", arity: 1, noTurbofish: true, unlessAnyInstanceMethod: "filterMap", replace: "{recvAtom}.mapNotNull({cb0})" }
+  - { receiver: dequeOrIter, match: "as_slice", arity: 0, noTurbofish: true, replace: "{recvAtom}.toList()" }
+  - { receiver: dequeOrIter, match: "size_hint", arity: 0, noTurbofish: true, replace: "run {{ val n = {recvAtom}.size; Pair(n, n) }}" }
+  - { receiver: rustAny, match: "is", arity: 0, requireTypeArgs: true, replace: "{recvAtom}.isType{typeArgs}()" }
+  - { receiver: rustAny, match: "downcast_ref", arity: 0, requireTypeArgs: true, replace: "{recvAtom}.downcastRef{typeArgs}()" }
+  - { receiver: rustAny, match: "downcast_mut", arity: 0, requireTypeArgs: true, replace: "{recvAtom}.downcastMut{typeArgs}()" }
+  - { receiver: rustAny, match: "downcast", arity: 0, requireTypeArgs: true, replace: "{recvAtom}.downcast{typeArgs}()" }
+  - { receiver: rustAny, match: "type_id", arity: 0, noTurbofish: true, unlessDeclaredTypes: "TypeId", unlessDeclaredTraits: "Any", replace: "{recvAtom}.typeId" }
+  - { receiver: any, match: "type_id", arity: 0, noTurbofish: true, unlessDeclaredTypes: "TypeId", unlessDeclaredTraits: "Any", replace: "RustAny.from({recv}).typeId" }
+
+  - { receiver: erasedOptionPlace, match: "take", arity: 0, noTurbofish: true, replace: "{recv}.also {{ {recv} = null }}" }
+  - { receiver: erasedOption, match: "unwrap", arity: 0, noTurbofish: true, replace: "{recvAtom}!!" }
+  - { receiver: erasedOption, match: "expect", arity: 1, noTurbofish: true, replace: "({recv} ?: error({arg0}))" }
+  - { receiver: erasedOption, match: "clone cloned copied flatten", arity: 0, noTurbofish: true, replace: "{recv}" }
+  - { receiver: erasedOption, match: "into_iter", arity: 0, noTurbofish: true, replace: "ArrayDeque(listOfNotNull({recv}))" }
+  - { receiver: erasedOption, match: "map and_then", arity: 1, noTurbofish: true, replace: "{recvAtom}?.let({cb0})" }
+  - { receiver: erasedOption, match: "map_or_else", arity: 2, noTurbofish: true, replace: "({recvAtom}?.let({cb1}) ?: {zeroClosure0})" }
+
+  # --- Unconstrained `PartialOrd` / `Ord` generic runtime value comparisons ---
+  - receiver: unconstrainedCmp
+    match: "partial_cmp partialCmp"
+    arity: 1
+    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+    replace: "kmPartialCompareValues({recv}, {arg0})?.let {{ cmpSign -> when {{ cmpSign < 0 -> {ordRef}.Less; cmpSign > 0 -> {ordRef}.Greater; else -> {ordRef}.Equal }} }}"
+
+  - receiver: unconstrainedCmp
+    match: "cmp"
+    arity: 1
+    imports: ["{coreNs}.mem.kmCompareValues"]
+    replace: "kmCompareValues({recv}, {arg0}).let {{ cmpSign -> when {{ cmpSign < 0 -> {ordRef}.Less; cmpSign > 0 -> {ordRef}.Greater; else -> {ordRef}.Equal }} }}"
+
+  - receiver: unconstrainedCmp
+    match: "lt"
+    arity: 1
+    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+    replace: "(kmPartialCompareValues({recv}, {arg0})?.let {{ cmpSign -> cmpSign < 0 }} == true)"
+
+  - receiver: unconstrainedCmp
+    match: "le"
+    arity: 1
+    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+    replace: "(kmPartialCompareValues({recv}, {arg0})?.let {{ cmpSign -> cmpSign <= 0 }} == true)"
+
+  - receiver: unconstrainedCmp
+    match: "gt"
+    arity: 1
+    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+    replace: "(kmPartialCompareValues({recv}, {arg0})?.let {{ cmpSign -> cmpSign > 0 }} == true)"
+
+  - receiver: unconstrainedCmp
+    match: "ge"
+    arity: 1
+    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+    replace: "(kmPartialCompareValues({recv}, {arg0})?.let {{ cmpSign -> cmpSign >= 0 }} == true)"
+
+  - receiver: unconstrainedCmp
+    match: "__chaining_less chainingLess"
+    arity: 1
+    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+    replace: "kmPartialCompareValues({recv}, {arg0}).let {{ cmpSign -> if (cmpSign == 0) {cfRef}.Continue<Boolean, Unit>(Unit) else {cfRef}.Break<Boolean, Unit>(cmpSign != null && cmpSign < 0) }}"
+
+  - receiver: unconstrainedCmp
+    match: "__chaining_greater chainingGreater"
+    arity: 1
+    imports: ["{coreNs}.mem.kmPartialCompareValues"]
+    replace: "kmPartialCompareValues({recv}, {arg0}).let {{ cmpSign -> if (cmpSign == 0) {cfRef}.Continue<Boolean, Unit>(Unit) else {cfRef}.Break<Boolean, Unit>(cmpSign != null && cmpSign > 0) }}"
+
+# ==============================================================================
+# Declarative Free & Associated Function Call Pattern/Replacement Rules
+# ==============================================================================
+
+calleePatternRules:
+  # --- Pre-callee raw path rules (evaluated before rendering generic callee path) ---
+  - phase: preCallee
+    matchSuffix: "debug_simd_finish"
+    minArity: 3
+    maxArity: 4
+    unlessDeclaredTopFns: "debug_simd_finish"
+    calleeGuard: taggedCoreResult
+    replace: "run {{ val simdDbgArr = {rawArg2}; ({rawArg0}).append({rawArg1}); {resName}.Ok<Unit, {fmtErr}>(Unit) }}"
+
+  - phase: preCallee
+    matchSuffix: "Write.write_fmt"
+    arity: 2
+    unlessDeclaredTypes: "Write"
+    calleeGuard: fmtStringBuilderArg0
+    replace: "{neutralAtom0}.append({neutralArg1})"
+
+  - phase: preCallee
+    matchSuffix: "Write.write_fmt"
+    arity: 2
+    unlessDeclaredTypes: "Write"
+    replace: "{neutralAtom0}.writeFmt({neutralArg1})"
+
+  # --- Post-callee rendered function/associated call rules ---
+  - match: "null nullMut null_mut nullVal"
+    matchSuffix: "ptr.null ptr.nullMut ptr.null_mut nullVal"
+    arity: 0
+    unlessDeclaredTopFns: "null null_mut"
+    imports: ["{coreNs}.ptr.{nullPtrCtor}"]
+    rawAbiImports: []
+    rawAbiReplace: "0L"
+    replace: "{nullPtrCtor}{turbofish}(0L)"
+
+  - { match: "drop", matchSuffix: "mem.drop", arity: 1, unlessDeclaredTopFns: "drop", replace: "({arg0}).let {{ }}" }
+  - { matchSuffix: "TypeId.of RustTypeId.of", arity: 0, replace: "RustTypeId.of{turbofish}()" }
+  - { match: "Cow.Borrowed Cow.Owned", matchSuffix: "Cow.Borrowed Cow.Owned", arity: 1, unlessDeclaredTypes: "Cow", replace: "{arg0}" }
+  - { match: "Box.new", matchOnBase: false, arity: 1, unlessDeclaredTypes: "Box", replace: "{arg0}" }
+  - { match: "Rc.new", matchOnBase: false, arity: 1, unlessDeclaredTypes: "Rc", replace: "{arg0}" }
+  - { match: "Arc.new", matchOnBase: false, arity: 1, unlessDeclaredTypes: "Arc", replace: "{arg0}" }
+  - { match: "NoDrop.new", matchOnBase: false, arity: 1, unlessDeclaredTypes: "NoDrop", replace: "{arg0}" }
+  - { match: "ManuallyDrop.new", matchOnBase: false, arity: 1, unlessDeclaredTypes: "ManuallyDrop", replace: "{arg0}" }
+  - { matchSuffix: "Arc.clone", arity: 1, unlessDeclaredTypes: "Arc", calleeGuard: noCalleeTypeArgs, replace: "{derefRefArg0}" }
+  - { matchSuffix: "Rc.clone", arity: 1, unlessDeclaredTypes: "Rc", calleeGuard: noCalleeTypeArgs, replace: "{derefRefArg0}" }
+  - { match: "Vec.new", matchOnBase: false, arity: 0, unlessDeclaredTypes: "Vec", replace: "mutableListOf()" }
+  - { match: "Vec.withCapacity", matchOnBase: false, arity: 1, unlessDeclaredTypes: "Vec", replace: "ArrayList({arg0})" }
+  - { match: "Vec.from", matchOnBase: false, arity: 1, unlessDeclaredTypes: "Vec", replace: "{arg0}.toMutableList()" }
+  - { match: "VecDeque.from", matchOnBase: false, arity: 1, unlessDeclaredTypes: "VecDeque", replace: "ArrayDeque({arg0})" }
+  - { match: "String.new String.withCapacity", matchSuffix: "String.new String.withCapacity", maxArity: 1, unlessDeclaredTypes: "String", replace: "\"\"" }
+  - { match: "String.from", arity: 1, unlessDeclaredTypes: "String", calleeGuard: strArg0, replace: "{arg0}" }
+  - { match: "String.from", arity: 1, unlessDeclaredTypes: "String", replace: "({arg0}).toString()" }
+  - { match: "HashMap.new BTreeMap.new HashMap.withCapacity BTreeMap.withCapacity", maxArity: 1, unlessDeclaredTypes: "HashMap BTreeMap", replace: "mutableMapOf{turbofish}()" }
+  - { match: "HashSet.new BTreeSet.new HashSet.withCapacity BTreeSet.withCapacity", maxArity: 1, unlessDeclaredTypes: "HashSet BTreeSet", replace: "mutableSetOf{turbofish}()" }
+  - { match: "empty iter.empty", matchOnBase: false, arity: 0, unlessTopSignatures: "empty", replace: "ArrayDeque()" }
+  - { match: "once", matchSuffix: "iter.once", arity: 1, unlessTopSignatures: "once", unlessDeclaredTopFns: "once", replace: "listOf{turbofish}({arg0})" }
+  - { match: "min cmp.min", matchOnBase: false, arity: 2, unlessDeclaredTopFns: "min", replace: "minOf({arg0}, {arg1})" }
+
+  # Raw slice views, `MaybeUninit`, `ptr::from_ref`/`from_mut`, and `any::type_name`
+  - match: "fromRawParts from_raw_parts"
+    matchSuffix: "slice.fromRawParts slice.from_raw_parts"
+    arity: 2
+    calleeGuard: coreActive
+    imports: ["{coreNs}.mem.linearSliceView"]
+    replace: "linearSliceView({arg0}, {arg1I32}, {arg0PointeeLayout})"
+
+  - match: "fromRawPartsMut from_raw_parts_mut"
+    matchSuffix: "slice.fromRawPartsMut slice.from_raw_parts_mut"
+    arity: 2
+    calleeGuard: coreActive
+    imports: ["{coreNs}.mem.linearMutSliceView"]
+    replace: "linearMutSliceView({arg0}, {arg1I32}, {arg0PointeeLayout})"
+
+  - match: "fromRawParts from_raw_parts fromRawPartsMut from_raw_parts_mut"
+    matchSuffix: "slice.fromRawParts slice.from_raw_parts slice.fromRawPartsMut slice.from_raw_parts_mut"
+    arity: 2
+    replace: "{callee}({arg0}, {arg1})"
+
+  - matchSuffix: "MaybeUninit.zeroed"
+    arity: 0
+    imports: ["{coreNs}.mem.maybeuninit.MaybeUninit"]
+    replace: "MaybeUninit.zeroed({maybeUninitCallLayout})"
+
+  - matchSuffix: "MaybeUninit.uninit"
+    arity: 0
+    imports: ["{coreNs}.mem.maybeuninit.MaybeUninit"]
+    replace: "MaybeUninit.uninit({maybeUninitCallLayout})"
+
+  - matchSuffix: "MaybeUninit.new"
+    arity: 1
+    imports: ["{coreNs}.mem.maybeuninit.MaybeUninit"]
+    replace: "MaybeUninit.new({arg0}, {maybeUninitArg0Layout})"
+
+  - match: "fromRef from_ref fromMut from_mut"
+    matchSuffix: "ptr.fromRef ptr.from_ref ptr.fromMut ptr.from_mut"
+    arity: 1
+    replace: "{arg0}"
+
+  - match: "typeName type_name"
+    matchSuffix: "any.typeName any.type_name"
+    arity: 0
+    replace: "{quotedSelfType}"
+
+  # Formatting trait UFCS (`Display::fmt`, `Debug::fmt`, etc.), endian byte-swaps, and companion `min`/`max`
+  - { arity: 2, calleeGuard: fmtTraitMethod, replace: "{arg1}.append(({arg0}).toString())" }
+
+  - match:
+      - "Byte.toLe Byte.fromLe Byte.toBe Byte.fromBe Byte.swapBytes"
+      - "UByte.toLe UByte.fromLe UByte.toBe UByte.fromBe UByte.swapBytes"
+      - "Short.toLe Short.fromLe UShort.toLe UShort.fromLe"
+      - "Int.toLe Int.fromLe UInt.toLe UInt.fromLe"
+      - "Long.toLe Long.fromLe ULong.toLe ULong.fromLe"
+    matchOnBase: false
+    arity: 1
+    replace: "{arg0}"
+
+  - { match: "Short.toBe Short.fromBe Short.swapBytes", matchOnBase: false, arity: 1, byteSwapKind: I16, replace: "{byteSwapArg0}" }
+  - { match: "UShort.toBe UShort.fromBe UShort.swapBytes", matchOnBase: false, arity: 1, byteSwapKind: U16, replace: "{byteSwapArg0}" }
+  - { match: "Int.toBe Int.fromBe Int.swapBytes", matchOnBase: false, arity: 1, byteSwapKind: I32, replace: "{byteSwapArg0}" }
+  - { match: "UInt.toBe UInt.fromBe UInt.swapBytes", matchOnBase: false, arity: 1, byteSwapKind: U32, replace: "{byteSwapArg0}" }
+  - { match: "Long.toBe Long.fromBe Long.swapBytes", matchOnBase: false, arity: 1, byteSwapKind: I64, replace: "{byteSwapArg0}" }
+  - { match: "ULong.toBe ULong.fromBe ULong.swapBytes", matchOnBase: false, arity: 1, byteSwapKind: U64, replace: "{byteSwapArg0}" }
+
+  - match: "Float.min kotlin.Float.min Double.min"
+    matchOnBase: false
+    arity: 2
+    replace: "run {{ val lhsMin0 = ({arg0}); val rhsMin0 = ({arg1}); when {{ lhsMin0.isNaN() -> rhsMin0; rhsMin0.isNaN() -> lhsMin0; else -> minOf(lhsMin0, rhsMin0) }} }}"
+
+  - match: "Float.max kotlin.Float.max Double.max"
+    matchOnBase: false
+    arity: 2
+    replace: "run {{ val lhsMax0 = ({arg0}); val rhsMax0 = ({arg1}); when {{ lhsMax0.isNaN() -> rhsMax0; rhsMax0.isNaN() -> lhsMax0; else -> maxOf(lhsMax0, rhsMax0) }} }}"
+
+  - match: "Byte.min UByte.min Short.min UShort.min Int.min UInt.min Long.min ULong.min"
+    matchOnBase: false
+    arity: 2
+    replace: "minOf({arg0}, {arg1})"
+
+  - match: "Byte.max UByte.max Short.max UShort.max Int.max UInt.max Long.max ULong.max"
+    matchOnBase: false
+    arity: 2
+    replace: "maxOf({arg0}, {arg1})"
+
+# ==============================================================================
+# Method, Call, Type-Inference & Trait Lowering Classification Catalogs
+# ==============================================================================
+
+rawPointerArithMethods:
+  - "offset add sub wrapping_offset wrapping_add wrapping_sub"
+  - "byte_offset byte_add byte_sub wrapping_byte_offset wrapping_byte_add wrapping_byte_sub"
+
+rawAbiByteOffsetMethods: "byte_offset byte_add byte_sub wrapping_byte_offset wrapping_byte_add wrapping_byte_sub"
+iterReceiverMethods: "iter iter_mut into_iter"
+pointerDistanceSubMethods: "checked_sub wrapping_sub unchecked_sub saturating_sub offset_from offset_from_unsigned sub_ptr byte_offset_from"
+indexedIterUnwrapMethods: "zip any all map filter filter_map flat_map fold for_each forEach enumerate count sum find position"
+
+numericReceiverKindMethods:
+  - "wrapping_add wrapping_sub wrapping_mul wrapping_div wrapping_rem wrapping_shl wrapping_shr"
+  - "unchecked_shl unchecked_shr checked_add checked_sub checked_mul checked_div checked_rem"
+  - "checked_div_euclid checked_rem_euclid checked_shl checked_shr checked_pow"
+  - "saturating_add saturating_sub saturating_mul overflowing_add overflowing_sub overflowing_mul"
+  - "overflowing_shl overflowing_shr div_euclid rem_euclid rotate_left rotate_right"
+  - "pow powf powi min max atan2 hypot log mul_add to_digit"
+
+u32ShiftOrExpMethods:
+  - "wrapping_shl wrapping_shr checked_shl checked_shr overflowing_shl overflowing_shr"
+  - "rotate_left rotate_right pow checked_pow"
+
+atomicSingleValueMethods: "store swap fetch_add fetch_sub fetch_and fetch_or fetch_xor fetch_max fetch_min"
+stringLikeTypes: "String CharSequence StringBuilder"
+optionBorrowIdentityMethods: "as_deref as_deref_mut as_ref as_mut"
+sizedCollectionPrefixes: ["List<", "MutableList<", "Set<", "MutableSet<", "Map<", "MutableMap<", "Collection<", "ArrayDeque<"]
+intoIterCollectionPrefixes: ["Iterable<", "Collection<", "List<", "MutableList<", "Set<", "MutableSet<"]
+stdlibIntTypes: "Byte Short Int Long I128 UByte UShort UInt ULong U128"
+
+tryIntoFromOnlyTargetsBySrc:
+  Byte: "Short Long I128"
+  Short: "Long I128"
+  Long: "I128"
+  UByte: "Short Int Long I128 UShort UInt ULong U128"
+  UShort: "Long I128 UInt ULong U128"
+  UInt: "Long I128 ULong U128"
+  ULong: "I128 U128"
+
+coreSliceOrPtrMethods: "asPtr asMutPtr chunksMut chunks"
+nonSliceCoreOwnerTypes: "MaybeUninit ConstPtr MutPtr AddressableLocal AddressableArrayLocal"
+peekMacroMethods: "peek peek2 peek3"
+callbackWrapMethods: "map map_err and_then or_else"
+
+integerCompanionMinMaxOwners: "Byte UByte Short UShort Int UInt Long ULong"
+companionConvertPrimitivesExtra: "I128 U128 Boolean Float Double F16 F128"
+knownStdUfcsReceiverMethods:
+  - "clone cmp partialCmp eq ne hash fmt deref derefMut asRef borrow borrowMut"
+  - "toString toOwned writeFmt write writeAll flush read readExact readToEnd readToString"
+
+primitiveArraySpecs:
+  - { arrayType: BooleanArray, elemType: Boolean, layoutFactory: booleanArray }
+  - { arrayType: ByteArray, elemType: Byte, numericKind: I8, layoutFactory: byteArray }
+  - { arrayType: UByteArray, elemType: UByte, numericKind: U8, layoutFactory: uByteArray }
+  - { arrayType: ShortArray, elemType: Short, numericKind: I16, layoutFactory: shortArray }
+  - { arrayType: UShortArray, elemType: UShort, numericKind: U16, layoutFactory: uShortArray }
+  - { arrayType: IntArray, elemType: Int, numericKind: I32, layoutFactory: intArray }
+  - { arrayType: UIntArray, elemType: UInt, numericKind: U32, layoutFactory: uIntArray }
+  - { arrayType: LongArray, elemType: Long, numericKind: I64, layoutFactory: longArray }
+  - { arrayType: ULongArray, elemType: ULong, numericKind: U64, layoutFactory: uLongArray }
+  - { arrayType: FloatArray, elemType: Float, numericKind: F32, layoutFactory: floatArray }
+  - { arrayType: DoubleArray, elemType: Double, numericKind: F64, layoutFactory: doubleArray }
+
+numericKindByElem:
+  Byte: I8
+  UByte: U8
+  Short: I16
+  UShort: U16
+  Int: I32
+  UInt: U32
+  Long: I64
+  ULong: U64
+  I128: I128
+  U128: U128
+  F16: F16
+  Float: F32
+  kotlin.Float: F32
+  Double: F64
+  F128: F128
+
+strPrimitiveParseMethods:
+  Boolean: "toBooleanStrictOrNull()"
+  Byte: "toByteOrNull()"
+  UByte: "toUByteOrNull()"
+  Short: "toShortOrNull()"
+  UShort: "toUShortOrNull()"
+  Int: "toIntOrNull()"
+  UInt: "toUIntOrNull()"
+  Long: "toLongOrNull()"
+  ULong: "toULongOrNull()"
+  Float: "toFloatOrNull()"
+  kotlin.Float: "toFloatOrNull()"
+  Double: "toDoubleOrNull()"
+
+mapSimpleNames: "MutableMap Map LinkedHashMap HashMap"
+setSimpleNames: "MutableSet Set LinkedHashSet HashSet"
+indexedSliceBases: "List MutableList Array ArrayDeque"
+
+nonOptionMethodNames: "ok_or ok_or_else is_ok is_err is_some is_none map_err to_lowercase to_uppercase"
+optionChainPreservingMethods: "map and_then flatten or or_else as_ref as_mut cloned copied filter"
+nullableNewWrapperOwners: "NonNull NonZero Alignment"
+layoutQueryFnIdents: "size_of size_of_val align_of align_of_val"
+mutPtrContainerBases: "NonNull Unique BoxRaw"
+endianIntMethods: "to_be from_be swap_bytes to_le from_le"
+optionUnwrapSingleArgMethods: "expect unwrap_or unwrap_or_else"
+optionZeroArgIdentityMethods: "cloned copied as_ref as_mut"
+atomicValueReturningMethods: "load swap into_inner fetch_add fetch_sub fetch_and fetch_or fetch_xor fetch_max fetch_min"
+
+fmtDebugBuilderReturns:
+  debug_struct: DebugStruct
+  debug_tuple: DebugTuple
+  debug_list: DebugList
+  debug_set: DebugSet
+  debug_map: DebugMap
+
+floatSuffixNumericKinds:
+  f16: F16
+  f32: F32
+  f64: F64
+  f128: F128
+
+intSuffixNumericKinds:
+  i8: I8
+  u8: U8
+  i16: I16
+  u16: U16
+  i32: I32
+  u32: U32
+  i64: I64
+  u64: U64
+  i128: I128
+  u128: U128
+
+numericCoerceSuffixByKind:
+  U8: "toUByte()"
+  U16: "toUShort()"
+  U32: "toUInt()"
+  U64: "toULong()"
+  I8: "toByte()"
+  I16: "toShort()"
+  I32: "toInt()"
+  I64: "toLong()"
+  F32: "toFloat()"
+  F64: "toDouble()"
+
+coreOpsOutputAssocTraits: "Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr Neg Not"
+
+stdlibDefaultlessAssocTypes:
+  Iterator: [Item]
+  IntoIterator: [Item, IntoIter]
+  Fn: [Output]
+  FnMut: [Output]
+  FnOnce: [Output]
+  Try: [Output, Residual]
+  Deref: [Target]
+  SliceIndex: [Output]
+  Future: [Output]
+  IntoFuture: [Output, IntoFuture]
+  FromStr: [Err]
+  TryFrom: [Error]
+  TryInto: [Error]
+  Pattern: [Searcher]
+  BuildHasher: [Hasher]
+  DoubleEndedIterator: [Item]
+  ExactSizeIterator: [Item]
+  FusedIterator: [Item]
+  AsyncIterator: [Item]
+
+# ==============================================================================
+# Cast, Operator, Witness, Pointer & Layout Lowering Catalogs
+# ==============================================================================
+
+coreOpsBinaryTraits: "Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr"
+coreOpsUnaryOutputTraits: "Neg Not"
+
+numericSuffixByKind:
+  I8: ".toByte()"
+  U8: ".toUByte()"
+  I16: ".toShort()"
+  U16: ".toUShort()"
+  I32: ".toInt()"
+  U32: ".toUInt()"
+  I64: ".toLong()"
+  U64: ".toULong()"
+  F16: ".toF16()"
+  F32: ".toFloat()"
+  F64: ".toDouble()"
+  F128: ".toF128()"
+  I128: ".toI128()"
+  U128: ".toU128()"
+
+boxedIntFromSuffixByKind:
+  I8: fromByte
+  I16: fromShort
+  I32: fromInt
+  I64: fromLong
+  U8: fromUByte
+  U16: fromUShort
+  U32: fromUInt
+  U64: fromULong
+
+zeroOrNullPointerLiterals: "0 0L 0u 0uL null"
+kotlinBuiltinValueTypeNames: "Byte Short Int Long UByte UShort UInt ULong Float Double Boolean Char String Unit Any"
+cPointerWidthUnsignedTypeNames: "size_t SizeT uintptr_t UintptrT rsize_t RsizeT __size_t"
+cPointerWidthSignedTypeNames: "ssize_t SsizeT ptrdiff_t PtrdiffT intptr_t IntptrT __ssize_t"
+
+companionCapableValueTypes:
+  - "Byte Short Int Long UByte UShort UInt ULong Float Double Boolean Char String"
+  - "kotlin.Byte kotlin.Short kotlin.Int kotlin.Long kotlin.UByte kotlin.UShort kotlin.UInt kotlin.ULong"
+  - "kotlin.Float kotlin.Double kotlin.Boolean kotlin.Char kotlin.String I128 U128 F16 F128 RustChar"
+
+iteratorAssocTraits: "Iterator DoubleEndedIterator ExactSizeIterator FusedIterator AsyncIterator"
+
+witnessMutRefScalars:
+  - "Byte UByte Short UShort Int UInt Long ULong I128 U128"
+  - "Float kotlin.Float Double Char RustChar ConstPtr MutPtr"
+
+zeroArgSelfProducerMethods:
+  - "zero one min_value max_value nan infinity neg_infinity neg_zero"
+  - "epsilon min_positive_value max_finite min_finite"
+
+externalOverridableStdlibTraits:
+  - "Read Write BufRead Seek Clone Iterator DoubleEndedIterator ExactSizeIterator"
+  - "BitOr BitAnd BitXor Not Add Sub Mul Div Rem Neg Shl Shr PanicPayload"
+
+coreOpsForwardRefTraits:
+  - "Add Sub Mul Div Rem BitAnd BitOr BitXor Shl Shr Neg Not"
+  - "AddAssign SubAssign MulAssign DivAssign RemAssign BitAndAssign BitOrAssign BitXorAssign ShlAssign ShrAssign"
+
+kotlinBuiltinArithTypes: "Byte Short Int Long UByte UShort UInt ULong Float Double"
+
+fixedScalarCodecs:
+  i8: I8
+  u8: U8
+  i16: I16
+  u16: U16
+  i32: I32
+  u32: U32
+  i64: I64
+  u64: U64
+  bool: BOOL
+
+literalCodecTypes:
+  BOOL: Boolean
+  I8: Byte
+  U8: UByte
+  I16: Short
+  U16: UShort
+  I32: Int
+  U32: UInt
+  I64: Long
+  U64: ULong
+
+extendedScalarPointedPrimitives: "isize usize i128 u128 f16 f32 f64 f128 char"
+addressBackedSysRoots: "libc wasip1 windows_sys wasi"
+
+rawMemoryAndLayoutIdents:
+  - "size_of size_of_val align_of align_of_val offset_of transmute transmute_copy transmute_unchecked"
+  - "zeroed MaybeUninit ManuallyDrop UnsafeCell SyncUnsafeCell from_raw_parts from_raw_parts_mut"
+  - "read_unaligned write_unaligned read_volatile write_volatile addr_of addr_of_mut"
+  - "copy_nonoverlapping NonNull TypeLayout PrimitiveLayouts"
+
+managedSliceBases: "List MutableList ArrayList String CharSequence LinearSliceView LinearMutSliceView ByteSlice MutByteSlice"
+viewOffsetSliceBases: "LinearSliceView LinearMutSliceView ByteSlice MutByteSlice"
+pointerCastMethods: "cast cast_mut cast_const"
+pointerContainerWrappers: "NonNull Vec Box Unique"
+integerLiteralSuffixes: "i8 u8 i16 u16 i32 u32 i64 u64 i128 u128 isize usize"
+
+knownStdlibFirstTypeLayoutFunctions:
+  - "size_of align_of min_align_of pref_align_of zeroed read read_unaligned read_volatile"
+  - "write write_unaligned write_volatile write_bytes copy copy_nonoverlapping dangling dangling_mut"
+
+pointerStrideOrAccessMethods:
+  - "offset add sub wrapping_offset wrapping_add wrapping_sub offset_from offset_from_unsigned sub_ptr"
+  - "read read_volatile read_unaligned write write_volatile write_unaligned write_bytes"
+  - "copy_to copy_to_nonoverlapping copy_from copy_from_nonoverlapping as_ref as_mut"
+
+sizedCoreConstNames: "IS_ZST LAYOUT MAX_SLICE_LEN ALIGNMENT"

@@ -15,7 +15,6 @@ import io.github.kotlinmania.syn.RangeLimits
 import io.github.kotlinmania.syn.Stmt
 import io.github.kotlinmania.syn.SynType
 import io.github.kotlinmania.syn.UnOp
-import io.github.kotlinmania.syn.gen.Visit
 import io.github.kotlinmania.syn.span
 
 private inline fun <T> KotlinJ2KEmitter.withNeutralConditionContext(block: () -> T): T {
@@ -966,7 +965,7 @@ internal class MatchArmBindingExtractor(
 private class DerefedIdentMutationVisitor(
     private val emitter: KotlinJ2KEmitter,
     private val rawIdent: String,
-) : Visit() {
+) : ScopedBlockAstVisitor(skipNestedClosures = true) {
     private val predicates = PatternPredicateInspector(emitter)
     private var mutates = false
     private var shadowed = false
@@ -978,11 +977,8 @@ private class DerefedIdentMutationVisitor(
 
     override fun visitItem(i: Item) {}
 
-    override fun visitExprClosure(e: Expr.Closure) {}
-
-    override fun visitStmt(s: Stmt) {
-        if (isLeadingCfgStmtDisabled(s)) return
-        super.visitStmt(s)
+    override fun onActiveStmt(s: Stmt) {
+        super.onActiveStmt(s)
         if (s is Stmt.Local && predicates.bindsRawIdent(s.pat, rawIdent)) {
             shadowed = true
         }
@@ -1880,14 +1876,8 @@ internal fun KotlinJ2KEmitter.renderBooleanExprMatch(
 internal fun KotlinJ2KEmitter.armReferencesSubject(pat: Pat): Boolean =
     PatternPredicateInspector(this).referencesSubject(pat)
 
-internal fun isStarProjectedOrPlainCheckType(typeTarget: String): Boolean {
-    val lt = typeTarget.indexOf('<')
-    if (lt < 0) return true
-    if (!typeTarget.endsWith('>')) return false
-    val inner = typeTarget.substring(lt + 1, typeTarget.length - 1).trim()
-    if (inner.isEmpty()) return false
-    return inner.split(',').all { it.trim() == "*" }
-}
+internal fun isStarProjectedOrPlainCheckType(typeTarget: String): Boolean =
+    typeTarget.asKotlinRenderedType()?.takeIf { !it.isNullable }?.isStarProjectedOrPlain() ?: false
 
 private fun hasTopLevelCommaOutsideGenerics(text: String): Boolean =
     KotlinTokenWalker.findTopLevelCommaIndex(text, trackParens = true) >= 0
@@ -1925,9 +1915,8 @@ internal fun KotlinJ2KEmitter.lookupEnumVariantTypeArity(variantType: String): I
 }
 
 internal fun KotlinJ2KEmitter.isGenericUnitEnumVariant(variantType: String): Boolean {
-    if ('<' in variantType) {
-        return isGenericUnitEnumVariant(variantType.substringBefore('<').trim())
-    }
+    val parsed = variantType.asKotlinRenderedType() ?: return false
+    if (parsed.hasTypeArgs) return isGenericUnitEnumVariant(parsed.headPath)
     if (lookupEnumVariantTypeArity(variantType) <= 0) return false
     if ('.' in variantType) {
         val parts = variantType.split('.')
@@ -1945,25 +1934,18 @@ internal fun KotlinJ2KEmitter.isGenericUnitEnumVariant(variantType: String): Boo
 }
 
 internal fun KotlinJ2KEmitter.starProjectedVariantIsType(variantType: String): String {
-    if ('<' in variantType) return variantType
-    val arity = lookupEnumVariantTypeArity(variantType)
-    if (arity <= 0) return variantType
-    return "$variantType<${List(arity) { "*" }.joinToString(", ")}>"
+    val parsed = variantType.asKotlinRenderedType() ?: return variantType
+    if (parsed.hasTypeArgs) return variantType
+    return parsed.withStarProjection(lookupEnumVariantTypeArity(variantType))
 }
 
 internal fun KotlinJ2KEmitter.parameterizedVariantCastType(variantType: String): String {
-    if ('<' in variantType) return variantType
-    val tps =
-        inspector.enumTypeParamsByVariant[variantType]
-            ?: inspector.enumTypeParamsByVariant[variantType.substringAfterLast('.')]
-    if (tps != null && tps.isNotEmpty()) {
-        val args =
-            if (tps.all { it in activeTypeParamNames }) {
-                tps.joinToString(", ")
-            } else {
-                tps.joinToString(", ") { "*" }
-            }
-        return "$variantType<$args>"
+    val parsed = variantType.asKotlinRenderedType() ?: return variantType
+    if (parsed.hasTypeArgs) return variantType
+    val tps = inspector.enumTypeParamsByVariant[variantType] ?: inspector.enumTypeParamsByVariant[parsed.simpleName]
+    if (!tps.isNullOrEmpty()) {
+        val args = if (tps.all { it in activeTypeParamNames }) tps else List(tps.size) { "*" }
+        return "${parsed.headPath}<${args.joinToString(", ")}>"
     }
     return starProjectedVariantIsType(variantType)
 }
@@ -2279,12 +2261,9 @@ internal fun KotlinJ2KEmitter.qualifyShadowedPatternVariantType(
     selfTypeName: String?,
 ): String {
     if ('.' in variantType) return variantType
-    val rawScrutinee = resolveScrutineeRenderedType(subjectText, selfTypeName)
-    val scrutineeNoNull = rawScrutinee?.removeSuffix("?")?.substringBefore('<')
     val scrutineeBase =
-        scrutineeNoNull
-            ?.substringAfterLast('.')
-            ?.trim()
+        resolveScrutineeRenderedType(subjectText, selfTypeName)
+            ?.simpleKotlinTypeName()
             ?.takeIf { it.isNotEmpty() && it !in activeTypeParamNames }
     if (variantType in activeTypeParamNames) {
         val ownerEnum =

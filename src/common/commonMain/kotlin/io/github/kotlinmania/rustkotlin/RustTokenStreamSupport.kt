@@ -272,6 +272,70 @@ internal open class RustTokenCursor(
         return trees.size
     }
 
+    fun skipQualifiers(startIdx: Int, qualifiers: Set<String>): Int {
+        var idx = startIdx
+        while (identAt(idx) in qualifiers) idx++
+        return idx
+    }
+
+    fun extractLeadingPathIdents(startIdx: Int = 0): Pair<List<String>, Int> {
+        var idx = if (isDoubleColonAt(startIdx)) startIdx + 2 else startIdx
+        val first = cleanIdentAt(idx) ?: return emptyList<String>() to startIdx
+        val segments = mutableListOf(first)
+        idx++
+        while (idx < size && isDoubleColonAt(idx)) {
+            val nextSeg = cleanIdentAt(idx + 2) ?: break
+            segments += nextSeg
+            idx += 3
+        }
+        return segments to idx
+    }
+
+    fun matchModDeclAt(startIdx: Int): Triple<Boolean, String, Int>? {
+        val isPub = identAt(startIdx) == "pub"
+        val kwIdx = if (isPub) copyOptionalPubVisibility(startIdx) else startIdx
+        if (identAt(kwIdx) != "mod") return null
+        val modName = cleanIdentAt(kwIdx + 1) ?: return null
+        if (punctCharAt(kwIdx + 2) != ';') return null
+        return Triple(isPub, modName, kwIdx + 3)
+    }
+
+    fun matchMacroRulesDefAt(startIdx: Int): Pair<String, Int>? {
+        if (identAt(startIdx) != "macro_rules" || punctCharAt(startIdx + 1) != '!') return null
+        var k = startIdx + 2
+        val macroName = cleanIdentAt(k).orEmpty()
+        if (identAt(k) != null) k++
+        if (groupAt(k) == null) return null
+        k++
+        if (punctCharAt(k) == ';') k++
+        return macroName to k
+    }
+
+    fun matchExternBlockBraceIndex(startIdx: Int): Int? {
+        var j = startIdx
+        if (identAt(j) == "unsafe") j++
+        if (identAt(j) != "extern") return null
+        j++
+        if (trees.getOrNull(j) is TokenTree.Literal) j++
+        return if (groupAt(j, Delimiter.Brace) != null) j else null
+    }
+
+    fun extractAngleInnerSlice(openAngleIdx: Int): Pair<List<TokenTree>, Int>? {
+        val afterCloseIdx = skipBalancedAngles(openAngleIdx) ?: return null
+        return trees.subList(openAngleIdx + 1, afterCloseIdx - 1) to afterCloseIdx
+    }
+
+    fun extractBracketArrayTypeAndLen(idx: Int = 0): Pair<List<TokenTree>, List<TokenTree>>? {
+        val bracketGrp = groupAt(idx, Delimiter.Bracket) ?: return null
+        val inner = bracketGrp.stream().toList()
+        val semiParts = RustTokenCursor(inner).splitByTopLevelPunct(';')
+        return if (semiParts.size == 2 && semiParts[0].isNotEmpty() && semiParts[1].isNotEmpty()) {
+            semiParts[0] to semiParts[1]
+        } else {
+            null
+        }
+    }
+
     fun collectTopLevelIdentsOutsideAngles(): List<String> {
         val out = mutableListOf<String>()
         anyTopLevelOutsideAngles { idx ->
@@ -606,12 +670,13 @@ internal open class RustTokenCursor(
 }
 
 /**
- * Shared `proc_macro2` [TokenTree] -> Kotlin text emitter.
+ * Shared `proc_macro2` [TokenTree] -> typed [KotlinEmitToken] stream emitter.
  *
  * Consolidates Rust attribute elision/rendering, `'a` lifetime elision, `&` / `&mut` borrow
  * stripping, `Token![...]` resolution, `macro!(...)` invocations, `::` -> `.` path emission,
- * `=>` -> `->` and joint multi-character operators, delimited groups, and Kotlin token-boundary
- * spacing for comment/KDoc code blocks, `macro_rules!` body templates, and `Verbatim` AST nodes.
+ * `=>` -> `->` and joint multi-character operators, delimited groups, and structural Kotlin
+ * token-boundary spacing via [KotlinTokenEmitter] for comment/KDoc code blocks, `macro_rules!`
+ * body templates, and `Verbatim` AST nodes.
  */
 internal open class RustTokenStreamKotlinEmitter(
     trees: List<TokenTree>,
@@ -625,13 +690,16 @@ internal open class RustTokenStreamKotlinEmitter(
     protected open fun spawnChild(childTrees: List<TokenTree>): RustTokenStreamKotlinEmitter =
         RustTokenStreamKotlinEmitter(childTrees)
 
-    protected open fun tryConsumeSpecialAt(idx: Int, outTokens: MutableList<String>): Int? = null
+    protected open fun tryConsumeSpecialAt(idx: Int, out: KotlinTokenEmitter): Int? = null
 
     protected open fun renderAttributeInteriorStream(stream: TokenStream, isInner: Boolean): String? = null
 
-    protected open fun consumeLifetimeAt(idx: Int, outTokens: MutableList<String>): Int {
+    protected open fun consumeLifetimeAt(idx: Int, out: KotlinTokenEmitter): Int {
         var next = idx + 2
-        if (punctCharAt(next) == '+' || (punctCharAt(next) == ',' && outTokens.lastOrNull() == "<")) {
+        val lastTok = out.lastToken()
+        val isLeadingAngleComma =
+            punctCharAt(next) == ',' && lastTok is KotlinEmitToken.Punct && lastTok.ch == '<'
+        if (punctCharAt(next) == '+' || isLeadingAngleComma) {
             next++
         }
         return next
@@ -659,12 +727,11 @@ internal open class RustTokenStreamKotlinEmitter(
         return rustTypeIdentToKotlin(fallback)
     }
 
-    open fun render(): String {
-        if (trees.isEmpty()) return ""
-        val outTokens = mutableListOf<String>()
+    open fun emitInto(out: KotlinTokenEmitter) {
+        if (trees.isEmpty()) return
         var i = 0
         while (i < size) {
-            val specialNext = tryConsumeSpecialAt(i, outTokens)
+            val specialNext = tryConsumeSpecialAt(i, out)
             if (specialNext != null) {
                 i = specialNext
                 continue
@@ -680,25 +747,25 @@ internal open class RustTokenStreamKotlinEmitter(
                 val grp = groupAt(nextIdx, Delimiter.Bracket)
                 if (grp != null) {
                     val renderedAttr = renderAttributeInteriorStream(grp.stream(), isInner)
-                    if (!renderedAttr.isNullOrEmpty()) outTokens += renderedAttr
+                    if (!renderedAttr.isNullOrEmpty()) out.raw(renderedAttr)
                     i = nextIdx + 1
                     continue
                 }
             }
 
             if (isLifetimeAt(i)) {
-                i = consumeLifetimeAt(i, outTokens)
+                i = consumeLifetimeAt(i, out)
                 continue
             }
 
             if (punctCharAt(i) == '&') {
-                val prev = outTokens.lastOrNull()
+                val prev = out.lastToken()
                 if (punctSpacingAt(i) == Spacing.Joint && punctCharAt(i + 1) == '&') {
-                    outTokens += "&&"
+                    out.operator("&&")
                     i += 2
                     continue
                 }
-                if (prev == null || prev in BORROW_DROP_PREDECESSORS) {
+                if (prev == null || isBorrowDropPredecessor(prev)) {
                     i++
                     if (isLifetimeAt(i)) i += 2
                     if (identAt(i) == "mut") i++
@@ -710,33 +777,47 @@ internal open class RustTokenStreamKotlinEmitter(
             if (bangMacroGrp != null) {
                 val rawMacro = cleanIdentAt(i).orEmpty()
                 if (identAt(i) == "Token" && bangMacroGrp.delimiter() == Delimiter.Bracket) {
-                    outTokens += mapSynTokenMacro(bangMacroGrp)
+                    out.ident(mapSynTokenMacro(bangMacroGrp))
                     i += 3
                     continue
                 }
                 val ktMacro = mapMacroName(rawMacro)
-                val inner = spawnChild(bangMacroGrp.stream().toList()).render()
-                outTokens +=
-                    when (bangMacroGrp.delimiter()) {
-                        Delimiter.Brace -> if (inner.isEmpty()) "$ktMacro {}" else "$ktMacro { $inner }"
-                        Delimiter.Bracket -> if (bracketMacroAsListOf) "listOf($inner)" else "$ktMacro[$inner]"
-                        else -> "$ktMacro($inner)"
-                    }
+                val innerTrees = bangMacroGrp.stream().toList()
+                when (bangMacroGrp.delimiter()) {
+                    Delimiter.Brace ->
+                        out.macroCall(ktMacro, "{", "}", spaceBeforeOpen = true, padInside = true) { childOut ->
+                            spawnChild(innerTrees).emitInto(childOut)
+                        }
+                    Delimiter.Bracket ->
+                        if (bracketMacroAsListOf) {
+                            out.macroCall("listOf", "(", ")") { childOut ->
+                                spawnChild(innerTrees).emitInto(childOut)
+                            }
+                        } else {
+                            out.macroCall(ktMacro, "[", "]") { childOut ->
+                                spawnChild(innerTrees).emitInto(childOut)
+                            }
+                        }
+                    else ->
+                        out.macroCall(ktMacro, "(", ")") { childOut ->
+                            spawnChild(innerTrees).emitInto(childOut)
+                        }
+                }
                 i += 3
                 continue
             }
 
             if (current is TokenTree.Ident && punctCharAt(i + 1) == '!' && punctCharAt(i + 2) != '=') {
-                outTokens += mapMacroName(cleanIdentAt(i).orEmpty())
+                out.ident(mapMacroName(cleanIdentAt(i).orEmpty()))
                 i += 2
                 continue
             }
 
             if (isDoubleColonAt(i)) {
-                if (stripModuleRootPrefixes && outTokens.lastOrNull() in MODULE_ROOT_PREFIXES) {
-                    outTokens.removeAt(outTokens.lastIndex)
+                if (stripModuleRootPrefixes && out.lastWordText() in MODULE_ROOT_PREFIXES) {
+                    out.dropLastToken()
                 } else if (!omitTurbofishDot || punctCharAt(i + 2) != '<') {
-                    outTokens += "."
+                    out.punct('.')
                 }
                 i += 2
                 continue
@@ -745,113 +826,82 @@ internal open class RustTokenStreamKotlinEmitter(
             when (current) {
                 is TokenTree.Ident -> {
                     val mapped = mapIdent(cleanIdentAt(i).orEmpty())
-                    if (mapped.isNotEmpty()) outTokens += mapped
+                    if (mapped.isNotEmpty()) out.wordOrKeywords(mapped)
                     i++
                 }
                 is TokenTree.Literal -> {
-                    outTokens += current.value.toString()
+                    out.literal(current.value.toString())
                     i++
                 }
                 is TokenTree.Group -> {
                     val grp = current.value
-                    val inner = spawnChild(grp.stream().toList()).render()
-                    outTokens +=
-                        when (grp.delimiter()) {
-                            Delimiter.Parenthesis ->
-                                if (emptyParensAfterAngleAsUnit && inner.isEmpty() && outTokens.lastOrNull() == "<") {
-                                    "Unit"
-                                } else {
-                                    "($inner)"
+                    val innerTrees = grp.stream().toList()
+                    val lastTok = out.lastToken()
+                    when (grp.delimiter()) {
+                        Delimiter.Parenthesis ->
+                            if (emptyParensAfterAngleAsUnit &&
+                                innerTrees.isEmpty() &&
+                                lastTok is KotlinEmitToken.Punct &&
+                                lastTok.ch == '<'
+                            ) {
+                                out.ident("Unit")
+                            } else {
+                                out.delimited("(", ")") { childOut ->
+                                    spawnChild(innerTrees).emitInto(childOut)
                                 }
-                            Delimiter.Bracket -> "[$inner]"
-                            Delimiter.Brace -> if (inner.isEmpty()) "{}" else "{ $inner }"
-                            Delimiter.None -> inner
-                        }
+                            }
+                        Delimiter.Bracket ->
+                            out.delimited("[", "]") { childOut ->
+                                spawnChild(innerTrees).emitInto(childOut)
+                            }
+                        Delimiter.Brace ->
+                            out.delimited("{", "}", padInside = true) { childOut ->
+                                spawnChild(innerTrees).emitInto(childOut)
+                            }
+                        Delimiter.None -> spawnChild(innerTrees).emitInto(out)
+                    }
                     i++
                 }
                 is TokenTree.Punct -> {
-                    val (punctOut, step) = consumePunctOrOperator(i, outTokens.lastOrNull())
-                    if (punctOut.isNotEmpty()) outTokens += punctOut
-                    i += step
+                    i += consumePunctOrOperatorInto(i, out)
                 }
             }
         }
-        return joinKotlinEmittedTokens(outTokens)
     }
 
-    private fun consumePunctOrOperator(idx: Int, prevRendered: String?): Pair<String, Int> {
+    open fun render(): String {
+        if (trees.isEmpty()) return ""
+        val out = KotlinTokenEmitter()
+        emitInto(out)
+        return out.render()
+    }
+
+    private fun consumePunctOrOperatorInto(idx: Int, out: KotlinTokenEmitter): Int {
         val jointOp = consumeJointOperator(idx)
         if (jointOp != null) {
             val (op, step) = jointOp
-            return (if (op == "=>") "->" else op) to step
+            val mapped = if (op == "=>") "->" else op
+            out.operator(mapped)
+            return step
         }
-        val c0 = punctCharAt(idx) ?: return "" to 1
-        if (stripPostfixQuestion &&
-            c0 == '?' &&
-            prevRendered != null &&
-            (prevRendered.endsWith(")") || prevRendered.last().isLetterOrDigit() || prevRendered.endsWith("]"))
-        ) {
-            return "" to 1
+        val c0 = punctCharAt(idx) ?: return 1
+        val prevTok = out.lastToken()
+        if (stripPostfixQuestion && c0 == '?' && prevTok != null && prevTok.canPrecedePostfixTry()) {
+            return 1
         }
-        return c0.toString() to 1
+        out.punct(c0)
+        return 1
     }
 
     companion object {
         private val MODULE_ROOT_PREFIXES = setOf("crate", "self", "super")
-        private val BORROW_DROP_PREDECESSORS = setOf("(", ",", ":", "=", "<", "->")
-        private val KEYWORD_SPACE_BEFORE_PAREN = setOf("if", "while", "for", "when", "return", "val", "var", "in")
-        private val KEYWORD_SPACE_BEFORE_ANGLE = setOf("val", "var", "return", "in")
-        private val BINARY_SPACED_OPS =
-            setOf(
-                "=",
-                "->",
-                "==",
-                "!=",
-                "<=",
-                ">=",
-                "&&",
-                "||",
-                "+",
-                "-",
-                "*",
-                "/",
-                "+=",
-                "-=",
-                "*=",
-                "/=",
-                "%=",
-                "&=",
-                "|=",
-                "^=",
-            )
 
-        fun joinKotlinEmittedTokens(tokens: List<String>): String {
-            if (tokens.isEmpty()) return ""
-            val sb = StringBuilder()
-            for (idx in tokens.indices) {
-                val tok = tokens[idx]
-                if (tok.isEmpty()) continue
-                val prev = if (idx > 0) tokens[idx - 1] else null
-                val needSpace =
-                    when {
-                        prev == null -> false
-                        tok == "." || prev == "." -> false
-                        tok == "," || tok == ";" || tok == ":" -> false
-                        prev == "," || prev == ":" || prev == ";" -> true
-                        tok in BINARY_SPACED_OPS || prev in BINARY_SPACED_OPS -> true
-                        tok.startsWith("(") || tok.startsWith("[") -> prev in KEYWORD_SPACE_BEFORE_PAREN
-                        prev == "<" || tok == ">" -> false
-                        tok == "<" -> prev in KEYWORD_SPACE_BEFORE_ANGLE
-                        prev.endsWith("(") || prev.endsWith("[") -> false
-                        tok.startsWith(")") || tok.startsWith("]") -> false
-                        prev == "!" || prev == "@" -> false
-                        else -> true
-                    }
-                if (needSpace && sb.isNotEmpty() && sb.last() != ' ') sb.append(' ')
-                sb.append(tok)
+        private fun isBorrowDropPredecessor(tok: KotlinEmitToken): Boolean =
+            when (tok) {
+                is KotlinEmitToken.Punct -> tok.ch == '(' || tok.ch == ',' || tok.ch == ':' || tok.ch == '<'
+                is KotlinEmitToken.Operator -> tok.symbol == "=" || tok.symbol == "->"
+                else -> false
             }
-            return sb.toString()
-        }
     }
 }
 
@@ -1023,4 +1073,40 @@ internal fun partitionCfgBranchArms(arms: List<CfgBranchArm>): List<Pair<List<To
         }
     }
     return result
+}
+
+/**
+ * Reusable item-level token stream scanner base class that accumulates outer/inner attributes
+ * into [pendingAttrs] and resets them automatically across `;` and `{...}` item boundaries.
+ */
+internal abstract class RustItemStreamScanner(
+    trees: List<TokenTree>,
+) : RustTokenCursor(trees) {
+    protected val pendingAttrs: MutableList<List<TokenTree>> = mutableListOf()
+
+    protected fun hasPendingAttrIdent(ident: String): Boolean =
+        pendingAttrs.any { RustTokenCursor(it).cleanIdentAt(0) == ident }
+
+    protected inline fun walkItemStream(
+        onItemToken: (idx: Int, attrs: List<List<TokenTree>>) -> Int?,
+    ) {
+        pendingAttrs.clear()
+        var idx = 0
+        while (idx < size) {
+            consumeAttribute(idx, pendingAttrs)?.let {
+                idx = it
+                continue
+            }
+            val nextIdx = onItemToken(idx, pendingAttrs)
+            if (nextIdx != null) {
+                pendingAttrs.clear()
+                idx = nextIdx
+                continue
+            }
+            if (punctCharAt(idx) == ';' || groupAt(idx, Delimiter.Brace) != null) {
+                pendingAttrs.clear()
+            }
+            idx++
+        }
+    }
 }

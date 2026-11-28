@@ -1,5 +1,6 @@
 package io.github.kotlinmania.rustkotlin
 
+import io.github.kotlinmania.io.Source
 import io.github.kotlinmania.io.files.Path
 import io.github.kotlinmania.libc.unix.access
 import io.github.kotlinmania.libc.unix.bsd.O_CREAT
@@ -14,6 +15,7 @@ import io.github.kotlinmania.libc.unix.fclose
 import io.github.kotlinmania.libc.unix.fopen
 import io.github.kotlinmania.libc.unix.free
 import io.github.kotlinmania.libc.unix.fwrite
+import io.github.kotlinmania.libc.unix.getenv
 import io.github.kotlinmania.libc.unix.readlink
 import io.github.kotlinmania.libc.unix.realpath
 import io.github.kotlinmania.rustlang.alloc.alloc.alloc
@@ -36,15 +38,8 @@ private object NativePosixFileProbe : PosixTargetFileProbe(
     override fun checkAccess(path: String, mode: Int): Boolean =
         withCString(path) { pathPtr -> access(pathPtr, mode) == 0 }
 
-    override fun resolveRealPath(path: String): String? {
-        val resolved = withCString(path) { pathPtr -> realpath(pathPtr, MutPtr(0L)) }
-        if (resolved.isNull()) return null
-        try {
-            return CStr.fromPtr(resolved.castConst()).toStringLossy()
-        } finally {
-            free(resolved)
-        }
-    }
+    override fun resolveRealPath(path: String): String? =
+        resolvePosixRealPathOrNull(path)
 
     override fun isSymbolicLink(
         path: String,
@@ -113,3 +108,35 @@ public actual fun describeVirtualKotlinFile(
 
 public actual fun writeNew(path: String, text: String): Unit =
     NativePosixFileProbe.writeNew(path, text)
+
+internal expect fun resolvePosixRawExecutablePath(): String?
+
+internal fun resolvePosixRealPathOrNull(path: String): String? {
+    val resolved = withCString(path) { pathPtr -> realpath(pathPtr, MutPtr(0L)) }
+    if (resolved.isNull()) return null
+    try {
+        return CStr.fromPtr(resolved.castConst()).toStringLossy()
+    } finally {
+        free(resolved)
+    }
+}
+
+internal actual fun readPlatformEnvironmentVariable(name: String): String? =
+    withCString(name) { namePtr ->
+        val raw = getenv(namePtr)
+        if (raw.isNull()) {
+            null
+        } else {
+            val text = CStr.fromPtr(raw.castConst()).toStringLossy().trim()
+            text.ifEmpty { null }
+        }
+    }
+
+internal actual fun resolvePlatformExecutablePath(): String? {
+    val rawExe = resolvePosixRawExecutablePath() ?: readPlatformEnvironmentVariable("_") ?: return null
+    return resolvePosixRealPathOrNull(rawExe) ?: rawExe
+}
+
+internal actual fun listPlatformPackagedRuleFiles(resourceDirPath: String): List<String> = emptyList()
+
+internal actual fun openPlatformPackagedRuleSource(resourcePath: String): Source? = null
